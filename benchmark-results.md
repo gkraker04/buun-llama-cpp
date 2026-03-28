@@ -660,3 +660,132 @@ This is significantly worse than turbo3's <1% gap. Speed is essentially identica
 (both compute-bound by dequant, not memory-bound at short context on this model).
 The 6.4x compression is impressive but the quality cost is too high for general use.
 turbo2 may work better for V-only (K stays turbo3) or for extreme memory pressure scenarios.
+
+## turbo3 vs q8_0 vs turbo4 — Full Context Scaling (2026-03-28)
+
+Model: Qwen3.5-27B-heretic Q6_K, RTX 3090 24GB. turbo3 uniform, turbo4 uniform.
+
+### PPL by Context Length
+
+| Context | Chunks | q8_0 | turbo3 | t3 vs q8 | turbo4 | t4 vs q8 | LA-1 t3 | LA-1 vs q8 |
+|---------|--------|------|--------|----------|--------|----------|---------|------------|
+| 2K | 8 | 5.8375 | 5.8323 | -0.09% | 5.8186 | -0.32% | 5.7690 | -1.17% |
+| 4K | 4 | 6.2677 | 6.3252 | +0.92% | — | — | 6.3198 | +0.83% |
+| 8K | 4 | 7.4241 | 7.3783 | -0.62% | — | — | 7.3952 | -0.39% |
+| 32K | 1 | 7.2139 | 7.1693 | -0.62% | 7.3296 | +1.60% | 7.2168 | +0.04% |
+| 64K | 1 | 8.1975 | 8.2379 | +0.49% | 8.5004 | +3.69% | — | — |
+
+### Decode Speed tg64 (tok/s)
+
+| Context | q8_0 | turbo3 | t3/q8 | turbo4 | t4/q8 |
+|---------|------|--------|-------|--------|-------|
+| 32K | 30.69 | 29.83 | 97.2% | 29.47 | 96.0% |
+| 64K | — | 29.79 | — | 29.51 | — |
+
+### VRAM at 64K
+
+| Config | VRAM |
+|--------|------|
+| turbo3 | ~22.3 GiB |
+| turbo4 | ~22.2 GiB |
+| q8_0 | **OOM** (~28+ GiB needed) |
+
+### Key Findings
+
+1. **turbo3 holds quality at all context lengths**: -0.62% at 32K, +0.49% at 64K (within noise)
+2. **turbo4 degrades catastrophically at long context**: +1.60% at 32K, **+3.69% at 64K**
+3. turbo4 QJL noise accumulates as sqrt(N) — 1-bit correction errors compound over more KV positions
+4. LA-1 advantage vanishes at long context: +0.04% at 32K (was -1.17% at 2K)
+5. turbo3 fits 64K on 24GB RTX 3090 where q8_0 would OOM
+6. Decode speed is constant across context lengths for both turbo types
+7. **Recommendation**: turbo3 for all use cases. turbo4 only viable at short context (<4K) on head_dim=256
+
+## InnerQ Per-Channel Equalization (#52) — 2026-03-28
+
+Branch: `experiment/innerq-channel-equalization`. Model: Qwen3-14B Q5_K_M (head_dim=128).
+
+### Concept
+
+Per-channel K scaling before L2 norm + FWHT to equalize channel magnitudes.
+Inverse scaling applied to Q in FA kernel before FWHT rotation. Targets the
+head_dim=128 quality gap where channels have extreme anisotropy (channel 114
+has 20x mean RMS on Qwen3-14B).
+
+### Calibration
+
+Online calibration: accumulate per-channel K² during first 100K token-counts,
+compute sqrt-dampened scales: `scale = (rms/mean_rms)^strength`, clamped to max 2.0x.
+Controlled by `TURBO_INNERQ=1` and `TURBO_INNERQ_STRENGTH=<float>` env vars.
+
+### Reference Baselines (Qwen3-14B Q5_K_M, head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| f16 baseline | 6.4239 | +0.05% |
+| q8_0 baseline | 6.4206 | — |
+| turbo3 uniform (no InnerQ) | 6.6340 | +3.33% |
+
+### Strength Sweep (turbo3 + InnerQ, 2K/8chunks)
+
+| Strength | PPL | vs q8_0 | vs turbo3 baseline | Gap closed |
+|----------|-----|---------|--------------------|-----------:|
+| 0.00 (identity) | 6.6340 | +3.33% | — | 0% |
+| 0.10 | 6.5596 | +2.17% | -1.12% | 35% |
+| **0.20** | **6.5175** | **+1.51%** | **-1.76%** | **55%** |
+| 0.30 | 6.5310 | +1.72% | -1.55% | 48% |
+| 0.50 | 6.5872 | +2.60% | -0.71% | 22% |
+| 1.00 (full RMS) | catastrophic | — | — | — |
+
+**Optimal: strength=0.20, max clamp=2.0x**
+
+### Effect on head_dim=256 (Qwen3.5-27B)
+
+No benefit — FWHT with 256 dimensions already equalizes channels effectively.
+Max channel ratio only 2x (vs 20x on hd128). InnerQ disabled automatically
+when head_dim >= 256 would be appropriate, but currently gated by env var.
+
+### Asymmetric Comparison (Qwen3-14B, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| turbo3 K+V + InnerQ (strength=0.20) | 6.5175 | +1.51% |
+| turbo3-K + turbo4-V + InnerQ | 6.6645 | +3.80% |
+| turbo3 K+V (no InnerQ) | 6.6340 | +3.33% |
+
+turbo3 uniform + InnerQ beats asymmetric turbo3-K + turbo4-V with InnerQ.
+
+### Effect on head_dim=256 — Auto-Detection (2026-03-28)
+
+| Config | PPL | vs q8_0 | Notes |
+|--------|-----|---------|-------|
+| turbo3 (no InnerQ) | 5.8501 | +0.22% | baseline |
+| turbo3 + InnerQ (strength=0.20) | 5.9283 | +1.56% | **WORSE** — channels balanced, perturbation hurts |
+| turbo3 + InnerQ (auto-detect) | 5.8501 | +0.22% | auto-disabled: max ratio 1.164 < 1.2 |
+
+Auto-detect threshold (max_ratio < 1.2) correctly disables InnerQ on hd256.
+
+### K-only vs K+V Scaling Comparison (Qwen3-14B, strength=0.20)
+
+| Config | PPL | vs q8_0 | Gap closed |
+|--------|-----|---------|------------|
+| K+V calibrate, K+V apply (best) | 6.5349 | +1.78% | 46% |
+| K-only calibrate, K+V apply | 6.5757 | +2.42% | 27% |
+| K-only calibrate, K-only apply (s=0.30) | 6.5418 | +1.89% | 43% |
+| K-only calibrate, K-only apply (s=0.20) | 6.5477 | +1.98% | 40% |
+| K-only calibrate, K-only apply (s=0.50) | 6.5486 | +1.99% | 40% |
+| Max-based (paper's formula, mode=1) | 6.6716 | +3.91% | **WORSE** |
+| No InnerQ baseline | 6.6340 | +3.33% | 0% |
+
+**Key findings**:
+1. V scaling helps even without output compensation (K+V > K-only)
+2. Mixed K+V calibration stats are better than K-only stats for K+V application
+3. Paper's max-based formula doesn't transfer to our codebook pipeline
+4. RMS-based mode=0 with strength=0.20 is optimal
+
+### Summary
+
+InnerQ closes the head_dim=128 gap by **~46%** (from +3.33% to +1.78% vs q8_0).
+Auto-detects and disables on hd256 models where channels are already balanced.
+The remaining +1.78% gap is inherent to lower dimensionality (fewer dimensions =
+larger relative quantization noise in dot products). Further improvement would
+require more bits or a fundamentally different approach.
