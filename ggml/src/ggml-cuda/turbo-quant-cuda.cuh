@@ -19,6 +19,72 @@ static __device__ int   d_innerq_is_k;                   // 1 = current set_rows
 extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
 extern void turbo_innerq_init_fattn();
 
+// === Post-FWHT data extraction for empirical codebook computation ===
+// Enabled by TURBO_EXTRACT=<max_samples> env var (e.g. TURBO_EXTRACT=2000000)
+// Dumps post-rotation normalized values to /tmp/turbo_postrot.bin (float32)
+// Device-visible extraction state
+static __device__ float * d_extract_buf_ptr = nullptr;
+static __device__ int   * d_extract_pos_ptr = nullptr;
+static __device__ int     d_extract_max_val = 0;
+
+// Host-side management
+static float * h_extract_gpu_buf = nullptr;
+static int   * h_extract_gpu_pos = nullptr;
+static int     h_extract_max = 0;
+static int     h_extract_state = 0;  // 0=uninit, 1=collecting, 2=done
+
+static void turbo_extract_init(int max_samples) {
+	cudaMalloc(&h_extract_gpu_buf, (size_t)max_samples * sizeof(float));
+	cudaMalloc(&h_extract_gpu_pos, sizeof(int));
+	int zero = 0;
+	cudaMemcpy(h_extract_gpu_pos, &zero, sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
+	cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
+	cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
+	h_extract_max = max_samples;
+	h_extract_state = 1;
+	fprintf(stderr, "TURBO_EXTRACT: collecting up to %d post-rotation samples\n", max_samples);
+}
+
+static void turbo_extract_check_done() {
+	if (h_extract_state != 1) return;
+	int pos;
+	cudaMemcpy(&pos, h_extract_gpu_pos, sizeof(int), cudaMemcpyDeviceToHost);
+	if (pos < h_extract_max) return;
+	// Buffer full — dump to disk
+	if (pos > h_extract_max) pos = h_extract_max;
+	float * host_buf = (float *)malloc((size_t)pos * sizeof(float));
+	cudaMemcpy(host_buf, h_extract_gpu_buf, (size_t)pos * sizeof(float), cudaMemcpyDeviceToHost);
+	const char * path = "/tmp/turbo_postrot.bin";
+	FILE * fp = fopen(path, "wb");
+	if (fp) {
+		fwrite(host_buf, sizeof(float), pos, fp);
+		fclose(fp);
+		fprintf(stderr, "TURBO_EXTRACT: wrote %d samples to %s (%.1f MB)\n",
+				pos, path, (float)pos * sizeof(float) / (1024*1024));
+	}
+	free(host_buf);
+	// Disable extraction (set device pointers to null)
+	float * null_ptr = nullptr;
+	int   * null_iptr = nullptr;
+	int     zero_max = 0;
+	cudaMemcpyToSymbol(d_extract_buf_ptr, &null_ptr, sizeof(float *));
+	cudaMemcpyToSymbol(d_extract_pos_ptr, &null_iptr, sizeof(int *));
+	cudaMemcpyToSymbol(d_extract_max_val, &zero_max, sizeof(int));
+	cudaFree(h_extract_gpu_buf); h_extract_gpu_buf = nullptr;
+	cudaFree(h_extract_gpu_pos); h_extract_gpu_pos = nullptr;
+	h_extract_state = 2;
+}
+
+// Device-side: append 128 post-rotation values to extraction buffer
+static __device__ void turbo_extract_append(const float * x) {
+	if (!d_extract_buf_ptr || !d_extract_pos_ptr) return;
+	int base = atomicAdd(d_extract_pos_ptr, 128);
+	if (base + 128 <= d_extract_max_val) {
+		for (int j = 0; j < 128; j++) d_extract_buf_ptr[base + j] = x[j];
+	}
+}
+
 // Host-side init: set identity scales, zero accumulators
 static void turbo_innerq_init() {
     float ones[128];
@@ -178,15 +244,25 @@ static __constant__ float d_turbo_mid_2bit[3] = {
     -0.086728f, 0.0f, 0.086728f
 };
 
+// === TURBO4: 4-bit codebook (Lloyd-Max for N(0, 1/sqrt(128))) ===
+static __constant__ float d_turbo_centroids_4bit[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
+static __constant__ float d_turbo_mid_4bit[15] = {
+    -0.212232f, -0.162977f, -0.127056f, -0.097191f, -0.070693f,
+    -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
+     0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f,
+};
+
 // === FWHT rotation sign arrays (from turbo-wht.h, seed=42 rotation, seed=1042 QJL) ===
 static __constant__ float d_turbo_wht_signs1[128] = {
     -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f};
 static __constant__ float d_turbo_wht_signs2[128] = {
     1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
-static __constant__ float d_turbo_qjl_wht_signs1[128] = {
-    1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
-static __constant__ float d_turbo_qjl_wht_signs2[128] = {
-    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f};
+// QJL sign arrays removed — turbo4 now uses pure 4-bit PolarQuant (no QJL correction)
 
 // === FWHT rotation functions ===
 static __device__ __forceinline__
@@ -221,6 +297,40 @@ uint8_t turbo_find_nearest_3bit(float val) {
     else if (val < d_turbo_mid_3bit[5]) return 5;
     else if (val < d_turbo_mid_3bit[6]) return 6;
     else                                return 7;
+}
+
+static __device__ __forceinline__
+uint8_t turbo_find_nearest_4bit(float val) {
+    // Binary search over 15 midpoints for 16 centroids
+    if (val < d_turbo_mid_4bit[7]) {
+        if (val < d_turbo_mid_4bit[3]) {
+            if (val < d_turbo_mid_4bit[1]) {
+                return val < d_turbo_mid_4bit[0] ? 0 : 1;
+            } else {
+                return val < d_turbo_mid_4bit[2] ? 2 : 3;
+            }
+        } else {
+            if (val < d_turbo_mid_4bit[5]) {
+                return val < d_turbo_mid_4bit[4] ? 4 : 5;
+            } else {
+                return val < d_turbo_mid_4bit[6] ? 6 : 7;
+            }
+        }
+    } else {
+        if (val < d_turbo_mid_4bit[11]) {
+            if (val < d_turbo_mid_4bit[9]) {
+                return val < d_turbo_mid_4bit[8] ? 8 : 9;
+            } else {
+                return val < d_turbo_mid_4bit[10] ? 10 : 11;
+            }
+        } else {
+            if (val < d_turbo_mid_4bit[13]) {
+                return val < d_turbo_mid_4bit[12] ? 12 : 13;
+            } else {
+                return val < d_turbo_mid_4bit[14] ? 14 : 15;
+            }
+        }
+    }
 }
 
 // === TURBO3: SET_ROWS kernel ===
@@ -275,6 +385,8 @@ static __global__ void k_set_rows_turbo3(
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    // Post-rotation extraction (if enabled)
+    turbo_extract_append(x);
     // Quantize and accumulate reconstruction norm for correction
     float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
@@ -314,16 +426,7 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
       v.y = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
 }
 
-// === TURBO4: 3-bit unpack helper ===
-static __device__ __forceinline__
-uint8_t turbo4_unpack_3bit(const uint8_t * qs, int j) {
-    int bit_offset = j * 3, byte_idx = bit_offset / 8, bit_pos = bit_offset % 8;
-    uint16_t raw = (uint16_t)qs[byte_idx];
-    if (byte_idx + 1 < 48) raw |= (uint16_t)qs[byte_idx + 1] << 8;
-    return (uint8_t)((raw >> bit_pos) & 0x7);
-}
-
-// === TURBO4: SET_ROWS quantize ===
+// === TURBO4: SET_ROWS quantize (4-bit PolarQuant, no QJL) ===
 static __device__ __forceinline__
 void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     float norm_sq = 0.0f;
@@ -332,45 +435,25 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
-    float normalized[128];
-    for (int j = 0; j < 128; j++) normalized[j] = x[j];
     // Forward FWHT rotation before quantization
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-    for (int j = 0; j < 48; j++) dst->qs[j] = 0;
-    for (int j = 0; j < 16; j++) dst->signs[j] = 0;
-    float recon[128];
-    for (int j = 0; j < 128; j++) {
-        uint8_t idx = turbo_find_nearest_3bit(x[j]);
-        recon[j] = d_turbo_centroids_3bit[idx];
-        int bit_offset = j * 3, byte_idx = bit_offset / 8, bit_pos = bit_offset % 8;
-        dst->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
-        if (bit_pos > 5 && byte_idx + 1 < 48)
-            dst->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+    // Post-rotation extraction (if enabled)
+    turbo_extract_append(x);
+    // 4-bit quantization: find nearest of 16 centroids, pack 2 per byte
+    for (int j = 0; j < 128; j += 2) {
+        uint8_t idx0 = turbo_find_nearest_4bit(x[j]);
+        uint8_t idx1 = turbo_find_nearest_4bit(x[j + 1]);
+        dst->qs[j / 2] = (idx1 << 4) | idx0;
     }
-    // Cross-space residual (matches Metal pre-rotate-queries approach)
-    float residual[128];
-    float rnorm_sq = 0.0f;
+    // Norm correction: compute reconstruction norm in rotated space
+    float recon_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        residual[j] = normalized[j] - recon[j];
-        rnorm_sq += residual[j] * residual[j];
+        uint8_t idx = (j & 1) ? (dst->qs[j / 2] >> 4) : (dst->qs[j / 2] & 0xF);
+        float r = d_turbo_centroids_4bit[idx];
+        recon_sq += r * r;
     }
-    float rnorm = sqrtf(rnorm_sq);
-    dst->rnorm = __float2half(rnorm);
-    // QJL rotation of residual, then extract sign bits
-    turbo_rotate_forward_cuda(residual, d_turbo_qjl_wht_signs1, d_turbo_qjl_wht_signs2);
-    for (int j = 0; j < 128; j++) {
-        if (residual[j] >= 0.0f) dst->signs[j / 8] |= (1 << (j % 8));
-    }
-    // Norm correction: compute full reconstruction norm (centroid + QJL) in unit space
-    float qjl_scale_unit = 1.2533141f / 128.0f * rnorm;
-    float recon_full_sq = 0.0f;
-    for (int j = 0; j < 128; j++) {
-        float s = (dst->signs[j / 8] & (1 << (j % 8))) ? qjl_scale_unit : -qjl_scale_unit;
-        float r = recon[j] + s;
-        recon_full_sq += r * r;
-    }
-    float recon_full_norm = sqrtf(recon_full_sq);
-    dst->norm = __float2half((recon_full_norm > 1e-10f) ? norm / recon_full_norm : norm);
+    float recon_norm = sqrtf(recon_sq);
+    dst->norm = __float2half((recon_norm > 1e-10f) ? norm / recon_norm : norm);
 }
 
 // === TURBO4: GET_ROWS dequantize ===
@@ -379,16 +462,12 @@ static __device__ __forceinline__
 void dequantize_turbo4_0(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_turbo4_0 * x = (const block_turbo4_0 *)vx;
     const float norm = __half2float(x[ib].norm);
-    const float rnorm = __half2float(x[ib].rnorm);
-    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
     { const int j = iqs;
-      uint8_t idx = turbo4_unpack_3bit(x[ib].qs, j);
-      float s = (x[ib].signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
-      v.x = (d_turbo_centroids_3bit[idx] + s * qjl_scale) * norm; }
+      uint8_t idx = (j & 1) ? (x[ib].qs[j / 2] >> 4) : (x[ib].qs[j / 2] & 0xF);
+      v.x = d_turbo_centroids_4bit[idx] * norm; }
     { const int j = iqs + 64;
-      uint8_t idx = turbo4_unpack_3bit(x[ib].qs, j);
-      float s = (x[ib].signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
-      v.y = (d_turbo_centroids_3bit[idx] + s * qjl_scale) * norm; }
+      uint8_t idx = (j & 1) ? (x[ib].qs[j / 2] >> 4) : (x[ib].qs[j / 2] & 0xF);
+      v.y = d_turbo_centroids_4bit[idx] * norm; }
 }
 
 // === TURBO2: find nearest 2-bit centroid ===

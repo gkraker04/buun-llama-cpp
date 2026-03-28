@@ -160,6 +160,9 @@ llama_kv_cache::llama_kv_cache(
         //   6 = V-only q8_0 for last 8 (asymmetric: values need more precision)
         //   7 = K-only q8_0 for last 8 (asymmetric: control experiment)
         //   8 = V-only q8_0 for first 2 + last 2
+        //   9 = q8_0 for last 2 only
+        //  10 = K-only q8_0 for last 4
+        //  11 = q8_0 for last 6
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -187,6 +190,9 @@ llama_kv_cache::llama_kv_cache(
                     case 6: promote_v = (il >= n_layer - 8); break;
                     case 7: promote_k = (il >= n_layer - 8); break;
                     case 8: promote_v = (il < 2 || il >= n_layer - 2); break;
+                    case 9: promote_k = promote_v = (il >= n_layer - 2); break;
+                    case 10: promote_k = (il >= n_layer - 4); break;
+                    case 11: promote_k = promote_v = (il >= n_layer - 6); break;
                 }
             }
             if (promote_k) {

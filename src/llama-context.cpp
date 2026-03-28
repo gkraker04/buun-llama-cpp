@@ -367,10 +367,8 @@ llama_context::llama_context(
             const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0);
             const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0);
             if ((turbo_k || turbo_v) && !cparams.flash_attn) {
-                throw std::runtime_error(
-                    "turbo KV cache requires Flash Attention (stores data in FWHT-rotated space). "
-                    "Use -fa on (or -fa auto, which is the default). "
-                    "If Flash Attention was auto-disabled, check that your GPU supports it and all KV layers are on the same device.");
+                LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
+                cparams.flash_attn = true;
             }
         }
     }
@@ -2969,6 +2967,16 @@ llama_context * llama_init_from_model(
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
+        }
+    }
+
+    // Auto-enable flash attention for turbo KV cache types
+    {
+        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0);
+        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0);
+        if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
     }
 

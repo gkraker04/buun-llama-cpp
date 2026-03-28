@@ -13,6 +13,12 @@ static __constant__ float d_turbo_centroids_3bit_fattn[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
+static __constant__ float d_turbo_centroids_4bit_fattn[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
 
 // FWHT rotation sign arrays for FA inline rotation (same values as turbo-quant-cuda.cuh)
 static __constant__ float d_turbo_wht_signs1_fattn[128] = {
@@ -315,12 +321,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
             const uint8_t qs_b1 = (lj1 < 4) ? qs_lo : qs_hi;
             const int idx1 = (qs_b1 >> ((lj1 % 4) * 2)) & 0x3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(cn[idx0]), __float2half(cn[idx1])),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
 #endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
         }
     }
     return sum;
@@ -371,12 +376,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
               const uint8_t hi1  = (signs >> lj1) & 0x1;
               idx1 = low2 | (hi1 << 2); }
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(cn[idx0]), __float2half(cn[idx1])),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
 #endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
         }
     }
     return sum;
@@ -392,8 +396,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     constexpr int cpy_ne = cpy_nb / 4;
     float sum = 0.0f;
     int prev_ib = -1;
-    float cn[8];
-    float qjl_norm = 0.0f;
+    float cn[16];
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
         const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
@@ -403,34 +406,30 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 
         if (ib != prev_ib) {
             const float norm = __half2float(K_t4[ib].norm);
-            const float rnorm = __half2float(K_t4[ib].rnorm);
-            qjl_norm = 1.2533141f / 128.0f * rnorm * norm;
 #pragma unroll
-            for (int c = 0; c < 8; c++) {
-                cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
+            for (int c = 0; c < 16; c++) {
+                cn[c] = d_turbo_centroids_4bit_fattn[c] * norm;
             }
             prev_ib = ib;
         }
 
-        // Batch-load 3-bit indices: 8 elems × 3 bits = 24 bits (byte-aligned, j_start is 8-aligned)
-        uint32_t packed;
-        memcpy(&packed, K_t4[ib].qs + j_start * 3 / 8, sizeof(uint32_t));
-        const uint8_t signs = K_t4[ib].signs[j_start / 8];
-
+        // 4-bit indices: 2 per byte, simple nibble extraction
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
             const int lj = k_KQ_1 * 2;
-            const uint8_t idx0 = (packed >> (lj * 3)) & 0x7;
-            const uint8_t idx1 = (packed >> ((lj + 1) * 3)) & 0x7;
-            const float k0 = cn[idx0] + ((signs >> lj) & 1 ? qjl_norm : -qjl_norm);
-            const float k1 = cn[idx1] + ((signs >> (lj + 1)) & 1 ? qjl_norm : -qjl_norm);
+            const int j0 = j_start + lj;
+            const uint8_t byte0 = K_t4[ib].qs[j0 / 2];
+            const uint8_t byte1 = K_t4[ib].qs[(j0 + 1) / 2];
+            const uint8_t idx0 = (j0 & 1) ? (byte0 >> 4) : (byte0 & 0xF);
+            const uint8_t idx1 = ((j0 + 1) & 1) ? (byte1 >> 4) : (byte1 & 0xF);
+            const float k0 = cn[idx0];
+            const float k1 = cn[idx1];
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(k0), __float2half(k1)),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += k0 * qf.x + k1 * qf.y;
 #endif
+            sum += k0 * qf.x + k1 * qf.y;
         }
     }
     return sum;
@@ -788,31 +787,16 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     const int64_t ib = i0 / QK_TURBO4;
     const int     j0 = (int)(i0 % QK_TURBO4);
     const float norm = __half2float(x[ib].norm);
-    const float rnorm = __half2float(x[ib].rnorm);
-    const float qjl_norm = 1.2533141f / 128.0f * rnorm * norm;
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
-    // Register-based centroid × norm LUT
-    float cn[8];
+    float cn[16];
 #pragma unroll
-    for (int c = 0; c < 8; c++) cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
-    // Batch-load 3-bit indices via uint32_t
-    const int bit_ofs = j0 * 3;
-    uint32_t packed;
-    memcpy(&packed, x[ib].qs + bit_ofs / 8, sizeof(uint32_t));
-    packed >>= (bit_ofs % 8);
-    // Batch-load signs (uint16_t handles byte-boundary spanning)
-    const int s_byte = j0 / 8;
-    const int s_shift = j0 % 8;
-    uint16_t signs16 = (uint16_t)x[ib].signs[s_byte];
-    if (s_shift + ne > 8 && s_byte + 1 < 16) {
-        signs16 |= (uint16_t)x[ib].signs[s_byte + 1] << 8;
-    }
-    signs16 >>= s_shift;
+    for (int c = 0; c < 16; c++) cn[c] = d_turbo_centroids_4bit_fattn[c] * norm;
     float vals[ne];
 #pragma unroll
     for (int l = 0; l < ne; l++) {
-        const uint8_t idx = (packed >> (l * 3)) & 0x7;
-        vals[l] = cn[idx] + ((signs16 >> l) & 1 ? qjl_norm : -qjl_norm);
+        const int j = j0 + l;
+        const uint8_t idx = (j & 1) ? (x[ib].qs[j / 2] >> 4) : (x[ib].qs[j / 2] & 0xF);
+        vals[l] = cn[idx];
     }
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
