@@ -20,7 +20,6 @@ static __constant__ float d_turbo_centroids_4bit_fattn[16] = {
      0.111065f,  0.143047f,  0.182907f,  0.241556f,
 };
 
-// TCQ codebook for dequant_f16 kernel (same values as turbo-quant-cuda.cuh)
 // GLA-trained TCQ codebook for fattn compilation unit (same values as turbo-quant-cuda.cuh)
 static __constant__ float d_turbo3_tcq_codebook_fattn[512] = {
     -0.06214560f, -0.12502260f, -0.07382884f, -0.03642227f, -0.03433620f, +0.01467172f, +0.06410509f, +0.13042919f,
