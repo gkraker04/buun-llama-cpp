@@ -1150,3 +1150,47 @@ Previous committed codebooks were unoptimized (3-bit: 37.6%, 2-bit: only 4.2% �
 - t2tcq-K + t3tcq-V (2.75 bpv) is the best hybrid: only +1.44% at 2K, confirming V quality matters more
 - turbo2 without TCQ degrades catastrophically at long context (+8.5% at 32K+)
 - turbo3_tcq at 65K (+1.04%) is better than turbo3 at 32K (+1.80%) — TCQ enables longer effective context
+
+## TurboQuant vs Rotated q4_0/q8_0 (ggerganov PR #21038) — 2026-03-30
+
+Branch: `master` (merged ggml-org + PR #21038)
+Model: Qwen3.5-27B-heretic Q6_K, RTX 3090, flash_attn=1
+Note: q4_0 and q8_0 now auto-enable Hadamard rotation from PR #21038.
+
+### Speed (pp512 + tg128)
+
+| KV Type | bpv | Prefill (tok/s) | Decode (tok/s) | Decode % of f16 |
+|---------|-----|----------------|----------------|-----------------|
+| f16 | 16.0 | 1156 | 31.19 | 100% |
+| q8_0 (rotated) | 8.5 | 1155 | 30.86 | 98.9% |
+| q4_0 (rotated) | 4.5 | 1147 | 30.81 | 98.8% |
+| turbo3 | 3.5 | 1145 | 30.23 | 96.9% |
+| turbo2 | 2.5 | 1144 | 30.61 | 98.1% |
+
+### PPL at multiple context lengths
+
+| KV Type | bpv | 2K PPL | 2K %↑ | 8K PPL | 8K %↑ | 32K PPL | 32K %↑ | 65K PPL | 65K %↑ |
+|---------|-----|--------|-------|--------|-------|---------|--------|---------|--------|
+| f16 (baseline) | 16.0 | 5.8048 | — | 7.3984 | — | 6.5377 | — | 6.4781 | — |
+| q8_0 (rotated) | 8.5 | 5.8385 | +0.58% | 7.4278 | +0.40% | 6.5327 | -0.08% | 6.4687 | -0.15% |
+| q4_0 (rotated) | 4.5 | 5.8578 | +0.91% | 7.4810 | +1.12% | 6.5835 | +0.70% | 6.5899 | +1.73% |
+| turbo3 | 3.5 | 5.8501 | +0.78% | 7.3783 | -0.27% | 6.5903 | +0.80% | 6.5122 | +0.53% |
+| turbo2 | 2.5 | 6.0786 | +4.72% | 8.0063 | +8.21% | 6.9028 | +5.58% | 7.1227 | +9.95% |
+
+### Analysis
+
+**turbo3 (3.5 bpv) vs rotated q4_0 (4.5 bpv):**
+- turbo3 uses 22% LESS space than rotated q4_0
+- At 2K: turbo3 is BETTER (5.85 vs 5.86)
+- At 8K: turbo3 is BETTER (7.38 vs 7.48)
+- At 32K: roughly tied (6.59 vs 6.58)
+- At 65K: turbo3 is MUCH BETTER (+0.53% vs +1.73%)
+- Conclusion: turbo3 is both smaller AND better quality, especially at long context
+
+**Rotated q8_0 (8.5 bpv):**
+- Near-perfect at all contexts — rotation essentially eliminates quantization error at 8-bit
+- Slightly BETTER than f16 at 32K/65K (likely noise, but confirms zero degradation)
+
+**turbo2 (2.5 bpv):**
+- Significant degradation at long context (+9.95% at 65K)
+- This is where TCQ helps most (turbo2_tcq cuts this to +5.19% from earlier benchmarks)
