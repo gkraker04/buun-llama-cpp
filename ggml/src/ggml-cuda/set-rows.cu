@@ -356,6 +356,24 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
+        // Runtime codebook loading: TURBO_TCQ_CB overrides compiled-in codebook
+        static bool tcq_cb_loaded = false;
+        if (!tcq_cb_loaded) {
+            tcq_cb_loaded = true;
+            const char *cb_path = getenv("TURBO_TCQ_CB");
+            if (cb_path) {
+                float cb[512];
+                FILE *f = fopen(cb_path, "rb");
+                if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                    fclose(f);
+                    cudaMemcpyToSymbol(d_turbo3_tcq_codebook, cb, 512*sizeof(float));
+                    fprintf(stderr, "TCQ encode: loaded codebook from %s\n", cb_path);
+                } else {
+                    if (f) fclose(f);
+                    fprintf(stderr, "TCQ encode: FAILED to load codebook from %s\n", cb_path);
+                }
+            }
+        }
         // TCQ Viterbi encode: 512 threads per block (one per trellis state)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
@@ -375,6 +393,24 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO2_TCQ;
+        // Runtime codebook loading: TURBO_TCQ_CB2 overrides compiled-in 2-bit codebook
+        static bool tcq2_cb_loaded = false;
+        if (!tcq2_cb_loaded) {
+            tcq2_cb_loaded = true;
+            const char *cb_path = getenv("TURBO_TCQ_CB2");
+            if (cb_path) {
+                float cb[256];
+                FILE *f = fopen(cb_path, "rb");
+                if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                    fclose(f);
+                    cudaMemcpyToSymbol(d_turbo2_tcq_codebook, cb, 256*sizeof(float));
+                    fprintf(stderr, "TCQ2 encode: loaded 2-bit codebook from %s\n", cb_path);
+                } else {
+                    if (f) fclose(f);
+                    fprintf(stderr, "TCQ2 encode: FAILED to load codebook from %s\n", cb_path);
+                }
+            }
+        }
         // 2-bit TCQ Viterbi encode: 256 threads per block (one per trellis state, L=8)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);

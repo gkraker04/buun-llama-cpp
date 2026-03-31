@@ -251,3 +251,9 @@ if __name__ == '__main__':
 	# export for both compilation units
 	export_c_codebook(codebook, k, L, scale, reduction, db_gain, "")
 	export_c_codebook(codebook, k, L, scale, reduction, db_gain, "_fattn")
+
+	# export binary (scaled) for runtime loading
+	scaled = codebook * scale
+	bin_path = f"/tmp/tcq_{k}bit_numpy_s{args.seed}.bin"
+	scaled.astype(np.float32).tofile(bin_path)
+	print(f"\nBinary codebook written to {bin_path}")

@@ -238,7 +238,7 @@ float lloyd_max_mse(int k, float sigma) {
 }
 
 template<int K, int L>
-void train(int n_train, int n_iters, int n_restarts) {
+void train(int n_train, int n_iters, int n_restarts, const char* init_file = nullptr, int base_seed = 42) {
 	constexpr int N_STATES = 1 << L;
 	const float sigma = 1.0f / sqrtf(128.0f); // post-FWHT scale for head_dim=256 (128-elem blocks)
 	const float* centroids = (K == 2) ? LM_2BIT : LM_3BIT;
@@ -292,7 +292,19 @@ void train(int n_train, int n_iters, int n_restarts) {
 		if (n_restarts > 1) printf("\n=== Restart %d/%d ===\n", restart+1, n_restarts);
 
 		// initialize codebook
-		init_coset_codebook(h_codebook, K, L, sigma, centroids);
+		if (init_file && restart == 0) {
+			FILE* fp = fopen(init_file, "rb");
+			if (!fp) { fprintf(stderr, "Cannot open init file: %s\n", init_file); exit(1); }
+			if (fread(h_codebook, sizeof(float), N_STATES, fp) != (size_t)N_STATES) {
+				fprintf(stderr, "Init file too small\n"); exit(1);
+			}
+			fclose(fp);
+			printf("Loaded initial codebook from %s\n", init_file);
+		} else {
+			init_coset_codebook(h_codebook, K, L, sigma, centroids);
+		}
+		// seed best with init codebook so 0-iter works
+		memcpy(best_global_codebook, h_codebook, N_STATES * sizeof(float));
 		if (restart > 0) {
 			srand(restart * 7919);
 			for (int s = 0; s < N_STATES; s++) {
@@ -310,7 +322,7 @@ void train(int n_train, int n_iters, int n_restarts) {
 			CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, h_codebook, N_STATES * sizeof(float)));
 
 			// generate fresh random data each iteration
-			CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, 42 + restart * 10000 + iter));
+			CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
 			CHECK_CURAND(curandGenerateNormal(gen, d_data, (size_t)n_train * T, 0.0f, sigma));
 
 			// run Viterbi
@@ -451,21 +463,26 @@ int main(int argc, char** argv) {
 	int n_train = 100000;
 	int n_iters = 200;
 	int n_restarts = 3;
+	int seed = 42;
+	const char* init_file = nullptr;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--bits") == 0 && i+1 < argc) bits = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--n-train") == 0 && i+1 < argc) n_train = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--n-iters") == 0 && i+1 < argc) n_iters = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--n-restarts") == 0 && i+1 < argc) n_restarts = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--init") == 0 && i+1 < argc) init_file = argv[++i];
 	}
 
 	printf("=== CUDA TCQ codebook training ===\n");
-	printf("bits=%d, n_train=%d, n_iters=%d, n_restarts=%d\n\n", bits, n_train, n_iters, n_restarts);
+	printf("bits=%d, n_train=%d, n_iters=%d, n_restarts=%d, seed=%d\n\n", bits, n_train, n_iters, n_restarts, seed);
+	if (init_file) printf("init=%s\n\n", init_file);
 
 	if (bits == 2) {
-		train<2, 8>(n_train, n_iters, n_restarts);
+		train<2, 8>(n_train, n_iters, n_restarts, init_file, seed);
 	} else if (bits == 3) {
-		train<3, 9>(n_train, n_iters, n_restarts);
+		train<3, 9>(n_train, n_iters, n_restarts, init_file, seed);
 	} else {
 		fprintf(stderr, "Unsupported bits: %d\n", bits);
 		return 1;
