@@ -613,11 +613,11 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
     -0.16474872f, -0.09278035f, -0.04699890f, -0.00779894f, +0.03187623f, +0.07828258f, +0.13561429f, +0.23917313f
 };
 
-// Temperature scaling for TCQ norm. alpha > 1 sharpens attention (helps long context).
+// Asymmetric temperature scaling for TCQ norm. V-heavier scaling improves long-context quality.
 // Override via TURBO_TCQ_ALPHA (K) and TURBO_TCQ_ALPHA_V (V) env vars.
 // If TURBO_TCQ_ALPHA_V is not set, V uses the same alpha as K.
-static __constant__ float d_tcq_norm_alpha = 1.2f;
-static __constant__ float d_tcq_norm_alpha_v = 1.2f;
+static __constant__ float d_tcq_norm_alpha = 1.1f;
+static __constant__ float d_tcq_norm_alpha_v = 1.3f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group
