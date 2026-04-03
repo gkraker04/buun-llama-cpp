@@ -1,6 +1,8 @@
 // CUDA TCQ codebook training — 100-1000x faster than numpy Viterbi
 // Compile: nvcc -O3 -arch=sm_86 -o tcq_train_cuda tcq_train_cuda.cu -lcurand
 // Usage:   ./tcq_train_cuda --bits 2 --n-train 100000 --n-iters 200
+//          ./tcq_train_cuda --bits 3 --data-file /tmp/turbo_postrot.bin --n-iters 100
+//          ./tcq_train_cuda --bits 3 --constrain-monotonicity --output-dir /tmp/codebooks
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +11,7 @@
 #include <cstring>
 #include <cstdint>
 #include <curand.h>
+#include "tcq_diagnostics.cuh"
 #include <cuda_runtime.h>
 
 #define CHECK_CUDA(call) do { \
@@ -237,14 +240,87 @@ float lloyd_max_mse(int k, float sigma) {
 	return total_mse / n_eval;
 }
 
+// ============================================================================
+// Load real data from file (format: raw float32 blocks, no header)
+// Returns number of 128-element blocks loaded
+// ============================================================================
+int load_real_data(const char* path, float** out_data) {
+	FILE* fp = fopen(path, "rb");
+	if (!fp) {
+		fprintf(stderr, "Cannot open data file: %s\n", path);
+		exit(1);
+	}
+
+	fseek(fp, 0, SEEK_END);
+	long file_size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	// check if file has int32 header (product trainer format)
+	int32_t maybe_count;
+	fread(&maybe_count, sizeof(int32_t), 1, fp);
+
+	int n_blocks;
+	long data_bytes;
+
+	if (maybe_count > 0 && maybe_count < 100000000 &&
+	    (long)maybe_count * T * sizeof(float) + sizeof(int32_t) == file_size) {
+		// has header
+		n_blocks = maybe_count;
+		data_bytes = (long)n_blocks * T * sizeof(float);
+		printf("Data file has header: %d blocks\n", n_blocks);
+	} else {
+		// raw format — no header
+		fseek(fp, 0, SEEK_SET);
+		data_bytes = file_size;
+		n_blocks = data_bytes / (T * sizeof(float));
+		if (n_blocks * T * (long)sizeof(float) != data_bytes) {
+			fprintf(stderr, "WARNING: Data file size %ld not divisible by %d, truncating\n",
+					file_size, (int)(T * sizeof(float)));
+		}
+		printf("Data file (raw): %d blocks (%.1f MB)\n", n_blocks, data_bytes / 1e6);
+	}
+
+	*out_data = (float*)malloc(data_bytes);
+	if (fread(*out_data, sizeof(float), (size_t)n_blocks * T, fp) != (size_t)n_blocks * T) {
+		fprintf(stderr, "Failed to read data file\n");
+		exit(1);
+	}
+	fclose(fp);
+	return n_blocks;
+}
+
+// ============================================================================
+// Main training loop
+// ============================================================================
 template<int K, int L>
-void train(int n_train, int n_iters, int n_restarts, const char* init_file = nullptr, int base_seed = 42) {
+void train(int n_train, int n_iters, int n_restarts, const char* init_file,
+           int base_seed, const char* data_file, const char* output_dir,
+           bool constrain_mono) {
 	constexpr int N_STATES = 1 << L;
-	const float sigma = 1.0f / sqrtf(128.0f); // post-FWHT scale for head_dim=256 (128-elem blocks)
+	constexpr int N_OUT = 1 << K;
+	constexpr int N_GROUPS = 1 << (L - K);
+	const float sigma = 1.0f / sqrtf(128.0f);
 	const float* centroids = (K == 2) ? LM_2BIT : LM_3BIT;
 
 	float lm_mse = lloyd_max_mse(K, sigma);
-	printf("Lloyd-Max %d-bit baseline: MSE = %.6f\n\n", K, lm_mse);
+	printf("Lloyd-Max %d-bit baseline: MSE = %.6f\n", K, lm_mse);
+	if (constrain_mono) printf("Monotonicity constraint: ENABLED\n");
+	if (data_file) printf("Training data: %s\n", data_file);
+	if (output_dir) printf("Output dir: %s\n", output_dir);
+	printf("\n");
+
+	// load real data if provided
+	float* h_real_data = nullptr;
+	int n_real_blocks = 0;
+	if (data_file) {
+		n_real_blocks = load_real_data(data_file, &h_real_data);
+		printf("Loaded %d real data blocks for training\n\n", n_real_blocks);
+	}
+
+	// create output directory if specified
+	if (output_dir) {
+		mkdir(output_dir, 0755);
+	}
 
 	// allocate GPU memory
 	float* d_data;
@@ -265,7 +341,7 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 	double* h_sums = (double*)malloc(N_STATES * sizeof(double));
 	int* h_counts = (int*)malloc(N_STATES * sizeof(int));
 
-	// cuRAND for generating random data
+	// cuRAND for generating random data (used when no data_file)
 	curandGenerator_t gen;
 	CHECK_CURAND(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
 
@@ -283,6 +359,14 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 			fprintf(stderr, "ERROR: Shared memory %zu exceeds maximum.\n", smem_size);
 			exit(1);
 		}
+	}
+
+	// upload real data to GPU once if available
+	float* d_real_data = nullptr;
+	if (h_real_data) {
+		CHECK_CUDA(cudaMalloc(&d_real_data, (size_t)n_real_blocks * T * sizeof(float)));
+		CHECK_CUDA(cudaMemcpy(d_real_data, h_real_data, (size_t)n_real_blocks * T * sizeof(float),
+		                      cudaMemcpyHostToDevice));
 	}
 
 	float best_global_mse = FLT_MAX;
@@ -312,18 +396,37 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 			}
 		}
 
+		// print initial diagnostics
+		printf("  init:         ");
+		int init_mono = compute_monotonicity<K>(h_codebook, N_GROUPS);
+		printf("mono=%d/%d\n", init_mono, N_GROUPS);
+
 		float best_mse = FLT_MAX;
 		float best_codebook[MAX_STATES];
 		memcpy(best_codebook, h_codebook, N_STATES * sizeof(float));
 		int stall = 0;
 
+		// pre-allocate batch buffer for real data sampling (reused across iterations)
+		float* h_batch = data_file ? (float*)malloc((size_t)n_train * T * sizeof(float)) : nullptr;
+
 		for (int iter = 0; iter < n_iters; iter++) {
 			// upload codebook to constant memory
 			CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, h_codebook, N_STATES * sizeof(float)));
 
-			// generate fresh random data each iteration
-			CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
-			CHECK_CURAND(curandGenerateNormal(gen, d_data, (size_t)n_train * T, 0.0f, sigma));
+			if (data_file) {
+				// sample n_train blocks randomly from real data
+				srand(base_seed + restart * 10000 + iter);
+				for (int i = 0; i < n_train; i++) {
+					int idx = rand() % n_real_blocks;
+					memcpy(h_batch + (size_t)i * T, h_real_data + (size_t)idx * T, T * sizeof(float));
+				}
+				CHECK_CUDA(cudaMemcpy(d_data, h_batch, (size_t)n_train * T * sizeof(float),
+				                      cudaMemcpyHostToDevice));
+			} else {
+				// generate fresh random data each iteration
+				CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
+				CHECK_CURAND(curandGenerateNormal(gen, d_data, (size_t)n_train * T, 0.0f, sigma));
+			}
 
 			// run Viterbi
 			k_viterbi_encode<K, L><<<n_train, N_STATES, smem_size>>>(
@@ -335,6 +438,8 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 			double mean_mse = 0.0;
 			for (int i = 0; i < n_train; i++) mean_mse += h_mse[i];
 			mean_mse /= n_train;
+
+			float reduction = (1.0f - mean_mse / lm_mse) * 100.0f;
 
 			const char* improved = "";
 			if (mean_mse < best_mse) {
@@ -373,7 +478,6 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 			if (used < N_STATES && iter < n_iters - 1) {
 				for (int s = 0; s < N_STATES; s++) {
 					if (h_counts[s] == 0) {
-						// find most-used state as donor
 						int donor = 0;
 						for (int d = 1; d < N_STATES; d++) {
 							if (h_counts[d] > h_counts[donor]) donor = d;
@@ -383,9 +487,24 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 				}
 			}
 
-			printf("  iter %3d: MSE = %.6f  (%d/%d used)%s\n",
-				   iter+1, (float)mean_mse, used, N_STATES, improved);
+			// apply monotonicity constraint if enabled
+			if (constrain_mono) {
+				apply_monotonicity_constraint<K>(h_codebook, N_GROUPS);
+			}
+
+			// print iteration info with diagnostics
+			printf("  iter %3d: MSE=%.6f (%.1f%%)  %d/%d used",
+				   iter+1, (float)mean_mse, reduction, used, N_STATES);
+			print_diagnostics<K>(h_codebook, h_counts, N_STATES);
+			printf("%s\n", improved);
 			fflush(stdout);
+
+			// save codebook for this iteration
+			if (output_dir) {
+				char fname[512];
+				snprintf(fname, sizeof(fname), "%s/cb_iter%03d.bin", output_dir, iter + 1);
+				save_codebook(h_codebook, N_STATES, fname);
+			}
 
 			if (stall >= 10 && iter > 20) {
 				printf("  Converged (10 iters without improvement)\n");
@@ -393,13 +512,23 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 			}
 		}
 
+		free(h_batch); // nullptr-safe
+
 		if (best_mse < best_global_mse) {
 			best_global_mse = best_mse;
 			memcpy(best_global_codebook, best_codebook, N_STATES * sizeof(float));
 		}
 	}
 
-	// evaluate on fresh data
+	// save best codebook
+	if (output_dir) {
+		char fname[512];
+		snprintf(fname, sizeof(fname), "%s/cb_best.bin", output_dir);
+		save_codebook(best_global_codebook, N_STATES, fname);
+		printf("\nBest codebook saved to %s/cb_best.bin\n", output_dir);
+	}
+
+	// evaluate on fresh data (always synthetic for fair comparison)
 	CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, best_global_codebook, N_STATES * sizeof(float)));
 	int n_eval = 10000;
 	float* d_eval_data;
@@ -427,12 +556,28 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 	printf("\nEVAL (%d fresh samples): MSE = %.6f (%.1f%% vs LM, %+.2f dB)\n",
 		   n_eval, (float)eval_mean, reduction, db_gain);
 
-	// print codebook as C array (already at 1/sqrt(128) scale)
+	// final diagnostics on best codebook
+	printf("Final codebook diagnostics: ");
+	// use eval counts for final diagnostics — re-collect
+	CHECK_CUDA(cudaMemset(d_state_sums, 0, N_STATES * sizeof(double)));
+	CHECK_CUDA(cudaMemset(d_state_counts, 0, N_STATES * sizeof(int)));
+	int total_eval = n_eval * T;
+	int threads_eval = 256;
+	int blocks_eval = (total_eval + threads_eval - 1) / threads_eval;
+	k_collect_centroids<<<blocks_eval, threads_eval>>>(
+		d_eval_data, d_eval_states, d_state_sums, d_state_counts, n_eval);
+	CHECK_CUDA(cudaGetLastError());
+	CHECK_CUDA(cudaMemcpy(h_counts, d_state_counts, N_STATES * sizeof(int), cudaMemcpyDeviceToHost));
+	print_diagnostics<K>(best_global_codebook, h_counts, N_STATES);
+	printf("\n");
+
+	// print codebook as C array
 	printf("\n// GLA-trained free-init TCQ codebook: k=%d, L=%d (%d states)\n", K, L, N_STATES);
 	printf("// MSE reduction: %.1f%% vs Lloyd-Max %d-bit, %.2f dB\n", reduction, K, db_gain);
-	printf("// CUDA-trained: n_train=%d, n_iters up to convergence, unit-norm blocks\n", n_train);
+	printf("// CUDA-trained: n_train=%d, n_iters up to convergence\n", n_train);
+	if (data_file) printf("// Trained on real model data: %s\n", data_file);
+	if (constrain_mono) printf("// Monotonicity constraint: ENABLED\n");
 
-	// print both codebook variants
 	const char* suffixes[] = {"", "_fattn"};
 	for (int v = 0; v < 2; v++) {
 		printf("static __constant__ float d_turbo%d_tcq_codebook%s[%d] = {\n", K, suffixes[v], N_STATES);
@@ -452,9 +597,11 @@ void train(int n_train, int n_iters, int n_restarts, const char* init_file = nul
 
 	// cleanup
 	free(h_codebook); free(h_mse); free(h_sums); free(h_counts); free(h_eval_mse);
+	if (h_real_data) free(h_real_data);
 	cudaFree(d_data); cudaFree(d_states); cudaFree(d_mse);
 	cudaFree(d_state_sums); cudaFree(d_state_counts);
 	cudaFree(d_eval_data); cudaFree(d_eval_states); cudaFree(d_eval_mse);
+	if (d_real_data) cudaFree(d_real_data);
 	curandDestroyGenerator(gen);
 }
 
@@ -465,6 +612,9 @@ int main(int argc, char** argv) {
 	int n_restarts = 3;
 	int seed = 42;
 	const char* init_file = nullptr;
+	const char* data_file = nullptr;
+	const char* output_dir = nullptr;
+	bool constrain_mono = false;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--bits") == 0 && i+1 < argc) bits = atoi(argv[++i]);
@@ -473,16 +623,30 @@ int main(int argc, char** argv) {
 		else if (strcmp(argv[i], "--n-restarts") == 0 && i+1 < argc) n_restarts = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--init") == 0 && i+1 < argc) init_file = argv[++i];
+		else if (strcmp(argv[i], "--data-file") == 0 && i+1 < argc) data_file = argv[++i];
+		else if (strcmp(argv[i], "--output-dir") == 0 && i+1 < argc) output_dir = argv[++i];
+		else if (strcmp(argv[i], "--constrain-monotonicity") == 0) constrain_mono = true;
+		else {
+			fprintf(stderr, "Unknown option: %s\n", argv[i]);
+			fprintf(stderr, "Usage: %s [--bits 2|3] [--n-train N] [--n-iters N] [--n-restarts N]\n", argv[0]);
+			fprintf(stderr, "       [--seed N] [--init file.bin] [--data-file file.bin]\n");
+			fprintf(stderr, "       [--output-dir dir] [--constrain-monotonicity]\n");
+			return 1;
+		}
 	}
 
 	printf("=== CUDA TCQ codebook training ===\n");
-	printf("bits=%d, n_train=%d, n_iters=%d, n_restarts=%d, seed=%d\n\n", bits, n_train, n_iters, n_restarts, seed);
-	if (init_file) printf("init=%s\n\n", init_file);
+	printf("bits=%d, n_train=%d, n_iters=%d, n_restarts=%d, seed=%d\n", bits, n_train, n_iters, n_restarts, seed);
+	if (init_file) printf("init=%s\n", init_file);
+	if (data_file) printf("data=%s\n", data_file);
+	if (output_dir) printf("output=%s\n", output_dir);
+	if (constrain_mono) printf("monotonicity constraint: ON\n");
+	printf("\n");
 
 	if (bits == 2) {
-		train<2, 8>(n_train, n_iters, n_restarts, init_file, seed);
+		train<2, 8>(n_train, n_iters, n_restarts, init_file, seed, data_file, output_dir, constrain_mono);
 	} else if (bits == 3) {
-		train<3, 9>(n_train, n_iters, n_restarts, init_file, seed);
+		train<3, 9>(n_train, n_iters, n_restarts, init_file, seed, data_file, output_dir, constrain_mono);
 	} else {
 		fprintf(stderr, "Unsupported bits: %d\n", bits);
 		return 1;
