@@ -2131,6 +2131,13 @@ ggml_tensor * llm_graph_context::build_attn(
     // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
     // - Prefill MMA: separate Q rotation kernel (fattn.cu)
 
+    // Pad Q to match K's padded head_dim (turbo FWHT requires 128-aligned heads)
+    const int64_t orig_head_dim = q->ne[0];
+    const bool head_padded = (q->ne[0] < k->ne[0]);
+    if (head_padded) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2142,6 +2149,20 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    // Crop output back to original head_dim after turbo head padding
+    // cur is 2D [padded_head * n_head_q, n_tokens] — unflatten, crop per-head, reflatten
+    if (head_padded) {
+        const int64_t padded_head = k->ne[0];
+        const int64_t n_head_q = cur->ne[0] / padded_head;
+        const int64_t n_tok = cur->ne[1];
+        cur = ggml_reshape_3d(ctx0, cur, padded_head, n_head_q, n_tok);
+        cur = ggml_view_3d(ctx0, cur,
+            orig_head_dim, n_head_q, n_tok,
+            cur->nb[1], cur->nb[2], 0);
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_reshape_2d(ctx0, cur, orig_head_dim * n_head_q, n_tok);
     }
 
     if (wo) {
