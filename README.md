@@ -4,7 +4,7 @@
 
 > **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats q8_0.
 
 **Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
 
@@ -12,7 +12,7 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Code
 
 Standard KV cache quantization treats each value independently. TCQ constrains quantization indices to follow a 512-state trellis, enabling a much larger effective codebook at the same bit rate. Combined with FWHT rotation and context-adaptive norm scaling, this achieves **10-44% KL-divergence reduction** over scalar quantization at 2-3 bits per value.
 
-At 3.25 bits per value, TCQ produces **lower perplexity than uncompressed FP16** KV cache.
+At 3.25 bits per value, TCQ produces **lower perplexity than q8_0** KV cache (5.802 vs 5.839).
 
 ## Build
 
@@ -40,7 +40,7 @@ The safe default. Virtually no quality loss vs FP16 with ~3.8x KV cache compress
 
 ### 3-bit TCQ (3.25 bpv) -- best quality at 3-bit
 
-Beats FP16 quality at short context, stays within 2% at long context. ~5x KV cache compression.
+Beats q8_0 quality at short context, stays within 2% at long context. ~5x KV cache compression.
 
 ```sh
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa \
@@ -89,7 +89,7 @@ Lower is better. Measured against FP16 KV cache base logits.
 | turbo3_tcq-K / turbo2_tcq-V | 2.75 | 0.078 | 0.101 |
 | turbo2_tcq (symmetric) | 2.25 | 0.101 | 0.136 |
 
-3-bit TCQ at 2K context achieves **lower perplexity than FP16** (5.831 vs 5.839) due to a beneficial norm-scaling effect.
+3-bit TCQ at 2K context achieves **lower perplexity than q8_0** (5.802 vs 5.839) due to a mild regularizing effect from norm scaling.
 
 ## Speed (Qwen3.5-27B Q6_K, RTX 3090)
 
