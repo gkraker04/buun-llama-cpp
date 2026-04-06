@@ -101,15 +101,6 @@ Lower is better. Measured against FP16 KV cache base logits.
 
 Decode speed is constant across context lengths (30 tok/s at 4K, 65K, and 128K). Prefill uses tensor-core MMA path at 99%+ of q8_0 speed.
 
-## Extreme context (128K on 24GB -- impossible with q8_0)
-
-| Context | Decode tok/s | Config |
-|---------|-------------|--------|
-| 65K | 29.79 | turbo3_tcq |
-| 128K | 29.89 | turbo3_tcq |
-
-q8_0 OOMs beyond ~65K on 24GB. TCQ enables full 128K with constant decode speed.
-
 ## Custom codebooks
 
 Trained codebooks are included in `codebooks/`. The defaults are compiled into the CUDA kernels, but you can override them:
@@ -134,7 +125,7 @@ Codebook training scripts are in `scripts/tcq_train_*.py`.
 
 Any GGUF model with `head_dim` that is a multiple of 128 works natively. Models with other head dimensions (e.g., Phi-3 at 96, Qwen3-0.6B at 64) are supported via automatic zero-padding.
 
-Tested on: Qwen3.5-27B, Qwen3-32B, Gemma-3-27B, Gemma-4-31B, MN-Violet-Lotus-12B, Harmonic-Hermes-9B, Phi-3-mini, and others.
+Tested on: Qwen3.5-27B, Qwen3-32B, Gemma-3-27B, Gemma-4-31B, Harmonic-Hermes-9B, Phi-3-mini, and others.
 
 ---
 
