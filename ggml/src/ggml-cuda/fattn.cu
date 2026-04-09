@@ -355,7 +355,7 @@ static __global__ void k_turbo2_dequant_f16(
     const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
     const float val = d_turbo_centroids_2bit_fattn[idx] * norm;
 
-    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 static __global__ void k_turbo3_dequant_f16(
@@ -378,7 +378,7 @@ static __global__ void k_turbo3_dequant_f16(
     const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
     const float val = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm;
 
-    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 static __global__ void k_turbo3_tcq_dequant_f16(
@@ -407,7 +407,7 @@ static __global__ void k_turbo3_tcq_dequant_f16(
     const int state = (raw >> bit_off) & 0x1FF;
     const float val = d_turbo3_tcq_codebook_fattn[state] * norm;
 
-    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 static __global__ void k_turbo2_tcq_dequant_f16(
@@ -436,7 +436,7 @@ static __global__ void k_turbo2_tcq_dequant_f16(
     const int state = (raw >> bit_off) & 0xFF;
     const float val = d_turbo2_tcq_codebook_fattn[state] * norm;
 
-    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 static __global__ void k_turbo4_dequant_f16(
@@ -458,7 +458,65 @@ static __global__ void k_turbo4_dequant_f16(
     const uint8_t idx = (j_in_blk & 1) ? (blk->qs[j_in_blk / 2] >> 4) : (blk->qs[j_in_blk / 2] & 0xF);
     const float val = d_turbo_centroids_4bit_fattn[idx] * norm;
 
-    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
+}
+
+// turbo3 K dequant with inverse FWHT: produces K in original (unrotated) domain
+// so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element FWHT groups
+// (each group spans 4 turbo3 storage blocks of 32 elements; all 4 blocks share the same norm).
+static __global__ void k_turbo3_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    // ne0 in elements, FWHT group = 128 elements = 4 turbo3 blocks of 32
+    const int n_groups = (int)(ne0 / 128);
+    constexpr int blocks_per_group = 128 / QK_TURBO3; // 4
+
+    for (int g = 0; g < n_groups; g++) {
+        // Element index within the FWHT group
+        const int j_in_grp = tid;            // 0..127
+        const int blk_in_grp = j_in_grp / QK_TURBO3;  // 0..3
+        const int j_in_blk  = j_in_grp % QK_TURBO3;   // 0..31
+
+        const block_turbo3_0 * blk = (const block_turbo3_0 *)src_row + g * blocks_per_group + blk_in_grp;
+        const float norm = __half2float(blk->norm);   // same for all 4 blocks in this group
+
+        const uint8_t low2 = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+        const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
+        const float c = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)];
+
+        smem[tid] = c * s2[tid];
+        __syncthreads();
+
+        // 7 butterfly passes (un-normalized FWHT, normalization applied below)
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = smem[j], b = smem[j + h];
+                smem[j] = a + b; smem[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Normalize, apply signs1, undo InnerQ scaling, multiply by norm, cast to fp16
+        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        dst[dst_base + g * 128 + tid] = __float2half(val);
+        __syncthreads();
+    }
 }
 
 // turbo4 K dequant with inverse FWHT: produces K in original (unrotated) domain
@@ -473,7 +531,7 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
     const int tid = threadIdx.x;
 
     const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
-    const int64_t dst_base = strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
 
     __shared__ float smem[128];
 
@@ -505,6 +563,164 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
         // Normalize, apply signs1, undo InnerQ scaling, apply norm, cast to fp16
         float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
         dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+    }
+}
+
+// turbo2 K dequant with inverse FWHT: produces K in original (unrotated) domain.
+// 128 threads per block, loops over 128-element FWHT groups (each group spans
+// 4 turbo2 storage blocks of 32 elements; all 4 blocks share the same norm).
+static __global__ void k_turbo2_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int n_groups = (int)(ne0 / 128);
+    constexpr int blocks_per_group = 128 / QK_TURBO2; // 4
+
+    for (int g = 0; g < n_groups; g++) {
+        const int j_in_grp = tid;            // 0..127
+        const int blk_in_grp = j_in_grp / QK_TURBO2;  // 0..3
+        const int j_in_blk  = j_in_grp % QK_TURBO2;   // 0..31
+
+        const block_turbo2_0 * blk = (const block_turbo2_0 *)src_row + g * blocks_per_group + blk_in_grp;
+        const float norm = __half2float(blk->norm);
+
+        const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+        const float c = d_turbo_centroids_2bit_fattn[idx];
+
+        smem[tid] = c * s2[tid];
+        __syncthreads();
+
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = smem[j], b = smem[j + h];
+                smem[j] = a + b; smem[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        dst[dst_base + g * 128 + tid] = __float2half(val);
+        __syncthreads();
+    }
+}
+
+// turbo3_tcq K dequant with inverse FWHT: produces K in original (unrotated) domain.
+// 128 threads per block, loops over 128-element TCQ blocks (1 block per FWHT group).
+static __global__ void k_turbo3_tcq_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int n_blocks = (int)(ne0 / QK_TURBO3_TCQ);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo3_tcq * blk = (const block_turbo3_tcq *)src_row + blk_idx;
+        const float norm = __half2float(blk->norm) * alpha;
+
+        // Sliding window decode: read 9-bit state from bitstream at bit offset tid*3
+        const int bit_pos = tid * 3;
+        const int byte_idx = bit_pos / 8;
+        const int bit_off = bit_pos % 8;
+        const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+        const int state = (raw >> bit_off) & 0x1FF;
+        const float c = d_turbo3_tcq_codebook_fattn[state];
+
+        smem[tid] = c * s2[tid];
+        __syncthreads();
+
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = smem[j], b = smem[j + h];
+                smem[j] = a + b; smem[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+        __syncthreads();
+    }
+}
+
+// turbo2_tcq K dequant with inverse FWHT: produces K in original (unrotated) domain.
+static __global__ void k_turbo2_tcq_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int n_blocks = (int)(ne0 / QK_TURBO2_TCQ);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo2_tcq * blk = (const block_turbo2_tcq *)src_row + blk_idx;
+        const float norm = __half2float(blk->norm) * alpha;
+
+        // Sliding window decode: read 8-bit state from bitstream at bit offset tid*2
+        const int bit_pos = tid * 2;
+        const int byte_idx = bit_pos / 8;
+        const int bit_off = bit_pos % 8;
+        const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+        const int state = (raw >> bit_off) & 0xFF;
+        const float c = d_turbo2_tcq_codebook_fattn[state];
+
+        smem[tid] = c * s2[tid];
+        __syncthreads();
+
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = smem[j], b = smem[j + h];
+                smem[j] = a + b; smem[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+        __syncthreads();
     }
 }
 
@@ -718,8 +934,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         K_f16.type = GGML_TYPE_F16;
         K_f16.data = k_fp16;
         K_f16.nb[0] = sizeof(half);
-        K_f16.nb[1] = K->ne[0] * sizeof(half);
-        K_f16.nb[2] = K->ne[0] * K->ne[1] * sizeof(half);
+        K_f16.nb[1] = K->ne[0] * K->ne[2] * sizeof(half);  // row stride: head_dim * n_head_kv (matches native cache)
+        K_f16.nb[2] = K->ne[0] * sizeof(half);             // head stride: head_dim (matches native cache)
         K_f16.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
     }
 
@@ -727,8 +943,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         V_f16.type = GGML_TYPE_F16;
         V_f16.data = v_fp16;
         V_f16.nb[0] = sizeof(half);
-        V_f16.nb[1] = V->ne[0] * sizeof(half);
-        V_f16.nb[2] = V->ne[0] * V->ne[1] * sizeof(half);
+        V_f16.nb[1] = V->ne[0] * V->ne[2] * sizeof(half);  // row stride: head_dim * n_head_kv (matches native cache)
+        V_f16.nb[2] = V->ne[0] * sizeof(half);             // head stride: head_dim (matches native cache)
         V_f16.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
     }
 
@@ -1217,8 +1433,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // negligible relative to FFN compute (~1% slower native on Qwen3.5-27B, 3090).
         // Set GGML_TURBO_DECODE_NATIVE=1 to force native VEC path (may help bandwidth-limited configs).
         static const bool turbo_decode_native = (getenv("GGML_TURBO_DECODE_NATIVE") != nullptr);
-        // Skip dequant for D>256: MMA templates only go up to 256; use native VEC path instead
-        const bool do_decode_dequant = !turbo_decode_native && turbo_kv && Q->ne[0] <= 256;
+        // Dequant turbo K/V to fp16 for D<=256 (any K/V combo), or D=512 only when BOTH
+        // K and V are turbo (Gemma 4 ISWA global layers with K=V — Bug A2). Mixed q8_0+turbo
+        // at D=512 stays on native VEC path because post-dequant q8_0 K + f16 V has no
+        // working VEC template at D=512.
+        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
+        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+        const bool both_turbo = turbo_k_only && turbo_v_only;
+        const bool do_decode_dequant = !turbo_decode_native && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_turbo));
 
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
@@ -1238,32 +1460,33 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     kv_dequant_k_buf_size[device_dec] = k_size;
                 }
                 k_fp16_dec = kv_dequant_k_buf[device_dec];
-                // K dequant to fp16. turbo2/3/TCQ stay in rotated domain (Q gets pre-rotated below).
-                // turbo4 K uses inverse-FWHT dequant → original domain (Q stays unrotated for turbo4 K),
-                // mirroring the prefill path so the centroid×sign×FWHT chain unwinds correctly.
+                // K dequant to fp16 in ORIGINAL (unrotated) domain via inverse FWHT.
+                // All turbo K types use inv-FWHT kernels so K matches native f16/q8_0 layout
+                // and Q stays unrotated. This mirrors the prefill path's encode→decode chain
+                // and is the only path that works on Gemma 4 ISWA + K=V global layers.
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 if (K->type == GGML_TYPE_TURBO2_0) {
-                    k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                    k_turbo2_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
-                    k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
-                } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
-                    k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                } else if (K->type == GGML_TYPE_TURBO3_0) {
+                    k_turbo3_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO4_0) {
                     k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else {
-                    k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
+                    k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
+                    k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
                 K_f16_dec.data = k_fp16_dec;
                 K_f16_dec.nb[0] = sizeof(half);
-                K_f16_dec.nb[1] = K->ne[0] * sizeof(half);
-                K_f16_dec.nb[2] = K->ne[0] * K->ne[1] * sizeof(half);
+                K_f16_dec.nb[1] = K->ne[0] * K->ne[2] * sizeof(half);  // row stride: head_dim * n_head_kv (matches native cache)
+                K_f16_dec.nb[2] = K->ne[0] * sizeof(half);             // head stride: head_dim (matches native cache)
                 K_f16_dec.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
@@ -1299,8 +1522,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 V_f16_dec.type = GGML_TYPE_F16;
                 V_f16_dec.data = v_fp16_dec;
                 V_f16_dec.nb[0] = sizeof(half);
-                V_f16_dec.nb[1] = V->ne[0] * sizeof(half);
-                V_f16_dec.nb[2] = V->ne[0] * V->ne[1] * sizeof(half);
+                V_f16_dec.nb[1] = V->ne[0] * V->ne[2] * sizeof(half);  // row stride: head_dim * n_head_kv (matches native cache)
+                V_f16_dec.nb[2] = V->ne[0] * sizeof(half);             // head stride: head_dim (matches native cache)
                 V_f16_dec.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
                 orig_v_decode = dst->src[2];
                 dst->src[2] = &V_f16_dec;
@@ -1308,16 +1531,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         // Pre-rotate Q for turbo K stored in rotated domain.
-        // turbo2/3/TCQ K stay rotated after dequant → Q must be pre-rotated to match.
-        // turbo4 K via k_turbo4_dequant_f16_inv_fwht is in original domain → Q stays unrotated.
-        // If decode dequant was skipped (D>256 or GGML_TURBO_DECODE_NATIVE), turbo4 K remains
-        // in rotated form and is consumed by the native vec turbo4 dot product, which expects
-        // a pre-rotated Q — so rotate Q in that case too.
+        // When do_decode_dequant fires, all turbo K types are dequanted via inv-FWHT into
+        // ORIGINAL domain → Q stays unrotated. When decode dequant is skipped (D>256 or
+        // GGML_TURBO_DECODE_NATIVE), turbo K is consumed by the native vec turbo dot product,
+        // which expects a pre-rotated Q — so rotate Q in that case.
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ);
-        const bool turbo4_k_in_orig_domain = do_decode_dequant && K->type == GGML_TYPE_TURBO4_0;
-        if (turbo_k_any && !turbo4_k_in_orig_domain && Q->ne[0] % 128 == 0) {
+        const bool turbo_k_in_orig_domain = do_decode_dequant && turbo_k_any;
+        if (turbo_k_any && !turbo_k_in_orig_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device_dec]) {
                 if (q_rot_buf[device_dec]) CUDA_CHECK(cudaFree(q_rot_buf[device_dec]));
