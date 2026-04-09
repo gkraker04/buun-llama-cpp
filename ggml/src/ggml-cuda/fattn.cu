@@ -563,6 +563,7 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
         // Normalize, apply signs1, undo InnerQ scaling, apply norm, cast to fp16
         float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
         dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+        __syncthreads();  // ensure all threads finish reading smem before next iter writes it (matches turbo3/turbo2 inv_fwht)
     }
 }
 
@@ -722,6 +723,31 @@ static __global__ void k_turbo2_tcq_dequant_f16_inv_fwht(
         dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
         __syncthreads();
     }
+}
+
+// q8_0 K dequant to f16 in TKHE layout, matching the turbo K dequant kernels.
+// Used at D=512 when K=q8_0 paired with V=turbo: produces (F16, F16) for the FA dispatch
+// and bypasses the (Q8_0, TURBO*) D=512 native VEC templates which have buggy SASS on
+// sm_120 PTX-JIT for some K/V combos. Q8_0 is in original (unrotated) domain → output too.
+// 1 thread per element, 1 block per (token, head, batch).
+static __global__ void k_q8_0_dequant_f16_tkhe(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+
+    const char * src_row = src + strm * nb3 + row * nb1 + head * nb2;
+    const int blk_idx = j / QK8_0;
+    const int j_in_blk = j % QK8_0;
+    const block_q8_0 * blk = (const block_q8_0 *)src_row + blk_idx;
+    const float d = __half2float(blk->d);
+    const float val = d * (float)blk->qs[j_in_blk];
+
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
@@ -1439,8 +1465,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // working VEC template at D=512.
         const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
         const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
-        const bool both_turbo = turbo_k_only && turbo_v_only;
-        const bool do_decode_dequant = !turbo_decode_native && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_turbo));
+        // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
+        // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
+        // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).
+        const bool k_is_f16_q8_or_turbo = (K->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0) || turbo_k_only;
+        const bool v_is_f16_q8_or_turbo = (V->type == GGML_TYPE_F16) || (V->type == GGML_TYPE_Q8_0) || turbo_v_only;
+        const bool both_dequantable_512 = k_is_f16_q8_or_turbo && v_is_f16_q8_or_turbo;
+        const bool do_decode_dequant = !turbo_decode_native && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
 
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
@@ -1452,7 +1483,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         CUDA_CHECK(cudaGetDevice(&device_dec));
 
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ) {
+            const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
+            const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
+            if (k_needs_dequant) {
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
                 if (k_size > kv_dequant_k_buf_size[device_dec]) {
                     if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
@@ -1480,6 +1513,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                } else if (K->type == GGML_TYPE_Q8_0) {
+                    // Q8_0 K dequant: only fires at D=512 when V is turbo (no F16/Q8_0 D=512
+                    // template, and (Q8_0, TURBO4_0) D=512 has buggy SASS on sm_120 PTX-JIT).
+                    // Output goes into TKHE layout matching V_f16_dec → dispatches as F16/F16 D=512.
+                    k_q8_0_dequant_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
@@ -1491,7 +1530,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+            if (v_needs_dequant) {
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
                 if (v_size > kv_dequant_v_buf_size[device_dec]) {
                     if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
@@ -1514,8 +1553,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_TURBO4_0) {
                     k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else {
+                } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_Q8_0) {
+                    // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
+                    k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 }
                 V_f16_dec = *V;
