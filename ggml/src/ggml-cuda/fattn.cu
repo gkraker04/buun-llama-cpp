@@ -1230,7 +1230,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         CUDA_CHECK(cudaGetDevice(&device_dec));
 
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ) {
+            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ) {
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
                 if (k_size > kv_dequant_k_buf_size[device_dec]) {
                     if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
@@ -1238,7 +1238,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     kv_dequant_k_buf_size[device_dec] = k_size;
                 }
                 k_fp16_dec = kv_dequant_k_buf[device_dec];
-                // K dequant to fp16 in rotated domain (Q rotation handles domain matching)
+                // K dequant to fp16. turbo2/3/TCQ stay in rotated domain (Q gets pre-rotated below).
+                // turbo4 K uses inverse-FWHT dequant → original domain (Q stays unrotated for turbo4 K),
+                // mirroring the prefill path so the centroid×sign×FWHT chain unwinds correctly.
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 if (K->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
@@ -1249,6 +1251,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                } else if (K->type == GGML_TYPE_TURBO4_0) {
+                    k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else {
                     k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
@@ -1263,7 +1268,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
                 if (v_size > kv_dequant_v_buf_size[device_dec]) {
                     if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
@@ -1271,6 +1276,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     kv_dequant_v_buf_size[device_dec] = v_size;
                 }
                 v_fp16_dec = kv_dequant_v_buf[device_dec];
+                // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
+                // ggml_turbo_wht inverse op (added in build_attn) un-rotates the attention output.
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
                 if (V->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
@@ -1281,6 +1288,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
+                } else if (V->type == GGML_TYPE_TURBO4_0) {
+                    k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -1297,11 +1307,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             }
         }
 
-        // Pre-rotate Q for turbo (K/V stored in rotated space, whether turbo3 or dequanted fp16)
+        // Pre-rotate Q for turbo K stored in rotated domain.
+        // turbo2/3/TCQ K stay rotated after dequant → Q must be pre-rotated to match.
+        // turbo4 K via k_turbo4_dequant_f16_inv_fwht is in original domain → Q stays unrotated.
+        // If decode dequant was skipped (D>256 or GGML_TURBO_DECODE_NATIVE), turbo4 K remains
+        // in rotated form and is consumed by the native vec turbo4 dot product, which expects
+        // a pre-rotated Q — so rotate Q in that case too.
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ);
-        if (turbo_k_any && Q->ne[0] % 128 == 0) {
+        const bool turbo4_k_in_orig_domain = do_decode_dequant && K->type == GGML_TYPE_TURBO4_0;
+        if (turbo_k_any && !turbo4_k_in_orig_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device_dec]) {
                 if (q_rot_buf[device_dec]) CUDA_CHECK(cudaFree(q_rot_buf[device_dec]));
