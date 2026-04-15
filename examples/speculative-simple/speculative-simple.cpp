@@ -171,13 +171,13 @@ int main(int argc, char ** argv) {
     int     n_reeval_skipped = 0; // iterations where all drafts accepted (no re-eval needed)
 
     while (true) {
-        int64_t t0, t1;
         n_iters++;
 
-        t0 = ggml_time_us();
-        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
-        t1 = ggml_time_us();
-        t_draft_total += (t1 - t0);
+        llama_tokens draft;
+        {
+            common_time_meas tm(t_draft_total);
+            draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+        }
 
         // always have a token to evaluate from before - id_last
         common_batch_clear(batch_tgt);
@@ -187,66 +187,62 @@ int main(int argc, char ** argv) {
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
-            // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
                 draft.clear();
             }
 
-            // For hybrid models: save recurrent state before adding draft tokens
-            // so we can restore it after rejection
             if (needs_reeval && !draft.empty()) {
-                t0 = ggml_time_us();
+                common_time_meas tm(t_backup_total);
                 auto * mem = llama_get_memory(ctx_tgt);
                 llama_memory_seq_rm(mem, seq_backup, -1, -1);
                 llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
                 has_backup = true;
-                t1 = ggml_time_us();
-                t_backup_total += (t1 - t0);
             }
 
             for (size_t i = 0; i < draft.size(); ++i) {
                 common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
             }
 
-            t0 = ggml_time_us();
-            llama_decode(ctx_tgt, batch_tgt);
-            t1 = ggml_time_us();
-            t_decode1_total += (t1 - t0);
+            {
+                common_time_meas tm(t_decode1_total);
+                llama_decode(ctx_tgt, batch_tgt);
+            }
         }
 
-        t0 = ggml_time_us();
-        const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
-        t1 = ggml_time_us();
-        t_sample_total += (t1 - t0);
+        llama_tokens ids;
+        {
+            common_time_meas tm(t_sample_total);
+            ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        }
 
-        GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+        GGML_ASSERT(ids.size() > 0);
 
         n_past    += ids.size() - 1;
-        n_drafted += draft.size(); // note: we ignore the discarded small drafts
+        n_drafted += draft.size();
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
 
-        t0 = ggml_time_us();
-        for (size_t i = 0; i < ids.size(); ++i) {
-            prompt_tgt.push_back(id_last);
+        {
+            common_time_meas tm(t_other_total);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                prompt_tgt.push_back(id_last);
 
-            id_last = ids[i];
+                id_last = ids[i];
 
-            if (llama_vocab_is_eog(vocab, id_last)) {
-                has_eos = true;
-                break;
-            }
+                if (llama_vocab_is_eog(vocab, id_last)) {
+                    has_eos = true;
+                    break;
+                }
 
-            const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
+                const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
 
-            if (params.use_color && i + 1 < ids.size()) {
-                LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
-            } else {
-                LOG("%s", token_str.c_str());
+                if (params.use_color && i + 1 < ids.size()) {
+                    LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
+                } else {
+                    LOG("%s", token_str.c_str());
+                }
             }
         }
-        t1 = ggml_time_us();
-        t_other_total += (t1 - t0);
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
@@ -254,23 +250,20 @@ int main(int argc, char ** argv) {
             const bool all_accepted = (ids.size() == draft.size() + 1);
 
             if (all_accepted) {
-                // All draft tokens accepted — recurrent state is already correct
-                // from the verification decode. Skip expensive restore+re-decode.
                 auto * mem = llama_get_memory(ctx_tgt);
                 llama_memory_seq_rm(mem, seq_backup, -1, -1);
                 llama_memory_seq_rm(mem, 0, n_past, -1);
                 n_reeval_skipped++;
             } else {
-                // Partial rejection — must restore backup and re-decode accepted tokens.
-                t0 = ggml_time_us();
                 auto * mem = llama_get_memory(ctx_tgt);
                 const int n_past_before = n_past - (int)ids.size();
 
-                llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
-                llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                t1 = ggml_time_us();
-                t_restore_total += (t1 - t0);
+                {
+                    common_time_meas tm(t_restore_total);
+                    llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                    llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
+                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                }
 
                 common_batch_clear(batch_tgt);
                 for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
@@ -278,10 +271,8 @@ int main(int argc, char ** argv) {
                 }
 
                 if (batch_tgt.n_tokens > 0) {
-                    t0 = ggml_time_us();
+                    common_time_meas tm(t_decode2_total);
                     llama_decode(ctx_tgt, batch_tgt);
-                    t1 = ggml_time_us();
-                    t_decode2_total += (t1 - t0);
                     n_reeval_tokens += batch_tgt.n_tokens;
                     n_reeval_calls++;
                 }
