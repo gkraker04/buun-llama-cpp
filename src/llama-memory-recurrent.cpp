@@ -165,19 +165,21 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             const auto & cell = cells[tail_id];
             // partial intersection is invalid if it includes the final pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                // for speculative decoding, we search for a checkpoint in the history
+                // for speculative decoding, find the best checkpoint to roll back to.
+                // search for the highest-position checkpoint at or below p0-1.
                 int32_t best_cell = -1;
+                llama_pos best_pos = -1;
                 for (uint32_t i = 0; i < size; ++i) {
-                    if (cells[i].has_seq_id(seq_id) && cells[i].pos == p0 - 1) {
+                    if ((int32_t)i != tail_id && cells[i].has_seq_id(seq_id) && cells[i].pos <= p0 - 1 && cells[i].pos > best_pos) {
+                        best_pos = cells[i].pos;
                         best_cell = i;
-                        break;
                     }
                 }
 
                 if (best_cell >= 0) {
                     tail_id = best_cell;
                 } else {
-                    // No checkpoint found at p0-1: SSM tensor state cannot be rolled back
+                    // No checkpoint found: SSM tensor state cannot be rolled back
                     return false;
                 }
             }
@@ -214,11 +216,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if (seq_id < 0) {
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
-                if (p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
-                    // partial removal: just move the position back
-                    cells[i].pos = p0 - 1;
-                    continue;
-                }
                 cells[i].seq_id.erase(seq_id);
             } else {
                 continue;

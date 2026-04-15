@@ -130,12 +130,11 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    // Always attempt both removals. Attention cache must be cleaned up
+    // even if recurrent rollback fails (e.g. no checkpoint available).
+    bool ok_recr = mem_recr->seq_rm(seq_id, p0, p1);
+    bool ok_attn = mem_attn->seq_rm(seq_id, p0, p1);
+    return ok_recr && ok_attn;
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
