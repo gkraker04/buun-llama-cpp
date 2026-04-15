@@ -179,6 +179,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
     COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
+    COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -334,6 +335,9 @@ struct common_params_speculative {
 
     // copyspec: copy from context
     int32_t copyspec_gamma      = 6;    // window size for rolling hash match
+
+    // token recycling: adjacency matrix
+    int32_t recycle_k            = 8;    // top-k successors per token
 
     // suffix tree speculative decoding
 

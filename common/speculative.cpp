@@ -29,7 +29,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
     COMMON_SPECULATIVE_TYPE_SUFFIX,
-    COMMON_SPECULATIVE_TYPE_COPYSPEC
+    COMMON_SPECULATIVE_TYPE_COPYSPEC,
+    COMMON_SPECULATIVE_TYPE_RECYCLE
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -42,7 +43,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
-    {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC}
+    {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC},
+    {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE}
 };
 
 struct common_speculative_config {
@@ -921,6 +923,85 @@ struct common_speculative_state_copyspec : public common_speculative_state {
     }
 };
 
+// Token Recycling: adjacency matrix tracking top-k successors per token.
+// Updated from observed bigrams in prompt and generated text.
+// Drafts by greedy walk through the adjacency matrix.
+struct common_speculative_state_recycle : public common_speculative_state {
+    int32_t k; // top-k successors per token
+
+    // adjacency: token -> vector of (count, successor) pairs, sorted by count descending
+    std::unordered_map<llama_token, std::vector<std::pair<uint32_t, llama_token>>> adj;
+
+    size_t n_fed = 0; // tokens already fed to adjacency matrix
+
+    common_speculative_state_recycle(enum common_speculative_type type, int32_t k)
+        : common_speculative_state(type)
+        , k(k)
+    {}
+
+    void add_bigram(llama_token a, llama_token b) {
+        auto & succs = adj[a];
+        for (size_t i = 0; i < succs.size(); i++) {
+            if (succs[i].second == b) {
+                succs[i].first++;
+                // bubble up to maintain sorted order
+                while (i > 0 && succs[i].first > succs[i-1].first) {
+                    std::swap(succs[i], succs[i-1]);
+                    i--;
+                }
+                return;
+            }
+        }
+        // new successor — insert if room, or replace least frequent
+        if ((int32_t)succs.size() < k) {
+            succs.push_back({1, b});
+        } else if (succs.back().first <= 1) {
+            succs.back() = {1, b};
+        }
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        adj.clear();
+        n_fed = 0;
+        for (size_t i = 0; i + 1 < prompt.size(); i++) {
+            add_bigram(prompt[i], prompt[i + 1]);
+        }
+        n_fed = prompt.size();
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        // feed new tokens
+        if (n_fed < prompt_tgt.size() + 1) {
+            size_t start = (n_fed > 0) ? n_fed - 1 : 0;
+            // build full sequence including id_last
+            for (size_t i = start; i < prompt_tgt.size(); i++) {
+                llama_token next = (i + 1 < prompt_tgt.size()) ? prompt_tgt[i + 1] : id_last;
+                add_bigram(prompt_tgt[i], next);
+            }
+            n_fed = prompt_tgt.size() + 1;
+        }
+
+        // greedy walk through adjacency matrix
+        llama_token cur = id_last;
+        for (int32_t i = 0; i < params.n_max; i++) {
+            auto it = adj.find(cur);
+            if (it == adj.end() || it->second.empty()) {
+                break;
+            }
+            cur = it->second[0].second; // most frequent successor
+            result.push_back(cur);
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls;
     common_speculative_state * curr_impl = nullptr;
@@ -972,6 +1053,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
         case COMMON_SPECULATIVE_TYPE_SUFFIX:        return "suffix";
         case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
+        case COMMON_SPECULATIVE_TYPE_RECYCLE:       return "recycle";
         default:                                    return "unknown";
     }
 }
@@ -1047,6 +1129,7 @@ common_speculative * common_speculative_init(
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         bool has_suffix        = (params.type == COMMON_SPECULATIVE_TYPE_SUFFIX);
         bool has_copyspec      = (params.type == COMMON_SPECULATIVE_TYPE_COPYSPEC);
+        bool has_recycle       = (params.type == COMMON_SPECULATIVE_TYPE_RECYCLE);
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -1082,6 +1165,9 @@ common_speculative * common_speculative_init(
         }
         if (has_copyspec) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
+        }
+        if (has_recycle) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_RECYCLE, params));
         }
         if (has_suffix) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
@@ -1170,6 +1256,15 @@ common_speculative * common_speculative_init(
                 ));
                 LOG_INF("%s: copyspec speculative decoding (gamma=%d)\n",
                     __func__, config.params.copyspec_gamma);
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_RECYCLE: {
+                impls.push_back(std::make_unique<common_speculative_state_recycle>(
+                    config.type,
+                    config.params.recycle_k
+                ));
+                LOG_INF("%s: token recycling speculative decoding (k=%d)\n",
+                    __func__, config.params.recycle_k);
                 break;
             }
             default:
