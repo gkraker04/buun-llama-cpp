@@ -119,7 +119,9 @@ int main(int argc, char ** argv) {
 
     // hybrid models with recurrent layers need re-evaluation of accepted tokens
     // after rejecting draft tokens, because the recurrent state cannot be rolled back
-    const bool needs_reeval = llama_model_is_recurrent(model_tgt);
+    const bool needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+    // backup sequence ID for saving recurrent state before speculative batches
+    const llama_seq_id seq_backup = 1;
 
     // ================================================
     // everything until here is standard initialization
@@ -171,11 +173,22 @@ int main(int argc, char ** argv) {
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
 
+        bool has_backup = false;
+
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
             // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
                 draft.clear();
+            }
+
+            // For hybrid models: save recurrent state before adding draft tokens
+            // so we can restore it after rejection
+            if (needs_reeval && !draft.empty()) {
+                auto * mem = llama_get_memory(ctx_tgt);
+                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
+                has_backup = true;
             }
 
             for (size_t i = 0; i < draft.size(); ++i) {
@@ -231,15 +244,21 @@ int main(int argc, char ** argv) {
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
-        if (needs_reeval && !draft.empty() && !has_eos) {
-            // For hybrid models: roll back everything from this batch (both KV cache
-            // and recurrent state), then re-decode only the accepted tokens so the
-            // recurrent state is correct. Without this, rejected draft tokens corrupt
-            // the recurrent (DeltaNet/SSM) state which cannot be rolled back.
+        if (has_backup && !has_eos) {
+            // For hybrid models: restore recurrent state from backup (before the
+            // speculative batch), remove attention KV entries from the batch, then
+            // re-decode accepted tokens to get correct recurrent state.
+            auto * mem = llama_get_memory(ctx_tgt);
             const int n_past_before = n_past - (int)ids.size(); // position where id_last was placed
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before, -1);
 
-            // Re-decode the accepted tokens that were pushed to prompt_tgt.
+            // Remove all entries from batch start for seq 0
+            llama_memory_seq_rm(mem, 0, n_past_before, -1);
+
+            // Restore recurrent state from backup
+            llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
+            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+            // Re-decode accepted tokens with clean recurrent state.
             // Don't include id_last — it'll be decoded at the start of the next iteration.
             common_batch_clear(batch_tgt);
             for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
@@ -249,7 +268,6 @@ int main(int argc, char ** argv) {
             if (batch_tgt.n_tokens > 0) {
                 llama_decode(ctx_tgt, batch_tgt);
             }
-            // n_past = prompt_tgt.size(), id_last will go at this position next iteration
             n_past = (int)prompt_tgt.size();
         } else {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);

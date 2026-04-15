@@ -397,30 +397,37 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
+    // create one shared ggml context for all view pairs
+    const uint32_t n_recur = hparams.n_layer; // overcount is fine, just allocates more overhead
     ggml_init_params params = {
-        /*.mem_size   =*/ size_t(2*ggml_tensor_overhead()),
+        /*.mem_size   =*/ size_t(4 * n_recur * ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
+    ggml_context * ctx = ggml_init(params);
 
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (r_l[il]) {
-            ggml_context * ctx = ggml_init(params);
-            size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_src * r_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_dst * r_row_size);
+            const uint32_t n_embd = hparams.n_embd_r();
+            size_t row_bytes = ggml_row_size(r_l[il]->type, n_embd);
+            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], n_embd, i_src * row_bytes);
+            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], n_embd, i_dst * row_bytes);
+            src_v->buffer = r_l[il]->buffer;
+            dst_v->buffer = r_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
         }
         if (s_l[il]) {
-            ggml_context * ctx = ggml_init(params);
-            size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_src * s_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_dst * s_row_size);
+            const uint32_t n_embd = hparams.n_embd_s();
+            size_t row_bytes = ggml_row_size(s_l[il]->type, n_embd);
+            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], n_embd, i_src * row_bytes);
+            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], n_embd, i_dst * row_bytes);
+            src_v->buffer = s_l[il]->buffer;
+            dst_v->buffer = s_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
-            ggml_free(ctx);
         }
     }
+
+    ggml_free(ctx);
 }
 
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
