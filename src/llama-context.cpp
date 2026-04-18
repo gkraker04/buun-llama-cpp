@@ -1409,6 +1409,23 @@ void llama_context::dflash_rollback(llama_seq_id seq_backup, int n_past_before, 
     tape_replay(n_accepted);
 }
 
+void llama_context::dflash_prepare_branch(llama_seq_id seq_backup, int depth) {
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem_hybrid) {
+        LLAMA_LOG_WARN("%s: dflash_prepare_branch requires hybrid memory\n", __func__);
+        return;
+    }
+
+    auto * mem_recr = mem_hybrid->get_mem_recr();
+
+    // restore recurrent state from backup (keep backup intact for subsequent branches)
+    mem_recr->seq_rm(0, -1, -1);
+    mem_recr->seq_cp(seq_backup, 0, -1, -1);
+
+    // tape replay to get DeltaNet state after processing 'depth' tokens (root + main_path[1..depth-1])
+    tape_replay(depth);
+}
+
 // round up to next bucket: 16, 32, 64, 128, 256, 512, 1024, 2048, ...
 static int64_t cross_bucket(int64_t n) {
     if (n <= 16) return 16;
@@ -3744,6 +3761,10 @@ void llama_tape_replay(llama_context * ctx, int n_accepted) {
 
 void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
     ctx->dflash_rollback(seq_backup, n_past_before, n_accepted);
+}
+
+void llama_dflash_prepare_branch(llama_context * ctx, llama_seq_id seq_backup, int depth) {
+    ctx->dflash_prepare_branch(seq_backup, depth);
 }
 
 void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {

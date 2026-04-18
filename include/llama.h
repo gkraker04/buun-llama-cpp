@@ -1067,6 +1067,14 @@ extern "C" {
             int                    n_past_before,
             int                    n_accepted);
 
+    // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
+    // Restores recurrent state from backup and tape-replays to given depth.
+    // Does NOT touch attention KV cache or destroy the backup.
+    LLAMA_API void llama_dflash_prepare_branch(
+            struct llama_context * ctx,
+            llama_seq_id           seq_backup,
+            int                    depth);
+
     // DFlash: set cross-attention data (fused target hidden states for drafter)
     // data: float[n_embd * n_tokens], n_embd: feature dimension, n_tokens: context length
     LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
