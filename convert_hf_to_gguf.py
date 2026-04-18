@@ -1530,6 +1530,12 @@ class TextModel(ModelBase):
         if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
             # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
             res = "qwen35"
+        if chkhsh == "99cc61242f7106804ce24fdf3a6451e4a55251078dffd5453c806e11b2310db3":
+            # ref: https://huggingface.co/Qwen/Qwen3.5-27B
+            res = "qwen35"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/z-lab/Qwen3.5-27B-DFlash (uses Qwen3.5 tokenizer)
+            res = "qwen35"
         if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
             # ref: https://huggingface.co/jdopensource/JoyAI-LLM-Flash
             res = "joyai-llm"
@@ -4707,6 +4713,45 @@ class Qwen3Model(Qwen2Model):
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
 
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DFlashDraftModel")
+class DFlashDraftModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT
+
+    def set_vocab(self):
+        try:
+            self._set_vocab_sentencepiece()
+        except FileNotFoundError:
+            self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        self.gguf_writer.add_causal_attention(False)
+
+        head_dim = self.hparams.get("head_dim", 128)
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+
+        arch = self.gguf_writer.arch
+        block_size = self.hparams.get("block_size", 16)
+        self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)
+
+        mask_token_id = self.hparams.get("mask_token_id", 248070)
+        self.gguf_writer.add_uint32(f"{arch}.dflash.mask_token_id", mask_token_id)
+
+        target_layer_ids = self.hparams.get("target_layer_ids", [1, 16, 31, 46, 61])
+        self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)
+
+        n_embd = self.hparams.get("hidden_size", 5120)
+        n_target_features = n_embd * len(target_layer_ids)
+        self.gguf_writer.add_uint32(f"{arch}.dflash.n_target_features", n_target_features)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # strip "model." prefix if present
+        if name.startswith("model."):
+            name = name[len("model."):]
         yield from super().modify_tensors(data_torch, name, bid)
 
 

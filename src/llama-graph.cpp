@@ -862,6 +862,7 @@ void llm_graph_result::set_outputs() {
             ggml_set_output(t);
         }
     }
+    // DFlash hidden state capture moved to eval callback (no graph outputs needed)
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {

@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -41,6 +42,9 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;
+
+    // DFlash: target layer indices to capture hidden states from (empty = disabled)
+    std::vector<int> dflash_capture_layers;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

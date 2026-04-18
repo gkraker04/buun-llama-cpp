@@ -62,8 +62,9 @@ struct llama_cross {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/11213#discussion_r1969892524
     //ggml_tensor * t_embd = nullptr;
 
-    int64_t n_embd = 0;
-    int64_t n_enc  = 0;
+    int64_t n_embd    = 0;
+    int64_t n_enc     = 0;  // may be padded to bucket for graph stability
+    int64_t n_enc_real = 0; // actual data length (unpadded)
 
     // embeddings data copied to host memory (tmp)
     std::vector<float> v_embd;
@@ -676,6 +677,9 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    // DFlash: captured per-layer hidden states (set by target model graph builder)
+    // DFlash hidden state capture moved to eval callback (dflash_eval_callback)
 
     std::vector<llm_graph_input_ptr> inputs;
 

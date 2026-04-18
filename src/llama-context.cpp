@@ -5,9 +5,13 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+
+#include "ggml-alloc.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -875,6 +879,567 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::get_layer_hidden(int slot) {
+    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+        return nullptr;
+    }
+    return layer_hiddens[slot].data.data();
+}
+
+int64_t llama_context::get_layer_hidden_n_tokens(int slot) const {
+    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+        return 0;
+    }
+    return layer_hiddens[slot].n_tokens;
+}
+
+int64_t llama_context::get_layer_hidden_n_embd(int slot) const {
+    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+        return 0;
+    }
+    return layer_hiddens[slot].n_embd;
+}
+
+int32_t llama_context::get_n_layer_hiddens() const {
+    return (int32_t) layer_hiddens.size();
+}
+
+// helper: read tensor data to a float buffer, handling non-contiguous views
+static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst, size_t n_floats) {
+    dst.resize(n_floats);
+    if (ggml_is_contiguous(t)) {
+        const size_t n_bytes = n_floats * sizeof(float);
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            memcpy(dst.data(), t->data, n_bytes);
+        } else {
+            ggml_backend_tensor_get(t, dst.data(), 0, n_bytes);
+        }
+    } else {
+        // non-contiguous view: read each innermost-contiguous slice separately
+        // for 4D [ne0, ne1, ne2, ne3], ne0*ne1 is contiguous if nb[1]==ne[0]*elem_size
+        const int64_t ne0 = t->ne[0];
+        const int64_t ne1 = t->ne[1];
+        const int64_t ne2 = t->ne[2];
+        const int64_t ne3 = t->ne[3];
+        const size_t esz = ggml_element_size(t);
+
+        // find the largest contiguous inner chunk
+        size_t contig_elems = ne0;
+        size_t contig_stride = t->nb[1];
+        if (t->nb[1] == ne0 * esz) {
+            contig_elems = ne0 * ne1;
+            contig_stride = t->nb[2];
+            if (t->nb[2] == ne0 * ne1 * esz) {
+                contig_elems = ne0 * ne1 * ne2;
+                contig_stride = t->nb[3];
+            }
+        }
+
+        size_t dst_off = 0;
+        size_t n_chunks = n_floats / contig_elems;
+        const size_t chunk_bytes = contig_elems * sizeof(float);
+
+        for (size_t i = 0; i < n_chunks; ++i) {
+            // compute source offset by iterating through outer dimensions
+            size_t src_off = 0;
+            size_t idx = i;
+            if (contig_elems == (size_t)(ne0)) {
+                int64_t i1 = idx % ne1; idx /= ne1;
+                int64_t i2 = idx % ne2; idx /= ne2;
+                int64_t i3 = idx;
+                src_off = i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+            } else if (contig_elems == (size_t)(ne0 * ne1)) {
+                int64_t i2 = idx % ne2; idx /= ne2;
+                int64_t i3 = idx;
+                src_off = i2 * t->nb[2] + i3 * t->nb[3];
+            } else {
+                int64_t i3 = idx;
+                src_off = i3 * t->nb[3];
+            }
+
+            if (ggml_backend_buffer_is_host(t->buffer)) {
+                memcpy(dst.data() + dst_off, (const char *)t->data + src_off, chunk_bytes);
+            } else {
+                ggml_backend_tensor_get(t, dst.data() + dst_off, src_off, chunk_bytes);
+            }
+            dst_off += contig_elems;
+        }
+    }
+}
+
+// DFlash eval callback: captures hidden state tensors + tape data during graph execution
+// without modifying the compute graph (zero FP impact on model computation)
+static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * cap = (dflash_capture_data *) user_data;
+
+    if (ask) {
+        // check hidden state capture targets
+        for (const auto & name : cap->tensor_names) {
+            if (strcmp(t->name, name.c_str()) == 0) {
+                return true;
+            }
+        }
+        // check tape recording targets
+        if (cap->tape_enabled) {
+            if (cap->tape_name_map.count(t->name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ask=false: tensor data is ready, read it back
+
+    // hidden state capture
+    for (size_t i = 0; i < cap->tensor_names.size(); ++i) {
+        if (strcmp(t->name, cap->tensor_names[i].c_str()) == 0) {
+            auto & buf = (*cap->hiddens)[i];
+            buf.n_embd   = t->ne[0];
+            buf.n_tokens = t->ne[1];
+            dflash_read_tensor(t, buf.data, buf.n_embd * buf.n_tokens);
+            return true;
+        }
+    }
+
+    // tape recording
+    if (cap->tape_enabled) {
+        auto it = cap->tape_name_map.find(t->name);
+        if (it != cap->tape_name_map.end()) {
+            int layer_idx = it->second.first;
+            int type      = it->second.second;
+            auto & tape   = cap->tape_layers[layer_idx];
+
+            // total elements in this tensor
+            size_t n_elem = ggml_nelements(t);
+
+            switch (type) {
+                case 0: // k_conv_predelta: [S_k, H_k, n_tokens, n_seqs]
+                    tape.S_k = t->ne[0];
+                    tape.H_k = t->ne[1];
+                    tape.n_tokens = (int) t->ne[2];
+                    dflash_read_tensor(t, tape.k, n_elem);
+                    break;
+                case 1: // v_conv_predelta: [S_v, H_v, n_tokens, n_seqs]
+                    tape.S_v = t->ne[0];
+                    tape.H_v = t->ne[1];
+                    dflash_read_tensor(t, tape.v, n_elem);
+                    break;
+                case 2: // gate: [H_v, n_tokens, n_seqs] (3D, pre-reshape)
+                    dflash_read_tensor(t, tape.gate, n_elem);
+                    break;
+                case 3: // beta: [1, H_v, n_tokens, n_seqs] (pre-sigmoid)
+                    dflash_read_tensor(t, tape.beta, n_elem);
+                    break;
+                case 4: // qkv_mixed_pretranspose: [conv_channels, n_tokens, n_seqs] (contiguous)
+                    tape.conv_channels = t->ne[0];
+                    dflash_read_tensor(t, tape.qkv_mixed, n_elem);
+                    break;
+            }
+            return true;
+        }
+    }
+
+    return true;
+}
+
+void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
+    // store layer IDs for the graph builder (still needed so qwen35.cpp knows which layers)
+    cparams.dflash_capture_layers.clear();
+    for (int32_t i = 0; i < n_layers; ++i) {
+        cparams.dflash_capture_layers.push_back(layer_ids[i]);
+    }
+
+    // set up eval callback for zero-graph-modification capture
+    dflash_capture = std::make_unique<dflash_capture_data>();
+    dflash_capture->hiddens = &layer_hiddens;
+    layer_hiddens.resize(n_layers);
+
+    for (int32_t i = 0; i < n_layers; ++i) {
+        dflash_capture->layer_ids.push_back(layer_ids[i]);
+        dflash_capture->tensor_names.push_back("l_out-" + std::to_string(layer_ids[i]));
+    }
+
+    // install our eval callback (replaces any existing one)
+    cparams.cb_eval = dflash_eval_callback;
+    cparams.cb_eval_user_data = dflash_capture.get();
+}
+
+void llama_context::set_tape_recording(bool enable) {
+    if (!dflash_capture) {
+        return;
+    }
+
+    dflash_capture->tape_enabled = enable;
+
+    if (enable && dflash_capture->recurrent_layer_ids.empty()) {
+        // first-time setup: identify recurrent layers and build name map
+        const auto & hparams = model.hparams;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.is_recurrent(il)) {
+                int idx = (int) dflash_capture->recurrent_layer_ids.size();
+                dflash_capture->recurrent_layer_ids.push_back(il);
+
+                std::string il_str = std::to_string(il);
+                dflash_capture->tape_name_map["k_conv_predelta-" + il_str]      = {idx, 0};
+                dflash_capture->tape_name_map["v_conv_predelta-" + il_str]      = {idx, 1};
+                dflash_capture->tape_name_map["gate-" + il_str]                 = {idx, 2};
+                dflash_capture->tape_name_map["beta-" + il_str]                 = {idx, 3};
+                dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, 4};
+            }
+        }
+        dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
+    }
+}
+
+void llama_context::tape_replay(int n_accepted) {
+    if (!dflash_capture || dflash_capture->tape_layers.empty() || n_accepted <= 0) {
+        return;
+    }
+
+    auto * mem_recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (!mem_recurrent) {
+        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (mem_hybrid) {
+            mem_recurrent = mem_hybrid->get_mem_recr();
+        }
+    }
+    if (!mem_recurrent) {
+        LLAMA_LOG_WARN("%s: tape replay requires recurrent memory\n", __func__);
+        return;
+    }
+
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers   = dflash_capture->tape_layers;
+
+    // find the cell index for seq 0
+    int32_t cell_idx = -1;
+    if (mem_recurrent->size > 0) {
+        int32_t tail = mem_recurrent->cells[0].tail;
+        if (tail >= 0) {
+            cell_idx = tail;
+        }
+    }
+    if (cell_idx < 0) {
+        LLAMA_LOG_WARN("%s: no active cell for seq 0\n", __func__);
+        return;
+    }
+
+    const uint32_t n_embd_s = hparams.n_embd_s();
+    const uint32_t n_embd_r = hparams.n_embd_r();
+
+    // find a GPU backend for graph computation
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+
+    if (!gpu_backend) {
+        // no GPU — fall back to CPU replay
+        tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+        return;
+    }
+
+    // GPU tape replay: build a ggml graph with GDN ops for all recurrent layers
+    // State is accessed via views of s_l[il] (zero-copy on GPU).
+    // Only tape data (~24MB) is uploaded CPU→GPU.
+
+    // count valid layers for context sizing
+    int n_valid = 0;
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        auto & tape = tape_layers[li];
+        if (tape.n_tokens > 0 && n_accepted <= tape.n_tokens) n_valid++;
+    }
+    if (n_valid == 0) goto conv_rebuild;
+
+    {
+        // per layer: q,k,v,g,b inputs + s_view + b_sigmoid + result(GDN) + result_state + s_write + cpy = ~11 tensors
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_valid * 14 + 4) + ggml_graph_overhead_custom(n_valid * 12, false);
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        struct ggml_context * ctx = ggml_init(ctx_params);
+
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_valid * 12, false);
+
+        // track inputs for data upload after allocation
+        struct replay_input {
+            ggml_tensor * q;
+            ggml_tensor * k;
+            ggml_tensor * v;
+            ggml_tensor * g;
+            ggml_tensor * b;
+            size_t tape_li;
+        };
+        std::vector<replay_input> inputs;
+        inputs.reserve(n_valid);
+
+        for (size_t li = 0; li < rec_ids.size(); ++li) {
+            int il = rec_ids[li];
+            auto & tape = tape_layers[li];
+
+            if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+
+            const int64_t S   = tape.S_k; // S_k == S_v
+            const int64_t H_k = tape.H_k;
+            const int64_t H_v = tape.H_v;
+
+            // input tensors (allocated on GPU by alloc_ctx_tensors)
+            ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
+            ggml_tensor * k_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
+            ggml_tensor * v_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, (int64_t)n_accepted, (int64_t)1);
+            ggml_tensor * g_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+            ggml_tensor * b_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+            ggml_set_input(q_in); ggml_set_input(k_in); ggml_set_input(v_in);
+            ggml_set_input(g_in); ggml_set_input(b_in);
+
+            // apply sigmoid to beta on GPU (matches forward pass FP behavior exactly)
+            ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
+
+            // state view: reads directly from recurrent memory GPU buffer (zero-copy)
+            ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+            size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
+                S * ggml_element_size(s_tensor),
+                S * S * ggml_element_size(s_tensor),
+                S * S * H_v * ggml_element_size(s_tensor),
+                s_byte_offset);
+
+            // GDN op: same kernel as forward pass, bit-identical state update
+            ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view);
+
+            // extract state from result (layout: [attn_output | new_state])
+            size_t attn_bytes = (size_t)(S * H_v * n_accepted) * ggml_element_size(result);
+            ggml_tensor * result_state = ggml_view_1d(ctx, result, n_embd_s, attn_bytes);
+
+            // write-back view: points to same location in s_l[il]
+            ggml_tensor * s_write = ggml_view_1d(ctx, s_tensor, n_embd_s, s_byte_offset);
+
+            // copy result state back to recurrent memory (GPU→GPU)
+            ggml_tensor * cpy = ggml_cpy(ctx, result_state, s_write);
+            ggml_build_forward_expand(graph, cpy);
+
+            inputs.push_back({ q_in, k_in, v_in, g_in, b_in, li });
+        }
+
+        // allocate non-view tensors on GPU (reuse persistent buffer when possible)
+        ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+        size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, gpu_buft);
+
+        if (needed > dflash_capture->replay_buf_size) {
+            if (dflash_capture->replay_buf) {
+                ggml_backend_buffer_free(dflash_capture->replay_buf);
+            }
+            dflash_capture->replay_buf = ggml_backend_buft_alloc_buffer(gpu_buft, needed);
+            dflash_capture->replay_buf_size = dflash_capture->replay_buf
+                ? ggml_backend_buffer_get_size(dflash_capture->replay_buf) : 0;
+        }
+
+        if (!dflash_capture->replay_buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate GPU buffer for tape replay, falling back to CPU\n", __func__);
+            ggml_free(ctx);
+            tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+            return;
+        }
+
+        // assign tensors within the persistent buffer
+        {
+            struct ggml_tallocr talloc = ggml_tallocr_new(dflash_capture->replay_buf);
+            struct ggml_tensor * t = ggml_get_first_tensor(ctx);
+            while (t) {
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    ggml_tallocr_alloc(&talloc, t);
+                } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
+                }
+                t = ggml_get_next_tensor(ctx, t);
+            }
+        }
+
+        // upload tape data (CPU→GPU, ~24MB total)
+        for (auto & inp : inputs) {
+            auto & tape = tape_layers[inp.tape_li];
+            const int64_t S   = tape.S_k;
+            const int64_t H_k = tape.H_k;
+            const int64_t H_v = tape.H_v;
+
+            // Q: zeros (attention output is discarded, only state update matters)
+            {
+                size_t q_size = (size_t)(S * H_k * n_accepted);
+                if (dflash_capture->replay_zeros.size() < q_size) {
+                    dflash_capture->replay_zeros.resize(q_size, 0.0f);
+                }
+                ggml_backend_tensor_set(inp.q, dflash_capture->replay_zeros.data(), 0, ggml_nbytes(inp.q));
+            }
+
+            // K, V: from tape (already in correct ggml layout)
+            ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
+            ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
+
+            // gate: pre-exp values (GDN kernel applies expf)
+            ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
+
+            // beta: pre-sigmoid values (sigmoid applied by ggml_sigmoid op in graph)
+            ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+        }
+
+        // compute: runs all GDN ops + state copies on GPU
+        ggml_backend_graph_compute(gpu_backend, graph);
+
+        // cleanup ggml context (buffer is persistent, reused across calls)
+        ggml_free(ctx);
+    }
+
+conv_rebuild:
+    // rebuild conv state from qkv_mixed tape (small, CPU is fine)
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        int il = rec_ids[li];
+        auto & tape = tape_layers[li];
+
+        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+        if (tape.qkv_mixed.empty() || !mem_recurrent->r_l[il]) continue;
+
+        ggml_tensor * r_tensor = mem_recurrent->r_l[il];
+        const size_t r_offset = (size_t)cell_idx * n_embd_r * ggml_element_size(r_tensor);
+
+        const int64_t conv_ch = tape.conv_channels;
+        const int64_t conv_window = (int64_t)(n_embd_r / conv_ch); // kernel_size - 1
+
+        std::vector<float> old_window(n_embd_r);
+        ggml_backend_tensor_get(r_tensor, old_window.data(), r_offset, n_embd_r * sizeof(float));
+
+        std::vector<float> new_conv(n_embd_r);
+        for (int64_t w = 0; w < conv_window; ++w) {
+            int src_pos = n_accepted + (int)w;
+            for (int64_t ch = 0; ch < conv_ch; ++ch) {
+                float val;
+                if (src_pos < (int)conv_window) {
+                    val = old_window[ch * conv_window + src_pos];
+                } else {
+                    val = tape.qkv_mixed[(src_pos - conv_window) * conv_ch + ch];
+                }
+                new_conv[ch * conv_window + w] = val;
+            }
+        }
+
+        ggml_backend_tensor_set(r_tensor, new_conv.data(), r_offset, n_embd_r * sizeof(float));
+    }
+
+    // advance the cell position to reflect n_accepted tokens processed
+    {
+        int32_t tail = mem_recurrent->cells[0].tail;
+        if (tail >= 0) {
+            mem_recurrent->cells[tail].pos += n_accepted;
+        }
+    }
+}
+
+// CPU fallback for tape replay (used when no GPU backend available)
+void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers   = dflash_capture->tape_layers;
+    const uint32_t n_embd_s = hparams.n_embd_s();
+
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        int il = rec_ids[li];
+        auto & tape = tape_layers[li];
+
+        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+
+        const int64_t S = tape.S_k;
+        const int64_t H_k = tape.H_k;
+        const int64_t H_v = tape.H_v;
+        const int64_t head_ratio = H_v / H_k;
+
+        ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+        const size_t s_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        std::vector<float> state(n_embd_s);
+        ggml_backend_tensor_get(s_tensor, state.data(), s_offset, n_embd_s * sizeof(float));
+
+        std::vector<float> sk(S);
+
+        for (int tok = 0; tok < n_accepted; ++tok) {
+            for (int64_t hv = 0; hv < H_v; ++hv) {
+                int64_t hk = hv / head_ratio;
+                float g_val = expf(tape.gate[tok * H_v + hv]);
+                float b_val = 1.0f / (1.0f + expf(-tape.beta[tok * H_v + hv]));
+
+                float * S_h = state.data() + hv * S * S;
+                const float * k_t = tape.k.data() + tok * (S * H_k) + hk * S;
+                const float * v_t = tape.v.data() + tok * (S * H_v) + hv * S;
+
+                // kv = S^T @ k, delta = (v - g*kv) * beta, S = g*S + k⊗delta (fused)
+                for (int64_t col = 0; col < S; ++col) {
+                    float kv = 0.0f;
+                    for (int64_t row = 0; row < S; ++row) {
+                        kv += S_h[col * S + row] * k_t[row];
+                    }
+                    float delta_col = (v_t[col] - g_val * kv) * b_val;
+                    for (int64_t row = 0; row < S; ++row) {
+                        S_h[col * S + row] = g_val * S_h[col * S + row] + k_t[row] * delta_col;
+                    }
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(s_tensor, state.data(), s_offset, n_embd_s * sizeof(float));
+    }
+}
+
+void llama_context::dflash_rollback(llama_seq_id seq_backup, int n_past_before, int n_accepted) {
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem_hybrid) {
+        LLAMA_LOG_WARN("%s: dflash_rollback requires hybrid memory\n", __func__);
+        return;
+    }
+
+    auto * mem_attn = mem_hybrid->get_mem_attn();
+    auto * mem_recr = mem_hybrid->get_mem_recr();
+
+    // KV cache: keep positions 0..n_past_before+n_accepted-1, remove rejected drafts
+    // The verification decode already populated correct KV entries for accepted tokens
+    int kv_keep_pos = n_past_before + n_accepted;
+    mem_attn->seq_rm(0, kv_keep_pos, -1);
+    // Clean up KV backup sequence
+    mem_attn->seq_rm(seq_backup, -1, -1);
+
+    // Recurrent state: restore from backup, then tape replay
+    mem_recr->seq_rm(0, -1, -1);
+    mem_recr->seq_cp(seq_backup, 0, -1, -1);
+    mem_recr->seq_rm(seq_backup, -1, -1);
+
+    // Replay DeltaNet state updates for accepted tokens
+    tape_replay(n_accepted);
+}
+
+// round up to next bucket: 16, 32, 64, 128, 256, 512, 1024, 2048, ...
+static int64_t cross_bucket(int64_t n) {
+    if (n <= 16) return 16;
+    // next power of 2
+    int64_t b = 1;
+    while (b < n) b <<= 1;
+    return b;
+}
+
+void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens) {
+    // pad to bucket size so the graph shape changes infrequently (avoids costly sched_reserve)
+    const int64_t bucket = cross_bucket(n_tokens);
+
+    if (cross.n_enc != bucket) {
+        sched_need_reserve = true;
+    }
+    cross.n_embd    = n_embd;
+    cross.n_enc     = bucket;
+    cross.n_enc_real = n_tokens;  // actual data length (used by input setter)
+    cross.v_embd.assign(n_embd * bucket, 0.0f);  // zero-fill padding
+    if (data) {
+        memcpy(cross.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
+    }
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1392,6 +1957,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+    // DFlash hidden state capture is now handled by the eval callback
+    // (dflash_eval_callback) — no post-graph readback needed here
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1834,6 +2402,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
+
+        // DFlash hidden state capture is now handled by the eval callback
+        // (dflash_eval_callback) — no post-graph readback needed here
 
         n_outputs_prev += n_outputs;
     } while (mctx->next());
@@ -3131,6 +3702,43 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+float * llama_get_layer_hidden(llama_context * ctx, int slot) {
+    ctx->synchronize();
+    return ctx->get_layer_hidden(slot);
+}
+
+int64_t llama_get_layer_hidden_n_tokens(llama_context * ctx, int slot) {
+    return ctx->get_layer_hidden_n_tokens(slot);
+}
+
+int64_t llama_get_layer_hidden_n_embd(llama_context * ctx, int slot) {
+    return ctx->get_layer_hidden_n_embd(slot);
+}
+
+int32_t llama_get_n_layer_hiddens(llama_context * ctx) {
+    return ctx->get_n_layer_hiddens();
+}
+
+void llama_set_dflash_capture(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
+    ctx->set_dflash_capture(layer_ids, n_layers);
+}
+
+void llama_set_tape_recording(llama_context * ctx, bool enable) {
+    ctx->set_tape_recording(enable);
+}
+
+void llama_tape_replay(llama_context * ctx, int n_accepted) {
+    ctx->tape_replay(n_accepted);
+}
+
+void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
+    ctx->dflash_rollback(seq_backup, n_past_before, n_accepted);
+}
+
+void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {
+    ctx->set_cross_data(data, n_embd, n_tokens);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

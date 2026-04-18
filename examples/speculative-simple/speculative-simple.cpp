@@ -48,6 +48,11 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx_tgt = NULL;
 
+    // speculative decoding with recurrent/hybrid models needs seq_backup=1 for state rollback
+    if (params.n_parallel < 2) {
+        params.n_parallel = 2;
+    }
+
     // load the target model
     auto llama_init_tgt = common_init_from_params(params);
 
@@ -88,6 +93,12 @@ int main(int argc, char ** argv) {
 
         params.speculative.model_dft = model_dft.get();
         params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+
+        // DFlash: share tok_embd/output from target BEFORE creating drafter context
+        // This avoids allocating huge placeholder tensors during graph reservation
+        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            llama_model_share_tensors(model_dft.get(), model_tgt);
+        }
     }
 
     // Tokenize the prompt
@@ -116,12 +127,19 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
+    // per-position rejection histogram: reject_pos[i] = how many times position i caused rejection
+    // position 0 = first draft token, position N-1 = last. "all_accepted" counted separately.
+    std::vector<int> reject_pos(16, 0);
+    int n_all_accepted = 0;
+
     // used to determine end of generation
     bool has_eos = false;
 
-    // hybrid models with recurrent layers need re-evaluation of accepted tokens
-    // after rejecting draft tokens, because the recurrent state cannot be rolled back
+    // hybrid models with recurrent layers need state management after partial rejection
     const bool needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+    // GPU tape replay: runs GDN ops on GPU with state views (zero-copy), uploads only tape data (~24MB).
+    // Bit-identical to forward pass. Falls back to CPU replay if no GPU backend.
+    const bool use_tape_replay = true;
     // backup sequence ID for saving recurrent state before speculative batches
     const llama_seq_id seq_backup = 1;
 
@@ -134,7 +152,12 @@ int main(int argc, char ** argv) {
     // target model sampling context
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
-    // eval the prompt
+    // init the speculator BEFORE prefill so DFlash can configure hidden state capture
+    const auto & params_spec = params.speculative;
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
+
+    // eval the prompt (with hidden state capture if DFlash is active)
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
 
     // note: keep the last token separate!
@@ -145,11 +168,6 @@ int main(int argc, char ** argv) {
     prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
 
     int n_past = inp.size() - 1;
-
-    // init the speculator
-    const auto & params_spec = params.speculative;
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
 
     common_speculative_begin(spec, prompt_tgt);
 
@@ -205,9 +223,18 @@ int main(int argc, char ** argv) {
                 common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
             }
 
+            // enable tape recording for DeltaNet state rollback during verification
+            if (use_tape_replay && !draft.empty()) {
+                llama_set_tape_recording(ctx_tgt, true);
+            }
+
             {
                 common_time_meas tm(t_decode1_total);
                 llama_decode(ctx_tgt, batch_tgt);
+            }
+
+            if (use_tape_replay && !draft.empty()) {
+                llama_set_tape_recording(ctx_tgt, false);
             }
         }
 
@@ -231,6 +258,18 @@ int main(int argc, char ** argv) {
         n_drafted += draft.size();
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
+
+        // track rejection position
+        if (!draft.empty()) {
+            if (ids.size() == draft.size() + 1) {
+                n_all_accepted++;
+            } else {
+                int rej_pos = (int)ids.size() - 1;  // 0-indexed position of first mismatch
+                if (rej_pos < (int)reject_pos.size()) {
+                    reject_pos[rej_pos]++;
+                }
+            }
+        }
 
         {
             common_time_meas tm(t_other_total);
@@ -268,23 +307,34 @@ int main(int argc, char ** argv) {
                 auto * mem = llama_get_memory(ctx_tgt);
                 const int n_past_before = n_past - (int)ids.size();
 
-                {
-                    common_time_meas tm(t_restore_total);
-                    llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                    llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                }
-
-                common_batch_clear(batch_tgt);
-                for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
-                    common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
-                }
-
-                if (batch_tgt.n_tokens > 0) {
+                if (use_tape_replay) {
+                    // DFlash rollback: KV cache trim + recurrent restore + tape replay
+                    // Handles KV and recurrent state separately:
+                    //   KV cache: keeps accepted tokens' entries (already computed during verify)
+                    //   Recurrent: restores backup + replays DeltaNet state updates
                     common_time_meas tm(t_decode2_total);
-                    llama_decode(ctx_tgt, batch_tgt);
-                    n_reeval_tokens += batch_tgt.n_tokens;
+                    llama_dflash_rollback(ctx_tgt, seq_backup, n_past_before, (int)ids.size());
+                    n_reeval_tokens += (int)ids.size();
                     n_reeval_calls++;
+                } else {
+                    {
+                        common_time_meas tm(t_restore_total);
+                        llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                        llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                    }
+                    // fallback: batched re-eval through full model
+                    common_batch_clear(batch_tgt);
+                    for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
+                        common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
+                    }
+
+                    if (batch_tgt.n_tokens > 0) {
+                        common_time_meas tm(t_decode2_total);
+                        llama_decode(ctx_tgt, batch_tgt);
+                        n_reeval_tokens += batch_tgt.n_tokens;
+                        n_reeval_calls++;
+                    }
                 }
                 n_past = (int)prompt_tgt.size();
             }
@@ -330,6 +380,23 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+
+    // per-position rejection histogram
+    {
+        int n_rounds_with_draft = n_all_accepted;
+        for (int i = 0; i < (int)reject_pos.size(); ++i) {
+            n_rounds_with_draft += reject_pos[i];
+        }
+        if (n_rounds_with_draft > 0) {
+            LOG_INF("\nrejection histogram (position → count [%%]):\n");
+            for (int i = 0; i < (int)reject_pos.size() && i < params_spec.n_max; ++i) {
+                if (reject_pos[i] > 0) {
+                    LOG_INF("  pos %2d: %4d (%5.1f%%)\n", i, reject_pos[i], 100.0f * reject_pos[i] / n_rounds_with_draft);
+                }
+            }
+            LOG_INF("  all ok: %4d (%5.1f%%)\n", n_all_accepted, 100.0f * n_all_accepted / n_rounds_with_draft);
+        }
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

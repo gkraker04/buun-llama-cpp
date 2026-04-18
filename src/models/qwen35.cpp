@@ -69,6 +69,10 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
         // Input for next layer
         inpL = cur;
+
+        // DFlash hidden state capture is handled by the eval callback
+        // (dflash_eval_callback) which reads "l_out-{il}" tensors during
+        // graph execution. No graph modification needed here.
     }
     cur = inpL;
 
@@ -255,8 +259,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    cb(qkv_mixed, "qkv_mixed_pretranspose", il);  // tape captures contiguous [conv_channels, n_tokens]
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
-    cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);

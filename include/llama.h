@@ -621,6 +621,14 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // DFlash drafter model hyperparameters
+    LLAMA_API int32_t llama_model_dflash_block_size       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_mask_token_id    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_layers  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
+    // fills layer_ids[0..n-1], returns n (capped by capacity)
+    LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 
@@ -1025,6 +1033,47 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // DFlash: get captured layer hidden state by slot index
+    // Returns pointer to float[n_embd * n_tokens] or NULL if slot is invalid
+    LLAMA_API float * llama_get_layer_hidden(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_tokens(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_embd(struct llama_context * ctx, int slot);
+    LLAMA_API int32_t llama_get_n_layer_hiddens(struct llama_context * ctx);
+
+    // DFlash: configure which target layers to capture hidden states from during decode
+    // layer_ids: array of layer indices, n_layers: number of layers
+    // Pass n_layers=0 to disable capture
+    LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+
+    // DFlash: enable/disable tape recording for DeltaNet rollback
+    // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
+    // during verification decode for efficient state replay instead of full re-evaluation
+    LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
+
+    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
+    // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
+    // Must be called after restoring from backup (seq_cp) and before the next decode
+    LLAMA_API void llama_tape_replay(struct llama_context * ctx, int n_accepted);
+
+    // DFlash: complete rollback for hybrid models after partial acceptance
+    // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
+    //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
+    //   - Recurrent state: restores from backup + tape replay for accepted tokens
+    // This replaces the manual seq_rm/seq_cp + tape_replay sequence
+    LLAMA_API void llama_dflash_rollback(
+            struct llama_context * ctx,
+            llama_seq_id           seq_backup,
+            int                    n_past_before,
+            int                    n_accepted);
+
+    // DFlash: set cross-attention data (fused target hidden states for drafter)
+    // data: float[n_embd * n_tokens], n_embd: feature dimension, n_tokens: context length
+    LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
+
+    // DFlash: share tok_embd and output tensors from src model to dst model
+    // Used to avoid duplicating embedding/lm_head weights between target and drafter
+    LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
     //
     // backend sampling API [EXPERIMENTAL]

@@ -523,6 +523,10 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // DFlash drafter fusion layer
+    struct ggml_tensor * dflash_fc          = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+
     // classifier
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;

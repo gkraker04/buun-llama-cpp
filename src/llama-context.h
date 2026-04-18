@@ -10,7 +10,10 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
+
+struct llama_memory_recurrent;
 
 struct llama_model;
 class llama_batch_allocr;
@@ -30,6 +33,52 @@ struct llama_memory_breakdown_data {
 
     size_t total() const {
         return model + context + compute;
+    }
+};
+
+// DFlash: hidden state buffer for captured layer activations
+struct dflash_layer_hidden_buf {
+    std::vector<float> data;
+    int64_t n_embd = 0;
+    int64_t n_tokens = 0;
+};
+
+// DFlash: tape recording data for one recurrent layer
+struct dflash_tape_layer {
+    std::vector<float> k;          // [S_k * H_k * n_tokens] after l2_norm
+    std::vector<float> v;          // [S_v * H_v * n_tokens]
+    std::vector<float> gate;       // [H_v * n_tokens] pre-exp
+    std::vector<float> beta;       // [H_v * n_tokens] pre-sigmoid
+    std::vector<float> qkv_mixed;  // [conv_channels * n_tokens] for conv state rebuild
+    int64_t S_k = 0, H_k = 0, S_v = 0, H_v = 0;
+    int64_t conv_channels = 0;
+    int n_tokens = 0;
+};
+
+// DFlash: eval callback data for hidden state capture + tape recording
+struct dflash_capture_data {
+    // hidden state capture (for drafter conditioning)
+    std::vector<int32_t> layer_ids;           // layer indices to capture
+    std::vector<std::string> tensor_names;    // pre-formatted "l_out-{id}" names
+    std::vector<dflash_layer_hidden_buf> * hiddens;  // pointer to context's layer_hiddens
+
+    // tape recording (for DeltaNet state rollback)
+    bool tape_enabled = false;
+    std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
+    std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
+    std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer
+
+    // persistent GPU buffer for tape replay (avoids per-call alloc/free)
+    ggml_backend_buffer_t replay_buf = nullptr;
+    size_t replay_buf_size = 0;
+
+    // S2: pre-allocated zeros buffer for Q input (avoids per-call alloc+zero)
+    std::vector<float> replay_zeros;
+
+    ~dflash_capture_data() {
+        if (replay_buf) {
+            ggml_backend_buffer_free(replay_buf);
+        }
     }
 };
 
@@ -234,6 +283,28 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // DFlash hidden state accessors
+    float * get_layer_hidden(int slot);
+    int64_t get_layer_hidden_n_tokens(int slot) const;
+    int64_t get_layer_hidden_n_embd(int slot) const;
+    int32_t get_n_layer_hiddens() const;
+
+    // DFlash: configure hidden state capture layers
+    void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+
+    // DFlash: enable/disable tape recording for DeltaNet state rollback
+    void set_tape_recording(bool enable);
+
+    // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
+    void tape_replay(int n_accepted);
+    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+
+    // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
+    void dflash_rollback(llama_seq_id seq_backup, int n_past_before, int n_accepted);
+
+    // DFlash: set cross data for drafter context
+    void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -294,6 +365,11 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // DFlash: captured hidden states from target model layers
+    std::vector<dflash_layer_hidden_buf> layer_hiddens;
+
+    std::unique_ptr<dflash_capture_data> dflash_capture;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

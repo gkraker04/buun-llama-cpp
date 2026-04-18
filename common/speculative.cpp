@@ -31,7 +31,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
     COMMON_SPECULATIVE_TYPE_SUFFIX,
     COMMON_SPECULATIVE_TYPE_COPYSPEC,
-    COMMON_SPECULATIVE_TYPE_RECYCLE
+    COMMON_SPECULATIVE_TYPE_RECYCLE,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -45,7 +46,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
     {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC},
-    {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE}
+    {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -1046,6 +1048,223 @@ struct common_speculative_state_recycle : public common_speculative_state {
     }
 };
 
+// DFlash block-diffusion speculative decoding
+// Uses an external drafter model conditioned on target hidden states via KV injection
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context * ctx_tgt;
+    llama_context * ctx_dft;
+    llama_model   * model_dft;
+
+    int block_size;
+    llama_token mask_token_id;
+    int n_target_layers;
+    int n_embd;
+    int n_target_features;
+
+    // accumulated fused target hidden states [n_embd, committed_len] per capture slot
+    // we store raw hidden states per layer, then concatenate on demand
+    std::vector<std::vector<float>> hidden_per_layer; // [n_target_layers][n_embd * committed_len]
+    int committed_len = 0;
+
+    // S3: cached interleaved concat_hidden — only new tokens get interleaved on each call
+    std::vector<float> cached_concat;
+    int cached_concat_len = 0; // how many tokens are already interleaved in cached_concat
+
+    // A2: sliding window limit for drafter context (0 = unlimited)
+    static constexpr int ctx_window = 512;
+
+    llama_batch batch_dft;
+
+    common_speculative_state_dflash(
+            llama_context * ctx_tgt_,
+            llama_context * ctx_dft_,
+            llama_model   * model_dft_)
+        : common_speculative_state(COMMON_SPECULATIVE_TYPE_DFLASH)
+        , ctx_tgt(ctx_tgt_)
+        , ctx_dft(ctx_dft_)
+        , model_dft(model_dft_)
+    {
+        block_size        = llama_model_dflash_block_size(model_dft_);
+        mask_token_id     = (llama_token) llama_model_dflash_mask_token_id(model_dft_);
+        n_target_layers   = llama_model_dflash_n_target_layers(model_dft_);
+        n_embd            = llama_model_n_embd(model_dft_);
+        n_target_features = llama_model_dflash_n_target_features(model_dft_);
+
+        hidden_per_layer.resize(n_target_layers);
+
+        // tok_embd/output sharing must happen BEFORE context creation
+        // (done in speculative-simple.cpp before common_speculative_init)
+
+        // configure target context to capture hidden states
+        std::vector<int32_t> capture_layers(n_target_layers);
+        llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
+        llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
+
+        batch_dft = llama_batch_init(block_size, 0, 1);
+
+        LOG_INF("dflash: block_size=%d, mask_token=%d, n_target_layers=%d, n_embd=%d\n",
+                block_size, mask_token_id, n_target_layers, n_embd);
+    }
+
+    ~common_speculative_state_dflash() override {
+        llama_batch_free(batch_dft);
+        llama_free(ctx_dft);
+    }
+
+    // called after initial prefill — extract hidden states from target
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+        capture_target_hiddens();
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        GGML_UNUSED(prompt_tgt);
+
+        const int n_draft = std::min(block_size - 1, params.n_max);
+        if (committed_len == 0) {
+            return;
+        }
+
+        const int64_t t0 = ggml_time_us();
+
+        // S3: incrementally update cached interleaved concat_hidden
+        // only interleave tokens from cached_concat_len..committed_len
+        if (cached_concat_len < committed_len) {
+            cached_concat.resize((size_t)n_target_features * committed_len);
+            for (int layer = 0; layer < n_target_layers; ++layer) {
+                for (int t = cached_concat_len; t < committed_len; ++t) {
+                    memcpy(&cached_concat[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                           &hidden_per_layer[layer][(size_t)t * n_embd],
+                           n_embd * sizeof(float));
+                }
+            }
+            cached_concat_len = committed_len;
+        }
+
+        // A2: sliding window — limit context to last ctx_window tokens
+        const float * cross_data = cached_concat.data();
+        int cross_len = committed_len;
+        if (ctx_window > 0 && committed_len > ctx_window) {
+            cross_data = cached_concat.data() + (size_t)(committed_len - ctx_window) * n_target_features;
+            cross_len = ctx_window;
+        }
+
+        const int64_t t1 = ggml_time_us();
+
+        // set cross data on drafter context
+        llama_set_cross_data(ctx_dft, cross_data, n_target_features, cross_len);
+
+        // build drafter batch: [id_last, mask, mask, ..., mask]
+        // positions are relative to the context window fed to the drafter
+        common_batch_clear(batch_dft);
+        common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
+        for (int i = 1; i < block_size; ++i) {
+            common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
+        }
+
+        const int64_t t2 = ggml_time_us();
+
+        // run drafter forward pass
+        int ret = llama_decode(ctx_dft, batch_dft);
+        if (ret != 0) {
+            LOG_ERR("dflash: drafter decode failed with %d\n", ret);
+            return;
+        }
+
+        const int64_t t3 = ggml_time_us();
+
+        // read logits and argmax for positions 1..block_size-1 (skip position 0 = staged_first)
+        {
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
+                float * logits = llama_get_logits_ith(ctx_dft, i);
+                if (!logits) {
+                    break;
+                }
+                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                result.push_back(best);
+            }
+        }
+
+        const int64_t t4 = ggml_time_us();
+
+        LOG_INF("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+                committed_len,
+                (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+
+    // called after target verification decode — capture and append new hidden states
+    void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(batch_tokens);
+        // n_accepted includes the bonus token: [id_last, draft0, ..., draftN-1] → accepted count
+        // the verification batch had (1 + n_draft) tokens
+        // only the first n_accepted tokens' hidden states should be kept
+        append_target_hiddens(n_accepted);
+    }
+
+private:
+    // called after initial prefill — grab all hidden states
+    void capture_target_hiddens() {
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        if (n_slots == 0) {
+            return;
+        }
+
+        int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
+        if (n_tokens <= 0) {
+            return;
+        }
+
+        // replace hidden state cache entirely (initial capture)
+        committed_len = (int) n_tokens;
+        cached_concat_len = 0; // invalidate incremental cache
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+
+            hidden_per_layer[layer].resize(embd * ntok);
+            if (data) {
+                memcpy(hidden_per_layer[layer].data(), data, embd * ntok * sizeof(float));
+            }
+        }
+    }
+
+    // called after each verification decode — append only the accepted tokens' hidden states
+    void append_target_hiddens(int n_accepted) {
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        if (n_slots == 0 || n_accepted <= 0) {
+            return;
+        }
+
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+
+            if (!data || ntok <= 0) continue;
+
+            // only keep the first n_accepted tokens from this batch
+            int n_to_append = std::min(n_accepted, (int) ntok);
+
+            size_t old_size = hidden_per_layer[layer].size();
+            hidden_per_layer[layer].resize(old_size + embd * n_to_append);
+            memcpy(hidden_per_layer[layer].data() + old_size, data, embd * n_to_append * sizeof(float));
+        }
+
+        committed_len += n_accepted;
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls;
     common_speculative_state * curr_impl = nullptr;
@@ -1174,6 +1393,12 @@ common_speculative * common_speculative_init(
         bool has_suffix        = (params.type == COMMON_SPECULATIVE_TYPE_SUFFIX);
         bool has_copyspec      = (params.type == COMMON_SPECULATIVE_TYPE_COPYSPEC);
         bool has_recycle       = (params.type == COMMON_SPECULATIVE_TYPE_RECYCLE);
+        bool has_dflash        = (params.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+
+        // DFlash uses --model-draft but is NOT a standard draft model
+        if (has_dflash) {
+            has_draft = false;
+        }
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -1216,6 +1441,9 @@ common_speculative * common_speculative_init(
         if (has_suffix) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
         }
+        if (has_dflash) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
+        }
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
@@ -1231,6 +1459,16 @@ common_speculative * common_speculative_init(
         switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                GGML_ASSERT(ctx_dft != nullptr);
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(
+                    ctx_tgt,
+                    ctx_dft,
+                    params.model_dft
+                ));
+                ctx_dft = nullptr; // ownership transferred
+                break;
+            }
             case COMMON_SPECULATIVE_TYPE_DRAFT: {
                 impls.push_back(std::make_unique<common_speculative_state_draft>(config.type,
                     /* .ctx_tgt      = */ ctx_tgt,
