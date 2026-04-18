@@ -216,6 +216,11 @@ int main(int argc, char ** argv) {
                     common_time_meas tm(t_decode1_total);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
+                // update DFlash drafter hidden states from this single-token decode
+                {
+                    llama_tokens batch_tokens = { id_last };
+                    common_speculative_update_logits(spec, ctx_tgt, batch_tokens, 1);
+                }
                 {
                     common_time_meas tm(t_sample_total);
                     llama_token t = common_sampler_sample(smpl, ctx_tgt, 0);
@@ -261,9 +266,9 @@ int main(int argc, char ** argv) {
 
                         auto it = tree.child_maps[current].find(target_token);
                         if (it != tree.child_maps[current].end()) {
-                            current = it->second; // follow to child node (1-based index = batch index)
+                            current = it->second;
                         } else {
-                            break; // bonus token — not in tree
+                            break;
                         }
                     }
                 }
@@ -389,6 +394,11 @@ int main(int argc, char ** argv) {
                     llama_decode(ctx_tgt, batch_tgt);
                     n_reeval_tokens += batch_tgt.n_tokens;
                     n_reeval_calls++;
+                }
+                // update DFlash drafter hidden states from re-eval
+                {
+                    llama_tokens reeval_tokens(prompt_tgt.begin() + (n_past - (int)ids.size()), prompt_tgt.end());
+                    common_speculative_update_logits(spec, ctx_tgt, reeval_tokens, (int)reeval_tokens.size());
                 }
                 n_past = (int)prompt_tgt.size();
             } else {
