@@ -972,18 +972,14 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cap = (dflash_capture_data *) user_data;
 
+    auto h_it = cap->hidden_name_idx.find(t->name);
+
     if (ask) {
-        // check hidden state capture targets
-        for (const auto & name : cap->tensor_names) {
-            if (strcmp(t->name, name.c_str()) == 0) {
-                return true;
-            }
+        if (h_it != cap->hidden_name_idx.end()) {
+            return true;
         }
-        // check tape recording targets
-        if (cap->tape_enabled) {
-            if (cap->tape_name_map.count(t->name)) {
-                return true;
-            }
+        if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
+            return true;
         }
         return false;
     }
@@ -991,14 +987,12 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     // ask=false: tensor data is ready, read it back
 
     // hidden state capture
-    for (size_t i = 0; i < cap->tensor_names.size(); ++i) {
-        if (strcmp(t->name, cap->tensor_names[i].c_str()) == 0) {
-            auto & buf = (*cap->hiddens)[i];
-            buf.n_embd   = t->ne[0];
-            buf.n_tokens = t->ne[1];
-            dflash_read_tensor(t, buf.data, buf.n_embd * buf.n_tokens);
-            return true;
-        }
+    if (h_it != cap->hidden_name_idx.end()) {
+        auto & buf = (*cap->hiddens)[h_it->second];
+        buf.n_embd   = t->ne[0];
+        buf.n_tokens = t->ne[1];
+        dflash_read_tensor(t, buf.data, buf.n_embd * buf.n_tokens);
+        return true;
     }
 
     // tape recording
@@ -1013,24 +1007,24 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             size_t n_elem = ggml_nelements(t);
 
             switch (type) {
-                case 0: // k_conv_predelta: [S_k, H_k, n_tokens, n_seqs]
+                case DFLASH_TAPE_K:
                     tape.S_k = t->ne[0];
                     tape.H_k = t->ne[1];
                     tape.n_tokens = (int) t->ne[2];
                     dflash_read_tensor(t, tape.k, n_elem);
                     break;
-                case 1: // v_conv_predelta: [S_v, H_v, n_tokens, n_seqs]
+                case DFLASH_TAPE_V:
                     tape.S_v = t->ne[0];
                     tape.H_v = t->ne[1];
                     dflash_read_tensor(t, tape.v, n_elem);
                     break;
-                case 2: // gate: [H_v, n_tokens, n_seqs] (3D, pre-reshape)
+                case DFLASH_TAPE_GATE:
                     dflash_read_tensor(t, tape.gate, n_elem);
                     break;
-                case 3: // beta: [1, H_v, n_tokens, n_seqs] (pre-sigmoid)
+                case DFLASH_TAPE_BETA:
                     dflash_read_tensor(t, tape.beta, n_elem);
                     break;
-                case 4: // qkv_mixed_pretranspose: [conv_channels, n_tokens, n_seqs] (contiguous)
+                case DFLASH_TAPE_QKV:
                     tape.conv_channels = t->ne[0];
                     dflash_read_tensor(t, tape.qkv_mixed, n_elem);
                     break;
@@ -1056,7 +1050,9 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
 
     for (int32_t i = 0; i < n_layers; ++i) {
         dflash_capture->layer_ids.push_back(layer_ids[i]);
-        dflash_capture->tensor_names.push_back("l_out-" + std::to_string(layer_ids[i]));
+        std::string name = "l_out-" + std::to_string(layer_ids[i]);
+        dflash_capture->hidden_name_idx[name] = i;
+        dflash_capture->tensor_names.push_back(std::move(name));
     }
 
     // install our eval callback (replaces any existing one)
@@ -1080,11 +1076,11 @@ void llama_context::set_tape_recording(bool enable) {
                 dflash_capture->recurrent_layer_ids.push_back(il);
 
                 std::string il_str = std::to_string(il);
-                dflash_capture->tape_name_map["k_conv_predelta-" + il_str]      = {idx, 0};
-                dflash_capture->tape_name_map["v_conv_predelta-" + il_str]      = {idx, 1};
-                dflash_capture->tape_name_map["gate-" + il_str]                 = {idx, 2};
-                dflash_capture->tape_name_map["beta-" + il_str]                 = {idx, 3};
-                dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, 4};
+                dflash_capture->tape_name_map["k_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_K};
+                dflash_capture->tape_name_map["v_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_V};
+                dflash_capture->tape_name_map["gate-" + il_str]                   = {idx, DFLASH_TAPE_GATE};
+                dflash_capture->tape_name_map["beta-" + il_str]                   = {idx, DFLASH_TAPE_BETA};
+                dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, DFLASH_TAPE_QKV};
             }
         }
         dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
@@ -1359,8 +1355,6 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
         std::vector<float> state(n_embd_s);
         ggml_backend_tensor_get(s_tensor, state.data(), s_offset, n_embd_s * sizeof(float));
 
-        std::vector<float> sk(S);
-
         for (int tok = 0; tok < n_accepted; ++tok) {
             for (int64_t hv = 0; hv < H_v; ++hv) {
                 int64_t hk = hv / head_ratio;
@@ -1434,10 +1428,11 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     cross.n_embd    = n_embd;
     cross.n_enc     = bucket;
     cross.n_enc_real = n_tokens;  // actual data length (used by input setter)
-    cross.v_embd.assign(n_embd * bucket, 0.0f);  // zero-fill padding
+    cross.v_embd.resize(n_embd * bucket);
     if (data) {
         memcpy(cross.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
     }
+    // padding beyond n_tokens is masked with -inf in set_input, no need to zero-fill
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {

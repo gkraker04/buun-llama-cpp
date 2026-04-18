@@ -55,11 +55,20 @@ struct dflash_tape_layer {
     int n_tokens = 0;
 };
 
+enum dflash_tape_type {
+    DFLASH_TAPE_K    = 0,
+    DFLASH_TAPE_V    = 1,
+    DFLASH_TAPE_GATE = 2,
+    DFLASH_TAPE_BETA = 3,
+    DFLASH_TAPE_QKV  = 4,
+};
+
 // DFlash: eval callback data for hidden state capture + tape recording
 struct dflash_capture_data {
     // hidden state capture (for drafter conditioning)
     std::vector<int32_t> layer_ids;           // layer indices to capture
     std::vector<std::string> tensor_names;    // pre-formatted "l_out-{id}" names
+    std::unordered_map<std::string, size_t> hidden_name_idx; // name → index for O(1) lookup
     std::vector<dflash_layer_hidden_buf> * hiddens;  // pointer to context's layer_hiddens
 
     // tape recording (for DeltaNet state rollback)
