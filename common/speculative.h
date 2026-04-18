@@ -16,6 +16,7 @@ struct common_speculative_tree {
     std::vector<std::unordered_map<llama_token, int>> child_maps; // [n_nodes+1] token → child node index (1-based)
     std::vector<uint8_t>     visibility; // [(n_nodes+1)²] row-major: visibility[i*(n+1)+j] = node i can attend to node j
     int n_nodes = 0;
+    int main_path_len = 0; // number of main-path nodes (indices 1..main_path_len in batch)
 };
 
 // comma separated list of all types

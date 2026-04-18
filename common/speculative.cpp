@@ -1324,25 +1324,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
             }
         }
 
-        // build tree via max-heap on cumulative log-probability
-        struct heap_entry {
-            float neg_logw; // negated for min-heap → max by logw
-            int parent_idx; // parent node index (0 = virtual root)
-            int depth;      // 1-based depth
-            int rank;       // rank within position's top-K
-            float logw;     // cumulative log-probability
-
-            bool operator>(const heap_entry & o) const { return neg_logw > o.neg_logw; }
-        };
-
-        std::priority_queue<heap_entry, std::vector<heap_entry>, std::greater<heap_entry>> heap;
-
-        // seed with top-1 at depth 1
-        if (depth_limit > 0 && topk > 0) {
-            float lw = top_log_probs[0][0];
-            heap.push({ -lw, 0, 1, 0, lw });
-        }
-
+        // build tree: main path first (top-1 at each depth), then branches via heap
+        // main path comes first in node order so DeltaNet processes it before branches
         tree.tokens.clear();
         tree.parents.clear();
         tree.depths.clear();
@@ -1352,35 +1335,82 @@ struct common_speculative_state_dflash : public common_speculative_state {
         tree.parents.push_back(-1); // root parent
         tree.child_maps.push_back({}); // root child_map
         tree.n_nodes = 0;
+        tree.main_path_len = 0;
 
-        while (!heap.empty() && tree.n_nodes < tree_budget) {
-            auto entry = heap.top();
-            heap.pop();
+        // phase 1: lay down the full main path (top-1 at each depth)
+        {
+            float cum_logw = 0.0f;
+            int parent = 0; // virtual root
+            for (int d = 1; d <= depth_limit && topk > 0 && tree.n_nodes < tree_budget; ++d) {
+                llama_token token_id = top_token_ids[d - 1][0];
+                cum_logw += top_log_probs[d - 1][0];
 
-            int depth = entry.depth;
-            int rank  = entry.rank;
+                int current_idx = tree.n_nodes + 1;
+                tree.tokens.push_back(token_id);
+                tree.parents.push_back(parent);
+                tree.depths.push_back(d);
+                tree.child_maps.push_back({});
+                tree.child_maps[parent][token_id] = current_idx;
+                tree.n_nodes++;
 
-            llama_token token_id = top_token_ids[depth - 1][rank];
-            int current_idx = tree.n_nodes + 1; // 1-based (0 = root)
+                parent = current_idx;
+            }
+            tree.main_path_len = tree.n_nodes;
+        }
 
-            tree.tokens.push_back(token_id);
-            tree.parents.push_back(entry.parent_idx);
-            tree.depths.push_back(depth);
-            tree.child_maps.push_back({});
-            tree.child_maps[entry.parent_idx][token_id] = current_idx;
-            tree.n_nodes++;
+        // phase 2: add branch nodes via heap (remaining budget)
+        if (tree.n_nodes < tree_budget && topk > 1) {
+            struct heap_entry {
+                float neg_logw;
+                int parent_idx;
+                int depth;
+                int rank;
+                float logw;
 
-            // push sibling (same depth, next rank)
-            if (rank + 1 < topk) {
-                float sib_logw = entry.logw - top_log_probs[depth - 1][rank]
-                                            + top_log_probs[depth - 1][rank + 1];
-                heap.push({ -sib_logw, entry.parent_idx, depth, rank + 1, sib_logw });
+                bool operator>(const heap_entry & o) const { return neg_logw > o.neg_logw; }
+            };
+
+            std::priority_queue<heap_entry, std::vector<heap_entry>, std::greater<heap_entry>> heap;
+
+            // seed heap with rank-1 siblings at each main-path node
+            float cum_logw = 0.0f;
+            for (int d = 1; d <= tree.main_path_len; ++d) {
+                cum_logw += top_log_probs[d - 1][0];
+                // sibling: same depth, rank 1, same parent as main-path node at depth d
+                int mp_parent = tree.parents[d]; // parent of main-path node d (1-based)
+                float sib_logw = cum_logw - top_log_probs[d - 1][0] + top_log_probs[d - 1][1];
+                heap.push({ -sib_logw, mp_parent, d, 1, sib_logw });
             }
 
-            // push child (depth+1, rank 0)
-            if (depth < depth_limit) {
-                float child_logw = entry.logw + top_log_probs[depth][0];
-                heap.push({ -child_logw, current_idx, depth + 1, 0, child_logw });
+            while (!heap.empty() && tree.n_nodes < tree_budget) {
+                auto entry = heap.top();
+                heap.pop();
+
+                int depth = entry.depth;
+                int rank  = entry.rank;
+
+                llama_token token_id = top_token_ids[depth - 1][rank];
+                int current_idx = tree.n_nodes + 1;
+
+                tree.tokens.push_back(token_id);
+                tree.parents.push_back(entry.parent_idx);
+                tree.depths.push_back(depth);
+                tree.child_maps.push_back({});
+                tree.child_maps[entry.parent_idx][token_id] = current_idx;
+                tree.n_nodes++;
+
+                // push next sibling (same depth, rank+1)
+                if (rank + 1 < topk) {
+                    float sib_logw = entry.logw - top_log_probs[depth - 1][rank]
+                                                + top_log_probs[depth - 1][rank + 1];
+                    heap.push({ -sib_logw, entry.parent_idx, depth, rank + 1, sib_logw });
+                }
+
+                // push child (depth+1, rank 0) — branch continuation
+                if (depth < depth_limit) {
+                    float child_logw = entry.logw + top_log_probs[depth][0];
+                    heap.push({ -child_logw, current_idx, depth + 1, 0, child_logw });
+                }
             }
         }
 
@@ -1398,8 +1428,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         const int64_t t1 = ggml_time_us();
-        LOG_INF("ddtree: built tree with %d nodes (budget %d) in %.1fms\n",
-                tree.n_nodes, tree_budget, (t1 - t0) / 1e3);
+        LOG_INF("ddtree: built tree with %d nodes (%d main + %d branch, budget %d) in %.1fms\n",
+                tree.n_nodes, tree.main_path_len, tree.n_nodes - tree.main_path_len,
+                tree_budget, (t1 - t0) / 1e3);
 
         GGML_UNUSED(prompt_tgt);
     }
