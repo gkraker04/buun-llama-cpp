@@ -63,6 +63,13 @@ enum dflash_tape_type {
     DFLASH_TAPE_QKV  = 4,
 };
 
+// DDTree: tree attention mask for verification
+struct llama_tree_mask {
+    bool active = false;
+    int n_tree_tokens = 0;         // number of tree tokens (root + nodes)
+    std::vector<uint8_t> visibility;  // [n² row-major] true = can attend
+};
+
 // DFlash: eval callback data for hidden state capture + tape recording
 struct dflash_capture_data {
     // hidden state capture (for drafter conditioning)
@@ -314,6 +321,10 @@ public:
     // DFlash: set cross data for drafter context
     void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // DDTree: set/clear tree attention mask for verification
+    void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
+    void clear_tree_mask();
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -379,6 +390,9 @@ private:
     std::vector<dflash_layer_hidden_buf> layer_hiddens;
 
     std::unique_ptr<dflash_capture_data> dflash_capture;
+
+    // DDTree: tree attention mask (set before verification decode, cleared after)
+    llama_tree_mask tree_mask;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

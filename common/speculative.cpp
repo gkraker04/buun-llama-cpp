@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <queue>
 #include <unordered_map>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -151,6 +152,41 @@ struct common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & result) = 0;
+
+    virtual void draft_tree(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            int tree_budget,
+            common_speculative_tree & tree) {
+        // default: flat draft, no tree
+        llama_tokens result;
+        draft(params, prompt_tgt, id_last, result);
+        tree.n_nodes = (int)result.size();
+        tree.tokens = std::move(result);
+        tree.parents.resize(tree.n_nodes + 1);
+        tree.parents[0] = -1;
+        for (int i = 0; i < tree.n_nodes; ++i) {
+            tree.parents[i + 1] = i; // linear chain
+            tree.depths.push_back(i + 1);
+        }
+        // build child_maps + visibility for linear chain
+        tree.child_maps.resize(tree.n_nodes + 1);
+        for (int i = 0; i < tree.n_nodes; ++i) {
+            tree.child_maps[i][tree.tokens[i]] = i + 1;
+        }
+        int n = tree.n_nodes + 1;
+        tree.visibility.assign(n * n, false);
+        for (int i = 0; i < n; ++i) {
+            // each node sees itself and all ancestors
+            int cur = i;
+            while (cur >= 0) {
+                tree.visibility[i * n + cur] = true;
+                cur = tree.parents[cur];
+            }
+        }
+        GGML_UNUSED(tree_budget);
+    }
 
     virtual void accept(uint16_t n_accepted) = 0;
 
@@ -1201,6 +1237,173 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_UNUSED(n_accepted);
     }
 
+    void draft_tree(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            int tree_budget,
+            common_speculative_tree & tree) override {
+        const int n_draft = std::min((int) params.n_max, block_size - 1);
+        if (n_draft <= 0 || committed_len == 0) {
+            return;
+        }
+
+        // run drafter forward pass (same as flat draft)
+        // --- begin shared draft setup ---
+        const int64_t t0 = ggml_time_us();
+
+        if (cached_concat_len < committed_len) {
+            cached_concat.resize((size_t)n_target_features * committed_len);
+            for (int layer = 0; layer < n_target_layers; ++layer) {
+                for (int t = cached_concat_len; t < committed_len; ++t) {
+                    memcpy(&cached_concat[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                           &hidden_per_layer[layer][(size_t)t * n_embd],
+                           n_embd * sizeof(float));
+                }
+            }
+            cached_concat_len = committed_len;
+        }
+
+        const float * cross_data = cached_concat.data();
+        int cross_len = committed_len;
+        if (ctx_window > 0 && committed_len > ctx_window) {
+            cross_data = cached_concat.data() + (size_t)(committed_len - ctx_window) * n_target_features;
+            cross_len = ctx_window;
+        }
+
+        llama_set_cross_data(ctx_dft, cross_data, n_target_features, cross_len);
+
+        common_batch_clear(batch_dft);
+        common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
+        for (int i = 1; i < block_size; ++i) {
+            common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
+        }
+
+        int ret = llama_decode(ctx_dft, batch_dft);
+        if (ret != 0) {
+            LOG_ERR("dflash: drafter decode failed with %d\n", ret);
+            return;
+        }
+        // --- end shared draft setup ---
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+        const int draft_horizon = std::min(n_draft, block_size - 1);
+        const int topk = std::min(tree_budget, n_vocab);
+        const int depth_limit = draft_horizon;
+
+        // collect top-K log-probs at each position
+        // top_log_probs[pos][rank], top_token_ids[pos][rank]
+        std::vector<std::vector<float>>       top_log_probs(depth_limit);
+        std::vector<std::vector<llama_token>> top_token_ids(depth_limit);
+
+        std::vector<std::pair<float, llama_token>> scored(n_vocab);
+
+        for (int pos = 0; pos < depth_limit; ++pos) {
+            float * logits = llama_get_logits_ith(ctx_dft, pos + 1); // pos+1 because batch[0] = id_last
+            if (!logits) break;
+
+            for (int v = 0; v < n_vocab; ++v) {
+                scored[v] = { logits[v], (llama_token)v };
+            }
+            std::partial_sort(scored.begin(), scored.begin() + topk, scored.end(),
+                [](const auto & a, const auto & b) { return a.first > b.first; });
+
+            // log-sum-exp for normalization
+            float max_val = scored[0].first;
+            float sum_exp = 0.0f;
+            for (int v = 0; v < n_vocab; ++v) {
+                sum_exp += expf(logits[v] - max_val);
+            }
+            float log_z = max_val + logf(sum_exp);
+
+            top_log_probs[pos].resize(topk);
+            top_token_ids[pos].resize(topk);
+            for (int k = 0; k < topk; ++k) {
+                top_log_probs[pos][k] = scored[k].first - log_z;
+                top_token_ids[pos][k] = scored[k].second;
+            }
+        }
+
+        // build tree via max-heap on cumulative log-probability
+        struct heap_entry {
+            float neg_logw; // negated for min-heap → max by logw
+            int parent_idx; // parent node index (0 = virtual root)
+            int depth;      // 1-based depth
+            int rank;       // rank within position's top-K
+            float logw;     // cumulative log-probability
+
+            bool operator>(const heap_entry & o) const { return neg_logw > o.neg_logw; }
+        };
+
+        std::priority_queue<heap_entry, std::vector<heap_entry>, std::greater<heap_entry>> heap;
+
+        // seed with top-1 at depth 1
+        if (depth_limit > 0 && topk > 0) {
+            float lw = top_log_probs[0][0];
+            heap.push({ -lw, 0, 1, 0, lw });
+        }
+
+        tree.tokens.clear();
+        tree.parents.clear();
+        tree.depths.clear();
+        tree.child_maps.clear();
+        tree.visibility.clear();
+
+        tree.parents.push_back(-1); // root parent
+        tree.child_maps.push_back({}); // root child_map
+        tree.n_nodes = 0;
+
+        while (!heap.empty() && tree.n_nodes < tree_budget) {
+            auto entry = heap.top();
+            heap.pop();
+
+            int depth = entry.depth;
+            int rank  = entry.rank;
+
+            llama_token token_id = top_token_ids[depth - 1][rank];
+            int current_idx = tree.n_nodes + 1; // 1-based (0 = root)
+
+            tree.tokens.push_back(token_id);
+            tree.parents.push_back(entry.parent_idx);
+            tree.depths.push_back(depth);
+            tree.child_maps.push_back({});
+            tree.child_maps[entry.parent_idx][token_id] = current_idx;
+            tree.n_nodes++;
+
+            // push sibling (same depth, next rank)
+            if (rank + 1 < topk) {
+                float sib_logw = entry.logw - top_log_probs[depth - 1][rank]
+                                            + top_log_probs[depth - 1][rank + 1];
+                heap.push({ -sib_logw, entry.parent_idx, depth, rank + 1, sib_logw });
+            }
+
+            // push child (depth+1, rank 0)
+            if (depth < depth_limit) {
+                float child_logw = entry.logw + top_log_probs[depth][0];
+                heap.push({ -child_logw, current_idx, depth + 1, 0, child_logw });
+            }
+        }
+
+        // build visibility matrix [(n_nodes+1) × (n_nodes+1)]
+        int n = tree.n_nodes + 1;
+        tree.visibility.assign(n * n, false);
+        tree.visibility[0] = true; // root sees itself
+        for (int i = 1; i < n; ++i) {
+            int parent = tree.parents[i];
+            // inherit parent's visibility row
+            for (int j = 0; j < i; ++j) {
+                tree.visibility[i * n + j] = tree.visibility[parent * n + j];
+            }
+            tree.visibility[i * n + i] = true; // see itself
+        }
+
+        const int64_t t1 = ggml_time_us();
+        LOG_INF("ddtree: built tree with %d nodes (budget %d) in %.1fms\n",
+                tree.n_nodes, tree_budget, (t1 - t0) / 1e3);
+
+        GGML_UNUSED(prompt_tgt);
+    }
+
     // called after target verification decode — capture and append new hidden states
     void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
         GGML_UNUSED(ctx);
@@ -1616,6 +1819,34 @@ llama_tokens common_speculative_draft(
     }
 
     return result;
+}
+
+common_speculative_tree common_speculative_draft_tree(
+        common_speculative * spec,
+        const common_params_speculative & params,
+        const llama_tokens & prompt_tgt,
+        llama_token id_last,
+        int tree_budget) {
+    common_speculative_tree tree;
+
+    spec->curr_impl = nullptr;
+
+    for (auto & impl : spec->impls) {
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft_tree(params, prompt_tgt, id_last, tree_budget, tree);
+            impl->n_call_draft++;
+        }
+
+        if (tree.n_nodes > 0) {
+            spec->curr_impl = impl.get();
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += tree.n_nodes;
+            break;
+        }
+    }
+
+    return tree;
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {

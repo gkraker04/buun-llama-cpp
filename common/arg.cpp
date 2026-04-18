@@ -3439,6 +3439,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
+        {"--tree-budget"}, "N",
+        string_format("DDTree node budget for tree verification (default: %d, 0 = flat)", params.speculative.tree_budget),
+        [](common_params & params, int value) {
+            params.speculative.tree_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
+    add_opt(common_arg(
         {"--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.p_split),
         [](common_params & params, const std::string & value) {

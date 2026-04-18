@@ -1071,6 +1071,14 @@ extern "C" {
     // data: float[n_embd * n_tokens], n_embd: feature dimension, n_tokens: context length
     LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // DDTree: set tree attention mask for verification decode
+    // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend
+    // n_tree_tokens: number of tokens in the tree batch (root + nodes)
+    LLAMA_API void llama_set_tree_mask(struct llama_context * ctx, const uint8_t * visibility, int n_tree_tokens);
+
+    // DDTree: clear tree attention mask after verification
+    LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+
     // DFlash: share tok_embd and output tensors from src model to dst model
     // Used to avoid duplicating embedding/lm_head weights between target and drafter
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);

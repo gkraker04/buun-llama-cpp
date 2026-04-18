@@ -1435,6 +1435,19 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     // padding beyond n_tokens is masked with -inf in set_input, no need to zero-fill
 }
 
+void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens) {
+    tree_mask.active = true;
+    tree_mask.n_tree_tokens = n_tree_tokens;
+    int n2 = n_tree_tokens * n_tree_tokens;
+    tree_mask.visibility.assign(visibility, visibility + n2);
+}
+
+void llama_context::clear_tree_mask() {
+    tree_mask.active = false;
+    tree_mask.n_tree_tokens = 0;
+    tree_mask.visibility.clear();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -2741,6 +2754,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3734,6 +3748,14 @@ void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_backup, int n_p
 
 void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {
     ctx->set_cross_data(data, n_embd, n_tokens);
+}
+
+void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {
+    ctx->set_tree_mask(visibility, n_tree_tokens);
+}
+
+void llama_clear_tree_mask(llama_context * ctx) {
+    ctx->clear_tree_mask();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

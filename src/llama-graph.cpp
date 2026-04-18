@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-cparams.h"
 
 #include "llama-kv-cache.h"
@@ -448,6 +449,27 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // DDTree: overwrite the tree×tree block of the attention mask with the visibility matrix
+    if (tree_mask && tree_mask->active) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+
+        float   * mask_data = (float *)   self_kq_mask->data;
+        int64_t * k_idxs    = (int64_t *) self_k_idxs->data;
+
+        const int n = tree_mask->n_tree_tokens;
+        const int64_t n_kv = self_kq_mask->ne[0];
+
+        GGML_ASSERT((int) ubatch->n_tokens == n);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                if (!tree_mask->visibility[i * n + j]) {
+                    mask_data[i * n_kv + k_idxs[j]] = -INFINITY;
+                }
+            }
+        }
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -946,6 +968,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    tree_mask        (params.tree_mask),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2069,9 +2092,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const llama_tree_mask * tree_mask = nullptr) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur, tree_mask);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2092,7 +2116,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, tree_mask);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -2583,7 +2607,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), tree_mask);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

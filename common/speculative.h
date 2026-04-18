@@ -3,7 +3,20 @@
 #include "llama.h"
 #include "common.h"
 
+#include <unordered_map>
+#include <vector>
+
 struct common_speculative;
+
+// DDTree: tree of likely continuations built from draft logits
+struct common_speculative_tree {
+    std::vector<llama_token> tokens;   // [n_nodes] tree node tokens (topological order)
+    std::vector<int32_t>     parents;  // [n_nodes+1] parent index (-1 for root, 0-based for nodes)
+    std::vector<int32_t>     depths;   // [n_nodes] depth (1-based: root's children = 1)
+    std::vector<std::unordered_map<llama_token, int>> child_maps; // [n_nodes+1] token → child node index (1-based)
+    std::vector<uint8_t>     visibility; // [(n_nodes+1)²] row-major: visibility[i*(n+1)+j] = node i can attend to node j
+    int n_nodes = 0;
+};
 
 // comma separated list of all types
 std::string common_speculative_type_name_str();
@@ -39,6 +52,15 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // update implementations with logits from the verification decode
 void common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+
+// DDTree: build a tree of likely continuations from draft logits
+// tree_budget: max tree nodes (0 = flat DFlash, >0 = DDTree)
+common_speculative_tree common_speculative_draft_tree(
+                     common_speculative * spec,
+        const common_params_speculative & params,
+                     const llama_tokens & prompt,
+                            llama_token   id_last,
+                                    int   tree_budget);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
