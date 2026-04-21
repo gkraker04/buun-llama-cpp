@@ -451,6 +451,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     // DDTree: overwrite the tree×tree block of the attention mask with the visibility matrix
+    // Sets BOTH allow (0) and block (-inf) to fully override seq_id-based masking
     if (tree_mask && tree_mask->active) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
 
@@ -464,9 +465,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < n; ++j) {
-                if (!tree_mask->visibility[i * n + j]) {
-                    mask_data[i * n_kv + k_idxs[j]] = -INFINITY;
-                }
+                float val = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
+                mask_data[i * n_kv + k_idxs[j]] = val;
             }
         }
     }

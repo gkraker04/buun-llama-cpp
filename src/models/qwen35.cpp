@@ -266,8 +266,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 &&
                              n_seq_tokens <= ggml_nelements(tree_parent_ids));
 
-    // Update convolution state cache (skip in tree mode — rollback handles it)
-    if (!tree_mode) {
+    // Update convolution state cache
+    // Note: in tree mode with linear parents, last d_conv-1 columns are correct.
+    // For actual tree branches, tree_rollback will overwrite with correct state.
+    {
         ggml_tensor * last_conv_states =
             ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
                          conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
@@ -287,7 +289,6 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
 
     ggml_tensor * conv_output_proper;
     if (tree_mode) {
-        // Tree-mode conv: follows parent pointers for convolution window (fuses silu)
         conv_output_proper = ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids);
         cb(conv_output_proper, "conv_output_tree", il);
     } else {
@@ -399,13 +400,11 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states (skip in tree mode — rollback handles it)
-    if (!tree_mode) {
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
-    }
+    // Update the recurrent states (tree_rollback will overwrite if needed)
+    ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, new_state,
+                ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

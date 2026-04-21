@@ -51,6 +51,9 @@ struct llama_cparams {
     // DFlash: drafter sampling temperature (0 = greedy argmax, >0 = Gumbel sampling)
     float dflash_sample_temp = 0.0f;
 
+    // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
+    int dflash_topk = 1;
+
     // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync)
     dflash_tape_gpu * tape_gpu = nullptr;
 

@@ -324,6 +324,7 @@ struct common_params_speculative {
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
     float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
+    int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
 
     // ngram-based speculative decoding
 

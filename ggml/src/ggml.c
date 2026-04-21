@@ -2552,6 +2552,33 @@ struct ggml_tensor * ggml_argmax_ext(
     return result;
 }
 
+// ggml_topk_ext
+
+struct ggml_tensor * ggml_topk_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        float                 temp,
+        uint64_t              seed) {
+    GGML_ASSERT(ggml_is_matrix(a));
+    GGML_ASSERT(a->ne[0] <= INT32_MAX);
+    GGML_ASSERT(k >= 1 && k <= 64);
+
+    // output [2*K*nrows] I32: first K*nrows = token IDs, second K*nrows = log-probs as float bits
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * k * a->ne[1]);
+
+    result->op     = GGML_OP_ARGMAX;
+    result->src[0] = a;
+
+    // op_params[0] = temp, op_params[1..2] = seed, op_params[3] = K
+    ggml_set_op_params_f32(result, 0, temp);
+    ggml_set_op_params_i32(result, 1, (int32_t)(seed & 0xFFFFFFFF));
+    ggml_set_op_params_i32(result, 2, (int32_t)(seed >> 32));
+    ggml_set_op_params_i32(result, 3, (int32_t)k);
+
+    return result;
+}
+
 // ggml_count_equal
 
 struct ggml_tensor * ggml_count_equal(

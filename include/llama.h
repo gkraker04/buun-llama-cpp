@@ -1012,11 +1012,13 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
-    // Get GPU-computed argmax of logits for all output positions.
-    // Returns array of n token IDs, or NULL if not available.
+    // Get GPU-computed argmax/topk of logits for all output positions.
+    // Returns array of K*n token IDs (row-major: pos0_tok0..pos0_tokK-1, pos1_tok0...), or NULL.
     LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);
     LLAMA_API int32_t   llama_get_logits_argmax_n(struct llama_context * ctx);
-    // Log-probabilities of argmax tokens (available when dflash_sample_temp > 0).
+    // K value: how many candidates per position (1 = argmax, >1 = top-K)
+    LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
+    // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
 
     // Get all output token embeddings.
@@ -1056,6 +1058,9 @@ extern "C" {
     // DFlash: set drafter sampling temperature (Gumbel-max trick)
     // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
     LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);
+
+    // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
+    LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
 
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)

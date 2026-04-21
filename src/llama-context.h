@@ -178,7 +178,8 @@ struct llama_context {
 
     int32_t * get_logits_argmax();
     int32_t   get_logits_argmax_n();
-    float   * get_logits_argmax_probs();  // log-probs of argmax tokens (when temp > 0)
+    int32_t   get_logits_argmax_k();
+    float   * get_logits_argmax_probs();  // log-probs of top-K tokens (when temp > 0)
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -348,6 +349,7 @@ public:
     // DFlash: configure hidden state capture layers
     void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
     void set_dflash_sample_temp(float temp);
+    void set_dflash_topk(int k);
 
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
@@ -418,10 +420,11 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
-    // GPU argmax results (1-dimensional: [n_outputs])
+    // GPU argmax/topk results (1-dimensional: [K * n_outputs])
     std::vector<int32_t> logits_argmax_buf;
-    std::vector<float>   logits_argmax_prob_buf;  // log-probs of argmax tokens (when temp > 0)
+    std::vector<float>   logits_argmax_prob_buf;  // log-probs of top-K tokens (when temp > 0)
     int32_t logits_argmax_count = 0;
+    int32_t logits_argmax_k = 1;  // K value (1 = argmax, >1 = top-K)
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

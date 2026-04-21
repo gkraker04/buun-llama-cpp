@@ -1224,14 +1224,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int n_embd;
     int n_target_features;
 
-    // accumulated fused target hidden states [n_embd, committed_len] per capture slot
-    // we store raw hidden states per layer, then concatenate on demand
-    std::vector<std::vector<float>> hidden_per_layer; // [n_target_layers][n_embd * committed_len]
-    int committed_len = 0;
+    // Ring buffer for target hidden states — fixed memory regardless of context length
+    // Stores last RING_SIZE tokens per layer in circular fashion
+    static constexpr int RING_SIZE = 4096;
 
-    // S3: cached interleaved concat_hidden — only new tokens get interleaved on each call
-    std::vector<float> cached_concat;
-    int cached_concat_len = 0; // how many tokens are already interleaved in cached_concat
+    // ring_buf[layer][slot * n_embd ... (slot+1) * n_embd - 1], slot = pos % RING_SIZE
+    std::vector<std::vector<float>> ring_buf; // [n_target_layers][RING_SIZE * n_embd]
+    int ring_write_pos = 0;    // next write slot (0..RING_SIZE-1)
+    int ring_filled = 0;       // how many valid slots (0..RING_SIZE)
+    int committed_len = 0;     // total tokens committed (unbounded counter)
+
+    // Interleaved cross-attention buffer — rebuilt from ring on each draft call
+    // Only holds ctx_window tokens worth of data
+    std::vector<float> cross_buf;
 
     // A2: sliding window limit for drafter context (0 = unlimited)
     static constexpr int ctx_window = 512;
@@ -1253,7 +1258,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
         n_embd            = llama_model_n_embd(model_dft_);
         n_target_features = llama_model_dflash_n_target_features(model_dft_);
 
-        hidden_per_layer.resize(n_target_layers);
+        ring_buf.resize(n_target_layers);
+        for (int i = 0; i < n_target_layers; ++i) {
+            ring_buf[i].resize((size_t)RING_SIZE * n_embd, 0.0f);
+        }
 
         // tok_embd/output sharing must happen BEFORE context creation
         // (done in speculative-simple.cpp before common_speculative_init)
@@ -1295,32 +1303,27 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t0 = ggml_time_us();
 
-        // S3: incrementally update cached interleaved concat_hidden
-        // only interleave tokens from cached_concat_len..committed_len
-        if (cached_concat_len < committed_len) {
-            cached_concat.resize((size_t)n_target_features * committed_len);
-            for (int layer = 0; layer < n_target_layers; ++layer) {
-                for (int t = cached_concat_len; t < committed_len; ++t) {
-                    memcpy(&cached_concat[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
-                           &hidden_per_layer[layer][(size_t)t * n_embd],
-                           n_embd * sizeof(float));
-                }
-            }
-            cached_concat_len = committed_len;
-        }
+        // Build interleaved cross-attention buffer from ring
+        // Only extract last ctx_window tokens (or all available if fewer)
+        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
+        cross_buf.resize((size_t)n_target_features * cross_len);
 
-        // A2: sliding window — limit context to last ctx_window tokens
-        const float * cross_data = cached_concat.data();
-        int cross_len = committed_len;
-        if (ctx_window > 0 && committed_len > ctx_window) {
-            cross_data = cached_concat.data() + (size_t)(committed_len - ctx_window) * n_target_features;
-            cross_len = ctx_window;
+        // Read position: start reading (cross_len) tokens back from ring_write_pos
+        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
+
+        for (int t = 0; t < cross_len; ++t) {
+            int slot = (read_start + t) % RING_SIZE;
+            for (int layer = 0; layer < n_target_layers; ++layer) {
+                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                       ring_buf[layer].data() + (size_t)slot * n_embd,
+                       n_embd * sizeof(float));
+            }
         }
 
         const int64_t t1 = ggml_time_us();
 
         // set cross data on drafter context
-        llama_set_cross_data(ctx_dft, cross_data, n_target_features, cross_len);
+        llama_set_cross_data(ctx_dft, cross_buf.data(), n_target_features, cross_len);
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
         // positions are relative to the context window fed to the drafter
@@ -1398,24 +1401,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // --- begin shared draft setup ---
         const int64_t t0 = ggml_time_us();
 
-        if (cached_concat_len < committed_len) {
-            cached_concat.resize((size_t)n_target_features * committed_len);
+        // Build interleaved cross-attention buffer from ring
+        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
+        cross_buf.resize((size_t)n_target_features * cross_len);
+
+        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
+        for (int t = 0; t < cross_len; ++t) {
+            int slot = (read_start + t) % RING_SIZE;
             for (int layer = 0; layer < n_target_layers; ++layer) {
-                for (int t = cached_concat_len; t < committed_len; ++t) {
-                    memcpy(&cached_concat[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
-                           &hidden_per_layer[layer][(size_t)t * n_embd],
-                           n_embd * sizeof(float));
-                }
+                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                       ring_buf[layer].data() + (size_t)slot * n_embd,
+                       n_embd * sizeof(float));
             }
-            cached_concat_len = committed_len;
         }
 
-        const float * cross_data = cached_concat.data();
-        int cross_len = committed_len;
-        if (ctx_window > 0 && committed_len > ctx_window) {
-            cross_data = cached_concat.data() + (size_t)(committed_len - ctx_window) * n_target_features;
-            cross_len = ctx_window;
-        }
+        const float * cross_data = cross_buf.data();
 
         llama_set_cross_data(ctx_dft, cross_data, n_target_features, cross_len);
 
@@ -1432,46 +1432,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
         // --- end shared draft setup ---
 
-        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
         const int draft_horizon = std::min(n_draft, block_size - 1);
-        const int topk = std::min(tree_budget, n_vocab);
         const int depth_limit = draft_horizon;
 
-        // collect top-K log-probs at each position
-        // top_log_probs[pos][rank], top_token_ids[pos][rank]
-        std::vector<std::vector<float>>       top_log_probs(depth_limit);
-        std::vector<std::vector<llama_token>> top_token_ids(depth_limit);
-
-        std::vector<std::pair<float, llama_token>> scored(n_vocab);
-
-        for (int pos = 0; pos < depth_limit; ++pos) {
-            float * logits = llama_get_logits_ith(ctx_dft, pos + 1); // pos+1 because batch[0] = id_last
-            if (!logits) break;
-
-            for (int v = 0; v < n_vocab; ++v) {
-                scored[v] = { logits[v], (llama_token)v };
-            }
-            std::partial_sort(scored.begin(), scored.begin() + topk, scored.end(),
-                [](const auto & a, const auto & b) { return a.first > b.first; });
-
-            // log-sum-exp for normalization
-            float max_val = scored[0].first;
-            float sum_exp = 0.0f;
-            for (int v = 0; v < n_vocab; ++v) {
-                sum_exp += expf(logits[v] - max_val);
-            }
-            float log_z = max_val + logf(sum_exp);
-
-            top_log_probs[pos].resize(topk);
-            top_token_ids[pos].resize(topk);
-            for (int k = 0; k < topk; ++k) {
-                top_log_probs[pos][k] = scored[k].first - log_z;
-                top_token_ids[pos][k] = scored[k].second;
-            }
+        // Use GPU argmax/topk for tree building
+        int32_t * argmax = llama_get_logits_argmax(ctx_dft);
+        if (!argmax) {
+            LOG_ERR("draft_tree: no GPU argmax available\n");
+            return;
         }
+        const int K = llama_get_logits_argmax_k(ctx_dft);
+        GGML_UNUSED(llama_get_logits_argmax_probs(ctx_dft)); // available for log-prob branch scoring
 
-        // build tree: main path first (top-1 at each depth), then branches via heap
-        // main path comes first in node order so DeltaNet processes it before branches
+        // Build tree from GPU top-K tokens
         tree.tokens.clear();
         tree.parents.clear();
         tree.depths.clear();
@@ -1483,13 +1456,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         tree.n_nodes = 0;
         tree.main_path_len = 0;
 
-        // phase 1: lay down the full main path (top-1 at each depth)
+        // Main path: top-1 (argmax) at each depth
         {
-            float cum_logw = 0.0f;
-            int parent = 0; // virtual root
-            for (int d = 1; d <= depth_limit && topk > 0 && tree.n_nodes < tree_budget; ++d) {
-                llama_token token_id = top_token_ids[d - 1][0];
-                cum_logw += top_log_probs[d - 1][0];
+            int parent = 0;
+            for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
+                llama_token token_id = (llama_token) argmax[d * K]; // first of K candidates at batch pos d
 
                 int current_idx = tree.n_nodes + 1;
                 tree.tokens.push_back(token_id);
@@ -1504,59 +1475,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
             tree.main_path_len = tree.n_nodes;
         }
 
-        // phase 2: add branch nodes via heap (remaining budget)
-        if (tree.n_nodes < tree_budget && topk > 1) {
-            struct heap_entry {
-                float neg_logw;
-                int parent_idx;
-                int depth;
-                int rank;
-                float logw;
+        // Phase 2: branching — add alternative candidates from top-K at each depth
+        if (K > 1 && tree.n_nodes < tree_budget) {
+            // Walk main path, at each depth add K-1 branches (siblings)
+            int main_parent = 0;
+            for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
+                for (int ki = 1; ki < K && tree.n_nodes < tree_budget; ++ki) {
+                    llama_token alt_token = (llama_token) argmax[d * K + ki];
+                    if (alt_token < 0) continue; // invalid slot
 
-                bool operator>(const heap_entry & o) const { return neg_logw > o.neg_logw; }
-            };
+                    // skip if same as main path token at this depth
+                    if (tree.child_maps[main_parent].count(alt_token)) continue;
 
-            std::priority_queue<heap_entry, std::vector<heap_entry>, std::greater<heap_entry>> heap;
-
-            // seed heap with rank-1 siblings at each main-path node
-            float cum_logw = 0.0f;
-            for (int d = 1; d <= tree.main_path_len; ++d) {
-                cum_logw += top_log_probs[d - 1][0];
-                // sibling: same depth, rank 1, same parent as main-path node at depth d
-                int mp_parent = tree.parents[d]; // parent of main-path node d (1-based)
-                float sib_logw = cum_logw - top_log_probs[d - 1][0] + top_log_probs[d - 1][1];
-                heap.push({ -sib_logw, mp_parent, d, 1, sib_logw });
-            }
-
-            while (!heap.empty() && tree.n_nodes < tree_budget) {
-                auto entry = heap.top();
-                heap.pop();
-
-                int depth = entry.depth;
-                int rank  = entry.rank;
-
-                llama_token token_id = top_token_ids[depth - 1][rank];
-                int current_idx = tree.n_nodes + 1;
-
-                tree.tokens.push_back(token_id);
-                tree.parents.push_back(entry.parent_idx);
-                tree.depths.push_back(depth);
-                tree.child_maps.push_back({});
-                tree.child_maps[entry.parent_idx][token_id] = current_idx;
-                tree.n_nodes++;
-
-                // push next sibling (same depth, rank+1)
-                if (rank + 1 < topk) {
-                    float sib_logw = entry.logw - top_log_probs[depth - 1][rank]
-                                                + top_log_probs[depth - 1][rank + 1];
-                    heap.push({ -sib_logw, entry.parent_idx, depth, rank + 1, sib_logw });
+                    int current_idx = tree.n_nodes + 1;
+                    tree.tokens.push_back(alt_token);
+                    tree.parents.push_back(main_parent);
+                    tree.depths.push_back(d);
+                    tree.child_maps.push_back({});
+                    tree.child_maps[main_parent][alt_token] = current_idx;
+                    tree.n_nodes++;
                 }
-
-                // push child (depth+1, rank 0) — branch continuation
-                if (depth < depth_limit) {
-                    float child_logw = entry.logw + top_log_probs[depth][0];
-                    heap.push({ -child_logw, current_idx, depth + 1, 0, child_logw });
-                }
+                // advance main_parent along main path
+                main_parent = d; // main path nodes are 1-indexed sequentially
             }
         }
 
@@ -1592,6 +1532,27 @@ struct common_speculative_state_dflash : public common_speculative_state {
     }
 
 private:
+    // write n_tokens into ring buffer from captured hidden states
+    void ring_write(int n_tokens) {
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if (!data || ntok <= 0) continue;
+
+            int to_write = std::min(n_tokens, (int)ntok);
+            for (int t = 0; t < to_write; ++t) {
+                int slot = (ring_write_pos + t) % RING_SIZE;
+                memcpy(ring_buf[layer].data() + (size_t)slot * embd,
+                       data + (size_t)t * embd,
+                       embd * sizeof(float));
+            }
+        }
+        ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
+        ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
+    }
+
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
@@ -1604,19 +1565,35 @@ private:
             return;
         }
 
-        // replace hidden state cache entirely (initial capture)
-        committed_len = (int) n_tokens;
-        cached_concat_len = 0; // invalidate incremental cache
+        // For initial prefill, only keep last RING_SIZE tokens
+        // (or all if fewer than RING_SIZE)
+        int start_offset = 0;
+        int to_store = (int)n_tokens;
+        if (to_store > RING_SIZE) {
+            start_offset = to_store - RING_SIZE;
+            to_store = RING_SIZE;
+        }
+
+        ring_write_pos = 0;
+        ring_filled = 0;
+
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if (!data || ntok <= 0) continue;
 
-            hidden_per_layer[layer].resize(embd * ntok);
-            if (data) {
-                memcpy(hidden_per_layer[layer].data(), data, embd * ntok * sizeof(float));
+            for (int t = 0; t < to_store; ++t) {
+                int slot = t % RING_SIZE;
+                memcpy(ring_buf[layer].data() + (size_t)slot * embd,
+                       data + (size_t)(start_offset + t) * embd,
+                       embd * sizeof(float));
             }
         }
+
+        ring_write_pos = to_store % RING_SIZE;
+        ring_filled = to_store;
+        committed_len = (int)n_tokens;
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
@@ -1626,21 +1603,7 @@ private:
             return;
         }
 
-        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
-            float * data = llama_get_layer_hidden(ctx_tgt, layer);
-            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
-            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
-
-            if (!data || ntok <= 0) continue;
-
-            // only keep the first n_accepted tokens from this batch
-            int n_to_append = std::min(n_accepted, (int) ntok);
-
-            size_t old_size = hidden_per_layer[layer].size();
-            hidden_per_layer[layer].resize(old_size + embd * n_to_append);
-            memcpy(hidden_per_layer[layer].data() + old_size, data, embd * n_to_append * sizeof(float));
-        }
-
+        ring_write(n_accepted);
         committed_len += n_accepted;
     }
 };
@@ -1758,6 +1721,15 @@ common_speculative * common_speculative_init(
             LOG_ERR("%s", "failed to create draft context\n");
             return nullptr;
         }
+        // Set topk/temp BEFORE first decode (graph reservation caches topology on K=1 shape,
+        // but we need to invalidate so the actual decode rebuilds with correct K)
+        if (params.draft_topk > 1) {
+            llama_set_dflash_topk(ctx_dft, params.draft_topk);
+            LOG_INF("dflash: top-K=%d enabled for tree branching\n", params.draft_topk);
+        }
+        if (params.sample_temp > 0.0f) {
+            llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
+        }
     }
 
     // Compute the implementations to use based on the config and their order of preference
@@ -1844,10 +1816,7 @@ common_speculative * common_speculative_init(
                 break;
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
                 GGML_ASSERT(ctx_dft != nullptr);
-                if (params.sample_temp > 0.0f) {
-                    llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
-                    LOG_INF("dflash: Gumbel sampling enabled (temp=%.2f)\n", params.sample_temp);
-                }
+                // topk and temp already set on ctx_dft above (before impls loop)
                 impls.push_back(std::make_unique<common_speculative_state_dflash>(
                     ctx_tgt,
                     ctx_dft,

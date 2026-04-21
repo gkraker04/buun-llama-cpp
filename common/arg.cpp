@@ -3446,6 +3446,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
     add_opt(common_arg(
+        {"--draft-topk"}, "N",
+        string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
+        [](common_params & params, int value) {
+            params.speculative.draft_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_TOPK"));
+    add_opt(common_arg(
         {"--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.p_split),
         [](common_params & params, const std::string & value) {

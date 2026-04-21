@@ -1060,6 +1060,17 @@ extern "C" {
             float                 temp,
             uint64_t              seed);
 
+    // top-K with temperature scaling and Gumbel noise
+    // output: [2*K*nrows] I32 — first K*nrows = token IDs (sorted by score desc),
+    //         second K*nrows = log-probs as float bits
+    // K candidates per row, row-major: row0_tok0, row0_tok1, ..., row0_tokK-1, row1_tok0, ...
+    GGML_API struct ggml_tensor * ggml_topk_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            float                 temp,
+            uint64_t              seed);
+
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
             struct ggml_context * ctx,

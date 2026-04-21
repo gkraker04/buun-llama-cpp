@@ -138,8 +138,12 @@ int main(int argc, char ** argv) {
     llama_context * ctx_tgt = NULL;
 
     // speculative decoding with recurrent/hybrid models needs seq_backup=1 for state rollback
-    if (params.n_parallel < 2) {
-        params.n_parallel = 2;
+    // DDTree additionally needs seq_branch=2 for branch KV entries
+    {
+        const int min_seqs = (params.speculative.tree_budget > 0) ? 3 : 2;
+        if (params.n_parallel < min_seqs) {
+            params.n_parallel = min_seqs;
+        }
     }
 
     // load the target model
@@ -160,8 +164,8 @@ int main(int argc, char ** argv) {
 
         params_dft.n_parallel   = 1;
         // DFlash drafter uses sliding window (ctx_window=512) at runtime.
-        // Default n_ctx to 544 (512 + block_size) to avoid reserving for n_ctx_train (131072).
-        params_dft.n_ctx        = params_spec.n_ctx > 0 ? params_spec.n_ctx : 544;
+        // n_ctx only affects graph reservation size; 256 keeps compute buffer small.
+        params_dft.n_ctx        = params_spec.n_ctx > 0 ? params_spec.n_ctx : 256;
         // drafter only processes block_size tokens per call — keep batch small to save VRAM
         params_dft.n_batch      = std::min((int32_t)64, params_dft.n_ctx);
         params_dft.n_ubatch     = params_dft.n_batch;
@@ -187,8 +191,14 @@ int main(int argc, char ** argv) {
         params.speculative.model_dft = model_dft.get();
         params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
 
+        // Auto-detect DFlash from model architecture
+        if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+            LOG_INF("auto-detected DFlash drafter (block_size=%d)\n", llama_model_dflash_block_size(model_dft.get()));
+        }
+
         // DFlash: share tok_embd/output from target BEFORE creating drafter context
-        // This avoids allocating huge placeholder tensors during graph reservation
         if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
             llama_model_share_tensors(model_dft.get(), model_tgt);
         }
@@ -230,11 +240,9 @@ int main(int argc, char ** argv) {
 
     // hybrid models with recurrent layers need state management after partial rejection
     const bool needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
-    // GPU tape replay: runs GDN ops on GPU with state views (zero-copy), uploads only tape data (~24MB).
-    // Bit-identical to forward pass. Falls back to CPU replay if no GPU backend.
-    const bool use_tape_replay = true;
     // backup sequence ID for saving recurrent state before speculative batches
     const llama_seq_id seq_backup = 1;
+    const llama_seq_id seq_branch = 2; // DDTree: branch tokens separate from main chain
 
     // ================================================
     // everything until here is standard initialization
@@ -300,6 +308,7 @@ int main(int argc, char ** argv) {
         LOG_INF("rejection sampling enabled (temp=%.2f)\n", sample_temp);
     }
 
+
     while (true) {
         n_iters++;
 
@@ -310,6 +319,7 @@ int main(int argc, char ** argv) {
         bool accepted_on_main_path = true;
         common_speculative_tree tree;
         int commit_n = 0;
+        std::vector<int32_t> linear_parents;
 
         if (tree_budget > 0) {
             // === DDTree path: single-pass tree-structured speculative decoding ===
@@ -339,16 +349,19 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // Single-pass tree verify: batch ALL tree nodes with tree mask + parent_ids
-                common_batch_add(batch_tgt, id_last, n_past, {0}, true);
+                // Main chain (chain-seed backbone) on seq_id=0, branches on seq_branch
+                // This allows cheap KV cleanup after acceptance (no re-decode needed)
+                common_batch_add(batch_tgt, id_last, n_past++, {0}, true);
                 for (int i = 0; i < tree.n_nodes; ++i) {
-                    common_batch_add(batch_tgt, tree.tokens[i], n_past + tree.depths[i], {0}, true);
+                    llama_seq_id sid = (i < tree.main_path_len) ? 0 : seq_branch;
+                    common_batch_add(batch_tgt, tree.tokens[i], n_past - 1 + tree.depths[i], {sid}, true);
                 }
 
                 n_draft_this_iter = tree.n_nodes;
                 main_path_len = tree.main_path_len;
 
                 if (needs_reeval) {
-                    llama_tape_replay_sync(ctx_tgt);
+                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
                     common_time_meas tm(t_backup_total);
                     auto * mem = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);
@@ -356,17 +369,26 @@ int main(int argc, char ** argv) {
                     has_backup = true;
                 }
 
-                // Set tree mask (attention layers) + parent_ids (DeltaNet layers)
+                // Set tree mask (attention layers) + parent_ids (tree-aware SSM kernel)
                 llama_set_tree_mask(ctx_tgt, tree.visibility.data(), tree.n_nodes + 1);
                 llama_set_tree_parent_ids(ctx_tgt, tree.parents.data(), tree.n_nodes + 1);
 
+                // Enable tape recording for conv state rollback
+                if (needs_reeval) {
+                    llama_set_tape_recording(ctx_tgt, true);
+                }
                 {
                     common_time_meas tm(t_decode1_total);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
+                if (needs_reeval) {
+                    llama_set_tape_recording(ctx_tgt, false);
+                }
 
                 llama_clear_tree_mask(ctx_tgt);
-                llama_clear_tree_parent_ids(ctx_tgt);
+                // Note: tree_parent_ids stays active until tree_rollback clears it
+
+                LOG_DBG("[iter %d] tree decode: n_nodes=%d, n_past=%d\n", n_iters, tree.n_nodes, n_past);
 
                 // Tree walk: all logits available from single pass
                 {
@@ -432,29 +454,37 @@ int main(int argc, char ** argv) {
                     draft.clear();
                 }
 
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                }
+
+                // Set linear parent_ids to trigger tree kernel (stores intermediates for fast rollback)
                 if (needs_reeval && !draft.empty()) {
                     llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
-                    common_time_meas tm(t_backup_total);
+                    const int n_batch_tokens = 1 + (int)draft.size();
+                    linear_parents.resize(n_batch_tokens);
+                    linear_parents[0] = -1; // root loads initial state
+                    for (int i = 1; i < n_batch_tokens; i++) {
+                        linear_parents[i] = i - 1;
+                    }
+                    llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
+
+                    // Take backup for rollback
                     auto * mem = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);
                     llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
                     has_backup = true;
                 }
 
-                for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
-                }
-
-                if (use_tape_replay && !draft.empty()) {
+                // Enable tape recording so GPU tape captures k/v/g/b for tape_replay
+                if (needs_reeval && !draft.empty()) {
                     llama_set_tape_recording(ctx_tgt, true);
                 }
-
                 {
                     common_time_meas tm(t_decode1_total);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
-
-                if (use_tape_replay && !draft.empty()) {
+                if (needs_reeval && !draft.empty()) {
                     llama_set_tape_recording(ctx_tgt, false);
                 }
             }
@@ -532,77 +562,80 @@ int main(int argc, char ** argv) {
 
         if (has_backup && !has_eos) {
             if (tree_budget > 0) {
-                // DDTree single-pass rollback
-                // All tree nodes were decoded in one pass. SSM state stored in intermediates.
-                const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
+                // DDTree rollback: tree_rollback for SSM state, seq_rm for KV cache
                 const int n_past_before = n_past - (int)ids.size();
-
+                const int accepted_len = (int)ids.size(); // includes bonus token
                 auto * mem = llama_get_memory(ctx_tgt);
-                if (all_accepted) {
-                    // All tree nodes on accepted path — clean up backup, trim extra KV
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    llama_memory_seq_rm(mem, 0, n_past, -1);
-                    // SSM state after full tree verify is correct (last token = commit_n)
-                    n_reeval_skipped++;
-                } else {
-                    {
-                        common_time_meas tm(t_restore_total);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    }
-                    {
-                        common_time_meas tm(t_decode2_total);
-                        llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data());
-                        n_reeval_tokens += commit_n;
-                        n_reeval_calls++;
-                    }
-                    // KV cache: keep only positions up to accepted path end
-                    int kv_keep = n_past_before + (int)ids.size();
-                    llama_memory_seq_rm(mem, 0, kv_keep, -1);
-                    n_past = (int)prompt_tgt.size();
+
+                // tree_rollback: restore SSM state from f16 intermediates + conv from tape
+                {
+                    common_time_meas tm(t_restore_total);
+                    llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data());
                 }
-            } else {
-                // Flat path rollback
-                const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
 
-                if (all_accepted) {
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    llama_memory_seq_rm(mem, 0, n_past, -1);
-                    n_reeval_skipped++;
-                } else {
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    const int n_past_before = n_past - (int)ids.size();
+                // KV cache cleanup via seq_rm (no re-decode needed)
+                {
+                    common_time_meas tm(t_decode2_total);
 
-                    if (use_tape_replay) {
-                        common_time_meas tm(t_decode2_total);
-                        llama_dflash_rollback(ctx_tgt, seq_backup, n_past_before, (int)ids.size());
-                        n_reeval_tokens += (int)ids.size();
-                        n_reeval_calls++;
+                    if (accepted_on_main_path) {
+                        // Fast path: accepted tokens are all on seq_id=0
+                        // Remove all branch KV entries
+                        llama_memory_seq_rm(mem, seq_branch, -1, -1);
+                        // Remove rejected main chain tail (keep positions through last accepted depth)
+                        llama_memory_seq_rm(mem, 0, n_past_before + accepted_len, -1);
+                        // Remove backup
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
                     } else {
-                        {
-                            common_time_meas tm(t_restore_total);
-                            llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                            llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
-                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        }
+                        // Rare: accepted path diverged onto a branch
+                        // Fall back to backup restore + re-decode for the branch tokens
+                        llama_memory_seq_rm(mem, seq_branch, -1, -1);
+                        llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                        llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+                        // Re-decode accepted tokens for KV
                         common_batch_clear(batch_tgt);
                         for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
                             common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
                         }
-
                         if (batch_tgt.n_tokens > 0) {
-                            common_time_meas tm(t_decode2_total);
                             llama_decode(ctx_tgt, batch_tgt);
                             n_reeval_tokens += batch_tgt.n_tokens;
                             n_reeval_calls++;
                         }
                     }
+                }
+                n_past = (int)prompt_tgt.size();
+            } else {
+                // Flat path rollback: tree_rollback (GPU intermediates) for SSM + conv state
+                const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
+
+                if (all_accepted) {
+                    llama_clear_tree_parent_ids(ctx_tgt);
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                    llama_memory_seq_rm(mem, 0, n_past, -1);
+                    n_reeval_skipped++;
+                } else {
+                    const int n_past_before = n_past - (int)ids.size();
+
+                    llama_clear_tree_parent_ids(ctx_tgt);
+
+                    {
+                        common_time_meas tm(t_decode2_total);
+                        llama_dflash_rollback(ctx_tgt, seq_backup, n_past_before, (int)ids.size());
+                    }
+
+                    n_reeval_tokens += (int)ids.size();
+                    n_reeval_calls++;
                     n_past = (int)prompt_tgt.size();
                 }
             }
         } else {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+            // Clear stale parent_ids if no rollback happened
+            llama_clear_tree_parent_ids(ctx_tgt);
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {

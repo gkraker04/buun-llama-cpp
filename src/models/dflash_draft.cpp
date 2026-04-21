@@ -105,7 +105,6 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // --- Embedding ---
     // tok_embd/output may be nullptr during graph reservation (shared from target at runtime)
-    // use F16 placeholder to reduce compute buffer (actual tensors are quantized, even smaller)
     ggml_tensor * tok_embd_use = model.tok_embd;
     if (!tok_embd_use) {
         tok_embd_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, model.vocab.n_tokens());
@@ -229,14 +228,16 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    // GPU argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
-    // Always use ggml_argmax_ext for consistent graph reservation (output is [2*nrows]).
-    // When dflash_sample_temp > 0: Gumbel-max sampling + log-prob output.
-    // When temp=0, seed=0: pure argmax (no noise), log-prob slot unused.
+    // GPU top-K or argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
     const float sample_temp = cparams.dflash_sample_temp;
     static std::atomic<uint64_t> gumbel_counter{1};
     const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
-    res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+    const int topk = cparams.dflash_topk;
+    if (topk > 1) {
+        res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
+    } else {
+        res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+    }
 
     ggml_build_forward_expand(gf, res->t_logits_argmax);
 }
