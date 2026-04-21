@@ -711,6 +711,11 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+
+            // DFlash: share tok_embd/output from target BEFORE creating drafter context
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_model_share_tensors(model_dft.get(), llama_get_model(ctx));
+            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -2157,6 +2162,18 @@ private:
                     slot.n_draft_total += draft.size();
 
                     if (needs_reeval) {
+                        // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
+                        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            llama_tape_replay_sync(ctx);
+                            const int n_batch_tokens = 1 + (int) draft.size();
+                            std::vector<int32_t> linear_parents(n_batch_tokens);
+                            linear_parents[0] = -1; // root loads initial state
+                            for (int i = 1; i < n_batch_tokens; i++) {
+                                linear_parents[i] = i - 1;
+                            }
+                            llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
+                        }
+
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
@@ -2752,6 +2769,14 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback)
+        const bool dflash_tape_active = needs_reeval
+            && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH
+            && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
+        if (dflash_tape_active) {
+            llama_set_tape_recording(ctx, true);
+        }
+
         int32_t i_next = 0;
 
         // process the created batch of tokens
@@ -2769,6 +2794,10 @@ private:
             };
 
             const int ret = llama_decode(ctx, batch_view);
+
+            if (dflash_tape_active) {
+                llama_set_tape_recording(ctx, false);
+            }
 
             metrics.on_decoded(slots);
 
@@ -2902,6 +2931,12 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
+                // update DFlash hidden state ring buffer with the decoded token's hidden states
+                if (slot.can_speculate()) {
+                    llama_tokens batch_tokens = { id };
+                    common_speculative_update_logits(slot.spec, ctx, batch_tokens, 1);
+                }
+
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
 
@@ -2969,36 +3004,55 @@ private:
 
                 if (slot.has_draft_backup) {
                     const llama_seq_id seq_backup = slot.id + n_parallel_user;
-                    auto * mem = llama_get_memory(ctx);
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
-                    if (all_accepted) {
-                        // All draft tokens accepted — recurrent state is already correct.
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        // DFlash: use tape replay for fast rollback (matches speculative-simple)
+                        if (all_accepted) {
+                            llama_clear_tree_parent_ids(ctx);
+                            auto * mem = llama_get_memory(ctx);
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                        } else {
+                            llama_clear_tree_parent_ids(ctx);
+                            llama_dflash_rollback(ctx, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
+                        }
                     } else {
-                        // Partial rejection — restore backup and re-decode accepted tokens.
-                        const int n_past_before = slot.n_tokens_before_draft;
+                        // Generic: backup-restore + re-decode for other speculative types
+                        auto * mem = llama_get_memory(ctx);
 
-                        llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
-                        llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        if (all_accepted) {
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                        } else {
+                            const int n_past_before = slot.n_tokens_before_draft;
 
-                        const int n_reeval = slot.prompt.n_tokens() - n_past_before;
-                        if (n_reeval > 0) {
-                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                            const auto & toks = slot.prompt.tokens.get_text_tokens();
-                            for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
-                                common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                            llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
+                            llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+                            const int n_reeval = slot.prompt.n_tokens() - n_past_before;
+                            if (n_reeval > 0) {
+                                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                                for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
+                                    common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                                }
+                                llama_decode(ctx, batch_reeval);
+                                llama_batch_free(batch_reeval);
                             }
-                            llama_decode(ctx, batch_reeval);
-                            llama_batch_free(batch_reeval);
                         }
                     }
 
                     slot.has_draft_backup = false;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                }
+
+                // update DFlash hidden state ring buffer with accepted tokens' hidden states
+                {
+                    llama_tokens batch_tokens = { slot.sampled };
+                    common_speculative_update_logits(slot.spec, ctx, batch_tokens, (int) ids.size());
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
