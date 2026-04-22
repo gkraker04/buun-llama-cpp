@@ -9,7 +9,10 @@ static void load_tcq_norm_alpha() {
     if (loaded) return;
     loaded = true;
     const char *s = getenv("TURBO_TCQ_ALPHA");
-    float alpha_k = 1.2f;
+    const char *sv = getenv("TURBO_TCQ_ALPHA_V");
+    if (!s && !sv) return; // use compiled-in defaults (K=1.1, V=1.3)
+    float alpha_k = 1.1f;
+    bool k_set = false;
     if (s) {
         char *end;
         errno = 0;
@@ -18,12 +21,10 @@ static void load_tcq_norm_alpha() {
             fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA='%s'\n", s);
         } else {
             alpha_k = a;
+            k_set = true;
             cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha_k, sizeof(float));
         }
     }
-    // V alpha: if TURBO_TCQ_ALPHA_V is set, use it; otherwise use same as K
-    const char *sv = getenv("TURBO_TCQ_ALPHA_V");
-    float alpha_v = alpha_k;
     if (sv) {
         char *end;
         errno = 0;
@@ -31,12 +32,15 @@ static void load_tcq_norm_alpha() {
         if (end == sv || errno != 0 || a <= 0.0f || a >= 10.0f) {
             fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA_V='%s'\n", sv);
         } else {
-            alpha_v = a;
+            cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &a, sizeof(float));
+            fprintf(stderr, "TCQ: norm alpha K=%.3f V=%.3f\n", alpha_k, a);
+            return;
         }
     }
-    cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &alpha_v, sizeof(float));
-    if (s || sv) {
-        fprintf(stderr, "TCQ: norm alpha K=%.3f V=%.3f\n", alpha_k, alpha_v);
+    // TURBO_TCQ_ALPHA set but not TURBO_TCQ_ALPHA_V: V matches K for backwards compat
+    if (k_set) {
+        cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &alpha_k, sizeof(float));
+        fprintf(stderr, "TCQ: norm alpha K=V=%.3f\n", alpha_k);
     }
 }
 

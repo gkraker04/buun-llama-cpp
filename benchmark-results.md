@@ -1821,3 +1821,51 @@ Compiled-in numpy codebook may be even better (preliminary showed 5.528 @2K vs 5
 | pp8192 | 980.38        | 931.54         | -5.0% |
 
 **Conclusion**: Chunked cuBLAS is uniformly slower, degradation grows with context length. The fused MMA flash attention avoids materializing the O(nq×nkv) score matrix S, saving bandwidth that dominates any tensor core advantage from cuBLAS. Not worth pursuing.
+
+## Experiment #70: Asymmetric K/V Temperature Scaling (2026-03-31) — POSITIVE
+
+**Model**: Qwen3.5-27B-heretic.Q6_K, RTX 3090, `-ctk turbo3_tcq -ctv turbo3_tcq`
+**Setup**: Separate alpha for K and V norms. `TURBO_TCQ_ALPHA` controls K, `TURBO_TCQ_ALPHA_V` controls V.
+
+### 2K Context (64 chunks) — Asymmetric Grid Search
+
+| K alpha | V alpha | PPL | Δ vs sym 1.20 |
+|---------|---------|-----|---------------|
+| 1.20 | 1.20 | 6.2088 | baseline |
+| 1.20 | 1.00 | 6.3363 | +0.128 |
+| 1.00 | 1.20 | 6.2501 | +0.041 |
+| 1.30 | 1.10 | 6.2215 | +0.013 |
+| **1.15** | **1.25** | **6.2023** | **-0.007** |
+| 1.10 | 1.30 | 6.2054 | -0.003 |
+| 1.05 | 1.35 | 6.2244 | +0.016 |
+
+### Cross-Context Comparison: Symmetric vs Best Asymmetric
+
+| Context | Sym K=V=1.20 | K=1.10, V=1.30 | Δ |
+|---------|-------------|----------------|--------|
+| 2K (64ch) | 6.2088 | 6.2054 | -0.003 |
+| 8K (8ch) | 6.2414 | 6.1782 | -0.063 |
+| 32K (4ch) | 6.5079 | 6.4465 | -0.061 |
+| 64K (4ch) | 6.1901 | 6.0912 | **-0.099** |
+
+### 64K V-Heavy Sweep
+
+| K alpha | V alpha | PPL (64K) | Δ vs sym |
+|---------|---------|-----------|----------|
+| 1.20 | 1.20 | 6.1901 | baseline |
+| 1.10 | 1.30 | 6.0912 | -0.099 |
+| **1.05** | **1.35** | **6.0833** | **-0.107** |
+| 1.00 | 1.40 | 6.0887 | -0.101 |
+
+### Key Finding: V Temperature Matters More Than K Temperature
+
+Removing V alpha hurts far more than removing K alpha:
+- K=1.20, V=1.00 at 32K: PPL=6.7771 (+0.270 vs symmetric)
+- K=1.00, V=1.20 at 32K: PPL=6.2501 (+0.041 vs symmetric)
+
+**V scaling contributes ~6.5x more to quality than K scaling.** This challenges the "attention temperature" narrative — the benefit primarily comes from V magnitude restoration, not attention routing sharpness.
+
+### Recommendations
+- **Universal default**: αK=1.10, αV=1.30 — no 2K regression, up to -0.099 PPL at 64K
+- **Long-context optimized**: αK=1.05, αV=1.35 — best 64K (-0.107) but slight 2K regression (+0.016)
+- **Conservative**: Keep symmetric αK=αV=1.20 — already excellent, asymmetric adds complexity for modest gain

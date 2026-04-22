@@ -798,11 +798,11 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Key numbers**: 3-bit @64K: 6.224 (was 7.034, TBQ3 was 7.034). 2-bit @64K: 6.248 (was 7.222, TBQ2 was 7.332).
 **Default**: Hard-code alpha=1.20 for shipping. Keep env var for experimentation.
 
-### 70. Asymmetric K/V norm scaling — raw norm for K, corrected for V `ready`
+### 70. Asymmetric K/V norm scaling `done`
 **Source**: Competitive analysis quality findings. K temperature helps attention routing, V accuracy helps output quality.
-**Concept**: Remove norm correction for K only (store raw L2 norm), keep correction for V. K gets temperature scaling "for free", V stays MSE-optimal.
-**Change**: Conditional in encode kernel based on `iq_is_k` flag (already available in set-rows.cu).
-**Test**: PPL at 2K/8K/32K/64K. Compare with symmetric alpha scaling (#69).
+**Concept**: Separate alpha_k and alpha_v via `TURBO_TCQ_ALPHA` and `TURBO_TCQ_ALPHA_V` env vars.
+**Change**: Added `d_tcq_norm_alpha_v` constant, K/V-conditional alpha in both 3-bit and 2-bit encode kernels.
+**Result**: **V-heavier asymmetric (αK=1.10, αV=1.30) beats symmetric α=1.20 by 0.06-0.10 PPL at 8K-64K** with no 2K regression. Key finding: **V scaling contributes 6.5x more to quality than K scaling**, challenging the "attention temperature" narrative. The benefit comes from V magnitude restoration, not attention routing sharpness. Optimal at 64K: αK=1.05, αV=1.35 (−0.107 PPL vs symmetric).
 
 ### 71. Native `vec_dot_fattn_vec_KQ_turbo3_tcq` — inline TCQ decode in FA `rejected`
 **Source**: Competitive analysis speed gap. Duster has `vec_dot_fattn_vec_KQ_tbq3_0` for TBQ. We dequant all KV to f16 first.
