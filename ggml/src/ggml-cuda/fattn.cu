@@ -213,6 +213,27 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 // During prefill (Q->ne[1] > 1), dequantize turbo K/V to fp16 temp buffers
 // and use the fast MMA kernel instead of the slower vec kernel.
 
+static __global__ void k_turbo2_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1,
+        const size_t nb1, const size_t nb2) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+
+    const char * src_row = src + head * nb2 + row * nb1;
+    const int blk_idx  = j / QK_TURBO2;
+    const int j_in_blk = j % QK_TURBO2;
+    const block_turbo2_0 * blk = (const block_turbo2_0 *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+    const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
+    const float val = d_turbo_centroids_2bit_fattn[idx] * norm;
+
+    dst[head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+}
+
 static __global__ void k_turbo3_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1,
@@ -310,18 +331,21 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool turbo_k = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
 
-    // Allocate and dequant K to fp16 (turbo3 or turbo4)
+    // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_k) {
         const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
         dim3 grid_k(K->ne[1], K->ne[2]);
-        if (K->type == GGML_TYPE_TURBO3_0) {
+        if (K->type == GGML_TYPE_TURBO2_0) {
+            k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+        } else if (K->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
         } else {
@@ -330,12 +354,15 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
-    // Allocate and dequant V to fp16 (turbo3 or turbo4)
+    // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_v) {
         const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
         dim3 grid_v(V->ne[1], V->ne[2]);
-        if (V->type == GGML_TYPE_TURBO3_0) {
+        if (V->type == GGML_TYPE_TURBO2_0) {
+            k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+        } else if (V->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
         } else {
@@ -479,26 +506,36 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -599,6 +636,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
             break;
@@ -613,7 +651,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
 
     // TurboQuant: only the vec kernel has turbo dequant support.
-    if (K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
+    if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
+        K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) {
         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)
             return BEST_FATTN_KERNEL_VEC;
@@ -734,8 +773,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
     // turbo4's QJL correction loses ~1% PPL precision in fp16 round-trip, but 2x prefill speedup
     // is worth it since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
-                          V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: Q rotation handled inside, V un-rotation at graph level
         ggml_cuda_turbo_prefill_attend(ctx, dst);
@@ -755,12 +794,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_v_decode = nullptr;
 
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TURBO3_0) {
+            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0) {
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
                 CUDA_CHECK(cudaMallocAsync(&k_fp16_dec, k_size, stream));
                 dim3 grid_k(K->ne[1], K->ne[2]);
-                k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                    (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                if (K->type == GGML_TYPE_TURBO2_0) {
+                    k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                } else {
+                    k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
                 K_f16_dec.data = k_fp16_dec;
@@ -771,12 +815,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TURBO3_0) {
+            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0) {
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
                 CUDA_CHECK(cudaMallocAsync(&v_fp16_dec, v_size, stream));
                 dim3 grid_v(V->ne[1], V->ne[2]);
-                k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                    (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                if (V->type == GGML_TYPE_TURBO2_0) {
+                    k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                } else {
+                    k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                }
                 V_f16_dec = *V;
                 V_f16_dec.type = GGML_TYPE_F16;
                 V_f16_dec.data = v_fp16_dec;
@@ -792,7 +841,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Pre-rotate Q for turbo (K/V stored in rotated space, whether turbo3 or dequanted fp16)
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
-        const bool turbo_k_any = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+        const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
         if (turbo_k_any && Q->ne[0] % 128 == 0) {
             int device;
             CUDA_CHECK(cudaGetDevice(&device));

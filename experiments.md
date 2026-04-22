@@ -130,7 +130,7 @@ Prefill pp4096 (tok/s):
 
 ---
 
-## Needs Research — Prefill Speed (mostly solved, 98.8% of q8_0)
+## Needs Research — Prefill Speed (SOLVED: 98.8% of q8_0, deprioritized)
 
 ### 12. BitDecoding-style MMA kernel with dequant pipelining
 **Status**: needs-research
@@ -179,11 +179,11 @@ Prefill pp4096 (tok/s):
 **Result**: Tested via #49 (GGML_PARALLEL_BLOCKS override). All parallel_blocks values 1-32 produce identical decode speed (~29.95 tok/s). Attention is <5% of decode time — FFN dominates. The remaining 2.8% turbo3→q8_0 gap is structural and can't be closed by attention tuning. Items 3-5 (nbatch_fa, stream_k, async softmax) also won't help since attention isn't the bottleneck.
 
 ### 18. SAS softmax optimization
-**Status**: needs-research
+**Status**: dropped — **attention <5% of decode, prefill already 98.8%**
 **Type**: speed (both)
 **Paper**: TurboAttention (Microsoft, arXiv:2412.08585)
-**What**: Decompose `exp(-x) = LUT(-x_int) * polynomial(-x_dec)`, polynomial runs on tensor cores in FP16. Independent of KV quant type.
-**Difficulty**: Medium (1 week). 5-15% improvement, orthogonal to everything else.
+**What**: Decompose `exp(-x) = LUT(-x_int) * polynomial(-x_dec)`, polynomial runs on tensor cores in FP16.
+**Finding**: 5-15% attention speedup × <5% attention share = <0.75% total throughput gain. Not worth the complexity. Prefill already at 98.8% of q8_0. Only revisit if targeting attention-heavy workloads (very long context decode on MoE models).
 
 ### 25b. Sign+magnitude encoding for turbo3 dequant
 **Status**: done — **NEUTRAL** (no measurable speedup)
@@ -211,13 +211,12 @@ Prefill pp4096 (tok/s):
 ## Needs Research — Quality Improvements
 
 ### 19. Channel reordering before FWHT
-**Status**: needs-research
+**Status**: dropped — **INCOMPATIBLE with random sign arrays**
 **Type**: quality (zero decode cost)
 **Paper**: RotateKV (IJCAI 2025, arXiv:2501.16383)
-**What**: Sort channels by outlier magnitude before applying Hadamard transform. Adapts to varying channel-wise outlier distributions without losing FWHT efficiency. Also applies pre-RoPE grouped-head rotation to smooth outliers across heads.
-**Result in paper**: <0.3 PPL degradation at 2-bit on LLaMA-2-13B, 3.97x memory reduction.
-**How it applies**: Add a learned permutation vector (one per model, computed during calibration) that reorders channels before FWHT in SET_ROWS. Inverse permutation after dequant. The permutation is just an index lookup — essentially free.
-**Difficulty**: Low (a few days). High potential quality win.
+**What**: Sort channels by magnitude so similar-magnitude channels land in the same FWHT block.
+**Research** (2026-03-27): RotateKV uses deterministic grouped-head Hadamard WITHOUT random signs. Our PolarQuant uses random sign arrays (s1, s2) that already destroy all channel magnitude structure — making reordering ineffective. Same reason GSR Walsh ordering (#39) showed no benefit. The algorithm (argsort of per-channel sum across calibration data) is simple but the prerequisite (preserved magnitude structure) doesn't hold. Code at github.com/ZunhaiSu/RotateKV. MixQuant (2601.22347) has related L1-norm balancing permutation, also assumes deterministic Hadamard.
+**Conclusion**: Would only help if we switched from random PolarQuant signs to deterministic Hadamard, which would lose the decorrelation benefit that makes our codebook work well.
 
 ### 20. ~~SmoothRot — channel-wise scaling before FWHT~~
 **Status**: dropped — **NOT APPLICABLE to KV cache**
@@ -263,12 +262,12 @@ Prefill pp4096 (tok/s):
 **Difficulty**: Low-Medium (1 week). High impact for chat/instruction-following quality.
 
 ### 24. Per-head adaptive precision
-**Status**: needs-research
+**Status**: deferred — **infra too heavy for uncertain gain**
 **Type**: quality
 **Papers**: KVC-Q (ScienceDirect 2026), KVTuner (ICML 2025), MixKVQ (arXiv:2512.19206)
-**What**: Different attention heads have different quantization sensitivity. "Retrieval heads" (sparse, peaked attention) are sensitive; "streaming heads" (diffuse attention) are robust. Allocate turbo4 to sensitive heads, turbo3 to robust ones. Same average bit rate, better quality.
-**Challenge**: Need per-head type in KV cache allocation — currently per-layer only. Significant infra change.
-**Difficulty**: High (2-3 weeks). Meaningful quality gain at same compression.
+**What**: Allocate turbo4 to sensitive heads, turbo3 to robust ones. Same average bit rate, better quality.
+**Assessment** (2026-03-27): Requires per-head type in KV cache allocation (currently per-layer only). On Qwen3.5-27B, turbo3 is already +0.22% PPL — per-head won't help. On head_dim=128 models with only 2-4 KV heads, there's barely enough heads to differentiate. The layer-adaptive modes (#8-11) already capture most of this benefit with much less complexity.
+**Difficulty**: High (2-3 weeks). Deferred until layer-adaptive is exhausted.
 
 ### 25. Drop QJL entirely (turbo3-only approach)
 **Status**: done — **QJL HELPS, do NOT drop**
@@ -289,12 +288,10 @@ Prefill pp4096 (tok/s):
 ## Needs Research — Architecture / New Formats
 
 ### 26. CommVQ — RoPE-commutative codebooks
-**Status**: needs-research
+**Status**: deferred — **fundamentally different approach, not incremental**
 **Type**: architecture
 **Paper**: CommVQ (ICML 2025, arXiv:2506.18879, Apple/UMass)
-**What**: Codebook trained via EM to commute with RoPE: `RoPE(codebook[i]) = codebook[RoPE_perm(i)]`. Eliminates need for pre-rotate-queries entirely. 87.5% KV reduction at 2-bit.
-**How it applies**: Would replace our FWHT rotation + pre-rotate-queries approach. The codebook itself handles the rotation. Eliminates the TURBO_WHT graph op and shared memory Q rotation.
-**Difficulty**: Very High. Requires EM-trained per-model codebooks, new quantization pipeline, changes to codebook storage.
+**What**: EM-trained codebooks that commute with RoPE. Elegant but requires per-model trained codebooks and new quantization pipeline. Incompatible with our universal Lloyd-Max approach. Would be a complete rewrite, not an improvement to turbo3/4.
 
 ### 27. ~~ConvRot — group rotation instead of full-dim FWHT~~
 **Status**: dropped — **failed by TheTom** (group-32 rotation: PPL 7.06 vs target 6.19)
@@ -302,24 +299,26 @@ Prefill pp4096 (tok/s):
 **What**: Replace full d=128 FWHT with group-of-32 Hadamard transforms. Tom tested this directly and it produces unacceptable PPL. Full d=128 rotation is necessary for proper decorrelation.
 
 ### 36. Temporal decay — progressive 3→2 bit requantization
-**Status**: needs-research
+**Status**: unblocked — turbo2 implemented (#28), needs per-position type tracking infra
 **Type**: quality + memory
 **Source**: TheTom/turboquant_plus/benchmarks/temporal_decay_prototype.py
-**What**: Old KV cache tokens get requantized from turbo3 (3-bit) to effective 2-bit, saving memory while keeping recent tokens at full precision. Requantization path: dequant 3-bit → re-normalize → quantize to nearest 2-bit centroid → recompute norm correction.
-**Synthetic results** (tests/temporal_decay_test.py):
-  - Cosine sim: turbo3=0.983, direct 2-bit=0.940, decay 3→2=0.940 (above 0.80 threshold)
-  - MSE: decay is 4.23x worse than turbo3, but only ~20% worse than direct 2-bit
-  - Inner product error: 1.76x worse than turbo3 (attention scores noisier but bounded)
-  - Memory savings: ~30-34% on top of turbo3's existing compression
-**Prerequisites**: Needs GGML_TYPE_TURBO2_0 (experiment #28) and per-position type tracking in KV cache
-**Difficulty**: High. Requires turbo2 type + KV cache age tracking + requantization trigger.
+**What**: Old tokens requantized turbo3→turbo2. ~30% extra memory savings.
+**Prerequisites**: GGML_TYPE_TURBO2_0 now available (#28). Still needs per-position type tracking in KV cache. turbo2 benchmark data (PPL 6.78 uniform, +8% vs f16) suggests this may only be viable for tokens >16K positions back where attention weights are negligible.
+**Updated assessment** (2026-03-27): Given turbo2's +8% uniform PPL hit, temporal decay would need to be very selective about which tokens to demote. May combine well with sparse V dequant (#51) — if attention weight is <1e-6, the requantization error doesn't matter.
 
-### 28. turbo2 (2-bit) and turbo5 (5-bit) variants
-**Status**: needs-research
-**Type**: new formats
-**What**: turbo2 = ~6x compression (aggressive, for very long contexts). turbo5 = nearly lossless. RotateKV achieves <0.3 PPL degradation at 2-bit, suggesting turbo2 is viable with channel reordering (#19).
-**Caution** (2026-03-27): "Understanding Physics of KV Cache Compression" (arXiv:2603.01426, Mar 2026) found all models hit a **hallucination safety cliff near 90% compression** (phase transition). turbo3 at 3.5 bpv = ~78% compression = safely below cliff. turbo2 at 2 bpv = ~87.5% = **right at the edge**. Will need careful PPL + downstream quality validation.
-**Difficulty**: Medium (1-2 weeks per variant).
+### 28. turbo2 (2-bit) variant
+**Status**: done — IMPLEMENTED AND TESTED
+**Type**: new format
+**What**: turbo2 = 2.5 bpv = 6.4x compression vs fp16. 2-bit PolarQuant (4-centroid Lloyd-Max), no QJL correction.
+**Results** (2026-03-27, Qwen3.5-27B head_dim=256, 4K ctx, 4 chunks):
+- turbo2 K+V: PPL 6.78 (+8.0% vs f16) — too much degradation for general use
+- turbo3-K + turbo2-V: PPL 6.57 (+4.6%) — mixed is much better
+- turbo2-K + turbo3-V: PPL 6.52 (+3.9%) — K matters more for quality
+- turbo2-K + q8_0-V: PPL 6.49 (+3.4%) — best turbo2 combo
+- Speed: identical to turbo3 (~30.6 tg128, compute-bound)
+- KV memory: 20 MiB vs 28 MiB (turbo3) vs 128 MiB (f16) at 4K
+**Conclusion**: turbo2 works but +8% PPL is too high for uniform K+V. Best use case is mixed turbo2-K/turbo3-V (3.9% gap at ~2.9 bpv average) or as part of layer-adaptive decay (#27). The 90% compression cliff warning from "Physics of KV Compression" paper was validated — turbo2 at 87.5% compression is indeed at the quality edge.
+**Difficulty**: Medium (implemented in 1 session, 22 files modified).
 
 ### 29. Blackwell native FP4/FP6 tensor cores
 **Status**: needs-research (hardware dependent)
@@ -329,10 +328,9 @@ Prefill pp4096 (tok/s):
 **Difficulty**: Medium (when targeting Blackwell). Long-term path.
 
 ### 30. Dynamic quantization switching at VRAM thresholds
-**Status**: needs-research
+**Status**: deferred — **complex, better solved by layer-adaptive modes**
 **Type**: quality + memory
-**What**: Start with q8_0, auto-switch to turbo when VRAM pressure rises. LogQuant (arXiv:2503.19950) shows attention spikes follow log distribution — recent tokens need more precision, older tokens can be compressed more aggressively. PM-KVQ explores progressive bit-width lowering per block.
-**Difficulty**: High (2-3 weeks).
+**What**: Auto-switch q8_0→turbo at VRAM pressure. Our layer-adaptive modes (#8-11) already provide the quality/compression tradeoff. Dynamic switching would add runtime complexity for marginal benefit over pre-configured layer-adaptive.
 
 ### 31. Turbo types in speculative decoding draft model
 **Status**: done — **NO PRACTICAL BENEFIT**
@@ -346,33 +344,29 @@ Prefill pp4096 (tok/s):
 **Conclusion**: turbo in speculative decoding is a non-issue. The draft KV is tiny and turbo3 doesn't affect acceptance rate.
 
 ### 32. Fused quantization in QKV projection
-**Status**: needs-research
+**Status**: deferred — **prefill already 98.8%, not worth the complexity**
 **Type**: speed (prefill)
 **Paper**: TurboAttention FlashQ (Microsoft, arXiv:2412.08585)
-**What**: Fuse turbo quantization into the QKV projection pass rather than as a separate SET_ROWS step. Avoids materializing full-precision KV before quantization.
-**Difficulty**: High. Deep integration with ggml compute graph.
+**What**: Fuse turbo quantization into the QKV projection pass rather than as a separate SET_ROWS step.
+**Finding**: SET_ROWS is already negligible vs attention+FFN compute. Prefill at 98.8% of q8_0. Deep ggml graph integration not justified.
 
 ### 33. Entropy coding for stored/offloaded caches
-**Status**: needs-research
+**Status**: deferred — **storage-only, no quality/speed impact**
 **Type**: compression (storage)
 **Paper**: KVTC (NVIDIA, ICLR 2026, arXiv:2511.01815)
-**What**: Lloyd-Max codebook indices aren't uniformly distributed — indices near zero are more common. Arithmetic/Huffman coding could save ~0.3-0.5 bits/value, pushing turbo3 from 4.9x to ~6x compression. Apply when caching to disk/CPU for prefix sharing.
-**Difficulty**: Medium (1-2 weeks). Only helps storage, not in-GPU decode.
+**What**: Arithmetic/Huffman coding on codebook indices for ~0.3-0.5 extra bits savings. Only helps disk storage/CPU offload. Revisit when prefix caching becomes a feature.
 
-### 34. Cross-layer codebook sharing
-**Status**: needs-research
+### 34. Cross-layer codebook sharing / delta coding
+**Status**: deferred — **complex dependency, uncertain benefit**
 **Type**: compression
 **Paper**: XQuant (arXiv:2510.11236)
-**What**: Exploit redundancy across layers. If FWHT normalizes distributions well enough, a single codebook works for all layers (which we already do). But cross-layer *delta coding* — encode layer N's KV as delta from layer N-1 — could push compression further.
-**Difficulty**: High. Complex dependency chain.
+**What**: We already share a single codebook across all layers. Delta coding (encode layer N as delta from N-1) would add cross-layer dependency in the critical path — bad for pipeline parallelism. The benefit is extra compression, but we're already at 3.5 bpv which is sufficient.
 
 ### 35. HCAttention — values on CPU, keys on GPU
-**Status**: needs-research
+**Status**: deferred — **major arch change, future feature**
 **Type**: memory (extreme context)
 **Paper**: HCAttention (arXiv:2507.19823)
-**What**: Keep keys on GPU for scoring, offload values to CPU, fetch only selected values (top-k attention positions). Enables 4M token context on single A100.
-**How it applies**: With turbo-compressed keys on GPU (tiny footprint), you could score against millions of cached tokens and only fetch the needed values from CPU. Extreme long-context scenario.
-**Difficulty**: Very High. Major architectural change.
+**What**: CPU-offloaded V with GPU-only K for extreme context (4M tokens). Good synergy with turbo-compressed K. Requires major architectural changes to attention pipeline.
 
 ### 37. MSE-optimal norm correction
 **Status**: done — **NEGATIVE RESULT**
@@ -415,14 +409,22 @@ Prefill pp4096 (tok/s):
 **Paper**: HadaNorm (arXiv:2506.09932, Jun 2025)
 **What**: Per-channel mean subtraction before Hadamard. Two interpretations: (a) per-token mean of 128-element group = what #22 tested (no benefit — already near-zero after L2 norm), (b) per-channel mean across tokens (requires calibration or running statistics, incompatible with per-token SET_ROWS pipeline). Same fundamental issue as #39: random sign arrays already decorrelate the distribution, making pre-centering redundant.
 
-### 41. CAT alignment correction after FWHT
-**Status**: needs-research
+### 41. CAT alignment correction / per-channel scaling
+**Status**: done — **CLOSED, theoretically cannot help**
 **Type**: quality
-**Paper**: "Dissecting Quantization Error" / CAT (arXiv:2603.04359, Mar 2026)
-**What**: Decomposes quantization error into two independent factors: (1) **concentration** (outlier spread) = what FWHT handles, (2) **alignment** (dominant variation direction match) = what FWHT does NOT handle. Proposes block Concentration-Alignment Transforms to address both.
-**How it applies**: Our FWHT rotation only solves concentration. A lightweight per-layer diagonal alignment correction after FWHT could improve quality. This is effectively the viable "diagonal approximation" of WUSH (#21) — per-channel scaling derived from calibration data that aligns the post-rotation distribution to the codebook.
-**Impact**: Could close the head_dim=128 quality gap (+2-4% PPL → closer to head_dim=256's +0.2%).
-**Difficulty**: Medium (1 week). Requires calibration pass to compute per-layer alignment factors.
+**Papers**: CAT (arXiv:2603.04359, Mar 2026), InnerQ (arXiv:2602.23200, Feb 2026)
+**What**: CAT decomposes quantization error into concentration (outlier spread, what FWHT handles) and alignment (direction match, what FWHT does NOT handle). Alignment is INVARIANT to orthogonal rotations — FWHT cannot improve it.
+**Analysis** (2026-03-27):
+Our pipeline makes CAT-style interventions ineffective:
+1. **L2 normalization** removes per-channel magnitude → all vectors unit norm
+2. **FWHT with random signs** mixes all channels → each output position ≈ i.i.d. N(0, 1/128)
+3. **Per-channel scaling before FWHT**: destroyed by mixing (FWHT is a dense linear transform)
+4. **Per-channel scaling after FWHT**: meaningless — all positions have identical distribution
+5. **Lloyd-Max codebook** is already optimal for the resulting standardized Gaussian
+6. **Norm correction** already preserves L2 norm of reconstruction (handles magnitude alignment)
+The remaining error is purely angular (codebook discretization) and cannot be reduced without more bits or a fundamentally different codebook structure. The head_dim=128 quality gap (+2-4% PPL) is a sqrt(n) noise effect in dot products — fewer dimensions means larger relative error per attention score. This is inherent to the dimensionality, not a codebook/distribution mismatch that scaling could fix.
+**Closes research line**: #19 (channel reordering), #20 (SmoothRot), #39 (GSR Walsh), #40 (HadaNorm), #41 (CAT) all fail for the same root cause — random sign arrays + FWHT already make the distribution optimally uniform.
+**Difficulty**: Low (heuristic test) to Medium (full calibration).
 
 ### 42. KVLinC asymmetric K/V rotation strategy
 **Status**: done — **NEGATIVE RESULT** (rotation helps keys too)
@@ -446,15 +448,18 @@ Prefill pp4096 (tok/s):
 **How it applies**: After FWHT rotation makes the distribution uniform, SQuat's orthogonality constraint ensures whatever residual quantization error remains is **invisible to queries**. The prompt-derived subspace can be computed once at prompt time with no ongoing cost. Could be combined with Lloyd-Max by biasing codebook selection toward codewords whose error is orthogonal to the query subspace.
 **Challenge**: O(d³) for the iterative quantization algorithm. May be too expensive for per-token SET_ROWS. A simplified version (project quantization error onto query subspace and minimize that instead of MSE) could be cheaper.
 **Difficulty**: High (2-3 weeks). Strongest theoretical backing for quality improvement.
+**Research completed 2026-03-27**: See detailed analysis in memory/reference_squat_algorithm_deep_dive.md. Code at github.com/Red-Hat-AI-Innovation-Team/SQuat. Key finding: O(d^2) per-token cost is trivial at d=128. Critical tension: FWHT rotation may destroy the low-rank query subspace structure SQuat exploits. Recommended: test Option B (block iterative update) first, measuring both rotated and unrotated Q subspace rank.
 
 ### 44. PatternKV — pattern subtraction before codebook
-**Status**: needs-research
+**Status**: research-complete — **LOW expected value** (FWHT already solves distribution flattening)
 **Type**: quality
-**Paper**: PatternKV (arXiv:2510.05176, Oct 2025)
-**What**: Mine representative "pattern vectors" online via clustering, align each KV vector to nearest pattern, quantize only the residual. Reduces dynamic range before quantization, improving codebook utilization. 2-bit competitive, 10% test-time scaling improvement, 1.4x throughput.
-**How it applies**: After FWHT rotation, subtract nearest pattern vector before Lloyd-Max quantization. Store pattern index (1-2 bits) alongside quantized residual. During dequant, add pattern back. Reduces the range our 8-entry codebook needs to cover.
-**Similarity to DeltaKV**: DeltaKV (arXiv:2602.08005, Feb 2026) independently showed >60% of KV tokens have nearest semantic matches >16 positions away. PatternKV uses a smaller, fixed set of patterns rather than DeltaKV's reference token retrieval.
-**Difficulty**: Medium (1-2 weeks). Requires pattern mining during prefill.
+**Paper**: PatternKV (arXiv:2510.05176, Oct 2025). Code: github.com/HCOOOH/PatternKV (0 stars, Llama-only Python/Triton).
+**Research** (2026-03-27): PatternKV mines 32 centroids via KMeans during prefill, subtracts nearest pattern before INT quantization of residual. CRITICAL INSIGHT: FWHT and PatternKV are COMPETING solutions to the same problem (distribution flattening). After our sign-randomized FWHT, post-rotation distribution is already ~Gaussian — patterns would capture little residual structure. INT2 PatternKV gains +1pt LongBench over KIVI; our FWHT+Lloyd-Max already achieves near-q8_0 quality at 3-bit.
+**Feasible path**: Subtract pattern before FWHT, store pre-rotated patterns for dequant. 4 patterns × 128 floats = 2KB/head. Pattern index costs 2 bits per 128-element group.
+**V has a gotcha**: 75% of V vectors benefit; the rest must skip (quality collapses without adaptive threshold).
+**Expected gain**: 0-0.5% on Qwen3.5-27B (already near-optimal), maybe 0.5-2% on head_dim=128 models.
+**DeltaKV**: Dropped — requires trained MLP compressor, Sparse-vLLM, incompatible with our approach.
+**Difficulty**: Medium. Could prototype but expected ROI is low.
 
 ### 45. Gemma-3 SWA V cache investigation
 **Status**: done — **FIXED, Gemma-3 turbo3 now works**
@@ -502,22 +507,28 @@ if (turbo_k_any && Q->ne[0] % 128 == 0) {
 **Difficulty**: High (3-4 weeks). Restructure fattn-mma to add dequant pipeline stage.
 
 ### 47. ButterflyQuant — learnable O(n log n) transforms
-**Status**: needs-research
+**Status**: dropped — **NOT APPLICABLE** (weight quant only, random signs negate benefit)
 **Type**: quality
-**Paper**: ButterflyQuant (arXiv:2509.09679, Sep 2025)
-**What**: Replace fixed Hadamard with learnable butterfly transforms parameterized by continuous Givens rotation angles. O(n log n) complexity, only n*log2(n)/2 learnable parameters. Includes uniformity regularization (KL vs Uniform) for even codebook utilization.
-**Results**: W2A16 PPL 15.4 vs Hadamard's 37.3 on LLaMA-2-7B. 128 calibration samples, converges in minutes.
-**How it applies**: Learn per-layer butterfly transforms offline. Same O(n log n) as FWHT but adapted to each layer's distribution. Store learned angles per layer (~448 params for d=128). Apply learned butterfly in SET_ROWS instead of fixed FWHT.
-**Difficulty**: Medium-High (2 weeks). Requires calibration infrastructure + per-model learned params.
+**Paper**: ButterflyQuant (arXiv:2509.09679, Sep 2025, v3 Feb 2026)
+**GitHub**: 42Shawn/Butterflyquant-llm (8 stars, README only, NO CODE)
+**What**: Replace fixed Hadamard with learnable butterfly transforms parameterized by continuous Givens rotation angles. O(n log n) complexity, n*log2(n)/2 learnable params (448 for n=128). Each butterfly stage has 64 independent Givens rotations G(theta)=[[cos,-sin],[sin,cos]] at stride 2^(i-1). Uniformity regularization KL(P_bins||Uniform) for codebook utilization. Identity init (theta=0), SGD+cosine LR, 128 WikiText-2 samples, converges in 500-700 steps on single H100.
+**Paper results**: W2A16 PPL 15.4 (ButterflyQuant) vs 16.43 (SpinQuant) vs 36.77 (GPTQ) on LLaMA-2-7B. Learned butterfly coherence 1.8-3.2e-2 per layer vs Hadamard's 1.56e-2.
+**Why dropped**: Three fundamental blockers:
+1. **Weight quant, not KV cache**: Paper optimizes rotation jointly with FIXED weight matrices. KV cache has dynamic per-token distributions — the learned rotation cannot be jointly optimized with the data it will see.
+2. **Random signs already optimal**: Our S2*H*S1 pipeline achieves coherence ~1.56e-2 (Hadamard-optimal), BETTER than ButterflyQuant's learned 1.8-3.2e-2. Same reason GSR Walsh ordering (#39) showed zero benefit — random signs decorrelate all output elements, making any structured rotation improvement moot.
+3. **No code, no KV validation**: GitHub repo is empty. Paper has zero KV cache experiments.
+**CUDA cost if implemented**: 4 FMA per butterfly pair vs 2 add/sub for FWHT (2x compute per pass). Would need 896 twiddle factors (3.5KB) in constant memory per layer. Net: slower rotation for zero quality gain.
+**Better alternative**: CAT alignment correction (#41) addresses the orthogonal "alignment" factor that our FWHT does NOT handle, rather than re-solving "concentration" that FWHT already handles optimally.
 
 ### 48. AQUA-KV — inter-layer KV prediction
-**Status**: needs-research
+**Status**: dropped — **architecturally incompatible with llama.cpp**
 **Type**: quality + compression
-**Paper**: AQUA-KV (arXiv:2501.19392, ICML 2025)
-**What**: Train compact linear predictors to predict current-layer KV from previous layer. Only store/quantize the **unpredictable residual**. 2-2.5 bits near-lossless on Llama 3.2.
-**How it applies**: Before turbo3 quantization, subtract the predicted KV from the previous layer. The residual has much lower variance, making the Lloyd-Max codebook more effective. Could halve effective bit-rate.
-**Challenge**: Requires per-model trained predictors. Adds compute for prediction in the attention path. Not compatible with layer-parallel execution.
-**Difficulty**: High (3-4 weeks). Requires training + inference path changes.
+**Paper**: AQUA-KV (arXiv:2501.19392, ICML 2025). Code: github.com/goodevening13/aquakv (19 stars, PyTorch only).
+**Research** (2026-03-27): Impressive results (2-bit near-lossless) but three fundamental conflicts:
+1. **Cross-layer dependency**: Requires dequanting layer L-1 KV to predict layer L. Our SET_ROWS quantizes each layer independently.
+2. **Pre-RoPE requirement**: Must store pre-RoPE keys, re-apply on read. We store post-RoPE.
+3. **Batch buffer model**: Accumulates 128 tokens then batch-compresses sequentially across layers. We quantize per-token.
+Would require redesigning llama.cpp's entire KV cache write path. Not worth the architectural cost when our 3-bit approach already achieves near-q8_0 quality.
 
 ### 49. Tune parallel_blocks heuristic for turbo decode
 **Status**: done — **NO EFFECT** (attention not the bottleneck)
@@ -624,3 +635,12 @@ if (turbo_k_any && Q->ne[0] % 128 == 0) {
 
 ### WUSH full transform (#21) — data-aware dense transform
 **Reason**: O(d²) per block = 18x slower than FWHT for d=128. Requires per-model calibration + per-block matrix storage (64KB/block in fp16). Diagonal approximation is the only viable path — see CAT (#41) for a cleaner version of this idea.
+
+### PatternKV (#44) — pattern subtraction before codebook quantization `needs-research`
+**Paper**: arXiv:2510.05176 (Oct 2025, v2 Jan 2026). Online k-means (32 centroids/head), subtract nearest pattern, quantize residual only.
+**Results**: +1pt LongBench at INT2 over KIVI, +2.6pt GSM8K. Only 0.08% drop at INT4. +6.6% prefill latency, +2.6% decode latency.
+**Analysis (2026-03-27)**: LOW expected benefit for turbo3/turbo4 because FWHT rotation already flattens the distribution (exactly what PatternKV targets). PatternKV operates on raw asymmetric INT quant without any rotation, so the "peaked distribution with outliers" problem it solves is already handled by our pipeline. Pattern subtraction in rotated space would require rotating patterns too, and rotated-space values are already approximately Gaussian where Lloyd-Max codebook is near-optimal. The V cache adaptive threshold (75% utilization, catastrophic without it) adds fragile complexity. Would need to operate pre-FWHT on raw vectors, but then pattern centroids are head_dim=128/256 floats that must be stored per-head per-layer (32 * 128 * 4B = 16KB/head, 40 layers * 4 heads = 2.56MB for Qwen3.5-27B -- fits in constant memory). **Verdict: unlikely to beat our existing FWHT flattening, but a simplified 4-pattern version is low-risk to prototype.**
+
+### DeltaKV (#44b) — inter-token residual compression `dropped`
+**Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
+**Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**

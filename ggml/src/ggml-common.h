@@ -292,6 +292,17 @@ typedef struct {
 } block_turbo3_0;                       // 14 bytes total
 static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
 
+// TurboQuant 2-bit: 2-bit PolarQuant indices, no QJL
+// Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
+// = 2.5 bits/value → 6.4× compression vs fp16
+#define QK_TURBO2 32
+#define QK_TURBO2_GROUP 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected vector L2 norm
+    uint8_t    qs[QK_TURBO2 / 4];      //  8 bytes: 2-bit indices (4 per byte)
+} block_turbo2_0;                       // 10 bytes total
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
+
 // TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
 // Per block: norm(fp16) + residual_norm(fp16) + 3-bit indices (48 bytes) + 1-bit signs (16 bytes)
 // = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16

@@ -12,6 +12,14 @@ static __constant__ float d_turbo_mid_3bit[7] = {
     -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f
 };
 
+// === TURBO2: 2-bit codebook (Lloyd-Max for N(0, 1/128)) ===
+static __constant__ float d_turbo_centroids_2bit[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+static __constant__ float d_turbo_mid_2bit[3] = {
+    -0.086728f, 0.0f, 0.086728f
+};
+
 // === FWHT rotation sign arrays (from turbo-wht.h, seed=42 rotation, seed=1042 QJL) ===
 static __constant__ float d_turbo_wht_signs1[128] = {
     -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f};
@@ -203,4 +211,78 @@ void dequantize_turbo4_0(const void * vx, const int64_t ib, const int iqs, float
       uint8_t idx = turbo4_unpack_3bit(x[ib].qs, j);
       float s = (x[ib].signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
       v.y = (d_turbo_centroids_3bit[idx] + s * qjl_scale) * norm; }
+}
+
+// === TURBO2: find nearest 2-bit centroid ===
+static __device__ __forceinline__
+uint8_t turbo_find_nearest_2bit(float val) {
+    if      (val < d_turbo_mid_2bit[0]) return 0;
+    else if (val < d_turbo_mid_2bit[1]) return 1;
+    else if (val < d_turbo_mid_2bit[2]) return 2;
+    else                                return 3;
+}
+
+// === TURBO2: SET_ROWS kernel ===
+template<typename idx_t>
+static __global__ void k_set_rows_turbo2(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_turbo2_0 * __restrict__ dst, const int64_t ne_total_groups,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1,  const int64_t s2,  const int64_t s3,
+        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= ne_total_groups) return;
+    const int64_t i_base = i * QK_TURBO2_GROUP;
+    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
+    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
+    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_turbo2_0 * dst_row_ptr = (block_turbo2_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
+    const int grp_idx = i00 / QK_TURBO2_GROUP;
+    const int blocks_per_group = QK_TURBO2_GROUP / QK_TURBO2;
+    float x[128]; float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
+    float grp_norm = sqrtf(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+    for (int j = 0; j < 128; j++) x[j] *= inv_norm;
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    float recon_norm_sq = 0.0f;
+    for (int b = 0; b < blocks_per_group; b++) {
+        block_turbo2_0 & blk = dst_row_ptr[grp_idx * blocks_per_group + b];
+        const int off = b * QK_TURBO2;
+        for (int j = 0; j < QK_TURBO2 / 4; j++) blk.qs[j] = 0;
+        for (int j = 0; j < QK_TURBO2; j++) {
+            uint8_t idx = turbo_find_nearest_2bit(x[off + j]);
+            blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+            float c = d_turbo_centroids_2bit[idx];
+            recon_norm_sq += c * c;
+        }
+    }
+    float recon_norm = sqrtf(recon_norm_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    for (int b = 0; b < blocks_per_group; b++) {
+        dst_row_ptr[grp_idx * blocks_per_group + b].norm = __float2half(corrected_norm);
+    }
+}
+
+// === TURBO2: GET_ROWS dequantize ===
+#define QR_TURBO2_0 2
+static __device__ __forceinline__
+void dequantize_turbo2_0(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo2_0 * x = (const block_turbo2_0 *)vx;
+    const float norm = __half2float(x[ib].norm);
+    { const int j = iqs;
+      const uint8_t idx = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
+      v.x = d_turbo_centroids_2bit[idx] * norm; }
+    { const int j = iqs + 16;
+      const uint8_t idx = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
+      v.y = d_turbo_centroids_2bit[idx] * norm; }
 }

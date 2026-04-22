@@ -560,3 +560,90 @@ turbo3 PPL verified unchanged (5.8501).
 ### CUDA 13.2 Compatibility
 Built and tested with CUDA 13.2.0 (nvcc V13.2.51). No segfault, identical results.
 Turbo3 PPL: 5.8501 (identical). Turbo4 PPL: 5.8186 (identical).
+
+## Community Report: Dual RTX 4090 (multi-GPU, unknown model)
+
+Date: 2026-03-27. First multi-GPU test after q_rot_buf per-device fix (6cdd9db87).
+
+| Config | Prefill tok/s | Decode tok/s | vs q8_0 prefill | vs q8_0 decode |
+|--------|--------------|-------------|-----------------|---------------|
+| q8_0 baseline | 5116.86 | 103.57 | 100% | 100% |
+| turbo3 | 4986.84 | 36.27 | 97.5% | 35.0% |
+| turbo4 | 2541.50 | 17.63 | 49.7% | 17.0% |
+
+**Analysis**:
+- turbo3 prefill at 97.5% of q8_0: consistent with RTX 3090 results (98.8%)
+- turbo3 decode at 35%: matches MoE decode regression pattern (Qwen3.5-35B-A3B was 37%)
+- turbo4 is exactly ~2x slower than turbo3 across both prefill and decode — unexpected
+- **Need to confirm**: what model, what context, was `-fa on` used?
+- turbo4 prefill at 49.7% suggests it may NOT be hitting the MMA prefill path (which should give ~98% like turbo3). Possible that `-fa` is off or the model triggers a non-MMA kernel path on multi-GPU.
+
+## Reproduction Test: ubergarm's Q4_0 + c512 configuration (2026-03-27)
+
+Testing exact same params as ubergarm (ik_llama.cpp#1509): Qwen3.5-35B-A3B-Q4_0, -c 512, seed 1337, -ngl 99.
+
+**Hardware**: RTX 3090 24GB (ubergarm used RTX A6000 48GB)
+
+| KV type | LA | PPL (ours) | PPL (ubergarm) | Delta |
+|---------|------|------------|----------------|-------|
+| f16 | - | 6.5776 ± 0.04194 | 6.5792 ± 0.04196 | match |
+| turbo3 | 1 | 6.6112 ± 0.04218 | 9.2400 | +0.51% vs +40.4% |
+
+**Conclusion**: Cannot reproduce. f16 baselines match perfectly, confirming identical model/dataset.
+turbo3 PPL is +0.51% on our build vs +40.4% on theirs. Issue is on their end —
+likely build config (stale cmake, missing FA, or patches applied on wrong base).
+
+## turbo2 (2-bit) Initial Results (2026-03-27)
+
+New 2-bit PolarQuant type: 10 bytes per 32 elements = 2.5 bpv (6.4x vs fp16).
+Model: Qwen3.5-27B-heretic Q6_K, head_dim=256, RTX 3090.
+
+### PPL (4K ctx, 4 chunks)
+
+| Config | PPL | vs f16 | vs q8_0 |
+|--------|-----|--------|---------|
+| f16 baseline | 6.2765 | — | — |
+| q8_0 baseline | 6.2677 | -0.14% | — |
+| turbo3 (3-bit) | 6.3252 | +0.78% | +0.92% |
+| **turbo2 (2-bit)** | **6.7792** | **+8.01%** | **+8.16%** |
+
+### Decode Speed pp512+tg64 (tok/s)
+
+| Config | pp512 | tg128 | pp512+tg64 | pp32768+tg64 |
+|--------|-------|-------|------------|--------------|
+| q8_0 | 1150.91 | 30.98 | 227.27 | 921.92 |
+| turbo3 | 1138.57 | 30.27 | 222.76 | 904.84 |
+| turbo2 | 1141.87 | 30.64 | 225.64 | 908.88 |
+
+### KV Memory (4K context, 16 KV layers)
+
+| Config | KV size | Compression vs fp16 |
+|--------|---------|---------------------|
+| f16 | 128 MiB | 1.0x |
+| q8_0 | 68 MiB | 1.9x |
+| turbo3 | 28 MiB | 4.6x |
+| turbo2 | 20 MiB | 6.4x |
+
+### Mixed K/V Configurations (4K ctx, 4 chunks)
+
+| K type | V type | PPL | vs f16 | Effective bpv |
+|--------|--------|-----|--------|---------------|
+| turbo3 | turbo2 | 6.5670 | +4.63% | ~2.9 |
+| turbo2 | turbo3 | 6.5203 | +3.88% | ~2.9 |
+| turbo2 | q8_0 | 6.4894 | +3.39% | ~5.3 |
+| q8_0 | turbo2 | 6.5490 | +4.34% | ~5.3 |
+
+### Layer-Adaptive turbo2 (4K ctx, 4 chunks)
+
+| Config | PPL | vs f16 | Notes |
+|--------|-----|--------|-------|
+| turbo2 uniform | 6.7792 | +8.01% | all 16 layers turbo2 |
+| turbo2 LA-1 | 6.7411 | +7.40% | first4+last4 = q8_0, 8 turbo2 |
+| turbo2 LA-2 | 6.6866 | +6.53% | last 8 = q8_0, 8 turbo2 |
+| (turbo3 uniform) | 6.3252 | +0.78% | reference: still much better |
+
+**Analysis**: turbo2 at 2.5 bpv has +8% PPL degradation on head_dim=256 (Qwen3.5-27B).
+This is significantly worse than turbo3's <1% gap. Speed is essentially identical to turbo3
+(both compute-bound by dequant, not memory-bound at short context on this model).
+The 6.4x compression is impressive but the quality cost is too high for general use.
+turbo2 may work better for V-only (K stays turbo3) or for extreme memory pressure scenarios.

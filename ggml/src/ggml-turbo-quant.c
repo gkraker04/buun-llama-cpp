@@ -170,6 +170,47 @@ static int nearest_centroid_3bit(float val) {
     return 7;
 }
 
+/* ---------- TURBO2_0: 2-bit PolarQuant, no QJL ---------- */
+
+void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2 == 0);
+    const int nb = k / QK_TURBO2;
+    for (int i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TURBO2; j++) norm += x[i*QK_TURBO2 + j] * x[i*QK_TURBO2 + j];
+        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+        memset(y[i].qs, 0, QK_TURBO2 / 4);
+    }
+}
+
+void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2 == 0);
+    const int nb = k / QK_TURBO2;
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO2; j++) {
+            uint8_t idx = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
+            y[block * QK_TURBO2 + j] = CENTROIDS_2BIT[idx] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO2 == 0);
+
+    size_t row_size = (n_per_row / QK_TURBO2) * sizeof(block_turbo2_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo2_0_ref(
+            src + row * n_per_row,
+            (block_turbo2_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 /* ---------- TURBO3_0: 2-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
