@@ -614,8 +614,10 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
 };
 
 // Temperature scaling for TCQ norm. alpha > 1 sharpens attention (helps long context).
-// Override via TURBO_TCQ_ALPHA env var.
+// Override via TURBO_TCQ_ALPHA (K) and TURBO_TCQ_ALPHA_V (V) env vars.
+// If TURBO_TCQ_ALPHA_V is not set, V uses the same alpha as K.
 static __constant__ float d_tcq_norm_alpha = 1.2f;
+static __constant__ float d_tcq_norm_alpha_v = 1.2f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group
@@ -775,7 +777,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         }
         float recon_norm = sqrtf(recon_norm_sq);
         float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
-        corrected_norm *= d_tcq_norm_alpha;
+        corrected_norm *= innerq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
 
         // Pack bitstream: [6 prefix bits] [out_0 (3 bits)] ... [out_127 (3 bits)]
         for (int j = 0; j < 49; j++) dst_blk->qs[j] = 0;
@@ -1013,7 +1015,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         }
         float recon_norm = sqrtf(recon_norm_sq);
         float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
-        corrected_norm *= d_tcq_norm_alpha;
+        corrected_norm *= iq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
 
         // Pack bitstream: [6 prefix bits] [out_0 (2 bits)] ... [out_127 (2 bits)]
         for (int j = 0; j < 33; j++) dst_blk->qs[j] = 0;

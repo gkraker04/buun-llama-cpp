@@ -9,16 +9,35 @@ static void load_tcq_norm_alpha() {
     if (loaded) return;
     loaded = true;
     const char *s = getenv("TURBO_TCQ_ALPHA");
-    if (!s) return;
-    char *end;
-    errno = 0;
-    float alpha = strtof(s, &end);
-    if (end == s || errno != 0 || alpha <= 0.0f || alpha >= 10.0f) {
-        fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA='%s'\n", s);
-        return;
+    float alpha_k = 1.2f;
+    if (s) {
+        char *end;
+        errno = 0;
+        float a = strtof(s, &end);
+        if (end == s || errno != 0 || a <= 0.0f || a >= 10.0f) {
+            fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA='%s'\n", s);
+        } else {
+            alpha_k = a;
+            cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha_k, sizeof(float));
+        }
     }
-    cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha, sizeof(float));
-    fprintf(stderr, "TCQ: norm alpha = %.3f\n", alpha);
+    // V alpha: if TURBO_TCQ_ALPHA_V is set, use it; otherwise use same as K
+    const char *sv = getenv("TURBO_TCQ_ALPHA_V");
+    float alpha_v = alpha_k;
+    if (sv) {
+        char *end;
+        errno = 0;
+        float a = strtof(sv, &end);
+        if (end == sv || errno != 0 || a <= 0.0f || a >= 10.0f) {
+            fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA_V='%s'\n", sv);
+        } else {
+            alpha_v = a;
+        }
+    }
+    cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &alpha_v, sizeof(float));
+    if (s || sv) {
+        fprintf(stderr, "TCQ: norm alpha K=%.3f V=%.3f\n", alpha_k, alpha_v);
+    }
 }
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
