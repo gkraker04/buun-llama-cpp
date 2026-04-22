@@ -570,6 +570,100 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
+// TCQ 3-bit: 9-bit state from trellis bitstream → 512-entry codebook
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_turbo3_tcq * K_tcq = (const block_turbo3_tcq *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float norm = 0.0f;
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO3_TCQ;
+        const int j_start = elem0 % QK_TURBO3_TCQ;
+
+        if (ib != prev_ib) {
+            norm = __half2float(K_tcq[ib].norm);
+            prev_ib = ib;
+        }
+
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int lj = k_KQ_1 * 2;
+            const int t0 = j_start + lj;
+            const int t1 = t0 + 1;
+            // 9-bit state decode for each element
+            const int bp0 = t0 * 3;
+            const uint16_t raw0 = (uint16_t)K_tcq[ib].qs[bp0/8] | ((uint16_t)K_tcq[ib].qs[bp0/8 + 1] << 8);
+            const float k0 = d_turbo3_tcq_codebook_fattn[(raw0 >> (bp0 % 8)) & 0x1FF] * norm;
+            const int bp1 = t1 * 3;
+            const uint16_t raw1 = (uint16_t)K_tcq[ib].qs[bp1/8] | ((uint16_t)K_tcq[ib].qs[bp1/8 + 1] << 8);
+            const float k1 = d_turbo3_tcq_codebook_fattn[(raw1 >> (bp1 % 8)) & 0x1FF] * norm;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif
+            sum += k0 * qf.x + k1 * qf.y;
+        }
+    }
+    return sum;
+}
+
+// TCQ 2-bit: 8-bit state from trellis bitstream → 256-entry codebook
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_turbo2_tcq * K_tcq = (const block_turbo2_tcq *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float norm = 0.0f;
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO2_TCQ;
+        const int j_start = elem0 % QK_TURBO2_TCQ;
+
+        if (ib != prev_ib) {
+            norm = __half2float(K_tcq[ib].norm);
+            prev_ib = ib;
+        }
+
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int lj = k_KQ_1 * 2;
+            const int t0 = j_start + lj;
+            const int t1 = t0 + 1;
+            // 8-bit state decode for each element
+            const int bp0 = t0 * 2;
+            const uint16_t raw0 = (uint16_t)K_tcq[ib].qs[bp0/8] | ((uint16_t)K_tcq[ib].qs[bp0/8 + 1] << 8);
+            const float k0 = d_turbo2_tcq_codebook_fattn[(raw0 >> (bp0 % 8)) & 0xFF] * norm;
+            const int bp1 = t1 * 2;
+            const uint16_t raw1 = (uint16_t)K_tcq[ib].qs[bp1/8] | ((uint16_t)K_tcq[ib].qs[bp1/8 + 1] << 8);
+            const float k1 = d_turbo2_tcq_codebook_fattn[(raw1 >> (bp1 % 8)) & 0xFF] * norm;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif
+            sum += k0 * qf.x + k1 * qf.y;
+        }
+    }
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -957,6 +1051,64 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
+// TCQ 3-bit V dequant: 9-bit state from trellis bitstream → 512-entry codebook
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_tcq * x = (const block_turbo3_tcq *) vx;
+    const int64_t ib = i0 / QK_TURBO3_TCQ;
+    const int     j0 = (int)(i0 % QK_TURBO3_TCQ);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int t = j0 + l;
+        const int bit_pos = t * 3;
+        const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
+        const int state = (raw >> (bit_pos % 8)) & 0x1FF;
+        vals[l] = d_turbo3_tcq_codebook_fattn[state] * norm;
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
+// TCQ 2-bit V dequant: 8-bit state from trellis bitstream → 256-entry codebook
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo2_tcq(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo2_tcq * x = (const block_turbo2_tcq *) vx;
+    const int64_t ib = i0 / QK_TURBO2_TCQ;
+    const int     j0 = (int)(i0 % QK_TURBO2_TCQ);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int t = j0 + l;
+        const int bit_pos = t * 2;
+        const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
+        const int state = (raw >> (bit_pos % 8)) & 0xFF;
+        vals[l] = d_turbo2_tcq_codebook_fattn[state] * norm;
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -977,6 +1129,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
+        return vec_dot_fattn_vec_KQ_turbo3_tcq<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO2_TCQ) {
+        return vec_dot_fattn_vec_KQ_turbo2_tcq<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1003,6 +1159,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
+        return dequantize_V_turbo3_tcq<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
+        return dequantize_V_turbo2_tcq<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

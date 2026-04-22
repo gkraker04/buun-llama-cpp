@@ -28,7 +28,7 @@ static void load_tcq_norm_alpha() {
     const char *s = getenv("TURBO_TCQ_ALPHA");
     const char *sv = getenv("TURBO_TCQ_ALPHA_V");
     if (!s && !sv) return;
-    float alpha_k = 1.1f;
+    float alpha_k = 1.0f;
     bool k_set = false;
     if (s) {
         char *end;

@@ -881,6 +881,20 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: After implementing #72, benchmark at 128K/256K/350K. Verify PPL doesn't degrade, measure speed.
 **Depends**: #72 (chunked cuBLAS GEMM prefill) — **REJECTED** (slower). Need alternative approach for long-context VRAM savings.
 
+### 85. Product-aware TCQ codebook training `needs-research`
+**Source**: Ordentlich & Polyanskiy, "Optimal Quantization for Matrix Multiplication" (arXiv:2410.13780, Oct 2024). Proves that the MSE-optimal quantizer is NOT optimal for approximating A^T B (the attention dot product). The rate-distortion function for matrix products differs from standard rate-distortion. Key result: at sub-0.906 bpw, dimensionality reduction before quantization is provably optimal; above that, the product-aware distortion metric still differs from MSE.
+**Related**: NestQuant (Savkin, Porat, Ordentlich, Polyanskiy, arXiv:2502.09720, ICML 2025) — applies nested E8 lattice quantization to KV cache with Hadamard rotation. Achieves 55% PPL gap reduction vs SpinQuant on Llama-3-8B at 4-bit W+A+KV. No speed benchmarks published. E8 lattice coding gain is only 0.65 dB over scalar — our TCQ gives 2-3 dB, so E8 itself is not a threat. NestQuant's edge comes from the product-aware objective, not the lattice.
+**Also**: "High-Rate Quantized Matrix Multiplication" (arXiv:2601.17187, Jan 2026) — follow-up introducing WaterSIC, within 0.25 bits of optimal. Shows GPTQ+rotation is within 0.1 bit of WaterSIC. "Optimal Scalar Quantization for Matrix Multiplication" (Ang, Kim, Pilanci, arXiv:2603.19559, Mar 2026) — closed-form optimal density with phase transition at |ρ| = 1/√3.
+**Concept**: Modify GLA codebook training to minimize attention error (Q @ K^T product distortion) instead of MSE. Currently our GLA trains on i.i.d. N(0,1) samples minimizing per-element MSE. Instead, generate (Q, K) pairs, quantize K with candidate codebook via Viterbi, compute ‖Q^T K - Q^T K̂‖² as the training loss. The Ordentlich-Polyanskiy theory says this is a fundamentally different optimum.
+**Connection to Q-anisotropy**: Our multilayer analysis found Q effective rank varies wildly per layer (layer 19: rank 1.9, layer 20: rank 114). A product-aware codebook would naturally weight errors along Q's dominant directions — exactly where MSE-trained codebooks are provably suboptimal. This also connects to the MSE-PPL divergence (#76 plan): lower MSE codebooks may put more error into Q-sensitive directions.
+**Implementation sketch**:
+1. Extract real Q vectors from model (dump during PPL eval, similar to K dump in multilayer plan)
+2. Modify numpy GLA: replace `mse = (x - codebook[state])²` with `product_error = (Q @ (x - codebook[state]))²` weighted by Q singular values
+3. Train codebooks on (Q, K) pairs per-layer or aggregated
+4. Compare: MSE-trained vs product-trained codebooks at 2K/8K/32K PPL
+**Risk**: Medium — Q statistics may vary too much across tokens/positions for a single codebook to capture. May need per-layer codebooks (already explored in multilayer plan). Training cost increases significantly (need Q data, not just K).
+**Expected**: If Ordentlich-Polyanskiy theory applies to our setting, product-aware codebooks should close some of the MSE-PPL gap. Even 0.02-0.05 PPL improvement at 2-3 bit would be significant. Could also explain why our "worse MSE" old numpy codebook gives better PPL than "better MSE" high-iteration codebooks.
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**

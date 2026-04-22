@@ -2041,3 +2041,23 @@ iid baseline: -0.0081. Per-group lag-1: mean -0.0080, std 0.093.
 **Theoretical prediction of lag-1 ≈ 0.15-0.30 was WRONG.** TCQ errors are effectively iid
 (zero autocorrelation at all lags). FWHT rotation destroys trellis-induced error structure.
 Experiment #74 (error decorrelation via permutation) can be dropped — nothing to fix.
+
+## CORRECTED: KLD Validation from Clean Master Build (2026-04-01)
+
+**IMPORTANT**: ALL KLD numbers from the previous "Boundary V + KLD Validation" section above are INVALID.
+They were measured from a build where 0 layers were offloaded to GPU (stale llama-server consuming all VRAM),
+causing turbo types to fall back to q8_0 on CPU. turbo2_tcq and q8_0 produced identical output because both
+were actually running as q8_0. The "KLD-optimal αV=1.10" finding was measuring q8_0 KLD, not turbo2_tcq KLD.
+
+### Verified results (clean master, 65/65 layers on GPU, 2K/8ch)
+
+| Config | PPL | Mean KLD | Median KLD | Same top p | RMS Δp |
+|--------|-----|----------|------------|-----------|--------|
+| f16 | 5.8048 | — | — | — | — |
+| q8_0 | 5.8385 (+0.58%) | 0.0171 | 0.000175 | 98.8% | 2.4% |
+| turbo2_tcq αK=1.0 αV=1.1 | 5.8913 (+1.49%) | 0.1003 | 0.010335 | 92.8% | 7.3% |
+
+turbo2_tcq KLD is 5.9x worse than q8_0. This is the honest cost of 2.25 bpv vs 8.5 bpv.
+
+Build: exp-alpha-fix from master + αK=1.0/αV=1.1 defaults. Codebook: numpy (compiled-in).
+GPU: RTX 3090 24GB, all 65 layers offloaded. KV cache on CUDA0.
