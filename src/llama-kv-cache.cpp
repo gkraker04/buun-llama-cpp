@@ -18,6 +18,7 @@ static bool ggml_is_power_of_2(int n) {
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
+// note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
     assert(tensor->type == GGML_TYPE_F32);
 
@@ -1411,14 +1412,19 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_k) {
+    const bool can_k_rot =
+        ggml_is_quantized(type_k()) &&
+        !hparams.is_n_embd_k_gqa_variable() &&
+        hparams.n_embd_head_k() % 64 == 0;
+
+    if (can_k_rot) {
         int nrot = 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         do {
             nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
+        } while (hparams.n_embd_head_k() % nrot == 0);
         nrot /= 2;
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
@@ -1432,7 +1438,12 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_v) {
+    const bool can_v_rot =
+        ggml_is_quantized(type_v()) &&
+        !hparams.is_n_embd_v_gqa_variable() &&
+        hparams.n_embd_head_v() % 64 == 0;
+
+    if (can_v_rot) {
         int nrot = 64;
         // using smaller rotation matrices for V seems beneficial
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
@@ -1870,6 +1881,7 @@ public:
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
 
+    // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
 
     const llama_kv_cache * kv_self;
