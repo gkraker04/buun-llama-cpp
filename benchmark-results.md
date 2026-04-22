@@ -2168,3 +2168,66 @@ turbo4 (4.125 bpv) has BETTER KLD than turbo3_tcq (3.25 bpv) — the extra bit b
 turbo3_tcq has notably better PPL than turbo4 despite worse bit rate — TCQ codebook optimization at work.
 V scaling provides a small genuine correction for TCQ types (αV≈1.04-1.06) but not for PolarQuant.
 K scaling never helps KLD for any type. All previous K scaling was pure attention sharpening.
+
+## KLD Context Sweep — 8K (2026-04-01)
+
+Same clean build as 2K sweep (exp-kld-sweep). 4 chunks, αK=1.0 fixed. f16 PPL(8K) = 7.3984, q8_0 KLD(8K) = 0.0167.
+
+### turbo2_tcq αV sweep at 8K
+
+| αV | PPL | Mean KLD | Median KLD | Same top p |
+|----|-----|----------|-----------|-----------|
+| 1.00 | 7.851 | 0.1850 | 0.01073 | 91.7% |
+| 1.02 | 7.715 | 0.1767 | 0.01044 | 91.7% |
+| **1.04** | **7.575** | **0.1646** | **0.01014** | **91.8%** |
+| 1.06 | 7.575 | 0.1701 | 0.01032 | 91.8% |
+| 1.08 | 7.383 | 0.1673 | 0.01009 | 91.9% |
+| 1.10 | 7.322 | 0.1658 | 0.01081 | 92.0% |
+| 1.20 | 6.818 | 0.1963 | 0.01500 | 90.9% |
+
+**KLD minimum shifts from αV=1.06 (2K) → αV=1.04 (8K).** KLD nearly doubles: 0.087→0.165.
+
+### turbo3_tcq αV sweep at 8K
+
+| αV | PPL | Mean KLD | Median KLD | Same top p |
+|----|-----|----------|-----------|-----------|
+| 1.00 | 7.638 | 0.1104 | 0.00304 | 94.9% |
+| 1.02 | 7.439 | 0.1069 | 0.00296 | 94.9% |
+| **1.04** | **7.391** | **0.1062** | **0.00304** | **95.1%** |
+| 1.06 | 7.232 | 0.1079 | 0.00347 | 95.0% |
+| 1.08 | 7.223 | 0.1101 | 0.00396 | 94.8% |
+| 1.10 | 7.064 | 0.1292 | 0.00454 | 94.1% |
+| 1.20 | 6.706 | 0.1962 | 0.00998 | 92.1% |
+
+**KLD minimum stays at αV=1.04.** KLD doubles: 0.053→0.106.
+
+### turbo4 α sweep at 8K
+
+| α | PPL | Mean KLD | Median KLD | Same top p |
+|---|-----|----------|-----------|-----------|
+| **1.00** | **7.409** | **0.0714** | **0.00141** | **96.6%** |
+| 1.02 | 7.294 | 0.0879 | 0.00166 | 96.4% |
+| 1.04 | 7.125 | 0.1026 | 0.00240 | 95.6% |
+| 1.06 | 7.023 | 0.1386 | 0.00359 | 94.6% |
+| 1.08 | 6.909 | 0.1648 | 0.00524 | 93.6% |
+| 1.10 | 6.771 | 0.1867 | 0.00715 | 92.7% |
+| 1.20 | 6.487 | 0.2759 | 0.02197 | 88.8% |
+
+**α=1.0 still optimal. KLD increases: 0.043→0.071.**
+
+### Cross-context KLD comparison (at KLD-optimal αV)
+
+| Type | 2K KLD | 8K KLD | Degradation |
+|------|--------|--------|-------------|
+| q8_0 | 0.0171 | 0.0167 | ~0% |
+| turbo4 (α=1.0) | 0.0428 | 0.0714 | +67% |
+| turbo3_tcq (αV=1.04) | 0.0531 | 0.1062 | +100% |
+| turbo2_tcq (αV=1.04) | — | 0.1646 | — |
+| turbo2_tcq (αV=1.06) | 0.0873 | 0.1701 | +95% |
+
+**KLD roughly doubles from 2K→8K for all turbo types while q8_0 stays flat.** This is the quantization error
+accumulating over longer attention windows. The PPL-KLD divergence is dramatic: αV=1.20 gives 6.8 PPL
+(best!) but 0.196 KLD (worst!). Temperature scaling games PPL at the expense of output distribution fidelity.
+
+**32K context sweep FAILED**: f16 base logits generation OOM/crashed at 32K (logits file 513K vs 7.6G for 8K).
+Need fewer chunks or alternative approach for 32K KLD measurement.
