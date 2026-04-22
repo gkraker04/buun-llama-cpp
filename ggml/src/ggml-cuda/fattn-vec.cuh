@@ -119,14 +119,10 @@ static __global__ void flash_attn_ext_vec(
     constexpr bool is_tcq2 = type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ;
     constexpr int smem_cb_size = is_tcq3 ? 512 : (is_tcq2 ? 256 : 0);
     __shared__ float smem_codebook[smem_cb_size > 0 ? smem_cb_size : 1];
-    if constexpr (is_tcq3) {
-        for (int i = tid; i < 512; i += nthreads) {
-            smem_codebook[i] = d_turbo3_tcq_codebook_fattn[i];
-        }
-        __syncthreads();
-    } else if constexpr (is_tcq2) {
-        for (int i = tid; i < 256; i += nthreads) {
-            smem_codebook[i] = d_turbo2_tcq_codebook_fattn[i];
+    if constexpr (smem_cb_size > 0) {
+        const float * cb_src = is_tcq3 ? d_turbo3_tcq_codebook_fattn : d_turbo2_tcq_codebook_fattn;
+        for (int i = tid; i < smem_cb_size; i += nthreads) {
+            smem_codebook[i] = cb_src[i];
         }
         __syncthreads();
     }
