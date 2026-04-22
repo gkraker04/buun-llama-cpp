@@ -705,11 +705,11 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Risk**: Very low — same pattern as `q_rot_buf`.
 **Expected gain**: Small decode latency reduction, mainly visible at short context where allocator overhead is proportionally larger.
 
-### 58. Head dimension padding to 128 `needs-research`
-**Source**: PR #5 (dusterbloom). Pad KV cache dimensions to QK=128 for models with non-128-aligned head_dim (64, 96, etc.).
-**Why**: Many models use head_dim=64 (LLaMA-2, Mistral, etc.) and can't use turbo types today. Padding to 128 would unlock them at the cost of ~2x memory overhead for head_dim=64.
-**Risk**: Medium — needs changes across KV cache allocation, SET_ROWS, FA kernels. Memory overhead may negate compression benefit for small head_dims.
-**Expected gain**: Model compatibility. Quality impact unknown — FWHT on zero-padded vectors changes the distribution.
+### 58. Head dimension padding to 128 `done`
+**Source**: PR #5 (dusterbloom). Pad KV cache dimensions to nearest 128 boundary for models with non-128-aligned head_dim.
+**Implementation** (branch experiment/tbq-ideas): Zero-pad per-head K/V dimensions. Padding in llama-kv-cache.cpp (allocation, stream views, get_k/v, cpy_k/v) and llama-graph.cpp (Q padding + output crop in build_attn, both normal and iSWA).
+**Test results** (Phi-3-mini, head_dim=96→128): turbo3 +3.97%, turbo2 +22.5%. No regression on 128/256-aligned models (Qwen3.5-27B exact match).
+**Design**: Padding is per-head to prevent FWHT groups crossing head boundaries. Zero-padded dimensions are no-ops in dot product by Parseval's theorem.
 
 ### 59. Smooth scaling before FWHT (from VecInfer) `done`
 **Paper**: arXiv:2510.06175 (Oct 2025). VecInfer applies SmoothQuant-style per-channel scaling before Hadamard rotation.
@@ -752,6 +752,44 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 - Free-init optimization: allow any initial trellis state (all 2^L states equally viable). 37.6% MSE gain at 3-bit.
 - Key bugs fixed: backtrace race condition (4→2 per byte packing), normalization order (must apply InnerQ BEFORE normalize)
 - **turbo2_tcq is the publication story**: at 2.25 bpv, gets near-3-bit quality (6.05 vs 5.83). First TCQ for KV cache.
+**Optimized Codebooks** (2026-03-29, numpy GLA n_train=4000, 100 iters):
+- 3-bit: 37.6%→50.1% MSE reduction. turbo3_tcq PPL 5.8331 at 2K, **+0.81% at 32K** (vs turbo3's +1.80%)
+- 2-bit: 4.2%→33.1% MSE reduction. turbo2_tcq PPL 6.0592 at 2K (was 6.1826 with old codebook)
+- TCQ halves turbo3 context degradation: +1.04% at 65K vs turbo3's +2.28%
+- TCQ transforms turbo2 long-context: +4.20% at 32K vs turbo2's +8.58%
+- Best hybrid: turbo2_tcq-K + turbo3_tcq-V (2.75 bpv): +1.44% at 2K, +2.99% at 65K
+- CUDA-trained codebooks find lower MSE but worse PPL — different GLA local optima. numpy codebook is best.
+- Training scripts: `scripts/tcq_train_vectorized.py` (best), `scripts/tcq_train_cuda.cu`
+
+### 62. Per-32 norm within 128-element rotation groups `planned`
+**Source**: signalnine/llama-cpp-turboquant (NVIDIA contributor). Merged into TheTom's tree 2026-03-29.
+**Concept**: FWHT over 128 elements, but store a separate corrected norm per 32-element sub-block. 4x finer norm granularity captures local amplitude variation in post-WHT data.
+**Tradeoff**: +0.5 bpv overhead. At 2-bit: 2.5 bpv. turbo2_tcq at 2.25 bpv gets 6.06, signalnine's per-32-norm at 2.5 bpv gets 6.01. Similar quality, different approach.
+
+### 63. Parallel FWHT encode (all-thread butterfly) `done`
+**Source**: signalnine's set-rows.cu. 128 threads participate in FWHT via shared memory butterfly.
+**Result**: Implemented on experiment/tbq-ideas branch. Verified identical output to serial kernel. Expected 1.5-2x encode speedup at long context.
+
+### 64. 64-element WHT group fallback + zero-padding `done`
+**Source**: signalnine. Pad head_dim to next multiple of 128.
+**Result**: Implemented as experiment #58 (zero-padding approach). Always GROUP_SIZE=128, no template branching needed.
+
+### 65. Sparse V dequant — skip negligible attention weights `planned`
+**Source**: signalnine/TheTom. Skip V dequant+accumulation when all attention weights < 1e-6.
+**Expected gain**: +22.8% decode at 32K (TheTom's number). More at longer context. Zero quality impact.
+**Risk**: Very low — ~3 lines in fattn-vec.cuh, purely additive.
+
+### 66. Fused attention+dequant kernel — eliminate fp16 intermediate `planned`
+**Concept**: Dequant K/V inline during attention instead of pre-dequanting to fp16 buffer. For turbo3: 3 instructions per element (extract index, load centroid, multiply norm). For TCQ: sliding window + codebook lookup.
+**Expected gain**: 1.5-2x decode speedup at long context. This is the fork-justifying feature — nobody else has fused attention for custom VQ codebooks.
+**Risk**: High — requires rewriting fattn-vec and fattn-mma kernels. Register pressure is the main concern.
+
+### 67. Speculative decoding with turbo-enabled larger draft models `planned`
+**Concept**: turbo KV on target model frees VRAM, allowing a larger/better draft model. Qwen3.5-27B Q6_K + turbo3 KV at 64K frees ~2.2 GB vs q8_0 — enough for 3B draft in Q4 instead of 0.5B.
+
+### 68. 256-element TCQ blocks for head_dim=256 models `planned`
+**Concept**: Run Viterbi trellis over 256 elements (full head_dim) instead of two independent 128-element groups. Longer trellis = better coding gain. Only benefits head_dim=256 models.
+**Priority**: Medium — nice paper result showing TCQ scales with block length.
 
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.

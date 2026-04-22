@@ -3,6 +3,12 @@
 Hardware: RTX 3090 24GB, Qwen3.5 27B Q6_K (20.56 GiB)
 Date: 2026-03-26
 Build: feature/turboquant-kv-cache + FA_ALL_QUANTS=ON
+Data: wikitext-2-raw/wiki.test.raw
+
+**Methodology note**: Early benchmarks (pre 2026-03-29) used 1 chunk for long-context PPL,
+which has ±0.15 error bars at 32K+. Results from 2026-03-29 onward use 4 chunks (±0.07)
+for long context and 8 chunks for 2K. Numbers across methodologies are not directly comparable —
+the 1-chunk data led to incorrect conclusions about turbo3 context scaling (see TURBO4_POSTMORTEM.md).
 
 ## PPL (2K ctx, 8 chunks)
 
@@ -1118,3 +1124,29 @@ Free-init trained codebook. 4.2% MSE reduction vs Lloyd-Max.
 
 Key finding: turbo2_tcq at 2.25 bpv achieves near-turbo3 quality (6.05 vs 5.83) with 25% fewer bits.
 The trellis structure provides enormous gains at 2-bit where scalar quantization breaks down.
+
+## TCQ Optimized Codebooks (2026-03-29, 4 chunks long-ctx / 8 chunks 2K)
+
+numpy GLA training: n_train=4000, 100 iters. 3-bit MSE: 50.1% reduction. 2-bit MSE: 33.1% reduction.
+Previous committed codebooks were unoptimized (3-bit: 37.6%, 2-bit: only 4.2% — essentially useless).
+
+### Complete Context Scaling Comparison (all types + hybrids)
+
+| Type | bpv | 2K PPL | vs q8_0 | 32K PPL | vs q8_0 | 65K PPL | vs q8_0 |
+|------|-----|--------|---------|---------|---------|---------|---------|
+| q8_0 | 8.0 | 5.8375 | — | 6.9539 | — | 6.9344 | — |
+| turbo3 | 3.25 | 5.8325 | -0.09% | 7.0790 | +1.80% | 7.0929 | +2.28% |
+| turbo3_tcq | 3.25 | 5.8331 | -0.08% | 7.0105 | +0.81% | 7.0067 | +1.04% |
+| t2tcq-K + t3tcq-V | 2.75 | 5.9214 | +1.44% | 7.1112 | +2.26% | 7.1416 | +2.99% |
+| t3tcq-K + t2tcq-V | 2.75 | 5.9904 | +2.62% | 7.1803 | +3.26% | 7.1535 | +3.16% |
+| turbo2_tcq | 2.25 | 6.0592 | +3.80% | 7.2458 | +4.20% | 7.2944 | +5.19% |
+| turbo2 | ~2.1 | 6.0083 | +2.93% | 7.5505 | +8.58% | 7.5259 | +8.53% |
+| turbo4 | 2.0 | 5.8644 | +0.46% | 6.9697 | +0.23% | 6.9697 | +0.51% |
+
+### Key findings
+- turbo4 PolarQuant (2.0 bpv) has the best context scaling of any type — gap stays <0.51% even at 65K
+- turbo3_tcq cuts 32K degradation by more than half vs turbo3 (0.81% vs 1.80%), holds at 1.04% at 65K
+- TCQ transforms turbo2 context scaling: 8.58%→4.20% at 32K, 8.53%→5.19% at 65K
+- t2tcq-K + t3tcq-V (2.75 bpv) is the best hybrid: only +1.44% at 2K, confirming V quality matters more
+- turbo2 without TCQ degrades catastrophically at long context (+8.5% at 32K+)
+- turbo3_tcq at 65K (+1.04%) is better than turbo3 at 32K (+1.80%) — TCQ enables longer effective context
