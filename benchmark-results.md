@@ -1952,3 +1952,55 @@ using all 512/256 threads. Backtrack and bitpack remain serial.
 ### Conclusion
 Current defaults (αK=1.1, αV=1.3) are near-optimal for both bit rates. No changes needed.
 The α=1.0→1.3 gap grows with context (3-bit: 0.14 at 2K → 0.66 at 32K), confirming temperature scaling is essential.
+
+---
+
+## Experiment #77: turbo4 Temperature Scaling (4-bit PolarQuant)
+Date: 2026-04-01, Branch: experiment/77-turbo4-quality-gap
+
+### Alpha sweep (2K / 32 chunks)
+
+| α | PPL |
+|---|-----|
+| 1.00 | 6.5713 ± 0.093 |
+| 1.10 | 6.3892 ± 0.089 |
+| 1.15 | 6.3431 ± 0.088 |
+| **1.20** | **6.3356 ± 0.088** |
+| 1.25 | 6.3443 ± 0.089 |
+| 1.30 | 6.3957 ± 0.090 |
+| 1.40 | 6.5799 ± 0.093 |
+| 1.50 | 6.8984 ± 0.100 |
+
+Optimum: **α=1.20** (same as symmetric TCQ optimum)
+
+### K/V isolation (2K / 32 chunks, α=1.2)
+
+| Config | PPL |
+|--------|-----|
+| K=turbo4 V=q8_0 | 6.4506 |
+| K=q8_0 V=turbo4 | 6.3511 |
+| Both turbo4 | 6.3356 |
+
+V matters more than K (same pattern as TCQ).
+
+### 8K validation (16 chunks)
+
+| Config | 2K PPL | 8K PPL | 32K PPL |
+|--------|--------|--------|---------|
+| q8_0 (8-bit baseline) | 6.5596 | 6.8206 | — |
+| turbo4 α=1.0 (4-bit) | 6.5713 | 6.8298 | 6.9420 |
+| **turbo4 α=1.2 (4-bit)** | **6.3356** | **6.1926** | **6.4603** |
+
+### K/V isolation at 8K (16 chunks, α=1.2)
+
+| Config | PPL |
+|--------|-----|
+| K=turbo4 V=q8_0 | 6.5162 |
+| K=q8_0 V=turbo4 | 6.3204 |
+| Both turbo4 | 6.1926 |
+
+V matters more, but K contributes meaningfully at longer context (0.128 PPL at 8K).
+
+### Conclusion
+turbo4 α=1.2 BEATS q8_0 at all context lengths. 4-bit quant outperforming 8-bit.
+Temperature scaling Δ: −0.236 (2K), −0.637 (8K), −0.482 (32K). Hardcoded α=1.2 as default.

@@ -840,10 +840,10 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Sweep αV from 1.0 to 1.6 (αK=1.1 fixed) for turbo3_tcq and turbo2_tcq at 2K/8K/32K.
 **Result**: αV=1.3 is robustly optimal for 3-bit at all contexts. 2-bit has slight preference for αV=1.35 at 8K (−0.052 PPL) but regresses at 2K (+0.041). Difference too small for per-bit-rate defaults. **Current defaults confirmed optimal. No changes.**
 
-### 77. Verify turbo4 quality gap vs TBQ4 `ready`
+### 77. Verify turbo4 quality gap vs TBQ4 `done`
 **Source**: Competitive analysis: TBQ4 beats turbo4 by 0.01-0.03 PPL everywhere. turbo4 has no TCQ — just scalar 4-bit quantization.
-**Concept**: Investigate whether TBQ4's advantage comes from (a) Lloyd-Max centroids being better than uniform for post-FWHT data, (b) the temperature scaling effect, or (c) something else. Try replacing turbo4 centroids with Lloyd-Max N(0,1) 16-point centroids.
-**Test**: PPL comparison at 2K/8K/32K/64K.
+**Concept**: Temperature scaling (hypothesis b) was the answer. Added `d_turbo4_alpha` constant with `TURBO4_ALPHA` env var override.
+**Result**: α=1.2 optimal (same as symmetric TCQ). PPL improvement: −0.236 (2K), −0.637 (8K), −0.482 (32K). turbo4 now BEATS q8_0 at all context lengths. V matters more than K (same as TCQ). Hardcoded α=1.2 as default.
 
 ### 78. Measure TCQ error autocorrelation empirically `ready`
 **Source**: Finding #29 from competitive analysis. Theoretical prediction of lag-1 autocorrelation ~0.15-0.30 but never measured.

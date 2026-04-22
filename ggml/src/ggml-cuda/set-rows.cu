@@ -4,13 +4,30 @@
 #include <cstring>
 #include <cerrno>
 
+static void load_turbo4_alpha() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const char *s = getenv("TURBO4_ALPHA");
+    if (!s) return;
+    char *end;
+    errno = 0;
+    float a = strtof(s, &end);
+    if (end == s || errno != 0 || a <= 0.0f || a >= 10.0f) {
+        fprintf(stderr, "TURBO4: invalid TURBO4_ALPHA='%s'\n", s);
+    } else {
+        cudaMemcpyToSymbol(d_turbo4_alpha, &a, sizeof(float));
+        fprintf(stderr, "TURBO4: alpha=%.3f\n", a);
+    }
+}
+
 static void load_tcq_norm_alpha() {
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
     const char *s = getenv("TURBO_TCQ_ALPHA");
     const char *sv = getenv("TURBO_TCQ_ALPHA_V");
-    if (!s && !sv) return; // use compiled-in defaults (K=1.1, V=1.3)
+    if (!s && !sv) return;
     float alpha_k = 1.1f;
     bool k_set = false;
     if (s) {
@@ -390,6 +407,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
+        load_turbo4_alpha();
         set_rows_cuda_quant<idx_t, block_turbo4_0, QK_TURBO4, quantize_f32_turbo4_0_block>(
             src0_d, src1_d, (block_turbo4_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,

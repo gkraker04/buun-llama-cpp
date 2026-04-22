@@ -426,6 +426,9 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
       v.y = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
 }
 
+// Temperature scaling for turbo4. Override via TURBO4_ALPHA env var.
+static __constant__ float d_turbo4_alpha = 1.2f;
+
 // === TURBO4: SET_ROWS quantize (4-bit PolarQuant, no QJL) ===
 static __device__ __forceinline__
 void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
@@ -453,7 +456,8 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
         recon_sq += r * r;
     }
     float recon_norm = sqrtf(recon_sq);
-    dst->norm = __float2half((recon_norm > 1e-10f) ? norm / recon_norm : norm);
+    float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst->norm = __float2half(corrected * d_turbo4_alpha);
 }
 
 // === TURBO4: GET_ROWS dequantize ===
