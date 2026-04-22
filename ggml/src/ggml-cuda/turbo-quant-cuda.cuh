@@ -19,6 +19,72 @@ static __device__ int   d_innerq_is_k;                   // 1 = current set_rows
 extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
 extern void turbo_innerq_init_fattn();
 
+// === Post-FWHT data extraction for empirical codebook computation ===
+// Enabled by TURBO_EXTRACT=<max_samples> env var (e.g. TURBO_EXTRACT=2000000)
+// Dumps post-rotation normalized values to /tmp/turbo_postrot.bin (float32)
+// Device-visible extraction state
+static __device__ float * d_extract_buf_ptr = nullptr;
+static __device__ int   * d_extract_pos_ptr = nullptr;
+static __device__ int     d_extract_max_val = 0;
+
+// Host-side management
+static float * h_extract_gpu_buf = nullptr;
+static int   * h_extract_gpu_pos = nullptr;
+static int     h_extract_max = 0;
+static int     h_extract_state = 0;  // 0=uninit, 1=collecting, 2=done
+
+static void turbo_extract_init(int max_samples) {
+	cudaMalloc(&h_extract_gpu_buf, (size_t)max_samples * sizeof(float));
+	cudaMalloc(&h_extract_gpu_pos, sizeof(int));
+	int zero = 0;
+	cudaMemcpy(h_extract_gpu_pos, &zero, sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
+	cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
+	cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
+	h_extract_max = max_samples;
+	h_extract_state = 1;
+	fprintf(stderr, "TURBO_EXTRACT: collecting up to %d post-rotation samples\n", max_samples);
+}
+
+static void turbo_extract_check_done() {
+	if (h_extract_state != 1) return;
+	int pos;
+	cudaMemcpy(&pos, h_extract_gpu_pos, sizeof(int), cudaMemcpyDeviceToHost);
+	if (pos < h_extract_max) return;
+	// Buffer full — dump to disk
+	if (pos > h_extract_max) pos = h_extract_max;
+	float * host_buf = (float *)malloc((size_t)pos * sizeof(float));
+	cudaMemcpy(host_buf, h_extract_gpu_buf, (size_t)pos * sizeof(float), cudaMemcpyDeviceToHost);
+	const char * path = "/tmp/turbo_postrot.bin";
+	FILE * fp = fopen(path, "wb");
+	if (fp) {
+		fwrite(host_buf, sizeof(float), pos, fp);
+		fclose(fp);
+		fprintf(stderr, "TURBO_EXTRACT: wrote %d samples to %s (%.1f MB)\n",
+				pos, path, (float)pos * sizeof(float) / (1024*1024));
+	}
+	free(host_buf);
+	// Disable extraction (set device pointers to null)
+	float * null_ptr = nullptr;
+	int   * null_iptr = nullptr;
+	int     zero_max = 0;
+	cudaMemcpyToSymbol(d_extract_buf_ptr, &null_ptr, sizeof(float *));
+	cudaMemcpyToSymbol(d_extract_pos_ptr, &null_iptr, sizeof(int *));
+	cudaMemcpyToSymbol(d_extract_max_val, &zero_max, sizeof(int));
+	cudaFree(h_extract_gpu_buf); h_extract_gpu_buf = nullptr;
+	cudaFree(h_extract_gpu_pos); h_extract_gpu_pos = nullptr;
+	h_extract_state = 2;
+}
+
+// Device-side: append 128 post-rotation values to extraction buffer
+static __device__ void turbo_extract_append(const float * x) {
+	if (!d_extract_buf_ptr || !d_extract_pos_ptr) return;
+	int base = atomicAdd(d_extract_pos_ptr, 128);
+	if (base + 128 <= d_extract_max_val) {
+		for (int j = 0; j < 128; j++) d_extract_buf_ptr[base + j] = x[j];
+	}
+}
+
 // Host-side init: set identity scales, zero accumulators
 static void turbo_innerq_init() {
     float ones[128];
@@ -319,6 +385,8 @@ static __global__ void k_set_rows_turbo3(
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    // Post-rotation extraction (if enabled)
+    turbo_extract_append(x);
     // Quantize and accumulate reconstruction norm for correction
     float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
@@ -369,6 +437,8 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
     // Forward FWHT rotation before quantization
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    // Post-rotation extraction (if enabled)
+    turbo_extract_append(x);
     // 4-bit quantization: find nearest of 16 centroids, pack 2 per byte
     for (int j = 0; j < 128; j += 2) {
         uint8_t idx0 = turbo_find_nearest_4bit(x[j]);

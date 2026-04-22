@@ -352,12 +352,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
             const uint8_t qs_b1 = (lj1 < 4) ? qs_lo : qs_hi;
             const int idx1 = (qs_b1 >> ((lj1 % 4) * 2)) & 0x3;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(cn[idx0]), __float2half(cn[idx1])),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
 #endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
         }
     }
     return sum;
@@ -408,12 +407,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
               const uint8_t hi1  = (signs >> lj1) & 0x1;
               idx1 = low2 | (hi1 << 2); }
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(cn[idx0]), __float2half(cn[idx1])),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
 #endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
         }
     }
     return sum;
@@ -458,12 +456,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
             const float k0 = cn[idx0];
             const float k1 = cn[idx1];
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum, make_half2(__float2half(k0), __float2half(k1)),
-                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            sum += k0 * qf.x + k1 * qf.y;
 #endif
+            sum += k0 * qf.x + k1 * qf.y;
         }
     }
     return sum;

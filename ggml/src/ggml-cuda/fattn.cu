@@ -769,12 +769,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
-    // Slight precision loss from fp16 round-trip, but 2x prefill speedup is worth it
-    // since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
+    // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
+    // turbo4 is excluded — its 16 centroids are ~0.023 apart, which rounds to the same
+    // fp16 value, costing +0.27% PPL. turbo2/turbo3 (4/8 centroids) survive fp16 fine.
+    // Set TURBO_PREFILL_VEC=1 to force vec kernel for all turbo types (debug override).
+    static const bool turbo_prefill_vec = [] {
+        const char * e = getenv("TURBO_PREFILL_VEC");
+        if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
+        return e != nullptr;
+    }();
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
-    if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    const bool turbo4_kv = K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0;
+    if (turbo_kv && !turbo4_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: Q rotation handled inside, V un-rotation at graph level
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {

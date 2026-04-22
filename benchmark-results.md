@@ -891,9 +891,103 @@ turbo3 degrades catastrophically at long context on hd128 (3.3% → 6.6%).
 
 turbo4 and turbo3 have identical decode speed (compute-bound dequant).
 
+### TheTom's centroids test (from turbo4-resurrection.md)
+
+TheTom's centroids: [-0.1739, -0.1172, -0.0895, -0.0688, -0.0513, -0.0356, -0.0210, -0.0069, ...]
+Ours (Gaussian Lloyd-Max): [-0.2416, -0.1829, -0.1430, -0.1111, -0.0833, -0.0581, -0.0343, -0.0114, ...]
+
+| Centroids | hd128 2K PPL | vs q8_0 | hd128 8K PPL | vs q8_0 | hd256 2K PPL | vs q8_0 |
+|-----------|-------------|---------|-------------|---------|-------------|---------|
+| Our Gaussian | 6.4978 | +1.20% | 7.0718 | +0.81% | 5.8467 | +0.15% |
+| TheTom's | 6.4082 | -0.19% | 7.0726 | +0.82% | 5.8829 | +0.77% |
+
+TheTom's centroids dramatically help hd128 at 2K (-0.19% beats q8_0!) but the gain
+vanishes at 8K (+0.82% ≈ same as Gaussian). Hurts hd256 (+0.77% vs +0.15%).
+
+Raw norm (no recon correction) test: PPL 7.80 on hd256 — catastrophic. Norm correction is essential.
+
+KEY OPEN QUESTION: TheTom's centroids don't match standard Lloyd-Max for ANY Gaussian.
+In N(0,1) units: outer=1.97 vs Lloyd-Max 2.73. He likely ran iterative Lloyd-Max on real
+post-FWHT KV data. Need to ask: (1) exact computation method, (2) does he normalize
+per-head or per-block? Per-head normalization for hd256 would give σ=1/√256 per block
+instead of our σ=1/√128.
+
 ### Empirical centroid calibration — FAILED
 
 Simulated post-FWHT distribution has kurtosis -0.047 (sub-Gaussian), but the empirical
 centroids derived from simulation gave catastrophic PPL = 6.8758 (+17.8%). The simulation
 is wrong for real model data. TheTom's measurement on real KV tensors shows kurtosis = 2.9
 (near-Gaussian), confirming Gaussian-optimal Lloyd-Max centroids are correct.
+
+### Empirical codebook: real post-FWHT data (TURBO_EXTRACT)
+
+Extracted 2M post-FWHT samples from each model. Post-rotation distribution is
+model-independent N(0, 1/√128): std=0.088388, kurtosis≈2.9 on both models.
+Empirical Lloyd-Max centroids improve MSE by only 0.2-0.3% vs Gaussian — already optimal.
+
+## New turbo4: K/V split + Layer-Adaptive on hd256
+
+Qwen3.5-27B Q6_K (head_dim=256, 2K/8chunks). q8_0 baseline: 5.8375.
+
+### K/V Quality Decomposition (hd256)
+
+| Config | PPL | vs q8_0 | Notes |
+|--------|-----|---------|-------|
+| q8_0 K + turbo4 V | 5.8397 | +0.04% | V quant essentially free |
+| turbo4 K + turbo4 V | 5.8467 | +0.16% | uniform turbo4 |
+| turbo4 K + q8_0 V | 5.8590 | +0.37% | K-only turbo4 — counterproductive |
+
+V quantization adds only +0.04%. K adds +0.12%. But keeping V at q8_0 is WORSE (+0.37%)
+than turbo4 V (+0.16%), likely because turbo4 V dequant noise averages out better through
+softmax-weighted sum than q8_0 systematic rounding.
+
+### Layer-Adaptive Sweep (hd256, new turbo4)
+
+Model has 16 attention layers (48 recurrent Delta Net layers use no KV cache).
+
+| Mode | Description | PPL | vs q8_0 | Promoted layers |
+|------|-------------|-----|---------|-----------------|
+| **LA-3** | **last 4 (K+V)** | **5.8420** | **+0.08%** | **4/16 = 25%** |
+| LA-10 | last 4 (K-only) | 5.8441 | +0.11% | K: 4/16, V: 0/16 |
+| LA-1 | first4+last4 (K+V) | 5.8461 | +0.15% | 8/16 = 50% |
+| 0 | turbo4 uniform | 5.8467 | +0.16% | 0/16 |
+
+**LA-3 (last 4 K+V q8_0) wins at +0.08% — practically lossless.**
+LA-1 (first4+last4) doesn't help on new turbo4 hd256 (unlike old QJL turbo4 where it was -0.71%).
+Only 16 attention layers means 4 promoted layers = 25% of KV cache at q8_0.
+
+## MMA Prefill fp16 Precision Fix — turbo4 (2026-03-28)
+
+**Root cause**: During prefill (Q->ne[1] > 1), turbo K/V are dequanted to fp16 temp buffers
+for tensor core MMA attention. turbo4's 16 centroids (spaced ~0.023 apart when scaled by norm)
+round-trip through fp16, losing precision. turbo3's 8 centroids (wider spacing) survive fp16.
+
+**Fix**: turbo4 now automatically bypasses MMA prefill and uses vec kernel (full float32
+precision). turbo2/turbo3 keep MMA prefill. FA auto-enabled for turbo types (was an error).
+
+### PPL Impact (Qwen3.5-27B, hd256, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 baseline | 5.8375 | — |
+| **turbo4 (vec prefill, auto)** | **5.8310** | **-0.11%** |
+| turbo4 (MMA prefill, old) | 5.8467 | +0.16% |
+| turbo3 (MMA prefill) | 5.8501 | +0.22% |
+
+turbo4 now **beats q8_0** by 0.11% without any manual env var.
+
+### Speed Impact
+
+| Config | pp4096 tok/s | pp/q8 | tg64 tok/s | tg/q8 |
+|--------|-------------|-------|-----------|-------|
+| q8_0 | 1139 | 100% | 31.23 | 100% |
+| turbo3 (MMA) | 1120 | 98.3% | 30.09 | 96.4% |
+| turbo4 (vec) | 420 | 36.9% | 30.14 | 96.5% |
+
+**Trade-off**: turbo4 prefill is 2.7x slower than q8_0 (vec kernel for full precision).
+Decode speed is unaffected (96.5% of q8_0). For interactive use where decode matters
+more than one-time prefill, this is acceptable.
+
+### Code Changes
+- `fattn.cu`: turbo4 automatically uses vec prefill (no MMA fp16 round-trip)
+- `llama-context.cpp`: FA auto-enabled for turbo types (was: throw error)
