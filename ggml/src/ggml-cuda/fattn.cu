@@ -781,7 +781,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Pre-rotate Q for turbo (K/V stored in rotated space, whether turbo3 or dequanted fp16)
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
-        if (turbo_kv && Q->ne[0] % 128 == 0) {
+        const bool turbo_k_any = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+        if (turbo_k_any && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size) {
                 if (q_rot_buf) CUDA_CHECK(cudaFree(q_rot_buf));
