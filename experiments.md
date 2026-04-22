@@ -88,10 +88,15 @@ Prefill pp4096 (tok/s):
 **Note**: All asymmetric turbo+q8 combos have slightly worse PPL than pure q8_0. The norm correction gives uniform turbo an edge that mixing with uncorrected q8_0 dilutes.
 
 ### 11. Layer-adaptive + asymmetric combined
-**Status**: ready (after experiments 8-10)
+**Status**: done — **NEGATIVE RESULT**
 **Type**: quality
-**What**: Decouple K/V in the adaptive logic. Since experiment 10 showed values matter more than keys on Qwen3.5 27B (opposite of literature), could promote only V to q8_0 on sensitive layers.
-**TODO**: Requires code change to `llama-kv-cache.cpp`.
+**Branch**: `experiment/attention-sink-protection`
+**What**: Decouple K/V in the adaptive logic. Since experiment 10 showed values matter more than keys on Qwen3.5 27B, tested promoting only V or only K to q8_0 on sensitive layers.
+**Results**:
+  - Mode 6 (V-only q8_0 last 8): PPL 5.8390 (+0.03%) — WORSE than uniform turbo3
+  - Mode 7 (K-only q8_0 last 8): PPL 5.8390 (+0.03%) — identical to mode 6
+  - Mode 8 (V-only q8_0 first2+last2): PPL 5.8330 (-0.08%) — ~= uniform
+**Finding**: Promoting only one of K/V hurts quality due to norm correction mismatch between turbo and q8_0 within the same layer. K vs V makes no difference. Both must be promoted together (mode 2: 5.8140) for the quality improvement to work.
 
 ### 11b. Layer-adaptive modes 3, 4, 5 — isolation tests
 **Status**: done

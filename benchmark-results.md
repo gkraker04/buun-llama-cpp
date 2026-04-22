@@ -82,6 +82,7 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 11. Decode speed at 65K is virtually identical to 32K — zero degradation even at 2x the context
 12. Mode 3 (last4) = Mode 5 (first2+last2) in PPL. Last 2 layers dominate quality impact.
 13. Mode 5 (first2+last2) is the max-compression sweet spot: only 4 layers q8_0, ~4.2x compression, -0.49% PPL
+14. Asymmetric layer-adaptive (V-only or K-only promotion) does NOT help — norm correction mismatch between turbo+q8_0 within a layer hurts. Both K+V must be promoted together.
 
 ## FWHT Rotation Results (CORRECTED)
 
@@ -132,3 +133,15 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 | 128K | 669 | 29.85 | full model context window! |
 
 **Key finding**: 27B model running at 128K context on a 24GB RTX 3090 with turbo3 KV cache. Impossible with q8_0. Decode speed is constant across all context lengths (~30 tok/s). Prefill scales sub-linearly with context length.
+
+## Asymmetric Layer-Adaptive (turbo3, PPL 2K/8chunks)
+
+| Mode | Strategy | PPL | vs q8_0 | Decode 4K | Notes |
+|------|----------|-----|---------|-----------|-------|
+| 6 | V-only q8_0 last 8 | 5.8390 | +0.03% | 30.16 | worse than uniform! |
+| 7 | K-only q8_0 last 8 | 5.8390 | +0.03% | — | identical to mode 6 |
+| 8 | V-only q8_0 first2+last2 | 5.8330 | -0.08% | — | ~= uniform |
+| 2 (ref) | both K+V q8_0 last 8 | 5.8140 | -0.40% | 30.14 | much better |
+| 0 (ref) | uniform turbo3 | 5.8323 | -0.09% | 29.93 | baseline |
+
+**Key finding**: Asymmetric layer-adaptive does NOT help. Promoting only K or only V gives identical PPL (5.8390), both worse than uniform turbo3. The norm correction mismatch between turbo and q8_0 within the same layer hurts quality. Both K and V must be promoted together (mode 2) for the quality improvement to work.

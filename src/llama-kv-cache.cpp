@@ -214,6 +214,9 @@ llama_kv_cache::llama_kv_cache(
         //   3 = q8_0 for last 4 only
         //   4 = q8_0 for first 4 only
         //   5 = q8_0 for first 2 + last 2
+        //   6 = V-only q8_0 for last 8 (asymmetric: values need more precision)
+        //   7 = K-only q8_0 for last 8 (asymmetric: control experiment)
+        //   8 = V-only q8_0 for first 2 + last 2
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -226,20 +229,27 @@ llama_kv_cache::llama_kv_cache(
                 }
                 return mode;
             }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
+            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                                   type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
             const uint32_t n_layer = hparams.n_layer;
-            bool promote = false;
+            bool promote_k = false;
+            bool promote_v = false;
             if (is_turbo && n_layer >= 8) {
                 switch (adaptive_mode) {
-                    case 1: promote = (il < 4 || il >= n_layer - 4); break;
-                    case 2: promote = (il >= n_layer - 8); break;
-                    case 3: promote = (il >= n_layer - 4); break;
-                    case 4: promote = (il < 4); break;
-                    case 5: promote = (il < 2 || il >= n_layer - 2); break;
+                    case 1: promote_k = promote_v = (il < 4 || il >= n_layer - 4); break;
+                    case 2: promote_k = promote_v = (il >= n_layer - 8); break;
+                    case 3: promote_k = promote_v = (il >= n_layer - 4); break;
+                    case 4: promote_k = promote_v = (il < 4); break;
+                    case 5: promote_k = promote_v = (il < 2 || il >= n_layer - 2); break;
+                    case 6: promote_v = (il >= n_layer - 8); break;
+                    case 7: promote_k = (il >= n_layer - 8); break;
+                    case 8: promote_v = (il < 2 || il >= n_layer - 2); break;
                 }
             }
-            if (promote) {
+            if (promote_k) {
                 layer_type_k = GGML_TYPE_Q8_0;
+            }
+            if (promote_v) {
                 layer_type_v = GGML_TYPE_Q8_0;
             }
         }
