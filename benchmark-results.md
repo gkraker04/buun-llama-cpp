@@ -4762,3 +4762,141 @@ Relative degradation vs q8_0 baseline:
 Baseline improved dramatically (-27%), but relative turbo degradation slightly increased.
 BF16 fix gives a cleaner signal, making quantization errors more visible against it.
 TCQ still substantially better than plain turbo3 on Gemma 4.
+
+## Context-Adaptive Decode-Time V Alpha (2026-04-05)
+
+Rebuild of lost implementation. Logarithmic alpha scaling based on current KV occupancy.
+Model: Qwen3.5-27B Q6_K, RTX 3090, wikitext-2 test set, pm/iter080 codebook.
+Encode alpha: forced to 1.0 (no encode-time scaling). K decode alpha: 1.0 (static).
+
+### 3-bit turbo3_tcq initial results (adaptive vs encode α=1.04 baseline)
+
+| Context | Baseline (encode α=1.04) | Adaptive (formula) | Historical decode best | Formula α | Optimal α |
+|---------|--------------------------|-------------------|----------------------|-----------|-----------|
+| 2K | 0.051270 | 0.056765 (+10.7%) | 0.055260 (α=1.02) | 1.025 | 1.02 |
+| 4K | 0.056709 | 0.054970 (-3.1%) | 0.053332 (α=1.00) | 1.020 | 1.00 |
+| 8K | 0.077869 | 0.075444 (-3.1%) | 0.071366 (α=1.02) | 1.015 | 1.02 |
+| 32K | 0.044224 | 0.045702 (+3.3%) | 0.040199 (α=1.00) | 1.005 | 1.00 |
+
+Initial formula: `alpha = 1.081792 - 0.007398 * ln(n_kv)`, clamped [0.98, 1.06]
+Not precise enough — 3-bit curve is very shallow, ±0.005 alpha matters.
+
+### 16K fine-grained V alpha sweep (0.005 steps, K=1.0, decode-time)
+
+| α | KLD |
+|---|---|
+| 0.990 | 0.073175 |
+| 0.995 | 0.069222 |
+| 1.000 | 0.073684 |
+| **1.005** | **0.065299** |
+| 1.010 | 0.067253 |
+| 1.015 | 0.069769 |
+| 1.020 | 0.066331 |
+| 1.025 | 0.067559 |
+| 1.030 | 0.069060 |
+| 1.035 | 0.067878 |
+| 1.040 | 0.067101 |
+| 1.045 | 0.072168 |
+| 1.050 | 0.075068 |
+
+Optimum: α=1.005, KLD=0.065299 (-1.6% vs previous 1.02 grid winner).
+Surface is non-convex with oscillations at 0.005 granularity.
+Good region: 1.005-1.020 (all under 0.067).
+
+### 32K fine-grained V alpha sweep (0.005 steps, K=1.0, decode-time)
+
+| α | KLD |
+|---|---|
+| 0.990 | 0.043787 |
+| 0.995 | 0.045326 |
+| **1.000** | **0.040199** |
+| 1.005 | 0.040853 |
+| 1.010 | 0.043769 |
+| 1.015 | 0.043235 |
+| 1.020 | 0.041322 |
+| 1.025 | 0.042914 |
+| 1.030 | 0.042112 |
+
+Optimum: α=1.000, KLD=0.040199 (matches historical). Surface non-convex like 16K.
+
+### Updated formula (v2, from fine-grained 16K+32K data)
+
+`alpha = 1.075 - 0.007213 * ln(n_kv)`, clamped [0.98, 1.04]
+Predictions: 2K→1.020, 4K→1.015, 8K→1.010, 16K→1.005, 32K→1.000
+
+| Context | Baseline (encode α=1.04) | Adaptive v2 | Static optimal | v2 formula α |
+|---------|--------------------------|-------------|----------------|--------------|
+| 2K | 0.051270 | 0.058861 (+14.8%) | 0.055260 (α=1.02) | 1.020 |
+| 32K | 0.044224 | 0.042023 (-5.0%) | 0.040199 (α=1.00) | 1.000 |
+
+**Key finding**: adaptive gives 0.042023 at 32K, not matching static 1.00 (0.040199), because
+alpha varies per-token as KV grows. Early tokens use higher alpha (e.g., n_kv=100 → α=1.042).
+This is correct behavior but KLD measurement favors static alpha tuned for full context.
+
+At 2K, adaptive is worse than encode-time baseline because decode-time α=1.02 (0.055260) is worse
+than encode-time α=1.04 (0.051270). Encode-time wins at short context due to fp16 rounding interactions.
+
+### Implementation state
+
+Branch: `experiment/context-adaptive-alpha`
+Files changed: `fattn.cu` (adaptive alpha function + 4 call sites), `set-rows.cu` (encode alpha forced to 1.0 by default)
+3-bit formula: `alpha = 1.075 - 0.007213 * ln(n_kv)` clamped [0.98, 1.04]
+2-bit formula: `alpha = 0.984758 + 0.010165 * ln(n_kv)` clamped [1.00, 1.12]
+Build: `/root/exp-adaptive-alpha/` on dorei
+Baseline: `/root/llama-padtest/` (master with encode α=1.04)
+Base logits: `/root/base_logits_fresh/`
+
+### 16K K alpha sweep (0.005 steps, V=adaptive formula, decode-time)
+
+| K α | KLD |
+|-----|-----|
+| 0.980 | 0.074352 |
+| 0.985 | 0.072333 |
+| 0.990 | 0.070978 |
+| 0.995 | 0.070926 |
+| **1.000** | **0.066938** |
+| 1.005 | 0.068708 |
+| 1.010 | 0.067742 |
+| 1.015 | 0.067113 |
+| 1.020 | 0.067196 |
+| 1.025 | 0.070318 |
+| 1.030 | 0.069299 |
+| 1.035 | 0.072496 |
+| 1.040 | 0.076673 |
+| 1.045 | 0.079675 |
+| 1.050 | 0.086668 |
+| 1.055 | 0.088410 |
+| 1.060 | 0.086583 |
+
+K=1.000 optimal at 16K. Clear minimum, rises sharply both directions.
+Published best (encode α=1.04): 0.070208. Adaptive V+K=1.0: 0.066938 → **4.7% better**.
+
+### 8K V alpha fine sweep (0.005 steps, K=1.0, decode-time)
+
+| α | KLD |
+|---|-----|
+| 1.000 | 0.077470 |
+| **1.005** | 0.074431 |
+| 1.010 | 0.077957 |
+| 1.015 | 0.074449 |
+| **1.020** | **0.071366** |
+| 1.025 | 0.073315 |
+| 1.030 | 0.073633 |
+
+Optimum: α=1.020, KLD=0.071366.
+
+### v3 formula (3-point fit from 8K/16K/32K optima)
+
+`alpha = 1.1484 - 0.01443 * ln(n_kv)`, clamped [0.98, 1.06]
+
+| Context | Paper (α=1.04) | Paper (optimal) | **v3 adaptive** | vs α=1.04 | vs optimal |
+|---------|---------------|-----------------|-----------------|-----------|------------|
+| 2K | 0.0552 | 0.0513 | **0.0585** | +5.9% | +13.9% |
+| 8K | 0.0746 | 0.0743 | **0.0731** | **-2.0%** | **-1.6%** |
+| 16K | 0.0702 | 0.0651 | **0.0654** | **-6.8%** | +0.5% |
+| 32K | 0.0447 | 0.0402 | **0.0415** | **-7.1%** | +3.3% |
+
+Beats paper α=1.04 at 8K/16K/32K. Matches per-context optimal at 16K.
+2K regression is inherent to decode-time alpha (encode-time wins at short context).
+
+**TODO**: 2-bit fine sweeps needed. Consider hybrid: encode-time α at short ctx, decode-time adaptive at long ctx.

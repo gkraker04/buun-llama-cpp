@@ -26,13 +26,13 @@ static void load_tcq_norm_alpha() {
     if (loaded) return;
     loaded = true;
 
-    // If decode-time alpha is active, force encode-time V alpha to 1.0 to prevent double-application.
-    // Decode-time alpha is applied in the dequant kernels (fattn.cu), not here.
-    const char *decode_v = getenv("TURBO_TCQ_DECODE_ALPHA_V");
-    if (decode_v) {
+    // Context-adaptive decode-time alpha is the default. Force encode-time V alpha to 1.0
+    // unless TURBO_TCQ_ENCODE_ALPHA=1 is explicitly set to use encode-time alpha instead.
+    const char *encode_mode = getenv("TURBO_TCQ_ENCODE_ALPHA");
+    if (!encode_mode) {
         float one = 1.0f;
         cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &one, sizeof(float));
-        fprintf(stderr, "TCQ: encode V alpha=1.0 (decode-time alpha active via TURBO_TCQ_DECODE_ALPHA_V=%s)\n", decode_v);
+        fprintf(stderr, "TCQ: encode V alpha=1.0 (context-adaptive decode-time alpha active)\n");
         // Still allow K alpha override
         const char *s = getenv("TURBO_TCQ_ALPHA");
         if (s) {

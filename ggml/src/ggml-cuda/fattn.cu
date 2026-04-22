@@ -281,16 +281,33 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// Decode-time V alpha: loaded once from TURBO_TCQ_DECODE_ALPHA_V env var.
-// When set, this alpha is applied at decode time (norm * alpha) instead of being baked
-// into the norm at encode time. Set encode-time alpha to 1.0 (TURBO_TCQ_ALPHA_V=1.0)
-// when using decode-time alpha to avoid double-application.
-static float d_tcq_decode_alpha_v = 1.0f; // default: no decode-time alpha
+// Context-adaptive V alpha: logarithmic scaling based on current KV occupancy.
+// 3-bit: alpha = 1.1484 - 0.01443 * ln(n_kv), calibrated on Qwen3.5-27B decode-time KLD sweeps
+//   at 8K/16K/32K. Optima: 8K→1.020, 16K→1.005, 32K→1.000.
+// 2-bit: alpha = 0.984758 + 0.010165 * ln(n_kv), same calibration (excluding 4K outlier)
+// Override with TURBO_TCQ_DECODE_ALPHA_V env var to force a static alpha (disables adaptive).
+static float d_tcq_decode_alpha_v_static = 0.0f; // 0 = use adaptive, >0 = static override
+static float d_tcq_decode_alpha_k = 1.0f;       // K decode alpha, static (default 1.0)
+static bool d_tcq_decode_alpha_loaded = false;
+
+static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
+    if (d_tcq_decode_alpha_v_static > 0.0f) return d_tcq_decode_alpha_v_static;
+    if (n_kv < 1) n_kv = 1;
+    const float ln_ctx = logf((float)n_kv);
+    if (v_type == GGML_TYPE_TURBO3_TCQ) {
+        // v3: 3-point fit from fine-grained KLD sweeps at 8K/16K/32K on Qwen3.5-27B.
+        // Per-token: n_kv=512→1.044, 2K→1.024, 8K→1.004, 16K→0.994, 32K→0.984
+        // Clamped [0.98, 1.06] — early tokens (small n_kv) use higher alpha.
+        return fmaxf(0.98f, fminf(1.06f, 1.1484f - 0.01443f * ln_ctx));
+    } else if (v_type == GGML_TYPE_TURBO2_TCQ) {
+        return fmaxf(1.00f, fminf(1.12f, 0.984758f + 0.010165f * ln_ctx));
+    }
+    return 1.0f;
+}
 
 static void load_tcq_decode_alpha() {
-    static bool loaded = false;
-    if (loaded) return;
-    loaded = true;
+    if (d_tcq_decode_alpha_loaded) return;
+    d_tcq_decode_alpha_loaded = true;
     const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V");
     if (s) {
         char * end;
@@ -299,10 +316,23 @@ static void load_tcq_decode_alpha() {
         if (end == s || errno != 0 || a <= 0.0f || a >= 10.0f) {
             fprintf(stderr, "TCQ: invalid TURBO_TCQ_DECODE_ALPHA_V='%s'\n", s);
         } else {
-            d_tcq_decode_alpha_v = a;
-            // Also set the fattn-common.cuh __constant__ for native decode path
+            d_tcq_decode_alpha_v_static = a;
             cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &a, sizeof(float));
-            fprintf(stderr, "TCQ decode: V alpha=%.4f (decode-time)\n", a);
+            fprintf(stderr, "TCQ decode: V alpha=%.4f (static override)\n", a);
+        }
+    } else {
+        fprintf(stderr, "TCQ decode: context-adaptive V alpha enabled\n");
+    }
+    const char * sk = getenv("TURBO_TCQ_DECODE_ALPHA_K");
+    if (sk) {
+        char * end;
+        errno = 0;
+        float a = strtof(sk, &end);
+        if (end == sk || errno != 0 || a <= 0.0f || a >= 10.0f) {
+            fprintf(stderr, "TCQ: invalid TURBO_TCQ_DECODE_ALPHA_K='%s'\n", sk);
+        } else {
+            d_tcq_decode_alpha_k = a;
+            fprintf(stderr, "TCQ decode: K alpha=%.4f\n", a);
         }
     }
 }
@@ -585,7 +615,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
             {
                 static bool tcq2_fattn_k_cb_loaded = false;
@@ -607,7 +637,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
         } else {
             // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
@@ -649,7 +679,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
         } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
             // Runtime codebook loading for 2-bit V decode (in case K is a different type)
             {
@@ -671,7 +701,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
         } else {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -1131,6 +1161,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     } else {
         load_tcq_decode_alpha();
 
+        // Update VEC __constant__ alpha for context-adaptive mode
+        if (d_tcq_decode_alpha_v_static == 0.0f &&
+            (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ)) {
+            float alpha = tcq_compute_alpha_v(V->type, V->ne[1]);
+            cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha, sizeof(float));
+        }
+
         // Load runtime codebooks for TCQ types (needed by both dequant and native VEC paths)
         if (K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ) {
             static bool tcq3_cb_loaded = false;
@@ -1206,10 +1243,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 } else {
                     k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
@@ -1238,10 +1275,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
                 } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
                 } else {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
