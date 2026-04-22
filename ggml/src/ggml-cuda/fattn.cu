@@ -236,14 +236,15 @@ static __global__ void k_turbo2_dequant_f16(
 
 static __global__ void k_turbo3_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1,
-        const size_t nb1, const size_t nb2) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
     const int j = threadIdx.x;
     if (j >= ne0) return;
 
-    const char * src_row = src + head * nb2 + row * nb1;
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
     const int blk_idx  = j / QK_TURBO3;
     const int j_in_blk = j % QK_TURBO3;
     const block_turbo3_0 * blk = (const block_turbo3_0 *)src_row + blk_idx;
@@ -253,19 +254,20 @@ static __global__ void k_turbo3_dequant_f16(
     const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
     const float val = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm;
 
-    dst[head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
 }
 
 static __global__ void k_turbo4_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1,
-        const size_t nb1, const size_t nb2) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
     const int j = threadIdx.x;
     if (j >= ne0) return;
 
-    const char * src_row = src + head * nb2 + row * nb1;
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
     const int blk_idx  = j / QK_TURBO4;
     const int j_in_blk = j % QK_TURBO4;
     const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
@@ -284,7 +286,7 @@ static __global__ void k_turbo4_dequant_f16(
     const float s = (blk->signs[j_in_blk / 8] & (1 << (j_in_blk % 8))) ? 1.0f : -1.0f;
     const float val = (d_turbo_centroids_3bit_fattn[idx] + s * qjl_scale) * norm;
 
-    dst[head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
 }
 
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
@@ -339,35 +341,29 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_k) {
-        const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+        const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
-        dim3 grid_k(K->ne[1], K->ne[2]);
-        if (K->type == GGML_TYPE_TURBO2_0) {
-            k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
-        } else if (K->type == GGML_TYPE_TURBO3_0) {
+        dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
+        if (K->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
             k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         }
     }
 
     // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_v) {
-        const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+        const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
-        dim3 grid_v(V->ne[1], V->ne[2]);
-        if (V->type == GGML_TYPE_TURBO2_0) {
-            k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
-        } else if (V->type == GGML_TYPE_TURBO3_0) {
+        dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+        if (V->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         }
     }
 
@@ -794,17 +790,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_v_decode = nullptr;
 
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0) {
-                const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+            if (K->type == GGML_TYPE_TURBO3_0) {
+                const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
                 CUDA_CHECK(cudaMallocAsync(&k_fp16_dec, k_size, stream));
-                dim3 grid_k(K->ne[1], K->ne[2]);
-                if (K->type == GGML_TYPE_TURBO2_0) {
-                    k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
-                } else {
-                    k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
-                }
+                dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
+                k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                    (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
                 K_f16_dec.data = k_fp16_dec;
@@ -815,17 +806,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0) {
-                const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+            if (V->type == GGML_TYPE_TURBO3_0) {
+                const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
                 CUDA_CHECK(cudaMallocAsync(&v_fp16_dec, v_size, stream));
-                dim3 grid_v(V->ne[1], V->ne[2]);
-                if (V->type == GGML_TYPE_TURBO2_0) {
-                    k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
-                } else {
-                    k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
-                }
+                dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+                k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                    (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 V_f16_dec = *V;
                 V_f16_dec.type = GGML_TYPE_F16;
                 V_f16_dec.data = v_fp16_dec;

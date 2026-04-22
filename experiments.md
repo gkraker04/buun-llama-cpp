@@ -541,6 +541,18 @@ Would require redesigning llama.cpp's entire KV cache write path. Not worth the 
   - q8_0 baseline: 30.81 tok/s (turbo3 = 97.2%)
 **Finding**: All parallel_blocks values within noise (±0.1 tok/s). Attention compute is <5% of total decode time — FFN dominates. The 2.8% turbo3-to-q8_0 gap is structural dequant overhead that can't be closed by attention-level tuning. This also applies to #17 (Split-K tuning).
 
+### 50. Fix multi-sequence (n_seq > 1) turbo dequant
+**Status**: done — **CRITICAL BUG FIX**
+**Type**: correctness
+**Branch**: `feature/turboquant-kv-cache`
+**What**: Turbo dequant-to-fp16 kernels in fattn.cu ignored the stream dimension (ne[3]).
+With kv_unified=false (the default) and n_seq > 1, K/V tensors have ne[3] = n_stream
+during prefill. Only stream 0 was allocated and dequanted — streams 1+ read
+uninitialized fp16 garbage, causing catastrophic PPL degradation.
+**Fix**: Added ne[3]/nb[3] to kernel signatures, allocation sizes, and 3D grid launches
+for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
+**Results**: n_seq=1: 6.31 (unchanged), n_seq=2: 6.30 (was 17.10), n_seq=4: 6.34 (was 22.56).
+
 ---
 
 ## External Research & References
