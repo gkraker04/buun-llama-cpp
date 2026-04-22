@@ -10,6 +10,95 @@
 
 LLM inference in C/C++
 
+> **Fork notice**: This is a fork of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) with CUDA-optimized TurboQuant KV cache quantization. See below for details.
+
+## TurboQuant CUDA KV Cache Quantization
+
+This fork adds full CUDA support for [TurboQuant](https://arxiv.org/abs/2501.06815) (Google Research, ICLR 2026) KV cache quantization, including custom Flash Attention kernels and a tensor-core prefill path. The result: **3.5-5x KV cache compression with quality that beats q8_0**.
+
+### What's implemented
+
+- **turbo3** (3.25-bit) and **turbo4** (4.25-bit) CUDA quantization and dequantization
+- **FWHT rotation** (Fast Walsh-Hadamard Transform) applied during quantization for near-uniform distribution
+- **Norm correction** (`corrected_norm = group_norm / recon_norm`) — the key to beating q8_0 quality
+- **QJL sign correction** (turbo4) — 1-bit Johnson-Lindenstrauss residual encoding
+- **Custom Flash Attention vec kernels** for both turbo3 and turbo4 K dot-product and V dequant
+- **Prefill dequant+MMA path** — bulk-dequants turbo KV to fp16 temp buffers for tensor core acceleration (turbo3 only; turbo4's QJL correction loses precision in fp16 round-trip)
+- **Layer-adaptive modes** — keep critical layers (first/last) at q8_0 for even better quality
+- **fp16 centroid LUT** in Flash Attention for decode speed
+- **Float norm broadcast** optimization for vec dequant
+
+### Benchmarks (Qwen3.5-27B Q6_K, RTX 3090 24GB)
+
+#### Quality (Perplexity, lower is better)
+
+| Config | PPL | vs q8_0 | KV Compression |
+|--------|-----|---------|----------------|
+| q8_0 baseline | 5.8375 | — | 1.0x |
+| **LA-1 turbo3** | **5.7690** | **-1.17%** | **3.5x** |
+| LA-5 turbo3 | 5.8091 | -0.49% | 4.2x |
+| turbo3 uniform | 5.8323 | -0.09% | 4.9x |
+| turbo4 uniform | 5.8186 | -0.32% | 3.8x |
+
+#### Speed
+
+| Config | Prefill (pp4096) | Decode (tg64) | vs q8_0 |
+|--------|-----------------|---------------|---------|
+| q8_0 baseline | 1133 tok/s | 31.04 tok/s | — |
+| LA-1 turbo3 | 1128 tok/s (99.6%) | 30.25 tok/s (97.5%) | ~98% |
+| turbo3 uniform | 1125 tok/s (99.3%) | 30.04 tok/s (96.8%) | ~98% |
+
+#### Extreme Context (128K on 24GB — impossible with q8_0)
+
+| Context | Prefill tok/s | Decode tok/s | Config |
+|---------|--------------|-------------|--------|
+| 65K | 847 | 29.79 | turbo3 uniform |
+| 128K | 671 | 29.89 | turbo3 uniform |
+| 128K | 674 | 30.01 | LA-5 turbo3 |
+
+q8_0 OOMs beyond ~65K context on 24GB. TurboQuant enables full 128K context with constant decode speed.
+
+### Usage
+
+Build with CUDA Flash Attention support:
+
+```sh
+cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON
+cmake --build build -j$(nproc)
+```
+
+Run with turbo3 KV cache:
+
+```sh
+# Recommended: Layer-adaptive mode 1 (best quality, up to ~65K context)
+TURBO_LAYER_ADAPTIVE=1 ./build/bin/llama-cli -m model.gguf -ctk turbo3 -ctv turbo3 -fa on
+
+# For 128K context on 24GB GPU
+TURBO_LAYER_ADAPTIVE=5 ./build/bin/llama-cli -m model.gguf -ctk turbo3 -ctv turbo3 -fa on
+
+# Maximum compression (4.9x)
+./build/bin/llama-cli -m model.gguf -ctk turbo3 -ctv turbo3 -fa on
+```
+
+### Context length recommendations
+
+| Context Range | Config | PPL vs q8_0 | Compression |
+|--------------|--------|-------------|-------------|
+| Up to 65K | `TURBO_LAYER_ADAPTIVE=1` turbo3 | -1.17% (better) | 3.5x |
+| 65K-128K | `TURBO_LAYER_ADAPTIVE=5` turbo3 | -0.49% (better) | 4.2x |
+| 128K+ | turbo3 uniform | -0.09% (better) | 4.9x |
+
+### Key findings
+
+- FWHT rotation is essential: +6.8% PPL without it
+- Norm correction makes turbo3 beat q8_0 — without it, quality is ~12% worse
+- QJL adds +0.3 PPL to turbo4 — worth keeping despite preventing MMA prefill
+- Decode speed gap (~3% vs q8_0) is structural: memory-bound, q8_0 benefits from native int8 dp4a on Ampere
+- Layer-adaptive mode 1 (first4+last4 at q8_0) gives the best quality at modest compression cost
+- Decode speed is constant across context lengths (30 tok/s at 4K, 65K, and 128K)
+
+---
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
