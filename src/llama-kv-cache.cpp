@@ -201,16 +201,14 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        // turbo3/turbo4 require GPU (CUDA/Metal) — no CPU vec_dot kernel exists.
-        // Segfaults if CPU flash attention tries to dot-product against turbo KV data.
+        // turbo types have no CPU vec_dot kernel — fall back to q8_0 for CPU-bound layers.
+        // This allows --fit on / partial offload to work: GPU layers get turbo, CPU layers get q8_0.
+        bool cpu_fallback = false;
         if (ggml_backend_buft_is_host(buft)) {
             const bool layer_has_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
                                           type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
             if (layer_has_turbo) {
-                throw std::runtime_error(
-                    "turbo KV cache requires all layers on GPU. "
-                    "Layer " + std::to_string(il) + " is on CPU. "
-                    "Use -ngl 99 (or -ngl " + std::to_string(hparams.n_layer) + ") to offload all layers.");
+                cpu_fallback = true;
             }
         }
 
@@ -267,6 +265,19 @@ llama_kv_cache::llama_kv_cache(
             }
             if (promote_v) {
                 layer_type_v = GGML_TYPE_Q8_0;
+            }
+            if (cpu_fallback) {
+                if (layer_type_k != GGML_TYPE_Q8_0) {
+                    layer_type_k = GGML_TYPE_Q8_0;
+                }
+                if (layer_type_v != GGML_TYPE_Q8_0) {
+                    layer_type_v = GGML_TYPE_Q8_0;
+                }
+                static bool warned = false;
+                if (!warned) {
+                    LLAMA_LOG_WARN("llama_kv_cache: turbo KV cache falling back to q8_0 for CPU-bound layers (partial offload)\n");
+                    warned = true;
+                }
             }
         }
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
