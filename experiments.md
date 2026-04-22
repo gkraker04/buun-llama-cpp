@@ -791,6 +791,97 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Run Viterbi trellis over 256 elements (full head_dim) instead of two independent 128-element groups. Longer trellis = better coding gain. Only benefits head_dim=256 models.
 **Priority**: Medium — nice paper result showing TCQ scales with block length.
 
+### 69. Temperature scaling — attention sharpening via norm inflation `ready`
+**Source**: Competitive analysis 2026-03-31. Duster's TBQ accidentally inflates norms 2.77x, acting as attention temperature T=0.36. This sharpens attention and helps at long context.
+**Concept**: Multiply `corrected_norm` by alpha in TCQ encode kernel. Try alpha = 1.5, 2.0, 2.5, 2.77. Combines our 976x better MSE with TBQ's temperature benefit.
+**Change**: One line in `turbo-quant-cuda.cuh` — scale the stored norm after correction.
+**Test**: PPL grid at 2K/8K/32K/64K for each alpha. If optimal alpha differs by context length, consider making alpha a runtime parameter.
+**Expected**: Beat TBQ at ALL context lengths. This is the single highest-impact experiment.
+
+### 70. Asymmetric K/V norm scaling — raw norm for K, corrected for V `ready`
+**Source**: Competitive analysis quality findings. K temperature helps attention routing, V accuracy helps output quality.
+**Concept**: Remove norm correction for K only (store raw L2 norm), keep correction for V. K gets temperature scaling "for free", V stays MSE-optimal.
+**Change**: Conditional in encode kernel based on `iq_is_k` flag (already available in set-rows.cu).
+**Test**: PPL at 2K/8K/32K/64K. Compare with symmetric alpha scaling (#69).
+
+### 71. Native `vec_dot_fattn_vec_KQ_turbo3_tcq` — inline TCQ decode in FA `ready`
+**Source**: Competitive analysis speed gap. Duster has `vec_dot_fattn_vec_KQ_tbq3_0` for TBQ. We dequant all KV to f16 first.
+**Concept**: Read 9-bit state from bitstream → `codebook[state] * norm` → accumulate dot product inline in FA. No intermediate f16 buffer needed.
+**Change**: New function in fattn-common.cuh. Simpler than TBQ's vec_dot (no inverse Hadamard).
+**Expected**: ~7% decode speedup, reduced VRAM at long context (eliminates O(context) f16 buffer).
+**Note**: This is #66 (fused attention+dequant) but specifically scoped to TCQ decode only.
+
+### 72. Chunked cuBLAS GEMM prefill `ready`
+**Source**: Competitive analysis speed gap. Duster's implementation: 3-kernel pipeline (init, softmax-update, finalize) + `cublasGemmStridedBatchedEx`.
+**Concept**: Dequant 4096 KV tokens at a time to f16, use cuBLAS for Q@K^T and P@V with online softmax between chunks. NOT TCQ-specific — works for all quant types.
+**Change**: New prefill path in fattn.cu. Reference: Duster's fattn.cu lines 502-1005.
+**Expected**: 20-27% prefill speedup. Enables 350K+ context on single RTX 3090.
+**Note**: Our TCQ dequant per chunk is FASTER than TBQ's (no inverse Hadamard needed).
+
+### 73. Parallelize TCQ encode thread-0 serial sections `ready`
+**Source**: Competitive analysis encode speed. Thread-0 does FWHT rotation + backtracking + bitpacking alone.
+**Concept**: FWHT is 128 elements × 7 stages — use 64+ threads (butterfly pattern, already done for #63 but only for non-TCQ). Bitpacking: each thread packs its own segment.
+**Change**: turbo-quant-cuda.cuh TCQ encode kernel.
+**Expected**: ~5% encode speedup.
+
+### 74. TCQ error decorrelation via element permutation `needs-research`
+**Source**: Competitive analysis quality findings. TCQ trellis (right-shift, k=3) shares 6/9 state bits between consecutive positions → correlated errors. Autocorrelation ~0.15-0.30 at lag 1. Correlated errors average out slower in Q@K dot products.
+**Concept**: Apply fixed permutation (e.g., bit-reversal) to element indices after FWHT before trellis encoding. Decorrelates errors across d_k dimension without changing MSE. Matching inverse permutation in decode.
+**Risk**: Medium — needs careful verification that permuted trellis still converges. May interact with codebook optimality.
+**Test**: Measure lag-1 autocorrelation before/after, PPL at 2K-64K.
+
+### 75. Lloyd-Max boundaries as TCQ initial state prior `needs-research`
+**Source**: Duster's TBQ uses textbook-optimal N(0,1) Lloyd-Max centroids. These are MSE-optimal for scalar Gaussian quantization.
+**Concept**: Use Lloyd-Max bin boundaries to inform TCQ Viterbi initial state distribution or trellis path metric initialization. The optimal scalar quantizer boundaries partition the space in a way that might help Viterbi converge faster or to better paths.
+**Risk**: Speculative — trellis structure already constrains state transitions heavily.
+
+### 76. Optimal temperature grid search across context lengths `ready`
+**Source**: Follow-up to #69. TBQ4=6.909, TBQ3=7.034, TBQ2=7.332 are monotonically ordered by temperature severity, suggesting optimal alpha varies with bit-rate.
+**Concept**: Sweep alpha from 1.0 to 3.0 in 0.25 steps for turbo2_tcq, turbo3_tcq, and turbo4. Measure PPL at 2K/8K/32K/64K for each. Find Pareto-optimal alpha per bit-rate.
+**Test**: 4 alphas × 3 quant types × 4 contexts = 48 benchmark runs. ~2 hrs on server.
+
+### 77. Verify turbo4 quality gap vs TBQ4 `ready`
+**Source**: Competitive analysis: TBQ4 beats turbo4 by 0.01-0.03 PPL everywhere. turbo4 has no TCQ — just scalar 4-bit quantization.
+**Concept**: Investigate whether TBQ4's advantage comes from (a) Lloyd-Max centroids being better than uniform for post-FWHT data, (b) the temperature scaling effect, or (c) something else. Try replacing turbo4 centroids with Lloyd-Max N(0,1) 16-point centroids.
+**Test**: PPL comparison at 2K/8K/32K/64K.
+
+### 78. Measure TCQ error autocorrelation empirically `ready`
+**Source**: Finding #29 from competitive analysis. Theoretical prediction of lag-1 autocorrelation ~0.15-0.30 but never measured.
+**Concept**: Dump quantization errors from TCQ encode, compute autocorrelation at lags 1-10. Compare with scalar Lloyd-Max (should be ~0). Confirm the theoretical prediction.
+**Change**: Add dump mode to encode kernel (env var trigger), Python analysis script.
+**Test**: Correlate measured autocorrelation with PPL degradation at long context.
+
+### 79. TBQ-style encode as TCQ fallback for speed-critical path `needs-research`
+**Source**: Duster's TBQ encode is fully parallel (one binary search per element, ~660B shared mem) vs our Viterbi (128 sequential barrier-synced iterations, 34.5KB shared mem).
+**Concept**: Offer Lloyd-Max scalar quantize as a fast encode path (e.g., for streaming/real-time), with TCQ Viterbi as the quality path. Runtime flag to select. Zero code sharing issues — the two encoders write the same bitstream format if we match centroids.
+**Risk**: Quality regression vs TCQ. Only useful if encode speed matters (batch inference, very long prompts).
+
+### 80. Padding non-128 head_dim completion `ready`
+**Source**: Infrastructure comparison — Duster has it done, ours is "in progress" (#58/#64).
+**Status**: Code changes done, needs final build+test verification.
+**Test**: Verify PPL on a head_dim=128 model (e.g., Llama-3) and head_dim=256 model (Qwen3.5).
+
+### 81. Sparse V dequant integration with TCQ `ready`
+**Source**: #65 planned but not tested with TCQ path. TheTom showed +22.8% decode at 32K.
+**Concept**: Skip V dequant+accumulation when all attention weights in a block < threshold. Works with both f16-dequant path and future native vec_dot (#71).
+**Change**: ~3 lines in fattn-vec.cuh. Purely additive.
+**Expected**: +22.8% decode at 32K, more at longer context. Zero quality impact.
+
+### 82. Replicate TBQ's exact 1-bit behavior for validation `needs-research`
+**Source**: Bombshell finding — TBQ is accidentally 1-bit. 100% of post-FWHT values map to 2 inner bins.
+**Concept**: Implement explicit 1-bit quantization (just store sign + raw norm) and verify it matches TBQ3 PPL exactly. If it does, this conclusively proves the temperature theory and means TBQ's 3-bit storage wastes 2 bits.
+**Test**: PPL should match TBQ3 at all context lengths. If so, we can publish this finding.
+
+### 83. Adaptive temperature per layer `needs-research`
+**Source**: From MSE-PPL divergence investigation — Q anisotropy varies wildly per layer (layer 19: rank 1.9, layer 20: rank 114). Optimal attention temperature likely varies per layer too.
+**Concept**: Store per-layer alpha in constant memory. Use different temperature scaling per layer based on that layer's Q effective rank.
+**Risk**: Requires knowing Q statistics at quantization time (not available in llama.cpp's online KV quantize). Could use precomputed per-model tables.
+
+### 84. 350K+ context validation `planned`
+**Source**: Duster's chunked cuBLAS GEMM enables 350K+ on single 3090. Currently we OOM much earlier.
+**Concept**: After implementing #72, benchmark at 128K/256K/350K. Verify PPL doesn't degrade, measure speed.
+**Depends**: #72 (chunked cuBLAS GEMM prefill).
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**

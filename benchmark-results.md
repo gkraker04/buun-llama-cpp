@@ -1616,3 +1616,105 @@ Test: wikitext-2-raw, 64 chunks @2K, 8 chunks @8K, 4 chunks @32K/64K
    When K and V used different quant types, V always decoded with compiled-in codebook regardless
    of TURBO_TCQ_CB/CB2 env vars. This caused encode/decode mismatch (PPL 9.65 instead of 6.63).
    Fix: added codebook loading to V dequant branches with separate static bool guards.
+
+## Head-to-Head Comparison: Ours vs TheTom vs Duster (2026-03-31)
+
+Same model (Qwen3.5-27B Q6_K), same wikitext-2 test file, same server (RTX 3090).
+- Ours: `/root/llama-tcq-clean` (master, TCQ codebooks compiled-in)
+- TheTom: `github.com/TheTom/llama-cpp-turboquant` feature/turboquant-kv-cache @ 8ad0f00
+- Duster: `github.com/dusterbloom/llama-cpp-turboquant-cuda` feature/turboquant-kv-cache @ a7a6d10
+
+### 3-bit PPL (turbo3 K+V uniform)
+
+| Impl | @2K (64ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|------|------------|-----------|------------|------------|
+| **ours (TCQ)** | **6.507** | **6.883** | **7.005** | 7.053 |
+| TheTom turbo3 | 6.548 | 6.934 | 7.089 | 7.114 |
+| Duster turbo3 | 6.562 | 6.917 | 7.088 | 7.115 |
+| Duster TBQ3 | 6.565 | 6.921 | 7.056 | **7.034** |
+
+TCQ wins at 2K-32K. Duster's TBQ3 (SRHT+Lloyd-Max) overtakes at 64K (7.034 vs 7.053).
+
+### 2-bit PPL (turbo2 K+V uniform)
+
+| Impl | @2K (64ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|------|------------|-----------|------------|------------|
+| **ours (TCQ)** | 6.742 | 7.266 | 7.294 | 7.484 |
+| TheTom turbo2 | **6.739** | 7.386 | 7.478 | 7.652 |
+| Duster turbo2 | 16.558 | 18.560 | 18.435 | 17.302 |
+| **Duster TBQ2** | 6.798 | **7.233** | **7.186** | **7.332** |
+
+Duster's turbo2 is broken (PPL 16-18). Duster's TBQ2 beats everyone at 8K+ context.
+Our TCQ with best codebook (not tested here): 6.708 @2K, 7.222 @64K — still behind TBQ2 at 32K.
+TheTom's turbo2 degrades most at long context.
+
+### 3-bit Speed (tok/s)
+
+| Impl | pp=512 | pp=8K | pp=32K | decode |
+|------|--------|-------|--------|--------|
+| ours (TCQ) | 892 | 878 | 796 | 28.7 |
+| **TheTom** | **1137** | **1109** | **989** | **30.8** |
+| Duster turbo3 | 1131 | 1102 | 986 | 30.1 |
+| Duster TBQ3 | FAIL | FAIL | FAIL | FAIL |
+
+TheTom 27% faster prefill, 7% faster decode. Duster turbo3 matches TheTom.
+Duster TBQ3 fails in llama-bench (context creation error).
+
+### 2-bit Speed (tok/s)
+
+| Impl | pp=512 | pp=8K | pp=32K | decode |
+|------|--------|-------|--------|--------|
+| ours (TCQ) | 981 | 957 | 859 | 29.4 |
+| TheTom turbo2 | **1151** | FAIL | FAIL | **30.4** |
+| Duster turbo2 | 1135 | 1105 | 988 | 30.6 |
+| Duster TBQ2 | FAIL | FAIL | FAIL | FAIL |
+
+TheTom turbo2 fails at 8K+ in llama-bench. Duster turbo2 is fastest (despite broken PPL).
+
+### Summary
+
+**Quality**: Our TCQ leads at 3-bit across all contexts. At 2-bit, Duster's TBQ2 (SRHT+Lloyd-Max)
+beats everyone at 8K+ context. Duster's TBQ3 also overtakes at 64K.
+
+**Speed**: We are 20-27% slower on prefill and ~7% slower on decode vs TheTom/Duster.
+This is the main gap to close.
+
+**Compression**: All turbo3 implementations are 3.25 bpv. All turbo2 are 2.25 bpv.
+Duster's TBQ types may differ — need to verify exact bpv.
+
+### Turbo4 PPL (4-bit, K+V uniform)
+
+| Impl | @2K (64ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|------|------------|-----------|------------|------------|
+| ours | 6.498 | 6.865 | 6.942 | 6.940 |
+| TheTom turbo4 | 6.552 | 6.972 | 7.056 | 7.058 |
+| Duster turbo4 | 6.498 | 6.865 | 6.942 | 6.940 |
+| **Duster TBQ4** | **6.492** | **6.856** | **6.920** | **6.909** |
+
+Ours and Duster's turbo4 are identical (same code). TheTom's is ~0.1 worse (missing
+inverse-FWHT prefill dequant?). Duster's TBQ4 marginally best everywhere.
+
+### Turbo4 Speed (tok/s)
+
+| Impl | pp=512 | pp=8K | pp=32K | decode |
+|------|--------|-------|--------|--------|
+| ours | 1135 | 1100 | 978 | 30.0 |
+| TheTom | 1134 | 1107 | 986 | 30.7 |
+| Duster turbo4 | 1135 | 1103 | 973 | 30.1 |
+
+All three identical — **speed gap is TCQ-specific, not general**.
+
+### Overall Competitive Assessment
+
+**Quality rankings by bitrate:**
+- 4-bit: Duster TBQ4 > ours = Duster turbo4 > TheTom (we're tied for 2nd)
+- 3-bit: **ours (TCQ) wins 2K-32K**, Duster TBQ3 wins 64K
+- 2-bit: Duster TBQ2 wins 8K+, ours wins 2K, TheTom worst
+
+**Speed gap is TCQ-only:**
+- turbo3 TCQ: 20-27% slower prefill, ~7% slower decode (Viterbi encode overhead)
+- turbo2 TCQ: similar pattern
+- turbo4: identical speed across all implementations (no TCQ)
+
+**Key insight:** TCQ's quality advantage comes at a speed cost. The Viterbi encode path
+is the bottleneck — turbo3/turbo4 without TCQ run at the same speed across all repos.
