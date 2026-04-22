@@ -3,6 +3,164 @@
 #include <cuda_fp16.h>
 #include "ggml-common.h"
 
+// === InnerQ per-channel equalization ===
+// Scale K channels before L2 norm + FWHT to reduce quantization error on anisotropic distributions.
+// Inverse scale applied to Q in FA kernel to preserve dot products.
+// Calibration: accumulate per-channel K^2, then set scale[i] = 1/sqrt(mean(K_i^2) * 128).
+static __device__ float d_innerq_channel_scale[128];     // per-channel K scale (init to 1.0)
+static __device__ float d_innerq_channel_scale_inv[128]; // per-channel Q inverse scale (init to 1.0)
+static __device__ float d_innerq_channel_sq[128];        // calibration accumulator: sum of K_i^2
+static __device__ float d_innerq_channel_max[128];       // calibration accumulator: max of |K_i| (for paper's formula)
+static __device__ int   d_innerq_count;                  // calibration token count
+static __device__ int   d_innerq_calibrate;              // 1 = accumulate stats, 0 = apply scales
+static __device__ int   d_innerq_is_k;                   // 1 = current set_rows is K cache, 0 = V cache
+
+// Forward declaration: fattn compilation unit has its own copy of inverse scales
+extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
+extern void turbo_innerq_init_fattn();
+
+// Host-side init: set identity scales, zero accumulators
+static void turbo_innerq_init() {
+    float ones[128];
+    for (int i = 0; i < 128; i++) ones[i] = 1.0f;
+    float zeros[128] = {};
+    int zero = 0;
+    cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
+    cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
+    cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
+    cudaMemcpyToSymbol(d_innerq_is_k, &zero, sizeof(zero));
+    turbo_innerq_init_fattn();
+}
+
+// Host-side: set K/V flag before kernel launch (called from set-rows.cu)
+static void turbo_innerq_set_is_k(int is_k) {
+    cudaMemcpyToSymbol(d_innerq_is_k, &is_k, sizeof(int));
+}
+
+// Host-side: enable calibration mode
+static void turbo_innerq_start_calibration() {
+    float zeros[128] = {};
+    int zero = 0, one = 1;
+    cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
+    cudaMemcpyToSymbol(d_innerq_calibrate, &one, sizeof(one));
+}
+
+// Host-side: finalize calibration — compute scales from accumulated stats
+static void turbo_innerq_finalize_calibration() {
+    int zero = 0;
+    cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
+
+    float sq[128], ch_max[128];
+    int count;
+    cudaMemcpyFromSymbol(sq, d_innerq_channel_sq, sizeof(sq));
+    cudaMemcpyFromSymbol(ch_max, d_innerq_channel_max, sizeof(ch_max));
+    cudaMemcpyFromSymbol(&count, d_innerq_count, sizeof(count));
+
+    if (count == 0) return;
+
+    // Mode: 0=RMS-based (default), 1=max-based (paper's formula: sqrt(max|K_i|))
+    static const char * mode_env = getenv("TURBO_INNERQ_MODE");
+    int mode = mode_env ? atoi(mode_env) : 0;
+
+    static const char * strength_env = getenv("TURBO_INNERQ_STRENGTH");
+    float strength = strength_env ? atof(strength_env) : 0.5f;
+    float max_clamp = 2.0f;
+
+    float scale[128], scale_inv[128];
+    float max_ratio = 1.0f;
+
+    if (mode == 1) {
+        // Paper's formula: scale[i] = 1/sqrt(max(|K_{:,i}|))
+        // This normalizes each channel so its max value becomes sqrt(max_val)
+        fprintf(stderr, "InnerQ mode=1 (paper's max-based formula)\n");
+        for (int i = 0; i < 128; i++) {
+            if (ch_max[i] > 1e-10f) {
+                float s = 1.0f / sqrtf(ch_max[i]);
+                // Normalize so mean scale = 1 (preserve overall magnitude)
+                scale[i] = s;
+            } else {
+                scale[i] = 1.0f;
+            }
+        }
+        // Normalize scales to have geometric mean ≈ 1
+        float log_sum = 0.0f;
+        for (int i = 0; i < 128; i++) log_sum += logf(scale[i]);
+        float geo_mean = expf(log_sum / 128.0f);
+        for (int i = 0; i < 128; i++) {
+            scale[i] /= geo_mean;
+            if (scale[i] > max_clamp) scale[i] = max_clamp;
+            if (scale[i] < 1.0f / max_clamp) scale[i] = 1.0f / max_clamp;
+            scale_inv[i] = 1.0f / scale[i];
+            float ratio = fmaxf(scale[i], 1.0f / scale[i]);
+            if (ratio > max_ratio) max_ratio = ratio;
+        }
+    } else {
+        // RMS-based: scale = (mean_rms/channel_rms)^strength
+        float total_rms = 0.0f;
+        float channel_rms[128];
+        for (int i = 0; i < 128; i++) {
+            channel_rms[i] = sqrtf(sq[i] / count);
+            total_rms += channel_rms[i];
+        }
+        float mean_rms = total_rms / 128.0f;
+
+        for (int i = 0; i < 128; i++) {
+            if (channel_rms[i] > 1e-10f) {
+                float raw = mean_rms / channel_rms[i];
+                float s = powf(raw, strength);
+                if (s > max_clamp) s = max_clamp;
+                if (s < 1.0f / max_clamp) s = 1.0f / max_clamp;
+                scale[i] = s;
+                scale_inv[i] = 1.0f / s;
+            } else {
+                scale[i] = 1.0f;
+                scale_inv[i] = 1.0f;
+            }
+            float ratio = fmaxf(scale[i], 1.0f / scale[i]);
+            if (ratio > max_ratio) max_ratio = ratio;
+        }
+    }
+
+    fprintf(stderr, "InnerQ calibration: %d tokens, mode=%d, strength=%.2f, max scale ratio: %.3f (clamped to %.1f)\n",
+            count, mode, strength, max_ratio, max_clamp);
+
+    // Auto-detect: if channels are already well-balanced, InnerQ won't help — skip
+    if (max_ratio < 1.2f) {
+        fprintf(stderr, "InnerQ: max ratio %.3f < 1.2 — channels already balanced, disabling (would hurt quality)\n", max_ratio);
+        float ones[128];
+        for (int i = 0; i < 128; i++) ones[i] = 1.0f;
+        cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
+        cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
+        turbo_innerq_update_fattn_scales(ones);
+        return;
+    }
+
+    // Print top-5 most affected channels
+    float scale_copy[128];
+    for (int i = 0; i < 128; i++) scale_copy[i] = scale[i];
+    for (int k = 0; k < 5; k++) {
+        float best = 0; int best_i = -1;
+        for (int i = 0; i < 128; i++) {
+            float r = fabsf(logf(scale_copy[i]));
+            if (r > best) { best = r; best_i = i; }
+        }
+        if (best_i >= 0) {
+            fprintf(stderr, "  channel %d: scale=%.4f (max=%.6f, rms=%.6f)\n",
+                    best_i, scale[best_i], ch_max[best_i], sqrtf(sq[best_i] / count));
+            scale_copy[best_i] = 1.0f; // mark as printed
+        }
+    }
+
+    cudaMemcpyToSymbol(d_innerq_channel_scale, scale, sizeof(scale));
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv, scale_inv, sizeof(scale_inv));
+    turbo_innerq_update_fattn_scales(scale_inv);
+}
+
 // === Shared constants ===
 static __constant__ float d_turbo_centroids_3bit[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
@@ -74,6 +232,7 @@ static __global__ void k_set_rows_turbo3(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s10, const int64_t s11, const int64_t s12,
+        const int innerq_is_k,
         const int64_t s1,  const int64_t s2,  const int64_t s3,
         const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd) {
@@ -93,6 +252,25 @@ static __global__ void k_set_rows_turbo3(
     const int blocks_per_group = QK_TURBO3_GROUP / QK_TURBO3;
     float x[128]; float norm_sq = 0.0f;
     for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
+    // InnerQ: calibrate from both K and V, apply scaling to both
+    if (d_innerq_calibrate) {
+        for (int j = 0; j < 128; j++) {
+            atomicAdd(&d_innerq_channel_sq[j], x[j] * x[j]);
+            float abs_val = fabsf(x[j]);
+            // atomicMax for float: CAS loop (no native float atomicMax)
+            unsigned int * addr = (unsigned int *)&d_innerq_channel_max[j];
+            unsigned int old_val = __float_as_uint(abs_val);
+            unsigned int assumed;
+            do {
+                assumed = *addr;
+                if (__uint_as_float(assumed) >= abs_val) break;
+            } while (atomicCAS(addr, assumed, old_val) != assumed);
+        }
+        atomicAdd(&d_innerq_count, 1);
+    }
+    for (int j = 0; j < 128; j++) x[j] *= d_innerq_channel_scale[j];
+    norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += x[j] * x[j];
     float grp_norm = sqrtf(norm_sq);
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;

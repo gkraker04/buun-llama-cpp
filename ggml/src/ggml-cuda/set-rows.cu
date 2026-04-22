@@ -1,6 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant-cuda.cuh"
+#include <cstring>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -334,6 +335,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         const int num_blocks_grid = (ne_total_groups + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
+        const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
@@ -343,7 +345,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             k_set_rows_turbo3<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
                 ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
-                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3,
+                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
@@ -357,12 +359,41 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 }
 
 
+// InnerQ calibration state machine (driven by TURBO_INNERQ env var)
+static int innerq_state = 0; // 0=uninit, 1=calibrating, 2=active, -1=disabled
+static int innerq_tokens_seen = 0;
+static constexpr int INNERQ_CALIBRATION_TOKENS = 100000; // count total set_rows tokens across all layers
+
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    // InnerQ: one-time init on first turbo SET_ROWS call
+    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0)) {
+        static const char * env = getenv("TURBO_INNERQ");
+        if (env && atoi(env) > 0) {
+            turbo_innerq_init();
+            turbo_innerq_start_calibration();
+            innerq_state = 1;
+            fprintf(stderr, "InnerQ: calibration started (collecting %d tokens)\n", INNERQ_CALIBRATION_TOKENS);
+        } else {
+            turbo_innerq_init(); // identity scales
+            innerq_state = -1;
+        }
+    }
+
+    // Track calibration progress
+    if (innerq_state == 1 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0)) {
+        innerq_tokens_seen += dst->src[0]->ne[1];
+        if (innerq_tokens_seen >= INNERQ_CALIBRATION_TOKENS) {
+            turbo_innerq_finalize_calibration();
+            innerq_state = 2;
+            fprintf(stderr, "InnerQ: calibration complete, scales active\n");
+        }
+    }
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);

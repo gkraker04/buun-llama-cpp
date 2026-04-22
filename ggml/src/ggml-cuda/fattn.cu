@@ -6,6 +6,17 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+// InnerQ: update the fattn-side inverse scale array from host
+void turbo_innerq_update_fattn_scales(const float * scale_inv) {
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, scale_inv, 128 * sizeof(float));
+}
+
+void turbo_innerq_init_fattn() {
+    float ones[128];
+    for (int i = 0; i < 128; i++) ones[i] = 1.0f;
+    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, ones, sizeof(ones));
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -308,7 +319,9 @@ static __global__ void k_turbo_fwht_forward(
     __shared__ float buf[128];
 
     if (threadIdx.x < 128) {
-        buf[threadIdx.x] = src[offset + threadIdx.x] * s1[threadIdx.x];
+        // InnerQ: apply inverse channel scale to Q before rotation
+        // This compensates for the channel scaling applied to K in SET_ROWS
+        buf[threadIdx.x] = src[offset + threadIdx.x] * d_innerq_channel_scale_inv_fattn[threadIdx.x] * s1[threadIdx.x];
     }
     __syncthreads();
 
