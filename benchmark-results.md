@@ -1865,6 +1865,15 @@ Removing V alpha hurts far more than removing K alpha:
 
 **V scaling contributes ~6.5x more to quality than K scaling.** This challenges the "attention temperature" narrative — the benefit primarily comes from V magnitude restoration, not attention routing sharpness.
 
+### 2-bit TCQ: Asymmetric Also Helps
+
+| Context | Sym K=V=1.20 | K=1.10, V=1.30 | Δ |
+|---------|-------------|----------------|--------|
+| 2K (64ch) | 6.3932 | 6.3737 | -0.020 |
+| 64K (4ch) | 6.3456 | 6.2519 | **-0.094** |
+
+Improvement consistent across bit rates (3-bit: −0.099 at 64K, 2-bit: −0.094 at 64K).
+
 ### Recommendations
 - **Universal default**: αK=1.10, αV=1.30 — no 2K regression, up to -0.099 PPL at 64K
 - **Long-context optimized**: αK=1.05, αV=1.35 — best 64K (-0.107) but slight 2K regression (+0.016)
