@@ -245,20 +245,22 @@ static __global__ void k_turbo4_dequant_f16(
     if (j >= ne0) return;
 
     const char * src_row = src + head * nb2 + row * nb1;
-    const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row;
+    const int blk_idx  = j / QK_TURBO4;
+    const int j_in_blk = j % QK_TURBO4;
+    const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
 
     const float norm = __half2float(blk->norm);
     const float rnorm = __half2float(blk->rnorm);
     const float qjl_scale = 1.2533141f / 128.0f * rnorm;
 
-    const int bit_offset = j * 3;
+    const int bit_offset = j_in_blk * 3;
     const int byte_idx = bit_offset / 8;
     const int bit_pos = bit_offset % 8;
     uint16_t raw = (uint16_t)blk->qs[byte_idx];
     if (byte_idx + 1 < 48) raw |= (uint16_t)blk->qs[byte_idx + 1] << 8;
     const uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
 
-    const float s = (blk->signs[j / 8] & (1 << (j % 8))) ? 1.0f : -1.0f;
+    const float s = (blk->signs[j_in_blk / 8] & (1 << (j_in_blk % 8))) ? 1.0f : -1.0f;
     const float val = (d_turbo_centroids_3bit_fattn[idx] + s * qjl_scale) * norm;
 
     dst[head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
@@ -269,8 +271,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool turbo_k = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    // turbo4's QJL correction loses precision in fp16 round-trip (PPL 5.90 vs 5.82).
+    // Only use prefill optimization for turbo3; turbo4 falls through to vec kernel.
+    const bool turbo_k = K->type == GGML_TYPE_TURBO3_0;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO3_0;
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
@@ -662,8 +666,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
-                          V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    // Only turbo3 uses prefill dequant+MMA (turbo4's QJL correction loses precision in fp16)
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
     if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         ggml_cuda_turbo_prefill_attend(ctx, dst);
         return;

@@ -145,3 +145,16 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 | 0 (ref) | uniform turbo3 | 5.8323 | -0.09% | 29.93 | baseline |
 
 **Key finding**: Asymmetric layer-adaptive does NOT help. Promoting only K or only V gives identical PPL (5.8390), both worse than uniform turbo3. The norm correction mismatch between turbo and q8_0 within the same layer hurts quality. Both K and V must be promoted together (mode 2) for the quality improvement to work.
+
+## turbo4 Prefill Dequant+MMA Investigation
+
+**Bug found**: turbo4 dequant_f16 kernel didn't handle ne0 > QK_TURBO4 (256 vs 128 for Qwen3.5-27B). Elements j >= 128 read from wrong block. Fix: add `blk_idx = j / QK_TURBO4` block indexing (matching turbo3 pattern).
+
+| Config | PPL (prefill via MMA) | PPL (prefill via vec) | Difference |
+|--------|----------------------|----------------------|------------|
+| turbo3 | 5.8501 | 5.8323 | +0.3% (acceptable) |
+| turbo4 (fixed) | 5.8966 | 5.8186 | +1.3% (too much) |
+
+**Root cause of turbo4 regression**: turbo4's QJL correction adds ~0.001 magnitude adjustments per element. This is at the limit of fp16 precision (10-bit mantissa). The fp16 round-trip (dequant → fp16 buffer → MMA read) rounds away the QJL signal. turbo3 is unaffected because its 8 centroids are coarse enough (~0.3 spacing) for fp16.
+
+**Decision**: Prefill dequant+MMA enabled for turbo3 only. turbo4 continues to use vec kernel for prefill (preserves PPL 5.8186 at cost of 588 tok/s prefill speed vs 1121 tok/s).
