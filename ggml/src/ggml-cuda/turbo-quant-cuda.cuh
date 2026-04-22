@@ -12,6 +12,39 @@ static __constant__ float d_turbo_mid_3bit[7] = {
     -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f
 };
 
+// === FWHT rotation sign arrays (from turbo-wht.h, seed=42 rotation, seed=1042 QJL) ===
+static __constant__ float d_turbo_wht_signs1[128] = {
+    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f};
+static __constant__ float d_turbo_wht_signs2[128] = {
+    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
+static __constant__ float d_turbo_qjl_wht_signs1[128] = {
+    1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+static __constant__ float d_turbo_qjl_wht_signs2[128] = {
+    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f};
+
+// === FWHT rotation functions ===
+static __device__ __forceinline__
+void turbo_fwht_128_cuda(float * x) {
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b; x[j + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
+}
+
+// Forward rotation: signs1 → FWHT → signs2
+static __device__ __forceinline__
+void turbo_rotate_forward_cuda(float * x, const float * s1, const float * s2) {
+    for (int i = 0; i < 128; i++) x[i] *= s1[i];
+    turbo_fwht_128_cuda(x);
+    for (int i = 0; i < 128; i++) x[i] *= s2[i];
+}
+
 static __device__ __forceinline__
 uint8_t turbo_find_nearest_3bit(float val) {
     if      (val < d_turbo_mid_3bit[0]) return 0;
@@ -55,19 +88,27 @@ static __global__ void k_set_rows_turbo3(
     float grp_norm = sqrtf(norm_sq);
     float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
-    // NOTE: FWHT rotation omitted — no graph-level inverse on CUDA yet.
-    // TODO: Add pre-rotate-Q in FA kernel + inverse-rotate output for optimal quality.
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    // Quantize and accumulate reconstruction norm for correction
+    float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
         block_turbo3_0 & blk = dst_row_ptr[grp_idx * blocks_per_group + b];
         const int off = b * QK_TURBO3;
-        blk.norm = __float2half(grp_norm);
         for (int j = 0; j < QK_TURBO3 / 4; j++) blk.qs[j] = 0;
         for (int j = 0; j < QK_TURBO3 / 8; j++) blk.signs[j] = 0;
         for (int j = 0; j < QK_TURBO3; j++) {
             uint8_t idx = turbo_find_nearest_3bit(x[off + j]);
             blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
             if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
+            float c = d_turbo_centroids_3bit[idx];
+            recon_norm_sq += c * c;
         }
+    }
+    // Norm correction: store corrected norm so dequant(x) has exact original L2 norm
+    float recon_norm = sqrtf(recon_norm_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+    for (int b = 0; b < blocks_per_group; b++) {
+        dst_row_ptr[grp_idx * blocks_per_group + b].norm = __float2half(corrected_norm);
     }
 }
 
@@ -106,6 +147,10 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     dst->norm = __float2half(norm);
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    float normalized[128];
+    for (int j = 0; j < 128; j++) normalized[j] = x[j];
+    // Forward FWHT rotation before quantization
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
     for (int j = 0; j < 48; j++) dst->qs[j] = 0;
     for (int j = 0; j < 16; j++) dst->signs[j] = 0;
     float recon[128];
@@ -117,12 +162,19 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
         if (bit_pos > 5 && byte_idx + 1 < 48)
             dst->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
     }
+    // Cross-space residual (matches Metal pre-rotate-queries approach)
+    float residual[128];
     float rnorm_sq = 0.0f;
     for (int j = 0; j < 128; j++) {
-        float r = x[j] - recon[j]; rnorm_sq += r * r;
-        if (r >= 0.0f) dst->signs[j / 8] |= (1 << (j % 8));
+        residual[j] = normalized[j] - recon[j];
+        rnorm_sq += residual[j] * residual[j];
     }
     dst->rnorm = __float2half(sqrtf(rnorm_sq));
+    // QJL rotation of residual, then extract sign bits
+    turbo_rotate_forward_cuda(residual, d_turbo_qjl_wht_signs1, d_turbo_qjl_wht_signs2);
+    for (int j = 0; j < 128; j++) {
+        if (residual[j] >= 0.0f) dst->signs[j / 8] |= (1 << (j % 8));
+    }
 }
 
 // === TURBO4: GET_ROWS dequantize ===

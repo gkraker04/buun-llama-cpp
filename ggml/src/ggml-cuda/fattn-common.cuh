@@ -311,24 +311,43 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
     float sum = 0.0f;
+    int prev_ib = -1;
+    float cn[8]; // register-based centroid × norm LUT
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
         const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO3;
+        const int j_start = elem0 % QK_TURBO3;
+
+        // Precompute centroid × norm into registers when block changes
+        if (ib != prev_ib) {
+            const float norm = __half2float(K_t3[ib].norm);
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
+            }
+            prev_ib = ib;
+        }
+
+        // Batch-load qs and signs for this 8-element range (j_start is always 8-aligned)
+        const uint8_t qs_lo = K_t3[ib].qs[j_start / 4];
+        const uint8_t qs_hi = K_t3[ib].qs[j_start / 4 + 1];
+        const uint8_t signs = K_t3[ib].signs[j_start / 8];
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int elem = (base_f2 + k_KQ_1) * 2;
-            const int ib = elem / QK_TURBO3, j0 = elem % QK_TURBO3;
-            // Norm caching: only reload when block changes
-            const float norm = __half2float(K_t3[ib].norm);
+            const int lj = k_KQ_1 * 2; // local offset 0,2,4,6 within the 8-element range
             float k0, k1;
-            { const int j = j0;
-              const uint8_t low2 = (K_t3[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
-              const uint8_t hi1  = (K_t3[ib].signs[j/8] >> (j%8)) & 0x1;
-              k0 = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm; }
-            { const int j = j0 + 1;
-              const uint8_t low2 = (K_t3[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
-              const uint8_t hi1  = (K_t3[ib].signs[j/8] >> (j%8)) & 0x1;
-              k1 = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm; }
+            { const uint8_t qs_b = (lj < 4) ? qs_lo : qs_hi;
+              const uint8_t low2 = (qs_b >> ((lj % 4) * 2)) & 0x3;
+              const uint8_t hi1  = (signs >> lj) & 0x1;
+              k0 = cn[low2 | (hi1 << 2)]; }
+            { const int lj1 = lj + 1;
+              const uint8_t qs_b = (lj1 < 4) ? qs_lo : qs_hi;
+              const uint8_t low2 = (qs_b >> ((lj1 % 4) * 2)) & 0x3;
+              const uint8_t hi1  = (signs >> lj1) & 0x1;
+              k1 = cn[low2 | (hi1 << 2)]; }
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
@@ -349,10 +368,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
     float sum = 0.0f;
-    // Norm caching: turbo4 block = 128 elements = D, so one block per head.
-    // Load norm/rnorm/qjl_scale once per block instead of per element pair.
     int prev_ib = -1;
-    float norm = 0.0f, qjl_scale = 0.0f;
+    float cn[8]; // register-based centroid × norm LUT
+    float qjl_norm = 0.0f; // qjl_scale × norm, precomputed
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
         const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
@@ -361,20 +379,24 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
             const int elem = (base_f2 + k_KQ_1) * 2;
             const int ib = elem / QK_TURBO4, j0 = elem % QK_TURBO4;
             if (ib != prev_ib) {
-                norm = __half2float(K_t4[ib].norm);
+                const float norm = __half2float(K_t4[ib].norm);
                 const float rnorm = __half2float(K_t4[ib].rnorm);
-                qjl_scale = 1.2533141f / 128.0f * rnorm;
+                qjl_norm = 1.2533141f / 128.0f * rnorm * norm;
+#pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
+                }
                 prev_ib = ib;
             }
             float k0, k1;
             { const int j = j0;
-              float c = d_turbo_centroids_3bit_fattn[turbo4_unpack_3bit_fattn(K_t4[ib].qs, j)];
-              float s = (K_t4[ib].signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
-              k0 = (c + s * qjl_scale) * norm; }
+              float c = cn[turbo4_unpack_3bit_fattn(K_t4[ib].qs, j)];
+              float s = (K_t4[ib].signs[j/8] & (1 << (j%8))) ? qjl_norm : -qjl_norm;
+              k0 = c + s; }
             { const int j = j0 + 1;
-              float c = d_turbo_centroids_3bit_fattn[turbo4_unpack_3bit_fattn(K_t4[ib].qs, j)];
-              float s = (K_t4[ib].signs[j/8] & (1 << (j%8))) ? 1.0f : -1.0f;
-              k1 = (c + s * qjl_scale) * norm; }
+              float c = cn[turbo4_unpack_3bit_fattn(K_t4[ib].qs, j)];
+              float s = (K_t4[ib].signs[j/8] & (1 << (j%8))) ? qjl_norm : -qjl_norm;
+              k1 = c + s; }
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
@@ -684,13 +706,22 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(
     const int     j0 = (int)(i0 % QK_TURBO3);
     const float norm = __half2float(x[ib].norm);
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    // Register-based centroid × norm LUT
+    float cn[8];
+#pragma unroll
+    for (int c = 0; c < 8; c++) cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
+    // Batch-load qs and signs bytes
+    const uint8_t qs_lo = x[ib].qs[j0 / 4];
+    const uint8_t qs_hi = (ne > 4 || j0 % 4 + ne > 4) ? x[ib].qs[j0 / 4 + 1] : 0;
+    const uint8_t signs = x[ib].signs[j0 / 8];
     float vals[ne];
 #pragma unroll
     for (int l = 0; l < ne; l++) {
-        const int j = j0 + l;
-        const uint8_t low2 = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
-        const uint8_t hi1  = (x[ib].signs[j/8] >> (j%8)) & 0x1;
-        vals[l] = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm;
+        const int lj = j0 % 4 + l;
+        const uint8_t qs_b = (lj < 4) ? qs_lo : qs_hi;
+        const uint8_t low2 = (qs_b >> ((lj % 4) * 2)) & 0x3;
+        const uint8_t hi1  = (signs >> ((j0 % 8) + l)) & 0x1;
+        vals[l] = cn[low2 | (hi1 << 2)];
     }
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
@@ -833,6 +864,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
+
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
