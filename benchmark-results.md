@@ -4900,3 +4900,217 @@ Beats paper α=1.04 at 8K/16K/32K. Matches per-context optimal at 16K.
 2K regression is inherent to decode-time alpha (encode-time wins at short context).
 
 **TODO**: 2-bit fine sweeps needed. Consider hybrid: encode-time α at short ctx, decode-time adaptive at long ctx.
+
+### S7: FP16 QK Accumulation (Gemma 4 31B, Q5_K_M, turbo3_tcq)
+
+Concept: Replace float FMA with half2 __hfma2 (2x throughput on Ampere) for Q*K dot product accumulation.
+
+| Build | pp512 tok/s | tg128 tok/s | PPL |
+|-------|-------------|-------------|-----|
+| S3 baseline | 410.11 ± 0.85 | 26.22 ± 0.11 | OK |
+| S7 (broken: read float2 as half2) | 465.59 ± 1.37 | 26.50 ± 0.01 | NaN |
+| S7 (fixed: float2→half2 convert) | 417.40 ± 1.15 | 26.19 ± 0.12 | **1467** |
+
+**Rejected.** On NVIDIA, Q is stored as float2 (V_DOT2_F32_F16_AVAILABLE is AMD-only). Converting both K and Q from float to half for __hfma2 introduces fatal rounding error (PPL 1467 vs expected ~10). The +1.8% speed from conversion overhead offsetting half2 throughput is not worth a 150x PPL regression. Would only work on AMD where Q is natively half2.
+
+## 2-bit turbo2_tcq Fine-Grained Decode V Alpha Sweep (2026-04-06)
+
+**Config**: K=turbo2_tcq, V=turbo2_tcq, Qwen3.5-27B Q6_K, dorei RTX 3090 (SM86)
+**Method**: TURBO_TCQ_DECODE_ALPHA_V static override, 0.005 alpha steps, encode alpha forced to 1.0
+**Base logits**: f16 KV, same GPU, same wikitext-2 test set
+
+### ctx=2048 (8 chunks)
+
+| α | KLD |
+|---|---|
+| 0.980 | 0.117962 |
+| 0.985 | 0.106166 |
+| 0.990 | 0.105058 |
+| 0.995 | 0.111652 |
+| 1.000 | 0.102415 |
+| 1.005 | 0.100632 |
+| 1.010 | 0.105949 |
+| 1.015 | 0.102284 |
+| 1.020 | 0.102029 |
+| 1.025 | 0.092002 |
+| **1.030** | **0.089631** |
+| 1.035 | 0.090786 |
+| 1.040 | 0.108500 |
+| 1.045 | 0.100355 |
+| 1.050 | 0.096376 |
+| 1.055 | 0.091924 |
+| 1.060 | 0.096972 |
+| 1.065 | 0.104394 |
+| 1.070 | 0.104681 |
+| 1.075 | 0.094663 |
+| 1.080 | 0.098771 |
+| 1.085 | 0.102405 |
+| 1.090 | 0.103402 |
+| 1.095 | 0.107941 |
+| 1.100 | 0.104177 |
+| 1.105 | 0.103487 |
+| 1.110 | 0.104963 |
+| 1.115 | 0.100118 |
+| 1.120 | 0.099885 |
+
+**Optimal**: α=1.030, KLD=0.089631. Good region: 1.025-1.055. Previous coarse optimal was α=1.06 (0.096972) — **7.7% improvement** from fine-grained sweep.
+
+### ctx=7168 (41 chunks)
+
+| α | KLD |
+|---|---|
+| 0.980 | 0.156314 |
+| 0.985 | 0.153300 |
+| 0.990 | 0.150484 |
+| 0.995 | 0.149293 |
+| 1.000 | 0.149423 |
+| 1.005 | 0.146340 |
+| 1.010 | 0.142318 |
+| 1.015 | 0.140829 |
+| 1.020 | 0.141461 |
+| 1.025 | 0.142034 |
+| 1.030 | 0.139547 |
+| 1.035 | 0.137421 |
+| 1.040 | 0.134213 |
+| 1.045 | 0.133975 |
+| 1.050 | 0.137707 |
+| 1.055 | 0.134986 |
+| 1.060 | 0.134844 |
+| **1.065** | **0.131410** |
+| 1.070 | 0.134114 |
+| 1.075 | 0.132144 |
+| 1.080 | 0.132501 |
+| 1.085 | 0.134813 |
+| 1.090 | 0.133009 |
+| 1.095 | 0.133206 |
+| 1.100 | 0.134908 |
+| 1.105 | 0.134106 |
+| 1.110 | 0.138920 |
+| 1.115 | 0.137020 |
+| 1.120 | 0.134538 |
+
+**Optimal**: α=1.065, KLD=0.131410. Good region: 1.040-1.095. Clear downward trend from 0.98→1.065, then flat plateau.
+
+### ctx=16384 (18 chunks)
+
+| α | KLD |
+|---|---|
+| 0.980 | 0.153945 |
+| 0.985 | 0.147283 |
+| 0.990 | 0.148052 |
+| 0.995 | 0.148146 |
+| 1.000 | 0.146519 |
+| 1.005 | 0.138568 |
+| 1.010 | 0.140696 |
+| 1.015 | 0.143318 |
+| 1.020 | 0.139618 |
+| 1.025 | 0.138608 |
+| 1.030 | 0.134231 |
+| 1.035 | 0.136990 |
+| 1.040 | 0.135913 |
+| 1.045 | 0.134947 |
+| 1.050 | 0.129960 |
+| 1.055 | 0.130328 |
+| 1.060 | 0.130384 |
+| 1.065 | 0.129489 |
+| 1.070 | 0.129752 |
+| 1.075 | 0.129664 |
+| 1.080 | 0.126689 |
+| 1.085 | 0.130034 |
+| **1.090** | **0.126175** |
+| 1.095 | 0.130961 |
+| 1.100 | 0.130712 |
+| 1.105 | 0.128086 |
+| 1.110 | 0.126764 |
+| 1.115 | 0.130740 |
+| 1.120 | 0.128221 |
+
+**Optimal**: α=1.090, KLD=0.126175. Good region: 1.065-1.120. Broad flat minimum — surface very noisy at this granularity.
+
+### ctx=32768 (9 chunks)
+
+| α | KLD |
+|---|---|
+| 0.980 | 0.111013 |
+| 0.985 | 0.108967 |
+| 0.990 | 0.106016 |
+| 0.995 | 0.105017 |
+| 1.000 | 0.107973 |
+| 1.005 | 0.105090 |
+| 1.010 | 0.098263 |
+| 1.015 | 0.098194 |
+| 1.020 | 0.092543 |
+| 1.025 | 0.097483 |
+| 1.030 | 0.093848 |
+| 1.035 | 0.092615 |
+| 1.040 | 0.093419 |
+| 1.045 | 0.090866 |
+| 1.050 | 0.093611 |
+| 1.055 | 0.086615 |
+| 1.060 | 0.087194 |
+| 1.065 | 0.085350 |
+| 1.070 | 0.086410 |
+| **1.075** | **0.083312** |
+| 1.080 | 0.086389 |
+| 1.085 | 0.085928 |
+| 1.090 | 0.086692 |
+| 1.095 | 0.086008 |
+| 1.100 | 0.091077 |
+| 1.105 | 0.083885 |
+| 1.110 | 0.085093 |
+| 1.115 | 0.087755 |
+| 1.120 | 0.086906 |
+
+**Optimal**: α=1.075, KLD=0.083312. Good region: 1.055-1.110. Very flat minimum — 16 alpha values within 5% of optimal.
+
+### Summary: 2-bit decode-time alpha optima
+
+| Context | ln(n_kv) | Optimal α | KLD | Good region |
+|---------|----------|-----------|-----|-------------|
+| 2K | 7.624 | 1.030 | 0.089631 | 1.025-1.055 |
+| 7K | 8.877 | 1.065 | 0.131410 | 1.040-1.095 |
+| 16K | 9.705 | 1.090 | 0.126175 | 1.065-1.120 |
+| 32K | 10.397 | 1.075 | 0.083312 | 1.055-1.110 |
+
+**Key finding**: 2-bit optimal alpha increases with context (opposite of 3-bit), confirming earlier coarse observations. Alpha rises from ~1.03 at 2K to ~1.08 at 32K. The surface is noisy but the trend is clear.
+
+### New adaptive formula
+
+LSQ fit to good-region centers: **α = 0.8865 + 0.0195 × ln(n_kv)**, clamped [1.00, 1.12]
+
+Previous formula: α = 0.984758 + 0.010165 × ln(n_kv) — nearly 2× steeper slope, lower intercept.
+
+| Context | Old formula α | New formula α | Measured optimal | Old error | New error |
+|---------|---------------|---------------|-----------------|-----------|-----------|
+| 2K | 1.063 | 1.035 | 1.030 | +0.033 | +0.005 |
+| 7K | 1.075 | 1.060 | 1.065 | +0.010 | -0.005 |
+| 16K | 1.084 | 1.076 | 1.090 | -0.006 | -0.014 |
+| 32K | 1.091 | 1.089 | 1.075 | +0.016 | +0.014 |
+
+**Big improvement at 2K**: error drops from 0.033 to 0.005 (6.6× more accurate). All predictions fall within the measured good region at every context length.
+
+Code updated in `fattn.cu:tcq_compute_alpha_v()`.
+
+### Adaptive formula end-to-end validation
+
+New formula `α = 0.8865 + 0.0195 × ln(n_kv)` running in adaptive mode (alpha varies per-token as n_kv grows). Same GPU, same model, same base logits as sweep.
+
+| Context | Static optimal | Old formula adaptive | **New formula adaptive** | Gap to static |
+|---------|---------------|---------------------|--------------------------|---------------|
+| 2K | 0.089631 (α=1.030) | — | **0.101053** | +12.7% |
+| 7K | 0.131410 (α=1.065) | — | **0.136365** | +3.8% |
+| 16K | 0.126175 (α=1.090) | — | **0.129307** | +2.5% |
+| 32K | 0.083312 (α=1.075) | — | **0.084869** | +1.9% |
+
+The 2K gap (12.7%) is inherent to adaptive: early tokens (n_kv=1..500) use suboptimal alpha. At 32K, the per-token ramp averages out and the gap is only 1.9%. This is the correct tradeoff for real-world usage where context fills dynamically.
+
+### Old vs new formula comparison (adaptive mode)
+
+| Context | Old formula | New formula | Δ | Static optimal |
+|---------|-------------|-------------|---|---------------|
+| 2K | 0.100508 | 0.101053 | +0.5% | 0.089631 |
+| 7K | 0.136549 | 0.136365 | -0.1% | 0.131410 |
+| 16K | 0.130971 | 0.129307 | -1.3% | 0.126175 |
+| 32K | 0.085078 | 0.084869 | -0.2% | 0.083312 |
+
+The improvement is modest in adaptive mode (per-token averaging smooths out formula differences). New formula improves 16K by 1.3% and 32K by 0.2%. The real benefit is closer-to-optimal per-token alpha distribution, especially at short context where the old formula was 0.033 off from static optimal vs 0.005 for the new.

@@ -284,7 +284,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 // Context-adaptive V alpha: logarithmic scaling based on current KV occupancy.
 // 3-bit: alpha = 1.1484 - 0.01443 * ln(n_kv), calibrated on Qwen3.5-27B decode-time KLD sweeps
 //   at 8K/16K/32K. Optima: 8K→1.020, 16K→1.005, 32K→1.000.
-// 2-bit: alpha = 0.984758 + 0.010165 * ln(n_kv), same calibration (excluding 4K outlier)
+// 2-bit: alpha = 0.8865 + 0.0195 * ln(n_kv), calibrated on fine-grained 0.005-step decode-time
+//   KLD sweeps at 2K/7K/16K/32K on Qwen3.5-27B. Optima: 2K→1.030, 7K→1.065, 16K→1.090, 32K→1.075.
 // Override with TURBO_TCQ_DECODE_ALPHA_V env var to force a static alpha (disables adaptive).
 static float d_tcq_decode_alpha_v_static = 0.0f; // 0 = use adaptive, >0 = static override
 static float d_tcq_decode_alpha_k = 1.0f;       // K decode alpha, static (default 1.0)
@@ -300,7 +301,9 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
         // Clamped [0.98, 1.06] — early tokens (small n_kv) use higher alpha.
         return fmaxf(0.98f, fminf(1.06f, 1.1484f - 0.01443f * ln_ctx));
     } else if (v_type == GGML_TYPE_TURBO2_TCQ) {
-        return fmaxf(1.00f, fminf(1.12f, 0.984758f + 0.010165f * ln_ctx));
+        // v2: 4-point fit from fine-grained 0.005-step KLD sweeps at 2K/7K/16K/32K.
+        // Per-token: n_kv=512→1.008, 2K→1.035, 7K→1.060, 16K→1.076, 32K→1.089
+        return fmaxf(1.00f, fminf(1.12f, 0.8865f + 0.0195f * ln_ctx));
     }
     return 1.0f;
 }

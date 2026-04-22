@@ -942,6 +942,55 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Conclusion**: Reverted. The FWHT rotation that makes values more uniform for quantization also makes them more uniform for fp16 representation. Applying inv_fwht before fp16 cast defeats this benefit.
 **Branch**: experiment/fused-k-dequant
 
+### 90. Gemma 4 architecture support `done`
+**Source**: Google Gemma 4 (April 2026). Cherry-picked from upstream PR #21309 + tokenizer fix #21343.
+**Implementation**: New `gemma4-iswa.cpp` graph builder (311 lines). Architecture support in llama-arch, llama-hparams, llama-model. Tokenizer: BPE with SPM-style whitespace escaping + special newline handling.
+**Features supported**: ISWA (5:1 SWA:global), MoE (128 experts top-k=8 + shared expert), PLE (per-layer embeddings), K=V, shared KV layers, variable head_dim (256/512).
+
+**D=512 VEC kernel fixes** (3 bugs):
+1. `get_best_fattn_kernel` head_dim switch missing `case 512:` → FA ops falling to CPU → segfault
+2. Turbo prefill MMA path has no D=512 templates → abort. Fix: fall back to VEC when D>256
+3. Decode dequant→fp16 at D=512 routing to MMA instead of VEC → abort. Fix: skip dequant at D>256
+
+**Results** (see benchmark-results.md for full data):
+- **26B MoE**: K-only turbo3 is free (-1.7% PPL). V catastrophic (+70%). Recommend K-only.
+- **31B dense**: K-only turbo3 helps PPL (-10.2%!). K+V only +5.3%. Recommend K+V.
+- Decode speed 76-90% of q8_0 (MoE/dense model compute dominates).
+- Qwen3.5-27B regression: none (5.8501 vs 5.8377 golden).
+
+**Note**: head_dim=256/512 are already 128-aligned, so no head padding needed.
+
+### 91. Per-layer alpha gradient for TCQ V quantization `tested-negative`
+**Concept**: Different V alpha per layer: `α_l = base + slope * (l / (n_layers - 1))`. Deeper layers accumulate more error, may benefit from higher alpha. Linear schedule as simplest possible depth-dependent scaling.
+**Implementation**: `__constant__` arrays `d_tcq_norm_alpha_v_per_layer[256]` and `d_tcq_per_layer_alpha_enabled` in turbo-quant-cuda.cuh. Layer index extracted from tensor name (`cache_v_l42`). Env vars: `TURBO_TCQ_ALPHA_V_FUNC=base,slope`, `TURBO_TCQ_N_LAYERS=N`.
+**PPL screening** (Qwen3.5-27B, 2K, 8 chunks, base=0.98):
+- slope -0.10 → PPL 7.2011, slope +0.02 → PPL 6.9374. Clear monotonic improvement with positive slope — deeper layers benefit from higher alpha.
+**KLD sweep** (Qwen3.5-27B, 2K, 16 chunks, 29 configurations):
+- **Uniform α=1.04: KLD 0.051270** (baseline)
+- base=1.04 slope=0.00: KLD 0.051270 (validates implementation — exact match)
+- **Every positive slope degrades KLD**: smallest tested (+0.02) → 0.060794 (+18.6%), largest (+0.14) → 0.094316 (+84%)
+- base=1.06 slope=+0.14: best PPL (5.722) but worst KLD (0.104, +103%)
+- No configuration across 4 bases × 7 slopes beats uniform
+**Key finding**: PPL and KLD diverge dramatically. PPL monotonically improves with positive slope. KLD monotonically worsens. The PPL "improvement" is distributional distortion, not fidelity.
+**Root cause**: α=1.04 reflects a global property of the FWHT + quantization pipeline (optimal norm inflation), not a per-layer effect. All layers need the same correction factor.
+**Conclusion**: Linear depth gradients do not help. Publishable negative result demonstrating PPL is unreliable for KV cache quantization parameter optimization.
+
+### 93. S8: Padded SMEM codebook layout `rejected`
+**Concept**: Add 1 padding slot per 32 codebook entries (512→528) to break mod-32 bank aliasing. Access via `cb[state + (state >> 5)]`.
+**Results** (Gemma 4 31B, turbo3_tcq): pp512 -9.7% (410→370), tg128 -0.9%
+**Why it failed**: Bank conflicts from random TCQ state lookups are inherent to birthday problem (32 threads, 32 banks, uniform random access). Redistributing entries doesn't change collision probability. Extra ALU per lookup causes net regression.
+
+### 94. S7: FP16 QK accumulation `rejected`
+**Concept**: Use half2 `__hfma2` (2x throughput on Ampere) for Q*K dot product accumulation instead of float FMA.
+**Results** (Gemma 4 31B, turbo3_tcq): pp512 +1.8% (410→417) but PPL = 1467 (should be ~10).
+**Why it failed**: On NVIDIA, Q is stored as float2 (`V_DOT2_F32_F16_AVAILABLE` is AMD-only). Converting both K and Q from float→half for `__hfma2` introduces fatal rounding error. Initial +13.5% result was a bug (reading float2 as half2 = garbage).
+**Key insight**: NVIDIA llama.cpp VEC kernel uses float Q registers. Half-precision QK reduction only works on AMD (where Q is natively half2) or with tensor cores (FlashInfer's approach — different kernel architecture).
+
+### 95. 2-bit decode-time V alpha fine calibration `done`
+**Concept**: Fine-grained (0.005-step) decode-time V alpha sweep for turbo2_tcq at 2K/7K/16K/32K to find true optima and fit a better adaptive formula.
+**Results**: Old formula had 0.033 error at 2K. New formula `α = 0.8865 + 0.0195 × ln(n_kv)` reduces max error to 0.014. End-to-end adaptive validation: 2K=0.101, 7K=0.136, 16K=0.129, 32K=0.085.
+**Key insight**: 2-bit optimal alpha increases with context (opposite of 3-bit), from ~1.03 at 2K to ~1.08 at 32K. Surface is noisy but trend is clear and well-captured by log formula. New slope is nearly 2× steeper than old.
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**
