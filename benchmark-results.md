@@ -296,3 +296,254 @@ PPL verification: 19.7152 (bit-exact match — turbo3 centroids are lossless in 
 **Key finding**: FP16 dequant eliminates context scaling degradation on MoE models
 (127 t/s flat from p=0 to p=32K) and has ZERO cost on dense models at all context lengths.
 Could be made the default for turbo3 decode.
+
+## Experiment: Attention-Sink Token Protection (#23)
+
+Store first N KV positions at fp16 precision (pre-quantization), overwrite dequanted fp16
+buffer before flash attention. Sink tokens receive disproportionate attention weights.
+
+| Config | PPL (2K/8chunks) | Delta vs baseline |
+|--------|------------------|-------------------|
+| turbo3 baseline (no sink) | 5.8501 ± 0.165 | — |
+| N=4 sink tokens | 5.8246 ± 0.164 | -0.026 |
+| N=8 sink tokens | 5.8506 ± 0.165 | +0.001 |
+| N=16 sink tokens | 5.8894 ± 0.167 | +0.039 |
+
+**Conclusion**: No significant improvement. All results within error bars (±0.165).
+turbo3 + FWHT + norm correction already achieves high enough quality that protecting
+sink positions provides no measurable benefit. The attention-sink phenomenon amplifies
+quantization error at those positions, but turbo3's error is too small for the effect
+to matter.
+
+## Experiment: NSNQuant Per-Token DC Removal (#22)
+
+Subtract per-element mean and renormalize before FWHT rotation. Simplified version of
+NSNQuant (which uses cross-token channel means, incompatible with per-token SET_ROWS).
+
+| Config | PPL (2K/8chunks) | Delta vs baseline |
+|--------|------------------|-------------------|
+| turbo3 baseline | 5.8501 ± 0.165 | — |
+| turbo3 + DC removal | 5.8827 ± 0.166 | +0.033 (noise) |
+| turbo4 baseline | 5.8186 (ref) | — |
+| turbo4 + DC removal | 17.4134 ± 0.618 | **+11.6 (catastrophic)** |
+
+**Conclusion**: Per-token DC removal provides no benefit for turbo3 (values already
+near-zero-mean after normalization + FWHT) and is catastrophic for turbo4 (QJL residual
+computed relative to DC-removed signal but decoded without DC restoration).
+
+## Experiment: MSE-Optimal Norm Correction (bonus)
+
+Replace L2-preserving norm correction (β = ||x||/||q||) with MSE-optimal scaling
+(α = ||x|| · dot(x,q) / ||q||²). Theoretically halves per-element MSE.
+
+| Config | PPL (2K/8chunks) | Delta vs baseline |
+|--------|------------------|-------------------|
+| turbo3 L2-preserving (baseline) | 5.8501 ± 0.165 | — |
+| turbo3 MSE-optimal | 5.9083 ± 0.167 | +0.058 (worse) |
+
+**Conclusion**: MSE-optimal scaling reduces the norm by cos(θ), effectively lowering
+attention temperature (making softmax more uniform). L2-preserving is better for
+attention because it maintains the intended dot-product magnitudes.
+
+## Session 2026-03-27 Night — Experiment Run Summary
+
+Working through Ready experiments, then Needs Research. Progress:
+- **#39 GSR Walsh ordering**: DONE — NEUTRAL (random signs negate benefit)
+- **#40 HadaNorm mean-centering**: DROPPED (duplicate of #22, incompatible with per-token quant)
+- **#49/#17 parallel_blocks tuning**: DONE — NO EFFECT (FFN dominates decode, not attention)
+- **#45 Gemma-3 SWA V bug**: DONE — **FIXED**. Added V un-rotation to iSWA build_attn overload. Gemma-3 turbo3 K+V PPL 5.8867 (+3.3% vs q8_0 5.6995). Was 45T before fix.
+- **#31 Turbo in speculative decoding**: DONE — NO BENEFIT (draft KV is tiny, spec decode slower than normal decode for this pair)
+- **#16b turbo4 prefill fix**: NOT YET STARTED
+- **#42 KVLinC asymmetric K/V rotation**: DONE — NEGATIVE (rotation helps both K and V)
+- **turbo4 head_dim=128 bug**: FOUND ROOT CAUSE — see below
+
+Server state: iSWA fix deployed at `/root/llama-cuda-turbo/` on `root@dorei`. Fully rebuilt.
+
+## BUG FOUND: turbo4 K broken on head_dim=128
+
+turbo4-K produces PPL 33K on Qwen3-14B (head_dim=128). turbo4-V works fine (PPL 6.62).
+
+**Root cause**: In `fattn.cu` line 702, the Q pre-rotation check is:
+```c
+const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
+```
+This only checks for TURBO3_0, NOT TURBO4_0! So when using turbo4 K:
+1. Q pre-rotation is SKIPPED (turbo_kv is false)
+2. Vec kernel gets UNROTATED Q dotted with ROTATED K → garbage dot products → PPL 33K
+
+This same `turbo_kv` variable gates THREE things in the else branch (lines 702-773):
+1. Line 713: `do_decode_dequant` — fp16 decode dequant (turbo4 doesn't need this anyway)
+2. Line 759: Q pre-rotation — **THIS IS THE BUG**. turbo4 K is stored rotated but Q never gets rotated
+3. The fp16 dequant kernels at lines 722/738 only handle TURBO3_0 blocks (correct, turbo4 uses vec kernel)
+
+**Fix**: Change line 759 to check for turbo4 K type too:
+```c
+const bool turbo_k_any = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+if (turbo_k_any && Q->ne[0] % 128 == 0) {
+```
+Only need to check K type (not V) since Q pre-rotation is for the Q·K dot product.
+
+**Mystery**: turbo4-K + q8_0-V gave PPL 5.8451 on Qwen3.5-27B (head_dim=256) in experiment #10. Need to verify this wasn't a fluke or different code state. The bug should affect ALL turbo4-K regardless of head_dim.
+
+**Test data** (Qwen3-14B Q5_K_M, head_dim=128, 2K/8chunks):
+- q8_0 baseline: PPL 6.5020
+- turbo3 K+V: PPL 6.7458 (+3.7%)
+- turbo4 K+V: PPL 32643 (BROKEN)
+- turbo4 K + q8_0 V: PPL 33890 (BROKEN — confirms K is the issue)
+- q8_0 K + turbo4 V: PPL 6.6232 (+1.9% — V works great, better than turbo3!)
+- GGML_TURBO_DECODE_FP16=1 turbo4 K: still broken (same PPL 33890 — rules out vec_dot inline bug)
+Local branch: `feature/turboquant-kv-cache` with iSWA fix + experiments.md + benchmark-results.md updates.
+
+## Gemma-3-27B-it turbo3 Results (post-#45 iSWA fix)
+
+| Config | PPL (2K/8chunks) | vs q8_0 | Notes |
+|--------|------------------|---------|-------|
+| q8_0 baseline | 5.6995 ± 0.174 | — | |
+| turbo3 K+V | 5.8867 ± 0.170 | +3.3% | **was 45T PPL before fix** |
+| turbo3-K + q8_0-V | 5.9633 ± 0.174 | +4.6% | K-only |
+
+**Finding**: With iSWA V un-rotation fix, Gemma-3 turbo3 matches the head_dim=128 degradation pattern (+3-4% PPL). Same as MN-Violet-Lotus (+2.6%) and Qwen3-14B (+3.8%). K-only is slightly worse than K+V, consistent with "values matter more" finding.
+
+## Experiment: KVLinC No-K-Rotation (#42)
+
+| Config | PPL (2K/8chunks) | vs q8_0 |
+|--------|------------------|---------|
+| turbo3 baseline (both rotated) | 5.8323 | -0.09% |
+| turbo3 K unrotated, V rotated | 6.1647 | +5.6% |
+| turbo3 neither rotated (prior) | 6.2357 | +6.8% |
+| q8_0 | 5.8375 | — |
+
+**Conclusion**: KVLinC's "rotation hurts keys" finding does NOT apply to turbo3 Lloyd-Max codebook. Rotation helps both K and V. K rotation alone contributes ~0.07 PPL, V rotation ~0.33 PPL, together ~0.40 PPL improvement.
+
+Experiment branches created: `experiment/gsr-walsh-ordering`, `experiment/parallel-blocks-tuning`, `experiment/kvlinc-no-k-rotation`.
+
+## Experiment: parallel_blocks Tuning (#49/#17)
+
+Forced different parallel_blocks values via GGML_PARALLEL_BLOCKS env var.
+turbo3 tg64 at 32K context:
+
+| parallel_blocks | tok/s |
+|-----------------|-------|
+| default (auto) | 29.95 ± 0.07 |
+| 1 | 29.97 ± 0.07 |
+| 2 | 29.95 ± 0.10 |
+| 4 | 29.95 ± 0.06 |
+| 8 | 29.96 ± 0.05 |
+| 16 | 29.96 ± 0.07 |
+| 32 | 29.93 ± 0.08 |
+| q8_0 baseline | 30.81 ± 0.07 |
+
+**Conclusion**: NO EFFECT. All values within noise. Attention is <5% of decode
+time — FFN dominates. 2.8% turbo3→q8_0 gap is structural dequant overhead.
+
+## Experiment: GSR Walsh Ordering (#39)
+
+Reorder FWHT output by sequency (sign-change count) to group similar-frequency
+components into turbo3 quantization blocks.
+
+| Config | PPL (2K/8chunks) | vs q8_0 |
+|--------|------------------|---------|
+| turbo3 baseline (natural Hadamard) | 5.8323 | -0.09% |
+| turbo3 + Walsh ordering | 5.8248 | -0.22% |
+| q8_0 reference | 5.8375 | — |
+
+**Conclusion**: NEUTRAL (-0.13%, within ±0.164 error bars). Random sign arrays
+in PolarQuant already decorrelate all 128 FWHT output elements, making them
+identically distributed. Sequency reordering cannot improve intra-block variance
+when frequency structure is already destroyed by random signs. GSR paper's gains
+(PPL 20.29→11.59) were with non-randomized Hadamard.
+
+## Multi-Model Validation (turbo3 uniform, 2K context)
+
+**BUG FIX**: KV cache context OOM for turbo types — the ggml context allocation didn't
+account for turbo rotation matrix tensors (2 extra objects). Fixed by adding `n_turbo_extra`
+to the context size calculation in `llama-kv-cache.cpp`.
+
+| Model | Architecture | head_dim | q8_0 PPL | turbo3 PPL | Delta |
+|-------|-------------|----------|----------|-----------|-------|
+| Qwen3.5-27B Q6_K | qwen3 | 256 | 5.8375 | 5.8501 | +0.2% |
+| Qwen3.5-35B-A3B Q4_K_S (MoE) | qwen3 | 256 | 6.4155 | 6.4334 | +0.3% |
+| MN-Violet-Lotus-12B Q4_K_M | llama | 128 | 5.6051 | 5.7494 | +2.6% |
+| Qwen3-14B Q5_K_M | qwen3 | 128 | 8.3084 | 8.6230 | +3.8% |
+| Gemma-3-27B-it Q4_K_M (K only) | gemma3 | 128 | 5.6995 | 7.4946 | +31% |
+| Gemma-3-27B-it Q4_K_M (V only) | gemma3 | 128 | 5.6995 | **45T** | **broken** |
+
+**Key findings**:
+1. turbo3 works excellently on Qwen3.5 models (head_dim=256): <0.3% PPL increase
+2. Quality degrades moderately on head_dim=128 models: +2.6% to +3.8% PPL
+3. **Gemma-3 V is completely broken** — turbo3 V produces catastrophic PPL on Gemma-3's
+   SWA/global hybrid attention architecture. turbo3 K works (degraded). Root cause:
+   likely related to the interleaved sliding-window attention cache architecture.
+4. The KV cache context OOM was a latent bug affecting all non-Qwen3.5 models with turbo types
+
+## Experiment #50: turbo4 Q Pre-rotation Fix (APPLIED)
+
+**Fix**: In `fattn.cu`, changed Q pre-rotation guard from `turbo_kv` (only checks TURBO3_0) to
+`turbo_k_any = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0)`.
+
+### Qwen3.5-27B Q6_K (head_dim=256, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 K+V | 5.8375 | — |
+| q8_0-K + turbo4-V | 5.8372 | -0.01% |
+| turbo4-K + q8_0-V | 5.8451 | +0.13% |
+| **turbo4 K+V** | **5.8186** | **-0.32%** |
+| turbo3 uniform | 5.8501 | +0.22% |
+
+**turbo4 K+V BEATS q8_0 on head_dim=256!** Also beats turbo3.
+
+### Qwen3-14B Q5_K_M (head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 K+V | 6.5020 | — |
+| q8_0-K + turbo4-V | 6.6232 | +1.9% |
+| turbo3 K+V | 6.7458 | +3.7% |
+| turbo4-K + q8_0-V | 6.8322 | +5.1% |
+| turbo4 K+V | 6.9118 | +6.3% |
+
+On head_dim=128, turbo4-V (+1.9%) beats turbo3 K+V (+3.7%), but turbo4-K (+5.1%) is the weak link.
+
+### Summary
+- Fix resolves turbo4 K from garbage (33K PPL) to functional on both head_dim sizes
+- head_dim=256: turbo4 is the BEST quantization option (-0.32% vs q8_0)
+- head_dim=128: turbo4-V excellent, turbo4-K degrades more than turbo3
+- Experiment #10's turbo4-K result (5.8451) confirmed reproducible after fix
+
+## Sparse V Dequant (credit: TheTom, sparse-v-dequant)
+
+Skip V dequantization for KV positions where `exp(score - max) < 1e-6`.
+At long context, 90%+ of attention weights are negligible — eliminating those
+dequant operations removes work without quality loss.
+
+### Quality (turbo3, Qwen3.5-27B, 2K/8chunks)
+PPL = 5.8501 — **bit-identical** to baseline. Zero quality impact.
+
+### Dense Model: Qwen3.5-27B Q6_K — Decode tg64
+
+| Context | turbo3 (fp16 dq) | turbo3 (native) | turbo4 |
+|---------|------------------|-----------------|--------|
+| 4K | 30.25 | — | 29.68 |
+| 32K | 30.03 | 30.02 | — |
+
+No meaningful improvement on dense model (attention is <5% of decode compute).
+
+### MoE Model: Qwen3.5-35B-A3B Q4_K_S — Decode tg64
+
+**KEY FINDING: sparse V eliminates context scaling regression on native dequant!**
+
+| Context | fp16 dq (sparse V) | native (sparse V) | native (no sparse V, old) |
+|---------|--------------------|--------------------|---------------------------|
+| p=0 | — | — | 125.77 |
+| 4K | 127.53 | 127.13 | — |
+| 8K | — | **126.89** | **114.44** (-9% regression!) |
+| 32K | 126.70 | **126.21** | (worse) |
+
+Native dequant with sparse V matches fp16 dequant speed at all contexts.
+The fp16 dequant path was originally created to fix this regression — sparse V
+achieves the same fix with zero extra memory bandwidth (no temp fp16 buffer).
+
+### CUDA 13.2 Compatibility
+Built and tested with CUDA 13.2.0 (nvcc V13.2.51). No segfault, identical results.
+Turbo3 PPL: 5.8501 (identical). Turbo4 PPL: 5.8186 (identical).

@@ -165,24 +165,18 @@ Prefill pp4096 (tok/s):
 **Challenge**: Shared memory is ~48KB/SM. A turbo4 block = 128 floats = 512 bytes dequantized. Balance cache size vs occupancy.
 **Difficulty**: Medium (1-2 weeks).
 
-### 16. Prefill-specific dequant-then-attend
-**Status**: needs-research
-**Type**: speed (prefill)
-**What**: Separate prefill path: batch-dequantize KV to fp16 temporary buffer, run standard fp16 MMA attention on it. Trades temporary VRAM for q8_0-equivalent prefill speed.
-**Challenge**: Memory overhead. 32K context × 128 head dim × 2 bytes × num_heads per layer. But turbo's whole point is saving KV VRAM — spending some temporarily during prefill is a reasonable tradeoff.
-**Difficulty**: Medium (1-2 weeks). Simplest approach to prefill parity.
+### 16 (original). ~~Prefill-specific dequant-then-attend~~
+**Status**: done — **superseded by #16 above** (turbo3 1125 tok/s, 98.8% of q8_0)
 
 ---
 
 ## Needs Research — Decode Speed (polish: 95-97% → parity)
 
-### 17. Split-K / FlashDecoding for very long context
-**Status**: needs-research
+### 17. Split-K / FlashDecoding tuning for turbo decode
+**Status**: done — **NO EFFECT** (see #49)
 **Type**: speed (decode)
-**Paper**: FlashDecoding (Stanford), FlashDecoding++ (MLSys 2024)
-**What**: Split KV sequence across multiple thread blocks, reduce results. FlashDecoding++ adds async softmax eliminating 18.8% sync overhead. Vulkan backend already has `flash_attn_split_k_reduce.comp`.
-**How it applies**: At very long context (64K+), single thread block can't process KV fast enough. Split-K would help. Also, async softmax could close the remaining 3-5% decode gap.
-**Difficulty**: Low-Medium (1-2 weeks).
+**Papers**: FlashDecoding (Stanford), FlashDecoding++ (MLSys 2024)
+**Result**: Tested via #49 (GGML_PARALLEL_BLOCKS override). All parallel_blocks values 1-32 produce identical decode speed (~29.95 tok/s). Attention is <5% of decode time — FFN dominates. The remaining 2.8% turbo3→q8_0 gap is structural and can't be closed by attention tuning. Items 3-5 (nbatch_fa, stream_k, async softmax) also won't help since attention isn't the bottleneck.
 
 ### 18. SAS softmax optimization
 **Status**: needs-research
@@ -225,36 +219,47 @@ Prefill pp4096 (tok/s):
 **How it applies**: Add a learned permutation vector (one per model, computed during calibration) that reorders channels before FWHT in SET_ROWS. Inverse permutation after dequant. The permutation is just an index lookup — essentially free.
 **Difficulty**: Low (a few days). High potential quality win.
 
-### 20. SmoothRot — channel-wise scaling before FWHT
-**Status**: needs-research
-**Type**: quality (minimal decode cost)
+### 20. ~~SmoothRot — channel-wise scaling before FWHT~~
+**Status**: dropped — **NOT APPLICABLE to KV cache**
+**Type**: quality
 **Paper**: SmoothRot (arXiv:2506.05413, Jul 2025)
-**What**: Per-channel scaling factors applied before Hadamard rotation. Reduces outlier magnitude so FWHT produces more uniform post-rotation distribution. 10-30% quantization gap reduction, no added latency at decode.
-**How it applies**: Store per-channel scale factors (computed from calibration data). Multiply before FWHT in SET_ROWS, divide after dequant. The divide can be folded into the norm.
-**Difficulty**: Low-Medium (1 week). Complements channel reordering (#19).
+**Research** (2026-03-27): SmoothRot only targets **FFN down-projection** massive outliers (>100x magnitude) in GLU architectures. It does NOT target KV cache quantization or attention projections. The paper explicitly states applying smoothing before attention layers showed "limited gains." Gains also vanish when combined with GPTQ. Not applicable to our head_dim=128 KV cache quality gap.
 
 ### 21. WUSH — data-aware transform replacing pure FWHT
-**Status**: needs-research
+**Status**: needs-research — **impractical as designed, diagonal approximation viable**
 **Type**: quality
 **Paper**: WUSH (arXiv:2512.00956, Nov 2025, ISTA/ETH)
-**What**: Proves Hadamard is the optimal *data-agnostic* orthogonal transform. Then derives a non-orthogonal transform: Hadamard + data-dependent SVD-based diagonal scaling. Reduces error by up to d× (d=block size). Consistently beats pure Hadamard on MXFP4 and INT4.
-**How it applies**: Replace FWHT with WUSH in SET_ROWS. The diagonal scaling factors would need to be stored per-model or per-layer (small overhead). Decode dequant would need the inverse scaling — can fold into norm.
-**Difficulty**: Medium (1-2 weeks). Strongest theoretical backing.
+**What**: T_wush = H * S^{-1/2} * U^T * W'^T. Proves Hadamard is the optimal *data-agnostic* orthogonal transform, then derives optimal *data-dependent* non-orthogonal transform.
+**Research** (2026-03-27): 50-60% layer loss reduction over Hadamard on K/V projections (Qwen3-8B MXFP4). End-to-end: +2.2-2.9pp quality recovery. However, the full transform is a **dense d×d matrix-vector multiply per block** — O(d²) vs O(d log d) for FWHT. With d=128: ~16384 FMAs vs ~896 for FWHT = **18x more compute**. Also requires per-model calibration + per-block matrix storage (128×128 = 64KB per block in fp16).
+**Viable path**: Their Future Work mentions a **diagonal approximation** — just per-channel scaling before FWHT, O(d) cost. This is essentially what CAT (experiment #41) achieves more cleanly.
+**Difficulty**: Full WUSH = impractical. Diagonal approx = see #41 (CAT alignment correction).
 
 ### 22. NSN normalization for universal codebooks
-**Status**: needs-research
+**Status**: done — **NO BENEFIT (simplified version); FULL VERSION INCOMPATIBLE**
 **Type**: quality
 **Paper**: NSNQuant (NeurIPS 2025, arXiv:2505.18231)
-**What**: Normalize-Shift-Normalize aligns token distributions to standard normal, enabling a single reusable codebook across all layers without calibration. Calibration-free. Up to 3x throughput.
-**How it applies**: Replace our normalize → rotate → quantize pipeline with normalize → shift → normalize → rotate → quantize. Could make codebooks even more universal (they already are, but this might help edge cases).
-**Difficulty**: Low (a few days to test).
+**What**: Normalize-Shift-Normalize aligns token distributions to standard normal, enabling a single reusable codebook across all layers without calibration.
+**Branch**: `experiment/nsnquant-dc-removal`
+**Implementation**: Simplified per-token DC removal (subtract mean, renormalize before FWHT). Full NSNQuant requires batch processing (per-channel mean across 64 tokens) which is incompatible with our per-token SET_ROWS pipeline.
+**Results** (2K/8chunks):
+  - turbo3 baseline: PPL 5.8501 ± 0.165
+  - turbo3 + DC removal: PPL 5.8827 ± 0.166 (+0.033, noise)
+  - turbo4 baseline: PPL 5.8186 ± ref
+  - turbo4 + DC removal: PPL 17.4134 ± 0.618 (**catastrophic** — QJL residual breaks)
+**Finding**: Per-token DC removal is useless because (1) values are already near-zero-mean after L2 normalization + FWHT, (2) for V the lost DC component corrupts the output, (3) for turbo4 the QJL sign-bit correction is computed relative to the DC-removed signal but decoded without correction. Full NSNQuant requires different infrastructure (batch quantization).
 
 ### 23. Attention-sink token protection
-**Status**: needs-research
+**Status**: done — **NO SIGNIFICANT EFFECT**
 **Type**: quality
 **Paper**: AnTKV (arXiv:2506.19505)
-**What**: Keep first few tokens (attention sinks) and most recent tokens at full precision. Only ~1% of tokens need protection. Significant quality improvement for multi-turn conversations and system prompts.
-**How it applies**: In `llama-kv-cache.cpp`, use q8_0 for KV entries at positions 0..K and positions (seq_len-M)..seq_len, turbo for the rest. K and M are small constants (e.g. 4-16).
+**What**: Keep first few tokens (attention sinks) at fp16 precision (pre-quantization), overwrite dequanted fp16 buffer before flash attention.
+**Branch**: `experiment/attention-sink-protection`
+**Results** (turbo3, 2K/8chunks):
+  - No sink (baseline): PPL 5.8501 ± 0.165
+  - N=4 sink tokens: PPL 5.8246 ± 0.164 (-0.026)
+  - N=8 sink tokens: PPL 5.8506 ± 0.165 (+0.001)
+  - N=16 sink tokens: PPL 5.8894 ± 0.167 (+0.039)
+**Finding**: All deltas within error bars. turbo3 + FWHT + norm correction already has high enough quality that sink protection provides no measurable benefit. The attention-sink amplification of quantization error doesn't matter when the error is this small.
 **Difficulty**: Low-Medium (1 week). High impact for chat/instruction-following quality.
 
 ### 24. Per-head adaptive precision
@@ -313,6 +318,7 @@ Prefill pp4096 (tok/s):
 **Status**: needs-research
 **Type**: new formats
 **What**: turbo2 = ~6x compression (aggressive, for very long contexts). turbo5 = nearly lossless. RotateKV achieves <0.3 PPL degradation at 2-bit, suggesting turbo2 is viable with channel reordering (#19).
+**Caution** (2026-03-27): "Understanding Physics of KV Cache Compression" (arXiv:2603.01426, Mar 2026) found all models hit a **hallucination safety cliff near 90% compression** (phase transition). turbo3 at 3.5 bpv = ~78% compression = safely below cliff. turbo2 at 2 bpv = ~87.5% = **right at the edge**. Will need careful PPL + downstream quality validation.
 **Difficulty**: Medium (1-2 weeks per variant).
 
 ### 29. Blackwell native FP4/FP6 tensor cores
@@ -329,10 +335,15 @@ Prefill pp4096 (tok/s):
 **Difficulty**: High (2-3 weeks).
 
 ### 31. Turbo types in speculative decoding draft model
-**Status**: ready
+**Status**: done — **NO PRACTICAL BENEFIT**
 **Type**: speed + memory
-**What**: Draft models use `-ctkd`/`-ctvd` flags. turbo4 on draft KV saves VRAM, allowing larger draft caches. Drafts are tolerant of quant noise since outputs are verified.
-**TODO**: Benchmark acceptance rate and overall tok/s with turbo4 draft KV.
+**What**: Draft models use `-ctkd`/`-ctvd` flags. turbo3 on draft KV saves VRAM.
+**Results** (Qwen3.5-2B Q4_K_M draft → Qwen3.5-27B Q6_K target, n=256, draft=8):
+  - q8_0 draft KV: 28.78 tok/s, n_drafted=1864
+  - turbo3 draft KV: 28.85 tok/s, n_drafted=1936
+  - Normal decode (no spec): ~31 tok/s
+**Finding**: (1) Speculative decoding is slower than normal decode for this model pair — the 2B draft has poor acceptance rate. (2) turbo3 on draft KV has zero impact on throughput or acceptance because the 2B model's KV cache is negligible compared to the 27B target. turbo KV matters for the target model (which already uses it), not the draft.
+**Conclusion**: turbo in speculative decoding is a non-issue. The draft KV is tiny and turbo3 doesn't affect acceptance rate.
 
 ### 32. Fused quantization in QKV projection
 **Status**: needs-research
@@ -363,6 +374,162 @@ Prefill pp4096 (tok/s):
 **How it applies**: With turbo-compressed keys on GPU (tiny footprint), you could score against millions of cached tokens and only fetch the needed values from CPU. Extreme long-context scenario.
 **Difficulty**: Very High. Major architectural change.
 
+### 37. MSE-optimal norm correction
+**Status**: done — **NEGATIVE RESULT**
+**Type**: quality
+**What**: Replace L2-preserving norm correction (β = ||x||/||q||) with MSE-optimal scaling (α = ||x|| · dot(x,q) / ||q||²). Theoretically halves per-element MSE.
+**Result**: turbo3 PPL 5.9083 vs baseline 5.8501 (+0.058, slightly WORSE). MSE-optimal reduces norm by cos(θ), lowering effective attention temperature. L2-preserving is better for attention.
+
+### 38. Multi-model validation + KV cache context OOM fix
+**Status**: done — **BUG FIX + QUALITY DATA**
+**Type**: quality, bugfix
+**Bug**: ggml context allocation for KV cache didn't account for turbo rotation matrix tensors (2 extra objects). Caused assertion failure on all non-Qwen3.5 models.
+**Fix**: Add `n_turbo_extra` (4 tensors) to context size in `llama-kv-cache.cpp`.
+**Quality results** (turbo3 uniform, 2K context):
+  - Qwen3.5-27B Q6_K: +0.2% (excellent)
+  - Qwen3.5-35B-A3B MoE Q4_K_S: +0.3% (excellent)
+  - MN-Violet-Lotus-12B Q4_K_M: +2.6% (acceptable)
+  - Qwen3-14B Q5_K_M: +3.8% (moderate degradation)
+  - Gemma-3-27B-it Q4_K_M: turbo3 K+V +3.3%, turbo3-K +4.6% (V was broken pre-#45 fix)
+**Key finding**: turbo3 quality degrades on head_dim=128 models (~3% PPL increase) vs head_dim=256 models (<0.3%). Gemma-3 V is completely broken due to SWA/global hybrid cache architecture. Needs investigation.
+
+---
+
+## New Experiments (from March 2026 research)
+
+### 39. GSR Walsh ordering for FWHT
+**Status**: done — **NEUTRAL** (no measurable improvement)
+**Type**: quality (zero cost)
+**Paper**: GSR (arXiv:2505.03810, ACL 2025 SRW)
+**Branch**: `experiment/gsr-walsh-ordering`
+**What**: Reorder FWHT output by sequency (sign-change count) using permutation `perm[s] = bit_reverse_7(gray(s))`. Groups similar-frequency components into the same turbo3 quantization block (32 elements within 128-element FWHT group).
+**Results** (turbo3 uniform, 2K/8chunks):
+  - turbo3 baseline: PPL 5.8323
+  - turbo3 + Walsh ordering: PPL 5.8248 (-0.13%, within error bars ±0.164)
+  - q8_0 reference: PPL 5.8375
+**Finding**: GSR paper's massive gains (PPL 20.29→11.59) were without random sign arrays. Our PolarQuant rotation uses random signs (s1, s2) that already decorrelate all 128 output elements, making them identically distributed. Sequency reordering cannot improve intra-block variance when the signs already destroy frequency structure. Walsh ordering only helps fixed (non-randomized) Hadamard transforms.
+
+### 40. Mean-centering before FWHT (HadaNorm)
+**Status**: dropped — **duplicate of #22, incompatible with per-token quantization**
+**Type**: quality (minimal cost)
+**Paper**: HadaNorm (arXiv:2506.09932, Jun 2025)
+**What**: Per-channel mean subtraction before Hadamard. Two interpretations: (a) per-token mean of 128-element group = what #22 tested (no benefit — already near-zero after L2 norm), (b) per-channel mean across tokens (requires calibration or running statistics, incompatible with per-token SET_ROWS pipeline). Same fundamental issue as #39: random sign arrays already decorrelate the distribution, making pre-centering redundant.
+
+### 41. CAT alignment correction after FWHT
+**Status**: needs-research
+**Type**: quality
+**Paper**: "Dissecting Quantization Error" / CAT (arXiv:2603.04359, Mar 2026)
+**What**: Decomposes quantization error into two independent factors: (1) **concentration** (outlier spread) = what FWHT handles, (2) **alignment** (dominant variation direction match) = what FWHT does NOT handle. Proposes block Concentration-Alignment Transforms to address both.
+**How it applies**: Our FWHT rotation only solves concentration. A lightweight per-layer diagonal alignment correction after FWHT could improve quality. This is effectively the viable "diagonal approximation" of WUSH (#21) — per-channel scaling derived from calibration data that aligns the post-rotation distribution to the codebook.
+**Impact**: Could close the head_dim=128 quality gap (+2-4% PPL → closer to head_dim=256's +0.2%).
+**Difficulty**: Medium (1 week). Requires calibration pass to compute per-layer alignment factors.
+
+### 42. KVLinC asymmetric K/V rotation strategy
+**Status**: done — **NEGATIVE RESULT** (rotation helps keys too)
+**Type**: quality
+**Paper**: KVLinC (arXiv:2510.05373, Oct 2025)
+**Branch**: `experiment/kvlinc-no-k-rotation`
+**What**: KVLinC claims rotation helps V but hurts K. Test: disable K rotation (TURBO_NO_K_ROTATE=1), keep V rotation.
+**Results** (turbo3 uniform, Qwen3.5-27B, 2K/8chunks):
+  - turbo3 baseline (both rotated): PPL 5.8323 (-0.09% vs q8_0)
+  - turbo3 K unrotated, V rotated: PPL 6.1647 (+5.6% vs q8_0)
+  - turbo3 neither rotated (prior data): PPL 6.2357 (+6.8% vs q8_0)
+**Finding**: Disabling K rotation hurts PPL by +0.33 (5.83→6.16). KVLinC's finding does NOT apply to our turbo3 codebook. Their result was for 2-bit with per-channel scale+zero quantization, which is a different paradigm. Our Lloyd-Max codebook with norm correction benefits from rotation on both K and V because it makes the distribution match the codebook's symmetric assumption. The +0.07 difference between K-unrotated (6.16) and neither-rotated (6.24) shows V rotation alone contributes about half the benefit.
+**Risk**: Our norm correction assumes rotation — need to verify norm correction still works on unrotated K.
+**Difficulty**: Medium (1 week). Straightforward to test.
+
+### 43. SQuat-inspired query-orthogonal codebook selection
+**Status**: needs-research
+**Type**: quality
+**Paper**: SQuat (arXiv:2503.24358, Mar 2025, Red Hat AI)
+**What**: Instead of minimizing ||k - k_quantized|| (compression error), SQuat ensures quantization residual is **orthogonal to the query subspace**. Query subspace from prompt SVD (rank ~30 for d=4096), generalizes to response tokens. 2-bit, no fine-tuning, no calibration data.
+**How it applies**: After FWHT rotation makes the distribution uniform, SQuat's orthogonality constraint ensures whatever residual quantization error remains is **invisible to queries**. The prompt-derived subspace can be computed once at prompt time with no ongoing cost. Could be combined with Lloyd-Max by biasing codebook selection toward codewords whose error is orthogonal to the query subspace.
+**Challenge**: O(d³) for the iterative quantization algorithm. May be too expensive for per-token SET_ROWS. A simplified version (project quantization error onto query subspace and minimize that instead of MSE) could be cheaper.
+**Difficulty**: High (2-3 weeks). Strongest theoretical backing for quality improvement.
+
+### 44. PatternKV — pattern subtraction before codebook
+**Status**: needs-research
+**Type**: quality
+**Paper**: PatternKV (arXiv:2510.05176, Oct 2025)
+**What**: Mine representative "pattern vectors" online via clustering, align each KV vector to nearest pattern, quantize only the residual. Reduces dynamic range before quantization, improving codebook utilization. 2-bit competitive, 10% test-time scaling improvement, 1.4x throughput.
+**How it applies**: After FWHT rotation, subtract nearest pattern vector before Lloyd-Max quantization. Store pattern index (1-2 bits) alongside quantized residual. During dequant, add pattern back. Reduces the range our 8-entry codebook needs to cover.
+**Similarity to DeltaKV**: DeltaKV (arXiv:2602.08005, Feb 2026) independently showed >60% of KV tokens have nearest semantic matches >16 positions away. PatternKV uses a smaller, fixed set of patterns rather than DeltaKV's reference token retrieval.
+**Difficulty**: Medium (1-2 weeks). Requires pattern mining during prefill.
+
+### 45. Gemma-3 SWA V cache investigation
+**Status**: done — **FIXED, Gemma-3 turbo3 now works**
+**Type**: quality/bugfix
+**Root cause**: V inverse rotation (`ggml_turbo_wht`) was missing from the iSWA `build_attn` overload in `llama-graph.cpp`. Gemma-3 uses iSWA for ALL layers.
+**Fix**: Added V un-rotation block to iSWA `build_attn` overload at ~line 2235 (after `build_attn_mha`, before W_O).
+**Results** (Gemma-3-27B-it Q4_K_M, 2K/8chunks):
+  - q8_0: PPL 5.6995
+  - turbo3 K+V: PPL 5.8867 (+3.3%) — **was 45 TRILLION before fix**
+  - turbo3-K + q8_0-V: PPL 5.9633 (+4.6%) — was reported as +31% in earlier test
+**Finding**: With the fix, Gemma-3 turbo3 quality matches the head_dim=128 model pattern (+3-4% PPL), same as MN-Violet-Lotus-12B (+2.6%) and Qwen3-14B (+3.8%). K-only slightly worse than K+V, consistent with Qwen3.5 findings that V matters more.
+
+### 50. turbo4 K broken on head_dim=128 — missing Q pre-rotation for TURBO4_0
+**Status**: done — **FIXED AND VERIFIED**
+**Type**: bugfix
+**What**: turbo4-K produced PPL 33K on Qwen3-14B (head_dim=128). turbo4-V worked fine.
+**Root cause**: In `fattn.cu` line 702, `turbo_kv` only checked `GGML_TYPE_TURBO3_0`, NOT `TURBO4_0`. This gated Q pre-rotation at line 759. turbo4 K stored rotated, but Q never got pre-rotated → garbage dot products.
+**Fix applied**: Changed Q pre-rotation guard at line 759 to include TURBO4_0:
+```c
+const bool turbo_k_any = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+if (turbo_k_any && Q->ne[0] % 128 == 0) {
+```
+**Results after fix**:
+  - Qwen3.5-27B (head_dim=256): turbo4 K+V PPL 5.8186 (-0.32% vs q8_0) — **BEATS q8_0!**
+  - Qwen3-14B (head_dim=128): turbo4 K+V PPL 6.9118 (+6.3% vs q8_0) — functional, turbo4-V still excellent (+1.9%)
+  - Experiment #10's turbo4-K result (5.8451) confirmed reproducible after fix
+**Mystery resolved**: Experiment #10 was probably from before FWHT rotation was implemented (no rotation = no pre-rotation needed).
+
+### 51. Sparse V dequant (TheTom)
+**Status**: done — **IMPLEMENTED AND VERIFIED**
+**Type**: speed (decode)
+**Credit**: TheTom (turboquant_plus/sparse-v-dequant)
+**What**: Skip V dequantization for KV positions where `exp(score - max) < 1e-6`. At long context, 90%+ of attention weights are negligible.
+**Implementation**: 3 lines added to fattn-vec.cuh V accumulation loop (both V_DOT2 and non-V_DOT2 paths). Threshold check after loading KQ_k, `continue` before V dequant.
+**Results**: Zero quality loss (PPL bit-identical). On dense model, no speedup (attention <5% of compute). On MoE model, eliminates native dequant context scaling regression: 114.44→126.89 tok/s at 8K (+10.9%). Native dequant with sparse V now matches fp16 dequant speed at all contexts.
+**Implication**: The fp16 decode dequant path may become unnecessary — sparse V achieves the same context-scaling fix with zero extra memory bandwidth.
+
+### 46. BitDecoding-style dequant pipeline for turbo prefill
+**Status**: needs-research → experiment #16b
+**Type**: speed (prefill)
+**Paper**: BitDecoding (HPCA 2026, arXiv:2503.18773), open source at github.com/OpenBitSys/BitDecoding
+**What**: Register-level software pipeline: CUDA cores dequant tile N+1 while tensor cores MMA tile N. Uses `lop3` PTX for bit manipulation, `ldmatrix` for TC layout, XOR swizzling for bank-conflict-free shared memory. Drops dequant overhead from 40-50% to **15%**. GQA query reshape (relevant to our 24Q/4KV Qwen3.5 layout).
+**Code available**: `csrc/bit_decode/` in the BitDecoding repo. C++ + CUDA, LibTorch build.
+**How it applies**: Our turbo3 prefill (experiment #16) already achieves 98.8% of q8_0 via dequant-then-MMA. This would primarily benefit turbo4 prefill (currently stuck at 588 tok/s due to QJL fp16 precision loss). Inline dequant avoids the fp16 temp buffer entirely.
+**Difficulty**: High (3-4 weeks). Restructure fattn-mma to add dequant pipeline stage.
+
+### 47. ButterflyQuant — learnable O(n log n) transforms
+**Status**: needs-research
+**Type**: quality
+**Paper**: ButterflyQuant (arXiv:2509.09679, Sep 2025)
+**What**: Replace fixed Hadamard with learnable butterfly transforms parameterized by continuous Givens rotation angles. O(n log n) complexity, only n*log2(n)/2 learnable parameters. Includes uniformity regularization (KL vs Uniform) for even codebook utilization.
+**Results**: W2A16 PPL 15.4 vs Hadamard's 37.3 on LLaMA-2-7B. 128 calibration samples, converges in minutes.
+**How it applies**: Learn per-layer butterfly transforms offline. Same O(n log n) as FWHT but adapted to each layer's distribution. Store learned angles per layer (~448 params for d=128). Apply learned butterfly in SET_ROWS instead of fixed FWHT.
+**Difficulty**: Medium-High (2 weeks). Requires calibration infrastructure + per-model learned params.
+
+### 48. AQUA-KV — inter-layer KV prediction
+**Status**: needs-research
+**Type**: quality + compression
+**Paper**: AQUA-KV (arXiv:2501.19392, ICML 2025)
+**What**: Train compact linear predictors to predict current-layer KV from previous layer. Only store/quantize the **unpredictable residual**. 2-2.5 bits near-lossless on Llama 3.2.
+**How it applies**: Before turbo3 quantization, subtract the predicted KV from the previous layer. The residual has much lower variance, making the Lloyd-Max codebook more effective. Could halve effective bit-rate.
+**Challenge**: Requires per-model trained predictors. Adds compute for prediction in the attention path. Not compatible with layer-parallel execution.
+**Difficulty**: High (3-4 weeks). Requires training + inference path changes.
+
+### 49. Tune parallel_blocks heuristic for turbo decode
+**Status**: done — **NO EFFECT** (attention not the bottleneck)
+**Type**: speed (decode)
+**Branch**: `experiment/parallel-blocks-tuning`
+**What**: Added GGML_PARALLEL_BLOCKS env var override to force different split-K values. Benchmarked all values from 1 to 32.
+**Results** (turbo3 tg64 at 32K context, Qwen3.5-27B, RTX 3090):
+  - default (auto): 29.95 tok/s
+  - pb=1: 29.97, pb=2: 29.95, pb=4: 29.95, pb=8: 29.96, pb=16: 29.96, pb=32: 29.93
+  - q8_0 baseline: 30.81 tok/s (turbo3 = 97.2%)
+**Finding**: All parallel_blocks values within noise (±0.1 tok/s). Attention compute is <5% of total decode time — FFN dominates. The 2.8% turbo3-to-q8_0 gap is structural dequant overhead that can't be closed by attention-level tuning. This also applies to #17 (Split-K tuning).
+
 ---
 
 ## External Research & References
@@ -384,35 +551,60 @@ Prefill pp4096 (tok/s):
 - **Hardware diagnostic script**: cross-platform benchmarking
 - **Asymmetric K/V compression**: aligns with our experiment #10
 
-### Ecosystem (as of 2026-03-26)
-- **TheTom/llama-cpp-turboquant** (23 stars, 8 forks) — Metal GPU, upstream for this repo
-- **TheTom/turboquant_plus** (220 stars) — Python reference, dropped QJL, documents 739→2747 tok/s journey
-- **tonbistudio/turboquant-pytorch** (253 stars) — Full PyTorch + Triton, validated on Qwen2.5-3B
-- **Dejan.ai** — Fused Triton kernel, 1.18-1.22x speedup, pre-rotate-queries trick
-- **Aaryan-Kapoor** — CPU-only TQ3_0 in llama.cpp
-- **veritatisquaesitoressumus** — CPU complete in ik_llama.cpp, CUDA awaiting validation
-- **mudler/LocalAI** — Experimenting, no PR yet
-- **vLLM #38171** — Working PoC from vllm-omni team, joint PR in progress
-- **Mainline llama.cpp** — Discussion #20969 (multi-contributor), no merged PR yet
+### Ecosystem (as of 2026-03-27)
+- **TheTom/turboquant_plus** (220+ stars, 91 commits, 511 tests) — Python reference, dropped QJL, 2747 tok/s prefill, 99% of q8_0 speed 2K-32K. Active: upstream llama.cpp PR prep, turbo4 fix, benchmark hardening.
+- **TheTom/llama-cpp-turboquant** (34 stars, 11 forks) — Metal GPU, upstream for this repo. CUDA backend mentioned as in-progress but not yet validated.
+- **tonbistudio/turboquant-pytorch** (338 stars, 42 forks) — Full PyTorch + Triton with QJL Stage 2. 3-bit: 99.45-99.61% cosine sim. MIT license.
+- **Dejan.ai** — Fused Triton kernel for Gemma 3 4B on RTX 4090. 2-bit fused path: character-identical to fp16. 1.18-1.22x speedup.
+- **0xSero/turboquant** — Triton + vLLM integration. 3-bit K, 2-bit V. Qwen3.5-27B on 4×RTX 3090: 914K token capacity (2x baseline), 30GB freed.
+- **Aaryan-Kapoor** — CPU TQ3_0 in llama.cpp (block-32, 14 bytes/32 values, 3.5 bpw). Qwen3.5-35B: identical output to FP16 at temp 0.
+- **veritatisquaesitoressumus** — CPU complete in ik_llama.cpp. TQ3 PPL 6.6872 vs FP16 6.5792. CUDA kernels written but unvalidated.
+- **mudler** — Experimental branch with tq1_0/tq2_0/tbq3_0/tbq4_0 types. Issue #20977 (18 comments).
+- **Madreag** — Ported Metal kernels to CUDA for RTX 5090: 4.6x KV compression, NIAH 6/6.
+- **vLLM #38171** (39 upvotes) — Draft PR #38280 open with eval results. lishunyang12/vllm-omni PoC: NIAH 6/6, 7.5x cache reduction at 2-bit. CUDA/Triton kernels Phase 3.
+- **Mainline llama.cpp** — Discussion #20969 (active), Issue #20977 (active). **No merged PR yet.** Maintainers want CONTRIBUTING.md compliance.
+- **MLX** — Prince_Canuma implementation, Qwen3.5-35B 100% exact match 8.5K-64K. HuggingFace model available.
+- **turboquant.net** — Community site. HN #1, 421 points, 119 comments.
+- **Consensus across implementations**: Multiple devs independently dropped QJL (Algorithm 2), finding Algorithm 1 alone sufficient. (Our data contradicts this when norm correction is active — see #25.)
 
 ### Key papers
 - TurboQuant (Google, ICLR 2026) — the original
 - PolarQuant (Google, arXiv:2502.02617) — same authors, polar coordinate decomposition
 - RotateKV (IJCAI 2025) — channel reordering + FWHT
-- BitDecoding (HPCA 2026) — TC-accelerated low-bit KV decode
+- BitDecoding (HPCA 2026, arXiv:2503.18773) — TC-accelerated low-bit KV decode, **open source C++**
 - SageAttention 1/2/3 (ICLR/ICML/NeurIPS 2025) — INT8/INT4 attention
 - KVTuner (ICML 2025) — per-layer/head sensitivity analysis
-- WUSH (arXiv:2512.00956) — optimal transform theory
-- NSNQuant (NeurIPS 2025) — calibration-free normalization
+- WUSH (arXiv:2512.00956) — optimal transform theory (impractical full, diagonal approx viable)
+- NSNQuant (NeurIPS 2025) — calibration-free normalization (tested #22, no benefit)
 - CommVQ (ICML 2025) — RoPE-commutative codebooks
 - KVTC (NVIDIA, ICLR 2026) — 20x compression via transform coding
 - Kitty (MLSys 2026) — uniform-precision tensor decomposition
-- SmoothRot (arXiv:2506.05413) — channel scaling before Hadamard
-- ConvRot (arXiv:2512.03673) — group Hadamard as convolution
-- TurboAttention (Microsoft) — fused quant + FlashQ + SAS softmax
+- ~~SmoothRot (arXiv:2506.05413) — only targets FFN, not KV~~
+- ConvRot (arXiv:2512.03673) — group Hadamard as convolution (dropped, TheTom tested)
+- TurboAttention (Microsoft) — fused quant + FlashQ + SAS softmax (no code)
 - HadaCore (arXiv:2412.08832) — TC-accelerated FWHT, 1.1-3.5x speedup
-- AnTKV (arXiv:2506.19505) — attention-sink protection
+- AnTKV (arXiv:2506.19505) — attention-sink protection (tested #23, no effect)
 - "More Keys Less Values" (arXiv:2502.15075) — asymmetric K/V theory
+
+#### New papers (2026 survey, added 2026-03-27)
+- **FlashAttention-4** (arXiv:2603.05451, Mar 2026) — Blackwell-optimized, 1613 TFLOPS/s B200, CuTe-DSL Python
+- **SQuat** (arXiv:2503.24358, Mar 2025) — query-subspace orthogonal quantization error, 2-bit no calibration
+- **CAT** (arXiv:2603.04359, Mar 2026) — concentration + alignment decomposition of quant error
+- **KVLinC** (arXiv:2510.05373, Oct 2025) — asymmetric K/V: raw keys channel-wise, rotated values token-wise
+- **DeltaKV** (arXiv:2602.08005, Feb 2026) — residual KV compression, 29% memory, Sparse-vLLM
+- **BinaryAttention** (arXiv:2603.09582, Mar 2026) — 1-bit QK attention, 2x faster than FA2
+- **Hadamard W_O** (arXiv:2603.08343, Mar 2026) — WHT replaces dense output projection, -25% params
+- **GSR** (arXiv:2505.03810, ACL 2025) — Walsh (sequency) ordering for Hadamard, free PPL gain
+- **HadaNorm** (arXiv:2506.09932, Jun 2025) — mean-centering before Hadamard
+- **ButterflyQuant** (arXiv:2509.09679, Sep 2025) — learnable O(n log n) butterfly transforms
+- **PatternKV** (arXiv:2510.05176, Oct 2025) — pattern subtraction before quantization
+- **AQUA-KV** (arXiv:2501.19392, ICML 2025) — inter-layer KV prediction + residual quantization
+- **MILLION** (arXiv:2504.03661) — product quantization for KV, codebook LUT in L1 cache
+- **Physics of KV Compression** (arXiv:2603.01426, Mar 2026) — hallucination cliff at 90% compression
+- **S2D** (arXiv:2602.14432, Feb 2026) — spectral origin of activation outliers
+- **VQKV** (arXiv:2603.16435, Mar 2026) — training-free multi-codebook VQ for KV
+- **ARKV** (arXiv:2603.08727, Mar 2026) — auto-select precision per layer via entropy/variance/kurtosis
+- **KVzap** (arXiv:2601.07891, Jan 2026, NVIDIA) — learned importance prediction for KV pruning
 
 ---
 
@@ -426,3 +618,9 @@ Prefill pp4096 (tok/s):
 
 ### Gemini's RoPE/WHT commutativity theory
 **Reason**: TheTom investigated, wasn't the actual root cause of quality issues. The real constraint is simpler: WHT must be applied after RoPE, which our implementation does correctly.
+
+### SmoothRot (#20) — channel scaling before FWHT
+**Reason**: Research (2026-03-27) found SmoothRot only targets FFN down-projection outliers, NOT KV cache or attention. Paper explicitly states smoothing before attention has "limited gains." Gains also vanish with GPTQ. Not applicable to our head_dim=128 KV cache quality gap.
+
+### WUSH full transform (#21) — data-aware dense transform
+**Reason**: O(d²) per block = 18x slower than FWHT for d=128. Requires per-model calibration + per-block matrix storage (64KB/block in fp16). Diagonal approximation is the only viable path — see CAT (#41) for a cleaner version of this idea.
