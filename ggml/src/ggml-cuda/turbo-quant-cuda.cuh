@@ -615,7 +615,7 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
 
 // Temperature scaling factor for TCQ norm. alpha > 1 sharpens attention (helps long context).
 // Set via TURBO_TCQ_ALPHA env var. Default 1.0 = standard MSE-optimal norm correction.
-static __constant__ float d_tcq_norm_alpha = 1.0f;
+static __constant__ float d_tcq_norm_alpha = 1.2f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group

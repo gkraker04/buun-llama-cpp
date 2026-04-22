@@ -1718,3 +1718,90 @@ All three identical — **speed gap is TCQ-specific, not general**.
 
 **Key insight:** TCQ's quality advantage comes at a speed cost. The Viterbi encode path
 is the bottleneck — turbo3/turbo4 without TCQ run at the same speed across all repos.
+
+---
+
+## Experiment #69: Temperature Scaling (2026-03-31)
+
+### Preliminary sweep — turbo3_tcq, compiled-in codebook (NOT best)
+
+| Alpha | @2K (8ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|-------|-----------|-----------|------------|------------|
+| 1.00 (baseline) | 5.824 | 6.883 | 7.005 | 7.053 |
+| **1.10** | **5.582** | 6.371 | 6.595 | 6.396 |
+| **1.25** | 5.528 | **6.219** | **6.541** | **6.178** |
+| 1.50 | 5.875 | 6.801 | 7.565 | 7.205 |
+| 1.75 | 6.880 | 8.835 | 10.745 | — |
+
+Sweet spot: alpha 1.10-1.25. Best universal: ~1.25 (wins everywhere except 2K by 0.05).
+Alpha=1.25 @64K: **6.178 vs 7.053 baseline = -12.4% PPL improvement**.
+Alpha=1.25 @2K: **5.528 vs 5.824 = -5.1% PPL improvement**.
+Note: these results use compiled-in codebook, NOT best.
+
+### Full sweep — turbo3_tcq, cb_50iter_finetuned.bin codebook
+
+| Alpha | @2K (8ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|-------|-----------|-----------|------------|------------|
+| 1.00 (baseline) | 5.912 | 7.001 | 7.071 | 7.034 |
+| 1.05 | 5.762 | 6.675 | 6.807 | 6.665 |
+| 1.10 | 5.687 | 6.484 | 6.647 | 6.448 |
+| 1.15 | 5.623 | 6.351 | 6.572 | 6.290 |
+| **1.20** | **5.567** | **6.289** | **6.574** | **6.224** |
+| 1.25 | 5.624 | 6.271 | 6.619 | 6.274 |
+| 1.30 | 5.590 | 6.315 | 6.698 | 6.329 |
+
+Optimal alpha for 3-bit (50iter codebook): **1.15-1.20**
+- alpha=1.20 best at 2K and 64K
+- alpha=1.25 best at 8K (marginal: 6.271 vs 6.289)
+- alpha=1.15 and 1.20 essentially tied at 32K
+
+**Universal improvement**: alpha=1.20 improves PPL by 5.8% @2K, 10.2% @8K, 7.0% @32K, 11.5% @64K.
+No context length where alpha=1.0 is better. This is a pure win.
+
+Note: cb_50iter_finetuned baseline (5.912 @2K) is worse than compiled-in numpy (5.824 @2K).
+Compiled-in numpy + alpha=1.25 gave 5.528 @2K in preliminary sweep — even better.
+Need compiled-in numpy fine sweep to find true global optimum.
+
+### Full sweep — turbo2_tcq, tcq_2bit_100iter_s99.bin codebook
+
+| Alpha | @2K (8ch) | @8K (8ch) | @32K (4ch) | @64K (4ch) |
+|-------|-----------|-----------|------------|------------|
+| 1.00 (baseline) | 6.042 | 7.135 | 7.205 | 7.222 |
+| 1.05 | 5.804 | 6.793 | 6.937 | 6.779 |
+| 1.10 | 5.800 | 6.570 | 6.717 | 6.488 |
+| 1.15 | 5.607 | 6.412 | 6.616 | 6.337 |
+| **1.20** | 5.619 | 6.387 | **6.615** | **6.248** |
+| **1.25** | **5.611** | **6.345** | 6.635 | 6.250 |
+| 1.30 | 5.640 | 6.380 | 6.697 | 6.311 |
+| 1.50 | 6.004 | 6.970 | 7.601 | 7.206 |
+
+Optimal alpha for 2-bit: **1.20-1.25** (same range as 3-bit!)
+- alpha=1.25 best at 2K and 8K
+- alpha=1.20 best at 32K and 64K (by tiny margin)
+- alpha=1.50 already degrades past baseline at 32K
+
+**Universal improvement**: alpha=1.20 improves PPL by 7.0% @2K, 10.5% @8K, 8.2% @32K, 13.5% @64K.
+
+### Summary — Temperature Scaling Experiment #69
+
+**CONFIRMED: Temperature scaling is a massive universal improvement for TCQ.**
+- Optimal alpha: 1.15-1.25 for both 3-bit and 2-bit TCQ
+- Default recommendation: alpha=1.20 (best overall)
+- Improvement is 5-14% PPL reduction across ALL context lengths
+- No regression at any context length — pure win
+- Improvement grows with context length (larger at 64K than 2K)
+- Same optimal alpha range regardless of codebook choice or bit rate
+
+Comparison vs competitors at alpha=1.20:
+
+| Config | @2K | @8K | @32K | @64K |
+|--------|-----|-----|------|------|
+| **Ours t3_tcq α=1.20** | **5.567** | **6.289** | **6.574** | **6.224** |
+| Duster TBQ3 | 6.565 | 6.921 | 7.056 | 7.034 |
+| TheTom turbo3 | 6.548 | 6.934 | 7.089 | 7.114 |
+| **Ours t2_tcq α=1.20** | **5.619** | **6.387** | **6.615** | **6.248** |
+| Duster TBQ2 | 6.798 | 7.233 | 7.186 | 7.332 |
+
+Note: our numbers use 50iter_finetuned (3-bit) and 100iter (2-bit) codebooks.
+Compiled-in numpy codebook may be even better (preliminary showed 5.528 @2K vs 5.567).
+**We now CRUSH every competitor at every context length at both bit rates.**

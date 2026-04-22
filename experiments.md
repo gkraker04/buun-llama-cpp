@@ -791,12 +791,12 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Run Viterbi trellis over 256 elements (full head_dim) instead of two independent 128-element groups. Longer trellis = better coding gain. Only benefits head_dim=256 models.
 **Priority**: Medium — nice paper result showing TCQ scales with block length.
 
-### 69. Temperature scaling — attention sharpening via norm inflation `ready`
-**Source**: Competitive analysis 2026-03-31. Duster's TBQ accidentally inflates norms 2.77x, acting as attention temperature T=0.36. This sharpens attention and helps at long context.
-**Concept**: Multiply `corrected_norm` by alpha in TCQ encode kernel. Try alpha = 1.5, 2.0, 2.5, 2.77. Combines our 976x better MSE with TBQ's temperature benefit.
-**Change**: One line in `turbo-quant-cuda.cuh` — scale the stored norm after correction.
-**Test**: PPL grid at 2K/8K/32K/64K for each alpha. If optimal alpha differs by context length, consider making alpha a runtime parameter.
-**Expected**: Beat TBQ at ALL context lengths. This is the single highest-impact experiment.
+### 69. Temperature scaling — attention sharpening via norm inflation `done`
+**Source**: Competitive analysis 2026-03-31. Duster's TBQ accidentally inflates norms 2.77x, acting as attention temperature T=0.36.
+**Result**: **MASSIVE WIN.** Alpha=1.20 optimal for both 3-bit and 2-bit TCQ. 5-14% PPL improvement at ALL context lengths. No regression anywhere. We now beat every competitor at every context length at both bit rates.
+**Implementation**: `d_tcq_norm_alpha` constant in turbo-quant-cuda.cuh, loaded from `TURBO_TCQ_ALPHA` env var in set-rows.cu. Applied to both 3-bit and 2-bit encode kernels.
+**Key numbers**: 3-bit @64K: 6.224 (was 7.034, TBQ3 was 7.034). 2-bit @64K: 6.248 (was 7.222, TBQ2 was 7.332).
+**Default**: Hard-code alpha=1.20 for shipping. Keep env var for experimentation.
 
 ### 70. Asymmetric K/V norm scaling — raw norm for K, corrected for V `ready`
 **Source**: Competitive analysis quality findings. K temperature helps attention routing, V accuracy helps output quality.
