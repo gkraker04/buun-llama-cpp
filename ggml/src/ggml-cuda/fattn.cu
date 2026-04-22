@@ -268,6 +268,34 @@ static __global__ void k_turbo3_dequant_f16(
     dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
 }
 
+static __global__ void k_turbo3_tcq_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x; // element index within row (0..ne0-1)
+    if (j >= ne0) return;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int blk_idx  = j / QK_TURBO3_TCQ;
+    const int t = j % QK_TURBO3_TCQ; // element index within 128-element block
+    const block_turbo3_tcq * blk = (const block_turbo3_tcq *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm);
+
+    // Sliding window decode: read 9-bit state from bitstream at bit offset t*3
+    const int bit_pos = t * 3;
+    const int byte_idx = bit_pos / 8;
+    const int bit_off = bit_pos % 8;
+    const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+    const int state = (raw >> bit_off) & 0x1FF;
+    const float val = d_turbo3_tcq_codebook_fattn[state] * norm;
+
+    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
+}
+
 static __global__ void k_turbo4_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
@@ -341,6 +369,12 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 
+// Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths)
+static half * kv_dequant_k_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_k_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+static half * kv_dequant_v_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_v_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+
 // === FWHT rotation kernels for pre-rotate-queries approach ===
 // Forward rotation on Q before attention (both prefill and decode paths).
 // One block per 128-element group, 128 threads per block.
@@ -383,8 +417,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ;
+
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
@@ -392,10 +429,18 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_k) {
         const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
-        CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
+        if (k_size > kv_dequant_k_buf_size[device]) {
+            if (kv_dequant_k_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device]));
+            CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device], k_size));
+            kv_dequant_k_buf_size[device] = k_size;
+        }
+        k_fp16 = kv_dequant_k_buf[device];
         dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
         if (K->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
+            k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
             // turbo4 K: inverse FWHT dequant — produces K in original domain (no Q rotation needed)
@@ -407,10 +452,18 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_v) {
         const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
-        CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
+        if (v_size > kv_dequant_v_buf_size[device]) {
+            if (kv_dequant_v_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device]));
+            CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device], v_size));
+            kv_dequant_v_buf_size[device] = v_size;
+        }
+        v_fp16 = kv_dequant_v_buf[device];
         dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
         if (V->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
+            k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
@@ -446,8 +499,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
     if (turbo_k && K->type != GGML_TYPE_TURBO4_0 && Q->ne[0] % 128 == 0) {
-        int device;
-        CUDA_CHECK(cudaGetDevice(&device));
         const size_t q_size = ggml_nelements(Q) * sizeof(float);
         if (q_size > q_rot_buf_size[device]) {
             if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
@@ -482,9 +533,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 
-    // Free K/V temporary buffers (stream-ordered, Q uses persistent buffer)
-    if (k_fp16) CUDA_CHECK(cudaFreeAsync(k_fp16, stream));
-    if (v_fp16) CUDA_CHECK(cudaFreeAsync(v_fp16, stream));
+    // K/V fp16 buffers are persistent (grow-only), no free needed
 }
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -687,6 +736,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_TCQ:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -827,8 +877,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
         return e != nullptr;
     }();
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
-                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ ||
+                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ;
     if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
@@ -848,13 +898,29 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_k_decode = nullptr;
         ggml_tensor * orig_v_decode = nullptr;
 
+        int device_dec;
+        CUDA_CHECK(cudaGetDevice(&device_dec));
+
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TURBO3_0) {
+            if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO3_TCQ) {
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
-                CUDA_CHECK(cudaMallocAsync(&k_fp16_dec, k_size, stream));
+                if (k_size > kv_dequant_k_buf_size[device_dec]) {
+                    if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
+                    CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device_dec], k_size));
+                    kv_dequant_k_buf_size[device_dec] = k_size;
+                }
+                k_fp16_dec = kv_dequant_k_buf[device_dec];
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
-                k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                    (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                if (K->type == GGML_TYPE_TURBO2_0) {
+                    k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
+                    k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else {
+                    k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
                 K_f16_dec.data = k_fp16_dec;
@@ -865,12 +931,25 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TURBO3_0) {
+            if (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_TCQ) {
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
-                CUDA_CHECK(cudaMallocAsync(&v_fp16_dec, v_size, stream));
+                if (v_size > kv_dequant_v_buf_size[device_dec]) {
+                    if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
+                    CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device_dec], v_size));
+                    kv_dequant_v_buf_size[device_dec] = v_size;
+                }
+                v_fp16_dec = kv_dequant_v_buf[device_dec];
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
-                k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                    (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                if (V->type == GGML_TYPE_TURBO2_0) {
+                    k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
+                    k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else {
+                    k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                }
                 V_f16_dec = *V;
                 V_f16_dec.type = GGML_TYPE_F16;
                 V_f16_dec.data = v_fp16_dec;
@@ -886,21 +965,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Pre-rotate Q for turbo (K/V stored in rotated space, whether turbo3 or dequanted fp16)
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
-        const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
+        const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ);
         if (turbo_k_any && Q->ne[0] % 128 == 0) {
-            int device;
-            CUDA_CHECK(cudaGetDevice(&device));
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
-            if (q_size > q_rot_buf_size[device]) {
-                if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
-                CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
-                q_rot_buf_size[device] = q_size;
+            if (q_size > q_rot_buf_size[device_dec]) {
+                if (q_rot_buf[device_dec]) CUDA_CHECK(cudaFree(q_rot_buf[device_dec]));
+                CUDA_CHECK(cudaMalloc(&q_rot_buf[device_dec], q_size));
+                q_rot_buf_size[device_dec] = q_size;
             }
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
-                (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+                (const float *)Q->data, q_rot_buf[device_dec], ggml_nelements(Q));
             Q_rot_decode = *Q;
-            Q_rot_decode.data = q_rot_buf[device];
+            Q_rot_decode.data = q_rot_buf[device_dec];
             orig_q_decode = dst->src[0];
             dst->src[0] = &Q_rot_decode;
         }
@@ -925,8 +1002,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (orig_q_decode) dst->src[0] = orig_q_decode;
         if (orig_k_decode) dst->src[1] = orig_k_decode;
         if (orig_v_decode) dst->src[2] = orig_v_decode;
-        if (k_fp16_dec) CUDA_CHECK(cudaFreeAsync(k_fp16_dec, stream));
-        if (v_fp16_dec) CUDA_CHECK(cudaFreeAsync(v_fp16_dec, stream));
+        // K/V fp16 buffers are persistent (grow-only), no free needed
     }
 
     // Output inverse rotation for turbo V types is handled at graph level

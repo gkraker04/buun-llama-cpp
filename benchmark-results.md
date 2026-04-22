@@ -84,6 +84,24 @@ Q pre-rotation moved from graph-level ggml_turbo_wht op to inline in FA kernels:
 Key finding: `cudaMallocAsync` for Q rotation buffer caused NaN on graph replay.
 Fixed by using a persistent `cudaMalloc` buffer that grows as needed.
 
+## Experiment #61: TCQ (Trellis-Coded Quantization) — turbo3_tcq
+
+Branch: `experiment/tcq-turbo3`. Right-shift bitshift trellis (k=3, L=9, 512 states).
+Parallel Viterbi encode (512 threads/block), O(1) sliding-window decode.
+3.25 bpv (52 bytes/128 elements) vs turbo3's 3.5 bpv.
+
+| Metric | turbo3_tcq | turbo3 | q8_0 | TCQ vs turbo3 |
+|--------|-----------|--------|------|---------------|
+| PPL (2K/8ch) | 5.8270 | 5.8323 | 5.8375 | -0.09% (better) |
+| Prefill pp4096 | 884.26 | 1122.57 | 1134.64 | -21% (slower) |
+| Decode tg64 | 28.58 | 30.17 | 31.02 | -5.3% (slower) |
+
+Notes:
+- PPL slightly better than turbo3 despite fewer bits (TCQ correlation gain)
+- Prefill 21% slower — Viterbi encode overhead (512 threads, 128 forward steps)
+- Decode 5% slower — 9-bit sliding window extract vs 3-bit direct index
+- VRAM: ~7% smaller KV cache vs turbo3 (3.25 vs 3.5 bpv)
+
 ## Observations
 
 1. Norm correction makes turbo3 and turbo4 BEAT q8_0 in PPL
@@ -1022,3 +1040,56 @@ PPL delta: +0.46% (within 8-chunk noise). Prefill: 2.67x improvement, matching q
 - `fattn.cu`: turbo4 K prefill dispatches inverse FWHT kernel, V uses simple dequant
 - `fattn.cu`: Q pre-rotation skipped for turbo4 K (original domain)
 - `fattn.cu`: removed `!turbo4_kv` MMA bypass — all turbo types use MMA prefill
+
+---
+
+## Experiment #57: Persistent decode K/V fp16 buffers
+
+**Date**: 2026-03-28
+**Branch**: experiment/tbq-ideas
+
+Replace `cudaMallocAsync`/`cudaFreeAsync` per decode token with grow-only persistent `cudaMalloc` buffers for K/V fp16 dequant. Same pattern as existing `q_rot_buf`.
+
+### Results (turbo3 K+V, Qwen3.5-27B Q6_K)
+
+| Metric | Before | After | Delta |
+|--------|--------|-------|-------|
+| PPL (2K/8chunks) | 5.8501 | 5.8501 | 0.00% |
+| Decode tg64 (tok/s) | 29.93 | 30.16 | +0.8% |
+
+PPL unchanged (expected — same computation). Small decode speed improvement from eliminating per-token alloc/free overhead.
+
+### Code Changes
+- `fattn.cu`: added `kv_dequant_k_buf` / `kv_dequant_v_buf` persistent per-device buffers
+- `fattn.cu`: replaced 4x `cudaMallocAsync` + 4x `cudaFreeAsync` with grow-only pattern
+- `fattn.cu`: removed redundant `cudaGetDevice` calls (shared device variable)
+
+---
+
+## Experiment #61: TCQ Python Prototype
+
+**Date**: 2026-03-28
+**Script**: `scripts/tcq_prototype.py`
+
+Trellis-coded quantization with bitshift trellis and iterative codebook training (GLA).
+Input: i.i.d. N(0,1) data, 128 elements/block (simulating post-FWHT KV cache).
+
+### 2-bit Results
+
+| Trellis | States | MSE | vs Lloyd-Max | dB |
+|---------|--------|-----|-------------|-----|
+| L=4 | 16 | 0.1185 | -0.9% | -0.04 |
+| L=6 | 64 | 0.1183 | -0.7% | -0.03 |
+| L=8 | 256 | 0.1101 | **+6.2%** | +0.28 |
+
+### 3-bit Results
+
+| Trellis | States | MSE | vs Lloyd-Max | dB |
+|---------|--------|-----|-------------|-----|
+| L=6 | 64 | 0.0354 | **+20.3%** | +0.99 |
+| L=9 | 512 | 0.0310 | **+30.3%** | +1.57 |
+
+D(R) bound at 3-bit: 0.0156 (4.54 dB from Lloyd-Max, 2.97 dB from TCQ L=9).
+
+Key finding: 3-bit gains are much larger than 2-bit. Codebook training is essential.
+V=1 scalar trellis — QTIP's V=2 would give larger gains but requires 2D codebook.

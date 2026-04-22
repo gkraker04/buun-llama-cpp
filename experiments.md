@@ -693,6 +693,60 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Source**: PR #2 (dusterbloom). Uses unnormalized Hadamard so post-FWHT values are N(0,1). Centroids universal for any head_dim.
 **Result**: Functionally equivalent to our approach — the 1/√128 factor just moves between centroids and norm. No quality/speed benefit, breaking format change. Not worth it.
 
+### 56. Norm correction — adjust stored norm for centroid reconstruction error `done`
+**Source**: PR #5 (dusterbloom). After Lloyd-Max quantization, recompute stored norm as `||x_original|| / ||x_reconstructed_centroids||` so dequantized vector has correct L2 norm.
+**Why**: Our current norm is just `||x||`. After quantizing to centroids, the reconstructed unit vector's L2 norm isn't exactly 1.0 — it depends on which centroids were selected. Multiplying by the original norm gives the wrong magnitude. The correction is: `norm_corrected = ||x|| / ||centroid_recon_unit||`. Zero runtime cost (correction during quant in SET_ROWS, dequant path unchanged).
+**Risk**: Very low — format-compatible (still stores one fp16 norm per block), dequant kernels unchanged.
+**Expected gain**: Small PPL improvement, especially at lower bit rates (turbo2/turbo3) where centroid quantization error is larger.
+
+### 57. Persistent decode K/V fp16 buffers `done`
+**Source**: PR #5 (dusterbloom). Replace `cudaMallocAsync`/`cudaFreeAsync` per decode token with grow-only persistent `cudaMalloc` buffers (same pattern as our existing `q_rot_buf`).
+**Why**: Avoids async allocator overhead on every decode step. Already proven pattern in our Q rotation buffer.
+**Risk**: Very low — same pattern as `q_rot_buf`.
+**Expected gain**: Small decode latency reduction, mainly visible at short context where allocator overhead is proportionally larger.
+
+### 58. Head dimension padding to 128 `needs-research`
+**Source**: PR #5 (dusterbloom). Pad KV cache dimensions to QK=128 for models with non-128-aligned head_dim (64, 96, etc.).
+**Why**: Many models use head_dim=64 (LLaMA-2, Mistral, etc.) and can't use turbo types today. Padding to 128 would unlock them at the cost of ~2x memory overhead for head_dim=64.
+**Risk**: Medium — needs changes across KV cache allocation, SET_ROWS, FA kernels. Memory overhead may negate compression benefit for small head_dims.
+**Expected gain**: Model compatibility. Quality impact unknown — FWHT on zero-padded vectors changes the distribution.
+
+### 59. Smooth scaling before FWHT (from VecInfer) `done`
+**Paper**: arXiv:2510.06175 (Oct 2025). VecInfer applies SmoothQuant-style per-channel scaling before Hadamard rotation.
+**Why**: FWHT redistributes outliers but doesn't fix inter-channel magnitude imbalance. Smooth scaling divides each K channel by `λ_i = sqrt(max(|K_i|))` (calibrated offline), then multiplies Q by the same factor. VecInfer ablation shows smooth + Hadamard is super-additive: Hadamard alone 51.0, smooth+Hadamard 51.8 at 1.5-bit on LLaMA-3.1-8B. Similar to our InnerQ but targets a different axis (magnitude equalization vs variance equalization).
+**Implementation**: Calibrate per-layer channel scales from ~256 samples. Apply inverse scale to K in SET_ROWS before FWHT. Apply forward scale to Q before attention. Store scales in constant memory (128 floats/layer). Could reuse InnerQ infrastructure.
+**Risk**: Low — same pattern as InnerQ. Calibration required.
+**Expected gain**: Small PPL improvement at low bit rates (turbo2/turbo3). Negligible at turbo4 where we're already beating q8_0.
+**Result**: Already covered by InnerQ (#52). VecInfer's formula = InnerQ mode=1 (max-based), which was tested and found WORSE than baseline on turbo3. InnerQ mode=0 (RMS, strength=0.20) gives 46% gap closure on hd128, auto-disables on hd256 (already balanced). No additional work needed.
+
+### 60. Product quantization + ADC lookup tables for K (from VecInfer) `needs-research`
+**Paper**: arXiv:2510.06175 (Oct 2025). VecInfer uses Product Quantization (PQ) instead of scalar VQ for keys. The key insight: PQ enables Asymmetric Distance Computation (ADC) — precompute `query_subvec · centroid` lookup table once per query, then each key token's attention score is just M integer-indexed table lookups instead of full dequant + dot product. For d=128, M=64 sub-vectors of dim 2: 64 uint8 lookups + 63 adds vs 128 dequant + 128 FMA.
+**Why**: Fundamentally faster Q·K computation. VecInfer reports 2.7x attention speedup on H100 at 2-bit. The fused kernel (compute on quantized, never dequant K) is the dream path.
+**Implementation**: Major arch change — replace scalar Lloyd-Max codebook with PQ codebook (M sub-vectors × C centroids). Requires offline codebook training (faiss k-means, ~256 calibration samples). New SET_ROWS kernel (PQ encode), new FA kernel (ADC LUT + table lookup). Format change.
+**Risk**: High — complete rework of quantization + attention for K. V can stay scalar. Python prototype first to validate quality (PQ MSE vs scalar Lloyd-Max MSE at same bit rate).
+**Expected gain**: Potentially large decode speedup at long context. Quality may differ — PQ sub-vector independence assumption vs scalar per-element optimality.
+
+### 61. Trellis-coded quantization (TCQ) for turbo2 + turbo3 `tested-marginal`
+**Source**: QTIP (NeurIPS 2024, arXiv:2406.11235) + Marcellin & Fischer 1990. From V.34 modem TCM, adapted for source coding. Cross-field idea from telecoms.
+**Concept**: Replace independent Lloyd-Max scalar quantization with Viterbi-optimal joint quantization over 128 elements using a bitshift trellis. Each element still stores k bits, but a trellis with 2^L states constrains which codewords can follow each other, enabling a much larger effective codebook (2^L entries vs 2^k) at the same bit rate.
+**Key insight — bitshift trellis decode is O(1)/element**: Element t's reconstruction depends only on an L-bit sliding window at bit positions [t*k, t*k+L). Fully parallel GPU decode, ~3-5 instructions per element. Codebook fits in shared memory.
+**Python prototype results** (i.i.d. N(0,1), 128 elements, trained codebook via GLA):
+- 2-bit L=8 (256 states): MSE 0.110 (+6.2% vs Lloyd-Max, +0.28 dB)
+- 3-bit L=6 (64 states): MSE 0.035 (+20.3% vs Lloyd-Max, +0.99 dB)
+- **3-bit L=9 (512 states): MSE 0.031 (+30.3% vs Lloyd-Max, +1.57 dB)**
+- Codebook training essential — untrained codebooks show zero or negative gain
+- V=1 (scalar) trellis, not QTIP's V=2 (vector). QTIP reports larger gains with V=2.
+- D(R) bound still 4.54 dB away at 3-bit — room for improvement with larger trellis/V=2
+**Encode**: Viterbi algorithm, O(2^L × 128) per block. At L=9 (512 states): ~6.4 ms/token for 320 blocks.
+**Next steps**:
+1. CUDA encode kernel: Viterbi in shared memory, warp-parallel state updates
+2. CUDA decode kernel: bitshift window + codebook lookup in fattn-vec and fattn MMA paths
+3. New block format: same qs[] layout but interpretation changes (trellis indices, not independent)
+4. Codebook training: offline (calibration data), store per-model trained codebook
+**Risk**: High engineering effort. Encode is inherently sequential over 128 elements (Viterbi). No published KV cache TCQ exists — would be novel.
+**Priority**: turbo3 (30% MSE reduction at L=9 is large). turbo2 gains more modest (6% at L=8), needs larger trellis.
+**Prototype**: `scripts/tcq_prototype.py`
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**
