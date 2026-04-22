@@ -2,6 +2,24 @@
 #include "cpy-utils.cuh"
 #include "turbo-quant-cuda.cuh"
 #include <cstring>
+#include <cerrno>
+
+static void load_tcq_norm_alpha() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const char *s = getenv("TURBO_TCQ_ALPHA");
+    if (!s) return;
+    char *end;
+    errno = 0;
+    float alpha = strtof(s, &end);
+    if (end == s || errno != 0 || alpha <= 0.0f || alpha >= 10.0f) {
+        fprintf(stderr, "TCQ: invalid TURBO_TCQ_ALPHA='%s'\n", s);
+        return;
+    }
+    cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha, sizeof(float));
+    fprintf(stderr, "TCQ: norm alpha = %.3f\n", alpha);
+}
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -373,14 +391,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     fprintf(stderr, "TCQ encode: FAILED to load codebook from %s\n", cb_path);
                 }
             }
-            const char *alpha_str = getenv("TURBO_TCQ_ALPHA");
-            if (alpha_str) {
-                float alpha = strtof(alpha_str, NULL);
-                if (alpha > 0.0f && alpha < 10.0f) {
-                    cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha, sizeof(float));
-                    fprintf(stderr, "TCQ: norm alpha = %.3f\n", alpha);
-                }
-            }
+            load_tcq_norm_alpha();
         }
         // TCQ Viterbi encode: 512 threads per block (one per trellis state)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
@@ -418,14 +429,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     fprintf(stderr, "TCQ2 encode: FAILED to load codebook from %s\n", cb_path);
                 }
             }
-            const char *alpha_str = getenv("TURBO_TCQ_ALPHA");
-            if (alpha_str) {
-                float alpha = strtof(alpha_str, NULL);
-                if (alpha > 0.0f && alpha < 10.0f) {
-                    cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha, sizeof(float));
-                    fprintf(stderr, "TCQ: norm alpha = %.3f\n", alpha);
-                }
-            }
+            load_tcq_norm_alpha();
         }
         // 2-bit TCQ Viterbi encode: 256 threads per block (one per trellis state, L=8)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);

@@ -613,8 +613,8 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
     -0.16474872f, -0.09278035f, -0.04699890f, -0.00779894f, +0.03187623f, +0.07828258f, +0.13561429f, +0.23917313f
 };
 
-// Temperature scaling factor for TCQ norm. alpha > 1 sharpens attention (helps long context).
-// Set via TURBO_TCQ_ALPHA env var. Default 1.0 = standard MSE-optimal norm correction.
+// Temperature scaling for TCQ norm. alpha > 1 sharpens attention (helps long context).
+// Override via TURBO_TCQ_ALPHA env var.
 static __constant__ float d_tcq_norm_alpha = 1.2f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
