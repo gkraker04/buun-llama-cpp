@@ -144,7 +144,6 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
     float norm = sqrtf(norm_sq);
     float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
-    dst->norm = __float2half(norm);
     float x[128];
     for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
     float normalized[128];
@@ -169,12 +168,23 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
         residual[j] = normalized[j] - recon[j];
         rnorm_sq += residual[j] * residual[j];
     }
-    dst->rnorm = __float2half(sqrtf(rnorm_sq));
+    float rnorm = sqrtf(rnorm_sq);
+    dst->rnorm = __float2half(rnorm);
     // QJL rotation of residual, then extract sign bits
     turbo_rotate_forward_cuda(residual, d_turbo_qjl_wht_signs1, d_turbo_qjl_wht_signs2);
     for (int j = 0; j < 128; j++) {
         if (residual[j] >= 0.0f) dst->signs[j / 8] |= (1 << (j % 8));
     }
+    // Norm correction: compute full reconstruction norm (centroid + QJL) in unit space
+    float qjl_scale_unit = 1.2533141f / 128.0f * rnorm;
+    float recon_full_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        float s = (dst->signs[j / 8] & (1 << (j % 8))) ? qjl_scale_unit : -qjl_scale_unit;
+        float r = recon[j] + s;
+        recon_full_sq += r * r;
+    }
+    float recon_full_norm = sqrtf(recon_full_sq);
+    dst->norm = __float2half((recon_full_norm > 1e-10f) ? norm / recon_full_norm : norm);
 }
 
 // === TURBO4: GET_ROWS dequantize ===
