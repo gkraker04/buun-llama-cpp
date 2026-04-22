@@ -310,31 +310,38 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // turbo4's QJL correction loses precision in fp16 round-trip (PPL 5.90 vs 5.82).
-    // Only use prefill optimization for turbo3; turbo4 falls through to vec kernel.
-    const bool turbo_k = K->type == GGML_TYPE_TURBO3_0;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO3_0;
+    const bool turbo_k = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
 
-    // Allocate and dequant K if turbo (turbo_k is only true for TURBO3_0)
-    // Uses cudaMallocAsync (stream-ordered, CUDA graph compatible)
+    // Allocate and dequant K to fp16 (turbo3 or turbo4)
     if (turbo_k) {
         const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
         dim3 grid_k(K->ne[1], K->ne[2]);
-        k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-            (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+        if (K->type == GGML_TYPE_TURBO3_0) {
+            k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+        } else {
+            k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+        }
     }
 
-    // Allocate and dequant V if turbo (turbo_v is only true for TURBO3_0)
+    // Allocate and dequant V to fp16 (turbo3 or turbo4)
     if (turbo_v) {
         const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
         CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
         dim3 grid_v(V->ne[1], V->ne[2]);
-        k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-            (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+        if (V->type == GGML_TYPE_TURBO3_0) {
+            k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+        } else {
+            k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+        }
     }
 
     // Create fp16 tensor copies on stack
@@ -723,8 +730,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * V = dst->src[2];
 
     // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
-    // Only turbo3 uses prefill dequant+MMA (turbo4's QJL correction loses precision in fp16)
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
+    // turbo4's QJL correction loses ~1% PPL precision in fp16 round-trip, but 2x prefill speedup
+    // is worth it since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+                          V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: Q rotation handled inside, V un-rotation at graph level
         ggml_cuda_turbo_prefill_attend(ctx, dst);

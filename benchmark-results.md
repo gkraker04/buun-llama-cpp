@@ -544,6 +544,19 @@ Native dequant with sparse V matches fp16 dequant speed at all contexts.
 The fp16 dequant path was originally created to fix this regression — sparse V
 achieves the same fix with zero extra memory bandwidth (no temp fp16 buffer).
 
+### Experiment #16b: turbo4 Prefill MMA Enabled
+
+Enabled fp16 dequant + MMA for turbo4 prefill. QJL correction loses ~1% PPL in fp16,
+but 1.9x prefill speedup is worth it (only prompt tokens affected).
+
+| Metric | turbo4 before | turbo4 after | turbo3 (ref) | q8_0 (ref) |
+|--------|---------------|--------------|--------------|------------|
+| pp4096 tok/s | 588 | **1113** | 1125 | 1133 |
+| PPL (all-prefill) | 5.8186 | 5.8966 | 5.8501 | 5.8375 |
+| Decode tg64 | 29.43 | 29.66 | 30.25 | 31.04 |
+
+turbo3 PPL verified unchanged (5.8501).
+
 ### CUDA 13.2 Compatibility
 Built and tested with CUDA 13.2.0 (nvcc V13.2.51). No segfault, identical results.
 Turbo3 PPL: 5.8501 (identical). Turbo4 PPL: 5.8186 (identical).

@@ -115,18 +115,18 @@ Prefill pp4096 (tok/s):
 ---
 
 ### 16. Prefill dequant-then-attend (dequant to fp16 + MMA)
-**Status**: done — **turbo3 only** (turbo4 disabled due to QJL fp16 precision loss)
+**Status**: done — **turbo3 + turbo4**
 **Type**: speed (prefill)
 **Branch**: `experiment/prefill-dequant-attend`
-**Result**: turbo3 prefill 631→1125 tok/s (1.78x, 98.8% of q8_0). PPL 5.8501 (within error bars of 5.8323 baseline).
-**turbo4 issue**: QJL correction (~0.001 magnitude) rounds away in fp16 temp buffer. turbo4 prefill PPL 5.8966 vs 5.8186 vec kernel (+1.3%). Disabled — turbo4 uses vec kernel for prefill (588 tok/s).
+**Result**: turbo3 prefill 631→1125 tok/s (1.78x, 98.8% of q8_0). turbo4 prefill 588→1113 tok/s (1.9x, 98.1% of q8_0).
+**turbo4 note**: QJL correction (~0.001 magnitude) rounds away in fp16 temp buffer. turbo4 prefill PPL 5.8966 vs 5.8186 full precision (+1.3%). Accepted tradeoff: only prompt tokens affected, generated tokens use full-precision SET_ROWS.
 **Bug fixed**: turbo4 dequant_f16 kernel had missing block indexing for ne0 > QK_TURBO4 (Qwen3.5-27B has head_dim=256).
 
-### 16b. turbo4 prefill via float32 temp or inline MMA dequant
-**Status**: ready
+### 16b. turbo4 prefill — accepted fp16 tradeoff
+**Status**: done — **ENABLED, 1.9x prefill speedup**
 **Type**: speed (prefill, turbo4 only)
-**What**: Two options to fix turbo4 prefill: (a) Use float32 temp buffer instead of fp16 (2x memory, need MMA dispatch that reads float32 K/V), or (b) BitDecoding-style inline dequant in MMA pipeline (no temp buffer, dequant overlapped with TC matmul). Option (b) is the long-term solution.
-**Difficulty**: Medium (a) to High (b).
+**What**: Enabled fp16 dequant + MMA for turbo4 prefill. QJL loses ~1% PPL precision in fp16 round-trip, but 2x prefill speedup is worth it since only prompt tokens are affected.
+**Result**: turbo4 pp4096 = 1113 tok/s (was 588). PPL 5.8966 (all-prefill worst case). Real inference quality between 5.82-5.90 depending on prompt/generation ratio.
 
 ---
 
