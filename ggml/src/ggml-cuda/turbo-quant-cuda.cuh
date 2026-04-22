@@ -431,8 +431,9 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
       v.y = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * norm; }
 }
 
-// Temperature scaling for turbo4. Override via TURBO4_ALPHA env var.
-static __constant__ float d_turbo4_alpha = 1.2f;
+// Temperature scaling for turbo4. KLD-optimal: α=1.0 (any scaling hurts KLD).
+// Override via TURBO4_ALPHA env var.
+static __constant__ float d_turbo4_alpha = 1.0f;
 
 // === TURBO4: SET_ROWS quantize (4-bit PolarQuant, no QJL) ===
 static __device__ __forceinline__
@@ -622,11 +623,11 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
     -0.16474872f, -0.09278035f, -0.04699890f, -0.00779894f, +0.03187623f, +0.07828258f, +0.13561429f, +0.23917313f
 };
 
-// Asymmetric temperature scaling for TCQ norm. V-heavier scaling improves long-context quality.
+// TCQ temperature scaling. KLD-optimal: αK=1.0, αV=1.04 (3-bit) / 1.06 (2-bit).
 // Override via TURBO_TCQ_ALPHA (K) and TURBO_TCQ_ALPHA_V (V) env vars.
 // If TURBO_TCQ_ALPHA_V is not set, V uses the same alpha as K.
 static __constant__ float d_tcq_norm_alpha = 1.0f;
-static __constant__ float d_tcq_norm_alpha_v = 1.1f;
+static __constant__ float d_tcq_norm_alpha_v = 1.04f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group

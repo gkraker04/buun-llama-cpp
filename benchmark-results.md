@@ -2061,3 +2061,110 @@ turbo2_tcq KLD is 5.9x worse than q8_0. This is the honest cost of 2.25 bpv vs 8
 
 Build: exp-alpha-fix from master + αK=1.0/αV=1.1 defaults. Codebook: numpy (compiled-in).
 GPU: RTX 3090 24GB, all 65 layers offloaded. KV cache on CUDA0.
+
+## KLD Alpha Sweep — Clean Build (2026-04-01)
+
+Fresh `git archive HEAD` of master → exp-kld-sweep. 65/65 layers on GPU. KV buffer sizes verified
+(9 MiB for turbo2_tcq, 13 MiB for turbo3_tcq, not 34 MiB). CUDA-finetuned codebooks loaded via env vars.
+f16 PPL = 5.8048, q8_0 KLD = 0.0171.
+
+### turbo2_tcq αV sweep (αK=1.0 fixed, CUDA 200-iter codebook)
+
+| αV | PPL | Mean KLD | Same top p |
+|----|-----|----------|-----------|
+| 1.00 | 6.004 | 0.0993 | 93.1% |
+| 1.02 | 5.969 | 0.0975 | 93.1% |
+| 1.04 | 5.923 | 0.1044 | 93.3% |
+| **1.06** | **5.879** | **0.0873** | **93.3%** |
+| 1.08 | 5.905 | 0.0991 | 93.4% |
+| 1.10 | 5.858 | 0.0926 | 93.3% |
+| 1.12 | 5.811 | 0.1107 | 92.9% |
+| 1.14 | 5.759 | 0.1146 | 92.5% |
+| 1.16 | 5.786 | 0.1185 | 92.4% |
+| 1.20 | 5.756 | 0.1231 | 92.3% |
+| 1.25 | 5.732 | 0.1385 | 91.6% |
+| 1.30 | 5.758 | 0.1502 | 91.0% |
+
+**KLD minimum at αV=1.06** (0.0873). V scaling corrects up to ~1.06, then hurts.
+
+### turbo2_tcq αK sweep (αV=1.0 fixed, CUDA 200-iter codebook)
+
+| αK | PPL | Mean KLD | Same top p |
+|----|-----|----------|-----------|
+| 1.00 | 6.004 | 0.0993 | 93.1% |
+| 1.02 | 5.995 | 0.1033 | 93.4% |
+| 1.04 | 5.951 | 0.1075 | 93.2% |
+| 1.06 | 5.916 | 0.1018 | 93.2% |
+| 1.08 | 5.908 | **0.0911** | 93.0% |
+| 1.10 | 5.845 | 0.1039 | 93.0% |
+| 1.14 | 5.818 | 0.1118 | 92.5% |
+| 1.20 | 5.811 | 0.1198 | 92.4% |
+
+K scaling shows weak minimum at αK=1.08 (0.091) — may be noise. Generally increases KLD.
+
+### turbo3_tcq αV sweep (αK=1.0 fixed, CUDA finetuned codebook)
+
+| αV | PPL | Mean KLD | Same top p |
+|----|-----|----------|-----------|
+| 1.00 | 5.892 | 0.0605 | 96.0% |
+| 1.02 | 5.810 | 0.0593 | 95.8% |
+| **1.04** | **5.788** | **0.0531** | **96.0%** |
+| 1.06 | 5.814 | 0.0700 | 95.7% |
+| 1.08 | 5.746 | 0.0691 | 95.2% |
+| 1.10 | 5.719 | 0.0847 | 95.4% |
+| 1.12 | 5.737 | 0.0887 | 94.7% |
+| 1.14 | 5.767 | 0.0870 | 94.7% |
+| 1.16 | 5.678 | 0.0906 | 94.3% |
+| 1.20 | 5.610 | 0.1123 | 93.6% |
+| 1.25 | 5.612 | 0.1256 | 92.6% |
+| 1.30 | 5.606 | 0.1479 | 91.9% |
+
+**KLD minimum at αV=1.04** (0.0531). Clear optimum — 12% better than α=1.0.
+
+### turbo3_tcq αK sweep (αV=1.0 fixed, CUDA finetuned codebook)
+
+| αK | PPL | Mean KLD | Same top p |
+|----|-----|----------|-----------|
+| **1.00** | 5.892 | **0.0605** | **96.0%** |
+| 1.02 | 5.828 | 0.0614 | 95.7% |
+| 1.04 | 5.884 | 0.0671 | 95.6% |
+| 1.06 | 5.866 | 0.0775 | 95.6% |
+| 1.08 | 5.789 | 0.0673 | 95.2% |
+| 1.10 | 5.760 | 0.0803 | 95.7% |
+| 1.14 | 5.787 | 0.0970 | 94.5% |
+| 1.20 | 5.711 | 0.1084 | 93.5% |
+
+**K scaling always hurts KLD.** α=1.0 is optimal. Every increase in αK worsens distribution fidelity.
+
+### turbo4 α sweep (single α, PolarQuant centroids)
+
+| α | PPL | Mean KLD | Same top p |
+|---|-----|----------|-----------|
+| **1.00** | **5.858** | **0.0428** | **97.0%** |
+| 1.02 | 5.794 | 0.0545 | 96.8% |
+| 1.04 | 5.732 | 0.0681 | 96.2% |
+| 1.06 | 5.714 | 0.0805 | 95.7% |
+| 1.08 | 5.659 | 0.0920 | 94.9% |
+| 1.10 | 5.656 | 0.1015 | 94.1% |
+| 1.12 | 5.632 | 0.1139 | 93.6% |
+| 1.14 | 5.556 | 0.1294 | 92.9% |
+| 1.16 | 5.527 | 0.1413 | 92.4% |
+| 1.20 | 5.503 | 0.1668 | 91.2% |
+| 1.25 | 5.489 | 0.1957 | 89.9% |
+| 1.30 | 5.517 | 0.2241 | 88.3% |
+
+**ANY scaling hurts KLD.** α=1.0 is optimal. Old default α=1.2 was 3.9x worse on KLD (0.167 vs 0.043).
+
+### KLD-optimal defaults summary
+
+| Type | KLD-opt αK | KLD-opt αV | PPL | Mean KLD | vs q8_0 KLD |
+|------|-----------|-----------|-----|----------|-------------|
+| q8_0 | — | — | 5.839 | 0.0171 | 1.0x |
+| turbo4 | 1.00 | 1.00 | 5.858 | 0.0428 | 2.5x |
+| turbo3_tcq | 1.00 | 1.04 | 5.788 | 0.0531 | 3.1x |
+| turbo2_tcq | 1.00 | 1.06 | 5.879 | 0.0873 | 5.1x |
+
+turbo4 (4.125 bpv) has BETTER KLD than turbo3_tcq (3.25 bpv) — the extra bit buys real fidelity.
+turbo3_tcq has notably better PPL than turbo4 despite worse bit rate — TCQ codebook optimization at work.
+V scaling provides a small genuine correction for TCQ types (αV≈1.04-1.06) but not for PolarQuant.
+K scaling never helps KLD for any type. All previous K scaling was pure attention sharpening.
