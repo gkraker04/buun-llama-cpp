@@ -17,6 +17,67 @@ void turbo_innerq_init_fattn() {
     cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, ones, sizeof(ones));
 }
 
+// Q² calibration: host-side management
+static int q_calibrate_state = 0; // 0=off, 1=collecting, 2=done
+
+void turbo_q_calibrate_init() {
+    const char * env = getenv("TURBO_Q_CALIBRATE");
+    if (!env || atoi(env) != 1) return;
+
+    double zeros[128] = {};
+    int zero = 0, one = 1;
+    cudaMemcpyToSymbol(d_q_channel_sq_fattn, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(d_q_channel_count_fattn, &zero, sizeof(zero));
+    cudaMemcpyToSymbol(d_q_calibrate_fattn, &one, sizeof(one));
+    q_calibrate_state = 1;
+    fprintf(stderr, "TURBO_Q_CALIBRATE: collecting per-position Q² statistics\n");
+}
+
+void turbo_q_calibrate_finalize() {
+    if (q_calibrate_state != 1) return;
+
+    int zero = 0;
+    cudaMemcpyToSymbol(d_q_calibrate_fattn, &zero, sizeof(zero));
+
+    double sq[128];
+    int count;
+    cudaMemcpyFromSymbol(sq, d_q_channel_sq_fattn, sizeof(sq));
+    cudaMemcpyFromSymbol(&count, d_q_channel_count_fattn, sizeof(count));
+
+    if (count == 0) {
+        fprintf(stderr, "TURBO_Q_CALIBRATE: no Q vectors seen, skipping\n");
+        q_calibrate_state = 2;
+        return;
+    }
+
+    // Compute E[Q²] per position and save as 128 float32 values
+    float weights[128];
+    fprintf(stderr, "TURBO_Q_CALIBRATE: %d Q groups accumulated\n", count);
+    double total = 0;
+    for (int i = 0; i < 128; i++) {
+        weights[i] = (float)(sq[i] / count);
+        total += weights[i];
+    }
+    float mean = (float)(total / 128.0);
+    float maxw = 0, minw = 1e30f;
+    for (int i = 0; i < 128; i++) {
+        if (weights[i] > maxw) maxw = weights[i];
+        if (weights[i] < minw) minw = weights[i];
+    }
+    fprintf(stderr, "  E[Q²] mean=%.6f min=%.6f max=%.6f ratio=%.2f\n",
+            mean, minw, maxw, maxw / (minw > 1e-10f ? minw : 1e-10f));
+
+    const char * path = "/tmp/q_weights.bin";
+    FILE * fp = fopen(path, "wb");
+    if (fp) {
+        fwrite(weights, sizeof(float), 128, fp);
+        fclose(fp);
+        fprintf(stderr, "  Saved Q weights to %s (128 floats)\n", path);
+    }
+
+    q_calibrate_state = 2;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -220,6 +281,32 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// Decode-time V alpha: loaded once from TURBO_TCQ_DECODE_ALPHA_V env var.
+// When set, this alpha is applied at decode time (norm * alpha) instead of being baked
+// into the norm at encode time. Set encode-time alpha to 1.0 (TURBO_TCQ_ALPHA_V=1.0)
+// when using decode-time alpha to avoid double-application.
+static float d_tcq_decode_alpha_v = 1.0f; // default: no decode-time alpha
+
+static void load_tcq_decode_alpha() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V");
+    if (s) {
+        char * end;
+        errno = 0;
+        float a = strtof(s, &end);
+        if (end == s || errno != 0 || a <= 0.0f || a >= 10.0f) {
+            fprintf(stderr, "TCQ: invalid TURBO_TCQ_DECODE_ALPHA_V='%s'\n", s);
+        } else {
+            d_tcq_decode_alpha_v = a;
+            // Also set the fattn-common.cuh __constant__ for native decode path
+            cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &a, sizeof(float));
+            fprintf(stderr, "TCQ decode: V alpha=%.4f (decode-time)\n", a);
+        }
+    }
+}
+
 // === Turbo prefill: bulk dequant to fp16 + MMA attention ===
 // During prefill (Q->ne[1] > 1), dequantize turbo K/V to fp16 temp buffers
 // and use the fast MMA kernel instead of the slower vec kernel.
@@ -271,7 +358,8 @@ static __global__ void k_turbo3_dequant_f16(
 static __global__ void k_turbo3_tcq_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
     const int64_t strm = blockIdx.z;
@@ -283,7 +371,7 @@ static __global__ void k_turbo3_tcq_dequant_f16(
     const int t = j % QK_TURBO3_TCQ; // element index within 128-element block
     const block_turbo3_tcq * blk = (const block_turbo3_tcq *)src_row + blk_idx;
 
-    const float norm = __half2float(blk->norm);
+    const float norm = __half2float(blk->norm) * alpha;
 
     // Sliding window decode: read 9-bit state from bitstream at bit offset t*3
     const int bit_pos = t * 3;
@@ -299,7 +387,8 @@ static __global__ void k_turbo3_tcq_dequant_f16(
 static __global__ void k_turbo2_tcq_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
     const int64_t strm = blockIdx.z;
@@ -311,7 +400,7 @@ static __global__ void k_turbo2_tcq_dequant_f16(
     const int t = j % QK_TURBO2_TCQ;
     const block_turbo2_tcq * blk = (const block_turbo2_tcq *)src_row + blk_idx;
 
-    const float norm = __half2float(blk->norm);
+    const float norm = __half2float(blk->norm) * alpha;
 
     // Sliding window decode: read 8-bit state from bitstream at bit offset t*2
     const int bit_pos = t * 2;
@@ -436,11 +525,19 @@ static __global__ void k_turbo_fwht_forward(
 
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     if (threadIdx.x < 128) {
-        dst[offset + threadIdx.x] = buf[threadIdx.x] * inv_sqrt_128 * s2[threadIdx.x];
+        float val = buf[threadIdx.x] * inv_sqrt_128 * s2[threadIdx.x];
+        dst[offset + threadIdx.x] = val;
+
+        // Q² calibration: accumulate per-position squared values
+        if (d_q_calibrate_fattn) {
+            atomicAdd(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
+            if (threadIdx.x == 0) atomicAdd(&d_q_channel_count_fattn, 1);
+        }
     }
 }
 
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    load_tcq_decode_alpha();
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -489,7 +586,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
             // Runtime codebook loading for 2-bit fattn decode
             {
@@ -512,7 +609,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
         } else {
             // turbo4 K: inverse FWHT dequant — produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
@@ -554,7 +651,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
         } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
             // Runtime codebook loading for 2-bit V decode (in case K is a different type)
             {
@@ -576,7 +673,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
         } else {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -999,6 +1096,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
+        load_tcq_decode_alpha();
         cudaStream_t stream = ctx.stream();
 
         // Dequant turbo3 K/V to fp16 for decode: trades extra memory bandwidth for
@@ -1031,10 +1129,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
                 } else {
                     k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
@@ -1063,10 +1161,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
                 } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], d_tcq_decode_alpha_v);
                 } else {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);

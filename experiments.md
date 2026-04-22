@@ -895,6 +895,37 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Risk**: Medium — Q statistics may vary too much across tokens/positions for a single codebook to capture. May need per-layer codebooks (already explored in multilayer plan). Training cost increases significantly (need Q data, not just K).
 **Expected**: If Ordentlich-Polyanskiy theory applies to our setting, product-aware codebooks should close some of the MSE-PPL gap. Even 0.02-0.05 PPL improvement at 2-3 bit would be significant. Could also explain why our "worse MSE" old numpy codebook gives better PPL than "better MSE" high-iteration codebooks.
 
+### 86. KLD scaling law: trained vs compiled-in codebooks across context `done`
+**Source**: Overnight multi-server benchmark campaign (2026-04-01). 4 servers: A100, dorei, 3090-A, 3090-B.
+**Concept**: Systematic KLD measurement of trained product-mono codebooks (iter001-iter100) vs compiled-in at 2K-32K with alpha optimization. Goal: scaling law predicting optimal codebook for any context length.
+**Methodology**: f16 base logits generated per-context with max chunks fitting in VRAM. KLD via llama-perplexity --kl-divergence. Alpha sweeps (0.96-1.12) for each candidate at each context.
+**Key findings**:
+1. Trained codebooks win 4K-24K, peaking at -3.7% (24K, A100 iter100@α=1.00 vs compiled-in@α=1.00)
+2. Crossover to compiled-in at ~30K (only +1.3% at 32K)
+3. Optimal iteration increases with context: iter060 (4K) → iter097 (8K) → iter100 (16K-24K)
+4. Optimal alpha DECREASES with context (1.04→1.00) then REVERSES at 32K back to 1.04
+5. Trained codebooks always want lower alpha than compiled-in at same context
+6. 2-bit: iter066@α=1.08 wins -7.0% at 8K. iter075 barely wins at 16K (-0.3%)
+7. K/V importance: V dominates at 2K, K dominates at 4K+ (up to -17.6% from K upgrade)
+8. Cross-GPU validation: identical KLDs on dorei/3090-A with same base logits. A100 differs in absolute values but consistent rankings.
+**Result**: Full data in benchmark-results.md "Scaling Law Summary" section. Actionable: iter100 is the best single trained codebook for 4K-24K. Per-context alpha tuning gives 2-6% quality improvement at zero speed cost. The 32K crossover may reflect a regime change in attention statistics.
+
+### 87. Fine-grained decode-time alpha characterization `ready`
+**Concept**: Find a closed-form mapping `α_decode_optimal = f(context_length)` for both 3-bit and 2-bit. Requires denser sampling in both alpha resolution and context lengths than the coarse 0.02-step × power-of-2 grid used so far.
+**Motivation**: Decode-time alpha is the preferred deployment path (enables context-adaptive scaling without re-encoding KV cache, produces 4% better KLD at 8K+). But the optimal decode alpha varies by context — we need a predictive formula for automatic tuning.
+**Plan**:
+1. Generate base logits for intermediate contexts on dorei: 6K, 12K (need ~34 GB, fits in available disk)
+2. 3-bit decode alpha sweep: 0.005 step from 0.995 to 1.035 at 2K, 4K, 6K, 8K, 12K, 16K, 24K, 32K (9 alphas × 8 contexts = 72 runs)
+3. 2-bit decode alpha sweep: 0.01 step from 1.03 to 1.12 at same contexts (10 alphas × 8 contexts = 80 runs)
+4. Fit curve: expect monotonic relationship between log(context) and optimal alpha
+**Known data** (coarse sweep, 0.02 step):
+- 3-bit decode optimal: 2K→1.02, 4K→1.00, 8K→1.02, 16K→1.02, 24K→1.02, 32K→1.00
+- 2-bit decode optimal: 2K→1.06, 4K→1.00, 8K→1.08, 16K→1.08, 24K→1.10, 32K→1.08
+- At 8K+, decode beats encode by 3-5% at matched alpha
+**Open question**: The 2K/4K decode results look anomalous relative to the smooth 8K+ trend. Finer alpha resolution may reveal the true optima are closer to the 8K+ pattern.
+**Estimated time**: ~17 hours on dorei (long contexts dominate). Could parallelize short contexts to 3090-A/B with fresh builds.
+**Risk**: Low — measurement only, no code changes.
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**

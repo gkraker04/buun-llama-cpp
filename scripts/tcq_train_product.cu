@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <curand.h>
 #include <cuda_runtime.h>
+#include "tcq_diagnostics.cuh"
 
 #define CHECK_CUDA(call) do { \
 	cudaError_t err = (call); \
@@ -287,13 +288,60 @@ enum TrainMode { MODE_MSE, MODE_ISOTROPY, MODE_QWEIGHTS };
 template<int K, int L>
 void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
            const char* init_file, const char* qweight_file, const char* out_file,
-           int q_rank, int base_seed) {
+           const char* data_file, int q_rank, int base_seed,
+           const char* output_dir, bool constrain_mono) {
 	constexpr int N_STATES = 1 << L;
+	constexpr int N_GROUPS = 1 << (L - K);
 	const float sigma = 1.0f / sqrtf(128.0f);
 	const float* centroids = (K == 2) ? LM_2BIT : LM_3BIT;
 
-	printf("Mode: %s\n", mode == MODE_MSE ? "mse" :
-	       mode == MODE_ISOTROPY ? "isotropy" : "qweights");
+	if (output_dir) { mkdir(output_dir, 0755); printf("Output dir: %s\n", output_dir); }
+	if (constrain_mono) printf("Monotonicity constraint: ENABLED\n");
+
+	// load real data from model dump if provided
+	float* h_real_data = nullptr;
+	int real_data_n = 0;
+	if (data_file) {
+		FILE* fp = fopen(data_file, "rb");
+		if (!fp) { fprintf(stderr, "Cannot open data file: %s\n", data_file); exit(1); }
+
+		fseek(fp, 0, SEEK_END);
+		long file_size = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+
+		// auto-detect: header format (int32 count + data) or raw format (just floats)
+		int32_t maybe_count;
+		fread(&maybe_count, sizeof(int32_t), 1, fp);
+
+		int count;
+		if (maybe_count > 0 && maybe_count < 100000000 &&
+		    (long)maybe_count * T * sizeof(float) + sizeof(int32_t) == file_size) {
+			count = maybe_count;
+			printf("Data file has header: %d blocks\n", count);
+		} else {
+			fseek(fp, 0, SEEK_SET);
+			count = file_size / (T * sizeof(float));
+			printf("Data file (raw): %d blocks (%.1f MB)\n", count, file_size / 1e6);
+		}
+
+		if (count > n_train) count = n_train;
+		real_data_n = count;
+		n_train = count;
+		h_real_data = (float*)malloc((size_t)count * T * sizeof(float));
+		size_t read = fread(h_real_data, sizeof(float), (size_t)count * T, fp);
+		fclose(fp);
+		if ((int)(read / T) < count) {
+			fprintf(stderr, "Data file truncated: got %d blocks, expected %d\n", (int)(read/T), count);
+			count = (int)(read / T);
+			real_data_n = count;
+			n_train = count;
+		}
+		printf("Loaded %d real K blocks from %s\n", real_data_n, data_file);
+	}
+
+	printf("Mode: %s, n_train=%d%s\n", mode == MODE_MSE ? "mse" :
+	       mode == MODE_ISOTROPY ? "isotropy" : "qweights",
+	       n_train, data_file ? " (real data)" : " (synthetic)");
 
 	// initialize per-position weights
 	float h_weights[T];
@@ -410,17 +458,23 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 		memcpy(best_codebook, h_codebook, N_STATES * sizeof(float));
 		int stall = 0;
 
+		// upload real data once before iteration loop
+		if (h_real_data) {
+			CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+		}
+
 		for (int iter = 0; iter < n_iters; iter++) {
 			CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, h_codebook, N_STATES * sizeof(float)));
 
-			// generate fresh K data
-			CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
-			CHECK_CURAND(curandGenerateNormal(gen, d_data, (size_t)n_train * T, 0.0f, sigma));
+			if (!h_real_data) {
+				// generate fresh synthetic K data
+				CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
+				CHECK_CURAND(curandGenerateNormal(gen, d_data, (size_t)n_train * T, 0.0f, sigma));
+			}
 
-			// generate Q vectors for product eval (different seed)
+			// generate Q vectors for product eval (always synthetic)
 			CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + 50000 + restart * 10000 + iter));
 			CHECK_CURAND(curandGenerateNormal(gen, d_queries, (size_t)n_train * T, 0.0f, sigma));
-			// apply anisotropy profile
 			{
 				int threads = 256;
 				int blocks = ((int)(n_train * T) + threads - 1) / threads;
@@ -525,6 +579,11 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 				}
 			}
 
+			// apply monotonicity constraint if enabled
+			if (constrain_mono) {
+				apply_monotonicity_constraint<K>(h_codebook, N_GROUPS);
+			}
+
 			// adaptive isotropy: update weights for next iteration
 			if (mode == MODE_ISOTROPY && iter < n_iters - 1) {
 				for (int t = 0; t < T; t++) {
@@ -536,10 +595,18 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 				CHECK_CUDA(cudaMemcpyToSymbol(d_weights, h_weights, T * sizeof(float)));
 			}
 
-			printf("  iter %3d: MSE=%.6f  prod=%.3e  isotropy=%.3f  (%d/%d used)%s\n",
-			       iter+1, (float)mean_mse, mean_product, pos_cv, used, N_STATES,
-			       improved ? " *" : "");
+			printf("  iter %3d: MSE=%.6f  prod=%.3e  isotropy=%.3f  (%d/%d used)",
+			       iter+1, (float)mean_mse, mean_product, pos_cv, used, N_STATES);
+			print_diagnostics<K>(h_codebook, h_counts, N_STATES);
+			printf("%s\n", improved ? " *" : "");
 			fflush(stdout);
+
+			// save codebook for this iteration
+			if (output_dir) {
+				char fname[512];
+				snprintf(fname, sizeof(fname), "%s/cb_iter%03d.bin", output_dir, iter + 1);
+				save_codebook(h_codebook, N_STATES, fname);
+			}
 
 			if (stall >= 10 && iter > 20) {
 				printf("  Converged (10 iters without improvement)\n");
@@ -702,6 +769,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 	}
 
 	// cleanup
+	if (h_real_data) free(h_real_data);
 	free(h_codebook); free(h_mse); free(h_wsums); free(h_waccum);
 	free(h_counts); free(h_pos_mse); free(h_product_err);
 	free(h_eval_mse); free(h_eval_prod);
@@ -724,6 +792,9 @@ int main(int argc, char** argv) {
 	const char* init_file = nullptr;
 	const char* qweight_file = nullptr;
 	const char* out_file = nullptr;
+	const char* data_file = nullptr;
+	const char* output_dir = nullptr;
+	bool constrain_mono = false;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--bits") == 0 && i+1 < argc) bits = atoi(argv[++i]);
@@ -733,8 +804,11 @@ int main(int argc, char** argv) {
 		else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--init") == 0 && i+1 < argc) init_file = argv[++i];
 		else if (strcmp(argv[i], "--out") == 0 && i+1 < argc) out_file = argv[++i];
+		else if (strcmp(argv[i], "--data-file") == 0 && i+1 < argc) data_file = argv[++i];
 		else if (strcmp(argv[i], "--q-weights") == 0 && i+1 < argc) qweight_file = argv[++i];
 		else if (strcmp(argv[i], "--q-rank") == 0 && i+1 < argc) q_rank = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--output-dir") == 0 && i+1 < argc) output_dir = argv[++i];
+		else if (strcmp(argv[i], "--constrain-monotonicity") == 0) constrain_mono = true;
 		else if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
 			i++;
 			if (strcmp(argv[i], "mse") == 0) mode = MODE_MSE;
@@ -749,12 +823,15 @@ int main(int argc, char** argv) {
 	       bits, n_train, n_iters, n_restarts, seed);
 	if (init_file) printf("init=%s\n", init_file);
 	if (out_file) printf("out=%s\n", out_file);
+	if (data_file) printf("data=%s\n", data_file);
+	if (output_dir) printf("output_dir=%s\n", output_dir);
+	if (constrain_mono) printf("monotonicity constraint: ON\n");
 	printf("\n");
 
 	if (bits == 2) {
-		train<2, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, q_rank, seed);
+		train<2, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else if (bits == 3) {
-		train<3, 9>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, q_rank, seed);
+		train<3, 9>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else {
 		fprintf(stderr, "Unsupported bits: %d\n", bits);
 		return 1;

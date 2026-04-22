@@ -25,6 +25,27 @@ static void load_tcq_norm_alpha() {
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
+
+    // If decode-time alpha is active, force encode-time V alpha to 1.0 to prevent double-application.
+    // Decode-time alpha is applied in the dequant kernels (fattn.cu), not here.
+    const char *decode_v = getenv("TURBO_TCQ_DECODE_ALPHA_V");
+    if (decode_v) {
+        float one = 1.0f;
+        cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &one, sizeof(float));
+        fprintf(stderr, "TCQ: encode V alpha=1.0 (decode-time alpha active via TURBO_TCQ_DECODE_ALPHA_V=%s)\n", decode_v);
+        // Still allow K alpha override
+        const char *s = getenv("TURBO_TCQ_ALPHA");
+        if (s) {
+            char *end;
+            errno = 0;
+            float a = strtof(s, &end);
+            if (end != s && errno == 0 && a > 0.0f && a < 10.0f) {
+                cudaMemcpyToSymbol(d_tcq_norm_alpha, &a, sizeof(float));
+            }
+        }
+        return;
+    }
+
     const char *s = getenv("TURBO_TCQ_ALPHA");
     const char *sv = getenv("TURBO_TCQ_ALPHA_V");
     if (!s && !sv) return;
@@ -94,7 +115,7 @@ static void init_tcq_error_dump() {
     const char *s = getenv("TURBO_TCQ_DUMP_ERRORS");
     if (!s) return;
     int n = atoi(s);
-    if (n <= 0 || n > 100000) return;
+    if (n <= 0 || n > 500000) return;
     tcq_dump_n = n;
     tcq_dump_x_host = (float *)malloc(n * 128 * sizeof(float));
     tcq_dump_out_host = (uint8_t *)malloc(n * 128 * sizeof(uint8_t));
