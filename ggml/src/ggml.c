@@ -776,6 +776,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_tcq,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_tcq_ref,
     },
+    [GGML_TYPE_TURBO2_TCQ] = {
+        .type_name                = "turbo2_tcq",
+        .blck_size                = QK_TURBO2_TCQ,
+        .type_size                = sizeof(block_turbo2_tcq),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_tcq,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_tcq_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -7757,6 +7765,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO3_TCQ: result = quantize_turbo3_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_TCQ: result = quantize_turbo2_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

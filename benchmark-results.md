@@ -1093,3 +1093,28 @@ D(R) bound at 3-bit: 0.0156 (4.54 dB from Lloyd-Max, 2.97 dB from TCQ L=9).
 
 Key finding: 3-bit gains are much larger than 2-bit. Codebook training is essential.
 V=1 scalar trellis — QTIP's V=2 would give larger gains but requires 2D codebook.
+
+## Experiment #61: TCQ Implementation Results (2026-03-28)
+
+### turbo3_tcq (3-bit TCQ, k=3, L=9, 512 states, 3.25 bpv)
+
+Free-init trained codebook. 37.6% MSE reduction vs Lloyd-Max.
+
+| Metric | Value | vs turbo3 | vs q8_0 |
+|--------|-------|-----------|---------|
+| PPL | 5.8294 | -0.05% | -0.14% |
+| Prefill pp4096 | 894 tok/s | -21% vs turbo3 (1139) | |
+| Decode tg64 | 28.69 tok/s | -5% vs turbo3 (30.2) | |
+
+### turbo2_tcq (2-bit TCQ, k=2, L=8, 256 states, 2.25 bpv)
+
+Free-init trained codebook. 4.2% MSE reduction vs Lloyd-Max.
+
+| Metric | Value | vs turbo2 | vs q8_0 |
+|--------|-------|-----------|---------|
+| PPL | **6.0546** | **-61.2%** (vs 15.61) | +3.7% |
+| Prefill pp4096 | 976 tok/s | | |
+| Decode tg64 | 29.53 tok/s | | |
+
+Key finding: turbo2_tcq at 2.25 bpv achieves near-turbo3 quality (6.05 vs 5.83) with 25% fewer bits.
+The trellis structure provides enormous gains at 2-bit where scalar quantization breaks down.

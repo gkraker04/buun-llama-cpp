@@ -332,6 +332,47 @@ size_t quantize_turbo3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT
     return nrows * row_size;
 }
 
+/* ---------- TURBO2_TCQ: 2-bit Trellis-Coded Quantization ---------- */
+
+void quantize_row_turbo2_tcq_ref(const float * GGML_RESTRICT x, block_turbo2_tcq * GGML_RESTRICT y, int64_t k) {
+	// Stub — CUDA kernel handles TCQ quantize (Viterbi). CPU path zeros out.
+	assert(k % QK_TURBO2_TCQ == 0);
+	const int nb = k / QK_TURBO2_TCQ;
+	for (int i = 0; i < nb; i++) {
+		float norm = 0.0f;
+		for (int j = 0; j < QK_TURBO2_TCQ; j++) norm += x[i*QK_TURBO2_TCQ + j] * x[i*QK_TURBO2_TCQ + j];
+		y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+		memset(y[i].qs, 0, 33);
+	}
+}
+
+void dequantize_row_turbo2_tcq(const block_turbo2_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+	// CPU dequant stub — placeholder (no codebook on CPU yet)
+	assert(k % QK_TURBO2_TCQ == 0);
+	const int nb = k / QK_TURBO2_TCQ;
+	for (int block = 0; block < nb; block++) {
+		for (int j = 0; j < QK_TURBO2_TCQ; j++) {
+			y[block * QK_TURBO2_TCQ + j] = 0.0f;
+		}
+	}
+}
+
+size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+	GGML_UNUSED(imatrix);
+	assert(n_per_row % QK_TURBO2_TCQ == 0);
+
+	size_t row_size = (n_per_row / QK_TURBO2_TCQ) * sizeof(block_turbo2_tcq);
+	for (int64_t row = 0; row < nrows; row++) {
+		quantize_row_turbo2_tcq_ref(
+			src + row * n_per_row,
+			(block_turbo2_tcq *)((char *)dst + row * row_size),
+			n_per_row
+		);
+	}
+	return nrows * row_size;
+}
+
 /* ---------- TURBO4_0: 4-bit PolarQuant (16 centroids, no QJL) ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {

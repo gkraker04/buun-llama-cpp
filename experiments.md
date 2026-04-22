@@ -726,7 +726,7 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Risk**: High — complete rework of quantization + attention for K. V can stay scalar. Python prototype first to validate quality (PQ MSE vs scalar Lloyd-Max MSE at same bit rate).
 **Expected gain**: Potentially large decode speedup at long context. Quality may differ — PQ sub-vector independence assumption vs scalar per-element optimality.
 
-### 61. Trellis-coded quantization (TCQ) for turbo2 + turbo3 `tested-marginal`
+### 61. Trellis-coded quantization (TCQ) for turbo2 + turbo3 `tested-success`
 **Source**: QTIP (NeurIPS 2024, arXiv:2406.11235) + Marcellin & Fischer 1990. From V.34 modem TCM, adapted for source coding. Cross-field idea from telecoms.
 **Concept**: Replace independent Lloyd-Max scalar quantization with Viterbi-optimal joint quantization over 128 elements using a bitshift trellis. Each element still stores k bits, but a trellis with 2^L states constrains which codewords can follow each other, enabling a much larger effective codebook (2^L entries vs 2^k) at the same bit rate.
 **Key insight — bitshift trellis decode is O(1)/element**: Element t's reconstruction depends only on an L-bit sliding window at bit positions [t*k, t*k+L). Fully parallel GPU decode, ~3-5 instructions per element. Codebook fits in shared memory.
@@ -746,6 +746,12 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Risk**: High engineering effort. Encode is inherently sequential over 128 elements (Viterbi). No published KV cache TCQ exists — would be novel.
 **Priority**: turbo3 (30% MSE reduction at L=9 is large). turbo2 gains more modest (6% at L=8), needs larger trellis.
 **Prototype**: `scripts/tcq_prototype.py`
+**CUDA Implementation Results** (2026-03-28):
+- turbo3_tcq (3.25 bpv): PPL 5.8294 (-0.14% vs q8_0), prefill 894 tok/s, decode 28.69 tok/s
+- **turbo2_tcq (2.25 bpv): PPL 6.0546 (+3.7% vs q8_0, -61% vs turbo2's 15.61)**, prefill 976 tok/s, decode 29.53 tok/s
+- Free-init optimization: allow any initial trellis state (all 2^L states equally viable). 37.6% MSE gain at 3-bit.
+- Key bugs fixed: backtrace race condition (4→2 per byte packing), normalization order (must apply InnerQ BEFORE normalize)
+- **turbo2_tcq is the publication story**: at 2.25 bpv, gets near-3-bit quality (6.05 vs 5.83). First TCQ for KV cache.
 
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.

@@ -315,6 +315,18 @@ typedef struct {
 } block_turbo3_tcq;                     // 52 bytes total for 128 values (3.25 bpv)
 static_assert(sizeof(block_turbo3_tcq) == sizeof(ggml_half) + 50, "wrong turbo3_tcq block size/padding");
 
+// TurboQuant 2-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=2, L=8)
+// One block = one 128-element rotation group. Bitstream: 6 prefix + 128×2-bit outputs = 262 bits = 33 bytes.
+// Decode: state_t = read_8_bits(qs, t*2), recon_t = codebook[state_t] * norm
+// = 2.25 bits/value → 7.1× compression vs fp16
+#define QK_TURBO2_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[33];                  // 33 bytes: 262-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_turbo2_tcq;                     // 36 bytes total for 128 values (2.25 bpv)
+static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_tcq block size/padding");
+
 // TurboQuant 4-bit: 16-level PolarQuant (Lloyd-Max optimal for post-WHT Gaussian)
 // Per block: norm(fp16) + 4-bit indices (64 bytes)
 // = 66 bytes per 128 values = 4.125 bits/value → 3.9× compression vs fp16
