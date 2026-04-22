@@ -651,15 +651,10 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     // Shared memory layout:
     // x[128]     : rotated+normalized input
     // cost[512]  : current path costs
-    // cb[512]    : codebook (loaded from constant memory for faster access)
     // bt[128][256]: backtrace, 4-bit packed (best predecessor index 0-7)
     __shared__ float x[128];
     __shared__ float cost[512];
-    __shared__ float cb[512];
     __shared__ uint8_t bt[128][256]; // 32KB: bt[t][s/2] = (pred_s_even) | (pred_s_odd << 4)
-
-    // Load codebook into shared memory
-    cb[sid] = d_turbo3_tcq_codebook[sid];
 
     // Thread 0: read source, compute norm, apply InnerQ, normalize, FWHT
     // Compute directly in shared x[] to avoid register-heavy local array
@@ -716,7 +711,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         // Right-shift trellis: ns = (prev >> 3) | (out << 6)
         // Predecessors of sid: prev = ((sid & 0x3F) << 3) | p, for p = 0..7
         int base_prev = (sid & 0x3F) << 3;
-        float dist = xt - cb[sid];
+        float dist = xt - d_turbo3_tcq_codebook[sid];
         dist = dist * dist;
 
         float best = 1e30f;
@@ -775,7 +770,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
             } else {
                 st = (outputs[t] << 6) | (outputs[t-1] << 3) | outputs[t-2];
             }
-            float c = cb[st];
+            float c = d_turbo3_tcq_codebook[st];
             recon_norm_sq += c * c;
         }
         float recon_norm = sqrtf(recon_norm_sq);
@@ -785,14 +780,13 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         for (int j = 0; j < 49; j++) dst_blk->qs[j] = 0;
 
         for (int t = 0; t < 128; t++) {
-            int out = outputs[t];
-            int bit_pos = 6 + t * 3;
-            for (int b = 0; b < 3; b++) {
-                if (out & (1 << b)) {
-                    int byte_idx = (bit_pos + b) / 8;
-                    int bit_off = (bit_pos + b) % 8;
-                    dst_blk->qs[byte_idx] |= (1 << bit_off);
-                }
+            const int bit_pos = 6 + t * 3;
+            const int byte_idx = bit_pos / 8;
+            const int bit_off = bit_pos % 8;
+            const int out = outputs[t] & 0x7;
+            dst_blk->qs[byte_idx] |= (uint8_t)(out << bit_off);
+            if (bit_off > 5) { // 3 bits cross byte boundary
+                dst_blk->qs[byte_idx + 1] |= (uint8_t)(out >> (8 - bit_off));
             }
         }
 
