@@ -991,3 +991,34 @@ more than one-time prefill, this is acceptable.
 ### Code Changes
 - `fattn.cu`: turbo4 automatically uses vec prefill (no MMA fp16 round-trip)
 - `llama-context.cpp`: FA auto-enabled for turbo types (was: throw error)
+
+---
+
+## Experiment #53: Inverse-FWHT Prefill Dequant for turbo4
+Date: 2026-03-28
+Branch: experiment/tbq-ideas
+
+### Problem
+turbo4 prefill was 37% of q8_0 (420 vs 1139 tok/s) because MMA was bypassed to avoid
+fp16 centroid precision loss. turbo4's 16 centroids are ~0.023 apart, rounding to same fp16.
+
+### Solution
+Inverse FWHT during K dequant-to-fp16: centroid lookup → signs2 → butterfly → signs1×norm → fp16.
+After inverse rotation, values are in original domain with natural variation — fp16 handles them fine.
+K only (V fp16 loss is negligible). Q is NOT pre-rotated (K is in original domain).
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| PPL (2048, 8 chunks) | 5.831 (vec) | 5.858 (MMA inv-FWHT) |
+| Prefill pp4096 | 420 tok/s | **1124 tok/s** (+167%) |
+| Decode tg64 | ~30 tok/s | 30.17 tok/s (unchanged) |
+
+PPL delta: +0.46% (within 8-chunk noise). Prefill: 2.67x improvement, matching q8_0 levels.
+
+### Code Changes
+- `fattn.cu`: new `k_turbo4_dequant_f16_inv_fwht` kernel (128 threads, shmem butterfly)
+- `fattn.cu`: turbo4 K prefill dispatches inverse FWHT kernel, V uses simple dequant
+- `fattn.cu`: Q pre-rotation skipped for turbo4 K (original domain)
+- `fattn.cu`: removed `!turbo4_kv` MMA bypass — all turbo types use MMA prefill

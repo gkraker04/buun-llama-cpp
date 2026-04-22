@@ -679,6 +679,20 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Results**: +1pt LongBench at INT2 over KIVI, +2.6pt GSM8K. Only 0.08% drop at INT4. +6.6% prefill latency, +2.6% decode latency.
 **Analysis (2026-03-27)**: LOW expected benefit for turbo3/turbo4 because FWHT rotation already flattens the distribution (exactly what PatternKV targets). PatternKV operates on raw asymmetric INT quant without any rotation, so the "peaked distribution with outliers" problem it solves is already handled by our pipeline. Pattern subtraction in rotated space would require rotating patterns too, and rotated-space values are already approximately Gaussian where Lloyd-Max codebook is near-optimal. The V cache adaptive threshold (75% utilization, catastrophic without it) adds fragile complexity. Would need to operate pre-FWHT on raw vectors, but then pattern centroids are head_dim=128/256 floats that must be stored per-head per-layer (32 * 128 * 4B = 16KB/head, 40 layers * 4 heads = 2.56MB for Qwen3.5-27B -- fits in constant memory). **Verdict: unlikely to beat our existing FWHT flattening, but a simplified 4-pattern version is low-risk to prototype.**
 
+### 53. Inverse-FWHT prefill dequant (from dusterbloom TBQ PR#2) `done`
+**Source**: PR #2 (dusterbloom). TBQ prefill does full inverse Hadamard + sign flip during dequant-to-fp16, producing original-domain fp16 values. Standard MMA then works with no Q rotation.
+**Why**: Our turbo4 prefill was 37% of q8_0 because we bypassed MMA to avoid fp16 centroid precision loss. TBQ's approach avoids the problem — the inverse FWHT mixes centroid values in float32 shared memory, only casting to fp16 after the transform.
+**Result**: turbo4 prefill 420 → **1124 tok/s** (+167%, matching q8_0). PPL 5.858 (+0.46% vs vec, within noise). Decode unchanged at 30.17 tok/s.
+**Design**: K-only inverse FWHT (V uses simple dequant, fp16 loss negligible). Q NOT pre-rotated (K in original domain). InnerQ inverse scaling applied in kernel. New kernel `k_turbo4_dequant_f16_inv_fwht` — 128 threads, shmem butterfly.
+
+### 54. Binary search quantization with pre-computed boundaries `done`
+**Source**: PR #2 (dusterbloom). Uses pre-computed Lloyd-Max decision boundaries with O(log n) binary search tree instead of linear codebook scan.
+**Result**: Already implemented — `turbo_find_nearest_4bit()` with `d_turbo_mid_4bit[15]` does 4 comparisons for 16 centroids. Nothing to do.
+
+### 55. N(0,1) centroid normalization (unnormalized Hadamard) `dropped`
+**Source**: PR #2 (dusterbloom). Uses unnormalized Hadamard so post-FWHT values are N(0,1). Centroids universal for any head_dim.
+**Result**: Functionally equivalent to our approach — the 1/√128 factor just moves between centroids and norm. No quality/speed benefit, breaking format change. Not worth it.
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**
