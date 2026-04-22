@@ -373,6 +373,14 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     fprintf(stderr, "TCQ encode: FAILED to load codebook from %s\n", cb_path);
                 }
             }
+            const char *alpha_str = getenv("TURBO_TCQ_ALPHA");
+            if (alpha_str) {
+                float alpha = strtof(alpha_str, NULL);
+                if (alpha > 0.0f && alpha < 10.0f) {
+                    cudaMemcpyToSymbol(d_tcq_norm_alpha, &alpha, sizeof(float));
+                    fprintf(stderr, "TCQ: norm alpha = %.3f\n", alpha);
+                }
+            }
         }
         // TCQ Viterbi encode: 512 threads per block (one per trellis state)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
