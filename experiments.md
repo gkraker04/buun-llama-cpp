@@ -818,11 +818,11 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Expected**: 20-27% prefill speedup. Enables 350K+ context on single RTX 3090.
 **Result**: **1-5% SLOWER than fused MMA.** pp512: -1.3%, pp2048: -2.6%, pp4096: -3.3%, pp8192: -5.0%. The fused MMA flash attention is fundamentally better because it avoids materializing the O(nq×nkv) score matrix S. cuBLAS GEMM must write/read S as intermediate, adding significant memory bandwidth overhead that dominates any tensor core advantage. Also found a bug in Duster's code: `CUBLAS_OP_N` with `lda=D < M=chunk_len` (undefined behavior). Not worth pursuing further — the architecture is fundamentally disadvantaged vs fused kernels on modern GPUs.
 
-### 73. Parallelize TCQ encode thread-0 serial sections `ready`
+### 73. Parallelize TCQ encode thread-0 serial sections `done`
 **Source**: Competitive analysis encode speed. Thread-0 does FWHT rotation + backtracking + bitpacking alone.
 **Concept**: FWHT is 128 elements × 7 stages — use 64+ threads (butterfly pattern, already done for #63 but only for non-TCQ). Bitpacking: each thread packs its own segment.
 **Change**: turbo-quant-cuda.cuh TCQ encode kernel.
-**Expected**: ~5% encode speedup.
+**Result**: **+12.6% prefill speedup** (3-bit: 902→1019, 2-bit: 983→1102 t/s at pp512). Warp-level reductions added in simplify pass. Merged to master.
 
 ### 74. TCQ error decorrelation via element permutation `needs-research`
 **Source**: Competitive analysis quality findings. TCQ trellis (right-shift, k=3) shares 6/9 state bits between consecutive positions → correlated errors. Autocorrelation ~0.15-0.30 at lag 1. Correlated errors average out slower in Q@K dot products.
