@@ -1194,3 +1194,425 @@ Note: q4_0 and q8_0 now auto-enable Hadamard rotation from PR #21038.
 **turbo2 (2.5 bpv):**
 - Significant degradation at long context (+9.95% at 65K)
 - This is where TCQ helps most (turbo2_tcq cuts this to +5.19% from earlier benchmarks)
+
+## TCQ Codebook GLA Optimization Study (2026-03-30)
+
+### Key Finding: MSE-PPL Divergence
+
+Training TCQ codebooks to deeper MSE optima **hurts** perplexity. There is a sweet spot where GLA refinement improves MSE without degrading PPL.
+
+### 3-bit TCQ (turbo3_tcq) — MSE vs PPL Curve
+
+| Codebook | GLA Iters | MSE Reduction | Gap to D(R) | PPL (2K, 8 chunks) | Delta PPL |
+|----------|-----------|---------------|-------------|---------------------|-----------|
+| Old (numpy, 4K samples) | 100 | 50.1% | 1.82 dB | 5.8236 | baseline |
+| **Fine-tuned (100K samples)** | **50** | **52.8%** | **1.53 dB** | **5.8313** | **+0.13%** |
+| Fine-tuned (100K samples) | 100 | 54.1% | 1.26 dB | 5.8889 | +1.12% |
+| Fine-tuned (100K samples) | 200 | 54.7% | 1.14 dB | 5.9094 | +1.47% |
+| From scratch (real data) | 500×30 | 54.9% | 1.06 dB | 5.8741 | +0.87% |
+| From scratch (synthetic) | 500×30 | 55.5% | 1.10 dB | 5.8885 | +1.11% |
+
+### 2-bit TCQ (turbo2_tcq)
+
+| Codebook | GLA Iters | MSE Reduction | Gap to D(R) | PPL (2K, 8 chunks) | Delta PPL |
+|----------|-----------|---------------|-------------|---------------------|-----------|
+| Old (numpy, 4K samples) | 100 | 33.1% | 1.04 dB | 6.0158 | baseline |
+| **Fine-tuned (100K samples)** | **50** | **34.1%** | **0.95 dB** | **5.9958** | **-0.33%** |
+
+### Theoretical Context
+
+Shannon rate-distortion bound D(R) = σ² × 2^{-2R} at σ = 1/√128:
+- 3-bit: D(R) = 0.00012207 — best codebook reaches 1.53 dB above
+- 2-bit: D(R) = 0.00048828 — best codebook reaches 0.95 dB above
+
+For comparison, QTIP (academic SOTA) claims 0.84 dB gap at 3-bit with lattice codebooks + learned transforms.
+
+### Interpretation
+
+1. **MSE ≠ PPL**: Element-wise MSE is a necessary but insufficient metric. Beyond ~52% MSE reduction (3-bit), the GLA moves codebook entries away from the coset initialization structure, which correlates with PPL degradation.
+
+2. **Coset structure matters**: The old codebook's coset initialization (shifted Lloyd-Max centroids) provides regularity that benefits attention computation beyond what MSE captures. All 64 groups are monotonically increasing in the old codebook; deep GLA breaks this to 48/64.
+
+3. **Sweet spot**: 50 GLA iterations from coset init with 100K samples provides the best MSE/PPL tradeoff. This improves MSE by 2.7pp (3-bit) / 1.0pp (2-bit) without hurting PPL.
+
+4. **Real vs synthetic data**: Post-FWHT KV distributions are near-perfect Gaussian (σ=0.088388 = 1/√128, kurtosis=-0.087). Synthetic training matches real data training — no "synthetic-to-real gap" exists.
+
+### Training Setup
+
+- Hardware: RTX 3090
+- Trainer: CUDA Viterbi (1 threadblock/sample, 512 threads/block for 3-bit, 256 for 2-bit)
+- Data: cuRAND N(0, 1/√128) synthetic, 100K samples/iteration
+- Model: Qwen3.5-27B-heretic.Q6_K (head_dim=256, 128-element rotation groups)
+
+## GLA Iteration Sweep — Full Curve (2026-03-30)
+
+Tested PPL for every iteration count from 0 (pure coset init) to 200 (deep convergence).
+All codebooks trained with CUDA GLA from coset initialization, 1 restart.
+
+### 3-bit TCQ — Complete PPL vs GLA Iterations
+
+| GLA Iters | Samples/iter | MSE Reduction | PPL (2K, 8ch) | Delta vs old |
+|-----------|-------------|---------------|---------------|--------------|
+| 0 (coset init) | — | 0.1% | 5.9194 | +1.64% |
+| 1 | 100K | -0.1% | 5.9194 | +1.64% |
+| 3 | 100K | 24.3% | 5.8450 | +0.37% |
+| 5 | 100K | 33.8% | 5.8576 | +0.58% |
+| 10 | 100K | 40.4% | 5.9386 | +1.97% |
+| 20 | 100K | 46.0% | 5.9712 | +2.53% |
+| 30 | 100K | 48.2% | 5.8733 | +0.85% |
+| **50** | **100K** | **52.8%** | **5.8313** | **+0.13%** |
+| 100 | 100K | 54.1% | 5.8889 | +1.12% |
+| 200 | 100K | 54.7% | 5.9094 | +1.47% |
+| 100 (small batch) | 4K | 53.2% | 5.9600 | +2.34% |
+| **Old numpy** | **4K** | **50.1%** | **5.8236** | **baseline** |
+
+### Key Findings
+
+1. **PPL is NON-MONOTONIC with GLA iterations**: PPL does NOT degrade monotonically as MSE improves. It oscillates wildly — the 10-20 iter range (40-46% MSE) gives PPL WORSE than the 0-iter coset init (5.94-5.97 vs 5.92).
+
+2. **Pure coset init is bad**: 0 GLA iterations gives PPL 5.92 — TCQ coding DOES help. The trellis needs trained centroids to be useful.
+
+3. **The trajectory matters, not just the endpoint**: The GLA optimization path through 512-dimensional codebook space passes through regions that are good and bad for this model's attention. MSE improves monotonically but PPL is chaotic.
+
+4. **Small-batch ≠ regularization**: 4K samples/iter (matching old numpy regime) gives PPL 5.96 — WORSE than 100K samples. The old numpy codebook's quality is NOT from small-batch regularization.
+
+5. **The old numpy codebook is a lucky local minimum**: Its quality (50.1% MSE, PPL 5.8236) has not been replicated by ANY training configuration — CUDA or numpy. Tested 4 numpy seeds (7, 42, 123, 999) at 100 iterations: PPL range 5.8801-5.9300, all ~1% worse than old. The old codebook's quality is seed-specific, not implementation-specific.
+
+### Numpy vs CUDA — Implementation Verification (2026-03-30)
+
+Confirmed the CUDA trainer is NOT broken. Numpy with the same coset init produces equivalent or worse PPL:
+
+| Impl | Seed | Iters | Samples/iter | MSE Red. | PPL |
+|------|------|-------|-------------|----------|------|
+| **Old numpy** | **?** | **100** | **4K** | **50.1%** | **5.8236** |
+| Numpy | 42 | 100 | 4K | 52.0% | 5.8979 |
+| Numpy | 42 | 200 | 4K | 54.3% | 5.8914 |
+| Numpy | 7 | 100 | 4K | 51.5% | 5.8801 |
+| Numpy | 123 | 100 | 4K | 52.4% | 5.9300 |
+| Numpy | 999 | 100 | 4K | 52.5% | 5.8853 |
+| CUDA | 42 | 50 | 100K | 52.8% | 5.8313 |
+| CUDA | 42 | 100 | 4K | 53.2% | 5.9600 |
+
+Patching verified: old numpy codebook from binary file → PPL 5.8236 (exact match).
+
+### PPL Robustness Test — Multi-Dataset (2026-03-30)
+
+Tests codebooks across 3 wikitext-2 splits with many more chunks. The 8-chunk "chaotic oscillation" was measurement noise — the real pattern is monotonic.
+
+| Codebook | test 64ch | valid 64ch | train 32ch | test 8ch (old) |
+|----------|-----------|-----------|-----------|----------------|
+| Old numpy 100-iter | 6.507 ±0.065 | 6.909 ±0.071 | 6.956 ±0.099 | 5.824 |
+| CUDA 3-iter | 6.502 ±0.065 | 6.910 ±0.071 | 6.959 ±0.098 | 5.845 |
+| CUDA 10-iter | 6.595 ±0.066 | 7.026 ±0.073 | 7.063 ±0.101 | 5.939 |
+| CUDA 20-iter | 6.568 ±0.066 | 7.008 ±0.072 | 7.050 ±0.101 | 5.971 |
+| CUDA 30-iter | 6.560 ±0.066 | 7.022 ±0.073 | 7.057 ±0.101 | 5.873 |
+
+Key findings:
+- **3-iter matches old numpy** (±0.005 across all datasets). The "lucky codebook" was not lucky.
+- **10+ iter crash is REAL** — persists across all 3 datasets (+0.06-0.12 PPL).
+- **30-iter "recovery" was noise** — on valid/train, 30-iter is as bad as 10-iter.
+- Real pattern: 3 iters good, 10+ iters monotonically bad. Use 3 GLA iterations.
+
+## TCQ Multi-Layer Codebook Ablation (2026-03-30)
+
+TURBO_TCQ_SPLIT env var: codebook A = old numpy (good), codebook B = CUDA 10-iter (bad).
+
+### K/V Split (32 chunks, wikitext-2 test)
+| Config | PPL | Δ PPL |
+|--------|-----|-------|
+| All A | 6.574 | baseline |
+| All B | 6.657 | +0.083 |
+| K=A, V=B | 6.627 | +0.053 |
+| K=B, V=A | 6.620 | +0.047 |
+
+### Layer Split (32 chunks, wikitext-2 test)
+| Config | B on layers | PPL | Δ PPL |
+|--------|------------|-----|-------|
+| SPLIT=0 | none | 6.574 | baseline |
+| SPLIT=10 | 10-39 | 6.634 | +0.060 |
+| SPLIT=20 | 20-39 | 6.619 | +0.045 |
+| SPLIT=30 | 30-39 | 6.599 | +0.025 |
+| SPLIT=all | 0-39 | 6.657 | +0.083 |
+
+Per-group: L0-9 +0.023 (28%), L10-19 +0.015 (18%), L20-29 +0.020 (24%), L30-39 +0.025 (30%).
+Perfectly additive (sum=0.083). No concentrated sensitivity. ~+0.002 PPL per layer.
+
+### TCQ Encode/Decode Mismatch Test (2026-03-30)
+
+Old numpy (A) vs 10-iter (B). 64 chunks, wikitext-2 test, c=512.
+
+| Config | Encode | Decode | PPL | Δ |
+|--------|--------|--------|-----|---|
+| A/A | Old numpy | Old numpy | 6.575 | baseline |
+| B/B | 10-iter | 10-iter | 6.630 | +0.055 |
+| A/B | Old numpy | 10-iter | 6.753 | +0.178 |
+| B/A | 10-iter | Old numpy | 6.783 | +0.208 |
+
+Mismatch penalty +0.12–0.21. Old numpy advantage is holistic (not decomposable into encode vs decode).
+
+### Numpy Multi-Seed Codebook Test (2026-03-30)
+
+Clean master build + runtime codebook loading. numpy GLA: n_train=4000, n_iters=100, n_restarts=1, coset init.
+64 chunks, wikitext-2 test, c=512.
+
+| Seed | PPL | Δ vs golden |
+|------|-----|-------------|
+| 99 (compiled-in) | 6.575 | baseline |
+| 99 (reproduced) | 6.583 | +0.008 (fp32 rounding) |
+| 123 | 6.600 | +0.025 |
+| 42 | 6.610 | +0.035 |
+| 7 | 6.611 | +0.036 |
+| 999 | 6.623 | +0.048 |
+
+Seed 99 is best of 5 but not an outlier. Range 0.048 PPL across seeds. Lucky but not unreasonably so.
+
+### QTIP Structural Variants: Tail-Biting & Left-Shift Trellis (2026-03-30)
+
+Clean master build + runtime codebook loading. v2 trainer: n_train=2000, n_iters=30, seed=99.
+CUDA uses right-shift free-init encoder (codebooks bit-reversed for left-shift compatibility).
+64 chunks, wikitext-2 test, c=512.
+
+| Variant | CUDA-compat MSE | PPL | Δ vs compiled-in |
+|---------|----------------|-----|------------------|
+| Compiled-in (100iter, 4K) | (reference) | 6.577 | baseline |
+| Right-shift v2 (30iter, 2K) | 0.023868 | 6.610 | +0.033 |
+| Right-shift + tail-biting (30iter, 2K) | 0.023332 | 6.617 | +0.040 |
+| Left-shift (30iter, 2K) | 0.023992 | 6.624 | +0.047 |
+
+**Findings at 512 context:**
+1. Left-shift trellis gives identical MSE to right-shift (isomorphism confirmed), but slightly worse PPL
+2. Tail-biting training gives the BEST MSE but NOT the best PPL — MSE-PPL inverse correlation persists
+3. Neither structural change improves PPL over the baseline at short context
+
+### Context-Length Crossover: 64K PPL Tests (2026-03-30 evening)
+
+Same codebooks tested at 64K context (4 chunks). CRITICAL FINDING: codebooks that are WORSE at 512
+context become BETTER at 64K context.
+
+| Variant | PPL @512 | Δ @512 | PPL @64K | Δ @64K |
+|---------|----------|--------|----------|--------|
+| Compiled-in (100iter, 4K numpy) | 6.577 | — | 7.083 | — |
+| **50-iter finetuned (real data)** | ~5.97* | ~+0.13 | **7.038** | **-0.045** |
+| V2 right-shift (30iter, 2K) | 6.610 | +0.033 | **7.048** | **-0.036** |
+| Right-shift + TB (30iter, 2K) | 6.617 | +0.040 | **7.069** | **-0.014** |
+| 50-iter numpy s42 | ~5.87* | ~+0.03 | 7.074 | -0.009 |
+| 10-iter CUDA s42 | ~5.94* | ~+0.10 | 7.131 | +0.048 |
+| Left-shift (30iter, 2K) | 6.624 | +0.047 | 7.153 | +0.070 |
+
+*PPL @512 estimated from earlier sweep data at 2K context (different chunk count).
+
+**Key findings:**
+1. CONTEXT-LENGTH CROSSOVER: codebooks worse at 512 context are better at 64K. The 50-iter
+   finetuned codebook is best at 64K (-0.045) despite being worst at short context.
+2. The MSE-PPL "paradox" at short context may be an artifact of evaluating at short context only.
+   TCQ's trellis constraint helps MORE at long context, and better-trained codebooks amplify this.
+3. The 50-iter finetuned codebook (trained on real model data) gives the best 64K result.
+4. Left-shift and 10-iter CUDA are worse at BOTH contexts — not all codebooks crossover.
+5. This suggests the optimal codebook depends on the target context length.
+
+### MSE-Context Scaling Grid (2026-03-30 night)
+
+Full grid: 5 codebooks × 4 context lengths. Looking for a scaling law between MSE reduction
+and optimal context length.
+
+| Codebook | MSE Red. | PPL @2K | PPL @8K | PPL @32K | PPL @64K |
+|----------|----------|---------|---------|----------|----------|
+| Compiled-in (s99, 100i, 4K numpy) | ~47% | **6.548** | 6.979 | 7.080 | 7.083 |
+| Finetuned (50i, 100K real data) | ~50%+ | 6.565 | 6.980 | **7.053** | **7.038** |
+| 3-iter (s42, 3i, 2K numpy) | ~24% | 6.570 | **6.963** | 7.071 | — |
+| 50-iter numpy (s42, 50i, 2K) | ~48% | 6.570 | 7.027 | 7.054 | 7.074 |
+| 10-iter CUDA (s42, 10i, 100K) | ~40% | 6.578 | 7.039 | 7.056 | 7.131 |
+
+Rankings at each context (best → worst):
+- @2K:  compiled-in > finetuned > 3-iter = 50-iter > 10-iter
+- @8K:  3-iter > compiled-in ≈ finetuned > 50-iter > 10-iter
+- @32K: finetuned > 50-iter > 10-iter > 3-iter > compiled-in
+- @64K: finetuned > 50-iter > compiled-in > 10-iter
+
+Compiled-in vs Finetuned head-to-head (cleanest comparison — same seed lineage):
+| Context | Compiled-in | Finetuned | Δ (fine - comp) |
+|---------|-------------|-----------|-----------------|
+| 2K | 6.548 | 6.565 | +0.017 (compiled wins) |
+| 8K | 6.979 | 6.980 | +0.001 (tied) |
+| 32K | 7.080 | 7.053 | -0.027 (finetuned wins) |
+| 64K | 7.083 | 7.038 | -0.045 (finetuned wins more) |
+
+Crossover at ~8K context. Per octave of context doubling: ~0.012 PPL advantage for higher-MSE codebook.
+
+## TCQ Full Context Grid: turbo2_tcq + turbo3_tcq (2026-03-31)
+
+Comprehensive grid of all turbo2_tcq/turbo3_tcq K/V combinations across context lengths.
+Model: Qwen3.5-27B-heretic Q6_K, RTX 3090, wikitext-2 test set.
+Codebooks: compiled-in (old numpy for both 2-bit and 3-bit).
+
+### Perplexity
+
+| Config | bpv | PPL @2K (64ch) | PPL @8K (8ch) | PPL @16K (4ch) | PPL @32K (4ch) | PPL @64K (4ch) |
+|--------|-----|----------------|---------------|----------------|----------------|----------------|
+| f16 | 16 | 6.4866 | 6.8381 | 5.9904 | 6.9498 | OOM |
+| q8_0 | 8.5 | 6.4956 | 6.8489 | 6.0008 | 6.9505 | 6.9186 |
+| turbo3_tcq | 3.25 | 6.5068 | 6.8834 | 5.9753 | 7.0052 | 7.0531 |
+| t2tcq-K / t3tcq-V | 2.75 | 6.5818 | 6.9976 | 6.1764 | 7.0669 | 7.1804 |
+| t3tcq-K / t2tcq-V | 2.75 | 6.6494 | 7.0899 | 6.2029 | 7.1540 | 7.2030 |
+| turbo2_tcq | 2.25 | 6.7421 | 7.2657 | 6.4018 | 7.2938 | 7.4836 |
+
+### PPL Delta vs f16
+
+| Config | bpv | Δ @2K | Δ @8K | Δ @16K | Δ @32K | Δ @64K |
+|--------|-----|-------|-------|--------|--------|--------|
+| q8_0 | 8.5 | +0.14% | +0.16% | +0.17% | +0.01% | — |
+| turbo3_tcq | 3.25 | +0.31% | +0.66% | -0.25% | +0.80% | — |
+| t2tcq-K / t3tcq-V | 2.75 | +1.47% | +2.33% | +3.10% | +1.68% | — |
+| t3tcq-K / t2tcq-V | 2.75 | +2.51% | +3.68% | +3.55% | +2.94% | — |
+| turbo2_tcq | 2.25 | +3.94% | +6.25% | +6.86% | +4.95% | — |
+
+Note: f16 OOMs at 64K (4GB KV cache on 24GB GPU with 20GB model). Deltas at 64K should
+be computed vs q8_0 (which is essentially lossless at 8-bit).
+
+### PPL Delta vs q8_0 at 64K
+
+| Config | bpv | Δ vs q8_0 @64K |
+|--------|-----|----------------|
+| turbo3_tcq | 3.25 | +1.94% |
+| t2tcq-K / t3tcq-V | 2.75 | +3.78% |
+| t3tcq-K / t2tcq-V | 2.75 | +4.11% |
+| turbo2_tcq | 2.25 | +8.16% |
+
+### Context Scaling Analysis (32K → 64K degradation)
+
+| Config | PPL @32K | PPL @64K | Δ (32K→64K) |
+|--------|----------|----------|-------------|
+| q8_0 | 6.9505 | 6.9186 | -0.032 (improves) |
+| turbo3_tcq | 7.0052 | 7.0531 | +0.048 |
+| t3tcq-K / t2tcq-V | 7.1540 | 7.2030 | +0.049 |
+| t2tcq-K / t3tcq-V | 7.0669 | 7.1804 | +0.114 |
+| turbo2_tcq | 7.2938 | 7.4836 | +0.190 |
+
+Key finding: 32K→64K degradation correlates with quantization aggressiveness.
+turbo2_tcq uniform degrades 4x more than turbo3_tcq (0.190 vs 0.048).
+K quality matters more than V at long context: t2K/t3V degrades 0.114 vs t3K/t2V at 0.049.
+
+### Decode Speed (tok/s, tg64)
+
+| Config | bpv | pp512 | pp2K | pp8K | pp16K | pp32K | pp64K |
+|--------|-----|-------|------|------|-------|-------|-------|
+| f16 | 16 | 30.91 | 30.83 | 30.82 | 30.80 | OOM | OOM |
+| turbo3_tcq | 3.25 | 28.73 | 28.63 | 28.59 | 28.62 | 28.58 | 28.59 |
+| t2tcq-K / t3tcq-V | 2.75 | 28.95 | 28.93 | 28.99 | 28.98 | 28.96 | 28.96 |
+| t3tcq-K / t2tcq-V | 2.75 | 29.06 | 29.00 | 28.98 | 28.96 | 28.93 | 28.93 |
+| turbo2_tcq | 2.25 | 29.42 | 29.39 | 29.38 | 29.35 | 29.34 | 29.34 |
+
+### Prefill Speed (tok/s)
+
+| Config | bpv | pp512 | pp2K | pp8K | pp16K | pp32K | pp64K |
+|--------|-----|-------|------|------|-------|-------|-------|
+| f16 | 16 | 1140 | 1127 | 1073 | 1008 | OOM | OOM |
+| turbo3_tcq | 3.25 | 899 | 900 | 876 | 846 | 794 | 705 |
+| t2tcq-K / t3tcq-V | 2.75 | 928 | 936 | 914 | 883 | 824 | 730 |
+| t3tcq-K / t2tcq-V | 2.75 | 934 | 940 | 914 | 883 | 825 | 730 |
+| turbo2_tcq | 2.25 | 974 | 981 | 955 | 920 | 857 | 755 |
+
+Key speed findings:
+- Decode speed is flat across context lengths (~28.6-29.4 tok/s for turbo types)
+- turbo2_tcq is slightly faster than turbo3_tcq (29.4 vs 28.6 tok/s = +2.8%) due to smaller KV cache
+- Prefill slows with context: turbo3_tcq drops from 900 to 705 tok/s (512→64K)
+- turbo2_tcq prefill is ~8% faster than turbo3_tcq (smaller KV = faster Viterbi encode)
+- All turbo types are ~7% slower on decode vs f16 (dequant overhead)
+- q8_0 speed not tested (llama-bench requires explicit flash-attention flag)
+
+## 2-bit TCQ Codebook Scaling Law Grid (2026-03-31)
+
+Tests 7 different 2-bit codebooks (from 0.7% to 34.9% MSE reduction) across 4 context lengths.
+All tests: turbo2_tcq uniform (K+V), wikitext-2 test set, Qwen3.5-27B Q6_K.
+Codebooks loaded via `TURBO_TCQ_CB2` env var (except compiled-in).
+
+### 2-bit Codebook Training Summary
+
+| Codebook | GLA Iters | Samples/iter | MSE Red. | Source |
+|----------|-----------|-------------|----------|--------|
+| 3-iter numpy | 3 | 4K | 0.7% | CPU vectorized |
+| 10-iter numpy | 10 | 4K | 13.0% | CPU vectorized |
+| 30-iter numpy | 30 | 4K | 25.5% | CPU vectorized |
+| 50-iter numpy | 50 | 4K | 28.5% | CPU vectorized |
+| 100-iter numpy | 100 | 4K | 32.1% | CPU vectorized |
+| Compiled-in | 100 | 4K | ~33% | CPU (old numpy s99) |
+| CUDA 200-iter | 200×3 | 100K | 34.9% | GPU Viterbi, 3 restarts |
+
+### PPL Grid
+
+| Codebook | MSE Red. | PPL @2K (64ch) | PPL @8K (8ch) | PPL @32K (4ch) | PPL @64K (4ch) |
+|----------|----------|----------------|---------------|----------------|----------------|
+| 3-iter numpy | 0.7% | 6.8434 | 7.6045 | 7.5000 | 7.6669 |
+| 10-iter numpy | 13.0% | 6.8421 | 7.3993 | 7.5489 | 7.7487 |
+| 30-iter numpy | 25.5% | 6.8038 | 7.2450 | 7.3984 | 7.2872 |
+| 50-iter numpy | 28.5% | 6.7809 | 7.3267 | 7.3291 | 7.3006 |
+| 100-iter numpy | 32.1% | 6.7076 | 7.1351 | 7.2050 | 7.2219 |
+| Compiled-in | ~33% | 6.7421 | 7.2657 | 7.2938 | 7.4836 |
+| CUDA 200-iter | 34.9% | **6.6583** | **7.1126** | 7.3230 | 7.3052 |
+
+### Analysis
+
+**At 2K (short context):** More MSE reduction = monotonically better PPL. CUDA 200-iter (34.9%) is
+the clear winner at 6.6583 — 0.185 PPL better than the 3-iter codebook. No paradox at short context.
+
+**At 64K (long context):** The pattern is more complex:
+- 100-iter numpy (32.1%) wins at 7.2219
+- CUDA 200-iter (34.9%) is close at 7.3052
+- 30-iter numpy (25.5%) at 7.2872 beats some higher-MSE codebooks
+- 3-iter (0.7%) and 10-iter (13%) are terrible (7.67, 7.75)
+
+**2-bit vs 3-bit scaling law comparison:**
+The 3-bit pattern (MSE-PPL crossover at ~8K) does NOT replicate cleanly at 2-bit. Instead:
+1. Undertrained codebooks (0.7-13% MSE red.) are worst at ALL context lengths
+2. The best codebook at 2K (CUDA 200-iter) is NOT the best at 64K
+3. But the crossover is much weaker than at 3-bit — more MSE reduction helps everywhere except 64K
+
+**Key insight:** The "MSE-PPL paradox" is much weaker at 2-bit. The compiled-in codebook anomaly
+(worse than 100-iter numpy at 2K despite similar MSE) suggests codebook structure differences matter
+more than MSE alone. The compiled-in codebook degrades badly at 64K (+0.26 vs 100-iter numpy)
+despite similar MSE reduction, pointing to codebook regularity/structure as a hidden factor.
+
+**Compiled-in anomaly:** The compiled-in codebook (~33% MSE) is worse than 100-iter numpy (32.1%)
+at every context length. This confirms the finding from 3-bit: codebook provenance matters, not
+just MSE. The compiled-in codebook was trained with a different code path / initialization.
+
+## Best-Codebook Mixed Config Grid (2026-03-31)
+
+Re-ran all TCQ configs with best available codebooks loaded via env vars:
+- Best 2-bit: `/tmp/tcq_2bit_100iter_s99.bin` (100-iter numpy, 32.1% MSE reduction)
+- Best 3-bit: `/tmp/cb_50iter_finetuned.bin` (finetuned 50-iter)
+
+Test: wikitext-2-raw, 64 chunks @2K, 8 chunks @8K, 4 chunks @32K/64K
+
+| Config | bpv | PPL @2K | PPL @8K | PPL @32K | PPL @64K |
+|--------|-----|---------|---------|----------|----------|
+| turbo3_tcq(best) | 3.25 | 6.530 | 6.982 | 7.050 | 7.020 |
+| t2K(best)/t3V(best) | 2.75 | 6.589 | 7.050 | 7.132 | 7.074 |
+| t3K(best)/t2V(best) | 2.75 | 6.633 | 7.064 | 7.166 | 7.123 |
+| turbo2_tcq(best) | 2.25 | 6.708 | 7.135 | 7.205 | 7.222 |
+
+### Comparison vs compiled-in codebooks
+
+| Config | PPL @2K (comp) | PPL @2K (best) | Δ | PPL @64K (comp) | PPL @64K (best) | Δ |
+|--------|----------------|----------------|---|-----------------|-----------------|---|
+| turbo3_tcq | 6.507 | 6.530 | +0.023 | 7.053 | 7.020 | **-0.033** |
+| t2K/t3V | 6.582 | 6.589 | +0.007 | 7.180 | 7.074 | **-0.106** |
+| t3K/t2V | 6.649 | 6.633 | -0.016 | 7.203 | 7.123 | **-0.080** |
+| turbo2_tcq | 6.742 | 6.708 | -0.034 | 7.484 | 7.222 | **-0.262** |
+
+### Key findings
+
+1. **Best codebooks help most where 2-bit is used**: turbo2_tcq gains 0.262 PPL at 64K, mixed
+   configs gain 0.08-0.11, pure 3-bit gains only 0.033. The compiled-in 2-bit codebook was the
+   primary source of long-context degradation.
+
+2. **3-bit finetuned codebook has crossover**: slightly worse at 2K (+0.023) but better at 64K
+   (-0.033). Confirms the 3-bit MSE-PPL crossover at ~8K found in the scaling law grid.
+
+3. **K quality > V quality confirmed again**: t2K/t3V (6.589 @2K, 7.074 @64K) beats
+   t3K/t2V (6.633 @2K, 7.123 @64K) at every context length. Allocate bits to K first.
+
+4. **Bug found and fixed**: V decode path in fattn.cu was missing runtime codebook loading.
+   When K and V used different quant types, V always decoded with compiled-in codebook regardless
+   of TURBO_TCQ_CB/CB2 env vars. This caused encode/decode mismatch (PPL 9.65 instead of 6.63).
+   Fix: added codebook loading to V dequant branches with separate static bool guards.

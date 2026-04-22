@@ -468,9 +468,49 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
+            // Runtime codebook loading for fattn decode
+            {
+                static bool tcq_fattn_cb_loaded = false;
+                if (!tcq_fattn_cb_loaded) {
+                    tcq_fattn_cb_loaded = true;
+                    const char *cb_path = getenv("TURBO_TCQ_CB");
+                    if (cb_path) {
+                        float cb[512];
+                        FILE *f = fopen(cb_path, "rb");
+                        if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                            fclose(f);
+                            cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
+                            fprintf(stderr, "TCQ decode: loaded codebook from %s\n", cb_path);
+                        } else {
+                            if (f) fclose(f);
+                            fprintf(stderr, "TCQ decode: FAILED to load codebook from %s\n", cb_path);
+                        }
+                    }
+                }
+            }
             k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
+            // Runtime codebook loading for 2-bit fattn decode
+            {
+                static bool tcq2_fattn_cb_loaded = false;
+                if (!tcq2_fattn_cb_loaded) {
+                    tcq2_fattn_cb_loaded = true;
+                    const char *cb_path = getenv("TURBO_TCQ_CB2");
+                    if (cb_path) {
+                        float cb[256];
+                        FILE *f = fopen(cb_path, "rb");
+                        if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                            fclose(f);
+                            cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
+                            fprintf(stderr, "TCQ2 decode: loaded 2-bit codebook from %s\n", cb_path);
+                        } else {
+                            if (f) fclose(f);
+                            fprintf(stderr, "TCQ2 decode: FAILED to load codebook from %s\n", cb_path);
+                        }
+                    }
+                }
+            }
             k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
@@ -494,9 +534,47 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
+            // Runtime codebook loading for 3-bit V decode (in case K is a different type)
+            {
+                static bool tcq_fattn_v_cb_loaded = false;
+                if (!tcq_fattn_v_cb_loaded) {
+                    tcq_fattn_v_cb_loaded = true;
+                    const char *cb_path = getenv("TURBO_TCQ_CB");
+                    if (cb_path) {
+                        float cb[512];
+                        FILE *f = fopen(cb_path, "rb");
+                        if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                            fclose(f);
+                            cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
+                            fprintf(stderr, "TCQ V decode: loaded 3-bit codebook from %s\n", cb_path);
+                        } else {
+                            if (f) fclose(f);
+                        }
+                    }
+                }
+            }
             k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
+            // Runtime codebook loading for 2-bit V decode (in case K is a different type)
+            {
+                static bool tcq2_fattn_v_cb_loaded = false;
+                if (!tcq2_fattn_v_cb_loaded) {
+                    tcq2_fattn_v_cb_loaded = true;
+                    const char *cb_path = getenv("TURBO_TCQ_CB2");
+                    if (cb_path) {
+                        float cb[256];
+                        FILE *f = fopen(cb_path, "rb");
+                        if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                            fclose(f);
+                            cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
+                            fprintf(stderr, "TCQ2 V decode: loaded 2-bit codebook from %s\n", cb_path);
+                        } else {
+                            if (f) fclose(f);
+                        }
+                    }
+                }
+            }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else {
