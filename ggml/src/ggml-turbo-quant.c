@@ -35,6 +35,19 @@ static const float CENTROIDS_3BIT[8] = {
      0.021460f,  0.065717f,  0.117832f,  0.190685f
 };
 
+/* 4-bit: Lloyd-Max for N(0, 1/sqrt(128)), 16 centroids */
+static const float CENTROIDS_4BIT[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
+static const float MIDPOINTS_4BIT[15] = {
+    -0.212232f, -0.162977f, -0.127056f, -0.097191f, -0.070693f,
+    -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
+     0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f,
+};
+
 /* ---------- rotation matrix (lazy init) ---------- */
 
 static float turbo_rotation[TURBO_D * TURBO_D];
@@ -170,6 +183,27 @@ static int nearest_centroid_3bit(float val) {
     return 7;
 }
 
+static int nearest_centroid_4bit(float val) {
+    /* 16 centroids, binary search on midpoints */
+    if (val < MIDPOINTS_4BIT[7]) {
+        if (val < MIDPOINTS_4BIT[3]) {
+            if (val < MIDPOINTS_4BIT[1]) return val < MIDPOINTS_4BIT[0] ? 0 : 1;
+            else                         return val < MIDPOINTS_4BIT[2] ? 2 : 3;
+        } else {
+            if (val < MIDPOINTS_4BIT[5]) return val < MIDPOINTS_4BIT[4] ? 4 : 5;
+            else                         return val < MIDPOINTS_4BIT[6] ? 6 : 7;
+        }
+    } else {
+        if (val < MIDPOINTS_4BIT[11]) {
+            if (val < MIDPOINTS_4BIT[9])  return val < MIDPOINTS_4BIT[8] ? 8 : 9;
+            else                          return val < MIDPOINTS_4BIT[10] ? 10 : 11;
+        } else {
+            if (val < MIDPOINTS_4BIT[13]) return val < MIDPOINTS_4BIT[12] ? 12 : 13;
+            else                          return val < MIDPOINTS_4BIT[14] ? 14 : 15;
+        }
+    }
+}
+
 /* ---------- TURBO2_0: 2-bit PolarQuant, no QJL ---------- */
 
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
@@ -257,11 +291,10 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
+/* ---------- TURBO4_0: 4-bit PolarQuant (16 centroids, no QJL) ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
-    turbo_init_qjl();
 
     assert(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
@@ -288,109 +321,52 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         float rotated[TURBO_D];
         matvec(turbo_rotation, normalized, rotated, d);
 
-        /* Step 3: 3-bit quantization */
+        /* Step 3: 4-bit quantization — find nearest of 16 centroids */
         uint8_t indices[TURBO_D];
         for (int i = 0; i < d; i++) {
-            indices[i] = (uint8_t)nearest_centroid_3bit(rotated[i]);
+            indices[i] = (uint8_t)nearest_centroid_4bit(rotated[i]);
         }
 
-        /* Step 4: Residual */
-        float reconstructed[TURBO_D];
+        /* Step 4: Norm correction */
+        float recon_sq = 0.0f;
         for (int i = 0; i < d; i++) {
-            reconstructed[i] = CENTROIDS_3BIT[indices[i]];
+            float r = CENTROIDS_4BIT[indices[i]];
+            recon_sq += r * r;
         }
-        float mse_recon[TURBO_D];
-        matvec(turbo_rotation_t, reconstructed, mse_recon, d);
+        float recon_norm = sqrtf(recon_sq);
+        y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
 
-        float residual[TURBO_D];
-        for (int i = 0; i < d; i++) {
-            residual[i] = normalized[i] - mse_recon[i];
-        }
-
-
-        /* Step 5: QJL */
-        float projected[TURBO_D];
-        matvec(turbo_qjl_matrix, residual, projected, d);
-
-        /* Pack */
-        y[block].norm  = GGML_FP32_TO_FP16(norm);
-
-        /* Pack 3-bit indices: 8 indices per 3 bytes */
-        memset(y[block].qs, 0, d * 3 / 8);
-        for (int i = 0; i < d; i++) {
-            int bit_offset = i * 3;
-            int byte_idx   = bit_offset / 8;
-            int bit_pos    = bit_offset % 8;
-            uint16_t val   = (uint16_t)(indices[i] & 0x7);
-            /* Write up to 2 bytes (3 bits might span a byte boundary) */
-            y[block].qs[byte_idx] |= (uint8_t)(val << bit_pos);
-            if (bit_pos > 5 && byte_idx + 1 < d * 3 / 8) {
-                y[block].qs[byte_idx + 1] |= (uint8_t)(val >> (8 - bit_pos));
-            }
-        }
-
-        /* Pack 1-bit QJL signs */
-        memset(y[block].signs, 0, d / 8);
-        for (int i = 0; i < d; i++) {
-            if (projected[i] >= 0.0f) {
-                y[block].signs[i / 8] |= (1 << (i % 8));
-            }
+        /* Pack 4-bit indices: 2 per byte, low nibble first */
+        for (int i = 0; i < d; i += 2) {
+            y[block].qs[i / 2] = (uint8_t)((indices[i + 1] << 4) | (indices[i] & 0xF));
         }
     }
 }
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
-    turbo_init_qjl();
 
     assert(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
     const int d  = QK_TURBO4;
 
     for (int block = 0; block < nb; block++) {
-        float norm  = GGML_FP16_TO_FP32(x[block].norm);
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
 
-        /* Unpack 3-bit indices */
-        uint8_t indices[TURBO_D];
-        for (int i = 0; i < d; i++) {
-            int bit_offset = i * 3;
-            int byte_idx   = bit_offset / 8;
-            int bit_pos    = bit_offset % 8;
-            uint16_t raw   = (uint16_t)x[block].qs[byte_idx];
-            if (byte_idx + 1 < d * 3 / 8) {
-                raw |= (uint16_t)x[block].qs[byte_idx + 1] << 8;
-            }
-            indices[i] = (uint8_t)((raw >> bit_pos) & 0x7);
-        }
-
-        /* Unpack signs */
-        float signs[TURBO_D];
-        for (int i = 0; i < d; i++) {
-            signs[i] = (x[block].signs[i / 8] & (1 << (i % 8))) ? 1.0f : -1.0f;
-        }
-
-        float rnorm = GGML_FP16_TO_FP32(x[block].rnorm);
-        const float qjl_scale = TURBO_QJL_CONST / (float)d * rnorm;
-
-        /* PolarQuant dequant */
+        /* Unpack 4-bit indices and reconstruct in rotated space */
         float rotated_recon[TURBO_D];
         for (int i = 0; i < d; i++) {
-            rotated_recon[i] = CENTROIDS_3BIT[indices[i]];
-        }
-        float mse_recon[TURBO_D];
-        matvec(turbo_rotation_t, rotated_recon, mse_recon, d);
-
-        /* QJL dequant */
-        float qjl_recon[TURBO_D];
-        matvec(turbo_qjl_matrix_t, signs, qjl_recon, d);
-        for (int i = 0; i < d; i++) {
-            qjl_recon[i] *= qjl_scale;
+            uint8_t idx = (i & 1) ? (x[block].qs[i / 2] >> 4) : (x[block].qs[i / 2] & 0xF);
+            rotated_recon[i] = CENTROIDS_4BIT[idx];
         }
 
-        /* Combine */
+        /* Inverse rotate */
         float * dst = y + block * d;
+        matvec(turbo_rotation_t, rotated_recon, dst, d);
+
+        /* Scale by norm */
         for (int i = 0; i < d; i++) {
-            dst[i] = (mse_recon[i] + qjl_recon[i]) * norm;
+            dst[i] *= norm;
         }
     }
 }

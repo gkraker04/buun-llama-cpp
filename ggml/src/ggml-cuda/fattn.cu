@@ -284,18 +284,8 @@ static __global__ void k_turbo4_dequant_f16(
     const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
 
     const float norm = __half2float(blk->norm);
-    const float rnorm = __half2float(blk->rnorm);
-    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
-
-    const int bit_offset = j_in_blk * 3;
-    const int byte_idx = bit_offset / 8;
-    const int bit_pos = bit_offset % 8;
-    uint16_t raw = (uint16_t)blk->qs[byte_idx];
-    if (byte_idx + 1 < 48) raw |= (uint16_t)blk->qs[byte_idx + 1] << 8;
-    const uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
-
-    const float s = (blk->signs[j_in_blk / 8] & (1 << (j_in_blk % 8))) ? 1.0f : -1.0f;
-    const float val = (d_turbo_centroids_3bit_fattn[idx] + s * qjl_scale) * norm;
+    const uint8_t idx = (j_in_blk & 1) ? (blk->qs[j_in_blk / 2] >> 4) : (blk->qs[j_in_blk / 2] & 0xF);
+    const float val = d_turbo_centroids_4bit_fattn[idx] * norm;
 
     dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
 }
@@ -780,8 +770,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * V = dst->src[2];
 
     // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
-    // turbo4's QJL correction loses ~1% PPL precision in fp16 round-trip, but 2x prefill speedup
-    // is worth it since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
+    // Slight precision loss from fp16 round-trip, but 2x prefill speedup is worth it
+    // since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {

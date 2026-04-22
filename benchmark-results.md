@@ -789,3 +789,111 @@ Auto-detects and disables on hd256 models where channels are already balanced.
 The remaining +1.78% gap is inherent to lower dimensionality (fewer dimensions =
 larger relative quantization noise in dot products). Further improvement would
 require more bits or a fundamentally different approach.
+
+## New turbo4: 4-bit PolarQuant (16 centroids, no QJL)
+
+Branch: `experiment/turbo4-4bit-polarquant`. Dropped QJL 1-bit correction entirely,
+replaced with pure 4-bit PolarQuant (16 Lloyd-Max centroids). Inspired by TheTom's
+Metal implementation showing QJL variance gets amplified by softmax.
+
+Block format: 66 bytes per 128 values = 4.125 bpv (was 68 bytes = 4.25 bpv with QJL).
+
+### Qwen3.5-27B Q6_K (head_dim=256, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 5.8377 | — |
+| new turbo4 (4-bit) | 5.8467 | +0.15% |
+| turbo3 | 5.8501 | +0.22% |
+| old turbo4 (QJL) | 5.8186 | -0.32% |
+
+On hd256, old QJL turbo4 was better (-0.32% vs +0.15%). QJL helps on hd256
+where the 1-bit correction noise is small relative to 256-dim dot products.
+
+### Qwen3-14B Q5_K_M (head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 6.4206 | — |
+| **new turbo4 (4-bit)** | **6.4978** | **+1.20%** |
+| turbo3 + InnerQ | 6.5175 | +1.51% |
+| turbo3 | 6.6340 | +3.33% |
+| old turbo4 (QJL) | 6.9118 | +6.3% |
+
+**Breakthrough on hd128!** New turbo4 beats turbo3+InnerQ by 0.31 percentage points.
+Old turbo4 (QJL) was catastrophic at +6.3%. The 72.5% MSE reduction from 16 vs 8
+centroids more than compensates for losing the QJL correction.
+
+InnerQ has no additional effect on new turbo4 (PPL identical with/without).
+
+### LA-1 on Qwen3-14B (head_dim=128, 2K/8chunks)
+
+| Config | PPL | vs q8_0 |
+|--------|-----|---------|
+| turbo3 | 6.6340 | +3.33% |
+| turbo3 + LA-1 | 6.6763 | +3.98% |
+| turbo3 + LA-1 + InnerQ | 6.6608 | +3.74% |
+
+LA-1 HURTS on hd128 (unlike hd256 where it gives -0.71%). 8/40=20% promoted layers
+create quality discontinuity that is worse than uniform turbo3 noise.
+
+### turbo4 Quality Decomposition (hd128, Qwen3-14B, 2K/8chunks)
+
+**K quality dominates V by 13x.** Source of gap analysis:
+
+| Config | PPL | vs q8_0 | Source |
+|--------|-----|---------|--------|
+| q8_0 (f16 K + f16 V) | 6.4206 | — | — |
+| f16 K + turbo4 V | 6.4256 | +0.08% | V quant only |
+| turbo4 K + f16 V | 6.4879 | +1.05% | K quant only |
+| turbo4 K + turbo4 V | 6.4978 | +1.20% | K + V combined |
+| turbo4 K + turbo3 V | 6.5854 | +2.57% | |
+| turbo3 K + turbo4 V | 6.6330 | +3.31% | |
+| turbo3 K + turbo3 V | 6.6340 | +3.33% | |
+
+### turbo4 + Layer-Adaptive sweep (hd128, Qwen3-14B, 2K/8chunks)
+
+| Mode | Description | PPL | vs q8_0 | Promoted layers |
+|------|-------------|-----|---------|-----------------|
+| **LA-3** | **last 4 (K+V)** | **6.4587** | **+0.59%** | **4/40 = 10%** |
+| LA-10 | last 4 (K-only) | 6.4604 | +0.62% | K: 4/40, V: 0/40 |
+| LA-11 | last 6 (K+V) | 6.4626 | +0.65% | 6/40 |
+| LA-2 | last 8 (K+V) | 6.4628 | +0.66% | 8/40 |
+| LA-1 | first4+last4 (K+V) | 6.4638 | +0.67% | 8/40 |
+| LA-7 | last 8 (K-only) | 6.4653 | +0.70% | K: 8/40, V: 0/40 |
+| LA-9 | last 2 (K+V) | 6.4795 | +0.92% | 2/40 |
+| 0 | turbo4 uniform | 6.4978 | +1.20% | 0/40 |
+| LA-4 | first 4 (K+V) | 6.5125 | +1.43% | 4/40 |
+| LA-5 | first2+last2 (K+V) | 6.5162 | +1.49% | 4/40 |
+
+Best: LA-3 (last 4, K+V) at +0.59%, 4.53 bpv average.
+Sweet spot: exactly 4 last layers. More layers (6, 8) give diminishing returns.
+First-layer promotion always hurts on hd128. K-only promotion nearly as good.
+
+### turbo4 Context Scaling (hd128, Qwen3-14B)
+
+| Context | q8_0 PPL | turbo4 PPL | turbo4 gap | turbo3 PPL | turbo3 gap |
+|---------|----------|------------|------------|------------|------------|
+| 2K | 6.4206 | 6.4978 | +1.20% | 6.6340 | +3.33% |
+| 8K | 7.0149 | 7.0718 | +0.81% | 7.4261 | +5.86% |
+| 32K | 7.2929 | 7.3638 | +0.97% | 7.7736 | +6.59% |
+
+turbo4 context scaling is excellent (~1% gap at all lengths).
+turbo3 degrades catastrophically at long context on hd128 (3.3% → 6.6%).
+
+### Decode Speed (hd128, Qwen3-14B, RTX 3090, tg64)
+
+| Config | t/s | vs q8_0 |
+|--------|-----|---------|
+| q8_0 | 69.68 | — |
+| turbo4 | 59.72 | 85.7% |
+| turbo3 | 59.54 | 85.4% |
+
+turbo4 and turbo3 have identical decode speed (compute-bound dequant).
+
+### Empirical centroid calibration — FAILED
+
+Simulated post-FWHT distribution has kurtosis -0.047 (sub-Gaussian), but the empirical
+centroids derived from simulation gave catastrophic PPL = 6.8758 (+17.8%). The simulation
+is wrong for real model data. TheTom's measurement on real KV tensors shows kurtosis = 2.9
+(near-Gaussian), confirming Gaussian-optimal Lloyd-Max centroids are correct.
