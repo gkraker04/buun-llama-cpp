@@ -353,6 +353,20 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+
+        // turbo3/turbo4 KV cache stores data in FWHT-rotated space.
+        // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
+        // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
+        {
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0);
+            if ((turbo_k || turbo_v) && !cparams.flash_attn) {
+                throw std::runtime_error(
+                    "turbo3/turbo4 KV cache requires Flash Attention (stores data in FWHT-rotated space). "
+                    "Use -fa on (or -fa auto, which is the default). "
+                    "If Flash Attention was auto-disabled, check that your GPU supports it and all KV layers are on the same device.");
+            }
+        }
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
