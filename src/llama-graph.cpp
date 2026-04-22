@@ -57,19 +57,27 @@ static bool can_reuse_kq_mask(
 
 // impl
 
-static ggml_tensor * ggml_mul_mat_aux(
-        ggml_context * ctx,
-        ggml_tensor * cur,
-        ggml_tensor * rot) {
-    const auto n = rot->ne[0];
+static bool is_power_of_2(int n) {
+    return (n & (n - 1)) == 0;
+}
 
-    ggml_tensor * res;
+// orthonormal Walsh-Hadamard rotation matrix
+static void set_input_hadamard(int n, float * data) {
+    assert(is_power_of_2(n));
 
-    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
-    res = ggml_mul_mat   (ctx, rot, res);
-    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    data[0*n + 0] = 1.0 / sqrtf(n);
 
-    return res;
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+
+                data[(i + s)*n + (j    )] =  val;
+                data[(i    )*n + (j + s)] =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
 }
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -450,12 +458,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (self_k_rot) {
-        mctx->set_input_k_rot(self_k_rot);
-    }
+    if (self_rotk && self_rotv) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_rotk->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_rotv->buffer));
 
-    if (self_v_rot) {
-        mctx->set_input_v_rot(self_v_rot);
+        float * dataf = (float *) self_rotk->data;
+        float * datab = (float *) self_rotv->data;
+
+        set_input_hadamard(self_rotk->ne[0], dataf);
+        set_input_hadamard(self_rotv->ne[0], datab);
     }
 }
 
@@ -505,20 +516,15 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
 
-    if (self_k_rot) {
-        mctx->get_base()->set_input_k_rot(self_k_rot);
-    }
+    if (self_rotk && self_rotv) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_rotk->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_rotv->buffer));
 
-    if (self_v_rot) {
-        mctx->get_base()->set_input_v_rot(self_v_rot);
-    }
+        float * dataf = (float *) self_rotk->data;
+        float * datab = (float *) self_rotv->data;
 
-    if (self_k_rot_swa) {
-        mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
-    }
-
-    if (self_v_rot_swa) {
-        mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
+        set_input_hadamard(self_rotk->ne[0], dataf);
+        set_input_hadamard(self_rotv->ne[0], datab);
     }
 }
 
@@ -576,12 +582,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
+    if (inp_attn->self_rotk && inp_attn->self_rotv) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_attn->self_rotk->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_attn->self_rotv->buffer));
 
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        float * dataf = (float *) inp_attn->self_rotk->data;
+        float * datab = (float *) inp_attn->self_rotv->data;
+
+        set_input_hadamard(inp_attn->self_rotk->ne[0], dataf);
+        set_input_hadamard(inp_attn->self_rotv->ne[0], datab);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -682,20 +691,15 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (inp_attn->self_k_rot) {
-        attn_ctx->get_base()->set_input_k_rot(inp_attn->self_k_rot);
-    }
+    if (inp_attn->self_rotk && inp_attn->self_rotv) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_attn->self_rotk->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_attn->self_rotv->buffer));
 
-    if (inp_attn->self_v_rot) {
-        attn_ctx->get_base()->set_input_v_rot(inp_attn->self_v_rot);
-    }
+        float * dataf = (float *) inp_attn->self_rotk->data;
+        float * datab = (float *) inp_attn->self_rotv->data;
 
-    if (inp_attn->self_k_rot_swa) {
-        attn_ctx->get_swa()->set_input_k_rot(inp_attn->self_k_rot_swa);
-    }
-
-    if (inp_attn->self_v_rot_swa) {
-        attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
+        set_input_hadamard(inp_attn->self_rotk->ne[0], dataf);
+        set_input_hadamard(inp_attn->self_rotv->ne[0], datab);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -2162,12 +2166,35 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask = build_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        ggml_set_input(inp->self_kq_mask);
+
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
 
-    inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
-    inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    {
+        const bool can_rot =
+            !hparams.is_n_embd_k_gqa_variable() &&
+            !hparams.is_n_embd_v_gqa_variable() &&
+            is_power_of_2(hparams.n_embd_head_k()) &&
+            is_power_of_2(hparams.n_embd_head_v()) &&
+            ggml_is_quantized(mctx_cur->type_k()) &&
+            ggml_is_quantized(mctx_cur->type_v());
+
+        if (can_rot) {
+            const auto nk = hparams.n_embd_head_k();
+            const auto nv = hparams.n_embd_head_v();
+
+            inp->self_rotk = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nk, nk);
+            inp->self_rotv = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nv, nv);
+
+            ggml_set_input(inp->self_rotk);
+            ggml_set_input(inp->self_rotv);
+        } else {
+            inp->self_rotk = nullptr;
+            inp->self_rotv = nullptr;
+        }
+    }
 
     return inp;
 }
@@ -2195,13 +2222,10 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
-    }
-
-    if (inp->self_v_rot) {
-        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    if (inp->self_rotk) {
+        q_cur = ggml_mul_mat(ctx0, inp->self_rotk, q_cur);
+        k_cur = ggml_mul_mat(ctx0, inp->self_rotk, k_cur);
+        v_cur = ggml_mul_mat(ctx0, inp->self_rotv, v_cur);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2235,12 +2259,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
-        if (cur->ne[0] % 128 == 0) {
-            cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-        }
+    if (inp->self_rotv) {
+        const auto n = inp->self_rotv->ne[0];
+
+        cur = ggml_reshape_4d(ctx0, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]);
+        cur = ggml_mul_mat(ctx0, inp->self_rotv, cur);
+        cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2], cur->ne[3]);
     }
 
     if (wo) {
@@ -2363,20 +2387,13 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il) const {
-    const bool is_swa = hparams.is_swa(il);
-
-    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
-    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
-
-    if (k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+    if (inp->self_rotk) {
+        q_cur = ggml_mul_mat(ctx0, inp->self_rotk, q_cur);
         if (k_cur) {
-            k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
+            k_cur = ggml_mul_mat(ctx0, inp->self_rotk, k_cur);
         }
-    }
-    if (v_rot) {
         if (v_cur) {
-            v_cur = ggml_mul_mat_aux(ctx0, v_cur, v_rot);
+            v_cur = ggml_mul_mat(ctx0, inp->self_rotv, v_cur);
         }
     }
 
@@ -2418,12 +2435,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
-        if (cur->ne[0] % 128 == 0) {
-            cur = ggml_cont(ctx0, cur);
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-        }
+    if (inp->self_rotv) {
+        const auto n = inp->self_rotv->ne[0];
+
+        cur = ggml_reshape_4d(ctx0, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]);
+        cur = ggml_mul_mat(ctx0, inp->self_rotv, cur);
+        cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2], cur->ne[3]);
     }
 
     if (wo) {
@@ -2523,11 +2540,29 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask_swa, GGML_TYPE_F16) : inp->self_kq_mask_swa;
     }
 
-    inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
-    inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
+    {
+        const bool can_rot =
+            !hparams.is_n_embd_k_gqa_variable() &&
+            !hparams.is_n_embd_v_gqa_variable() &&
+            is_power_of_2(hparams.n_embd_head_k()) &&
+            is_power_of_2(hparams.n_embd_head_v()) &&
+            ggml_is_quantized(mctx_cur->get_base()->type_k()) &&
+            ggml_is_quantized(mctx_cur->get_base()->type_v());
 
-    inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
-    inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+        if (can_rot) {
+            const auto nk = hparams.n_embd_head_k();
+            const auto nv = hparams.n_embd_head_v();
+
+            inp->self_rotk = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nk, nk);
+            inp->self_rotv = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nv, nv);
+
+            ggml_set_input(inp->self_rotk);
+            ggml_set_input(inp->self_rotv);
+        } else {
+            inp->self_rotk = nullptr;
+            inp->self_rotv = nullptr;
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
