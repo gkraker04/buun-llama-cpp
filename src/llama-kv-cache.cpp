@@ -264,6 +264,13 @@ llama_kv_cache::llama_kv_cache(
                     case 9: promote_k = promote_v = (il >= n_layer - 2); break;
                     case 10: promote_k = (il >= n_layer - 4); break;
                     case 11: promote_k = promote_v = (il >= n_layer - 6); break;
+                    case 12: promote_k = promote_v = !hparams.is_swa(il); break;  // global layers only
+                    case 13: promote_v = !hparams.is_swa(il); break;              // global V only
+                    case 14: promote_k = promote_v = hparams.is_swa(il); break;   // SWA layers only
+                    case 15: promote_v = hparams.is_swa(il); break;               // SWA V only
+                    case 16: promote_k = promote_v = (il % 4 == 0); break;        // every 4th layer q8_0 (Qwen-like)
+                    case 17: promote_k = promote_v = (il % 3 == 0); break;        // every 3rd layer q8_0
+                    case 18: promote_k = promote_v = (il % 2 == 0); break;        // every 2nd layer q8_0
                 }
             }
             if (promote_k) {
@@ -286,8 +293,69 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+
+        // Turbo FA vec kernel supports head_dim <= 512.
+        // Fall back to f16 for layers with larger head dimensions.
+        {
+            auto is_turbo = [](ggml_type t) {
+                return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+                       t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+            };
+            const uint32_t head_k = hparams.n_embd_head_k(il);
+            const uint32_t head_v = hparams.n_embd_head_v(il);
+            if (is_turbo(layer_type_k) && head_k > 512) {
+                layer_type_k = GGML_TYPE_F16;
+                static bool logged_k = false;
+                if (!logged_k) {
+                    LLAMA_LOG_WARN("llama_kv_cache: layer %d head_dim_k=%u > 512, falling back to f16 K (turbo FA limit)\n", il, head_k);
+                    logged_k = true;
+                }
+            }
+            if (is_turbo(layer_type_v) && head_v > 512) {
+                layer_type_v = GGML_TYPE_F16;
+                static bool logged_v = false;
+                if (!logged_v) {
+                    LLAMA_LOG_WARN("llama_kv_cache: layer %d head_dim_v=%u > 512, falling back to f16 V (turbo FA limit)\n", il, head_v);
+                    logged_v = true;
+                }
+            }
+        }
+
+        // Turbo head padding: FWHT requires head_dim % 128 == 0
+        // Pad per-head to nearest 128 with zeros (contribute nothing via Parseval's theorem)
+        uint32_t n_embd_k_alloc = n_embd_k_gqa;
+        uint32_t n_embd_v_alloc = n_embd_v_gqa;
+        {
+            auto is_turbo = [](ggml_type t) {
+                return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+                       t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+            };
+            if (is_turbo(layer_type_k)) {
+                uint32_t head_k = hparams.n_embd_head_k(il);
+                uint32_t padded = ((head_k + 127) / 128) * 128;
+                if (padded > head_k) {
+                    n_embd_k_alloc = padded * hparams.n_head_kv(il);
+                }
+            }
+            if (is_turbo(layer_type_v) && !v_trans) {
+                uint32_t head_v = hparams.n_embd_head_v(il);
+                uint32_t padded = ((head_v + 127) / 128) * 128;
+                if (padded > head_v) {
+                    n_embd_v_alloc = padded * hparams.n_head_kv(il);
+                }
+            }
+            if (n_embd_k_alloc != n_embd_k_gqa || n_embd_v_alloc != n_embd_v_gqa) {
+                static bool logged = false;
+                if (!logged) {
+                    LLAMA_LOG_INFO("llama_kv_cache: turbo head padding: %u -> %u per head\n",
+                        hparams.n_embd_head_k(il), ((hparams.n_embd_head_k(il) + 127) / 128) * 128);
+                    logged = true;
+                }
+            }
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_alloc, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -1259,13 +1327,17 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    // may be padded for turbo FWHT alignment
+    assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
+
+    const uint32_t n_head_kv     = hparams.n_head_kv(il);
+    const uint32_t n_embd_head_k = n_embd_k_gqa / n_head_kv;
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
-            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            n_embd_head_k, n_head_kv, n_kv, ns,
+            ggml_row_size(k->type, n_embd_head_k),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
@@ -1285,10 +1357,14 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
+        // use padded head_dim from cache tensor (may be padded for turbo FWHT)
+        const uint32_t n_head_kv     = hparams.n_head_kv(il);
+        const uint32_t n_embd_head_v = n_embd_v_gqa / n_head_kv;
+
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
-                ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
+                n_embd_head_v, n_head_kv, n_kv, ns,
+                ggml_row_size(v->type, n_embd_head_v),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
@@ -1314,11 +1390,19 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
 
-    const int64_t n_embd_gqa = n_embd_head*n_head;
+    // cache head_dim may be padded for turbo FWHT alignment
+    const int64_t cache_head = k->ne[0] / n_head;
 
     // we can merge dims 0 and 1
     // TODO: add ggml helper function for this?
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+
+    // pad per-head to match cache (zeros contribute nothing via Parseval's theorem)
+    if (n_embd_head < cache_head) {
+        k_cur = ggml_pad(ctx, k_cur, cache_head - n_embd_head, 0, 0, 0);
+    }
+
+    const int64_t n_embd_gqa = cache_head * n_head;
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
@@ -1358,16 +1442,23 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
-        v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+        // pad per-head for turbo FWHT alignment
+        const int64_t cache_head = v->ne[0] / n_head;
+        if (n_embd_head < cache_head) {
+            v_cur = ggml_pad(ctx, v_cur, cache_head - n_embd_head, 0, 0, 0);
+        }
+        const int64_t n_embd_gqa_cache = cache_head * n_head;
+
+        v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa_cache, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
 
-            assert(n_embd_gqa == v->ne[0]);
-            assert(kv_size    == v->ne[1]);
+            assert(n_embd_gqa_cache == v->ne[0]);
+            assert(kv_size          == v->ne[1]);
 
             // merge the buffer across all streams because the idxs are global
-            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+            v = ggml_reshape_2d(ctx, v, n_embd_gqa_cache, kv_size*n_stream);
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
