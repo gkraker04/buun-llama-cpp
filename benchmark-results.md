@@ -158,3 +158,18 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 **Root cause of turbo4 regression**: turbo4's QJL correction adds ~0.001 magnitude adjustments per element. This is at the limit of fp16 precision (10-bit mantissa). The fp16 round-trip (dequant → fp16 buffer → MMA read) rounds away the QJL signal. turbo3 is unaffected because its 8 centroids are coarse enough (~0.3 spacing) for fp16.
 
 **Decision**: Prefill dequant+MMA enabled for turbo3 only. turbo4 continues to use vec kernel for prefill (preserves PPL 5.8186 at cost of 588 tok/s prefill speed vs 1121 tok/s).
+
+## Layer-Adaptive + Prefill MMA (turbo3, comprehensive)
+
+| Config | PPL | vs q8_0 | pp4096 tok/s | pp/q8 | tg64 tok/s | tg/q8 | Compression |
+|--------|-----|---------|-------------|-------|-----------|-------|-------------|
+| **LA-1 turbo3** | **5.7690** | **-1.17%** | **1128** | **99.6%** | **30.25** | **97.5%** | ~3.5x |
+| LA-5 turbo3 | 5.8246 | -0.22% | 1119 | 98.8% | 30.03 | 96.8% | ~4.2x |
+| turbo3 uniform | 5.8501 | +0.22% | 1125 | 99.3% | 30.04 | 96.8% | 4.9x |
+| q8_0 baseline | 5.8375 | — | 1133 | 100% | 31.04 | 100% | 1.0x |
+
+**Recommended config: LA-1 turbo3** (TURBO_LAYER_ADAPTIVE=1)
+- 1.17% BETTER PPL than q8_0
+- 99.6% prefill speed, 97.5% decode speed
+- 3.5x KV cache compression
+- Enables 128K context on 24GB GPU where q8_0 OOMs at ~65K
