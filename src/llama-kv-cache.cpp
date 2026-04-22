@@ -111,7 +111,7 @@ llama_kv_cache::llama_kv_cache(
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
-            const size_t n_turbo_extra = is_turbo ? 4 : 0; // rotation matrix tensors
+            const size_t n_turbo_extra = is_turbo ? 8 : 0; // rotation matrices + safety margin
             ggml_init_params params = {
                 /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + n_turbo_extra)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
