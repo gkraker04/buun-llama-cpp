@@ -1878,3 +1878,43 @@ Improvement consistent across bit rates (3-bit: −0.099 at 64K, 2-bit: −0.094
 - **Universal default**: αK=1.10, αV=1.30 — no 2K regression, up to -0.099 PPL at 64K
 - **Long-context optimized**: αK=1.05, αV=1.35 — best 64K (-0.107) but slight 2K regression (+0.016)
 - **Conservative**: Keep symmetric αK=αV=1.20 — already excellent, asymmetric adds complexity for modest gain
+
+---
+
+## Experiment #73: Parallelize TCQ Encode Kernels (2026-04-01)
+
+Parallelized pre-Viterbi (load, InnerQ, norm, FWHT) and post-Viterbi (argmin, recon norm) 
+using all 512/256 threads. Backtrack and bitpack remain serial.
+
+### PPL Verification (2K, 32 chunks, wikitext-2 test)
+
+| Type | Baseline | Experiment | Δ |
+|------|----------|------------|---|
+| 3-bit TCQ | 6.3465 ± 0.089 | 6.3295 ± 0.089 | -0.017 (noise, FP order change) |
+| 2-bit TCQ | 6.4996 ± 0.092 | 6.4972 ± 0.092 | -0.002 (noise) |
+
+### Prefill Speed (t/s, 3-bit TCQ)
+
+| Context | Baseline | Experiment | Speedup |
+|---------|----------|------------|---------|
+| pp512 | 901.67 | 1015.04 | +12.6% |
+| pp2048 | 898.86 | 1015.03 | +12.9% |
+| pp4096 | 891.75 | 1006.63 | +12.9% |
+| pp8192 | 876.28 | 987.09 | +12.6% |
+
+### Prefill Speed (t/s, 2-bit TCQ)
+
+| Context | Baseline | Experiment | Speedup |
+|---------|----------|------------|---------|
+| pp512 | 982.51 | 1101.70 | +12.1% |
+| pp2048 | 980.31 | 1093.63 | +11.6% |
+| pp4096 | 973.18 | 1087.41 | +11.7% |
+| pp8192 | 954.11 | 1064.56 | +11.6% |
+
+### Decode Speed (3-bit TCQ, tg64)
+
+| Baseline | Experiment | Δ |
+|----------|------------|---|
+| 28.69 | 29.64 | +3.3% (no regression) |
+
+### Result: CONFIRMED — ~12% prefill speedup, no quality change
