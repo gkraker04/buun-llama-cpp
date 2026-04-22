@@ -613,6 +613,10 @@ static __constant__ float d_turbo3_tcq_codebook[512] = {
     -0.16474872f, -0.09278035f, -0.04699890f, -0.00779894f, +0.03187623f, +0.07828258f, +0.13561429f, +0.23917313f
 };
 
+// Temperature scaling factor for TCQ norm. alpha > 1 sharpens attention (helps long context).
+// Set via TURBO_TCQ_ALPHA env var. Default 1.0 = standard MSE-optimal norm correction.
+static __constant__ float d_tcq_norm_alpha = 1.0f;
+
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group
 // Backtrace stored in shared memory (32KB, 4-bit packed)
@@ -862,10 +866,6 @@ static __constant__ float d_turbo2_tcq_codebook[256] = {
     -0.09664737f, -0.03306058f, +0.01965956f, +0.08313737f, -0.15701702f, -0.03552708f, +0.03436711f, +0.12348684f,
     -0.07465987f, +0.03148096f, -0.01592258f, +0.07807118f, -0.08365041f, -0.00777653f, +0.06189138f, +0.16461129f
 };
-
-// Temperature scaling factor for TCQ norm. alpha > 1 sharpens attention (helps long context).
-// Set via TURBO_TCQ_ALPHA env var. Default 1.0 = standard MSE-optimal norm correction.
-static __constant__ float d_tcq_norm_alpha = 1.0f;
 
 // 2-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=2, L=8)
 template<typename idx_t>
