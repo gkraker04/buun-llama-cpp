@@ -201,3 +201,18 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 ## Sign+Magnitude Encoding (branch: experiment/sign-magnitude-encoding)
 
 turbo3 decode speed: 30.05 tok/s (4K) / 29.91 tok/s (32K). Identical to baseline. q8_0: 31.03 tok/s. The 3% gap is memory-bound, not ALU-bound. Encoding change has no effect.
+
+## 128K Context Test
+
+| Config | pp131072 tok/s | tg64 tok/s | Fits on 24GB? |
+|--------|---------------|-----------|---------------|
+| turbo3 uniform | 671.42 | 29.89 | YES |
+| LA-5 turbo3 (first2+last2) | 673.95 | 30.01 | YES |
+| LA-1 turbo3 (first4+last4) | — | — | **NO (OOM)** |
+
+**Key finding**: LA-1 (8 q8_0 layers) OOMs at 128K on 24GB RTX 3090. LA-5 (4 q8_0 layers) and uniform turbo3 both work. LA-5 is the recommended config for 128K: PPL 5.8091 (-0.49% vs q8_0), 674 tok/s prefill, 30.01 tok/s decode, fits on 24GB.
+
+**Context length recommendations**:
+- Up to 65K: Use LA-1 turbo3 (best PPL: -1.17%)
+- 65K-128K: Use LA-5 turbo3 (best balance: -0.49% PPL, 4.2x compression)
+- 128K+: Use turbo3 uniform (maximum compression: 4.9x)
