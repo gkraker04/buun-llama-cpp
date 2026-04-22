@@ -236,6 +236,85 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // TurboQuant Q pre-rotation: forward FWHT in shared memory
+    // K/V are stored in rotated space. Rotating Q once here avoids inverse-rotating K
+    // for every KV position in the inner loop. O(d log d) once vs O(seq * d log d).
+    if constexpr (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) {
+        __shared__ float Q_rot_buf[128];
+        const int my_kq = threadIdx.x % nthreads_KQ; // 0..7, which Q elements this thread holds
+
+        for (int j = 0; j < ncols; ++j) {
+            // Process D in 128-element groups (D=128: 1 group, D=256: 2 groups)
+            for (int g = 0; g < D/128; ++g) {
+                // Each group uses 8 Q_reg entries: [g*8 .. g*8+7]
+                // Q_reg[j][g*8+r] (r=0..3) covers elements [8*my_kq+2r, 8*my_kq+2r+1] in first half
+                // Q_reg[j][g*8+4+r] (r=0..3) covers elements [64+8*my_kq+2r, ...] in second half
+
+                // Step 1: Threads 0-7 write Q elements to shared memory
+                if (threadIdx.x < nthreads_KQ) {
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                        Q_rot_buf[8*my_kq + 2*r]     = __half2float(__low2half(Q_reg[j][g*8 + r]));
+                        Q_rot_buf[8*my_kq + 2*r + 1]  = __half2float(__high2half(Q_reg[j][g*8 + r]));
+                        Q_rot_buf[64 + 8*my_kq + 2*r]     = __half2float(__low2half(Q_reg[j][g*8 + 4 + r]));
+                        Q_rot_buf[64 + 8*my_kq + 2*r + 1]  = __half2float(__high2half(Q_reg[j][g*8 + 4 + r]));
+#else
+                        Q_rot_buf[8*my_kq + 2*r]     = Q_reg[j][g*8 + r].x;
+                        Q_rot_buf[8*my_kq + 2*r + 1]  = Q_reg[j][g*8 + r].y;
+                        Q_rot_buf[64 + 8*my_kq + 2*r]     = Q_reg[j][g*8 + 4 + r].x;
+                        Q_rot_buf[64 + 8*my_kq + 2*r + 1]  = Q_reg[j][g*8 + 4 + r].y;
+#endif
+                    }
+                }
+                __syncthreads();
+
+                // Step 2: Parallel FWHT rotation (matching k_turbo_fwht_forward pattern)
+                // Signs1 multiply — all 128 threads
+                if (tid < 128) {
+                    Q_rot_buf[tid] *= d_turbo_wht_signs1_fattn[tid];
+                }
+                __syncthreads();
+
+                // Parallel FWHT butterfly: 64 threads, 7 passes
+                for (int h = 1; h < 128; h *= 2) {
+                    if (tid < 64) {
+                        int jj = (tid / h) * (2 * h) + (tid % h);
+                        float a = Q_rot_buf[jj], b = Q_rot_buf[jj + h];
+                        Q_rot_buf[jj] = a + b; Q_rot_buf[jj + h] = a - b;
+                    }
+                    __syncthreads();
+                }
+
+                // Normalize and signs2 multiply — all 128 threads
+                {
+                    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+                    if (tid < 128) {
+                        Q_rot_buf[tid] *= inv_sqrt_128 * d_turbo_wht_signs2_fattn[tid];
+                    }
+                }
+                __syncthreads();
+
+                // Step 3: All threads read back rotated Q
+                const int kq = threadIdx.x % nthreads_KQ;
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                    Q_reg[j][g*8 + r]     = make_half2(__float2half(Q_rot_buf[8*kq + 2*r]),
+                                                        __float2half(Q_rot_buf[8*kq + 2*r + 1]));
+                    Q_reg[j][g*8 + 4 + r] = make_half2(__float2half(Q_rot_buf[64 + 8*kq + 2*r]),
+                                                        __float2half(Q_rot_buf[64 + 8*kq + 2*r + 1]));
+#else
+                    Q_reg[j][g*8 + r]     = make_float2(Q_rot_buf[8*kq + 2*r],
+                                                         Q_rot_buf[8*kq + 2*r + 1]);
+                    Q_reg[j][g*8 + 4 + r] = make_float2(Q_rot_buf[64 + 8*kq + 2*r],
+                                                          Q_rot_buf[64 + 8*kq + 2*r + 1]);
+#endif
+                }
+                __syncthreads();
+            }
+        }
+    }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;

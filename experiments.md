@@ -296,6 +296,19 @@ Prefill pp4096 (tok/s):
 **Paper**: ConvRot (arXiv:2512.03673, Dec 2025)
 **What**: Replace full d=128 FWHT with group-of-32 Hadamard transforms. Tom tested this directly and it produces unacceptable PPL. Full d=128 rotation is necessary for proper decorrelation.
 
+### 36. Temporal decay — progressive 3→2 bit requantization
+**Status**: needs-research
+**Type**: quality + memory
+**Source**: TheTom/turboquant_plus/benchmarks/temporal_decay_prototype.py
+**What**: Old KV cache tokens get requantized from turbo3 (3-bit) to effective 2-bit, saving memory while keeping recent tokens at full precision. Requantization path: dequant 3-bit → re-normalize → quantize to nearest 2-bit centroid → recompute norm correction.
+**Synthetic results** (tests/temporal_decay_test.py):
+  - Cosine sim: turbo3=0.983, direct 2-bit=0.940, decay 3→2=0.940 (above 0.80 threshold)
+  - MSE: decay is 4.23x worse than turbo3, but only ~20% worse than direct 2-bit
+  - Inner product error: 1.76x worse than turbo3 (attention scores noisier but bounded)
+  - Memory savings: ~30-34% on top of turbo3's existing compression
+**Prerequisites**: Needs GGML_TYPE_TURBO2_0 (experiment #28) and per-position type tracking in KV cache
+**Difficulty**: High. Requires turbo2 type + KV cache age tracking + requantization trigger.
+
 ### 28. turbo2 (2-bit) and turbo5 (5-bit) variants
 **Status**: needs-research
 **Type**: new formats
@@ -409,7 +422,7 @@ Prefill pp4096 (tok/s):
 **Reason**: TheTom tested directly. PPL 7.06 vs target 6.19. Full d=128 FWHT rotation is necessary for proper decorrelation. Smaller group sizes lose too much.
 
 ### Custom GGML_OP_TURBO_WHT as speed optimization
-**Reason**: TheTom found it's a red herring — same speed as dense matmul. The graph-level op works functionally but doesn't help performance. We keep it for correctness (Q pre-rotation, V un-rotation) but shouldn't expect speed gains from it.
+**Reason**: TheTom found it's a red herring — same speed as dense matmul. Q pre-rotation moved inline into FA kernels (vec: shared memory FWHT, prefill: separate kernel with persistent buffer). V un-rotation stays at graph level for CUDA graph compatibility. Decode: 30.14 tok/s (-0.4% vs baseline), PPL identical. Key fix: `cudaMallocAsync` for Q temp buffer caused NaN on graph replay — replaced with persistent `cudaMalloc`.
 
 ### Gemini's RoPE/WHT commutativity theory
 **Reason**: TheTom investigated, wasn't the actual root cause of quality issues. The real constraint is simpler: WHT must be applied after RoPE, which our implementation does correctly.

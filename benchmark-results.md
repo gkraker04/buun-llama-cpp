@@ -67,6 +67,23 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 | 4 (first4) | first 4 | 4 | 5.8211 | -0.28% | ~4.2x |
 | 0 (uniform) | none | 0 | 5.8323 | -0.09% | 4.9x |
 
+## FWHT Inline FA Rotation (experiment/fwht-inline-fa)
+
+Q pre-rotation moved from graph-level ggml_turbo_wht op to inline in FA kernels:
+- Vec kernel (decode): shared memory FWHT rotation, zero extra kernel launches
+- Prefill MMA: separate forward rotation kernel with persistent buffer
+- V un-rotation remains at graph level (CUDA graph compatible)
+
+| Metric | Before (graph-level) | After (inline Q) | Delta |
+|--------|---------------------|-------------------|-------|
+| Decode tg64 | 30.25 | 30.14 | -0.4% |
+| Prefill pp512 | 1149.90 | 1146.21 | -0.3% |
+| PPL (10-chunk) | 19.7152 | 19.7152 | identical |
+| CUDA graphs | working | working | no change |
+
+Key finding: `cudaMallocAsync` for Q rotation buffer caused NaN on graph replay.
+Fixed by using a persistent `cudaMalloc` buffer that grows as needed.
+
 ## Observations
 
 1. Norm correction makes turbo3 and turbo4 BEAT q8_0 in PPL

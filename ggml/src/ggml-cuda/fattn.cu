@@ -266,6 +266,41 @@ static __global__ void k_turbo4_dequant_f16(
     dst[head * (ne1 * ne0) + row * ne0 + j] = __float2half(val);
 }
 
+// === FWHT rotation kernels for inline FA rotation ===
+// Forward rotation on Q (for prefill path — vec path does it inline in shared memory)
+// One block per 128-element group, 128 threads per block.
+static __global__ void k_turbo_fwht_forward(
+        const float * __restrict__ src, float * __restrict__ dst,
+        const int64_t n_elements) {
+    const int64_t offset = blockIdx.x * 128;
+    if (offset >= n_elements) return;
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+
+    __shared__ float buf[128];
+
+    if (threadIdx.x < 128) {
+        buf[threadIdx.x] = src[offset + threadIdx.x] * s1[threadIdx.x];
+    }
+    __syncthreads();
+
+    // Parallel FWHT butterfly: 64 threads, 7 passes
+    for (int h = 1; h < 128; h *= 2) {
+        if (threadIdx.x < 64) {
+            int j = (threadIdx.x / h) * (2 * h) + (threadIdx.x % h);
+            float a = buf[j], b = buf[j + h];
+            buf[j] = a + b; buf[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (threadIdx.x < 128) {
+        dst[offset + threadIdx.x] = buf[threadIdx.x] * inv_sqrt_128 * s2[threadIdx.x];
+    }
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
@@ -329,20 +364,48 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         V_f16.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
     }
 
-    // Temporarily swap src pointers to fp16 tensors
+    // Rotate Q for turbo pre-rotate-queries (only when K is in rotated space)
+    // Use persistent buffer to avoid cudaMallocAsync issues with graph-level ops
+    const ggml_tensor * Q = dst->src[0];
+    static float * q_rot_buf = nullptr;
+    static size_t  q_rot_buf_size = 0;
+    float * q_rotated = nullptr;
+    if (turbo_k && Q->ne[0] % 128 == 0) {
+        const size_t q_size = ggml_nelements(Q) * sizeof(float);
+        if (q_size > q_rot_buf_size) {
+            if (q_rot_buf) CUDA_CHECK(cudaFree(q_rot_buf));
+            CUDA_CHECK(cudaMalloc(&q_rot_buf, q_size));
+            q_rot_buf_size = q_size;
+        }
+        q_rotated = q_rot_buf;
+        const int64_t n_q_groups = ggml_nelements(Q) / 128;
+        k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
+            (const float *)Q->data, q_rotated, ggml_nelements(Q));
+    }
+
+    // Temporarily swap src pointers to fp16 K/V and rotated Q
+    ggml_tensor * orig_q = dst->src[0];
     ggml_tensor * orig_k = dst->src[1];
     ggml_tensor * orig_v = dst->src[2];
+
+    ggml_tensor Q_rot;
+    if (q_rotated) {
+        Q_rot = *Q;
+        Q_rot.data = q_rotated;
+        dst->src[0] = &Q_rot;
+    }
     dst->src[1] = k_fp16 ? &K_f16 : orig_k;
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
 
-    // Dispatch to MMA kernel (sees fp16 K/V, uses tensor cores)
+    // Dispatch to MMA kernel (sees rotated Q, fp16 K/V, uses tensor cores)
     ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
 
     // Restore original tensor pointers
+    dst->src[0] = orig_q;
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 
-    // Free temporary buffers
+    // Free K/V temporary buffers (Q uses persistent buffer)
     if (k_fp16) CUDA_CHECK(cudaFreeAsync(k_fp16, stream));
     if (v_fp16) CUDA_CHECK(cudaFreeAsync(v_fp16, stream));
 }
@@ -662,33 +725,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+
+    // Turbo prefill optimization: dequant to fp16 and use MMA for large Q batch
     // Only turbo3 uses prefill dequant+MMA (turbo4's QJL correction loses precision in fp16)
     const bool turbo_kv = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
     if (turbo_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        // Prefill path: Q rotation handled inside, V un-rotation at graph level
         ggml_cuda_turbo_prefill_attend(ctx, dst);
-        return;
+    } else {
+        // Decode / non-turbo path: vec kernel does inline Q rotation
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+            case BEST_FATTN_KERNEL_NONE:
+                GGML_ABORT("fatal error");
+            case BEST_FATTN_KERNEL_TILE:
+                ggml_cuda_flash_attn_ext_tile(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_VEC:
+                ggml_cuda_flash_attn_ext_vec(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_WMMA_F16:
+                ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
+                break;
+            case BEST_FATTN_KERNEL_MMA_F16:
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+                break;
+        }
     }
 
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
-        case BEST_FATTN_KERNEL_NONE:
-            GGML_ABORT("fatal error");
-        case BEST_FATTN_KERNEL_TILE:
-            ggml_cuda_flash_attn_ext_tile(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_VEC:
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_WMMA_F16:
-            ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_MMA_F16:
-            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
-            break;
-    }
+    // Output inverse rotation for turbo V types is handled at graph level
+    // (ggml_turbo_wht op in llama-graph.cpp) to maintain CUDA graph compatibility.
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
