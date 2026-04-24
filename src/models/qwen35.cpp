@@ -263,7 +263,9 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 &&
+    // Tree-mode conv kernel is sized for a single sequence — skip on multi-seq batches
+    // (see build_delta_net() for the same constraint on the attention tree kernel).
+    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1 &&
                              n_seq_tokens <= ggml_nelements(tree_parent_ids));
 
     // Update convolution state cache
