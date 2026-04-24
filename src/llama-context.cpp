@@ -928,67 +928,69 @@ int32_t llama_context::get_n_layer_hiddens() const {
     return (int32_t) layer_hiddens.size();
 }
 
-// helper: read tensor data to a float buffer, handling non-contiguous views
-static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst, size_t n_floats) {
-    dst.resize(n_floats);
+// helper: read tensor data into a raw float pointer, handling non-contiguous views
+static void dflash_read_tensor_to(struct ggml_tensor * t, float * dst, size_t n_floats) {
     if (ggml_is_contiguous(t)) {
         const size_t n_bytes = n_floats * sizeof(float);
         if (ggml_backend_buffer_is_host(t->buffer)) {
-            memcpy(dst.data(), t->data, n_bytes);
+            memcpy(dst, t->data, n_bytes);
         } else {
-            ggml_backend_tensor_get(t, dst.data(), 0, n_bytes);
+            ggml_backend_tensor_get(t, dst, 0, n_bytes);
         }
-    } else {
-        // non-contiguous view: read each innermost-contiguous slice separately
-        // for 4D [ne0, ne1, ne2, ne3], ne0*ne1 is contiguous if nb[1]==ne[0]*elem_size
-        const int64_t ne0 = t->ne[0];
-        const int64_t ne1 = t->ne[1];
-        const int64_t ne2 = t->ne[2];
-        const int64_t ne3 = t->ne[3];
-        const size_t esz = ggml_element_size(t);
+        return;
+    }
 
-        // find the largest contiguous inner chunk
-        size_t contig_elems = ne0;
-        size_t contig_stride = t->nb[1];
-        if (t->nb[1] == ne0 * esz) {
-            contig_elems = ne0 * ne1;
-            contig_stride = t->nb[2];
-            if (t->nb[2] == ne0 * ne1 * esz) {
-                contig_elems = ne0 * ne1 * ne2;
-                contig_stride = t->nb[3];
-            }
-        }
+    // non-contiguous view: read each innermost-contiguous slice separately
+    // for 4D [ne0, ne1, ne2, ne3], ne0*ne1 is contiguous if nb[1]==ne[0]*elem_size
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const size_t esz = ggml_element_size(t);
 
-        size_t dst_off = 0;
-        size_t n_chunks = n_floats / contig_elems;
-        const size_t chunk_bytes = contig_elems * sizeof(float);
-
-        for (size_t i = 0; i < n_chunks; ++i) {
-            // compute source offset by iterating through outer dimensions
-            size_t src_off = 0;
-            size_t idx = i;
-            if (contig_elems == (size_t)(ne0)) {
-                int64_t i1 = idx % ne1; idx /= ne1;
-                int64_t i2 = idx % ne2; idx /= ne2;
-                int64_t i3 = idx;
-                src_off = i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
-            } else if (contig_elems == (size_t)(ne0 * ne1)) {
-                int64_t i2 = idx % ne2; idx /= ne2;
-                int64_t i3 = idx;
-                src_off = i2 * t->nb[2] + i3 * t->nb[3];
-            } else {
-                int64_t i3 = idx;
-                src_off = i3 * t->nb[3];
-            }
-
-            if (ggml_backend_buffer_is_host(t->buffer)) {
-                memcpy(dst.data() + dst_off, (const char *)t->data + src_off, chunk_bytes);
-            } else {
-                ggml_backend_tensor_get(t, dst.data() + dst_off, src_off, chunk_bytes);
-            }
-            dst_off += contig_elems;
+    // find the largest contiguous inner chunk
+    size_t contig_elems = ne0;
+    if (t->nb[1] == ne0 * esz) {
+        contig_elems = ne0 * ne1;
+        if (t->nb[2] == ne0 * ne1 * esz) {
+            contig_elems = ne0 * ne1 * ne2;
         }
     }
+
+    size_t dst_off = 0;
+    size_t n_chunks = n_floats / contig_elems;
+    const size_t chunk_bytes = contig_elems * sizeof(float);
+
+    for (size_t i = 0; i < n_chunks; ++i) {
+        // compute source offset by iterating through outer dimensions
+        size_t src_off = 0;
+        size_t idx = i;
+        if (contig_elems == (size_t)(ne0)) {
+            int64_t i1 = idx % ne1; idx /= ne1;
+            int64_t i2 = idx % ne2; idx /= ne2;
+            int64_t i3 = idx;
+            src_off = i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+        } else if (contig_elems == (size_t)(ne0 * ne1)) {
+            int64_t i2 = idx % ne2; idx /= ne2;
+            int64_t i3 = idx;
+            src_off = i2 * t->nb[2] + i3 * t->nb[3];
+        } else {
+            int64_t i3 = idx;
+            src_off = i3 * t->nb[3];
+        }
+
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            memcpy(dst + dst_off, (const char *)t->data + src_off, chunk_bytes);
+        } else {
+            ggml_backend_tensor_get(t, dst + dst_off, src_off, chunk_bytes);
+        }
+        dst_off += contig_elems;
+    }
+}
+
+// helper: read tensor data to a float vector, handling non-contiguous views
+static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst, size_t n_floats) {
+    dst.resize(n_floats);
+    dflash_read_tensor_to(t, dst.data(), n_floats);
 }
 
 // DFlash eval callback: captures hidden state tensors + tape data during graph execution
@@ -1015,12 +1017,25 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
     // ask=false: tensor data is ready, read it back
 
-    // hidden state capture
+    // hidden state capture — appends this ubatch's hiddens to the buffer.
+    // The decode() entry point zeroes buf.n_tokens before the ubatch loop, so
+    // within a single llama_decode() call the buffer accumulates all ubatches.
     if (h_it != cap->hidden_name_idx.end()) {
         auto & buf = (*cap->hiddens)[h_it->second];
-        buf.n_embd   = t->ne[0];
-        buf.n_tokens = t->ne[1];
-        dflash_read_tensor(t, buf.data, buf.n_embd * buf.n_tokens);
+        const int64_t new_embd = t->ne[0];
+        const int64_t new_n    = t->ne[1];
+
+        if (buf.n_embd != new_embd) {
+            // embd change (shouldn't happen mid-decode); restart the buffer
+            buf.n_embd   = new_embd;
+            buf.n_tokens = 0;
+        }
+
+        const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
+        const size_t add_elems = (size_t) new_n * (size_t) new_embd;
+        buf.data.resize(old_elems + add_elems);
+        dflash_read_tensor_to(t, buf.data.data() + old_elems, add_elems);
+        buf.n_tokens += new_n;
         return true;
     }
 
@@ -2738,6 +2753,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     int64_t n_outputs_prev = 0;
+
+    // DFlash: reset hidden state capture buffers so the eval callback accumulates
+    // this decode() call's ubatches (prefill with n_tokens > n_ubatch otherwise
+    // loses all but the last ubatch's hiddens, starving the drafter's ring).
+    if (dflash_capture) {
+        for (auto & buf : layer_hiddens) {
+            buf.n_tokens = 0;
+        }
+    }
 
     do {
         const auto & ubatch = mctx->get_ubatch();
