@@ -1018,19 +1018,15 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     // ask=false: tensor data is ready, read it back
 
     // hidden state capture — appends this ubatch's hiddens to the buffer.
-    // The decode() entry point zeroes buf.n_tokens before the ubatch loop, so
-    // within a single llama_decode() call the buffer accumulates all ubatches.
+    // dflash_reset_hidden_capture() (called at the top of decode()) zeroes
+    // buf.n_tokens before the ubatch loop, so within one llama_decode() call
+    // the buffer accumulates all ubatches.
     if (h_it != cap->hidden_name_idx.end()) {
         auto & buf = (*cap->hiddens)[h_it->second];
         const int64_t new_embd = t->ne[0];
         const int64_t new_n    = t->ne[1];
 
-        if (buf.n_embd != new_embd) {
-            // embd change (shouldn't happen mid-decode); restart the buffer
-            buf.n_embd   = new_embd;
-            buf.n_tokens = 0;
-        }
-
+        buf.n_embd = new_embd;
         const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
         const size_t add_elems = (size_t) new_n * (size_t) new_embd;
         buf.data.resize(old_elems + add_elems);
@@ -1118,6 +1114,15 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     // install our eval callback (replaces any existing one)
     cparams.cb_eval = dflash_eval_callback;
     cparams.cb_eval_user_data = dflash_capture.get();
+}
+
+void llama_context::dflash_reset_hidden_capture() {
+    if (!dflash_capture) {
+        return;
+    }
+    for (auto & buf : layer_hiddens) {
+        buf.n_tokens = 0;
+    }
 }
 
 void llama_context::set_tape_recording(bool enable) {
@@ -2754,14 +2759,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
-    // DFlash: reset hidden state capture buffers so the eval callback accumulates
-    // this decode() call's ubatches (prefill with n_tokens > n_ubatch otherwise
-    // loses all but the last ubatch's hiddens, starving the drafter's ring).
-    if (dflash_capture) {
-        for (auto & buf : layer_hiddens) {
-            buf.n_tokens = 0;
-        }
-    }
+    // DFlash: reset hidden-state capture so this decode()'s eval callback
+    // accumulates across ubatches (prefill with n_tokens > n_ubatch would
+    // otherwise leave only the last ubatch's hiddens in layer_hiddens).
+    dflash_reset_hidden_capture();
 
     do {
         const auto & ubatch = mctx->get_ubatch();

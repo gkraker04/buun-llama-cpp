@@ -351,6 +351,10 @@ public:
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
 
+    // DFlash: reset hidden-state capture for a fresh decode() call so the
+    // eval callback accumulates across this call's ubatches
+    void dflash_reset_hidden_capture();
+
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
 
