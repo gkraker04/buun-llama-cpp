@@ -904,22 +904,30 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         params.lr.init();
 
-        // Apply DFlash-safe defaults for memory-heavy knobs the user didn't touch.
-        // The drafter's block size is 16, and its max internal batch is 64, so the
-        // llama.cpp stock defaults (n_batch=2048, n_ubatch=512) allocate far more
-        // KV/activation memory than DFlash can use and commonly OOM on first run.
+        // DFlash-safe defaults. The drafter's block_size=16 / internal max
+        // batch=64 means it only needs a tiny graph, and multi-slot target
+        // activation memory scales as n_ubatch * n_parallel — stock ub=512
+        // with np=auto=4 OOMs a 24 GB GPU. So cap to keep first-run users
+        // from hitting OOM. The tradeoff: target prefill is ~30% slower at
+        // ub=64 vs ub=512. Users who want faster prefill pass -ub explicitly
+        // (and can also pass -b to keep -b >= -ub).
         if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            if (params.n_batch == params_org.n_batch && params.n_batch > 256) {
-                LOG_INF("dflash: capping -b from %d to 256 (drafter block_size=16; pass -b N to override)\n", params.n_batch);
-                params.n_batch = 256;
-            }
-            if (params.n_ubatch == params_org.n_ubatch && params.n_ubatch > 64) {
-                LOG_INF("dflash: capping -ub from %d to 64 (drafter block_size=16; pass -ub N to override)\n", params.n_ubatch);
-                params.n_ubatch = 64;
-            }
             if (params.speculative.n_ctx == params_org.speculative.n_ctx && params.speculative.n_ctx == 0) {
                 LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
                 params.speculative.n_ctx = 256;
+            }
+            bool capped = false;
+            if (params.n_batch == params_org.n_batch && params.n_batch > 256) {
+                params.n_batch = 256;
+                capped = true;
+            }
+            if (params.n_ubatch == params_org.n_ubatch && params.n_ubatch > 64) {
+                params.n_ubatch = 64;
+                capped = true;
+            }
+            if (capped) {
+                LOG_INF("dflash: capped -b/-ub to 256/64 for OOM safety. "
+                        "Pass -ub 512 -b 2048 for ~30%% faster prompt prefill at +2-3 GB VRAM.\n");
             }
         }
     } catch (const std::invalid_argument & ex) {

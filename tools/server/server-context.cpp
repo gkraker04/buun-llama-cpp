@@ -688,6 +688,12 @@ private:
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
+            // DFlash drafter only processes block_size (=16) tokens per call — cap
+            // drafter ubatch so users who opt into a larger target -ub (for faster
+            // prompt prefill) don't also inflate the drafter's graph reservation.
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_dft.n_ubatch = std::min(params_dft.n_ubatch, (int32_t)64);
+            }
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams_dft;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
