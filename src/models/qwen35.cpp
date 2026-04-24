@@ -355,7 +355,11 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     // GPU tape: copy k/v/gate/beta directly to persistent GPU buffer (no eval callback sync)
-    if (cparams.tape_gpu) {
+    // Skipped for n_seqs > 1: the tape is a per-context singleton buffer, so multi-seq
+    // batches (e.g. llama-server with np > 1 packing multiple slots' prompts) would clobber
+    // each other's entries. Prompt-processing batches don't need the tape anyway — it's
+    // only read during DFlash verify rollback, which runs per-slot with n_seqs == 1.
+    if (cparams.tape_gpu && n_seqs == 1) {
         auto * tgpu = cparams.tape_gpu;
         // find tape layer index for this model layer
         int li = -1;
