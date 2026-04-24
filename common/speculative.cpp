@@ -1768,7 +1768,7 @@ done:
 // initialization of the speculative decoding system
 //
 // [CHECKPOINT B0.1] ctx_dft factory (shared-ownership foundation)
-llama_context * common_speculative_create_ctx_dft(common_params_speculative & params) {
+llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params) {
     if (!params.model_dft) {
         return nullptr;
     }

@@ -566,9 +566,11 @@ private:
     llama_context * ctx = nullptr;
 
     // [CHECKPOINT B0.3] DFlash-only: one drafter context shared across all slots'
-    // common_speculative states (non-owning refs). Freed in destroy() after all
-    // specs have been freed.
-    llama_context * ctx_dft_shared = nullptr;
+    // common_speculative states (non-owning refs). Must outlive all specs — the
+    // destroy() order below (specs first, then this) enforces that; when destroy()
+    // isn't called explicitly, member-destructor order (reverse-declaration) frees
+    // specs via `slots` before this unique_ptr runs.
+    llama_context_ptr ctx_dft_shared;
 
     llama_batch batch {};
 
@@ -620,10 +622,7 @@ private:
 
         // Free the shared DFlash drafter context after all specs are gone
         // (specs hold non-owning refs, so this must come last).
-        if (ctx_dft_shared) {
-            llama_free(ctx_dft_shared);
-            ctx_dft_shared = nullptr;
-        }
+        ctx_dft_shared.reset();
 
         llama_batch_free(batch);
     }
@@ -831,8 +830,8 @@ private:
 
             // [CHECKPOINT B0.3] create the shared DFlash drafter context once;
             // every slot's common_speculative gets a non-owning reference to it.
-            ctx_dft_shared = common_speculative_create_ctx_dft(params_base.speculative);
-            if (ctx_dft_shared == nullptr) {
+            ctx_dft_shared.reset(common_speculative_create_ctx_dft(params_base.speculative));
+            if (!ctx_dft_shared) {
                 SRV_ERR("%s", "failed to create shared DFlash drafter context\n");
                 return false;
             }
@@ -856,7 +855,7 @@ private:
             if (slot_can_spec) {
                 // DFlash: hand each slot the shared ctx_dft (non-owning). For other
                 // speculative types, ctx_dft_shared is null and init creates its own.
-                slot.spec = common_speculative_init(params_base.speculative, slot.ctx, ctx_dft_shared);
+                slot.spec = common_speculative_init(params_base.speculative, slot.ctx, ctx_dft_shared.get());
                 if (slot.spec) {
                     if (mctx) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");

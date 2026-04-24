@@ -38,7 +38,7 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 // have been freed. Returns nullptr if the speculative params have no draft model.
 // topk / sample_temp / other per-ctx_dft config is applied here so the shared
 // context is fully configured before it is wired into any common_speculative.
-llama_context * common_speculative_create_ctx_dft(common_params_speculative & params);
+llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params);
 
 common_speculative * common_speculative_init(
         common_params_speculative & params,
