@@ -1143,9 +1143,7 @@ void llama_context::dflash_reset_hidden_capture() {
     // reset every slot because a single decode() may hold ubatches for multiple slots
     for (auto & slot_bufs : layer_hiddens) {
         for (auto & buf : slot_bufs) {
-            if (buf.n_tokens != 0) {
-                buf.n_tokens = 0;
-            }
+            buf.n_tokens = 0;
         }
     }
 }
@@ -4395,8 +4393,8 @@ void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
 }
 
-void llama_dflash_allocate_slots(llama_context * ctx, int n_slots, int max_tokens) {
-    ctx->allocate_tape_gpu(n_slots, max_tokens);
+void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {
+    ctx->allocate_tape_gpu(n_slots, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
 }
 
 void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {

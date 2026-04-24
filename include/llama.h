@@ -1073,7 +1073,7 @@ extern "C" {
     // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
     // Call before the first llama_decode() (and before set_tape_recording(true)). For
     // single-slot workloads this is optional — a 1-slot allocation is created lazily.
-    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots, int max_tokens);
+    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots);
 
     // DFlash: select which slot's GPU tape the next llama_decode() writes into.
     // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
