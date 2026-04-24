@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
