@@ -2607,6 +2607,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         }
                     }
                 }
+                // Optional SWA: when keys are absent, n_swa stays 0 and all layers use full attention
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > 0) {
+                    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+                }
                 type = LLM_TYPE_UNKNOWN;
             } break;
         default: throw std::runtime_error("unsupported model architecture: " + arch_name());

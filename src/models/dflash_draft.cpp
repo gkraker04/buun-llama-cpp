@@ -6,24 +6,26 @@
 // Holds the target hidden states, context positions, and asymmetric non-causal attention mask
 class llm_graph_input_dflash : public llm_graph_input_i {
 public:
-    llm_graph_input_dflash(const llama_cross * cross, int64_t ctx_len, int64_t n_block)
-        : cross(cross), ctx_len(ctx_len), n_block(n_block) {}
+    llm_graph_input_dflash(const llama_cross * cross, int64_t ctx_len, int64_t n_block, uint32_t n_swa)
+        : cross(cross), ctx_len(ctx_len), n_block(n_block), n_swa(n_swa) {}
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * target_hidden = nullptr; // [n_target_features, ctx_len]
-    ggml_tensor * pos_ctx       = nullptr; // [ctx_len]
-    ggml_tensor * kq_mask       = nullptr; // [ctx_len + n_block, n_block, 1, 1]
-    ggml_tensor * kq_mask_cnv   = nullptr;
+    ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len]
+    ggml_tensor * pos_ctx           = nullptr; // [ctx_len]
+    ggml_tensor * kq_mask           = nullptr; // [ctx_len + n_block, n_block, 1, 1]
+    ggml_tensor * kq_mask_cnv       = nullptr;
+    // Only allocated when hparams.is_swa_any(); same shape as kq_mask
+    ggml_tensor * kq_mask_swa       = nullptr;
+    ggml_tensor * kq_mask_swa_cnv   = nullptr;
 
     const llama_cross * cross;
     int64_t ctx_len;
     int64_t n_block;
+    uint32_t n_swa;
 };
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
     // copy target hidden states from cross->v_embd to the input tensor
     // v_embd may be padded (zero-filled beyond n_enc_real)
     if (target_hidden && cross && !cross->v_embd.empty()) {
@@ -59,6 +61,33 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    // Causal SWA: block query q attends to block keys <= q and to real ctx keys
+    // in window [q_pos - n_swa, q_pos]; padded ctx slots are masked.
+    // q_pos comes from ubatch->pos when available, else inferred as n_real + q.
+    if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
+        float * data = (float *) kq_mask_swa->data;
+        const int64_t n_kv   = ctx_len + n_block;
+        const int32_t window = (int32_t) n_swa;
+        const bool    have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
+                               && ((int64_t) ubatch->n_tokens >= n_block);
+        for (int64_t q = 0; q < n_block; ++q) {
+            const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t) (n_real + q);
+            for (int64_t k = 0; k < n_kv; ++k) {
+                float v = 0.0f;
+                if (k < n_real) {
+                    if (q_pos - (int32_t) k > window) v = -INFINITY;
+                } else if (k < ctx_len) {
+                    v = -INFINITY;
+                } else {
+                    const int64_t b_k = k - ctx_len;
+                    if (b_k > q) v = -INFINITY;
+                }
+                data[q * n_kv + k] = v;
+            }
+        }
+    }
 }
 
 llm_build_dflash_draft::llm_build_dflash_draft(
@@ -78,7 +107,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t n_kv_total = ctx_len + n_tokens;
 
     // --- DFlash-specific inputs ---
-    auto inp_dflash = std::make_unique<llm_graph_input_dflash>(cross, ctx_len, n_tokens);
+    const bool have_swa = hparams.is_swa_any();
+    auto inp_dflash = std::make_unique<llm_graph_input_dflash>(cross, ctx_len, n_tokens, hparams.n_swa);
 
     // concatenated target hidden states [n_target_features, ctx_len]
     inp_dflash->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, ctx_len);
@@ -90,14 +120,24 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_set_input(inp_dflash->pos_ctx);
     cb(inp_dflash->pos_ctx, "dflash_pos_ctx", -1);
 
-    // asymmetric non-causal mask [n_kv_total, n_tokens, 1, 1]
+    // asymmetric non-causal mask [n_kv_total, n_tokens, 1, 1] — full-attention layers
     inp_dflash->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_total, n_tokens, 1, 1);
     ggml_set_input(inp_dflash->kq_mask);
     inp_dflash->kq_mask_cnv = cparams.flash_attn
         ? ggml_cast(ctx0, inp_dflash->kq_mask, GGML_TYPE_F16)
         : inp_dflash->kq_mask;
 
-    ggml_tensor * kq_mask       = inp_dflash->kq_mask_cnv;
+    if (have_swa) {
+        inp_dflash->kq_mask_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_total, n_tokens, 1, 1);
+        ggml_set_input(inp_dflash->kq_mask_swa);
+        cb(inp_dflash->kq_mask_swa, "dflash_kq_mask_swa", -1);
+        inp_dflash->kq_mask_swa_cnv = cparams.flash_attn
+            ? ggml_cast(ctx0, inp_dflash->kq_mask_swa, GGML_TYPE_F16)
+            : inp_dflash->kq_mask_swa;
+    }
+
+    ggml_tensor * kq_mask_full  = inp_dflash->kq_mask_cnv;
+    ggml_tensor * kq_mask_swa   = inp_dflash->kq_mask_swa_cnv; // may be null if no SWA
     ggml_tensor * pos_ctx       = inp_dflash->pos_ctx;
     ggml_tensor * target_hidden = inp_dflash->target_hidden;
 
@@ -123,6 +163,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     // --- Transformer layers ---
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
+
+        ggml_tensor * kq_mask = (hparams.is_swa(il) && kq_mask_swa) ? kq_mask_swa : kq_mask_full;
 
         ggml_tensor * cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);

@@ -4748,6 +4748,13 @@ class DFlashDraftModel(TextModel):
         n_target_features = n_embd * len(target_layer_ids)
         self.gguf_writer.add_uint32(f"{arch}.dflash.n_target_features", n_target_features)
 
+        if self.hparams.get("use_sliding_window") and self.hparams.get("sliding_window"):
+            self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
+            layer_types = self.hparams.get("layer_types", [])
+            pattern = [t == "sliding_attention" for t in layer_types]
+            if pattern:
+                self.gguf_writer.add_sliding_window_pattern(pattern)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # strip "model." prefix if present
         if name.startswith("model."):
