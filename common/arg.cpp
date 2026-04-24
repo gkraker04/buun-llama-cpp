@@ -3488,6 +3488,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
     add_opt(common_arg(
+        {"--dflash-max-slots"}, "N",
+        string_format("max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: %d)", params.speculative.dflash_max_slots),
+        [](common_params & params, int value) {
+            params.speculative.dflash_max_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DFLASH_MAX_SLOTS"));
+    add_opt(common_arg(
         {"--draft-topk"}, "N",
         string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
         [](common_params & params, int value) {

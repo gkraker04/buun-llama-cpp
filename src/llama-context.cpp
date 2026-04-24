@@ -1004,6 +1004,12 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cap = (dflash_capture_data *) user_data;
 
+    // skip when the ubatch has no owning slot (multi-seq or beyond --dflash-max-slots)
+    // to avoid cross-slot contamination of layer_hiddens.
+    if (cap->skip_capture) {
+        return false;
+    }
+
     auto h_it = cap->hidden_name_idx.find(t->name);
 
     if (ask) {
@@ -1122,19 +1128,50 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     // install our eval callback (replaces any existing one)
     cparams.cb_eval = dflash_eval_callback;
     cparams.cb_eval_user_data = dflash_capture.get();
+
+    // each ubatch must carry exactly one slot's tokens so the per-ubatch
+    // active-slot switch in decode() can route capture + tape writes.
+    if (memory) {
+        memory->set_force_split_seq(true);
+    }
 }
 
 void llama_context::dflash_reset_hidden_capture() {
     if (!dflash_capture) {
         return;
     }
-    auto * sh = dflash_capture->active_slot_hiddens();
-    if (!sh) {
+    // reset every slot because a single decode() may hold ubatches for multiple slots
+    for (auto & slot_bufs : layer_hiddens) {
+        for (auto & buf : slot_bufs) {
+            if (buf.n_tokens != 0) {
+                buf.n_tokens = 0;
+            }
+        }
+    }
+}
+
+// idempotent: populates recurrent-layer ids + tape name map the first time it's called.
+// Both set_tape_recording(true) and allocate_tape_gpu() fall through here so the setup
+// order between them is flexible.
+void llama_context::dflash_ensure_recurrent_setup() {
+    if (!dflash_capture || !dflash_capture->recurrent_layer_ids.empty()) {
         return;
     }
-    for (auto & buf : *sh) {
-        buf.n_tokens = 0;
+    const auto & hparams = model.hparams;
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (hparams.is_recurrent(il)) {
+            int idx = (int) dflash_capture->recurrent_layer_ids.size();
+            dflash_capture->recurrent_layer_ids.push_back(il);
+
+            std::string il_str = std::to_string(il);
+            dflash_capture->tape_name_map["k_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_K};
+            dflash_capture->tape_name_map["v_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_V};
+            dflash_capture->tape_name_map["gate-" + il_str]                   = {idx, DFLASH_TAPE_GATE};
+            dflash_capture->tape_name_map["beta-" + il_str]                   = {idx, DFLASH_TAPE_BETA};
+            dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, DFLASH_TAPE_QKV};
+        }
     }
+    dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
 }
 
 void llama_context::set_tape_recording(bool enable) {
@@ -1144,29 +1181,11 @@ void llama_context::set_tape_recording(bool enable) {
 
     dflash_capture->tape_enabled = enable;
 
-    if (enable && dflash_capture->recurrent_layer_ids.empty()) {
-        // first-time setup: identify recurrent layers and build name map
-        const auto & hparams = model.hparams;
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-            if (hparams.is_recurrent(il)) {
-                int idx = (int) dflash_capture->recurrent_layer_ids.size();
-                dflash_capture->recurrent_layer_ids.push_back(il);
-
-                std::string il_str = std::to_string(il);
-                dflash_capture->tape_name_map["k_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_K};
-                dflash_capture->tape_name_map["v_conv_predelta-" + il_str]        = {idx, DFLASH_TAPE_V};
-                dflash_capture->tape_name_map["gate-" + il_str]                   = {idx, DFLASH_TAPE_GATE};
-                dflash_capture->tape_name_map["beta-" + il_str]                   = {idx, DFLASH_TAPE_BETA};
-                dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, DFLASH_TAPE_QKV};
-            }
+    if (enable) {
+        dflash_ensure_recurrent_setup();
+        if (dflash_capture->tapes.empty()) {
+            allocate_tape_gpu(1, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
         }
-        dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
-
-        // allocate GPU-resident tape buffer (graph writes directly, no eval callback sync).
-        // Default single-slot; callers that want multi-slot (e.g. llama-server with
-        // --dflash-max-slots > 1) call allocate_tape_gpu(n_slots, max_tokens) explicitly
-        // before set_tape_recording(true), and we pick up their allocation.
-        allocate_tape_gpu(1, 20); // max 20 tokens per verify batch (16 draft + a few extra)
     }
 
     // expose to graph builder via cparams (tracks the currently active slot)
@@ -1174,7 +1193,12 @@ void llama_context::set_tape_recording(bool enable) {
 }
 
 void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
-    if (!dflash_capture || dflash_capture->recurrent_layer_ids.empty()) {
+    if (!dflash_capture) {
+        return;
+    }
+    // populate recurrent-layer metadata if the caller beat set_tape_recording() to it
+    dflash_ensure_recurrent_setup();
+    if (dflash_capture->recurrent_layer_ids.empty()) {
         return;
     }
     if (n_slots < 1) {
@@ -2827,6 +2851,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        // DFlash: route this ubatch's hidden-state + tape captures to the slot owning its seq_id.
+        // The graph's tape-write guard already restricts capture to n_seqs_unq == 1; multi-seq
+        // ubatches can't capture, so we leave active_tape_idx untouched.
+        if (dflash_capture) {
+            if (ubatch.n_seqs_unq == 1) {
+                const int seq = ubatch.seq_id_unq[0];
+                if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
+                    set_active_dflash_slot(seq);
+                    dflash_capture->skip_capture = false;
+                } else {
+                    // seq has no DFlash slot (e.g. beyond --dflash-max-slots);
+                    // disable capture so we don't corrupt another slot's hiddens.
+                    dflash_capture->skip_capture = true;
+                }
+            } else {
+                // multi-seq ubatch: graph tape-write is guarded off; also skip
+                // capture so mixed hiddens don't get routed to the wrong slot.
+                dflash_capture->skip_capture = true;
+            }
+        }
+
         // count the outputs in this ubatch
         {
             int32_t n_outputs_new = 0;
@@ -4348,6 +4393,10 @@ void llama_set_dflash_topk(llama_context * ctx, int k) {
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
+}
+
+void llama_dflash_allocate_slots(llama_context * ctx, int n_slots, int max_tokens) {
+    ctx->allocate_tape_gpu(n_slots, max_tokens);
 }
 
 void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {

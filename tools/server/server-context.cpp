@@ -803,6 +803,21 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        // DFlash multi-slot: --dflash-max-slots caps how many server slots keep DFlash state;
+        // slots above the cap fall back to non-speculative decode (slot.spec stays null). The
+        // matching tape/hidden buffers are allocated after the per-slot init loop (set_dflash_capture
+        // runs inside common_speculative_init for slot 0, so dflash_capture must exist first).
+        int dflash_slots_cap = 0;
+        if (can_spec && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            dflash_slots_cap = std::max(1, std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
+            if (dflash_slots_cap < params_base.n_parallel) {
+                SRV_INF("DFlash enabled for slots 0..%d; slots %d+ will use non-speculative decode\n",
+                        dflash_slots_cap - 1, dflash_slots_cap);
+            } else {
+                SRV_INF("DFlash enabled for all %d slots\n", dflash_slots_cap);
+            }
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot slot;
@@ -814,8 +829,11 @@ private:
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
+            const bool slot_can_spec = can_spec &&
+                (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
+
             // try speculative decoding
-            if (can_spec) {
+            if (slot_can_spec) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
                     if (mctx) {
@@ -837,6 +855,12 @@ private:
             slot.reset();
 
             slots.push_back(std::move(slot));
+        }
+
+        // Allocate DFlash per-slot tape + hidden buffers now that common_speculative_init
+        // (run for slot 0 above) has created dflash_capture on the target context.
+        if (dflash_slots_cap > 0) {
+            llama_dflash_allocate_slots(ctx, dflash_slots_cap, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
         }
 
         {
@@ -2924,6 +2948,9 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
+                        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            llama_dflash_set_active_slot(ctx, slot.id);
+                        }
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -2951,6 +2978,9 @@ private:
                 // verify. Fires correctly on the fallback non-spec path during generation
                 // (draft too small → single-token decode), where slot.sampled was just decoded.
                 if (slot.can_speculate() && slot.n_decoded > 0) {
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        llama_dflash_set_active_slot(ctx, slot.id);
+                    }
                     llama_tokens batch_tokens = { id };
                     common_speculative_update_logits(slot.spec, ctx, batch_tokens, 1);
                 }
@@ -3025,7 +3055,9 @@ private:
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                        // DFlash: use tape replay for fast rollback (matches speculative-simple)
+                        // DFlash: use tape replay for fast rollback (matches speculative-simple).
+                        // Route replay through this slot's tape.
+                        llama_dflash_set_active_slot(ctx, slot.id);
                         if (all_accepted) {
                             llama_clear_tree_parent_ids(ctx);
                             auto * mem = llama_get_memory(ctx);
@@ -3069,6 +3101,9 @@ private:
 
                 // update DFlash hidden state ring buffer with accepted tokens' hidden states
                 {
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        llama_dflash_set_active_slot(ctx, slot.id);
+                    }
                     llama_tokens batch_tokens = { slot.sampled };
                     common_speculative_update_logits(slot.spec, ctx, batch_tokens, (int) ids.size());
                 }

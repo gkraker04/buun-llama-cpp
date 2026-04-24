@@ -1067,6 +1067,14 @@ extern "C" {
     // during verification decode for efficient state replay instead of full re-evaluation
     LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
 
+    // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
+    enum { LLAMA_DFLASH_MAX_VERIFY_TOKENS = 20 };
+
+    // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
+    // Call before the first llama_decode() (and before set_tape_recording(true)). For
+    // single-slot workloads this is optional — a 1-slot allocation is created lazily.
+    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots, int max_tokens);
+
     // DFlash: select which slot's GPU tape the next llama_decode() writes into.
     // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
     // concurrent slots don't clobber each other. Must be called before each decode

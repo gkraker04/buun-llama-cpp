@@ -114,6 +114,11 @@ struct dflash_capture_data {
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     int active_tape_idx = 0;
 
+    // When the current ubatch belongs to a seq with no allocated DFlash slot
+    // (e.g. beyond --dflash-max-slots), set this to true so the eval callback
+    // skips hidden-state capture instead of contaminating another slot's buffer.
+    bool skip_capture = false;
+
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
@@ -375,6 +380,7 @@ public:
 
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
+    void dflash_ensure_recurrent_setup();
 
     // DFlash: allocate GPU-resident tape buffer for graph-embedded recording.
     // n_slots > 1 allocates per-slot buffers so concurrent slots (llama-server -np > 1)
