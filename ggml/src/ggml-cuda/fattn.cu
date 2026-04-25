@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-turbo.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -207,6 +208,78 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+}
+
+// Turbo MMA fused dispatch: ncols1 selection (mirrors f16 version but calls turbo case).
+template <int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
+
+    if constexpr (ncols2 <= 8) {
+        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8/ncols2, ncols2, type_K, type_V>(ctx, dst);
+            return;
+        }
+    }
+
+    if (Q->ne[1] <= 16/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 16/ncols2, ncols2, type_K, type_V>(ctx, dst);
+        return;
+    }
+
+    // Turing (sm_75) is capped at ncols=32 — the kernel has NO_DEVICE_CODE for ncols>32.
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 32/ncols2, ncols2, type_K, type_V>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 64/ncols2, ncols2, type_K, type_V>(ctx, dst);
+}
+
+// Turbo MMA fused dispatch: ncols2 selection based on GQA ratio.
+template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, K, mask}) {
+        if (t == nullptr || ggml_is_quantized(t->type)) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                use_gqa_opt = false;
+                break;
+            }
+        }
+    }
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst);
+        return;
+    }
+
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst);
+        return;
+    }
+
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst);
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1414,6 +1487,53 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }();
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+
+    // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
+    // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
+    static const bool turbo_mma_fused = [] {
+        const char * e = getenv("GGML_TURBO_MMA_FUSED");
+        if (e && atoi(e) == 0) {
+            fprintf(stderr, "GGML_TURBO_MMA_FUSED=0: fused turbo MMA kernel disabled\n");
+            return false;
+        }
+        return true;
+    }();
+    const bool turbo4_matched = K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0;
+    if (turbo_mma_fused && turbo4_matched && (Q->ne[0] == 128 || Q->ne[0] == 256) &&
+        turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        cudaStream_t stream = ctx.stream();
+        int device;
+        CUDA_CHECK(cudaGetDevice(&device));
+
+        // Pre-rotate Q: turbo4 K stays in WHT-rotated domain (no inv-FWHT), so Q must be rotated.
+        ggml_tensor Q_rot_fused;
+        ggml_tensor * orig_q_fused = nullptr;
+        if (Q->ne[0] % 128 == 0) {
+            const size_t q_size = ggml_nelements(Q) * sizeof(float);
+            if (q_size > q_rot_buf_size[device]) {
+                if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
+                CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
+                q_rot_buf_size[device] = q_size;
+            }
+            const int64_t n_q_groups = ggml_nelements(Q) / 128;
+            k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
+                (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+            Q_rot_fused = *Q;
+            Q_rot_fused.data = q_rot_buf[device];
+            orig_q_fused = dst->src[0];
+            dst->src[0] = &Q_rot_fused;
+        }
+
+        if (Q->ne[0] == 128) {
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+        }
+
+        if (orig_q_fused) dst->src[0] = orig_q_fused;
+        return;
+    }
+
     if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && Q->ne[0] <= 256 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
