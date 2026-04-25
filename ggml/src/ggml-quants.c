@@ -2036,9 +2036,9 @@ static void quantize_row_q4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * G
 size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q1_0_ref(src, dst, (int64_t)nrow*n_per_row);
-        return nrow * ggml_row_size(GGML_TYPE_Q1_0, n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
     }
-    size_t row_size = ggml_row_size(GGML_TYPE_Q1_0, n_per_row);
+    size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q1_0_ref(src, (block_q1_0*)qrow, n_per_row);
@@ -5356,10 +5356,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                         return false;
                     }
                 }
-            } break;
-        case GGML_TYPE_Q1_0:
-            {
-                VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {

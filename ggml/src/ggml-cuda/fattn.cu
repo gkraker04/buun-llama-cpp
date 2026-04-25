@@ -963,11 +963,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            break;
-        case 512:
-            if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
             if (!gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
@@ -1243,7 +1238,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 if (K->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
@@ -1275,7 +1270,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
                 if (V->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
                 } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
