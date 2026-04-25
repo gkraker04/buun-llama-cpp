@@ -1838,20 +1838,26 @@ static int64_t cross_bucket(int64_t n) {
 }
 
 void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens) {
-    // pad to bucket size so the graph shape changes infrequently (avoids costly sched_reserve)
-    const int64_t bucket = cross_bucket(n_tokens);
+    // Cap n_tokens for graph-shape bucketing so VRAM stops growing once the
+    // drafter's sliding window is full. The full data is still stored in v_embd
+    // so set_input can window into the most recent tokens.
+    static const int64_t max_ctx = [] {
+        const char * e = getenv("GGML_DFLASH_MAX_CTX");
+        return e ? (int64_t) atoi(e) : (int64_t) 4096;
+    }();
+    const int64_t capped = (max_ctx > 0 && n_tokens > max_ctx) ? max_ctx : n_tokens;
+    const int64_t bucket = cross_bucket(capped);
 
     if (cross.n_enc != bucket) {
         sched_need_reserve = true;
     }
     cross.n_embd    = n_embd;
     cross.n_enc     = bucket;
-    cross.n_enc_real = n_tokens;  // actual data length (used by input setter)
-    cross.v_embd.resize(n_embd * bucket);
+    cross.n_enc_real = n_tokens;  // actual full data length (for windowing in set_input)
+    cross.v_embd.resize(n_embd * n_tokens);
     if (data) {
         memcpy(cross.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
     }
-    // padding beyond n_tokens is masked with -inf in set_input, no need to zero-fill
 }
 
 // Per-seq cross data stash for multi-slot DFlash
@@ -1867,8 +1873,8 @@ void llama_context::set_cross_data_seq(llama_seq_id seq_id, const float * data, 
 
     auto & entry = cross.v_embd_per_seq[seq_id];
     entry.n_enc      = cross.n_enc;
-    entry.n_enc_real = cross.n_enc_real;
-    entry.v_embd.resize(n_embd * cross.n_enc);
+    entry.n_enc_real = n_tokens;
+    entry.v_embd.resize(n_embd * n_tokens);
     if (data) {
         memcpy(entry.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
     }

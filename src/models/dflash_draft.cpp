@@ -2,6 +2,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <vector>
+
+// Max cross-attention context for DFlash drafter (caps VRAM growth).
+// Override with GGML_DFLASH_MAX_CTX env var. 0 = unlimited.
+static int64_t dflash_max_cross_ctx() {
+    static const int64_t val = [] {
+        const char * e = getenv("GGML_DFLASH_MAX_CTX");
+        return e ? (int64_t) atoi(e) : (int64_t) 4096;
+    }();
+    return val;
+}
 
 // DFlash drafter custom graph input
 // Holds the target hidden states, context positions, and asymmetric non-causal attention mask
@@ -55,23 +66,31 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
         }
 
-        if (target_hidden && src_data && src_n_enc > 0) {
-            const size_t src_bytes    = (size_t) cross->n_embd * (size_t) src_n_enc * sizeof(float);
+        // Sliding window: if src has more tokens than ctx_len, take the most recent
+        const int64_t src_real = src_n_real > 0 ? src_n_real : 0;
+        const int64_t n_copy  = std::min(src_real, ctx_len);
+        const int64_t win_off = (src_real > ctx_len) ? (src_real - ctx_len) : 0;
+
+        if (target_hidden && src_data && n_copy > 0) {
+            const int64_t n_feat = cross->n_embd;
+            const float * src = src_data + win_off * n_feat;
+            const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
-            const size_t copy_bytes   = std::min(src_bytes, tensor_bytes);
-            ggml_backend_tensor_set(target_hidden, src_data, 0, copy_bytes);
+            ggml_backend_tensor_set(target_hidden, src, 0, std::min(copy_bytes, tensor_bytes));
             if (copy_bytes < tensor_bytes) {
                 ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
             }
+        } else if (target_hidden) {
+            ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
         }
 
-        const int64_t n_real = src_n_real > 0 ? src_n_real : ctx_len;
+        const int64_t n_real = n_copy;
 
         if (pos_ctx && pos_ctx->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
             int32_t * data = (int32_t *) pos_ctx->data;
             for (int64_t i = 0; i < ctx_len; ++i) {
-                data[i] = (i < n_real) ? (int32_t) i : 0;
+                data[i] = (i < n_real) ? (int32_t) (win_off + i) : 0;
             }
         }
 
@@ -135,26 +154,37 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
         }
 
-        // pack target_hidden: slot s at offset [s * per_slot_ctx, (s+1) * per_slot_ctx)
+        // pack target_hidden (f16): slot s at offset [s * per_slot_ctx, (s+1) * per_slot_ctx)
+        // Sliding window: if a slot has more tokens than per_slot_ctx, take the most recent.
+        int64_t slot_win_off[LLAMA_DFLASH_MAX_SLOTS] = {};
+        int64_t slot_n_copy[LLAMA_DFLASH_MAX_SLOTS]  = {};
+        for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
+            const int64_t nr = slot_info[s].n_real > 0 ? slot_info[s].n_real : 0;
+            slot_n_copy[s] = std::min(nr, (int64_t) per_slot_ctx);
+            slot_win_off[s] = (nr > per_slot_ctx) ? (nr - per_slot_ctx) : 0;
+        }
+
         if (target_hidden && n_feat > 0) {
             ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
             for (int s = 0; s < n_seqs; s++) {
-                if (!slot_info[s].data || slot_info[s].n_real <= 0) { continue; }
-                const size_t src_bytes  = n_feat * (size_t) slot_info[s].n_real * sizeof(float);
+                if (!slot_info[s].data || slot_n_copy[s] <= 0) { continue; }
+                const float * src = slot_info[s].data + slot_win_off[s] * n_feat;
+                const size_t copy_bytes = n_feat * (size_t) slot_n_copy[s] * sizeof(float);
                 const size_t dst_offset = (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
-                ggml_backend_tensor_set(target_hidden, slot_info[s].data, dst_offset, src_bytes);
+                ggml_backend_tensor_set(target_hidden, src, dst_offset, copy_bytes);
             }
         }
 
-        // pos_ctx: per-slot position patterns [0..n_real_s-1, 0...] repeated
+        // pos_ctx: per-slot position patterns with window offset
         if (pos_ctx && pos_ctx->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
             int32_t * data = (int32_t *) pos_ctx->data;
             for (int s = 0; s < n_seqs; s++) {
-                const int64_t nr  = slot_info[s].n_real;
+                const int64_t nc  = slot_n_copy[s];
+                const int64_t wo  = slot_win_off[s];
                 const int64_t off = (int64_t) s * per_slot_ctx;
                 for (int64_t i = 0; i < per_slot_ctx; i++) {
-                    data[off + i] = (i < nr) ? (int32_t) i : 0;
+                    data[off + i] = (i < nc) ? (int32_t) (wo + i) : 0;
                 }
             }
         }
@@ -168,13 +198,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             for (int64_t q = 0; q < n_block; q++) {
                 const int qs = (int)(q / n_seq_tokens);
                 const int ql = (int)(q % n_seq_tokens);
-                const int64_t nr = slot_info[qs].n_real;
+                const int64_t nc = slot_n_copy[qs];
                 for (int64_t k = 0; k < n_kv; k++) {
                     float v = -INFINITY;
                     if (k < ctx_len) {
                         const int ks = (int)(k / per_slot_ctx);
                         const int kl = (int)(k % per_slot_ctx);
-                        if (ks == qs && kl < nr) { v = 0.0f; }
+                        if (ks == qs && kl < nc) { v = 0.0f; }
                     } else {
                         const int bi = (int)(k - ctx_len);
                         const int ks = bi / n_seq_tokens;
@@ -197,14 +227,15 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             for (int64_t q = 0; q < n_block; q++) {
                 const int qs = (int)(q / n_seq_tokens);
                 const int ql = (int)(q % n_seq_tokens);
-                const int64_t nr = slot_info[qs].n_real;
-                const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t)(nr + ql);
+                const int64_t nc = slot_n_copy[qs];
+                const int64_t full_nr = slot_info[qs].n_real > 0 ? slot_info[qs].n_real : 0;
+                const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t)(full_nr + ql);
                 for (int64_t k = 0; k < n_kv; k++) {
                     float v = -INFINITY;
                     if (k < ctx_len) {
                         const int ks = (int)(k / per_slot_ctx);
                         const int kl = (int)(k % per_slot_ctx);
-                        if (ks == qs && kl < nr && q_pos - (int32_t) kl <= window) {
+                        if (ks == qs && kl < nc && q_pos - (int32_t)(slot_win_off[qs] + kl) <= window) {
                             v = 0.0f;
                         }
                     } else {
@@ -243,6 +274,10 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     int64_t ctx_len;
     if (n_slots == 1) {
         ctx_len = (cross && cross->n_enc > 0) ? cross->n_enc : (int64_t) LLAMA_DFLASH_PER_SLOT_CTX;
+        const int64_t max_ctx = dflash_max_cross_ctx();
+        if (max_ctx > 0 && ctx_len > max_ctx) {
+            ctx_len = max_ctx;
+        }
     } else {
         ctx_len = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
     }
