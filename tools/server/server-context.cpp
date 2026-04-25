@@ -732,11 +732,13 @@ private:
                         llama_model_dflash_block_size(model_dft.get()));
             }
 
-            // DFlash drafter only processes block_size (=16) tokens per call — cap
-            // drafter ubatch so users who opt into a larger target -ub (for faster
-            // prompt prefill) don't also inflate the drafter's graph reservation.
+            // DFlash drafter decodes up to MAX_SLOTS × block_size tokens per call
+            // (batched multi-slot draft). Size drafter ubatch exactly for that so
+            // graph reservation matches the worst case and users who opt into a
+            // larger target -ub don't inflate the drafter.
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                params_dft.n_ubatch = std::min(params_dft.n_ubatch, (int32_t)64);
+                const int block_size = llama_model_dflash_block_size(model_dft.get());
+                params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
             }
 
             params_base.speculative.model_dft = model_dft.get();

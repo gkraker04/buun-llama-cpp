@@ -26,10 +26,19 @@ public:
 };
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
-    // copy target hidden states from cross->v_embd to the input tensor
-    // v_embd may be padded (zero-filled beyond n_enc_real)
+    // copy target hidden states from cross->v_embd to the input tensor.
+    // v_embd may be narrower than target_hidden when fewer than MAX_SLOTS are active
+    // (single-slot path: v_embd sized for PER_SLOT_CTX, target_hidden sized for
+    // MAX_SLOTS * PER_SLOT_CTX). Copy what we have, zero-fill the rest — padding
+    // regions are masked to -INF in kq_mask so zero content is safe.
     if (target_hidden && cross && !cross->v_embd.empty()) {
-        ggml_backend_tensor_set(target_hidden, cross->v_embd.data(), 0, ggml_nbytes(target_hidden));
+        const size_t vembd_bytes  = cross->v_embd.size() * sizeof(float);
+        const size_t tensor_bytes = ggml_nbytes(target_hidden);
+        const size_t copy_bytes   = std::min(vembd_bytes, tensor_bytes);
+        ggml_backend_tensor_set(target_hidden, cross->v_embd.data(), 0, copy_bytes);
+        if (copy_bytes < tensor_bytes) {
+            ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
+        }
     }
 
     const int64_t n_real = cross ? cross->n_enc_real : ctx_len;
@@ -99,10 +108,14 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     const int64_t n_target_features = hparams.dflash_n_target_features;
 
-    // n_tokens comes from ubatch — equals block_size during inference, may differ during reservation
-    // ctx_len: from cross data at runtime, or cparams.n_ctx during graph reservation
-    const bool have_cross = cross && !cross->v_embd.empty();
-    const int64_t ctx_len = have_cross ? cross->n_enc : n_ctx;
+    // [CHECKPOINT B2.1] multi-slot graph shape
+    // Fixed drafter graph shape: reserved for up to MAX_SLOTS × PER_SLOT_CTX context
+    // tokens regardless of how many slots are actually active. At runtime, unused
+    // slot regions are zero-filled (target_hidden) and masked out (-INF in kq_mask),
+    // so a single decode can serve 1..MAX_SLOTS slots without rebuilding the graph.
+    // n_tokens comes from ubatch; the drafter's n_ubatch must be >= MAX_SLOTS × block_size
+    // so reservation sizes the per-token tensors correctly (set in ctx_dft creation).
+    const int64_t ctx_len = (int64_t) LLAMA_DFLASH_MAX_SLOTS * LLAMA_DFLASH_PER_SLOT_CTX;
 
     const int64_t n_kv_total = ctx_len + n_tokens;
 
