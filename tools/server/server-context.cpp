@@ -1118,7 +1118,10 @@ private:
                 }
 
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                // on ties, prefer spec-capable slots so requests land on DFlash/draft
+                // slots rather than non-speculative fallback slots
+                if (!ret || slot.t_last_used < t_last ||
+                    (slot.t_last_used == t_last && slot.can_speculate() && !ret->can_speculate())) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }

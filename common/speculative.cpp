@@ -1810,6 +1810,37 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
     if (params.sample_temp > 0.0f) {
         llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
     }
+
+    // warmup the draft context with an empty run so the first real decode isn't slow
+    {
+        const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+
+        llama_token bos = llama_vocab_bos(vocab_dft);
+        llama_token eos = llama_vocab_eos(vocab_dft);
+
+        llama_token tmp[2];
+        int n_tmp = 0;
+        if (bos != LLAMA_TOKEN_NULL) { tmp[n_tmp++] = bos; }
+        if (eos != LLAMA_TOKEN_NULL) { tmp[n_tmp++] = eos; }
+        if (n_tmp == 0) { tmp[n_tmp++] = 0; }
+
+        llama_set_warmup(ctx_dft, true);
+        int ret = llama_decode(ctx_dft, llama_batch_get_one(tmp, n_tmp));
+        if (ret != 0) {
+            LOG_WRN("%s: draft warmup decode failed: %d (non-fatal)\n", __func__, ret);
+        }
+
+        llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+        if (mem_dft) {
+            llama_memory_clear(mem_dft, true);
+        }
+        llama_synchronize(ctx_dft);
+        llama_perf_context_reset(ctx_dft);
+        llama_set_warmup(ctx_dft, false);
+
+        LOG_INF("%s: draft model warmup complete\n", __func__);
+    }
+
     return ctx_dft;
 }
 
