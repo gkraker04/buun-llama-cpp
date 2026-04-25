@@ -1090,7 +1090,7 @@ extern "C" {
     // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
     // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.
     enum {
-        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 20,
+        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25, // must be >= draft_max + 1
         LLAMA_DFLASH_MAX_SLOTS         = 8,
         LLAMA_DFLASH_PER_SLOT_CTX      = 512,
     };

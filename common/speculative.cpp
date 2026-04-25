@@ -206,6 +206,17 @@ struct common_speculative_state {
     // n_accepted: how many were accepted (ids.size(), including the bonus token)
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
 
+    // flush captured hidden states into the ring buffer during prefill.
+    // called after each llama_decode sub-batch so checkpoint splits don't
+    // lose hidden state context between sub-batches.
+    virtual void flush_prefill() {}
+
+    // save/restore ring buffer state for checkpoint persistence.
+    // allows hidden states captured during prefill to survive checkpoint restore.
+    virtual size_t ring_state_size() const { return 0; }
+    virtual void ring_state_save(uint8_t * /*buf*/, size_t /*size*/) const {}
+    virtual bool ring_state_load(const uint8_t * /*buf*/, size_t /*size*/) { return false; }
+
     // identify which server slot (seq_id on both ctx_tgt and shared ctx_dft) this
     // state owns. Default 0 (single-slot). Non-DFlash impls ignore this.
     virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
@@ -1224,6 +1235,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int ring_write_pos = 0;    // next write slot (0..RING_SIZE-1)
     int ring_filled = 0;       // how many valid slots (0..RING_SIZE)
     int committed_len = 0;     // total tokens committed (unbounded counter)
+    bool prefill_flushed = false; // true if flush_prefill() was called during this request
 
     // Interleaved cross-attention buffer — rebuilt from ring on each draft call
     // Only holds ctx_window tokens worth of data
@@ -1308,7 +1320,112 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // called after initial prefill — extract hidden states from target
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        if (prefill_flushed) {
+            // ring was already populated incrementally by flush_prefill() calls
+            // during checkpoint-split prefill — nothing to do
+            prefill_flushed = false;
+            return;
+        }
         capture_target_hiddens();
+    }
+
+    void flush_prefill() override {
+        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        if (n_slots == 0) return;
+
+        int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
+        if (n_tokens <= 0) return;
+
+        if (!prefill_flushed) {
+            // first flush for this request — reset ring
+            ring_write_pos = 0;
+            ring_filled = 0;
+            committed_len = 0;
+        }
+
+        ring_write((int)n_tokens);
+        committed_len += (int)n_tokens;
+        prefill_flushed = true;
+    }
+
+    // Ring state serialization for checkpoint persistence.
+    // Format: [ring_write_pos:i32][ring_filled:i32][committed_len:i32]
+    //         [n_target_layers:i32][n_embd:i32][n_entries:i32]
+    //         [layer_0 data: n_entries * n_embd * f32] ...
+
+    size_t ring_state_size() const override {
+        int n_entries = std::min(ring_filled, RING_SIZE);
+        return 6 * sizeof(int32_t) +
+               (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
+    }
+
+    void ring_state_save(uint8_t * buf, size_t size) const override {
+        int n_entries = std::min(ring_filled, RING_SIZE);
+        size_t expected = 6 * sizeof(int32_t) +
+                          (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
+        if (size < expected) return;
+
+        int32_t * hdr = (int32_t *)buf;
+        hdr[0] = ring_write_pos;
+        hdr[1] = ring_filled;
+        hdr[2] = committed_len;
+        hdr[3] = n_target_layers;
+        hdr[4] = n_embd;
+        hdr[5] = n_entries;
+
+        uint8_t * dst = buf + 6 * sizeof(int32_t);
+        size_t layer_bytes = (size_t)n_entries * n_embd * sizeof(float);
+
+        for (int l = 0; l < n_target_layers; ++l) {
+            memcpy(dst, ring_buf[l].data(), layer_bytes);
+            dst += layer_bytes;
+        }
+    }
+
+    bool ring_state_load(const uint8_t * buf, size_t size) override {
+        if (size < 6 * sizeof(int32_t)) return false;
+
+        const int32_t * hdr = (const int32_t *)buf;
+        int saved_write_pos = hdr[0];
+        int saved_filled    = hdr[1];
+        int saved_committed = hdr[2];
+        int saved_layers    = hdr[3];
+        int saved_embd      = hdr[4];
+        int saved_entries    = hdr[5];
+
+        if (saved_layers != n_target_layers || saved_embd != n_embd) {
+            LOG_WRN("dflash: ring state mismatch: layers %d/%d, embd %d/%d\n",
+                    saved_layers, n_target_layers, saved_embd, n_embd);
+            return false;
+        }
+
+        if (saved_write_pos < 0 || saved_write_pos >= RING_SIZE ||
+            saved_filled < 0 || saved_entries < 0 || saved_entries > RING_SIZE) {
+            LOG_WRN("dflash: ring state corrupt: write_pos=%d, filled=%d, entries=%d\n",
+                    saved_write_pos, saved_filled, saved_entries);
+            return false;
+        }
+
+        size_t layer_bytes = (size_t)saved_entries * n_embd * sizeof(float);
+        if (size < 6 * sizeof(int32_t) + layer_bytes * n_target_layers) return false;
+
+        ring_write_pos = saved_write_pos;
+        ring_filled    = saved_filled;
+        committed_len  = saved_committed;
+
+        const uint8_t * src = buf + 6 * sizeof(int32_t);
+        for (int l = 0; l < n_target_layers; ++l) {
+            memcpy(ring_buf[l].data(), src, layer_bytes);
+            src += layer_bytes;
+        }
+
+        // mark as flushed so subsequent flush_prefill() calls from suffix
+        // decoding APPEND to the restored ring instead of resetting it
+        prefill_flushed = true;
+
+        return true;
     }
 
     void draft(
@@ -1606,7 +1723,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
 private:
     // write n_tokens into ring buffer from captured hidden states
-    void ring_write(int n_tokens) {
+    // write n_tokens from the capture buffer into the ring, starting at
+    // src_offset in the capture buffer. wraps circularly in the ring.
+    void ring_write(int n_tokens, int src_offset = 0) {
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
@@ -1614,11 +1733,11 @@ private:
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
             if (!data || ntok <= 0) continue;
 
-            int to_write = std::min(n_tokens, (int)ntok);
+            int to_write = std::min(n_tokens, (int)ntok - src_offset);
             for (int t = 0; t < to_write; ++t) {
                 int slot = (ring_write_pos + t) % RING_SIZE;
                 memcpy(ring_buf[layer].data() + (size_t)slot * embd,
-                       data + (size_t)t * embd,
+                       data + (size_t)(src_offset + t) * embd,
                        embd * sizeof(float));
             }
         }
@@ -1628,48 +1747,21 @@ private:
 
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
-        // select this slot's hidden buffers (after multi-slot decode, active_tape_idx
-        // reflects the last decoded slot — each slot must select its own first)
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        if (n_slots == 0) {
-            return;
-        }
+        if (n_slots == 0) return;
 
         int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
-        if (n_tokens <= 0) {
-            return;
-        }
+        if (n_tokens <= 0) return;
 
-        // For initial prefill, only keep last RING_SIZE tokens
-        // (or all if fewer than RING_SIZE)
-        int start_offset = 0;
-        int to_store = (int)n_tokens;
-        if (to_store > RING_SIZE) {
-            start_offset = to_store - RING_SIZE;
-            to_store = RING_SIZE;
-        }
+        // only keep last RING_SIZE tokens if prompt exceeds ring capacity
+        int start_offset = std::max(0, (int)n_tokens - RING_SIZE);
+        int to_store = (int)n_tokens - start_offset;
 
         ring_write_pos = 0;
         ring_filled = 0;
-
-        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
-            float * data = llama_get_layer_hidden(ctx_tgt, layer);
-            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
-            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
-            if (!data || ntok <= 0) continue;
-
-            for (int t = 0; t < to_store; ++t) {
-                int slot = t % RING_SIZE;
-                memcpy(ring_buf[layer].data() + (size_t)slot * embd,
-                       data + (size_t)(start_offset + t) * embd,
-                       embd * sizeof(float));
-            }
-        }
-
-        ring_write_pos = to_store % RING_SIZE;
-        ring_filled = to_store;
+        ring_write(to_store, start_offset);
         committed_len = (int)n_tokens;
     }
 
@@ -2325,6 +2417,46 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
     for (auto & impl : spec->impls) {
         impl->update_logits(ctx, batch_tokens, n_accepted);
     }
+}
+
+void common_speculative_flush_prefill(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->flush_prefill();
+    }
+}
+
+size_t common_speculative_ring_state_size(const common_speculative * spec) {
+    if (spec == nullptr) return 0;
+    size_t total = 0;
+    for (auto & impl : spec->impls) {
+        total += impl->ring_state_size();
+    }
+    return total;
+}
+
+void common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size) {
+    if (spec == nullptr) return;
+    for (auto & impl : spec->impls) {
+        size_t impl_size = impl->ring_state_size();
+        if (impl_size > 0 && impl_size <= size) {
+            impl->ring_state_save(buf, impl_size);
+            buf += impl_size;
+            size -= impl_size;
+        }
+    }
+}
+
+bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size) {
+    if (spec == nullptr) return false;
+    for (auto & impl : spec->impls) {
+        if (impl->ring_state_load(buf, size)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

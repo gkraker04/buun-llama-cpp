@@ -566,9 +566,10 @@ struct server_prompt_checkpoint {
     int64_t n_tokens;
 
     std::vector<uint8_t> data;
+    std::vector<uint8_t> ring_data; // DFlash ring buffer state
 
     size_t size() const {
-        return data.size();
+        return data.size() + ring_data.size();
     }
 };
 

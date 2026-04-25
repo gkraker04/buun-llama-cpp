@@ -84,6 +84,18 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 // update implementations with logits from the verification decode
 void common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 
+// flush hidden states captured during the current prefill sub-batch into
+// the DFlash ring buffer. Call after each llama_decode during split prefill
+// so checkpoint placement doesn't lose hidden state context.
+void common_speculative_flush_prefill(common_speculative * spec);
+
+// save/restore ring buffer state for checkpoint persistence.
+// the ring contains target hidden states needed by the DFlash drafter's
+// cross-attention. Without this, checkpoint-restored prefills lose context.
+size_t common_speculative_ring_state_size(const common_speculative * spec);
+void   common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size);
+bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
+
 // DDTree: build a tree of likely continuations from draft logits
 // tree_budget: max tree nodes (0 = flat DFlash, >0 = DDTree)
 common_speculative_tree common_speculative_draft_tree(

@@ -2614,6 +2614,12 @@ private:
                                         } else {
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+
+                                            // restore DFlash ring buffer from checkpoint
+                                            if (slot.can_speculate() && !it->ring_data.empty()) {
+                                                common_speculative_ring_state_load(slot.spec, it->ring_data.data(), it->ring_data.size());
+                                            }
+
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                         }
                                     }
@@ -2711,15 +2717,6 @@ private:
                             llama_model_is_hybrid(model) ||
                             (llama_model_n_swa(model) > 0 && !params_base.swa_full)
                             );
-
-                    // DFlash: the prefill-split for checkpoint placement (line below) drops the
-                    // first N-4 prefill hidden states from the DFlash ring buffer, because each
-                    // llama_decode overwrites the capture buffer and common_speculative_begin()
-                    // only reads it once (after the final sub-batch). Disable checkpointing for
-                    // DFlash: we don't need server checkpoints (DFlash has its own tape-replay
-                    // rollback for speculation), and skipping the split lets the drafter see the
-                    // full prompt hidden state context on its first draft call. ~12pp accept gain.
-                    do_checkpoint = do_checkpoint && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH;
 
                     bool has_mtmd = false;
 
@@ -2876,11 +2873,20 @@ private:
                         llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, slot.id,
                                                      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
+                        // save DFlash ring buffer alongside the recurrent state checkpoint
+                        if (slot.can_speculate()) {
+                            size_t ring_size = common_speculative_ring_state_size(slot.spec);
+                            if (ring_size > 0) {
+                                cur.ring_data.resize(ring_size);
+                                common_speculative_ring_state_save(slot.spec, cur.ring_data.data(), ring_size);
+                            }
+                        }
+
                         SLT_WRN(slot,
                                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
                                 ", size = %.3f MiB)\n",
                                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024.0 / 1024.0);
                     }
                 }
 
@@ -3016,6 +3022,15 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
+
+            // DFlash: flush captured hidden states into the ring buffer before
+            // the next llama_decode resets the capture buffer. This lets
+            // checkpoint-split prefill preserve all hidden states incrementally.
+            for (auto & slot : slots) {
+                if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) && slot.can_speculate()) {
+                    common_speculative_flush_prefill(slot.spec);
+                }
+            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
