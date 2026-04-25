@@ -108,15 +108,23 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     const int64_t n_target_features = hparams.dflash_n_target_features;
 
-    // [CHECKPOINT B2.1] multi-slot graph shape
-    // Drafter graph shape scales with cparams.dflash_n_slots (set via llama_set_dflash_n_slots,
-    // typically at ctx_dft init based on the server's --dflash-max-slots). ctx_len =
-    // n_slots × PER_SLOT_CTX. Single-slot users (default n_slots=1) keep the narrow graph
-    // and pay no overhead; multi-slot users pay proportional attention cost.
-    // At runtime, cparams.dflash_n_slots is treated as the fixed active-slot count:
-    // set_input populates all n_slots with real data or pads/masks unused trailing slots.
-    const int n_slots = std::max(1, std::min((int) cparams.dflash_n_slots, (int) LLAMA_DFLASH_MAX_SLOTS));
-    const int64_t ctx_len = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
+    // Drafter graph shape:
+    //   n_slots == 1: ctx_len = cross->n_enc (power-of-2 bucket of actual data length).
+    //                 set_cross_data triggers sched_need_reserve when the bucket changes,
+    //                 so the graph re-reserves at each bucket boundary. This matches the
+    //                 pre-B2.0 path and keeps single-slot at the original throughput.
+    //   n_slots >= 2: ctx_len = n_slots × PER_SLOT_CTX (fixed). The shared drafter ctx
+    //                 services multiple slots whose bucket-of-n_enc would otherwise
+    //                 thrash sched_need_reserve as different slots write data of
+    //                 different lengths. Fixed width avoids that thrash; multi-slot
+    //                 users pay flat n_slots × PER_SLOT_CTX attention cost.
+    const int n_slots = std::clamp((int) cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
+    int64_t ctx_len;
+    if (n_slots == 1) {
+        ctx_len = (cross && cross->n_enc > 0) ? cross->n_enc : (int64_t) LLAMA_DFLASH_PER_SLOT_CTX;
+    } else {
+        ctx_len = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
+    }
 
     const int64_t n_kv_total = ctx_len + n_tokens;
 
