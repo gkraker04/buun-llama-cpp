@@ -27,22 +27,49 @@ public:
 };
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
-    // copy target hidden states from cross->v_embd to the input tensor.
-    // v_embd may be narrower than target_hidden when fewer than MAX_SLOTS are active
-    // (single-slot path: v_embd sized for PER_SLOT_CTX, target_hidden sized for
-    // MAX_SLOTS * PER_SLOT_CTX). Copy what we have, zero-fill the rest — padding
-    // regions are masked to -INF in kq_mask so zero content is safe.
-    if (target_hidden && cross && !cross->v_embd.empty()) {
-        const size_t vembd_bytes  = cross->v_embd.size() * sizeof(float);
+    // [CHECKPOINT B2.3] resolve cross data for the active seq.
+    // Multi-slot DFlash routes per-slot data through cross->v_embd_per_seq[seq] so
+    // concurrent slots don't clobber each other through the singleton cross->v_embd.
+    // When the active seq has a per-seq entry, read that. Otherwise fall through to
+    // the legacy v_embd buffer (encoder-decoder paths, single-slot pre-B1.x).
+    const float * src_data  = nullptr;
+    int64_t       src_n_enc  = 0;
+    int64_t       src_n_real = 0;
+    if (cross) {
+        llama_seq_id active_seq = -1;
+        if (ubatch && ubatch->n_seqs_unq > 0 && ubatch->seq_id_unq) {
+            active_seq = ubatch->seq_id_unq[0];
+        }
+        if (active_seq >= 0) {
+            auto it = cross->v_embd_per_seq.find(active_seq);
+            if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
+                src_data   = it->second.v_embd.data();
+                src_n_enc  = it->second.n_enc;
+                src_n_real = it->second.n_enc_real;
+            }
+        }
+        if (!src_data && !cross->v_embd.empty()) {
+            src_data   = cross->v_embd.data();
+            src_n_enc  = cross->n_enc;
+            src_n_real = cross->n_enc_real;
+        }
+    }
+
+    // Copy target hidden states into the input tensor at offset 0 (active slot region).
+    // Source may be narrower than target_hidden when n_slots > 1 (other slot regions are
+    // padded). Zero-fill the rest — padding is masked to -INF in kq_mask so values are
+    // irrelevant.
+    if (target_hidden && src_data && src_n_enc > 0) {
+        const size_t src_bytes    = (size_t) cross->n_embd * (size_t) src_n_enc * sizeof(float);
         const size_t tensor_bytes = ggml_nbytes(target_hidden);
-        const size_t copy_bytes   = std::min(vembd_bytes, tensor_bytes);
-        ggml_backend_tensor_set(target_hidden, cross->v_embd.data(), 0, copy_bytes);
+        const size_t copy_bytes   = std::min(src_bytes, tensor_bytes);
+        ggml_backend_tensor_set(target_hidden, src_data, 0, copy_bytes);
         if (copy_bytes < tensor_bytes) {
             ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
         }
     }
 
-    const int64_t n_real = cross ? cross->n_enc_real : ctx_len;
+    const int64_t n_real = src_n_real > 0 ? src_n_real : ctx_len;
 
     // context positions: [0, 1, ..., n_real-1, 0, 0, ..., 0] (padding gets position 0)
     if (pos_ctx && pos_ctx->buffer) {
