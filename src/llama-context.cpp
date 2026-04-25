@@ -1199,8 +1199,8 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     cparams.cb_eval = dflash_eval_callback;
     cparams.cb_eval_user_data = dflash_capture.get();
 
-    // B2.6: GPU tape, eval callback hidden scatter, and QKV per-seq
-    // metadata all support multi-seq ubatches. However, the server's
+    // GPU tape, eval callback hidden scatter, and QKV per-seq metadata
+    // all support multi-seq ubatches. However, the server's
     // batch can mix prompt + TG tokens from different slots; split_equal
     // on such mixed batches produces incorrect ubatches. Expose the flag
     // so callers can toggle it off for verify-only decodes.
@@ -1263,7 +1263,7 @@ void llama_context::set_tape_recording(bool enable) {
     }
 
     // expose to graph builder via cparams — populate all tape pointers so graph
-    // reservation accounts for worst-case per-seq copy ops (B2.6).
+    // reservation accounts for worst-case per-seq copy ops.
     if (enable && !dflash_capture->tapes.empty()) {
         const int n_tapes = (int) dflash_capture->tapes.size();
         cparams.tape_gpu = dflash_capture->tapes[0].get();
@@ -1666,14 +1666,16 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
         if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
         if (tape.qkv_mixed.empty() || !mem_recurrent->r_l[il]) continue;
 
-        // B2.6: for multi-seq verify, QKV mixed has per-seq data packed
+        // for multi-seq verify, QKV mixed has per-seq data packed
         // contiguously as [channels, n_seq_tokens, n_seqs]. Find offset.
         size_t qkv_seq_offset = 0;
         if (tape.n_seqs > 1) {
+            bool found = false;
             for (int s = 0; s < tape.n_seqs; ++s) {
-                if (tape.seq_ids[s] == seq_id) break;
+                if (tape.seq_ids[s] == seq_id) { found = true; break; }
                 qkv_seq_offset += (size_t) tape.n_tokens * (size_t) tape.conv_channels;
             }
+            GGML_ASSERT(found && "tape_replay_conv: seq_id not found in tape");
         }
 
         ggml_tensor * r_tensor = mem_recurrent->r_l[il];
@@ -1852,16 +1854,15 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     // padding beyond n_tokens is masked with -inf in set_input, no need to zero-fill
 }
 
-// [CHECKPOINT B1.2] per-seq cross data stash — multi-slot DFlash support
+// Per-seq cross data stash for multi-slot DFlash
 void llama_context::set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
     if (seq_id < 0) {
         set_cross_data(data, n_embd, n_tokens);
         return;
     }
 
-    // Always update the single-slot v_embd too — until B2 widens the drafter graph
-    // to read v_embd_per_seq, the graph still pulls from v_embd, and sequential
-    // draft() calls rely on the just-set data being there.
+    // Also update the single-slot v_embd — sequential (non-batched) draft() calls
+    // read from v_embd directly, and the graph's set_input single-slot path uses it.
     set_cross_data(data, n_embd, n_tokens);
 
     auto & entry = cross.v_embd_per_seq[seq_id];
@@ -2489,11 +2490,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2989,9 +2986,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (dflash_capture) {
             dflash_capture->ubatch = &ubatch;
 
-            // populate per-seq tape pointers for graph builder (B2.6)
+            // populate per-seq tape pointers for graph builder
             if (!dflash_capture->tapes.empty()) {
-                const int ns = std::min((int) ubatch.n_seqs, (int) LLAMA_DFLASH_MAX_SLOTS);
+                const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
                 bool seqs_changed = (ns != cparams.tape_gpu_n_seqs);
                 cparams.tape_gpu_n_seqs = ns;
 

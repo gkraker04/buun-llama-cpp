@@ -53,9 +53,9 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
-// [CHECKPOINT B1.3] inform the speculative stack which server slot (seq_id on
-// ctx_tgt and the shared ctx_dft) this instance services. Safe to call multiple
-// times; no-op for non-DFlash impls.
+// inform the speculative stack which server slot (seq_id on ctx_tgt and the
+// shared ctx_dft) this instance services. Safe to call multiple times;
+// no-op for non-DFlash impls.
 void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
@@ -66,11 +66,11 @@ llama_tokens common_speculative_draft(
                             llama_token   id_last,
                      std::vector<float> * draft_log_probs = nullptr);
 
-// [CHECKPOINT B2.4] Batched DFlash draft: all specs prepare cross data, one
-// combined multi-seq decode, results distributed back. Each spec must have
-// had set_seq_id called and share the same ctx_dft. Specs without a ready
-// DFlash impl get empty results. Does not run extension impls (CopySpec etc.)
-// — caller should extend per-spec results afterwards if desired.
+// Batched DFlash draft: all specs prepare cross data, one combined multi-seq
+// decode, results distributed back. Each spec must have had set_seq_id called
+// and share the same ctx_dft. Specs without a ready DFlash impl get empty
+// results. Does not run extension impls (CopySpec etc.) — caller should
+// extend per-spec results afterwards if desired.
 void common_speculative_draft_batch(
         std::vector<common_speculative *> & specs,
         llama_context                     * ctx_dft,

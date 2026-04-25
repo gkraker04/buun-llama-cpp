@@ -379,7 +379,7 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
-        // [EXPERIMENTAL] DFlash drafter: initial number of cross-attention slots.
+        // DFlash drafter: initial number of cross-attention slots.
         // Sets the drafter graph width at reservation. Clamped to [1, LLAMA_DFLASH_MAX_SLOTS].
         // Set this BEFORE llama_init_from_model — runtime widening past this value requires
         // a larger compute buffer than was allocated at init.
@@ -1080,7 +1080,7 @@ extern "C" {
     // during verification decode for efficient state replay instead of full re-evaluation
     LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
 
-    // B2.6: toggle force_split_seq on the memory. When false, the batch allocator
+    // Toggle force_split_seq on the memory. When false, the batch allocator
     // may produce multi-seq ubatches (split_equal), allowing concurrent verify tokens
     // from multiple slots to be processed in a single GPU launch. Set to false before
     // a verify-only decode, and true after (mixed prompt+TG batches need split_seq).

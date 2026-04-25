@@ -357,9 +357,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     // GPU tape: copy k/v/gate/beta directly to persistent per-slot GPU buffers.
-    // B2.6: per-seq loop — extracts each seq's 3D slice from the 4D source
-    // tensors and copies to that seq's tape buffer. For n_seqs==1 this
-    // degenerates to the pre-B2.6 behavior (single copy set at offset 0).
+    // Per-seq loop extracts each seq's 3D slice from the 4D source tensors.
+    // For n_seqs==1 this degenerates to a single copy at offset 0.
     if (cparams.tape_gpu_n_seqs > 0) {
         for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
             auto * tgpu = cparams.tape_gpu_seqs[s];

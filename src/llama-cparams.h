@@ -66,7 +66,7 @@ struct llama_cparams {
     // tape_gpu is non-null when GPU tape is enabled (backward compat sentinel).
     dflash_tape_gpu * tape_gpu = nullptr;
 
-    // B2.6: per-seq tape pointers for multi-seq verify batching.
+    // Per-seq tape pointers for multi-seq verify batching.
     // tape_gpu_seqs[s] = tape for ubatch seq index s (0..tape_gpu_n_seqs-1).
     // Populated by the decode loop before each process_ubatch().
     dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};

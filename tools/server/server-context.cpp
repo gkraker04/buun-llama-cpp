@@ -565,7 +565,7 @@ private:
 
     llama_context * ctx = nullptr;
 
-    // [CHECKPOINT B0.3] DFlash-only: one drafter context shared across all slots'
+    // DFlash: one drafter context shared across all slots'
     // common_speculative states (non-owning refs). Must outlive all specs — the
     // destroy() order below (specs first, then this) enforces that; when destroy()
     // isn't called explicitly, member-destructor order (reverse-declaration) frees
@@ -846,7 +846,7 @@ private:
                 SRV_INF("DFlash enabled for all %d slots\n", dflash_slots_cap);
             }
 
-            // [CHECKPOINT B0.3] create the shared DFlash drafter context once;
+            // Create the shared DFlash drafter context once;
             // every slot's common_speculative gets a non-owning reference to it.
             // dflash_slots_cap is passed at init so the initial graph reserve sizes
             // the compute buffer for the requested width — single-slot servers stay
@@ -884,8 +884,8 @@ private:
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                         return false;
                     }
-                    // [CHECKPOINT B1.3] DFlash: tag every drafter call from this slot
-                    // with its own seq_id so the shared ctx_dft routes cross-data per slot.
+                    // DFlash: tag every drafter call from this slot with its own
+                    // seq_id so the shared ctx_dft routes cross-data per slot.
                     common_speculative_set_seq_id(slot.spec, slot.id);
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
                 } else {
@@ -2196,14 +2196,14 @@ private:
 
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
-        // B1-style dynamic bucketing (~128-256 ctx_len) instead of the fixed
-        // n_slots×512 width — recovering single-slot throughput on np>1 servers.
+        // dynamic bucketing (~128-256 ctx_len) instead of the fixed n_slots×512
+        // width — recovering single-slot throughput on np>1 servers.
         // The idempotent set_dflash_n_slots call costs nothing when unchanged
         // and triggers one sched_need_reserve per transition.
         //
-        // [CHECKPOINT B2.5] When ≥2 DFlash slots need drafts, batch them into a
-        // single drafter decode. Results are stored in batched_drafts[] and consumed
-        // by the per-slot loop below.
+        // When ≥2 DFlash slots need drafts, batch them into a single drafter
+        // decode. Results are stored in batched_drafts[] and consumed by the
+        // per-slot loop below.
         std::vector<llama_tokens> batched_drafts(slots.size());
         if (ctx_dft_shared) {
             int n_drafting = 0;
@@ -2262,7 +2262,7 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                // B2.5: use pre-computed batched draft if available, else single-slot
+                // use pre-computed batched draft if available, else single-slot
                 llama_tokens draft;
                 if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
@@ -2341,7 +2341,7 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
-        // B2.6: track how many TG tokens are in the batch vs total, to detect
+        // track how many TG tokens are in the batch vs total, to detect
         // pure-verify batches where multi-seq batching is safe.
         const int32_t n_tg_tokens = batch.n_tokens;
 
@@ -2927,9 +2927,9 @@ private:
 
         int32_t i_next = 0;
 
-        // B2.6: allow multi-seq batching when the batch is pure TG (no prompt
-        // tokens). This lets concurrent slots' verify tokens be processed in a
-        // single multi-seq ubatch instead of N sequential per-seq ubatches.
+        // allow multi-seq batching when the batch is pure TG (no prompt tokens).
+        // This lets concurrent slots' verify tokens be processed in a single
+        // multi-seq ubatch instead of N sequential per-seq ubatches.
         const bool can_batch_multiseq = (n_tg_tokens == batch.n_tokens && n_tg_tokens > 0
             && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH);
         if (can_batch_multiseq) {
@@ -3280,7 +3280,7 @@ private:
             llama_set_tape_recording(ctx, false);
         }
 
-        // B2.6: restore force_split_seq for the next cycle (prompt batches need it)
+        // restore force_split_seq for the next cycle (prompt batches need it)
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx, true);
         }

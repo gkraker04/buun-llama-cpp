@@ -71,7 +71,7 @@ struct llama_cross {
     // Single-slot / encoder-decoder path: graph builders read from here directly.
     std::vector<float> v_embd;
 
-    // [CHECKPOINT B1.1] per-seq cross buffers for DFlash multi-slot.
+    // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot
     // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
     struct seq_cross {

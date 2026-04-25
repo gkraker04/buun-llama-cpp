@@ -31,7 +31,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
 
     if (n_seqs == 1) {
         // === Single-slot path ===
-        // [CHECKPOINT B2.3] resolve cross data for the active seq.
+        // resolve cross data for the active seq
         const float * src_data  = nullptr;
         int64_t       src_n_enc  = 0;
         int64_t       src_n_real = 0;
@@ -114,7 +114,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
         }
     } else {
-        // === [CHECKPOINT B2.4] Multi-slot batched draft path ===
+        // === Multi-slot batched draft path ===
         // Pack each slot's cross data at per-slot offsets in target_hidden.
         // Build per-slot isolating masks so each slot's block queries only
         // attend to that slot's cross keys and block keys.
@@ -233,13 +233,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     //   n_slots == 1: ctx_len = cross->n_enc (power-of-2 bucket of actual data length).
     //                 set_cross_data triggers sched_need_reserve when the bucket changes,
     //                 so the graph re-reserves at each bucket boundary. This matches the
-    //                 pre-B2.0 path and keeps single-slot at the original throughput.
+    //                 original single-slot path and keeps throughput unchanged.
     //   n_slots >= 2: ctx_len = n_slots × PER_SLOT_CTX (fixed). The shared drafter ctx
     //                 services multiple slots whose bucket-of-n_enc would otherwise
     //                 thrash sched_need_reserve as different slots write data of
     //                 different lengths. Fixed width avoids that thrash; multi-slot
     //                 users pay flat n_slots × PER_SLOT_CTX attention cost.
-    const int n_slots = std::clamp((int) cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
+    const int n_slots = std::clamp(cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
     int64_t ctx_len;
     if (n_slots == 1) {
         ctx_len = (cross && cross->n_enc > 0) ? cross->n_enc : (int64_t) LLAMA_DFLASH_PER_SLOT_CTX;

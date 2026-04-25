@@ -53,7 +53,7 @@ struct dflash_tape_layer {
     int64_t S_k = 0, H_k = 0, S_v = 0, H_v = 0;
     int64_t conv_channels = 0;
     int n_tokens = 0;
-    // B2.6: per-seq metadata for multi-seq verify QKV scatter
+    // per-seq metadata for multi-seq verify QKV scatter
     int n_seqs = 1;
     llama_seq_id seq_ids[LLAMA_DFLASH_MAX_SLOTS] = {};
 };

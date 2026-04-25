@@ -206,14 +206,12 @@ struct common_speculative_state {
     // n_accepted: how many were accepted (ids.size(), including the bonus token)
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
 
-    // [CHECKPOINT B1.3] DFlash multi-slot: identify which slot (seq_id on both ctx_tgt
-    // and the shared ctx_dft) this state owns. Default is 0 — legacy single-slot value.
-    // Non-DFlash impls ignore this.
+    // identify which server slot (seq_id on both ctx_tgt and shared ctx_dft) this
+    // state owns. Default 0 (single-slot). Non-DFlash impls ignore this.
     virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
 
-    // [CHECKPOINT B2.4] Prepare cross-attention data for batched drafting on a shared
-    // ctx_dft. Builds ring→cross_buf→set_cross_data_seq. Returns cross_len (position
-    // offset for batch tokens), or -1 if not ready (no committed tokens).
+    // prepare cross-attention data for batched drafting on a shared ctx_dft.
+    // Returns cross_len (position offset for batch tokens), or -1 if not ready.
     virtual int prepare_batch_draft(llama_context * /*ctx_dft*/) { return -1; }
 };
 
@@ -241,22 +239,6 @@ struct common_speculative_state_draft : public common_speculative_state {
         batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
         smpl = nullptr;
 
-        // TODO: optimize or pass from outside?
-        // {
-        //     common_params_sampling params;
-        //     params.no_perf = false;
-        //
-        //     params.top_k = 40;
-        //     params.top_p = 0.9;
-        //
-        //     params.samplers = {
-        //         COMMON_SAMPLER_TYPE_TOP_K,
-        //         COMMON_SAMPLER_TYPE_TOP_P,
-        //         COMMON_SAMPLER_TYPE_INFILL,
-        //     };
-        //
-        //     result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
-        // }
         {
             common_params_sampling params;
             params.no_perf = false;
@@ -402,7 +384,6 @@ struct common_speculative_state_draft : public common_speculative_state {
         common_batch_clear(batch);
 
         for (size_t i = i_start + reuse_n; i < prompt_cur.size(); ++i) {
-            //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_cur[i]);
             common_batch_add(batch, prompt_cur[i], i - i_start, { 0 }, false);
 
             prompt_dft.push_back(prompt_cur[i]);
@@ -410,8 +391,6 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         // we should rarely end-up here during normal decoding
         if (batch.n_tokens > 0) {
-            //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
-
             llama_decode(ctx_dft, batch);
         }
 
@@ -1228,7 +1207,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     llama_context * ctx_dft;
     llama_model   * model_dft;
     bool            owns_ctx_dft; // when false, ctx_dft is externally owned (shared across slots)
-    llama_seq_id    seq_id = 0;   // [CHECKPOINT B1.3] which server slot this state owns
+    llama_seq_id    seq_id = 0;   // which server slot this state owns
 
     int block_size;
     llama_token mask_token_id;
@@ -1251,7 +1230,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     std::vector<float> cross_buf;
 
     // A2: sliding window limit for drafter context (0 = unlimited)
-    static constexpr int ctx_window = 512;
+    static constexpr int ctx_window = LLAMA_DFLASH_PER_SLOT_CTX;
 
     llama_batch batch_dft;
 
@@ -1302,10 +1281,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
         seq_id = seq_id_;
     }
 
-    // [CHECKPOINT B2.4] prepare cross-attention data for batched draft decode.
-    // Builds ring→cross_buf→set_cross_data_seq on ctx_dft. Returns cross_len
-    // (the position offset for tokens in the combined batch), or -1 if this
-    // slot has no committed tokens yet.
+    // prepare cross-attention data for batched draft decode.
+    // Returns cross_len (position offset for tokens), or -1 if no committed tokens.
     int prepare_batch_draft(llama_context * ctx_dft_ext) override {
         if (committed_len == 0) {
             return -1;
@@ -1368,9 +1345,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t1 = ggml_time_us();
 
-        // [CHECKPOINT B1.3] set cross data keyed by this slot's seq_id. Until B2 widens
-        // the drafter graph to read v_embd_per_seq, the per-seq impl also updates the
-        // top-level v_embd so the graph's existing read path still sees fresh data.
         llama_set_cross_data_seq(ctx_dft, seq_id, cross_buf.data(), n_target_features, cross_len);
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
@@ -1426,7 +1400,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t4 = ggml_time_us();
 
-        LOG_INF("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+        LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
                 committed_len,
                 (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
     }
@@ -1466,7 +1440,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const float * cross_data = cross_buf.data();
 
-        // [CHECKPOINT B1.3] per-seq cross data + batch tagging (see draft()).
         llama_set_cross_data_seq(ctx_dft, seq_id, cross_data, n_target_features, cross_len);
 
         common_batch_clear(batch_dft);
@@ -1655,9 +1628,8 @@ private:
 
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
-        // [CHECKPOINT B2.3] route reads to this slot's hidden buffers. After concurrent
-        // multi-slot target decode, active_tape_idx reflects the LAST decoded slot's
-        // index. Each slot's update_logits/capture must select its own buffer first.
+        // select this slot's hidden buffers (after multi-slot decode, active_tape_idx
+        // reflects the last decoded slot — each slot must select its own first)
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
@@ -1703,8 +1675,6 @@ private:
 
     // called after each verification decode — append only the accepted tokens' hidden states
     void append_target_hiddens(int n_accepted) {
-        // [CHECKPOINT B2.3] select this slot's hidden buffers before reading. See
-        // capture_target_hiddens() for the rationale.
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
@@ -1820,7 +1790,6 @@ done:
 
 // initialization of the speculative decoding system
 //
-// [CHECKPOINT B0.1] ctx_dft factory (shared-ownership foundation)
 llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots) {
     if (!params.model_dft) {
         return nullptr;
@@ -1848,8 +1817,7 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
         llama_context             * ctx_dft_shared) {
-    // [CHECKPOINT B0.2] external ctx_dft path
-    // When ctx_dft_shared is provided, we use it non-owning so multiple
+    // When ctx_dft_shared is provided, use it non-owning so multiple
     // common_speculative instances can share one drafter context.
     const bool owns_ctx_dft = (ctx_dft_shared == nullptr);
     llama_context * ctx_dft = ctx_dft_shared;
@@ -2091,8 +2059,6 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
     }
 }
 
-// [CHECKPOINT B1.3] wire the server slot's seq_id into every impl state.
-// DFlash uses it to route cross-data and batch tags; others ignore it.
 void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return;
@@ -2149,7 +2115,7 @@ llama_tokens common_speculative_draft(
     return result;
 }
 
-// [CHECKPOINT B2.4] Batched DFlash draft: prepare cross data for all specs,
+// Batched DFlash draft: prepare cross data for all specs,
 // build one combined multi-seq batch, decode once, distribute results.
 void common_speculative_draft_batch(
         std::vector<common_speculative *> & specs,
@@ -2232,10 +2198,9 @@ void common_speculative_draft_batch(
 
     const int64_t t2 = ggml_time_us();
 
-    // Phase 5: read per-spec argmax results
-    int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
-    float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
-    const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
+    // read per-spec argmax results
+    int32_t * argmax  = llama_get_logits_argmax(ctx_dft);
+    const int K_flat  = llama_get_logits_argmax_k(ctx_dft);
 
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
@@ -2269,10 +2234,8 @@ void common_speculative_draft_batch(
 
     const int64_t t3 = ggml_time_us();
 
-    LOG_INF("dflash batch draft (%d specs): prepare=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+    LOG_DBG("dflash batch draft (%d specs): prepare=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
             n_ready, (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t3 - t0) / 1e3);
-
-    GGML_UNUSED(argmax_probs);
 }
 
 common_speculative_tree common_speculative_draft_tree(
