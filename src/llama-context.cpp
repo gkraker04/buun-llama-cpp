@@ -1010,12 +1010,6 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cap = (dflash_capture_data *) user_data;
 
-    // skip when the ubatch has no owning slot (multi-seq or beyond --dflash-max-slots)
-    // to avoid cross-slot contamination of layer_hiddens.
-    if (cap->skip_capture) {
-        return false;
-    }
-
     auto h_it = cap->hidden_name_idx.find(t->name);
 
     if (ask) {
@@ -1023,6 +1017,11 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             return true;
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
+            // tape capture is graph-level per-slot — multi-seq ubatches can't
+            // route per-token writes here, so don't intercept on those.
+            if (cap->ubatch_n_seqs_unq > 1) {
+                return false;
+            }
             // with GPU tape, only intercept qkv_mixed (others captured by graph)
             if (cap->active_tape()) {
                 auto it = cap->tape_name_map.find(t->name);
@@ -1035,23 +1034,54 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
     // ask=false: tensor data is ready, read it back
 
-    // hidden state capture — appends this ubatch's hiddens to the buffer.
+    // hidden state capture — appends this ubatch's hiddens to layer_hiddens.
     // dflash_reset_hidden_capture() (called at the top of decode()) zeroes
-    // buf.n_tokens before the ubatch loop, so within one llama_decode() call
-    // the buffer accumulates all ubatches.
+    // buf.n_tokens for every slot before the ubatch loop, so within one
+    // llama_decode() call each slot's buffer accumulates only that slot's
+    // tokens (in their ubatch order) across all ubatches in this decode.
     if (h_it != cap->hidden_name_idx.end()) {
-        auto * slot_hiddens = cap->active_slot_hiddens();
-        GGML_ASSERT(slot_hiddens && h_it->second < slot_hiddens->size());
-        auto & buf = (*slot_hiddens)[h_it->second];
         const int64_t new_embd = t->ne[0];
         const int64_t new_n    = t->ne[1];
 
-        buf.n_embd = new_embd;
-        const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
-        const size_t add_elems = (size_t) new_n * (size_t) new_embd;
-        buf.data.resize(old_elems + add_elems);
-        dflash_read_tensor_to(t, buf.data.data() + old_elems, add_elems);
-        buf.n_tokens += new_n;
+        if (cap->ubatch_n_seqs_unq <= 1) {
+            // single-seq fast path: route the whole tensor to one slot
+            auto * sh = cap->slot_hiddens(cap->ubatch_active_slot);
+            if (!sh) {
+                return true; // no DFlash slot for this seq; skip capture
+            }
+            GGML_ASSERT(h_it->second < sh->size());
+            auto & buf = (*sh)[h_it->second];
+            buf.n_embd = new_embd;
+            const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
+            const size_t add_elems = (size_t) new_n * (size_t) new_embd;
+            buf.data.resize(old_elems + add_elems);
+            dflash_read_tensor_to(t, buf.data.data() + old_elems, add_elems);
+            buf.n_tokens += new_n;
+            return true;
+        }
+
+        // multi-seq scatter: read full tensor once, then route each token's
+        // hidden vector to its owning slot's buffer.
+        GGML_ASSERT(cap->ubatch_seq_id);
+        GGML_ASSERT((int64_t) cap->ubatch_n_tokens == new_n);
+        cap->scatter_buf.resize((size_t) new_embd * (size_t) new_n);
+        dflash_read_tensor_to(t, cap->scatter_buf.data(), cap->scatter_buf.size());
+
+        for (int64_t i = 0; i < new_n; ++i) {
+            const llama_seq_id seq = cap->ubatch_seq_id[i][0];
+            auto * sh = cap->slot_hiddens(seq);
+            if (!sh || h_it->second >= sh->size()) {
+                continue; // seq has no DFlash slot — drop this token's hidden
+            }
+            auto & buf = (*sh)[h_it->second];
+            buf.n_embd = new_embd;
+            const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
+            buf.data.resize(old_elems + (size_t) new_embd);
+            std::memcpy(buf.data.data() + old_elems,
+                        cap->scatter_buf.data() + (size_t) i * (size_t) new_embd,
+                        (size_t) new_embd * sizeof(float));
+            buf.n_tokens += 1;
+        }
         return true;
     }
 
@@ -1211,16 +1241,14 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture) {
         return;
     }
-    // populate recurrent-layer metadata if the caller beat set_tape_recording() to it
-    dflash_ensure_recurrent_setup();
-    if (dflash_capture->recurrent_layer_ids.empty()) {
-        return;
-    }
     if (n_slots < 1) {
         n_slots = 1;
     }
 
-    // keep layer_hiddens outer dim in sync with the tape slot count
+    // Keep layer_hiddens outer dim in sync with the slot count regardless of
+    // whether GPU tape gets allocated. Hidden-state capture is needed by every
+    // DFlash-enabled context (target side); tape allocation only fires for
+    // models with DeltaNet-style recurrent layers (drafter side).
     if (!layer_hiddens.empty() && (int) layer_hiddens.size() != n_slots) {
         const size_t n_capture_layers = layer_hiddens.front().size();
         layer_hiddens.resize(n_slots);
@@ -1229,6 +1257,12 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
                 slot_bufs.resize(n_capture_layers);
             }
         }
+    }
+
+    // populate recurrent-layer metadata if the caller beat set_tape_recording() to it
+    dflash_ensure_recurrent_setup();
+    if (dflash_capture->recurrent_layer_ids.empty()) {
+        return;
     }
 
     // find GPU backend
@@ -2887,24 +2921,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
-        // DFlash: route this ubatch's hidden-state + tape captures to the slot owning its seq_id.
-        // The graph's tape-write guard already restricts capture to n_seqs_unq == 1; multi-seq
-        // ubatches can't capture, so we leave active_tape_idx untouched.
+        // DFlash: stash this ubatch's seq routing for the eval callback. Single-seq
+        // ubatches use the fast path (whole tensor → one slot's layer_hiddens);
+        // multi-seq ubatches scatter per-token to layer_hiddens[seq]. Tape capture
+        // remains gated to single-seq because the graph picks tape buffers globally.
         if (dflash_capture) {
+            dflash_capture->ubatch_seq_id      = ubatch.seq_id;
+            dflash_capture->ubatch_n_tokens    = ubatch.n_tokens;
+            dflash_capture->ubatch_n_seqs_unq  = ubatch.n_seqs_unq;
+            dflash_capture->ubatch_active_slot = -1;
+
             if (ubatch.n_seqs_unq == 1) {
-                const int seq = ubatch.seq_id_unq[0];
+                const llama_seq_id seq = ubatch.seq_id_unq[0];
+                // Hidden-state slot validity is bounded by layer_hiddens (which
+                // exists for any DFlash-enabled context). Tape slot validity is
+                // bounded by tapes (only allocated for recurrent target models).
+                if (dflash_capture->hiddens &&
+                    seq >= 0 && seq < (int) dflash_capture->hiddens->size()) {
+                    dflash_capture->ubatch_active_slot = seq;
+                }
                 if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                     set_active_dflash_slot(seq);
-                    dflash_capture->skip_capture = false;
-                } else {
-                    // seq has no DFlash slot (e.g. beyond --dflash-max-slots);
-                    // disable capture so we don't corrupt another slot's hiddens.
-                    dflash_capture->skip_capture = true;
                 }
-            } else {
-                // multi-seq ubatch: graph tape-write is guarded off; also skip
-                // capture so mixed hiddens don't get routed to the wrong slot.
-                dflash_capture->skip_capture = true;
             }
         }
 

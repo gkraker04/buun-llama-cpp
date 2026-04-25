@@ -114,10 +114,23 @@ struct dflash_capture_data {
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     int active_tape_idx = 0;
 
-    // When the current ubatch belongs to a seq with no allocated DFlash slot
-    // (e.g. beyond --dflash-max-slots), set this to true so the eval callback
-    // skips hidden-state capture instead of contaminating another slot's buffer.
-    bool skip_capture = false;
+    // Per-ubatch routing metadata, written by the decode loop before each
+    // process_ubatch() call. Used by the eval callback to scatter hidden-state
+    // captures into per-slot layer_hiddens buffers when one ubatch carries
+    // tokens for multiple slots (concurrent multi-slot DFlash).
+    //
+    // ubatch_active_slot:
+    //   >= 0  single-seq ubatch with a valid DFlash slot — fast path writes
+    //         the whole ubatch's tensor directly to layer_hiddens[slot].
+    //   -1    multi-seq ubatch (scatter per-token via ubatch_seq_id), or
+    //         single-seq ubatch whose seq has no DFlash slot (skip capture).
+    int                          ubatch_active_slot = -1;
+    const llama_seq_id * const * ubatch_seq_id      = nullptr; // [n_tokens] -> seq id list
+    uint32_t                     ubatch_n_tokens    = 0;
+    uint32_t                     ubatch_n_seqs_unq  = 0;
+
+    // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
+    std::vector<float> scatter_buf;
 
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
@@ -130,6 +143,13 @@ struct dflash_capture_data {
             return nullptr;
         }
         return &(*hiddens)[active_tape_idx];
+    }
+
+    std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
+        if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
+            return nullptr;
+        }
+        return &(*hiddens)[slot];
     }
 
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
