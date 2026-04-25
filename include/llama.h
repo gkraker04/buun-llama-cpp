@@ -378,6 +378,12 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // [EXPERIMENTAL] DFlash drafter: initial number of cross-attention slots.
+        // Sets the drafter graph width at reservation. Clamped to [1, LLAMA_DFLASH_MAX_SLOTS].
+        // Set this BEFORE llama_init_from_model — runtime widening past this value requires
+        // a larger compute buffer than was allocated at init.
+        int32_t dflash_n_slots;
     };
 
     struct llama_model_tensor_override {

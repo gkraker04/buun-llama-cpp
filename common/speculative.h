@@ -38,7 +38,10 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 // have been freed. Returns nullptr if the speculative params have no draft model.
 // topk / sample_temp / other per-ctx_dft config is applied here so the shared
 // context is fully configured before it is wired into any common_speculative.
-llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params);
+// dflash_n_slots: initial DFlash drafter graph width (1 for non-DFlash or single-slot).
+// Sets cparams_dft.dflash_n_slots before llama_init_from_model so the initial reserve
+// allocates a compute buffer sized for the target slot count.
+llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots = 1);
 
 common_speculative * common_speculative_init(
         common_params_speculative & params,

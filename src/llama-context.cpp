@@ -67,6 +67,13 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // DFlash: drafter graph width = n_slots × LLAMA_DFLASH_PER_SLOT_CTX. Set at init so the
+    // initial graph reserve allocates a compute buffer large enough for the requested width.
+    {
+        const int n_slots_req = (params.dflash_n_slots <= 0) ? 1 : params.dflash_n_slots;
+        cparams.dflash_n_slots = std::max(1, std::min(n_slots_req, (int) LLAMA_DFLASH_MAX_SLOTS));
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -4172,6 +4179,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.dflash_n_slots              =*/ 1,
     };
 
     return result;

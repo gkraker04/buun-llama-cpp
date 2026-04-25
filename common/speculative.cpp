@@ -1781,11 +1781,15 @@ done:
 // initialization of the speculative decoding system
 //
 // [CHECKPOINT B0.1] ctx_dft factory (shared-ownership foundation)
-llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params) {
+llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots) {
     if (!params.model_dft) {
         return nullptr;
     }
-    llama_context * ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+    // Take cparams_dft by value so we can stamp dflash_n_slots before init without
+    // mutating the caller's params struct.
+    llama_context_params cparams_dft = params.cparams_dft;
+    cparams_dft.dflash_n_slots = (dflash_n_slots <= 0) ? 1 : dflash_n_slots;
+    llama_context * ctx_dft = llama_init_from_model(params.model_dft, cparams_dft);
     if (ctx_dft == nullptr) {
         LOG_ERR("%s", "failed to create draft context\n");
         return nullptr;

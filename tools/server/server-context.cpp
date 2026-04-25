@@ -845,16 +845,16 @@ private:
 
             // [CHECKPOINT B0.3] create the shared DFlash drafter context once;
             // every slot's common_speculative gets a non-owning reference to it.
-            ctx_dft_shared.reset(common_speculative_create_ctx_dft(params_base.speculative));
+            // dflash_slots_cap is passed at init so the initial graph reserve sizes
+            // the compute buffer for the requested width — single-slot servers stay
+            // narrow (cheap), multi-slot servers get a compute buffer big enough for
+            // the batched cross-attention. Runtime widening past this cap requires a
+            // larger compute buffer than is available.
+            ctx_dft_shared.reset(common_speculative_create_ctx_dft(params_base.speculative, dflash_slots_cap));
             if (!ctx_dft_shared) {
                 SRV_ERR("%s", "failed to create shared DFlash drafter context\n");
                 return false;
             }
-
-            // Size the drafter graph for the actual number of DFlash-eligible slots.
-            // Default is 1 (narrow graph), so single-slot servers avoid paying the
-            // multi-slot attention cost. This triggers a graph reserve on next decode.
-            llama_set_dflash_n_slots(ctx_dft_shared.get(), dflash_slots_cap);
         }
 
         // initialize slots
