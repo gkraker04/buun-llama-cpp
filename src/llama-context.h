@@ -373,6 +373,7 @@ public:
     void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
+    void set_dflash_n_slots(int n);
 
     // DFlash: reset hidden-state capture for a fresh decode() call so the
     // eval callback accumulates across this call's ubatches

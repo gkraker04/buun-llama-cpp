@@ -54,6 +54,14 @@ struct llama_cparams {
     // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
     int dflash_topk = 1;
 
+    // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
+    // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
+    // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the
+    // drafter context (not the target) via llama_set_dflash_n_slots(). Default 1
+    // (single-slot) so the drafter graph stays narrow when no batching is configured.
+    // Capped at LLAMA_DFLASH_MAX_SLOTS.
+    int dflash_n_slots = 1;
+
     // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync)
     dflash_tape_gpu * tape_gpu = nullptr;
 

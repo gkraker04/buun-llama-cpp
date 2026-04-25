@@ -1106,6 +1106,17 @@ void llama_context::set_dflash_topk(int k) {
     gf_res_prev->reset();
 }
 
+void llama_context::set_dflash_n_slots(int n) {
+    const int clamped = std::max(1, std::min(n, (int) LLAMA_DFLASH_MAX_SLOTS));
+    if (cparams.dflash_n_slots == clamped) {
+        return;
+    }
+    cparams.dflash_n_slots = clamped;
+    // drafter graph ctx_len depends on n_slots → force a fresh reserve on next decode
+    sched_need_reserve = true;
+    gf_res_prev->reset();
+}
+
 void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
     // store layer IDs for the graph builder (still needed so qwen35.cpp knows which layers)
     cparams.dflash_capture_layers.clear();
@@ -4408,6 +4419,10 @@ void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
 
 void llama_set_dflash_topk(llama_context * ctx, int k) {
     ctx->set_dflash_topk(k);
+}
+
+void llama_set_dflash_n_slots(llama_context * ctx, int n) {
+    ctx->set_dflash_n_slots(n);
 }
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {

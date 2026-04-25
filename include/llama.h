@@ -1062,6 +1062,13 @@ extern "C" {
     // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
     LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
 
+    // DFlash: set the number of concurrent slots the drafter graph is reserved for.
+    // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
+    // Increases drafter ctx_len (and attention cost) linearly — set to the max slots
+    // the server will actually batch (e.g. --dflash-max-slots). Invalidates graph
+    // cache and forces a reserve on next decode.
+    LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
+
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
     // during verification decode for efficient state replay instead of full re-evaluation

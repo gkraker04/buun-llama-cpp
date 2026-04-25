@@ -850,6 +850,11 @@ private:
                 SRV_ERR("%s", "failed to create shared DFlash drafter context\n");
                 return false;
             }
+
+            // Size the drafter graph for the actual number of DFlash-eligible slots.
+            // Default is 1 (narrow graph), so single-slot servers avoid paying the
+            // multi-slot attention cost. This triggers a graph reserve on next decode.
+            llama_set_dflash_n_slots(ctx_dft_shared.get(), dflash_slots_cap);
         }
 
         // initialize slots

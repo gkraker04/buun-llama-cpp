@@ -109,13 +109,14 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t n_target_features = hparams.dflash_n_target_features;
 
     // [CHECKPOINT B2.1] multi-slot graph shape
-    // Fixed drafter graph shape: reserved for up to MAX_SLOTS × PER_SLOT_CTX context
-    // tokens regardless of how many slots are actually active. At runtime, unused
-    // slot regions are zero-filled (target_hidden) and masked out (-INF in kq_mask),
-    // so a single decode can serve 1..MAX_SLOTS slots without rebuilding the graph.
-    // n_tokens comes from ubatch; the drafter's n_ubatch must be >= MAX_SLOTS × block_size
-    // so reservation sizes the per-token tensors correctly (set in ctx_dft creation).
-    const int64_t ctx_len = (int64_t) LLAMA_DFLASH_MAX_SLOTS * LLAMA_DFLASH_PER_SLOT_CTX;
+    // Drafter graph shape scales with cparams.dflash_n_slots (set via llama_set_dflash_n_slots,
+    // typically at ctx_dft init based on the server's --dflash-max-slots). ctx_len =
+    // n_slots × PER_SLOT_CTX. Single-slot users (default n_slots=1) keep the narrow graph
+    // and pay no overhead; multi-slot users pay proportional attention cost.
+    // At runtime, cparams.dflash_n_slots is treated as the fixed active-slot count:
+    // set_input populates all n_slots with real data or pads/masks unused trailing slots.
+    const int n_slots = std::max(1, std::min((int) cparams.dflash_n_slots, (int) LLAMA_DFLASH_MAX_SLOTS));
+    const int64_t ctx_len = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
 
     const int64_t n_kv_total = ctx_len + n_tokens;
 
