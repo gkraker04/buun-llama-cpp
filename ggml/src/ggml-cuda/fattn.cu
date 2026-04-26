@@ -408,35 +408,37 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
     return 1.0f;
 }
 
-static void load_tcq_decode_alpha() {
-    if (d_tcq_decode_alpha_loaded) return;
-    d_tcq_decode_alpha_loaded = true;
-    const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V");
-    if (s) {
-        char * end;
-        errno = 0;
-        float a = strtof(s, &end);
-        if (end == s || errno != 0 || a <= 0.0f || a >= 10.0f) {
-            fprintf(stderr, "TCQ: invalid TURBO_TCQ_DECODE_ALPHA_V='%s'\n", s);
-        } else {
-            d_tcq_decode_alpha_v_static = a;
-            cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &a, sizeof(float));
-            fprintf(stderr, "TCQ decode: V alpha=%.4f (static override)\n", a);
+static void load_tcq_decode_alpha(int device) {
+    static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
+    if (loaded[device]) return;
+    loaded[device] = true;
+    if (!d_tcq_decode_alpha_loaded) {
+        d_tcq_decode_alpha_loaded = true;
+        const char * sk = getenv("TURBO_TCQ_DECODE_ALPHA_K");
+        if (sk) {
+            char * end;
+            errno = 0;
+            float a = strtof(sk, &end);
+            if (end != sk && errno == 0 && a > 0.0f && a < 10.0f) {
+                d_tcq_decode_alpha_k = a;
+                fprintf(stderr, "TCQ decode: K alpha=%.4f\n", a);
+            }
         }
-    } else {
-        fprintf(stderr, "TCQ decode: context-adaptive V alpha enabled\n");
+        const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V");
+        if (s) {
+            char * end;
+            errno = 0;
+            float a = strtof(s, &end);
+            if (end != s && errno == 0 && a > 0.0f && a < 10.0f) {
+                d_tcq_decode_alpha_v_static = a;
+            }
+        }
     }
-    const char * sk = getenv("TURBO_TCQ_DECODE_ALPHA_K");
-    if (sk) {
-        char * end;
-        errno = 0;
-        float a = strtof(sk, &end);
-        if (end == sk || errno != 0 || a <= 0.0f || a >= 10.0f) {
-            fprintf(stderr, "TCQ: invalid TURBO_TCQ_DECODE_ALPHA_K='%s'\n", sk);
-        } else {
-            d_tcq_decode_alpha_k = a;
-            fprintf(stderr, "TCQ decode: K alpha=%.4f\n", a);
-        }
+    if (d_tcq_decode_alpha_v_static > 0.0f) {
+        cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &d_tcq_decode_alpha_v_static, sizeof(float));
+        if (device == 0) fprintf(stderr, "TCQ decode: V alpha=%.4f (static override)\n", d_tcq_decode_alpha_v_static);
+    } else {
+        if (device == 0) fprintf(stderr, "TCQ decode: context-adaptive V alpha enabled\n");
     }
 }
 
@@ -888,7 +890,7 @@ static __global__ void k_turbo_fwht_forward(
 }
 
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    load_tcq_decode_alpha();
+    load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -923,9 +925,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
             {
-                static bool tcq_fattn_k_cb_loaded = false;
-                if (!tcq_fattn_k_cb_loaded) {
-                    tcq_fattn_k_cb_loaded = true;
+                static bool tcq_fattn_k_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                if (!tcq_fattn_k_cb_loaded[device]) {
+                    tcq_fattn_k_cb_loaded[device] = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB");
                     if (cb_path) {
                         float cb[512];
@@ -933,7 +935,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 512, f) == 512) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
-                            fprintf(stderr, "TCQ K prefill: loaded codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ K prefill: loaded codebook from %s (device %d)\n", cb_path, device);
                         } else {
                             if (f) fclose(f);
                             fprintf(stderr, "TCQ K prefill: FAILED to load codebook from %s\n", cb_path);
@@ -945,9 +947,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
             {
-                static bool tcq2_fattn_k_cb_loaded = false;
-                if (!tcq2_fattn_k_cb_loaded) {
-                    tcq2_fattn_k_cb_loaded = true;
+                static bool tcq2_fattn_k_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                if (!tcq2_fattn_k_cb_loaded[device]) {
+                    tcq2_fattn_k_cb_loaded[device] = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB2");
                     if (cb_path) {
                         float cb[256];
@@ -955,7 +957,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 256, f) == 256) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
-                            fprintf(stderr, "TCQ2 K prefill: loaded 2-bit codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ2 K prefill: loaded 2-bit codebook from %s (device %d)\n", cb_path, device);
                         } else {
                             if (f) fclose(f);
                             fprintf(stderr, "TCQ2 K prefill: FAILED to load codebook from %s\n", cb_path);
@@ -994,9 +996,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
             // Runtime codebook loading for 3-bit V decode (in case K is a different type)
             {
-                static bool tcq_fattn_v_cb_loaded = false;
-                if (!tcq_fattn_v_cb_loaded) {
-                    tcq_fattn_v_cb_loaded = true;
+                static bool tcq_fattn_v_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                if (!tcq_fattn_v_cb_loaded[device]) {
+                    tcq_fattn_v_cb_loaded[device] = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB");
                     if (cb_path) {
                         float cb[512];
@@ -1004,7 +1006,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 512, f) == 512) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
-                            fprintf(stderr, "TCQ V decode: loaded 3-bit codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ V decode: loaded 3-bit codebook from %s (device %d)\n", cb_path, device);
                         } else {
                             if (f) fclose(f);
                         }
@@ -1016,9 +1018,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
             // Runtime codebook loading for 2-bit V decode (in case K is a different type)
             {
-                static bool tcq2_fattn_v_cb_loaded = false;
-                if (!tcq2_fattn_v_cb_loaded) {
-                    tcq2_fattn_v_cb_loaded = true;
+                static bool tcq2_fattn_v_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                if (!tcq2_fattn_v_cb_loaded[device]) {
+                    tcq2_fattn_v_cb_loaded[device] = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB2");
                     if (cb_path) {
                         float cb[256];
@@ -1026,7 +1028,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 256, f) == 256) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
-                            fprintf(stderr, "TCQ2 V decode: loaded 2-bit codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ2 V decode: loaded 2-bit codebook from %s (device %d)\n", cb_path, device);
                         } else {
                             if (f) fclose(f);
                         }
@@ -1539,7 +1541,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
-        load_tcq_decode_alpha();
+        load_tcq_decode_alpha(ctx.device);
 
         // Update VEC __constant__ alpha for context-adaptive mode
         if (d_tcq_decode_alpha_v_static == 0.0f &&
@@ -1550,9 +1552,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         // Load runtime codebooks for TCQ types (needed by both dequant and native VEC paths)
         if (K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ) {
-            static bool tcq3_cb_loaded = false;
-            if (!tcq3_cb_loaded) {
-                tcq3_cb_loaded = true;
+            static bool tcq3_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq3_cb_loaded[ctx.device]) {
+                tcq3_cb_loaded[ctx.device] = true;
                 const char *cb_path = getenv("TURBO_TCQ_CB");
                 if (cb_path) {
                     float cb[512];
@@ -1560,7 +1562,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     if (f && fread(cb, sizeof(float), 512, f) == 512) {
                         fclose(f);
                         cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
-                        fprintf(stderr, "TCQ decode: loaded 3-bit codebook from %s\n", cb_path);
+                        fprintf(stderr, "TCQ decode: loaded 3-bit codebook from %s (device %d)\n", cb_path, ctx.device);
                     } else {
                         if (f) fclose(f);
                         fprintf(stderr, "TCQ decode: FAILED to load 3-bit codebook from %s\n", cb_path);
@@ -1569,9 +1571,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             }
         }
         if (K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
-            static bool tcq2_cb_loaded = false;
-            if (!tcq2_cb_loaded) {
-                tcq2_cb_loaded = true;
+            static bool tcq2_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq2_cb_loaded[ctx.device]) {
+                tcq2_cb_loaded[ctx.device] = true;
                 const char *cb_path = getenv("TURBO_TCQ_CB2");
                 if (cb_path) {
                     float cb[256];
@@ -1579,7 +1581,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     if (f && fread(cb, sizeof(float), 256, f) == 256) {
                         fclose(f);
                         cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
-                        fprintf(stderr, "TCQ decode: loaded 2-bit codebook from %s\n", cb_path);
+                        fprintf(stderr, "TCQ decode: loaded 2-bit codebook from %s (device %d)\n", cb_path, ctx.device);
                     } else {
                         if (f) fclose(f);
                         fprintf(stderr, "TCQ decode: FAILED to load 2-bit codebook from %s\n", cb_path);

@@ -787,7 +787,9 @@ private:
             }
 
             if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type =  COMMON_SPECULATIVE_TYPE_NONE;
+                params_base.speculative.type      = COMMON_SPECULATIVE_TYPE_NONE;
+                params_base.speculative.model_dft  = nullptr;
+                model_dft.reset();
                 SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
             }
         }

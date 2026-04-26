@@ -4,10 +4,10 @@
 #include <cstring>
 #include <cerrno>
 
-static void load_turbo4_alpha() {
-    static bool loaded = false;
-    if (loaded) return;
-    loaded = true;
+static void load_turbo4_alpha(int device) {
+    static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
+    if (loaded[device]) return;
+    loaded[device] = true;
     const char *s = getenv("TURBO4_ALPHA");
     if (!s) return;
     char *end;
@@ -17,14 +17,14 @@ static void load_turbo4_alpha() {
         fprintf(stderr, "TURBO4: invalid TURBO4_ALPHA='%s'\n", s);
     } else {
         cudaMemcpyToSymbol(d_turbo4_alpha, &a, sizeof(float));
-        fprintf(stderr, "TURBO4: alpha=%.3f\n", a);
+        fprintf(stderr, "TURBO4: alpha=%.3f (device %d)\n", a, device);
     }
 }
 
-static void load_tcq_norm_alpha() {
-    static bool loaded = false;
-    if (loaded) return;
-    loaded = true;
+static void load_tcq_norm_alpha(int device) {
+    static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
+    if (loaded[device]) return;
+    loaded[device] = true;
 
     // Context-adaptive decode-time alpha is the default. Force encode-time V alpha to 1.0
     // unless TURBO_TCQ_ENCODE_ALPHA=1 is explicitly set to use encode-time alpha instead.
@@ -32,7 +32,7 @@ static void load_tcq_norm_alpha() {
     if (!encode_mode) {
         float one = 1.0f;
         cudaMemcpyToSymbol(d_tcq_norm_alpha_v, &one, sizeof(float));
-        fprintf(stderr, "TCQ: encode V alpha=1.0 (context-adaptive decode-time alpha active)\n");
+        if (device == 0) fprintf(stderr, "TCQ: encode V alpha=1.0 (context-adaptive decode-time alpha active)\n");
         // Still allow K alpha override
         const char *s = getenv("TURBO_TCQ_ALPHA");
         if (s) {
@@ -83,14 +83,17 @@ static void load_tcq_norm_alpha() {
 }
 
 // TCQ error dump for autocorrelation analysis (TURBO_TCQ_DUMP_ERRORS=N)
+// Only active on the first device that triggers it (diagnostic tool, not perf-critical)
 static int    tcq_dump_n = 0;
+static int    tcq_dump_device = -1;
 static float * tcq_dump_x_host = nullptr;
 static uint8_t * tcq_dump_out_host = nullptr;
 static float * tcq_dump_x_dev = nullptr;
 static uint8_t * tcq_dump_out_dev = nullptr;
 
 static void tcq_error_dump_flush() {
-    if (tcq_dump_n == 0) return;
+    if (tcq_dump_n == 0 || tcq_dump_device < 0) return;
+    ggml_cuda_set_device(tcq_dump_device);
     cudaMemcpy(tcq_dump_x_host, tcq_dump_x_dev, tcq_dump_n * 128 * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(tcq_dump_out_host, tcq_dump_out_dev, tcq_dump_n * 128 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
     FILE * f = fopen("/tmp/tcq_errors.bin", "wb");
@@ -108,15 +111,22 @@ static void tcq_error_dump_flush() {
     free(tcq_dump_out_host);
 }
 
-static void init_tcq_error_dump() {
-    static bool loaded = false;
-    if (loaded) return;
-    loaded = true;
+static void init_tcq_error_dump(int device) {
+    static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
+    if (loaded[device]) return;
+    loaded[device] = true;
     const char *s = getenv("TURBO_TCQ_DUMP_ERRORS");
     if (!s) return;
     int n = atoi(s);
     if (n <= 0 || n > 500000) return;
+    // Only allocate dump buffers on the first device that requests them
+    if (tcq_dump_device >= 0) {
+        // Already allocated on another device — just set the symbol pointers for this device
+        cudaMemcpyToSymbol(d_tcq_dump_max, &n, sizeof(int));
+        return;
+    }
     tcq_dump_n = n;
+    tcq_dump_device = device;
     tcq_dump_x_host = (float *)malloc(n * 128 * sizeof(float));
     tcq_dump_out_host = (uint8_t *)malloc(n * 128 * sizeof(uint8_t));
     cudaMalloc(&tcq_dump_x_dev, n * 128 * sizeof(float));
@@ -336,15 +346,15 @@ static void set_rows_cuda(
     }
 }
 
-// Global backtrace buffer for Viterbi (replaces 32KB shared memory per block)
-static uint8_t * tcq_bt_buf = nullptr;
-static int64_t   tcq_bt_buf_bytes = 0;
+// Per-device backtrace buffer for Viterbi (replaces 32KB shared memory per block)
+static uint8_t * tcq_bt_buf[GGML_CUDA_MAX_DEVICES] = {};
+static int64_t   tcq_bt_buf_bytes[GGML_CUDA_MAX_DEVICES] = {};
 
-static void ensure_tcq_bt_buf(int64_t bytes_needed) {
-    if (bytes_needed <= tcq_bt_buf_bytes) return;
-    if (tcq_bt_buf) cudaFree(tcq_bt_buf);
-    cudaMalloc(&tcq_bt_buf, bytes_needed);
-    tcq_bt_buf_bytes = bytes_needed;
+static void ensure_tcq_bt_buf(int device, int64_t bytes_needed) {
+    if (bytes_needed <= tcq_bt_buf_bytes[device]) return;
+    if (tcq_bt_buf[device]) cudaFree(tcq_bt_buf[device]);
+    cudaMalloc(&tcq_bt_buf[device], bytes_needed);
+    tcq_bt_buf_bytes[device] = bytes_needed;
 }
 
 template<typename src_t, typename idx_t>
@@ -485,7 +495,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
-        load_turbo4_alpha();
+        load_turbo4_alpha(ctx.device);
         set_rows_cuda_quant<idx_t, block_turbo4_0, QK_TURBO4, quantize_f32_turbo4_0_block>(
             src0_d, src1_d, (block_turbo4_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
@@ -493,32 +503,34 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
-        // Runtime codebook loading: TURBO_TCQ_CB overrides compiled-in codebook
-        static bool tcq_cb_loaded = false;
-        if (!tcq_cb_loaded) {
-            tcq_cb_loaded = true;
-            const char *cb_path = getenv("TURBO_TCQ_CB");
-            if (cb_path) {
-                float cb[512];
-                FILE *f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 512, f) == 512) {
-                    fclose(f);
-                    cudaMemcpyToSymbol(d_turbo3_tcq_codebook, cb, 512*sizeof(float));
-                    fprintf(stderr, "TCQ encode: loaded codebook from %s\n", cb_path);
-                } else {
-                    if (f) fclose(f);
-                    fprintf(stderr, "TCQ encode: FAILED to load codebook from %s\n", cb_path);
+        // Runtime codebook loading: TURBO_TCQ_CB overrides compiled-in codebook (per-device)
+        {
+            static bool tcq_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq_cb_loaded[ctx.device]) {
+                tcq_cb_loaded[ctx.device] = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB");
+                if (cb_path) {
+                    float cb[512];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo3_tcq_codebook, cb, 512*sizeof(float));
+                        fprintf(stderr, "TCQ encode: loaded codebook from %s (device %d)\n", cb_path, ctx.device);
+                    } else {
+                        if (f) fclose(f);
+                        fprintf(stderr, "TCQ encode: FAILED to load codebook from %s\n", cb_path);
+                    }
                 }
+                load_tcq_norm_alpha(ctx.device);
+                init_tcq_error_dump(ctx.device);
             }
-            load_tcq_norm_alpha();
-            init_tcq_error_dump();
         }
         // TCQ Viterbi encode: 512 threads per block, global bt buffer (128×512 bytes/block)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            ensure_tcq_bt_buf(ne_total_groups * 128 * 512);
+            ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 512);
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
@@ -526,39 +538,41 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO2_TCQ;
-        // Runtime codebook loading: TURBO_TCQ_CB2 overrides compiled-in 2-bit codebook
-        static bool tcq2_cb_loaded = false;
-        if (!tcq2_cb_loaded) {
-            tcq2_cb_loaded = true;
-            const char *cb_path = getenv("TURBO_TCQ_CB2");
-            if (cb_path) {
-                float cb[256];
-                FILE *f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 256, f) == 256) {
-                    fclose(f);
-                    cudaMemcpyToSymbol(d_turbo2_tcq_codebook, cb, 256*sizeof(float));
-                    fprintf(stderr, "TCQ2 encode: loaded 2-bit codebook from %s\n", cb_path);
-                } else {
-                    if (f) fclose(f);
-                    fprintf(stderr, "TCQ2 encode: FAILED to load codebook from %s\n", cb_path);
+        // Runtime codebook loading: TURBO_TCQ_CB2 overrides compiled-in 2-bit codebook (per-device)
+        {
+            static bool tcq2_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq2_cb_loaded[ctx.device]) {
+                tcq2_cb_loaded[ctx.device] = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB2");
+                if (cb_path) {
+                    float cb[256];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo2_tcq_codebook, cb, 256*sizeof(float));
+                        fprintf(stderr, "TCQ2 encode: loaded 2-bit codebook from %s (device %d)\n", cb_path, ctx.device);
+                    } else {
+                        if (f) fclose(f);
+                        fprintf(stderr, "TCQ2 encode: FAILED to load codebook from %s\n", cb_path);
+                    }
                 }
+                load_tcq_norm_alpha(ctx.device);
+                init_tcq_error_dump(ctx.device);
             }
-            load_tcq_norm_alpha();
-            init_tcq_error_dump();
         }
         // 2-bit TCQ Viterbi encode: 256 threads per block, global bt buffer (128×256 bytes/block)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            ensure_tcq_bt_buf(ne_total_groups * 128 * 256);
+            ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 256);
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
@@ -566,7 +580,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, 0, stream>>>(
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
