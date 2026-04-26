@@ -1110,6 +1110,7 @@ private:
         }
 
         // find the slot that has been least recently used
+        // prefer spec-capable (DFlash) slots so requests get speculative decoding
         if (ret == nullptr) {
             int64_t t_last = -1;
 
@@ -1119,11 +1120,13 @@ private:
                     continue;
                 }
 
-                // select the current slot if the criteria match
-                // on ties, prefer spec-capable slots so requests land on DFlash/draft
-                // slots rather than non-speculative fallback slots
-                if (!ret || slot.t_last_used < t_last ||
-                    (slot.t_last_used == t_last && slot.can_speculate() && !ret->can_speculate())) {
+                // strongly prefer spec-capable slots: pick a spec slot over a non-spec
+                // slot regardless of LRU, then use LRU within the same capability tier
+                const bool curr_spec = ret && ret->can_speculate();
+                const bool slot_spec = slot.can_speculate();
+                if (!ret ||
+                    (slot_spec && !curr_spec) ||
+                    (slot_spec == curr_spec && slot.t_last_used < t_last)) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
