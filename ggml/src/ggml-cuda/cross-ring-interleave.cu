@@ -1,4 +1,8 @@
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
+#endif
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>

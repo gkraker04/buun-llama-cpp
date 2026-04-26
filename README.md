@@ -45,8 +45,6 @@ cmake -B build \
 cmake --build build -j$(nproc)
 ```
 
-Measured on RX 7900 XTX with Qwen*-27B Q4_K_M targets and the DFlash draft: AR ~27 tok/s, DFlash ~51 tok/s on Qwen3.5 (×1.88), ~43 tok/s on Qwen3.6 (×1.61). Build also produces a working `llama-server` with `--spec-type dflash`.
-
 ## Recommended configurations
 
 ### turbo4 (4.25 bpv) -- lossless quality, great compression
