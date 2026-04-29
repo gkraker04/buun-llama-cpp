@@ -739,7 +739,6 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     __shared__ int warp_min_idx[16];
     __shared__ float warp_min_cost[16];
     __shared__ float pred_min_cost[64];
-    __shared__ uint8_t pred_min_p[64];
     __shared__ int shared_initial_state;
 
     if (sid < 128) x[sid] = grp_src[sid];
@@ -846,7 +845,6 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
                 }
             }
             pred_min_cost[sid] = best;
-            pred_min_p[sid] = (uint8_t) best_p;
             bt[t * 64 + sid] = (uint8_t) best_p;
         }
         __syncthreads();
@@ -876,13 +874,21 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         }
     }
     __syncthreads();
-    if (sid == 0) {
-        float best = warp_min_cost[0];
-        int best_idx = warp_min_idx[0];
-        for (int w = 1; w < 16; w++) {
-            if (warp_min_cost[w] < best) { best = warp_min_cost[w]; best_idx = warp_min_idx[w]; }
+    if (sid < 32) {
+        float best = (sid < 16) ? warp_min_cost[sid] : 3.4028234663852886e38f;
+        int best_idx = (sid < 16) ? warp_min_idx[sid] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_down_sync(0xFFFFFFFFULL, best, offset);
+            int other_idx = __shfl_down_sync(0xFFFFFFFFULL, best_idx, offset);
+            if (other_cost < best) {
+                best = other_cost;
+                best_idx = other_idx;
+            }
         }
-        shared_initial_state = best_idx; // temporarily: best final state (becomes initial after backtrack)
+        if (sid == 0) {
+            shared_initial_state = best_idx; // temporarily: best final state (becomes initial after backtrack)
+        }
     }
     __syncthreads();
 
