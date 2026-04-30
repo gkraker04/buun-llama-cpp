@@ -1986,6 +1986,12 @@ void llama_context::allocate_tree_buffers(int max_tree_tokens) {
         return;
     }
 
+    if (getenv("GGML_NO_TREE_VERIFY")) {
+        LLAMA_LOG_INFO("%s: GGML_NO_TREE_VERIFY set — disabling tree verify, using flat chain\n", __func__);
+        tree_bufs.disabled = true;
+        return;
+    }
+
     // Free existing
     if (tree_bufs.buffer) {
         ggml_backend_buffer_free(tree_bufs.buffer);
