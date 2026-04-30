@@ -45,6 +45,9 @@ cmake -B build \
 cmake --build build -j$(nproc)
 ```
 
+#### [For Windows ROCM](https://github.com/lemonade-sdk/llamacpp-rocm/blob/main/docs/manual_instructions.md)
+Test on ROCm 7.13 + AMD Radeon AI PRO R9700
+
 ## Recommended configurations
 
 ### turbo4 (4.25 bpv) -- lossless quality, great compression
