@@ -908,7 +908,7 @@ static __global__ void k_turbo_fwht_forward(
 
     // Q² calibration: accumulate per-position squared values
     if (d_q_calibrate_fattn) {
-        atomicAdd(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
+        atomicAdd_double(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
         if (threadIdx.x == 0) atomicAdd(&d_q_channel_count_fattn, 1);
     }
 }
