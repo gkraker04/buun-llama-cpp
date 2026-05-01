@@ -495,6 +495,29 @@ void llama_context::sched_reserve() {
     }
 
     if (cparams.auto_fgdn) {
+        // Fused GDN kernels are only tested on NVIDIA CUDA. Disable on ROCm/MUSA/other.
+        bool have_cuda_gpu = false;
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                const char * reg_name = ggml_backend_reg_name(reg);
+                if (reg_name && strncmp(reg_name, "CUDA", 4) == 0) {
+                    have_cuda_gpu = true;
+                }
+                break;
+            }
+        }
+
+        if (!have_cuda_gpu) {
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+            cparams.auto_fgdn    = false;
+            LLAMA_LOG_INFO("%s: fused Gated Delta Net disabled (non-CUDA backend)\n", __func__);
+        }
+    }
+
+    if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
         if (cparams.fused_gdn_ar) {
