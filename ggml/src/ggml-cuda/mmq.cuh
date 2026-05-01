@@ -122,7 +122,10 @@ static int get_mmq_x_max_host_for_type(const int cc) {
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) {
+            case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
             case GGML_TYPE_Q3_K:
                 return mmq_x_max < 64 ? mmq_x_max : 64;
             default:
