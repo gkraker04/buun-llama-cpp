@@ -1415,6 +1415,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
+        {"--no-fused-gdn"},
+        "disable fused Gated Delta Net kernels (use decomposed ops instead)",
+        [](common_params & params) {
+            params.no_fused_gdn = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {
