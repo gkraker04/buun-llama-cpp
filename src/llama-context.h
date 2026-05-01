@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
@@ -24,17 +25,6 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
-
-// "memory" as in physical memory for a buffer type, in bytes
-struct llama_memory_breakdown_data {
-    size_t model   = 0; // memory allocated for the model
-    size_t context = 0; // memory allocated for the context
-    size_t compute = 0; // memory allocated for temporary compute buffers
-
-    size_t total() const {
-        return model + context + compute;
-    }
-};
 
 // DFlash: hidden state buffer for captured layer activations
 struct dflash_layer_hidden_buf {
@@ -169,7 +159,6 @@ struct dflash_capture_data {
         }
     }
 };
-
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -314,7 +303,7 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
-    std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
+    llama_memory_breakdown memory_breakdown() const;
 
     //
     // training

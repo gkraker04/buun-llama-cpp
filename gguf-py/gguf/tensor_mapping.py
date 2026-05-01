@@ -1365,6 +1365,8 @@ class TensorNameMap:
             "visual.merger.mlp.{bid}", # qwen2vl
             "mlp_AR.linear_{bid}", # PaddleOCR-VL
             "merger.mlp.{bid}",
+            "vision_tower.merger.mlp.{bid}", # dots.ocr
+            "vit.perceive.proj.{bid}", # HunyuanOCR (proj.0 = conv1, proj.2 = conv2)
         ),
 
         MODEL_TENSOR.V_MMPROJ_FC: (
@@ -1372,6 +1374,7 @@ class TensorNameMap:
             "model.vision.linear_proj.linear_proj", # cogvlm
             "model.projector.layers", # Deepseek-OCR
             "visual.merger.proj", # glm4v
+            "vit.perceive.mlp", # HunyuanOCR
         ),
 
         MODEL_TENSOR.V_MMPROJ_MLP: (
@@ -1399,6 +1402,7 @@ class TensorNameMap:
             "model.vision_tower.embeddings.patch_embeddings.projection", # Intern-S1
             "vpm.embeddings.patch_embedding",
             "model.vision_model.embeddings.patch_embedding", # SmolVLM
+            "vit.embeddings.patch_embedding", # HunyuanOCR
             "vision_tower.patch_conv", # pixtral-hf
             "vision_encoder.patch_conv", # pixtral
             "vision_model.patch_embedding.linear", # llama 4
@@ -1409,10 +1413,13 @@ class TensorNameMap:
             "siglip2.vision_model.embeddings.patch_embedding",
             "vision_model.radio_model.model.patch_generator.embedder", # Nemotron Nano v2 VL
             "model.vision_tower.patch_embedder.input_proj", # gemma4
+            "vision_tower.patch_embed.patchifier.proj", # dots.ocr
+            "vision_model.conv1", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_NORM: (
             "visual.post_conv_layernorm", # glm4v
+            "vision_tower.patch_embed.patchifier.norm", # dots.ocr
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_POS: (
@@ -1420,6 +1427,7 @@ class TensorNameMap:
             "model.vision_tower.embeddings.position_embeddings", # Intern-S1
             "vpm.embeddings.position_embedding",
             "model.vision_model.embeddings.position_embedding", # SmolVLM
+            "vit.embeddings.position_embedding", # HunyuanOCR
             "vision_model.positional_embedding_vlm", # llama 4
             "vision_tower.patch_embed.pos_emb", # kimi-vl
             "visual.pos_embed", # qwen3vl
@@ -1427,22 +1435,27 @@ class TensorNameMap:
             "visual.embeddings.position_embedding", # glm4v
             "vision_model.radio_model.model.patch_generator.pos_embed", # Nemotron Nano v2 VL
             "model.vision_tower.patch_embedder.position_embedding_table", # gemma4
+            "vision_model.positional_embedding", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_IMGNL: (
             "model.image_newline",  # Deepseek-OCR
+            "vit.perceive.image_newline", # HunyuanOCR
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_VSEP: (
             "model.view_seperator",  # Deepseek-OCR
+            "vit.perceive.image_sep", # HunyuanOCR
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_QKV: (
             "visual.blocks.{bid}.attn.qkv", # qwen3vl
+            "vision_tower.blocks.{bid}.attn.qkv", # dots.ocr
             "model.vision.transformer.layers.{bid}.attention.query_key_value", # cogvlm
             "model.vision_model.transformer.layers.{bid}.self_attn.qkv_proj", # Deepseek-OCR CLIP
             "vision_tower.encoder.blocks.{bid}.wqkv", # Kimi-K2.5
             "vision_model.radio_model.model.blocks.{bid}.attn.qkv", # Nemotron Nano v2 VL
+            "vision_model.transformer.resblocks.{bid}.attn.in_proj", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q: (
@@ -1450,6 +1463,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.q_proj", # Intern-S1
             "vpm.encoder.layers.{bid}.self_attn.q_proj",
             "model.vision_model.encoder.layers.{bid}.self_attn.q_proj", # SmolVLM
+            "vit.layers.{bid}.self_attn.q_proj", # HunyuanOCR
             "vision_model.model.layers.{bid}.self_attn.q_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.q_proj", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.attention.wq", # pixtral
@@ -1472,6 +1486,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.k_proj", # Intern-S1
             "vpm.encoder.layers.{bid}.self_attn.k_proj",
             "model.vision_model.encoder.layers.{bid}.self_attn.k_proj", # SmolVLM
+            "vit.layers.{bid}.self_attn.k_proj", # HunyuanOCR
             "vision_model.model.layers.{bid}.self_attn.k_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.k_proj", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.attention.wk", # pixtral
@@ -1494,6 +1509,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.v_proj", # Intern-S1
             "vpm.encoder.layers.{bid}.self_attn.v_proj",
             "model.vision_model.encoder.layers.{bid}.self_attn.v_proj", # SmolVLM
+            "vit.layers.{bid}.self_attn.v_proj", # HunyuanOCR
             "vision_model.model.layers.{bid}.self_attn.v_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.v_proj", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.attention.wv", # pixtral
@@ -1510,6 +1526,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.layernorm_before", # Intern-S1
             "vpm.encoder.layers.{bid}.layer_norm1",
             "model.vision_model.encoder.layers.{bid}.layer_norm1", # SmolVLM
+            "vit.layers.{bid}.input_layernorm", # HunyuanOCR
             "vision_tower.transformer.layers.{bid}.attention_norm", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.attention_norm", # pixtral
             "vision_model.model.layers.{bid}.input_layernorm", # llama4, gemma4
@@ -1519,6 +1536,8 @@ class TensorNameMap:
             "model.vision_model.transformer.layers.{bid}.layer_norm1", # Deepseek-OCR CLIP
             "siglip2.vision_model.encoder.layers.{bid}.layer_norm1",
             "vision_model.radio_model.model.blocks.{bid}.norm1", # Nemotron Nano v2 VL
+            "vision_tower.blocks.{bid}.norm1", # dots.ocr
+            "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -1527,6 +1546,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.attention.projection_layer", # Intern-S1
             "vpm.encoder.layers.{bid}.self_attn.out_proj",
             "model.vision_model.encoder.layers.{bid}.self_attn.out_proj", # SmolVLM
+            "vit.layers.{bid}.self_attn.o_proj", # HunyuanOCR
             "model.vision_model.encoder.layers.{bid}.self_attn.projection_layer", # Janus Pro
             "vision_model.model.layers.{bid}.self_attn.o_proj", # llama4
             "vision_tower.transformer.layers.{bid}.attention.o_proj", # pixtral-hf
@@ -1538,6 +1558,8 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.self_attn.out_proj", # youtuvl
             "vision_model.radio_model.model.blocks.{bid}.attn.proj", # Nemotron Nano v2 VL
             "vision_model.model.layers.{bid}.self_attn.o_proj.linear", # gemma4
+            "vision_tower.blocks.{bid}.attn.proj", # dots.ocr
+            "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_POST_ATTN_NORM: (
@@ -1546,6 +1568,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.layernorm_after", # Intern-S1
             "vpm.encoder.layers.{bid}.layer_norm2",
             "model.vision_model.encoder.layers.{bid}.layer_norm2", # SmolVLM
+            "vit.layers.{bid}.post_attention_layernorm", # HunyuanOCR
             "vision_model.model.layers.{bid}.post_attention_layernorm", # llama4
             "vision_tower.transformer.layers.{bid}.ffn_norm", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.ffn_norm", # pixtral
@@ -1556,6 +1579,8 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.layer_norm2",
             "vision_model.radio_model.model.blocks.{bid}.norm2", # Nemotron Nano v2 VL
             "vision_model.model.layers.{bid}.pre_feedforward_layernorm", # gemma4
+            "vision_tower.blocks.{bid}.norm2", # dots.ocr
+            "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -1563,6 +1588,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.mlp.fc1", # Intern-S1
             "vpm.encoder.layers.{bid}.mlp.fc1",
             "model.vision_model.encoder.layers.{bid}.mlp.fc1", # SmolVLM, gemma3
+            "vit.layers.{bid}.mlp.dense_h_to_4h", # HunyuanOCR
             "vision_tower.transformer.layers.{bid}.feed_forward.up_proj", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.feed_forward.w3", # pixtral
             "vision_model.model.layers.{bid}.mlp.fc1", # llama4
@@ -1575,6 +1601,7 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.mlp.fc1",
             "vision_model.radio_model.model.blocks.{bid}.mlp.fc1", # Nemotron Nano v2 VL
             "vision_model.model.layers.{bid}.mlp.up_proj", # gemma4
+            "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_FFN_GATE: (
@@ -1589,6 +1616,7 @@ class TensorNameMap:
             "model.vision_tower.encoder.layer.{bid}.mlp.fc2", # Intern-S1
             "vpm.encoder.layers.{bid}.mlp.fc2",
             "model.vision_model.encoder.layers.{bid}.mlp.fc2", # SmolVLM, gemma3
+            "vit.layers.{bid}.mlp.dense_4h_to_h", # HunyuanOCR
             "vision_tower.transformer.layers.{bid}.feed_forward.down_proj", # pixtral-hf
             "vision_encoder.transformer.layers.{bid}.feed_forward.w2", # pixtral
             "vision_model.model.layers.{bid}.mlp.fc2", # llama4
@@ -1601,6 +1629,7 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.mlp.fc2",
             "vision_model.radio_model.model.blocks.{bid}.mlp.fc2", # Nemotron Nano v2 VL
             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
+            "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_POST_NORM: (
@@ -1614,11 +1643,13 @@ class TensorNameMap:
         MODEL_TENSOR.V_LAYER_SCALE_1: (
             "vision_tower.vision_model.encoder.layers.{bid}.ls1", # InternVL
             "model.vision_tower.encoder.layer.{bid}.lambda_1", # Intern-S1
+            "vision_model.transformer.resblocks.{bid}.ls_1", # Step3-VL
         ),
 
         MODEL_TENSOR.V_LAYER_SCALE_2: (
             "vision_tower.vision_model.encoder.layers.{bid}.ls2", # InternVL
             "model.vision_tower.encoder.layer.{bid}.lambda_2", # Intern-S1
+            "vision_model.transformer.resblocks.{bid}.ls_2", # Step3-VL
         ),
 
         MODEL_TENSOR.V_LAYER_OUT_SCALE: (
@@ -1631,6 +1662,8 @@ class TensorNameMap:
             "vision_encoder.ln_pre", # pixtral
             "vision_model.layernorm_pre", # llama4
             "model.vision_model.pre_layrnorm", # Deepseek-OCR CLIP
+            "vision_tower.patch_embed.patchifier.norm", # dots.ocr
+            "vision_model.ln_pre", # Step3-VL
         ),
 
         MODEL_TENSOR.V_POST_NORM: (
@@ -1645,6 +1678,8 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_MM_POST_NORM: (
             "visual.merger.post_projection_norm", # glm4v
+            "vision_tower.post_trunk_norm", # dots.ocr
+            "vit.perceive.after_rms", # HunyuanOCR
         ),
 
         MODEL_TENSOR.V_MM_INP_PROJ: (
@@ -1660,6 +1695,7 @@ class TensorNameMap:
             "model.vision.linear_proj.norm1", # cogvlm
             "mlp_AR.pre_norm", # PaddleOCR-VL
             "merger.ln_q",
+            "vision_tower.merger.ln_q", # dots.ocr
         ),
 
         MODEL_TENSOR.V_MM_SOFT_EMB_NORM: (
@@ -1812,6 +1848,18 @@ class TensorNameMap:
             "model.vision.eoi", # cogvlm
         ),
 
+        MODEL_TENSOR.V_MM_PRE_NORM: (
+            "vit.perceive.before_rms", # HunyuanOCR
+        ),
+
+        MODEL_TENSOR.V_TOK_IMG_BEGIN: (
+            "vit.perceive.image_begin", # HunyuanOCR
+        ),
+
+        MODEL_TENSOR.V_TOK_IMG_END: (
+            "vit.perceive.image_end", # HunyuanOCR
+        ),
+
         MODEL_TENSOR.V_STD_BIAS: (
             "model.vision_tower.std_bias", # gemma4
         ),
@@ -1848,6 +1896,14 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_INP_PROJ: (
             "conformer.subsample_conv_projection.input_proj_linear", # gemma4
+        ),
+
+        MODEL_TENSOR.A_ENC_CONV2D: (
+            "audio_tower.conv2d{bid}", # qwen3omni
+        ),
+
+        MODEL_TENSOR.A_ENC_CONV_OUT: (
+            "audio_tower.conv_out", # qwen3omni
         ),
 
         MODEL_TENSOR.A_PRE_NORM: (),
@@ -1999,8 +2055,9 @@ class TensorNameMap:
         # this prefix is added in the conversion code in modify_tensors()
 
         MODEL_TENSOR.A_MMPROJ: (
-            "audio.multi_modal_projector.linear_{bid}", # ultravox
-            "audio_adapter.model.{bid}" # lfm2
+            "audio.multi_modal_projector.linear_{bid}", # ultravox, meralion
+            "audio_adapter.model.{bid}", # lfm2
+            "audio_tower.proj{bid}", # qwen3omni
         ),
 
         MODEL_TENSOR.A_MMPROJ_FC: (
