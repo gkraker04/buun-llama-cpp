@@ -3804,16 +3804,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--draft", "--draft-n", "--draft-max"}, "N",
-        "the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max",
-        [](common_params & /*params*/, int /*value*/) {
-            throw std::invalid_argument("the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max");
+        string_format("(compat alias for --spec-draft-n-max) max draft tokens (default: %d)", params.speculative.draft.n_max),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_max = value;
+            params.speculative.n_max       = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
-        "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
-        [](common_params & /*params*/, int /*value*/) {
-            throw std::invalid_argument("the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min");
+        string_format("(compat alias for --spec-draft-n-min) min draft tokens (default: %d)", params.speculative.draft.n_min),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min = value;
+            params.speculative.n_min       = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
     add_opt(common_arg(
