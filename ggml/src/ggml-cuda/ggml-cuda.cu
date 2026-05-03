@@ -1499,7 +1499,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     // sub-matrices. cuBLAS treats these as invalid parameters and aborts
     // with CUBLAS_STATUS_INVALID_VALUE. Zero-size GEMMs are defined as
     // no-ops (no output written), matching OpenBLAS and MKL behavior.
-    if (row_diff == 0 || src1_ncols == 0 || ne10 == 0) {
+    if (row_diff == 0 || src1_ncols == 0 || ne10 == 0 || ne00 == 0 || ldc == 0) {
         return;
     }
 
