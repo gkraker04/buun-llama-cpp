@@ -392,6 +392,17 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 </details>
 
 
+
+
+## CI Build Fixes
+
+This section documents recent fixes to the CI build system that address compilation errors on Android and Windows with CUDA 12.4.
+
+- **Portability fix for atomicAdd on MSVC/CUDA 12.4**: Added `atomicAdd_double` function to safely perform atomic additions on double values, ensuring compatibility with MSVC's limited atomic operation support.
+- **Marking unused parameters**: Used `GGML_UNUSED` macro for dequant stub functions to suppress unused parameter warnings that were causing build failures on Android.
+- **Avoiding -Werror on Android**: Marked unused variables in dequant stubs to prevent the Android NDK build from failing due to strict warning-as-error settings.
+
+These changes ensure that the repository builds successfully on Android and Windows platforms with CUDA 12.4, resolving issues that arose from changes in the upstream build system.
 ## Supported backends
 
 | Backend | Target devices |
