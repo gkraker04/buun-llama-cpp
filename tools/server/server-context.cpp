@@ -902,12 +902,6 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type      = COMMON_SPECULATIVE_TYPE_NONE;
-                params_base.speculative.model_dft  = nullptr;
-                model_dft.reset();
-                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
-            }
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx))) {
@@ -1012,10 +1006,6 @@ private:
                 // speculative types, ctx_dft_shared is null and init creates its own.
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx, ctx_dft_shared.get()));
                 if (slot.spec) {
-                    if (mctx) {
-                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
-                        return false;
-                    }
                     // DFlash: tag every drafter call from this slot with its own
                     // seq_id so the shared ctx_dft routes cross-data per slot.
                     common_speculative_set_seq_id(slot.spec.get(), slot.id);
@@ -2434,10 +2424,6 @@ private:
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
-                }
 
                 // use pre-computed batched draft if available, else single-slot
                 llama_tokens draft;
