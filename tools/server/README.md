@@ -55,6 +55,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
 | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
+| `--no-fused-gdn` | disable fused Gated Delta Net kernels (use decomposed ops instead) |
 | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
 | `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |
 | `--rope-scaling {none,linear,yarn}` | RoPE frequency scaling method, defaults to linear unless specified by the model<br/>(env: LLAMA_ARG_ROPE_SCALING_TYPE) |
@@ -231,8 +232,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--sleep-idle-seconds SECONDS` | number of seconds of idleness after which the server will sleep (default: -1; -1 = disabled) |
 | `-td, --threads-draft N` | number of threads to use during generation (default: same as --threads) |
 | `-tbd, --threads-batch-draft N` | number of threads to use during batch and prompt processing (default: same as --threads-draft) |
-| `--draft, --draft-n, --draft-max N` | number of tokens to draft for speculative decoding (default: 16)<br/>(env: LLAMA_ARG_DRAFT_MAX) |
-| `--draft-min, --draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_DRAFT_MIN) |
+| `--draft, --draft-n, --draft-max N` | (compat alias for --spec-draft-n-max) max draft tokens (default: 16)<br/>(env: LLAMA_ARG_DRAFT_MAX) |
+| `--draft-min, --draft-n-min N` | (compat alias for --spec-draft-n-min) min draft tokens (default: 0)<br/>(env: LLAMA_ARG_DRAFT_MIN) |
 | `--draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.75)<br/>(env: LLAMA_ARG_DRAFT_P_MIN) |
 | `-cd, --ctx-size-draft N` | size of the prompt context for the draft model (default: 0, 0 = loaded from model)<br/>(env: LLAMA_ARG_CTX_SIZE_DRAFT) |
 | `-devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
@@ -243,6 +244,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-ngram-size-n N` | ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: 12) |
 | `--spec-ngram-size-m N` | ngram size M for ngram-simple/ngram-map speculative decoding, length of draft m-gram (default: 48) |
 | `--spec-ngram-min-hits N` | minimum hits for ngram-map speculative decoding (default: 1) |
+| `--dflash-max-slots N` | max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: auto)<br/>(env: LLAMA_ARG_DFLASH_MAX_SLOTS) |
+| `--spec-dflash-default` | enable default DFlash speculative decoding config (requires -md) |
 | `-mv, --model-vocoder FNAME` | vocoder model for audio generation (default: unused) |
 | `--tts-use-guide-tokens` | Use guide tokens to improve TTS word recall |
 | `--embd-gemma-default` | use default EmbeddingGemma model (note: can download weights from the internet) |
