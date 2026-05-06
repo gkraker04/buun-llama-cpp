@@ -2005,6 +2005,11 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
+    // check limits before allocating — evict old entries to make room
+    if (limit_size > 0 && !evict_to_fit(state_size, true)) {
+        return nullptr;
+    }
+
     std::vector<uint8_t> state_data;
 
     // check if we can allocate enough memory for the new state
@@ -2013,7 +2018,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+        limit_size = std::max<size_t>(1, 0.4 * size());
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
@@ -2084,41 +2089,45 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+bool server_prompt_cache::evict_to_fit(size_t needed, bool log) {
+    if (limit_size == 0) {
+        return true; // no limit
+    }
+
+    // new entry alone exceeds budget — don't touch the cache, just bail out
+    if (needed > limit_size) {
+        if (log) {
+            SRV_WRN(" - cache state too large (%.3f MiB) to fit within limit (%.3f MiB), skipping\n",
+                    needed / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        }
+
+        return false;
+    }
+
+    // evict oldest entries until there is room — we know it will fit eventually
+    // because the entry alone is <= limit_size, so clearing everything guarantees space
+    size_t projected = size() + needed;
+    while (projected > limit_size && !states.empty()) {
+        if (log) {
+            SRV_WRN(" - cache size limit reached (%.3f MiB), removing oldest entry (%.3f MiB) to make room\n",
+                    projected / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
+        }
+
+        projected -= states.front().size();
+        states.pop_front();
+    }
+
+    return true;
+}
+
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
+    // evict entries that are over the budget with no new allocation pending
+    if (limit_size > 0 && size() > limit_size) {
+        evict_to_fit(0, true);
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
-
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
-
-    if (limit_tokens > 0) {
-        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
-    }
-
-    SRV_WRN(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_WRN(" - cache state: %zu prompts, %.3f MiB (limit: %.3f MiB)\n",
+            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
 
     for (const auto & state : states) {
         SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

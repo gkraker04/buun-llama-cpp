@@ -631,7 +631,7 @@ struct server_prompt_cache {
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
-    // in tokens, 0 = no limit
+    // in tokens, 0 = no limit (deprecated — size-only enforcement)
     size_t limit_tokens = 0;
 
     size_t size() const;
@@ -643,4 +643,11 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx, int32_t id_slot);
 
     void update();
+
+private:
+    // Evict oldest entries until there is room for `needed` bytes or the cache is empty.
+    // Returns true if eviction made enough room (or nothing was needed), false if the
+    // cache was cleared and the limit is still exceeded — i.e., a single entry exceeds
+    // the budget. When log=true, each eviction is logged.
+    bool evict_to_fit(size_t needed, bool log);
 };
