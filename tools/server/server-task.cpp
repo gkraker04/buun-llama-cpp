@@ -2005,6 +2005,24 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
+    // skip if a single entry alone exceeds the entire cache budget
+    if (limit_size > 0 && state_size > limit_size) {
+        SRV_WRN(" - cache state too large (%.3f MiB) to fit within limit (%.3f MiB), skipping\n",
+                state_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+
+        return nullptr;
+    }
+
+    // evict oldest entries to make room before allocating — prevents OOM from cache growing past budget
+    if (limit_size > 0 && size() + state_size > limit_size) {
+        while (states.size() > 1 && size() + state_size > limit_size) {
+            SRV_WRN(" - cache size limit reached (%.3f MiB), removing oldest entry (%.3f MiB)\n",
+                    (size() + state_size) / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
+        }
+    }
+
     std::vector<uint8_t> state_data;
 
     // check if we can allocate enough memory for the new state
@@ -2013,7 +2031,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
-        limit_size = std::max<size_t>(1, 0.4*size());
+        limit_size = std::max<size_t>(1, 0.4 * size());
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
