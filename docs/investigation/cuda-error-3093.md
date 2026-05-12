@@ -82,6 +82,43 @@ With `-ngl -2` (partial offload), recurrent layers -1 and -2 live on CPU. The ta
 3. **Verify hidden state dims for vision tokens**: Ensure eval_callback captures with correct `n_embd` regardless of token type (text vs vision)
 4. **Test partial offload path**: Verify ring_write correctly handles host-buffered layer hiddens for partially-offloaded recurrent layers when mmproj is loaded
 
+## Cross-Configuration Findings
+
+### Crash reproduces across KV quant types
+| Log | KV Type | Parallel | Context | Crash Phase |
+|-----|---------|----------|---------|-------------|
+| 20-52-03 | turbo4 | 1 slot | 131072 | First gen token verify (12 tok) |
+| 21-02-33 | turbo4 | 1 slot | 96512 | First gen token verify (12 tok) |
+| 21-15-51 | turbo2_tcq | 2 slots (--parallel 2) | 175872 | Mid-decode draft batch (9 tok) |
+
+**Critical**: Crash is NOT limited to TCQ. Reproduces with both turbo4 and turbo2_tcq, ruling out our previous narrow hypothesis that TCQ + parallel was the sole trigger. The crash path shared across configs points to DFlash + mmproj interaction itself.
+
+### Backward Position Pattern Before Crash (Logs 1 & 2)
+```
+find_slot: position 14937 after 14932 with 8 new tokens     ← DFlash draft (forward gap)
+verify ubatch: 12 tok                                         ← first gen token verify OK
+done request: POST /v1/chat/completions 200
+spec cycle: accept=11.9ms                                     ← 11 tokens accepted
+find_slot: position 14931 after 14933 with 1 new tokens      ← BACKWARDS! copyspec suffix lookup
+CUDA error: illegal memory access ~250ms later               ← crash at synchronize
+```
+
+The backward position (14931 after 14933) comes from copyspec's secondary impl doing suffix-based speculation, looking up a historical position behind the current cell. The crash fires during the next `cudaStreamSynchronize` — likely in `tape_replay_sync()` or the next decode graph execution where the GDN kernel accesses recurrent state that was modified by tape replay on a different stream.
+
+### Tape Replay + Partial Offload Interaction
+With `-ngl -2` (partial offload, last 2 layers on CPU):
+- Recurrent S state: 576 MiB across 64 layers, 4 cells
+- R state (DeltaNet): 22.5 MiB
+- Fix #44 added host-memory fallback for `tape_replay()` GPU path
+- But `append_target_hiddens` → `ring_write` → GPU ring upload uses `cudaMemcpyAsync(..., cudaMemcpyHostToDevice)` regardless of offload config
+- The GDN kernel for partially-offloaded layers may access state tensors that live on different devices
+
+### Hypothesis Refinement
+**Primary suspect**: During spec cycles with mmproj loaded, the verify batch decode triggers `tape_replay` which launches an async GDN graph. The next synchronize (either in `tape_replay_sync()` or in the subsequent `sched_reserve()` when cross-attention bucket changes) catches a CUDA illegal memory access from:
+1. GDN kernel accessing a recurrent state tensor that was partially modified by tape replay conv rebuild
+2. Concat K/V tensors in drafter attention with mismatched dimensions during transition phases
+3. GPU ring buffer staging data not fully synchronized before target model reads it
+
 ## Server Arguments (from log 1)
 
 ```
@@ -90,3 +127,11 @@ llama-server -m Qwen3.6-27B-Q4_K_M.gguf --mmproj mmproj-BF16.gguf
   --port 8080 --threads 6 --threads-batch 6
   --draft-max 16 -b 256 -ub 64
 ```
+
+## To Do / Fix Plan
+
+1. **Reproduce with DFlash-only** (disable copyspec) — isolate whether copyspec backward-position pattern triggers crash
+2. **Reproduce with mmproj unloaded** — confirm crash is mmproj-specific
+3. **Add CUDA error context logging** in `ggml-cuda.cu:3093` — log last kernel or add cudaGetError before synchronize to catch which operation faults
+4. **Verify tape_replay stream isolation** — ensure GDN replay graph uses separate stream/device from target decode graph, especially with partial offload
+5. **Test with `-ngl 99` (full offload)** — eliminate partial-offload as variable
