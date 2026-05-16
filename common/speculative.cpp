@@ -1562,9 +1562,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         if (!prefill_flushed) {
             // first flush for this request — reset ring
+            // WARNING: GPU ring is NOT cleared here. After reset, positions [0, n_tokens)
+            // are overwritten by ring_write() below, but positions [n_tokens, ctx_window)
+            // retain stale data from the PREVIOUS slot. This stale data is only read
+            // if build_cross_data() is called with gpu_filled < ctx_window before the
+            // ring wraps around again — which is the common case for short-prompt slots.
+            // To prevent stale-data corruption, we memset the GPU ring on reset.
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
+
+            // Clear GPU ring to prevent stale cross-slot data from being read
+            // by the interleave kernel during the first build_cross_data() calls
+            if (gpu_ring_handle) {
+                llama_dflash_cross_ring_gpu_clear(gpu_ring_handle, n_target_layers);
+            }
         }
 
         ring_write((int)n_tokens);

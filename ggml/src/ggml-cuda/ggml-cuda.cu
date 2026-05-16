@@ -5428,6 +5428,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // DFlash GPU cross-attention ring (cross-ring-interleave.cu)
 extern "C" void * dflash_cross_ring_gpu_alloc(int, int, int);
 extern "C" void   dflash_cross_ring_gpu_free(void *);
+extern "C" void   dflash_cross_ring_gpu_clear(void *, int);
 extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, int, int);
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
@@ -5463,6 +5464,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "dflash_cross_ring_gpu_write") == 0) {
         return (void *)dflash_cross_ring_gpu_write;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_clear") == 0) {
+        return (void *)dflash_cross_ring_gpu_clear;
     }
     if (strcmp(name, "dflash_cross_ring_gpu_interleave") == 0) {
         return (void *)dflash_cross_ring_gpu_interleave;

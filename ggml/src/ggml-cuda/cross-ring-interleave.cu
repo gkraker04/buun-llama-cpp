@@ -114,6 +114,23 @@ extern "C" void dflash_cross_ring_gpu_free(void * handle) {
     delete ring;
 }
 
+// Clear all GPU ring buffers to zero — called when the ring is reset for a new slot
+// to prevent stale inter-slot data from being read by the interleave kernel.
+extern "C" void dflash_cross_ring_gpu_clear(void * handle, int n_layers) {
+    if (!handle) return;
+    auto * ring = (dflash_cross_ring_gpu *)handle;
+    (void)cudaSetDevice(ring->device);
+    for (int l = 0; l < n_layers && l < ring->n_layers; l++) {
+        cudaMemsetAsync(ring->h_layer_ptrs[l], 0,
+            (size_t)ring->ring_size * ring->n_embd * sizeof(float),
+            cudaStreamPerThread);
+    }
+    // Also clear the staging buffer
+    cudaMemsetAsync(ring->d_staging, 0,
+        (size_t)ring->ring_size * ring->n_layers * ring->n_embd * sizeof(float),
+        cudaStreamPerThread);
+}
+
 // Upload host data to a specific position in the GPU ring for one layer.
 // Handles wrap-around: if ring_pos + n_tokens > ring_size, splits into two copies.
 extern "C" void dflash_cross_ring_gpu_write(

@@ -4732,6 +4732,7 @@ struct dflash_cross_ring_handle {
     void   (*fn_write)(void *, int, int, const float *, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    void   (*fn_clear)(void *, int);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -4752,12 +4753,14 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
     using interleave_fn_t = const float * (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
+    using clear_fn_t      = void   (*)(void *, int);
 
     auto fn_alloc      = (alloc_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc");
     auto fn_free       = (free_fn_t)       ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_free");
     auto fn_write      = (write_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write");
     auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_interleave");
     auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor");
+    auto fn_clear      = (clear_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_clear");
 
     if (!fn_alloc || !fn_free || !fn_write || !fn_interleave || !fn_set_tensor) {
         return nullptr;
@@ -4772,6 +4775,7 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_write      = fn_write;
     handle->fn_interleave = fn_interleave;
     handle->fn_set_tensor = fn_set_tensor;
+    handle->fn_clear      = fn_clear;
     return handle;
 }
 
@@ -4784,6 +4788,14 @@ void llama_dflash_cross_ring_gpu_free(void * handle) {
     auto * h = (dflash_cross_ring_handle *)handle;
     h->fn_free(h->gpu_ring);
     delete h;
+}
+
+void llama_dflash_cross_ring_gpu_clear(void * handle, int n_layers) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_clear) {
+        h->fn_clear(h->gpu_ring, n_layers);
+    }
 }
 
 void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd) {
