@@ -129,6 +129,19 @@ extern "C" void dflash_cross_ring_gpu_clear(void * handle, int n_layers) {
     cudaMemsetAsync(ring->d_staging, 0,
         (size_t)ring->ring_size * ring->n_layers * ring->n_embd * sizeof(float),
         cudaStreamPerThread);
+
+    // Full device sync: ensures the ring memsets complete AND any pending GPU
+    // work on other streams (target's backend stream, drafter's backend stream)
+    // is finished before the calling code proceeds. This prevents use-after-free:
+    // target's sched_reserve() only syncs the target's backend stream. If the
+    // drafter has pending work on cudaStreamPerThread (interleave kernel, D2D
+    // copies) or its own backend stream (decode graph), and target's sched_reserve
+    // frees+reallocates compute buffers, the drafter's still-running kernels
+    // access freed GPU memory → illegal memory access.
+    // NOTE: cudaDeviceSynchronize is expensive but this only fires on slot
+    // transitions (flush_prefill at the start of a new prefill), not on every
+    // decode step.
+    cudaDeviceSynchronize();
 }
 
 // Upload host data to a specific position in the GPU ring for one layer.
