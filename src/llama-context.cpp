@@ -4808,6 +4808,7 @@ void llama_dflash_cross_ring_gpu_sync_streams(void) {
     typedef void (*sync_fn_t)(void);
     static sync_fn_t fn_sync = nullptr;
     static bool resolved = false;
+    static bool sync_found = false;
 
     if (!resolved) {
         resolved = true;
@@ -4816,12 +4817,17 @@ void llama_dflash_cross_ring_gpu_sync_streams(void) {
             auto * name = ggml_backend_reg_name(reg);
             if (name && strstr(name, "CUDA")) {
                 fn_sync = (sync_fn_t)ggml_backend_reg_get_proc_address(reg, "dflash_cross_ring_gpu_device_sync");
+                sync_found = fn_sync != nullptr;
+                fprintf(stderr, "I sched_reserve: DFlash sync proc address resolution: %s (CUDA reg=%s)\n",
+                        sync_found ? "FOUND" : "NOT FOUND", name);
                 break;
             }
         }
     }
     if (fn_sync) {
+        fprintf(stderr, "I sched_reserve: calling dflash_cross_ring_gpu_device_sync...\n");
         fn_sync();
+        fprintf(stderr, "I sched_reserve: dflash_cross_ring_gpu_device_sync completed\n");
     }
 }
 
