@@ -1451,6 +1451,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (gpu_ring_handle) {
             int gpu_write_pos = ring_write_pos % ctx_window;
             int gpu_filled = std::min(ring_filled, ctx_window);
+            LOG_DBG("dflash cross: seq=%d GPU ring write_pos=%d filled=%d n_layers=%d n_embd=%d window=%d\n",
+                    seq_id, gpu_write_pos, gpu_filled, n_target_layers, n_embd, ctx_window);
             llama_dflash_cross_ring_gpu_set_cross(ctx, gpu_ring_handle, seq_id,
                 gpu_write_pos, gpu_filled, n_target_layers, n_embd, ctx_window);
             return gpu_filled;
@@ -1960,11 +1962,20 @@ private:
     // src_offset in the capture buffer. wraps circularly in the ring.
     void ring_write(int n_tokens, int src_offset = 0) {
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        int prev_write_pos = ring_write_pos;
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
             if (!data || ntok <= 0) continue;
+
+            // Guard: captured hidden state n_embd must match expected model n_embd.
+            // If they differ (e.g. mmproj encoder output with mismatched dims),
+            // the GPU ring writes would use wrong stride and corrupt adjacent data.
+            if (embd != n_embd) {
+                LOG_WRN("dflash ring: layer %d embd=%lld != n_embd=%d — skipping GPU upload\n",
+                        layer, (long long)embd, n_embd);
+            }
 
             int to_write = std::min(n_tokens, (int)ntok - src_offset);
             for (int t = 0; t < to_write; ++t) {
@@ -1975,14 +1986,19 @@ private:
             }
 
             // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
-            if (gpu_ring_handle && to_write > 0) {
+            if (gpu_ring_handle && to_write > 0 && embd == n_embd) {
                 int gpu_pos = ring_write_pos % ctx_window;
                 llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
-                    data + (size_t)src_offset * embd, to_write, embd);
+                    data + (size_t)src_offset * embd, to_write, (int)embd);
             }
         }
         ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
         ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
+
+        // Diagnostic: log ring state after every write for cross-session analysis
+        LOG_DBG("dflash ring: wrote %d tok (+%d ntok) pos=%d->%d filled=%d committed=%d\n",
+                n_tokens, n_tokens,
+                prev_write_pos, ring_write_pos, ring_filled, committed_len);
     }
 
     // called after initial prefill — grab all hidden states

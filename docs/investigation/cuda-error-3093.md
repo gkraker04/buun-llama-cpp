@@ -75,12 +75,37 @@ The GPU D2D path (`fn_set_tensor_d2d`) copies from the ring staging buffer using
 
 With `-ngl -2` (partial offload), recurrent layers -1 and -2 live on CPU. The tape_replay fix (#44) handles this for replay, but the hidden state capture path (`append_target_hiddens` → `ring_write`) doesn't check whether the layer's hidden state buffer is host memory before writing to the GPU ring. Writing H2D data from a host-buffered tensor could cause an illegal device access when the drafter kernel tries to read it.
 
-## Next Steps / Fix Plan
+## To Do / Fix Plan
 
-1. **Add CUDA error context**: Before `cudaStreamSynchronize` in ggml-cuda.cu:3093, capture the last launched kernel identity via logging or cudaGetError before/after key DFlash operations
-2. **Check ring buffer bounds**: Add assertions to verify `ring_write_pos`, `ring_filled`, and GPU staging buffer dimensions are consistent during spec cycles with mmproj
-3. **Verify hidden state dims for vision tokens**: Ensure eval_callback captures with correct `n_embd` regardless of token type (text vs vision)
-4. **Test partial offload path**: Verify ring_write correctly handles host-buffered layer hiddens for partially-offloaded recurrent layers when mmproj is loaded
+1. ~~Add CUDA error context** in `ggml-backend_cuda_synchronize` — log device and error string before aborting~~ ✅ Done (commit 1)
+2. ~~Add `n_embd` consistency guard in `ring_write()` — skip GPU write path when captured hidden state dim != expected `n_embd`~~ ✅ Done (commit 1)
+3. ~~Add CUDA error checks in `dflash_cross_ring_gpu_interleave` — check both launch and sync errors, with full context logging~~ ✅ Done (commit 1)
+4. ~~Add bounds validation in `dflash_cross_ring_gpu_write` — verify `n_embd` matches ring allocation before writing~~ ✅ Done (commit 1)
+5. ~~Add ring buffer diagnostic logging — log ring state (`write_pos`, `filled`, `committed_len`) on every write and cross-data build~~ ✅ Done (commit 1)
+6. **Test with `-ngl 99` (full offload)** — eliminate partial offload as variable
+7. **Test with `--no-copyspec`** — disable copyspec secondary to test if backward-position pattern triggers crash
+8. **Test with mmproj unloaded** — confirm crash is mmproj-specific
+
+## Fixes Applied (May 2026)
+
+These fixes were implemented on `fix/cuda-error-3093` branch:
+
+### Commit 1: cuda-error-3093 diagnostic guards and bounds checks
+
+**Files changed**: 3 files, +48/-4 lines
+
+1. **`ggml/src/ggml-cuda/ggml-cuda.cu`** — `ggml_backend_cuda_synchronize`:
+   - Now captures `cudaStreamSynchronize` return value explicitly, logs device ID and error string before forwarding to `CUDA_CHECK_GEN` abort
+   - Helps identify which device faulted (relevant for multi-GPU setups)
+
+2. **`ggml/src/ggml-cuda/cross-ring-interleave.cu`** — GPU ring operations:
+   - `dflash_cross_ring_gpu_write`: Added `n_embd` bounds guard — if caller passes mismatched `n_embd` vs ring allocation, skips the write with a diagnostic instead of silently corrupting adjacent ring data
+   - `dflash_cross_ring_gpu_interleave`: Added explicit `cudaGetLastError` after kernel launch and `cudaStreamSynchronize` error check, both with full context (read_start, cross_len, ring_size, layers, embd) logged to stderr
+
+3. **`common/speculative.cpp`** — `ring_write` and `build_cross_data`:
+   - `ring_write`: Added `embd != n_embd` guard that warns and skips GPU upload when dimensions mismatch
+   - `ring_write`: Added diagnostic logging of ring state (write_pos before/after, filled, committed_len) at DEBUG level
+   - `build_cross_data` GPU path: Added diagnostic logging of seq_id, write_pos, filled, n_layers, n_embd, ctx_window
 
 ## Cross-Configuration Findings
 

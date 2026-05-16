@@ -129,6 +129,13 @@ extern "C" void dflash_cross_ring_gpu_write(
     // which GPU the caller (target model decode) last set as current.
     (void)cudaSetDevice(ring->device);
 
+    // Bounds guard: validate n_embd matches ring allocation
+    if (n_embd != ring->n_embd) {
+        fprintf(stderr, "dflash gpu ring write: layer %d n_embd=%d != ring->n_embd=%d — SKIPPING (would corrupt ring)\n",
+                layer, n_embd, ring->n_embd);
+        return;
+    }
+
     float * dst = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
 
@@ -172,8 +179,23 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
         ring->n_layers,
         ring->n_embd);
 
+    // Check for launch errors immediately (not just at synchronize)
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "dflash gpu ring: k_cross_ring_interleave launch error: %s "
+                "(read_start=%d cross_len=%d ring_size=%d layers=%d embd=%d)\n",
+                cudaGetErrorString(launch_err),
+                read_start, cross_len, ring->ring_size, ring->n_layers, ring->n_embd);
+    }
+
     // sync so staging is ready before drafter decode reads it
-    cudaStreamSynchronize(cudaStreamPerThread);
+    cudaError_t sync_err = cudaStreamSynchronize(cudaStreamPerThread);
+    if (sync_err != cudaSuccess) {
+        fprintf(stderr, "dflash gpu ring: k_cross_ring_interleave sync error: %s "
+                "(read_start=%d cross_len=%d ring_size=%d layers=%d embd=%d)\n",
+                cudaGetErrorString(sync_err),
+                read_start, cross_len, ring->ring_size, ring->n_layers, ring->n_embd);
+    }
 
     return ring->d_staging;
 }
