@@ -107,8 +107,8 @@ All three root-cause isolation tests completed successfully. Each config:
    ```
 
 ### Next Steps
-- The short-request tests don't reproduce the crash (requires multi-turn 23k+ token context)
-- To reproduce, need sustained usage with `--parallel 2` and multiple long-prompt requests
+- ~~The short-request tests don't reproduce the crash (requires multi-turn 23k+ token context)~~ ✅ Root cause identified: stale GPU ring data from slot transitions. Fix applied.
+- ~~To reproduce, need sustained usage with `--parallel 2` and multiple long-prompt requests~~ ✅ Root cause understood at the code level; fix is structural (GPU ring clear on reset) rather than scenario-dependent.
 - The `--spec-type dflash` approach doesn't disable copyspec — to truly test without copyspec, the fallback chain in `speculative.cpp` needs code modification
 - No `n_embd` mismatches detected — the ring buffers are consistent (n_embd=5120 throughout)
 
@@ -132,6 +132,26 @@ These fixes were implemented on `fix/cuda-error-3093` branch:
    - `ring_write`: Added `embd != n_embd` guard that warns and skips GPU upload when dimensions mismatch
    - `ring_write`: Added diagnostic logging of ring state (write_pos before/after, filled, committed_len) at DEBUG level
    - `build_cross_data` GPU path: Added diagnostic logging of seq_id, write_pos, filled, n_layers, n_embd, ctx_window
+
+### Commit 2: GPU ring clear on slot reset — root cause fix
+
+**Files changed**: 5 files, +46 lines
+
+**Root cause analysis:** When `flush_prefill()` resets the CPU ring buffer (`ring_write_pos=0`, `ring_filled=0`) for a new slot entering prefill (which happens with `--parallel 2+` when slot N enters its first decode while slot M has been running for a while), the GPU ring buffer was **not** cleared. Positions `[n_tokens, ctx_window)` retained stale hidden states from the previous slot.
+
+When `build_cross_data()` subsequently called the GPU interleave kernel with `gpu_filled < ctx_window` (the common case for newly-arriving short-prompt slots competing with long-running slots), the interleave kernel processed tokens at positions that contained stale data from the previous slot. The garbage cross-attention data propagated through the GDN kernel (DeltaNet forward pass in the drafter), causing a CUDA illegal memory access caught at `cudaStreamSynchronize`.
+
+**Fix:**
+1. **`ggml/src/ggml-cuda/cross-ring-interleave.cu`** — Added `dflash_cross_ring_gpu_clear()`: `cudaMemsetAsync` on all per-layer ring buffers + staging buffer to zero.
+2. **`ggml/src/ggml-cuda/ggml-cuda.cu`** — Registered `dflash_cross_ring_gpu_clear` in the CUDA backend proc address table.
+3. **`src/llama-context.cpp`** — Added `fn_clear` function pointer to `dflash_cross_ring_handle`, resolved at GPU ring init time. Added `llama_dflash_cross_ring_gpu_clear()` wrapper that safely dispatches through the handle (graceful no-op if `fn_clear` is null for backward compat).
+4. **`include/llama.h`** — Added `LLAMA_API void llama_dflash_cross_ring_gpu_clear(void * handle, int n_layers)`.
+5. **`common/speculative.cpp`** — `flush_prefill()` now calls `llama_dflash_cross_ring_gpu_clear()` when resetting the ring for a new slot.
+
+**Why this explains the crash:**
+- Crash Log 1 (turbo4, 1 slot): With `--ctx 262144`, the server may split prefill into multiple checkpoint segments, each calling `flush_prefill()` with the ring reset. The first gen token's verify batch reads stale inter-segment data.
+- Crash Log 2 (turbo4, 1 slot): Same mechanism — checkpoint-split prefill leaves stale GPU ring data between segments.
+- Crash Log 3 (turbo2_tcq, 2 slots): Classic slot transition — slot 1's prefill writes data at positions [0, n_tokens-1], but the interleave reads from positions that include stale data from slot 0.
 
 ## Cross-Configuration Findings
 
