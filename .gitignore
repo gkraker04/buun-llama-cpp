@@ -158,3 +158,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+venv/
+common/nppBackup/

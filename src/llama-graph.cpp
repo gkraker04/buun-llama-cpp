@@ -2618,7 +2618,7 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
             states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), states->nb[1], (rs_head + n_seqs)*states->nb[1])));
 
     return output_states;
 }
