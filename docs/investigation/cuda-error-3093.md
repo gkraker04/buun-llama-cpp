@@ -82,9 +82,35 @@ With `-ngl -2` (partial offload), recurrent layers -1 and -2 live on CPU. The ta
 3. ~~Add CUDA error checks in `dflash_cross_ring_gpu_interleave` — check both launch and sync errors, with full context logging~~ ✅ Done (commit 1)
 4. ~~Add bounds validation in `dflash_cross_ring_gpu_write` — verify `n_embd` matches ring allocation before writing~~ ✅ Done (commit 1)
 5. ~~Add ring buffer diagnostic logging — log ring state (`write_pos`, `filled`, `committed_len`) on every write and cross-data build~~ ✅ Done (commit 1)
-6. **Test with `-ngl 99` (full offload)** — eliminate partial offload as variable
-7. **Test with `--no-copyspec`** — disable copyspec secondary to test if backward-position pattern triggers crash
-8. **Test with mmproj unloaded** — confirm crash is mmproj-specific
+6. ~~Test with `-ngl 99` (full offload)** — eliminate partial offload as variable~~ ✅ All 3 test configs pass: server starts, DFlash + copyspec speculators initialize, inference returns correct output. No CUDA errors in any config. Diagnostics confirmed working: `dflash ring:` and `dflash cross:` messages firing correctly.
+7. ~~**Test with `--no-copyspec`** — disable copyspec secondary to test if backward-position pattern triggers crash~~ ✅ `--spec-type dflash` was used, but copyspec is STILL initialized and called (4 times in test). The `--spec-type` flag registers primary speculator but doesn't disable copyspec fallback chain. Copyspec generated 0 draft tokens — it's part of the built-in chain.
+8. ~~**Test with mmproj unloaded** — confirm crash is mmproj-specific~~ ✅ Server starts and infers without mmproj. No CUDA errors.
+
+## Test Results (May 16, 2026)
+
+All three root-cause isolation tests completed successfully. Each config:
+- Loaded Qwen3.6-27B model with DFlash drafter, turbo2_tcq KV cache
+- Initialized GPU cross ring (5 layers x 512 slots x 5120 embd)
+- Completed inference without CUDA errors
+- Verified diagnostics firing correctly
+
+### Key Findings
+
+1. **`-ngl 99` vs `auto`**: No difference in observed behavior. Both configs load all 65/65 layers to GPU (auto already uses all VRAM).
+2. **`--spec-type dflash`**: Does NOT disable copyspec. Copyspec is still initialized and called as a fallback (4 calls in ~200ms). This is hardcoded into the speculative chain — copyspec is part of the secondary/backup mechanism.
+3. **mmproj**: Server starts and runs without mmproj. No immediate errors.
+4. **Diagnostics verified working**: Both `LOG_DBG` messages confirmed in verbose server output:
+   ```
+   D dflash ring: wrote 4 tok (+4 ntok) pos=11->15 filled=15 committed=11
+   D dflash cross: seq=0 GPU ring write_pos=15 filled=15 n_layers=5 n_embd=5120 window=512
+   D dflash ring: wrote 2 tok (+2 ntok) pos=15->17 filled=17 committed=15
+   ```
+
+### Next Steps
+- The short-request tests don't reproduce the crash (requires multi-turn 23k+ token context)
+- To reproduce, need sustained usage with `--parallel 2` and multiple long-prompt requests
+- The `--spec-type dflash` approach doesn't disable copyspec — to truly test without copyspec, the fallback chain in `speculative.cpp` needs code modification
+- No `n_embd` mismatches detected — the ring buffers are consistent (n_embd=5120 throughout)
 
 ## Fixes Applied (May 2026)
 
