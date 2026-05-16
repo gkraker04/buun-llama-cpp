@@ -425,6 +425,14 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    // Sync DFlash GPU ring streams before resetting the scheduler's compute
+    // buffers. DFlash GPU ring operations (H2D copies, interleave kernel) use
+    // cudaStreamPerThread which is NOT managed by the scheduler and is NOT
+    // synced by ggml_backend_sched_synchronize(). If cudaStreamPerThread has
+    // pending work when ggml_backend_sched_reset() frees+reallocates GPU
+    // buffers, the drafter's still-running kernels access freed memory.
+    llama_dflash_cross_ring_gpu_sync_streams();
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -4788,6 +4796,33 @@ void llama_dflash_cross_ring_gpu_free(void * handle) {
     auto * h = (dflash_cross_ring_handle *)handle;
     h->fn_free(h->gpu_ring);
     delete h;
+}
+
+void llama_dflash_cross_ring_gpu_sync_streams(void) {
+    // Resolve the CUDA backend's device sync function.
+    // This syncs cudaStreamPerThread and any other GPU streams that are NOT
+    // managed by the scheduler and thus NOT synced by sched_reserve()'s
+    // ggml_backend_sched_synchronize().
+    //
+    // If no CUDA backend is loaded, this is a harmless no-op.
+    typedef void (*sync_fn_t)(void);
+    static sync_fn_t fn_sync = nullptr;
+    static bool resolved = false;
+
+    if (!resolved) {
+        resolved = true;
+        for (int i = 0; i < ggml_backend_reg_count(); i++) {
+            auto * reg = ggml_backend_reg_get(i);
+            auto * name = ggml_backend_reg_name(reg);
+            if (name && strstr(name, "CUDA")) {
+                fn_sync = (sync_fn_t)ggml_backend_reg_get_proc_address(reg, "dflash_cross_ring_gpu_device_sync");
+                break;
+            }
+        }
+    }
+    if (fn_sync) {
+        fn_sync();
+    }
 }
 
 void llama_dflash_cross_ring_gpu_clear(void * handle, int n_layers) {

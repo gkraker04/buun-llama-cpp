@@ -5432,6 +5432,7 @@ extern "C" void   dflash_cross_ring_gpu_clear(void *, int);
 extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, int, int);
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
+extern "C" void   dflash_cross_ring_gpu_device_sync(void);
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -5473,6 +5474,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_gpu_set_tensor;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_device_sync") == 0) {
+        return (void *)dflash_cross_ring_gpu_device_sync;
     }
     return nullptr;
 }

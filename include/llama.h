@@ -1140,6 +1140,7 @@ extern "C" {
     LLAMA_API void   llama_dflash_cross_ring_gpu_clear(void * handle, int n_layers);
     LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_sync_streams(void);
 
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend

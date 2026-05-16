@@ -238,3 +238,18 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
     cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
                      cudaMemcpyDeviceToDevice, cudaStreamPerThread);
 }
+
+// Synchronise all GPU streams used by the DFlash ring.
+// Called from sched_reserve() before the scheduler's compute buffers are
+// freed+reallocated. Without this, pending H2D ring writes and the
+// interleave kernel on cudaStreamPerThread may still be accessing GPU
+// memory when ggml_backend_sched_reset() frees it, causing illegal memory
+// access.
+extern "C" void dflash_cross_ring_gpu_device_sync(void) {
+    cudaError_t err = cudaStreamSynchronize(cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "dflash_cross_ring_gpu_device_sync: "
+                "cudaStreamSynchronize(cudaStreamPerThread) failed: %s\n",
+                cudaGetErrorString(err));
+    }
+}

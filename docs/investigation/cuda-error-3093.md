@@ -124,18 +124,34 @@ The crash occurs 285ms AFTER the last spec cycle, during silent GPU computation.
   3. Tree verify (48 layers × 12 tokens = 864 MB allocated)
 - Memory was resized from 2→4 cells (2.18.929) ≈ 290ms before the error, implying the resize itself is not the trigger
 
-### Likely Causes (ordered by probability)
+### Root Cause: `cudaStreamPerThread` NOT synced by `sched_reserve()`
 
-1. **Draft verify batch overruns tree verify buffer**: 864 MB allocated for 48 layers × 12 tokens. With concurrent slots, one slot's tree verify might overlap with another's, exceeding the allocation.
+**The code even documents this bug.** From `cross-ring-interleave.cu:136-138`:
+```
+// target's sched_reserve() only syncs the target's backend stream. If the
+// drafter has pending work on cudaStreamPerThread (interleave kernel, D2D
+// copies) or its own backend stream (decode graph), and target's sched_reserve
+// frees+reallocates compute buffers, the drafter's still-running kernels
+// access freed GPU memory → illegal memory access.
+```
 
-2. **GPU ring buffer concurrent access**: `dflash_max_slots=1` means only slot 0 has DFlash. But when slot 1 enters prefill, the shared drafter context accesses GPU ring data. With `set_cross_data_gpu()` writing to the ring while slot 0's generation reads it, a race condition on the DFlash cross-data structure causes illegal memory access.
+**Why `ring_clear`'s `cudaDeviceSynchronize` isn't enough**: The `ring_clear` sync only fires on **slot transitions** (start of a new prefill). The crash happens when `sched_reserve()` is called **mid-generation** when the cross-attention bucket changes. No slot transition, so the ring_clear sync doesn't fire.
 
-3. **Cross-attention context length mismatch**: When both slots have different context lengths, the shared cross-attention structure (`cross.n_enc`, `cross.v_embd_gpu`) may have stale dimensions from the previous slot's operation.
+**The actual flow:**
+1. Both slots are generating with DFlash
+2. Cross-attention bucket changes (prefill→generation or vice versa)
+3. `sched_need_reserve = true` is set
+4. `sched_reserve()` calls `synchronize()` → only syncs SCHEDULER streams (`ggml_backend_sched_synchronize`)
+5. `sched.reset(...)` destroys old scheduler → frees GPU buffers
+6. But `cudaStreamPerThread` has pending DFlash operations (H2D ring writes, interleave kernel)
+7. Those pending operations access the freed buffers → **CUDA illegal memory access**
+
+**Fix applied:** Added `cudaStreamSynchronize(cudaStreamPerThread)` in `sched_reserve()` after `synchronize()` and before the scheduler reset.
 
 ### Next Steps
 
 1. ~~Test `s->nb[1]` fix~~ ✅ FIXED
-2. **[ ] Test with `CUDA_LAUNCH_BLOCKING=1`** — Serializes CUDA operations to identify the exact faulty kernel
-3. **[ ] Test with `dflash_max_slots=2`** — Enabling DFlash for both slots might resolve the asymmetry
-4. **[ ] Check if `set_cross_data_gpu` uses proper synchronization** between shared drafter context and target model backend
+2. ~~Add `cudaStreamSynchronize(cudaStreamPerThread)` in `sched_reserve()`~~ ✅ FIXED (pending build + test)
+3. **[ ] Test with fixed binary** — Confirm `--parallel 2` + DFlash + mmproj survives concurrent requests
+4. **[ ] Test with `CUDA_LAUNCH_BLOCKING=1`** — If still broken, pinpoints exact faulty kernel
 5. **[ ] Monitor buun's SD-075/SD-078 branches** for upstream fixes to the multi-slot DFlash crash
