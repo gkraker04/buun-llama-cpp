@@ -75,16 +75,88 @@ The GPU D2D path (`fn_set_tensor_d2d`) copies from the ring staging buffer using
 
 With `-ngl -2` (partial offload), recurrent layers -1 and -2 live on CPU. The tape_replay fix (#44) handles this for replay, but the hidden state capture path (`append_target_hiddens` → `ring_write`) doesn't check whether the layer's hidden state buffer is host memory before writing to the GPU ring. Writing H2D data from a host-buffered tensor could cause an illegal device access when the drafter kernel tries to read it.
 
-## To Do / Fix Plan
+## Updates — May 16, 2026
+
+### Production Test with Fix Applied (Commit 2: GPU ring clear)
+
+**Build**: `b9322-318676356` (GPU ring clear fix + diagnostics)
+**Server config**: `buun-server_qwen3.6.sh` — `--parallel 2`, `turbo3_tcq`/`turbo2_tcq`, DFlash + mmproj, `--cache-ram 7680`
+
+**Result**: Server started and ran successfully. Slot 1 processed a 15,095-token prompt with DFlash, generated ~530 tokens output — **completed successfully** (4m 52s). This is the longest we've seen it run without crashing.
+
+**Then**: User opened the WebUI and sent a short chat message (17 tokens) → **CRASH INSTANTLY**.
+
+```
+CUDA synchronize error on device 0: an illegal memory access was encountered
+CUDA error: an illegal memory access was encountered
+  current device: 0, in function ggml_backend_cuda_synchronize at ...ggml-cuda.cu:3109
+```
+
+**Crash sequence:**
+```
+4.55.028.566 | prompt processing done, n_tokens=17, batch.n_tokens=5
+4.55.159.843 | created context checkpoint (pos_min=12, pos_max=12, n_tokens=13, size=150.896 MiB)
+4.55.295.087 | verify ubatch: 5 tok, 135.2ms (27.03ms/tok)
+4.55.306.412 | sched_reserve: reserving ...
+4.55.332.731 | CUDA0 compute buffer size = 123.75 MiB
+4.55.332.767 | graph nodes = 210, graph splits = 4
+4.55.332.769 | reserve took 26.32 ms, sched copies = 1
+4.55.659.373 | CUDA synchronize error ← 326ms AFTER sched_reserve completes
+```
+
+### Root Cause Analysis
+
+**Key differences from our test:**
+- Our test used `--parallel 1` → ✅ works
+- Production uses `--parallel 2` → ❌ crashes on second request after long first request
+
+**What's already in our build:**
+- SD-075 multi-slot DFlash tape fix (skip tree-mode on multi-seq, pass seq_id through tape_replay) ✅ merged
+- SD-078 batched DFlash draft (B2.0-B2.6: wider drafter graph, per-seq cross-data routing) ✅ merged
+- Our GPU ring clear (cudaMemset on slot reset) ✅ deployed
+
+**Despite all these fixes, `--parallel 2` still crashes.**
+
+### New Hypothesis: Shared Drafter Context State Pollution
+
+With `--parallel 2`, each slot gets its own `common_speculative` instance (and its own DFlash ring), but ALL slots share the same **drafter context (`ctx_dft`)**. The shared drafter has:
+- A single KV cache sized for both sequences (`n_seq_max=2`)
+- A single compute buffer allocation
+- Shared GPU ring interleave
+
+When slot 1 processes 15K tokens:
+1. Fills its sequence (seq_id=1) in the drafter's KV cache
+2. Writes hidden states to its own CPU ring and GPU ring
+3. Allocates compute buffers in the shared scheduler
+
+When slot 1's request completes → `slot.release()` calls `reset()` but does NOT destroy or reset `slot.spec`. The DFlash state persists.
+
+When slot 0 starts a new 17-token request:
+1. `flush_prefill()` clears the GPU ring ✅
+2. 17 hidden states are written to the new ring
+3. The target model processes the prompt (17 tokens) OK
+4. The first DFlash verify batch (5 tokens, target verification of draft) — SUCCEEDS ✅
+5. **BUT**: The drafter's KV cache still has slot 1's data at various positions
+6. The next decode step launches — `sched_reserve` re-computes buffer sizes
+7. The NEXT speculative cycle runs with cross-attention → GPU kernel accesses stale drafter KV cache → illegal memory access
+
+**Why sched_reserve is called mid-generation:**
+After prefill (batch=17) and the first verify batch, the `cross.n_enc` bucket changes from the prefill value to a generation value. `set_cross_data_gpu` detects the bucket mismatch and sets `sched_need_reserve=true`. The scheduler is rebuilt with new compute buffer sizes. On the FIRST compute after the rebuild, the illegal access surfaces at synchronize.
+
+### To Do / Fix Plan
 
 1. ~~Add CUDA error context** in `ggml-backend_cuda_synchronize` — log device and error string before aborting~~ ✅ Done (commit 1)
 2. ~~Add `n_embd` consistency guard in `ring_write()` — skip GPU write path when captured hidden state dim != expected `n_embd`~~ ✅ Done (commit 1)
 3. ~~Add CUDA error checks in `dflash_cross_ring_gpu_interleave` — check both launch and sync errors, with full context logging~~ ✅ Done (commit 1)
 4. ~~Add bounds validation in `dflash_cross_ring_gpu_write` — verify `n_embd` matches ring allocation before writing~~ ✅ Done (commit 1)
 5. ~~Add ring buffer diagnostic logging — log ring state (`write_pos`, `filled`, `committed_len`) on every write and cross-data build~~ ✅ Done (commit 1)
-6. ~~Test with `-ngl 99` (full offload)** — eliminate partial offload as variable~~ ✅ All 3 test configs pass: server starts, DFlash + copyspec speculators initialize, inference returns correct output. No CUDA errors in any config. Diagnostics confirmed working: `dflash ring:` and `dflash cross:` messages firing correctly.
-7. ~~**Test with `--no-copyspec`** — disable copyspec secondary to test if backward-position pattern triggers crash~~ ✅ `--spec-type dflash` was used, but copyspec is STILL initialized and called (4 times in test). The `--spec-type` flag registers primary speculator but doesn't disable copyspec fallback chain. Copyspec generated 0 draft tokens — it's part of the built-in chain.
-8. ~~**Test with mmproj unloaded** — confirm crash is mmproj-specific~~ ✅ Server starts and infers without mmproj. No CUDA errors.
+6. ~~Test with `-ngl 99` (full offload)** — eliminate partial offload as variable~~ ✅ No change
+7. ~~**Test with `--spec-type dflash`** — determine if copyspec triggers crash~~ ✅ Copyspec still in chain
+8. ~~**Test with mmproj unloaded** — isolate mmproj interaction~~ ✅ No crash without mmproj
+9. ✅ **GPU ring clear on slot reset** — applied, helps single-slot but not `--parallel 2`
+10. **⬜ Investigate shared drafter KV cache stale entries** — Most promising lead. The drafter's KV cache isn't cleared when a slot finishes. Need to check if `llama_kv_cache_seq_rm` (or equivalent) is called on `ctx_dft` during slot release.
+11. **⬜ Test with `CUDA_LAUNCH_BLOCKING=1`** — Pinpoints the exact kernel causing the illegal access (slow but diagnostic)
+12. **⬜ Test with `--parallel 1`** — Already confirmed working. Official workaround.
 
 ## Test Results (May 16, 2026)
 
@@ -96,62 +168,12 @@ All three root-cause isolation tests completed successfully. Each config:
 
 ### Key Findings
 
-1. **`-ngl 99` vs `auto`**: No difference in observed behavior. Both configs load all 65/65 layers to GPU (auto already uses all VRAM).
-2. **`--spec-type dflash`**: Does NOT disable copyspec. Copyspec is still initialized and called as a fallback (4 calls in ~200ms). This is hardcoded into the speculative chain — copyspec is part of the secondary/backup mechanism.
-3. **mmproj**: Server starts and runs without mmproj. No immediate errors.
-4. **Diagnostics verified working**: Both `LOG_DBG` messages confirmed in verbose server output:
-   ```
-   D dflash ring: wrote 4 tok (+4 ntok) pos=11->15 filled=15 committed=11
-   D dflash cross: seq=0 GPU ring write_pos=15 filled=15 n_layers=5 n_embd=5120 window=512
-   D dflash ring: wrote 2 tok (+2 ntok) pos=15->17 filled=17 committed=15
-   ```
-
-### Next Steps
-- ~~The short-request tests don't reproduce the crash (requires multi-turn 23k+ token context)~~ ✅ Root cause identified: stale GPU ring data from slot transitions. Fix applied.
-- ~~To reproduce, need sustained usage with `--parallel 2` and multiple long-prompt requests~~ ✅ Root cause understood at the code level; fix is structural (GPU ring clear on reset) rather than scenario-dependent.
-- The `--spec-type dflash` approach doesn't disable copyspec — to truly test without copyspec, the fallback chain in `speculative.cpp` needs code modification
-- No `n_embd` mismatches detected — the ring buffers are consistent (n_embd=5120 throughout)
-
-## Fixes Applied (May 2026)
-
-These fixes were implemented on `fix/cuda-error-3093` branch:
-
-### Commit 1: cuda-error-3093 diagnostic guards and bounds checks
-
-**Files changed**: 3 files, +48/-4 lines
-
-1. **`ggml/src/ggml-cuda/ggml-cuda.cu`** — `ggml_backend_cuda_synchronize`:
-   - Now captures `cudaStreamSynchronize` return value explicitly, logs device ID and error string before forwarding to `CUDA_CHECK_GEN` abort
-   - Helps identify which device faulted (relevant for multi-GPU setups)
-
-2. **`ggml/src/ggml-cuda/cross-ring-interleave.cu`** — GPU ring operations:
-   - `dflash_cross_ring_gpu_write`: Added `n_embd` bounds guard — if caller passes mismatched `n_embd` vs ring allocation, skips the write with a diagnostic instead of silently corrupting adjacent ring data
-   - `dflash_cross_ring_gpu_interleave`: Added explicit `cudaGetLastError` after kernel launch and `cudaStreamSynchronize` error check, both with full context (read_start, cross_len, ring_size, layers, embd) logged to stderr
-
-3. **`common/speculative.cpp`** — `ring_write` and `build_cross_data`:
-   - `ring_write`: Added `embd != n_embd` guard that warns and skips GPU upload when dimensions mismatch
-   - `ring_write`: Added diagnostic logging of ring state (write_pos before/after, filled, committed_len) at DEBUG level
-   - `build_cross_data` GPU path: Added diagnostic logging of seq_id, write_pos, filled, n_layers, n_embd, ctx_window
-
-### Commit 2: GPU ring clear on slot reset — root cause fix
-
-**Files changed**: 5 files, +46 lines
-
-**Root cause analysis:** When `flush_prefill()` resets the CPU ring buffer (`ring_write_pos=0`, `ring_filled=0`) for a new slot entering prefill (which happens with `--parallel 2+` when slot N enters its first decode while slot M has been running for a while), the GPU ring buffer was **not** cleared. Positions `[n_tokens, ctx_window)` retained stale hidden states from the previous slot.
-
-When `build_cross_data()` subsequently called the GPU interleave kernel with `gpu_filled < ctx_window` (the common case for newly-arriving short-prompt slots competing with long-running slots), the interleave kernel processed tokens at positions that contained stale data from the previous slot. The garbage cross-attention data propagated through the GDN kernel (DeltaNet forward pass in the drafter), causing a CUDA illegal memory access caught at `cudaStreamSynchronize`.
-
-**Fix:**
-1. **`ggml/src/ggml-cuda/cross-ring-interleave.cu`** — Added `dflash_cross_ring_gpu_clear()`: `cudaMemsetAsync` on all per-layer ring buffers + staging buffer to zero.
-2. **`ggml/src/ggml-cuda/ggml-cuda.cu`** — Registered `dflash_cross_ring_gpu_clear` in the CUDA backend proc address table.
-3. **`src/llama-context.cpp`** — Added `fn_clear` function pointer to `dflash_cross_ring_handle`, resolved at GPU ring init time. Added `llama_dflash_cross_ring_gpu_clear()` wrapper that safely dispatches through the handle (graceful no-op if `fn_clear` is null for backward compat).
-4. **`include/llama.h`** — Added `LLAMA_API void llama_dflash_cross_ring_gpu_clear(void * handle, int n_layers)`.
-5. **`common/speculative.cpp`** — `flush_prefill()` now calls `llama_dflash_cross_ring_gpu_clear()` when resetting the ring for a new slot.
-
-**Why this explains the crash:**
-- Crash Log 1 (turbo4, 1 slot): With `--ctx 262144`, the server may split prefill into multiple checkpoint segments, each calling `flush_prefill()` with the ring reset. The first gen token's verify batch reads stale inter-segment data.
-- Crash Log 2 (turbo4, 1 slot): Same mechanism — checkpoint-split prefill leaves stale GPU ring data between segments.
-- Crash Log 3 (turbo2_tcq, 2 slots): Classic slot transition — slot 1's prefill writes data at positions [0, n_tokens-1], but the interleave reads from positions that include stale data from slot 0.
+1. **`-ngl 99` vs `auto`**: No difference in observed behavior.
+2. **`--spec-type dflash`**: Does NOT disable copyspec — still initialized as fallback.
+3. **mmproj**: Works without mmproj, crash triggers with mmproj loaded.
+4. **`--parallel 1`**: Works perfectly — no crash, full DFlash + mmproj inference.
+5. **`--parallel 2`**: ❌ Crashes on second request after long first request, even with GPU ring clear fix.
+6. **Diagnostics verified working**: Both `LOG_DBG` messages confirmed in verbose server output.
 
 ## Cross-Configuration Findings
 
