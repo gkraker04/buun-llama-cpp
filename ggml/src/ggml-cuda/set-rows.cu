@@ -3,6 +3,7 @@
 #include "turbo-quant-cuda.cuh"
 #include <cstring>
 #include <cerrno>
+#include <mutex>
 
 static void load_turbo4_alpha(int device) {
     static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
@@ -349,12 +350,16 @@ static void set_rows_cuda(
 // Per-device backtrace buffer for Viterbi (replaces 32KB shared memory per block)
 static uint8_t * tcq_bt_buf[GGML_CUDA_MAX_DEVICES] = {};
 static int64_t   tcq_bt_buf_bytes[GGML_CUDA_MAX_DEVICES] = {};
+static std::mutex tcq_bt_mutex;
 
 static void ensure_tcq_bt_buf(int device, int64_t bytes_needed) {
-    if (bytes_needed <= tcq_bt_buf_bytes[device]) return;
-    if (tcq_bt_buf[device]) cudaFree(tcq_bt_buf[device]);
-    cudaMalloc(&tcq_bt_buf[device], bytes_needed);
-    tcq_bt_buf_bytes[device] = bytes_needed;
+    {
+        std::lock_guard<std::mutex> lock(tcq_bt_mutex);
+        if (bytes_needed <= tcq_bt_buf_bytes[device]) return;
+        if (tcq_bt_buf[device]) cudaFree(tcq_bt_buf[device]);
+        cudaMalloc(&tcq_bt_buf[device], bytes_needed);
+        tcq_bt_buf_bytes[device] = bytes_needed;
+    }
 }
 
 template<typename src_t, typename idx_t>
