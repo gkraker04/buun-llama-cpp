@@ -1,0 +1,28 @@
+@echo off
+setlocal
+
+echo === Setting up MSVC ===
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+if %errorlevel% neq 0 exit /b 1
+
+echo === CUDA ===
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+
+cd /d G:\hermes\buun-llama-cpp
+
+echo === Clean old build ===
+if exist build-86 rmdir /s /q build-86
+mkdir build-86
+cd build-86
+
+echo === Cmake with Ninja ===
+cmake .. -G Ninja -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF
+if %errorlevel% neq 0 exit /b 1
+
+echo === Ninja build ===
+ninja -j6
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+echo === DONE ===
+for /r %%i in (llama-server.exe) do @if exist "%%i" echo %%i

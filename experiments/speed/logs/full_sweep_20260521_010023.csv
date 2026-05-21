@@ -1,0 +1,4 @@
+n_min,n_max,decode_tok_s,avg_tokens,draft_n_avg,draft_acc_avg,draft_rate_pct
+0,1,24.5,216.4,146.6,105.6,72.0
+0,3,23.1,206.6,143.0,100.4,70.2
+0,2,22.9,217.4,149.6,103.4,69.1

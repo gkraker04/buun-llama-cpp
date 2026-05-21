@@ -1,0 +1,4 @@
+﻿n_max,batch_size,ubatch_size,decode_tok_s,prompt_tok_s,gen_tokens,vram_mb,quality_passes,status
+1,256,128,25.272,58.646,256,868,1/5,ok
+2,256,128,30.165,57.399,256,870,2/5,ok
+,256,128,0,0,0,,/5,

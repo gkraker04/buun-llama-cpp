@@ -1,0 +1,33 @@
+========================================================================
+FULL SWEEP: n_min/n_max 0-16 (server restarts)
+Configs: 152 | Warmup: 3 | Measured: 5 p-min=0.75
+Log: G:\\hermes\\buun-llama-cpp\\experiments\\speed\\logs\full_sweep_20260521_010023.txt
+CSV: G:\\hermes\\buun-llama-cpp\\experiments\\speed\\logs\full_sweep_20260521_010023.csv
+========================================================================
+
+[1/152] n_min=0, n_max=1
+  Pass 1: decode=25.5 tok/s draft=106/140 (76%) tokens=209
+  Pass 2: decode=23.5 tok/s draft=104/153 (68%) tokens=222
+  Pass 3: decode=23.6 tok/s draft=86/126 (68%) tokens=187
+  Pass 4: decode=26.5 tok/s draft=128/160 (80%) tokens=241
+  Pass 5: decode=23.4 tok/s draft=104/154 (68%) tokens=223
+  AVG: 24.5 tok/s draft=106/147 (72%)
+
+[2/152] n_min=0, n_max=2
+  Pass 1: decode=20.8 tok/s draft=123/183 (67%) tokens=256
+  Pass 2: decode=23.1 tok/s draft=112/153 (73%) tokens=230
+  Pass 3: decode=23.5 tok/s draft=99/142 (70%) tokens=211
+  Pass 4: decode=24.1 tok/s draft=91/127 (72%) tokens=191
+  Pass 5: decode=23.0 tok/s draft=92/143 (64%) tokens=199
+  AVG: 22.9 tok/s draft=103/150 (69%)
+
+[3/152] n_min=0, n_max=3
+  Pass 1: decode=25.2 tok/s draft=98/130 (75%) tokens=195
+  Pass 2: decode=22.4 tok/s draft=105/160 (66%) tokens=226
+  Pass 3: decode=22.8 tok/s draft=84/117 (72%) tokens=176
+  Pass 4: decode=23.5 tok/s draft=124/168 (74%) tokens=243
+  Pass 5: decode=21.9 tok/s draft=91/140 (65%) tokens=193
+  AVG: 23.1 tok/s draft=100/143 (70%)
+
+[4/152] n_min=0, n_max=4
+  Pass 1: decode=22.5 tok/s draft=89/124 (72%) tokens=191

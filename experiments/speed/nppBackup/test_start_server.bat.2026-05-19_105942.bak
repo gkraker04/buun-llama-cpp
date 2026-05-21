@@ -1,0 +1,85 @@
+@echo off
+setlocal
+
+REM === Start llama-server for Hermes Agent on Windows ===
+REM Model: Ornstein3.6-27B-MTP Q4_K_M
+REM Port: 8081
+REM Uses Buun build for in-graph MTP (depth=3 chain predictions, p_min=0 optimal)
+
+set "SERVER=G:\hermes\buun-llama-cpp\build-86\bin\llama-server.exe"
+if not exist "%SERVER%" set "SERVER=G:\hermes\buun-llama-cpp\build\llama-server.exe"
+
+if not exist "%SERVER%" (
+    echo ERROR: llama-server.exe not found!
+    echo Searched paths:
+    dir /s G:\hermes\buun-llama-cpp\build\llama-server.exe 2>nul
+    exit /b 1
+)
+
+echo Using: %SERVER%
+
+set "MODEL_DIR=G:\models\GestaltLabs\Ornstein3.6-27B-MTP-NSC-ACE-SABER-GGUF"
+set "MODEL=%MODEL_DIR%\Ornstein3.6-27B-MTP-NSC-ACE-SABER-Q4_K_M-MTP.gguf"
+set "MMPROJ=%MODEL_DIR%\mmproj-Ornstein3.6-27B-MTP-NSC-ACE-SABER-F16.gguf"
+set "LOG_DIR=%~dp0logs"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+REM Build per-second timestamp (2026-05-17_22-18-45 format)
+set "TS_YEAR=%DATE:~-4%"
+set "TS_MONTH=%DATE:~4,2%"
+set "TS_DAY=%DATE:~7,2%"
+set "TS_HOUR=%TIME:~0,2%"
+set "TS_MIN=%TIME:~3,2%"
+set "TS_SEC=%TIME:~6,2%"
+if "%TS_HOUR:~0,1%"==" " set "TS_HOUR=0%TS_HOUR:~1,1%"
+set "LOG=%LOG_DIR%\server_%TS_YEAR%-%TS_MONTH%-%TS_DAY%_%TS_HOUR%-%TS_MIN%-%TS_SEC%.log"
+set "JINJA=G:\models\froggeric\Qwen-Fixed-Chat-Template\chat_template.jinja"
+
+echo Starting llama-server...
+"%SERVER%" ^
+    --threads 12 ^
+    --prio 3 ^
+    --n-predict 32768 ^
+    --batch-size 1024 ^
+    --ubatch-size 128 ^
+    --flash-attn on ^
+    --cache-type-k turbo4 ^
+    --cache-type-v turbo4 ^
+    --no-mmap ^
+    --n-gpu-layers all ^
+    --fit off ^
+    --ctx-size 262144 ^
+    --model "%MODEL%" ^
+    --log-file "%LOG%" ^
+    --offline ^
+    --log-prefix ^
+    --log-timestamps ^
+    --cache-type-k-draft turbo4 ^
+    --cache-type-v-draft turbo4 ^
+    --temperature 0.6 ^
+    --top-k 20 ^
+    --top-p 0.95 ^
+    --min-p 0.01 ^
+    --repeat-penalty 1.0 ^
+    --presence-penalty 0.0 ^
+    --ctx-checkpoints 8 ^
+    --cache-ram 8192 ^
+    --kv-unified ^
+    --parallel 1 ^
+    --mmproj "%MMPROJ%" ^
+    --no-mmproj-offload ^
+    --image-min-tokens 1024 ^
+    --alias Qwen3.6-27B ^
+    --host 0.0.0.0 ^
+    --port 8081 ^
+    --api-key dummythicc ^
+    --props ^
+    --reasoning on ^
+    --chat-template-kwargs "{\"preserve_thinking\":true}" ^
+    --reasoning-budget 8192 ^
+    --reasoning-budget-message ". My reasoning budget is exhausted, but I have enough information to answer directly now." ^
+    --spec-type draft-mtp ^
+    --spec-draft-n-max 2
+
+echo Server exited with code %errorlevel%
+pause
