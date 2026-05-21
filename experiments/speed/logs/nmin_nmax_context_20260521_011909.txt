@@ -1,0 +1,14 @@
+========================================================================
+n_min/n_max x Context Sweep (server restarts)
+Configs: 152 | Contexts: 8 | Warmup: 3 | Measured: 5
+p_min=0.75, p_min hardcoded in bat
+Log: G:\\hermes\\buun-llama-cpp\\experiments\\speed\\logs\nmin_nmax_context_20260521_011909.txt
+CSV: G:\\hermes\\buun-llama-cpp\\experiments\\speed\\results\\nmin_nmax_context_sweep.csv
+========================================================================
+
+[1/152] n_min=0, n_max=1
+  Warmup... done
+    Context 256... decode=23.1 tok/s draft=132/185 (71%)
+    Context 1024... decode=23.3 tok/s draft=139/186 (74%)
+    Context 2048... decode=24.0 tok/s draft=141/195 (72%)
+    Context 4096...
