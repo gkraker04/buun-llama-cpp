@@ -1,0 +1,3 @@
+DFlash Proper Benchmark (v2 - cache-ram=0, full log)
+====================================================
+Starting server...

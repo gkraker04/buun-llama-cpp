@@ -1,0 +1,25 @@
+DFlash n_min/n_max Full Sweep (0-16, per-request params)
+=========================================================
+Configs: 152  Passes: 3  Single server start (no restarts)
+
+Starting server...
+Server ready.
+
+Warming up...
+Done.
+
+[  1/152] n_min= 0 n_max= 1 ->  23.3 tok/s draft=88/134 (66%)
+[  2/152] n_min= 0 n_max= 2 ->  23.7 tok/s draft=97/142 (68%)
+[  3/152] n_min= 0 n_max= 3 ->  24.0 tok/s draft=102/150 (68%)
+[  4/152] n_min= 0 n_max= 4 ->  23.5 tok/s draft=88/136 (65%)
+[  5/152] n_min= 0 n_max= 5 ->  24.7 tok/s draft=100/141 (71%)
+[  6/152] n_min= 0 n_max= 6 ->  23.9 tok/s draft=89/133 (67%)
+[  7/152] n_min= 0 n_max= 7 ->  24.7 tok/s draft=98/141 (70%)
+[  8/152] n_min= 0 n_max= 8 ->  24.3 tok/s draft=94/135 (69%)
+[  9/152] n_min= 0 n_max= 9 ->  23.8 tok/s draft=93/140 (67%)
+[ 10/152] n_min= 0 n_max=10 ->  24.4 tok/s draft=108/151 (71%)
+[ 11/152] n_min= 0 n_max=11 ->  22.8 tok/s draft=95/144 (66%)
+[ 12/152] n_min= 0 n_max=12 ->  23.9 tok/s draft=97/138 (71%)
+[ 13/152] n_min= 0 n_max=13 ->  24.2 tok/s draft=101/142 (71%)
+[ 14/152] n_min= 0 n_max=14 ->  24.1 tok/s draft=100/141 (71%)
+[ 15/152] n_min= 0 n_max=15 ->  24.4 tok/s draft=106/150 (71%)

@@ -1,0 +1,72 @@
+@echo off
+setlocal
+
+REM === DFlash test server for Hermes Agent ===
+REM Based on Buun's recommended params for Qwen3.6-27B + DFlash drafter
+REM Model: Ornstein3.6-27B + DFlash drafter Q8_0
+REM Port: 8081
+
+set "SERVER=G:\hermes\buun-llama-cpp\build\bin\llama-server.exe"
+if not exist "%SERVER%" (
+    echo ERROR: llama-server.exe not found!
+    dir /s G:\hermes\buun-llama-cpp\build\llama-server.exe 2>nul
+    exit /b 1
+)
+
+set "TARGET_DIR=G:\models\unsloth\Qwen3.6-27B-GGUF"
+set "TARGET=%TARGET_DIR%\Qwen3.6-27B-Q4_K_M.gguf"
+
+set "DRAFT_DIR=G:\models\gkraker04\dflash-drafter-3.6"
+set "DRAFT=%DRAFT_DIR%\dflash-draft-3.6-Q4_K_M.gguf"
+
+set "MMPROJ=%TARGET_DIR%\mmproj-BF16.gguf"
+
+:check_draft
+if not exist "%DRAFT%" (
+    echo WARNING: spiritbuun drafter not found, trying local stash...
+    set "DRAFT=G:\models\gkraker04\dflash-drafter-3.6\dflash-draft-3.6-Q8_0.gguf"
+)
+
+echo Using target: %TARGET%
+echo Using drafter: %DRAFT%
+
+REM Buun recommended: c=6048 cd=256 b=256 ub=64 np=1 ngl=99 ngld=99 fa on
+"%SERVER%" ^
+    --threads 12 ^
+    --prio 3 ^
+    --n-predict 32768 ^
+    --batch-size 256 ^
+    --ubatch-size 64 ^
+    --flash-attn on ^
+    --cache-type-k turbo2_tcq ^
+    --cache-type-v turbo2_tcq ^
+    --no-mmap ^
+    --n-gpu-layers 99 ^
+    --fit-target 5000 ^
+    --model "%TARGET%" ^
+    --offline ^
+    --log-prefix ^
+    --log-timestamps ^
+    --cache-type-k-draft turbo2_tcq ^
+    --cache-type-v-draft turbo2_tcq ^
+    --temperature 0.6 ^
+    --top-k 20 ^
+    --parallel 1 ^
+    --spec-draft-model "%DRAFT%" ^
+    --mmproj "%MMPROJ%" ^
+    --no-mmproj-offload ^
+    --image-min-tokens 1024 ^
+    --alias Qwen3.6-27B ^
+    --host 0.0.0.0 ^
+    --port 8081 ^
+    --api-key dummythicc ^
+    --reasoning off
+    --spec-type dflash ^
+    --spec-draft-p-min 0.75 ^
+    --spec-draft-n-max 7 ^
+    --spec-draft-n-min 0 ^
+    -ngld 99 ^
+    -cd 256 ^
+
+echo Server exited with code %errorlevel%
+pause
