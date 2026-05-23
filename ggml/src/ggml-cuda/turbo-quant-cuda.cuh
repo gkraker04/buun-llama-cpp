@@ -1360,3 +1360,22 @@ void dequantize_turbo2_tcq(const void * vx, const int64_t ib, const int iqs, flo
         v.y = d_turbo2_tcq_codebook[state] * norm;
     }
 }
+
+// ---- turbo4 device dequant functions (for weight quantization matmul) ----
+
+__device__ __forceinline__
+float turbo4_dequant_element(const block_turbo4_0 * __restrict__ blk, int j, float norm) {
+    uint8_t idx = (blk->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    return d_turbo_centroids_4bit[idx] * norm;
+}
+
+__device__ __forceinline__
+void turbo4_dequant_block_to_half(
+    const block_turbo4_0 * __restrict__ blk,
+    half * __restrict__ dst, int dst_offset) {
+    float norm = __half2float(blk->norm);
+    for (int j = 0; j < QK_TURBO4; j++) {
+        uint8_t idx = (blk->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+        dst[dst_offset + j] = __float2half(d_turbo_centroids_4bit[idx] * norm);
+    }
+}

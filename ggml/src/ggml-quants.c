@@ -5573,6 +5573,51 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
+        case GGML_TYPE_TURBO4_0:
+            {
+                const block_turbo4_0 * q = (const block_turbo4_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_TURBO3_0:
+            {
+                const block_turbo3_0 * q = (const block_turbo3_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_TURBO2_0:
+            {
+                const block_turbo2_0 * q = (const block_turbo2_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_TURBO3_TCQ:
+            {
+                const block_turbo3_tcq * q = (const block_turbo3_tcq *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_TURBO2_TCQ:
+            {
+                const block_turbo2_tcq * q = (const block_turbo2_tcq *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
 
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
