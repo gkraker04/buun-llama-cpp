@@ -375,6 +375,50 @@ size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT
 
 /* ---------- TURBO4_0: 4-bit PolarQuant (16 centroids, no QJL) ---------- */
 
+
+/* ---------- CPU WHT butterfly matching GPU k_turbo_wht ---------- */
+#define TURBO_WHT_N 128
+static const float turbo_wht_s1[TURBO_WHT_N] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1};
+static const float turbo_wht_s2[TURBO_WHT_N] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1};
+
+static void turbo_wht_forward(float * buf, int n) {
+    for (int i = 0; i < n; i++) buf[i] *= turbo_wht_s1[i];
+    for (int h = 1; h < n; h *= 2) {
+        for (int i = 0; i < n; i += 2 * h) {
+            for (int j = i; j < i + h; j++) {
+                float a = buf[j], b = buf[j + h];
+                buf[j] = a + b;
+                buf[j + h] = a - b;
+            }
+        }
+    }
+    const    float inv_sqrt = 0.08838834764831845f; // 1/sqrt(128)
+    for (int i = 0; i < n; i++) buf[i] *= inv_sqrt * turbo_wht_s2[i];
+}
+
+static void turbo_wht_inverse(float * buf, int n) {
+    for (int i = 0; i < n; i++) buf[i] *= turbo_wht_s2[i];
+    for (int h = 1; h < n; h *= 2) {
+        for (int i = 0; i < n; i += 2 * h) {
+            for (int j = i; j < i + h; j++) {
+                float a = buf[j], b = buf[j + h];
+                buf[j] = a + b;
+                buf[j + h] = a - b;
+            }
+        }
+    }
+    const    float inv_sqrt = 0.08838834764831845f;
+    for (int i = 0; i < n; i++) buf[i] *= inv_sqrt * turbo_wht_s1[i];
+}
+
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
 
@@ -399,14 +443,13 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
             memset(normalized, 0, d * sizeof(float));
         }
 
-        /* Step 2: Rotate */
-        float rotated[TURBO_D];
-        matvec(turbo_rotation, normalized, rotated, d);
+        /* Step 2: WHT rotate */
+        turbo_wht_forward(normalized, d);
 
         /* Step 3: 4-bit quantization — find nearest of 16 centroids */
         uint8_t indices[TURBO_D];
         for (int i = 0; i < d; i++) {
-            indices[i] = (uint8_t)nearest_centroid_4bit(rotated[i]);
+            indices[i] = (uint8_t)nearest_centroid_4bit(normalized[i]);
         }
 
         /* Step 4: Norm correction */
@@ -442,9 +485,10 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
             rotated_recon[i] = CENTROIDS_4BIT[idx];
         }
 
-        /* Inverse rotate */
+        /* Inverse WHT rotate */
+        turbo_wht_inverse(rotated_recon, d);
         float * dst = y + block * d;
-        matvec(turbo_rotation_t, rotated_recon, dst, d);
+        memcpy(dst, rotated_recon, d * sizeof(float));
 
         /* Scale by norm */
         for (int i = 0; i < d; i++) {

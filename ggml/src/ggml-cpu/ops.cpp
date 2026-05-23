@@ -4939,6 +4939,11 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;

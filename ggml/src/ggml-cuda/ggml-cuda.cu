@@ -2517,6 +2517,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
+        // Turbo types use custom matmul, not mul_mat_vec_q
+        if (src0->type == GGML_TYPE_TURBO4_0 ||
+            src0->type == GGML_TYPE_TURBO3_0 ||
+            src0->type == GGML_TYPE_TURBO2_0) {
+            return false;
+        }
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
@@ -2655,7 +2661,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+                            // Route turbo types to custom matmul
+                            if (src0->type == GGML_TYPE_TURBO4_0 ||
+                                src0->type == GGML_TYPE_TURBO3_0 ||
+                                src0->type == GGML_TYPE_TURBO2_0) {
+                                ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
+                                return;
+                            }            if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
