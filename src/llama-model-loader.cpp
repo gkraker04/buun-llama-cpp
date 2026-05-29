@@ -69,6 +69,10 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
 
+        case LLAMA_FTYPE_MOSTLY_TURBO4_0: return "TURBO4_0 - 4.0 bpw turbo4";
+        case LLAMA_FTYPE_MOSTLY_TURBO3_0: return "TURBO3_0 - 3.0 bpw turbo3";
+        case LLAMA_FTYPE_MOSTLY_TURBO2_0: return "TURBO2_0 - 2.0 bpw turbo2";
+
         default: return "unknown, may not work";
     }
 }
