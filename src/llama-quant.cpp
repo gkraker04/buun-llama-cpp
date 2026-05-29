@@ -829,6 +829,12 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
 
+        case LLAMA_FTYPE_MOSTLY_TURBO4_0: return GGML_TYPE_TURBO4_0;
+        case LLAMA_FTYPE_MOSTLY_TURBO3_0: return GGML_TYPE_TURBO3_0;
+        case LLAMA_FTYPE_MOSTLY_TURBO2_0: return GGML_TYPE_TURBO2_0;
+        case LLAMA_FTYPE_MOSTLY_TURBO3_TCQ: return GGML_TYPE_TURBO3_TCQ;
+        case LLAMA_FTYPE_MOSTLY_TURBO2_TCQ: return GGML_TYPE_TURBO2_TCQ;
+
         default: return GGML_TYPE_COUNT;
     }
 }

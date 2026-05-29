@@ -13,7 +13,7 @@ static __constant__ float d_turbo_wht_s2[128] = {
      1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1};
 
 // One block per 128-element group. 128 threads per block.
-static __global__ void k_turbo_wht(
+__global__ void k_turbo_wht(
         const float * __restrict__ src, float * __restrict__ dst,
         const int64_t n_elements, const int direction) {
 

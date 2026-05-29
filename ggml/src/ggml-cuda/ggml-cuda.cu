@@ -65,6 +65,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/turbo-matmul.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2567,9 +2568,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE
+        && !(src0->type == GGML_TYPE_TURBO4_0 ||
+             src0->type == GGML_TYPE_TURBO3_0 ||
+             src0->type == GGML_TYPE_TURBO2_0);
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && !(src0->type == GGML_TYPE_TURBO4_0 ||
+             src0->type == GGML_TYPE_TURBO3_0 ||
+             src0->type == GGML_TYPE_TURBO2_0);
 
     bool any_gpus_with_slow_fp16 = false;
 
@@ -2629,6 +2636,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (src0->type == GGML_TYPE_TURBO4_0 ||
+               src0->type == GGML_TYPE_TURBO3_0 ||
+               src0->type == GGML_TYPE_TURBO2_0) {
+        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
@@ -5215,6 +5226,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_TCQ:
+                    case GGML_TYPE_TURBO2_TCQ:
                         return true;
                     default:
                         return false;
