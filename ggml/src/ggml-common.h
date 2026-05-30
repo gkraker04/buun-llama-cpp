@@ -331,6 +331,8 @@ static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_
 // Per block: norm(fp16) + 4-bit indices (64 bytes)
 // = 66 bytes per 128 values = 4.125 bits/value → 3.9× compression vs fp16
 #define QK_TURBO4 128
+#define QR_TURBO4 1
+#define QI_TURBO4 (QK_TURBO4 / (4 * QR_TURBO4))
 typedef struct {
     ggml_half  norm;                    //  2 bytes: L2 norm for rescaling
     uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit indices (2 per byte, low nibble first)

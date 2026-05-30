@@ -1,6 +1,15 @@
 @echo off
 setlocal
 rem windows line endings fixed
+
+REM === Kill any existing llama-server on port 8081 before starting ===
+REM echo Killing any existing llama-server...
+REM taskkill /F /IM llama-server.exe 2>nul
+REM timeout /t 3 /nobreak >nul
+REM taskkill /F /IM llama-server.exe 2>nul
+REM timeout /t 3 /nobreak >nul
+REM echo.
+
 if "%1"=="" set "NMAX=2"
 if not "%1"=="" set "NMAX=%1"
 if "%2"=="" set "PMIN=0.0"
@@ -59,20 +68,20 @@ if "%BUUN%" equ "0" (
 
 echo Starting buun-llama-server...
 "%SERVER%" ^
-    --verbose ^
     --threads 12 ^
-    --prio 3 ^
+    --prio 2 ^
+    --ctx-size 4096 ^
     --n-predict 32768 ^
     --batch-size 2048 ^
-    --ubatch-size 512 ^
+    --ubatch-size 256 ^
     --flash-attn on ^
     --cache-type-k %K_CACHE% ^
     --cache-type-v %V_CACHE% ^
-    --no-mmap ^
-    --n-gpu-layers all ^
+    --n-gpu-layers auto ^
     --model "%MODEL%" ^
     --log-file "%LOG%" ^
     --offline ^
+    --log-verbosity 5 ^
     --log-prefix ^
     --log-timestamps ^
     --cache-type-k-draft %K_CACHE% ^
@@ -81,19 +90,18 @@ echo Starting buun-llama-server...
     --top-k 20 ^
     --top-p 0.95 ^
     --min-p 0.01 ^
-    --ctx-checkpoints 8 ^
-    --cache-ram 8192 ^
+    --repeat-penalty 1.0 ^
+    --presence-penalty 1.5 ^
+    --ctx-checkpoints 4 ^
+    --cache-ram 4096 ^
     --kv-unified ^
     --parallel 1 ^
-    --alias Qwen3.6-27B ^
+    --no-mmproj-auto ^
+    --alias Qwen3.6-27B-buun ^
     --host 0.0.0.0 ^
     --port 8081 ^
     --api-key dummythicc ^
     --props ^
-    --reasoning on ^
-    --chat-template-kwargs "{\"preserve_thinking\":true}" ^
-    --reasoning-budget 8192 ^
-    --reasoning-budget-message ". My reasoning budget is exhausted, but I have enough information to answer directly now." ^
     --spec-type draft-mtp,ngram-mod,ngram-map-k4v ^
     --spec-draft-n-max %NMAX% ^
     --spec-draft-p-min %PMIN%
@@ -103,6 +111,7 @@ if "%ERRORLEVEL%"=="0" (
 ) else (
   echo Server exited with code %ERRORLEVEL%.
 )
+
 pause
 
 REM    --mmproj "%MMPROJ%" ^

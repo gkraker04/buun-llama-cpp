@@ -2,6 +2,8 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "vecdot-turbo4.cuh"
+#include "turbo-wht.cuh"
 
 #include <cstdint>
 
@@ -31,6 +33,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        case GGML_TYPE_TURBO4_0: return vec_dot_turbo4_0_q8_1;
         default:                return nullptr;
     }
 }
@@ -57,6 +60,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+        case GGML_TYPE_TURBO4_0: return VDR_TURBO4_0_Q8_1_MMVQ;
         default:                return 1;
     }
 }
@@ -1108,6 +1112,12 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_TURBO4_0:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TURBO4_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -1174,6 +1184,15 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
+    }
+
+    // WHT pre-rotate activations for turbo4
+    ggml_cuda_pool_alloc<float> rot_alloc;
+    if (src0->type == GGML_TYPE_TURBO4_0) {
+        const int64_t n_rot = ((ne10 * ne11 * ne12 * ne13) / 128) * 128;
+        rot_alloc.alloc(ctx.pool(), n_rot);
+        ggml_cuda_turbo_wht_forward(src1_d, rot_alloc.get(), n_rot, stream);
+        src1_d = rot_alloc.get();
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);

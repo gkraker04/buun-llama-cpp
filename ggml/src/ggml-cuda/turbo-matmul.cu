@@ -5,11 +5,10 @@
 
 // ============================================================
 // Activation pre-rotation via existing WHT kernel
-// ============================================================
+// Activation pre-rotation via shared WHT wrapper
 static void prerotate_activations(
     const float * src, float * dst, int64_t n_elements, cudaStream_t stream) {
-    k_turbo_wht<<<(int)(n_elements / 128), 128, 0, stream>>>(
-        src, dst, n_elements, 0);
+    ggml_cuda_turbo_wht_forward(src, dst, n_elements, stream);
 }
 
 // ============================================================
