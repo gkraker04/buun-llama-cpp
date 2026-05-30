@@ -5029,6 +5029,27 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 #endif // defined(__linux__)
 
+#if defined(_WIN32)
+    // On Windows, cudaMemGetInfo reports per-context memory only — each process gets its own context.
+    // Use nvidia-smi for system-wide cross-process memory reporting.
+    FILE* pipe = _popen("nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader -i 0", "r");
+    if (pipe) {
+        char line[256];
+        if (fgets(line, sizeof(line), pipe)) {
+            // nvidia-smi returns values in MiB, e.g. "1234 MiB, 24576 MiB"
+            long free_mib = 0;
+            long total_mib = 0;
+            if (sscanf(line, "%ld MiB, %ld MiB", &free_mib, &total_mib) == 2) {
+                *free = (size_t)free_mib * 1024 * 1024;
+                *total = (size_t)total_mib * 1024 * 1024;
+            }
+        }
+        _pclose(pipe);
+    } else {
+        GGML_LOG_WARN("%s: nvidia-smi failed, falling back to cudaMemGetInfo\n", __func__);
+    }
+#endif // defined(_WIN32)
+
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
