@@ -813,6 +813,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         }
     }
 
+    // Align to backend alignment so cumulative tensor offsets stay properly aligned
+    size = GGML_PAD(size, 128);
+
     return size;
 
     GGML_UNUSED(buft);
