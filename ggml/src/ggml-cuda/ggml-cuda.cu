@@ -2623,13 +2623,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+    } else if (src0->type == GGML_TYPE_TURBO4_0 ||
+               src0->type == GGML_TYPE_TURBO3_0 ||
+               src0->type == GGML_TYPE_TURBO2_0) {
+        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-    } else if (src0->type == GGML_TYPE_TURBO3_0 ||
-               src0->type == GGML_TYPE_TURBO2_0) {
-        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
@@ -2662,8 +2663,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-                            // Route turbo3/turbo2 to custom matmul (turbo4 goes through MMVQ)
-                            if (src0->type == GGML_TYPE_TURBO3_0 ||
+                            // Route turbo types to custom matmul
+                            if (src0->type == GGML_TYPE_TURBO4_0 ||
+                                src0->type == GGML_TYPE_TURBO3_0 ||
                                 src0->type == GGML_TYPE_TURBO2_0) {
                                 ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
                                 return;
