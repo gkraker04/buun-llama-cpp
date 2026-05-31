@@ -70,18 +70,20 @@ echo Starting buun-llama-server...
 "%SERVER%" ^
     --threads 12 ^
     --prio 2 ^
-    --ctx-size 4096 ^
+    --ctx-size 2048 ^
     --n-predict 32768 ^
-    --batch-size 2048 ^
-    --ubatch-size 256 ^
+    --batch-size 256 ^
+    --ubatch-size 64 ^
     --flash-attn on ^
     --cache-type-k %K_CACHE% ^
     --cache-type-v %V_CACHE% ^
-    --n-gpu-layers auto ^
+    --n-gpu-layers all ^
+    --fit-target 0 ^
     --model "%MODEL%" ^
     --log-file "%LOG%" ^
     --offline ^
-    --log-verbosity 5 ^
+    --no-mmap ^
+    --log-verbosity 4 ^
     --log-prefix ^
     --log-timestamps ^
     --cache-type-k-draft %K_CACHE% ^
@@ -92,19 +94,21 @@ echo Starting buun-llama-server...
     --min-p 0.01 ^
     --repeat-penalty 1.0 ^
     --presence-penalty 1.5 ^
-    --ctx-checkpoints 4 ^
-    --cache-ram 4096 ^
+    --ctx-checkpoints 0 ^
+    --cache-ram 0 ^
     --kv-unified ^
     --parallel 1 ^
-    --no-mmproj-auto ^
-    --alias Qwen3.6-27B-buun ^
+    --alias Qwen3.6-27B-turbo4-test ^
     --host 0.0.0.0 ^
-    --port 8081 ^
+    --port 8082 ^
     --api-key dummythicc ^
     --props ^
     --spec-type draft-mtp,ngram-mod,ngram-map-k4v ^
     --spec-draft-n-max %NMAX% ^
-    --spec-draft-p-min %PMIN%
+    --spec-draft-p-min %PMIN% ^
+   --jinja ^
+    --chat-template-file "%JINJA%" ^
+    --no-warmup
 
 if "%ERRORLEVEL%"=="0" (
   echo Server started successfully on port 8081
