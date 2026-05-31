@@ -6,8 +6,8 @@ echo === Setting up MSVC ===
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 if %errorlevel% neq 0 exit /b 1
 
-echo === CUDA ===
-set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+echo === CUDA 13.2 ===
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
 set "CMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe"
 
