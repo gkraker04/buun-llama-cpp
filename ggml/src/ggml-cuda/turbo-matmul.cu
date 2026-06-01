@@ -12,7 +12,7 @@ static void prerotate_activations(
 }
 
 // ============================================================
-// Path A: Single-token decode (ne11 == 1) — trivial verifier
+// Path A: Single-token decode (ne11 == 1) — working kernel
 // ============================================================
 static __global__ void k_turbo4_mul_mat_vec_simple(
     const block_turbo4_0 * __restrict__ vx,
@@ -23,11 +23,13 @@ static __global__ void k_turbo4_mul_mat_vec_simple(
 
     const int row = blockIdx.x;
     if (row >= nrows_x) return;
+    const int tid = threadIdx.x;  // 0..255
     const int blocks_per_row = ncols_x / QK_TURBO4;
     const block_turbo4_0 * x_row = vx + (int64_t)row * blocks_per_row;
     float sumf = 0.0f;
 
-    for (int i = 0; i < ncols_x; i++) {
+    // Each thread handles a subset of elements (strided)
+    for (int i = tid; i < ncols_x; i += blockDim.x) {
         const int blk_idx = i / QK_TURBO4;
         const int elem_in_blk = i % QK_TURBO4;
         const block_turbo4_0 * blk = &x_row[blk_idx];
@@ -37,7 +39,28 @@ static __global__ void k_turbo4_mul_mat_vec_simple(
         sumf += vy[i] * w;
     }
 
-    dst[row] = sumf;
+    // Warp-level reduction (32 threads per warp)
+    const int lane = tid % 32;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+
+    // Block-level reduction: warp leaders write to shared memory
+    __shared__ float warp_sums[8];  // max 256 threads = 8 warps
+    if (lane == 0) {
+        const int warp_id = tid / 32;
+        if (warp_id < 8)
+            warp_sums[warp_id] = sumf;
+    }
+    __syncthreads();
+
+    if (lane == 0 && tid / 32 == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; w++)
+            total += warp_sums[w];
+        dst[row] = total;
+    }
 }
 
 // ============================================================
@@ -219,8 +242,8 @@ void ggml_cuda_mul_mat_turbo(
     const int stride_y = ncols_x, stride_dst = nrows_x;
 
     if (ncols_dst == 1) {
-        // Single-token: use verified simple kernel (~6 tok/s, correct output)
-        k_turbo4_mul_mat_vec_simple<<<nrows_x, 1, 0, stream>>>(
+        // Single-token: use verified simple kernel (~6 tok/s with 256 threads, correct output)
+        k_turbo4_mul_mat_vec_simple<<<nrows_x, 256, 0, stream>>>(
             (const block_turbo4_0 *)src0_d, rotated.get(), dst_d, ncols_x, nrows_x);
     } else if (ncols_dst <= 8) {
         // Multi-token: use cuBLAS path (verified correct)
