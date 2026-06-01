@@ -12,7 +12,36 @@ static void prerotate_activations(
 }
 
 // ============================================================
-// Path A: Single-token decode (ne11 == 1)
+// Path A: Single-token decode (ne11 == 1) — trivial verifier
+// ============================================================
+static __global__ void k_turbo4_mul_mat_vec_simple(
+    const block_turbo4_0 * __restrict__ vx,
+    const float * __restrict__  vy,
+    float * __restrict__        dst,
+    const int ncols_x,
+    const int nrows_x) {
+
+    const int row = blockIdx.x;
+    if (row >= nrows_x) return;
+    const int blocks_per_row = ncols_x / QK_TURBO4;
+    const block_turbo4_0 * x_row = vx + (int64_t)row * blocks_per_row;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < ncols_x; i++) {
+        const int blk_idx = i / QK_TURBO4;
+        const int elem_in_blk = i % QK_TURBO4;
+        const block_turbo4_0 * blk = &x_row[blk_idx];
+        const float norm = __half2float(blk->norm);
+        const uint8_t idx = (blk->qs[elem_in_blk / 2] >> ((elem_in_blk % 2) * 4)) & 0xF;
+        const float w = d_turbo_centroids_4bit[idx] * norm;
+        sumf += vy[i] * w;
+    }
+
+    dst[row] = sumf;
+}
+
+// ============================================================
+// Path A-original: Single-token decode (ne11 == 1) — parallel
 // ============================================================
 static __global__ void k_turbo4_mul_mat_vec(
     const block_turbo4_0 * __restrict__ vx,
@@ -190,7 +219,7 @@ void ggml_cuda_mul_mat_turbo(
     const int stride_y = ncols_x, stride_dst = nrows_x;
 
     if (ncols_dst == 1) {
-        k_turbo4_mul_mat_vec<<<nrows_x, 32, 0, stream>>>(
+        k_turbo4_mul_mat_vec_simple<<<nrows_x, 1, 0, stream>>>(
             (const block_turbo4_0 *)src0_d, rotated.get(), dst_d, ncols_x, nrows_x);
     } else if (ncols_dst <= 8) {
         switch (ncols_dst) {
