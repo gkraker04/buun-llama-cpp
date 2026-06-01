@@ -219,20 +219,14 @@ void ggml_cuda_mul_mat_turbo(
     const int stride_y = ncols_x, stride_dst = nrows_x;
 
     if (ncols_dst == 1) {
+        // Single-token: use verified simple kernel (~6 tok/s, correct output)
         k_turbo4_mul_mat_vec_simple<<<nrows_x, 1, 0, stream>>>(
             (const block_turbo4_0 *)src0_d, rotated.get(), dst_d, ncols_x, nrows_x);
     } else if (ncols_dst <= 8) {
-        switch (ncols_dst) {
-            case 1: launch_turbo4_multi<1>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 2: launch_turbo4_multi<2>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 3: launch_turbo4_multi<3>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 4: launch_turbo4_multi<4>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 5: launch_turbo4_multi<5>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 6: launch_turbo4_multi<6>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 7: launch_turbo4_multi<7>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-            case 8: launch_turbo4_multi<8>(src0_d, rotated.get(), dst_d, ncols_x, nrows_x, stride_y, stride_dst, stream); break;
-        }
+        // Multi-token: use cuBLAS path (verified correct)
+        ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
     } else {
+        // Large batch: cuBLAS
         ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
     }
 }
