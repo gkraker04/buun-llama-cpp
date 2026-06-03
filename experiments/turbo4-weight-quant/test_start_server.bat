@@ -2,15 +2,19 @@
 setlocal
 rem windows line endings fixed
 
-REM === Kill any existing llama-server on port 8081 before starting ===
-REM echo Killing any existing llama-server...
-REM taskkill /F /IM llama-server.exe 2>nul
-REM timeout /t 3 /nobreak >nul
-REM taskkill /F /IM llama-server.exe 2>nul
-REM timeout /t 3 /nobreak >nul
-REM echo.
+REM === Kill any existing server on port 8082 before starting ===
+echo Killing any existing server on port 8082...
+REM Try by image name first (broad kill)
+taskkill /F /IM llama-server.exe 2>nul
+timeout /t 1 /nobreak >nul
+REM Then kill anything still holding port 8082
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8082"') do (
+    if not "%%a"=="" taskkill /F /PID %%a 2>nul
+)
+timeout /t 2 /nobreak >nul
+echo.
 
-if "%1"=="" set "NMAX=2"
+if "%1"=="" set "NMAX=3"
 if not "%1"=="" set "NMAX=%1"
 if "%2"=="" set "PMIN=0.0"
 if not "%2"=="" set "PMIN=%2"
@@ -42,7 +46,7 @@ if not exist "%SERVER%" (
 echo Using: %SERVER%
 
 set "MODEL_DIR=G:\models\gkraker04\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-GGUF"
-set "MODEL=%MODEL_DIR%\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v4-i3.gguf"
+set "MODEL=%MODEL_DIR%\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v6-i3.gguf"
 set "MMPROJ=%MODEL_DIR%\mmproj-Ornstein3.6-27B-MTP-NSC-ACE-SABER-F16.gguf"
 
 set "LOG_DIR=%MODEL_DIR%\logs"
@@ -88,14 +92,14 @@ echo Starting buun-llama-server...
     --log-timestamps ^
     --cache-type-k-draft %K_CACHE% ^
     --cache-type-v-draft %V_CACHE% ^
-    --temperature 0.6 ^
+    --temperature 0.7 ^
     --top-k 20 ^
-    --top-p 0.95 ^
-    --min-p 0.01 ^
+    --top-p 0.8 ^
+    --min-p 0.00 ^
     --repeat-penalty 1.0 ^
     --presence-penalty 1.5 ^
-    --ctx-checkpoints 0 ^
-    --cache-ram 0 ^
+    --ctx-checkpoints 4 ^
+    --cache-ram 4096 ^
     --kv-unified ^
     --parallel 1 ^
     --alias Qwen3.6-27B-turbo4-test ^
@@ -106,17 +110,20 @@ echo Starting buun-llama-server...
     --spec-type draft-mtp,ngram-mod,ngram-map-k4v ^
     --spec-draft-n-max %NMAX% ^
     --spec-draft-p-min %PMIN% ^
-   --jinja ^
-    --chat-template-file "%JINJA%" ^
-    --no-warmup
+    --spec-ngram-mod-n-match 16 ^
+    --spec-ngram-mod-n-min 24 ^
+    --spec-ngram-mod-n-max 48 ^
+    --spec-ngram-map-k4v-size-n 12 ^
+    --spec-ngram-map-k4v-size-m 48 ^
+    --spec-ngram-map-k4v-min-hits 1 ^
+    --jinja ^
+    --chat-template-file "%JINJA%"
 
 if "%ERRORLEVEL%"=="0" (
   echo Server started successfully on port 8081
 ) else (
   echo Server exited with code %ERRORLEVEL%.
 )
-
-pause
 
 REM    --mmproj "%MMPROJ%" ^
 REM    --no-mmproj-offload ^

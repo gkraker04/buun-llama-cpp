@@ -2,6 +2,8 @@
 #include "turbo-quant-cuda.cuh"
 #include "turbo-wht.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
+#include "common.cuh"
 
 // ============================================================
 // Activation pre-rotation via existing WHT kernel
@@ -12,8 +14,67 @@ static void prerotate_activations(
 }
 
 // ============================================================
-// Path A: Single-token decode (ne11 == 1) — working kernel
+// LUT for turbo4 4-bit indices → centroid values
 // ============================================================
+// Centroids for 4-bit turbo (from fattn-common.cuh d_turbo_centroids_4bit_fattn)
+// We represent them as int8 LUT for efficient dp4a-style dot products
+static constexpr __device__ float k_turbo4_centroids_f32[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
+
+// ============================================================
+// Path A2: Single-token decode with pre-quantized q8_1 activations
+// ============================================================
+static __global__ void k_turbo4_mul_mat_vec_q8(
+    const block_turbo4_0 * __restrict__ vx,
+    const block_q8_1 * __restrict__ vq8,
+    float * __restrict__        dst,
+    const int ncols_x,
+    const int nrows_x) {
+
+    const int row = blockIdx.x;
+    if (row >= nrows_x) return;
+    const int lane = threadIdx.x;  // 0..31
+
+    const int blocks_per_row = ncols_x / QK_TURBO4;
+    const int q8_per_block = QK_TURBO4 / QK8_1;  // 8
+
+    const block_turbo4_0 * x_row = vx + (int64_t)row * blocks_per_row;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < blocks_per_row; ib++) {
+        const block_turbo4_0 * blk = &x_row[ib];
+        const float norm = __half2float(blk->norm);
+        const int blk_idx_q8 = ib * q8_per_block;
+
+        for (int g = 0; g < q8_per_block; g++) {
+            const block_q8_1 * q8_blk = &vq8[blk_idx_q8 + g];
+
+            const int elem = g * QK8_1 + lane;
+            const uint8_t byte_val = blk->qs[elem / 2];
+            const int nibble_shift = (elem % 2) * 4;
+            const uint8_t idx = (byte_val >> nibble_shift) & 0xF;
+            const float w = k_turbo4_centroids_f32[idx];
+
+            const signed char a_i8 = q8_blk->qs[lane];
+            const float d = __low2float(q8_blk->ds);
+
+            sumf += w * (float)((int)a_i8) * norm * d;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+
+    if (lane == 0) dst[row] = sumf;
+}
+
+// ============================================================
+// Path A1: Single-token decode — working simple kernel
 static __global__ void k_turbo4_mul_mat_vec_simple(
     const block_turbo4_0 * __restrict__ vx,
     const float * __restrict__  vy,
@@ -242,9 +303,20 @@ void ggml_cuda_mul_mat_turbo(
     const int stride_y = ncols_x, stride_dst = nrows_x;
 
     if (ncols_dst == 1) {
-        // Single-token: use verified simple kernel (~6 tok/s with 256 threads, correct output)
-        k_turbo4_mul_mat_vec_simple<<<nrows_x, 256, 0, stream>>>(
-            (const block_turbo4_0 *)src0_d, rotated.get(), dst_d, ncols_x, nrows_x);
+        // Single-token: quantize rotated activations to q8_1, then vec_dot
+        const int64_t ne10_padded = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
+        const int64_t n_q8_bytes = ne10_padded * (int64_t)sizeof(block_q8_1) / QK8_1;
+        ggml_cuda_pool_alloc<char> q8_buf(ctx.pool(id), n_q8_bytes);
+        {
+            const int64_t s01 = ncols_x;  // stride between rows
+            quantize_row_q8_1_cuda(rotated.get(), nullptr, q8_buf.get(),
+                GGML_TYPE_F32, ncols_x, s01, ncols_x, ncols_x,
+                ne10_padded, 1, 1, 1, stream);
+        }
+        k_turbo4_mul_mat_vec_q8<<<nrows_x, 32, 0, stream>>>(
+            (const block_turbo4_0 *)src0_d, (const block_q8_1 *)q8_buf.get(),
+            dst_d, ncols_x, nrows_x);
+        CUDA_CHECK(cudaGetLastError());
     } else if (ncols_dst <= 8) {
         // Multi-token: use cuBLAS path (verified correct)
         ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
