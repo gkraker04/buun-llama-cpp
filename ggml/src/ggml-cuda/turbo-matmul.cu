@@ -316,7 +316,7 @@ void ggml_cuda_mul_mat_turbo(
         k_turbo4_mul_mat_vec_q8<<<nrows_x, 32, 0, stream>>>(
             (const block_turbo4_0 *)src0_d, (const block_q8_1 *)q8_buf.get(),
             dst_d, ncols_x, nrows_x);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     } else if (ncols_dst <= 8) {
         // Multi-token: use cuBLAS path (verified correct)
         ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
