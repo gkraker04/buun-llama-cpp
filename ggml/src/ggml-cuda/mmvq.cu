@@ -4,8 +4,8 @@
 #include "vecdotq.cuh"
 #include "vecdot-turbo4.cuh"
 #include "turbo-matmul.cuh"
-#include "ggml-common.h"
 #include "turbo-wht.cuh"
+#include "ggml-common.h"
 
 #include <cstdint>
 
@@ -1216,39 +1216,29 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    // Turbo4: pre-dequantize weights to Q8_0 (full WHT dequant cycle)
-    // then dispatch as Q8_0 MMVQ. This avoids the vec_dot having to
-    // implement the complex s2→FWHT→normalize→s1 dequant internally.
-    ggml_cuda_pool_alloc<char> q80_w_alloc;
+    // Native turbo4 MMVQ: dispatch directly to vec_dot_turbo4_0_q8_1.
+    // For correctness, activations must be WHT-rotated before q8_1 quantization:
+    //   Σ iWHT(C)·A = Σ C·WHT(A)  (Parseval / orthogonality of WHT)
+    // One WHT pre-rotation per activation row, then our vec_dot kernel can
+    // dot unrotated centroids directly with rotated q8_1 activations.
     ggml_type dispatch_type = src0->type;
     const void * dispatch_data = src0->data;
-    if (src0->type == GGML_TYPE_TURBO4_0) {
-        // Step 1: Dequant turbo4 to fp16 (full WHT cycle: s2→FWHT→norm→s1)
-        const int64_t n_blocks_t4 = (ne00 * ne01) / QK_TURBO4;
-        ggml_cuda_pool_alloc<half> w_f16(ctx.pool(), ne00 * ne01);
-        k_convert_turbo4_to_fp16_orig<<<(int)n_blocks_t4, 128, 0, stream>>>(
-            (const block_turbo4_0 *)src0->data, w_f16.get(), n_blocks_t4);
-
-        // Step 2: Convert fp16 to Q8_0 (4 blocks per turbo4 block: 128/32=4)
-        const int64_t n_blocks_q80 = (ne00 * ne01) / QK8_0;
-        q80_w_alloc.alloc(ctx.pool(), n_blocks_q80 * sizeof(block_q8_0));
-        k_convert_f16_to_q8_0<<<(int)n_blocks_q80, QK8_0, 0, stream>>>(
-            w_f16.get(), (block_q8_0 *)q80_w_alloc.get(), n_blocks_q80);
-
-        dispatch_data = q80_w_alloc.get();
-        dispatch_type = GGML_TYPE_Q8_0;
-    }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+
+    // No WHT pre-rotation — the vec_dot kernel applies iWHT to centroids directly.
+    // Activations are q8_1-quantized in their original (unrotated) domain.
+    const float * activation_data = src1_d;
+
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), dispatch_type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(activation_data, nullptr, src1_q8_1.get(), dispatch_type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
-    const int64_t s01 = dispatch_type == GGML_TYPE_TURBO4_0 ? ne00 / ggml_blck_size(dispatch_type) : src0->nb[1] / ts_src0;
+    const int64_t s01 = dispatch_type == GGML_TYPE_Q8_0 ? ne00 / QK8_0 : dispatch_type == GGML_TYPE_TURBO4_0 ? ne00 / ggml_blck_size(dispatch_type) : src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
@@ -1271,7 +1261,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        dispatch_data, dispatch_type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

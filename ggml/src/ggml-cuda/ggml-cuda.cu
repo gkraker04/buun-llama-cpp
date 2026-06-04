@@ -2630,10 +2630,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-    } else if (src0->type == GGML_TYPE_TURBO4_0 ||
-               src0->type == GGML_TYPE_TURBO3_0 ||
-               src0->type == GGML_TYPE_TURBO2_0) {
-        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
