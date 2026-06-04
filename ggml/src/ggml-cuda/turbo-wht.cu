@@ -55,6 +55,12 @@ void ggml_cuda_turbo_wht_forward(const float * src, float * dst, int64_t n_eleme
     k_turbo_wht<<<(int)n_groups, 128, 0, stream>>>(src, dst, n_elements, 0);
 }
 
+// Raw-buffer wrapper: inverse WHT rotation (direction=1)
+void ggml_cuda_turbo_wht_inverse(const float * src, float * dst, int64_t n_elements, cudaStream_t stream) {
+    const int64_t n_groups = (n_elements + 127) / 128;
+    k_turbo_wht<<<(int)n_groups, 128, 0, stream>>>(src, dst, n_elements, 1);
+}
+
 void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(src0->type == GGML_TYPE_F32);

@@ -107,6 +107,8 @@ echo Starting buun-llama-server...
     --port 8082 ^
     --api-key dummythicc ^
     --props ^
+    --reasoning-budget 8092 ^
+    --reasoning-budget-message ". My reasoning budget is exhausted, but I have enough information to answer directly now." ^
     --spec-type draft-mtp,ngram-mod,ngram-map-k4v ^
     --spec-draft-n-max %NMAX% ^
     --spec-draft-p-min %PMIN% ^

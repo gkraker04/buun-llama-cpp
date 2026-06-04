@@ -3,6 +3,8 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "vecdot-turbo4.cuh"
+#include "turbo-matmul.cuh"
+#include "ggml-common.h"
 #include "turbo-wht.cuh"
 
 #include <cstdint>
@@ -1124,6 +1126,34 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// F16→Q8_0 conversion: 32 threads per block, one block per Q8_0 block
+static __global__ void k_convert_f16_to_q8_0(
+    const half * __restrict__ src,
+    block_q8_0 * __restrict__ dst,
+    const int64_t n_blocks) {
+
+    const int blk = blockIdx.x;
+    if (blk >= (int)n_blocks) return;
+    const int tid = threadIdx.x;
+
+    float val = __half2float(src[(int64_t)blk * QK8_0 + tid]);
+
+    // Warp reduce max abs (32 threads = 1 warp)
+    float abs_v = fabsf(val);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        abs_v = fmaxf(abs_v, __shfl_xor_sync(0xffffffff, abs_v, off));
+    }
+
+    float d = abs_v / 127.0f;
+    if (d == 0.0f) d = 1.0f / 127.0f;
+
+    dst[blk].qs[tid] = (int8_t)(val / d + (val >= 0 ? 0.5f : -0.5f));
+    if (tid == 0) {
+        dst[blk].d = __float2half(d);
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1186,13 +1216,27 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    // WHT pre-rotate activations for turbo4
-    ggml_cuda_pool_alloc<float> rot_alloc;
+    // Turbo4: pre-dequantize weights to Q8_0 (full WHT dequant cycle)
+    // then dispatch as Q8_0 MMVQ. This avoids the vec_dot having to
+    // implement the complex s2→FWHT→normalize→s1 dequant internally.
+    ggml_cuda_pool_alloc<char> q80_w_alloc;
+    ggml_type dispatch_type = src0->type;
+    const void * dispatch_data = src0->data;
     if (src0->type == GGML_TYPE_TURBO4_0) {
-        const int64_t n_rot = ((ne10 * ne11 * ne12 * ne13) / 128) * 128;
-        rot_alloc.alloc(ctx.pool(), n_rot);
-        ggml_cuda_turbo_wht_forward(src1_d, rot_alloc.get(), n_rot, stream);
-        src1_d = rot_alloc.get();
+        // Step 1: Dequant turbo4 to fp16 (full WHT cycle: s2→FWHT→norm→s1)
+        const int64_t n_blocks_t4 = (ne00 * ne01) / QK_TURBO4;
+        ggml_cuda_pool_alloc<half> w_f16(ctx.pool(), ne00 * ne01);
+        k_convert_turbo4_to_fp16_orig<<<(int)n_blocks_t4, 128, 0, stream>>>(
+            (const block_turbo4_0 *)src0->data, w_f16.get(), n_blocks_t4);
+
+        // Step 2: Convert fp16 to Q8_0 (4 blocks per turbo4 block: 128/32=4)
+        const int64_t n_blocks_q80 = (ne00 * ne01) / QK8_0;
+        q80_w_alloc.alloc(ctx.pool(), n_blocks_q80 * sizeof(block_q8_0));
+        k_convert_f16_to_q8_0<<<(int)n_blocks_q80, QK8_0, 0, stream>>>(
+            w_f16.get(), (block_q8_0 *)q80_w_alloc.get(), n_blocks_q80);
+
+        dispatch_data = q80_w_alloc.get();
+        dispatch_type = GGML_TYPE_Q8_0;
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -1201,10 +1245,10 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), dispatch_type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s01 = dispatch_type == GGML_TYPE_TURBO4_0 ? ne00 / ggml_blck_size(dispatch_type) : src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;

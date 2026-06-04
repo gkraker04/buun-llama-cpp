@@ -7,6 +7,7 @@ __global__ void k_turbo_wht(
 
 // Raw-buffer wrapper for WHT rotation (non-static, cross-TU safe)
 void ggml_cuda_turbo_wht_forward(const float * src, float * dst, int64_t n_elements, cudaStream_t stream);
+void ggml_cuda_turbo_wht_inverse(const float * src, float * dst, int64_t n_elements, cudaStream_t stream);
 
 // Operation wrapper for WHT op in graph (for tensor operations)
 void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -235,6 +235,65 @@ static __global__ void k_convert_turbo4_to_fp16(
     turbo4_dequant_block_to_half(&src[block_idx], dst, (int64_t)block_idx * QK_TURBO4);
 }
 
+// WHT sign arrays (matching turbo-wht.cu) for fused kernel
+static __constant__ float d_fused_wht_s1[128] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1};
+static __constant__ float d_fused_wht_s2[128] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1};
+
+// Fused kernel: dequant turbo4 → inverse WHT → fp16, all in one pass.
+// 128 threads per block, one block per turbo4 block (128 elements).
+// Uses shared memory for the FWHT butterfly.
+// Non-static: used by mmvq.cu for turbo4→Q8_0 pre-dequant path.
+__global__ void k_convert_turbo4_to_fp16_orig(
+    const block_turbo4_0 * __restrict__ src,
+    half * __restrict__ dst,
+    const int64_t n_blocks) {
+
+    __shared__ float buf[128];
+
+    const int blk = blockIdx.x;
+    if (blk >= n_blocks) return;
+    const block_turbo4_0 * block = &src[blk];
+    const float norm = __half2float(block->norm);
+
+    // Step 1: Dequant — read 4-bit centroid indices, unquantize to float
+    if (threadIdx.x < QK_TURBO4) {
+        uint8_t idx = (block->qs[threadIdx.x / 2] >> ((threadIdx.x % 2) * 4)) & 0xF;
+        buf[threadIdx.x] = d_turbo_centroids_4bit[idx] * norm;
+    }
+    __syncthreads();
+
+    // Step 2: Inverse WHT — direction=1: s2 → FWHT → s1
+    if (threadIdx.x < 128) {
+        buf[threadIdx.x] *= d_fused_wht_s2[threadIdx.x];  // s2 first
+    }
+    __syncthreads();
+
+    // FWHT butterfly: 64 threads, 7 passes over shared memory
+    for (int h = 1; h < 128; h *= 2) {
+        if (threadIdx.x < 64) {
+            int j = (threadIdx.x / h) * (2 * h) + (threadIdx.x % h);
+            float a = buf[j], b = buf[j + h];
+            buf[j] = a + b; buf[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize (1/sqrt(128)), apply s1 sign, convert to fp16 and write
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (threadIdx.x < 128) {
+        float val = buf[threadIdx.x] * inv_sqrt_128 * d_fused_wht_s1[threadIdx.x];
+        dst[(int64_t)blk * QK_TURBO4 + threadIdx.x] = __float2half(val);
+    }
+}
+
 static void ggml_cuda_mul_mat_turbo_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -246,25 +305,18 @@ static void ggml_cuda_mul_mat_turbo_cublas(
     const int id = ggml_cuda_get_device();
     cudaStream_t stream = ctx.stream();
 
-    // Pre-rotate activations
-    ggml_cuda_pool_alloc<float> rotated(ctx.pool(id), ne00 * ne11);
-    prerotate_activations((const float *)src1->data, rotated.get(), ne00 * ne11, stream);
-
-    // Dequant weights to fp16
+    // Fused: dequant + inverse WHT + fp16 conversion in one kernel
     const int64_t n_blocks = (int64_t)ne00 * ne01 / QK_TURBO4;
     ggml_cuda_pool_alloc<half> w_f16(ctx.pool(id), ne00 * ne01);
-    {
-        const int grid = (int)((n_blocks + 255) / 256);
-        k_convert_turbo4_to_fp16<<<grid, 256, 0, stream>>>(
-            (const block_turbo4_0 *)src0->data, w_f16.get(), n_blocks);
-    }
+    k_convert_turbo4_to_fp16_orig<<<(int)n_blocks, 128, 0, stream>>>(
+        (const block_turbo4_0 *)src0->data, w_f16.get(), n_blocks);
 
-    // Convert rotated activations to fp16
+    // Convert activations to fp16
     ggml_cuda_pool_alloc<half> a_f16(ctx.pool(id), ne00 * ne11);
     {
         const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
         GGML_ASSERT(to_fp16 != nullptr);
-        to_fp16((const char *)rotated.get(), a_f16.get(), ne00 * ne11, stream);
+        to_fp16((const char *)src1->data, a_f16.get(), ne00 * ne11, stream);
     }
 
     // cuBLAS GEMM
@@ -280,6 +332,74 @@ static void ggml_cuda_mul_mat_turbo_cublas(
 }
 
 // ============================================================
+// Vec matmul: dequant turbo4 + inverse WHT + dot with float activations
+// 128 threads per block, one block per row. Dequants in shared memory.
+// Correct: dot(dequant(w), x) = dot(WHT(w), WHT(x)), done with proper WHT.
+// ============================================================
+static __global__ void k_turbo4_mul_mat_vec_wht(
+    const block_turbo4_0 * __restrict__ vx,
+    const float * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x) {
+
+    const int row = blockIdx.x;
+    if (row >= nrows_x) return;
+    const int tid = threadIdx.x;  // 0..127
+    const int blocks_per_row = ncols_x / QK_TURBO4;
+    const block_turbo4_0 * x_row = vx + (int64_t)row * blocks_per_row;
+
+    __shared__ float buf[128];
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < blocks_per_row; ib++) {
+        const block_turbo4_0 * blk = &x_row[ib];
+        const float norm = __half2float(blk->norm);
+        const int block_start = ib * QK_TURBO4;
+
+        // Step 1: Load centroid, apply s2 sign (inverse WHT: s2 first)
+        if (tid < 128) {
+            uint8_t idx = (blk->qs[tid / 2] >> ((tid % 2) * 4)) & 0xF;
+            buf[tid] = d_turbo_centroids_4bit[idx] * norm * d_fused_wht_s2[tid];
+        }
+        __syncthreads();
+
+        // Step 2: FWHT butterfly (7 passes, 64 threads handle 128 elements)
+        for (int h = 1; h < 128; h *= 2) {
+            if (tid < 64) {
+                int j = (tid / h) * (2 * h) + (tid % h);
+                float a = buf[j], b = buf[j + h];
+                buf[j] = a + b;
+                buf[j + h] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Step 3: Normalize by 1/sqrt(128), apply s1 sign, dot with activation
+        if (tid < 128) {
+            constexpr float inv_sqrt_128 = 0.08838834764831845f;
+            float val = buf[tid] * inv_sqrt_128 * d_fused_wht_s1[tid];
+            sumf += val * vy[block_start + tid];
+        }
+    }
+
+    // Reduction: 128 threads → 1 (warp shuffle × 4 warps → shared → final)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+
+    __shared__ float warp_sums[4];
+    if ((tid & 31) == 0) {
+        warp_sums[tid >> 5] = sumf;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        dst[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    }
+}
+
+// ============================================================
 // Main dispatch
 // ============================================================
 void ggml_cuda_mul_mat_turbo(
@@ -289,39 +409,23 @@ void ggml_cuda_mul_mat_turbo(
     GGML_ASSERT(src0->type == GGML_TYPE_TURBO4_0 ||
                 src0->type == GGML_TYPE_TURBO3_0 ||
                 src0->type == GGML_TYPE_TURBO2_0);
-    const int ncols_x = src0->ne[0], nrows_x = src0->ne[1], ncols_dst = src1->ne[1];
+
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];
+    const int64_t ne11 = src1->ne[1];
     cudaStream_t stream = ctx.stream();
-    const int id = ggml_cuda_get_device();
 
-    // Step 1: Pre-rotate all activations
-    const int64_t n_act = (int64_t)ncols_x * ncols_dst;
-    ggml_cuda_pool_alloc<float> rotated(ctx.pool(id), n_act);
-    prerotate_activations((const float *)src1->data, rotated.get(), n_act, stream);
-
-    const void * src0_d = src0->data;
-    float * dst_d = (float *)dst->data;
-    const int stride_y = ncols_x, stride_dst = nrows_x;
-
-    if (ncols_dst == 1) {
-        // Single-token: quantize rotated activations to q8_1, then vec_dot
-        const int64_t ne10_padded = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
-        const int64_t n_q8_bytes = ne10_padded * (int64_t)sizeof(block_q8_1) / QK8_1;
-        ggml_cuda_pool_alloc<char> q8_buf(ctx.pool(id), n_q8_bytes);
-        {
-            const int64_t s01 = ncols_x;  // stride between rows
-            quantize_row_q8_1_cuda(rotated.get(), nullptr, q8_buf.get(),
-                GGML_TYPE_F32, ncols_x, s01, ncols_x, ncols_x,
-                ne10_padded, 1, 1, 1, stream);
-        }
-        k_turbo4_mul_mat_vec_q8<<<nrows_x, 32, 0, stream>>>(
-            (const block_turbo4_0 *)src0_d, (const block_q8_1 *)q8_buf.get(),
-            dst_d, ncols_x, nrows_x);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    } else if (ncols_dst <= 8) {
-        // Multi-token: use cuBLAS path (verified correct)
-        ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
+    if (ne11 == 1) {
+        // Single-token decode: fast vec matmul with on-the-fly WHT dequant
+        // One block per row, 128 threads per block
+        dim3 blocks((int)ne01);
+        dim3 threads(128);
+        k_turbo4_mul_mat_vec_wht<<<blocks, threads, 0, stream>>>(
+            (const block_turbo4_0 *)src0->data,
+            (const float *)src1->data,
+            (float *)dst->data,
+            (int)ne00, (int)ne01);
     } else {
-        // Large batch: cuBLAS
+        // Batched prefill: use cuBLAS
         ggml_cuda_mul_mat_turbo_cublas(ctx, src0, src1, dst);
     }
 }

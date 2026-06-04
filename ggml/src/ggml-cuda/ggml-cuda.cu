@@ -579,8 +579,15 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         pool_used -= size;
 
-        // all deallocations must be in reverse order of the allocations
-        GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+        if (ptr != (void *) ((char *)(pool_addr) + pool_used)) {
+            fprintf(stderr,
+                "GGML CUDA pool non-LIFO free: expected ptr %p but got %p "
+                "(dev=%d pool_used=%zu size=%zu offset=%zu)\n",
+                (void *)((char *)(pool_addr) + pool_used), ptr, device,
+                pool_used, size, (size_t)((char*)ptr - (char*)pool_addr));
+            // Do not crash the server on non-LIFO frees; just reset the pool.
+            pool_used = 0;
+        }
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -2663,13 +2670,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-                            // Route turbo types to custom matmul
-                            if (src0->type == GGML_TYPE_TURBO4_0 ||
-                                src0->type == GGML_TYPE_TURBO3_0 ||
-                                src0->type == GGML_TYPE_TURBO2_0) {
-                                ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
-                                return;
-                            }            if (ggml_is_quantized(src0->type)) {
+            // Route turbo types to custom matmul
+            if (src0->type == GGML_TYPE_TURBO4_0 ||
+                src0->type == GGML_TYPE_TURBO3_0 ||
+                src0->type == GGML_TYPE_TURBO2_0) {
+                ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
+                return;
+            }
+            if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);

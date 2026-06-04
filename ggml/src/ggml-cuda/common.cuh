@@ -1017,7 +1017,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_TURBO4_0> {
     static constexpr int qk = QK_TURBO4;
-    static constexpr int qr = 2;  // must match QR_TURBO4_0 from turbo-quant-cuda.cuh
+    static constexpr int qr = 2;  // matches turbo-quant-cuda.cuh's internal layout
     static constexpr int qi = QK_TURBO4 / (4 * qr);
 };
 

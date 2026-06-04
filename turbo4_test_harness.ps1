@@ -76,9 +76,10 @@ $serverProcess = Start-Process -FilePath $ServerPath -ArgumentList @(
     "--port", $TestPort,
     "--api-key", "dummythicc",
     "--props",
-    "--spec-type", "draft-mtp,ngram-mod,ngram-map-k4v",
-    "--spec-draft-n-max", "2",
-    "--spec-draft-p-min", "0.0",
+    "--ubatch-size", "2",  # Force multi-token batch to hit cuBLAS path
+    "--spec-type", "mtp",
+    "--spec-draft-n-max", "8",
+    "--spec-draft-p-min", "0.3",
     "--jinja",
     "--chat-template-file", $JinjaPath,
     "--no-warmup"
