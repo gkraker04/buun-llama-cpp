@@ -5,6 +5,10 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 
+// Forward declaration for turbo4 dequantization (defined in ggml-turbo-quant.c)
+struct block_turbo4_0;
+extern "C" void dequantize_row_turbo4_0(const block_turbo4_0 * x, float * y, int64_t k);
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -1281,8 +1285,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
-    ggml_set_name(tensor, ggml_get_name(cur));
+    struct ggml_tensor * tensor;
+
+    // Convert TURBO4_0 tensors to F16 at load time for faster inference
+    // This trades VRAM (fp16 is ~3.88x larger than turbo4) for speed
+    if (cur->type == GGML_TYPE_TURBO4_0) {
+        LLAMA_LOG_INFO("create_tensor: converting %s from TURBO4_0 to F16 (%zu -> %zu bytes)\n",
+            tn.str().c_str(), ggml_nbytes(cur),
+            ggml_nelements(cur) * sizeof(ggml_fp16_t));
+        // Create tensor as F16 instead of TURBO4_0
+        tensor = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, cur->ne);
+        ggml_set_name(tensor, ggml_get_name(cur));
+        // Track for dequantization during data load
+        turbo4_to_f16_tensors.insert(ggml_get_name(cur));
+    } else {
+        tensor = ggml_dup_tensor(ctx, cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1385,14 +1404,49 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
             continue;
         }
         *first = std::min(*first, weight->offs);
-        *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+        // Use the weight's tensor size (original file size), not the model tensor's size
+        // This is important for TURBO4_0 -> F16 converted tensors where sizes differ
+        *last  = std::max(*last,  weight->offs + ggml_nbytes(weight->tensor));
     }
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
 
-    if (use_mmap) {
+    // Check if this tensor was converted from TURBO4_0 to F16
+    const std::string tensor_name = ggml_get_name(cur);
+    const bool needs_dequant = (turbo4_to_f16_tensors.find(tensor_name) != turbo4_to_f16_tensors.end());
+
+    if (needs_dequant) {
+        // The tensor is F16 but the file has TURBO4_0 data
+        // Read turbo4 data, dequantize to fp32, convert to fp16
+        const size_t turbo4_nbytes = ggml_nbytes(w.tensor);  // original size in file
+        const size_t fp16_nbytes = ggml_nbytes(cur);          // target size
+        const int64_t n_elements = ggml_nelements(cur);
+
+        LLAMA_LOG_INFO("load_data_for: dequantizing %s from TURBO4_0 (%zu bytes) to F16 (%zu bytes, %lld elements)\n",
+            tensor_name.c_str(), turbo4_nbytes, fp16_nbytes, (long long)n_elements);
+
+        // Read turbo4 data from file/mmap
+        std::vector<uint8_t> turbo4_buf(turbo4_nbytes);
+        if (use_mmap) {
+            const auto & mapping = mappings.at(w.idx);
+            memcpy(turbo4_buf.data(), (uint8_t *)mapping->addr() + w.offs, turbo4_nbytes);
+        } else {
+            const auto & file = files.at(w.idx);
+            file->seek(w.offs, SEEK_SET);
+            file->read_raw(turbo4_buf.data(), turbo4_nbytes);
+        }
+
+        // Dequantize turbo4 -> fp32
+        std::vector<float> fp32_buf(n_elements);
+        dequantize_row_turbo4_0((const block_turbo4_0 *)turbo4_buf.data(), fp32_buf.data(), n_elements);
+
+        // Convert fp32 -> fp16
+        GGML_ASSERT(cur->data != nullptr);
+        ggml_fp16_t * fp16_dst = (ggml_fp16_t *)cur->data;
+        ggml_fp32_to_fp16_row(fp32_buf.data(), fp16_dst, n_elements);
+    } else if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
         if (cur->data == nullptr) {
             cur->data = (uint8_t *)mapping->addr() + w.offs;
@@ -1407,7 +1461,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
-    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+    if (check_tensors && !needs_dequant && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
     }
 }
@@ -1538,6 +1592,50 @@ bool llama_model_loader::load_all_data(
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
+        }
+
+        // Check if this tensor needs TURBO4_0 -> F16 dequantization
+        const std::string tensor_name = ggml_get_name(cur);
+        const bool needs_dequant = (turbo4_to_f16_tensors.find(tensor_name) != turbo4_to_f16_tensors.end());
+
+        if (needs_dequant) {
+            // Dequantize TURBO4_0 from file to F16 in tensor buffer
+            const size_t turbo4_nbytes = ggml_nbytes(weight->tensor);  // original size in file
+            const int64_t n_elements = ggml_nelements(cur);
+
+            LLAMA_LOG_INFO("load_all_data: dequantizing %s from TURBO4_0 (%zu bytes) to F16 (%lld elements)\n",
+                tensor_name.c_str(), turbo4_nbytes, (long long)n_elements);
+
+            // Read turbo4 data from file/mmap
+            std::vector<uint8_t> turbo4_buf(turbo4_nbytes);
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                memcpy(turbo4_buf.data(), (uint8_t *)mapping->addr() + weight->offs, turbo4_nbytes);
+            } else {
+                const auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(turbo4_buf.data(), turbo4_nbytes);
+            }
+
+            // Dequantize turbo4 -> fp32
+            std::vector<float> fp32_buf(n_elements);
+            dequantize_row_turbo4_0((const block_turbo4_0 *)turbo4_buf.data(), fp32_buf.data(), n_elements);
+
+            // Convert fp32 -> fp16 and write to tensor buffer
+            // Note: cur->data might be nullptr if using mmap allocation
+            // In that case, we need to allocate a host buffer and use ggml_backend_tensor_set
+            std::vector<ggml_fp16_t> fp16_buf(n_elements);
+            ggml_fp32_to_fp16_row(fp32_buf.data(), fp16_buf.data(), n_elements);
+
+            if (cur->data != nullptr) {
+                memcpy(cur->data, fp16_buf.data(), n_elements * sizeof(ggml_fp16_t));
+            } else {
+                // Tensor data not yet allocated, use backend tensor set
+                ggml_backend_tensor_set(cur, fp16_buf.data(), 0, n_elements * sizeof(ggml_fp16_t));
+            }
+
+            size_done += turbo4_nbytes;  // progress tracking uses original file size
+            continue;
         }
 
         size_t n_size = ggml_nbytes(cur);

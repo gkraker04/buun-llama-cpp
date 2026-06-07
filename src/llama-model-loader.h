@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -111,6 +112,9 @@ struct llama_model_loader {
     };
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    // track tensors that were converted from TURBO4_0 to F16 at load time
+    mutable std::set<std::string> turbo4_to_f16_tensors;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
