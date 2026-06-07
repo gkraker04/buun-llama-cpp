@@ -14,7 +14,7 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8082"') do (
 timeout /t 2 /nobreak >nul
 echo.
 
-if "%1"=="" set "NMAX=3"
+if "%1"=="" set "NMAX=2"
 if not "%1"=="" set "NMAX=%1"
 if "%2"=="" set "PMIN=0.0"
 if not "%2"=="" set "PMIN=%2"
@@ -22,9 +22,11 @@ if "%3"=="" set "BATCH=2048"
 if not "%3"=="" set "BATCH=%3"
 if "%4"=="" set "UBATCH=512"
 if not "%4"=="" set "UBATCH=%4"
-if "%5"=="" set "K_CACHE=turbo2_tcq"
+REM if "%5"=="" set "K_CACHE=turbo2_tcq"
+if "%5"=="" set "K_CACHE=f16"
 if not "%5"=="" set "K_CACHE=%5"
-if "%6"=="" set "V_CACHE=turbo2_tcq"
+REM if "%6"=="" set "V_CACHE=turbo2_tcq"
+if "%6"=="" set "V_CACHE=f16"
 if not "%6"=="" set "V_CACHE=%6"
 
 echo Ornstein MTP: n_max=%NMAX%, p_min=%PMIN%, batch=%BATCH%, ubatch=%UBATCH%, K=%K_CACHE%, V=%V_CACHE%
@@ -46,7 +48,7 @@ if not exist "%SERVER%" (
 echo Using: %SERVER%
 
 set "MODEL_DIR=G:\models\gkraker04\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-GGUF"
-set "MODEL=%MODEL_DIR%\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v6-i3.gguf"
+set "MODEL=%MODEL_DIR%\Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v7-i4.gguf"
 set "MMPROJ=%MODEL_DIR%\mmproj-Ornstein3.6-27B-MTP-NSC-ACE-SABER-F16.gguf"
 
 set "LOG_DIR=%MODEL_DIR%\logs"
@@ -70,11 +72,11 @@ if "%BUUN%" equ "0" (
     set "V_CACHE=q4_0"
 )
 
+echo Ornstein MTP: n_max=%NMAX%, p_min=%PMIN%, batch=%BATCH%, ubatch=%UBATCH%, K=%K_CACHE%, V=%V_CACHE%
 echo Starting buun-llama-server...
 "%SERVER%" ^
     --threads 12 ^
-    --prio 2 ^
-    --ctx-size 2048 ^
+    --prio 3 ^
     --n-predict 32768 ^
     --batch-size 256 ^
     --ubatch-size 64 ^
@@ -82,11 +84,11 @@ echo Starting buun-llama-server...
     --cache-type-k %K_CACHE% ^
     --cache-type-v %V_CACHE% ^
     --n-gpu-layers all ^
-    --fit-target 0 ^
+    --fit-target 1536 ^
     --model "%MODEL%" ^
     --log-file "%LOG%" ^
     --offline ^
-    --no-mmap ^
+    --mmap ^
     --log-verbosity 4 ^
     --log-prefix ^
     --log-timestamps ^
@@ -107,6 +109,7 @@ echo Starting buun-llama-server...
     --port 8082 ^
     --api-key dummythicc ^
     --props ^
+    --reasoning off ^
     --reasoning-budget 8092 ^
     --reasoning-budget-message ". My reasoning budget is exhausted, but I have enough information to answer directly now." ^
     --spec-type draft-mtp,ngram-mod,ngram-map-k4v ^
