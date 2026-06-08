@@ -514,6 +514,22 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
     // Post-rotation extraction (if enabled)
     turbo_extract_append(x);
+    // Adaptive outlier scaling: if any WHT component exceeds centroid range,
+    // scale down and compensate via norm. Prevents clipping of outlier blocks.
+    const float max_centroid = 0.241556f;  /* d_turbo_centroids_4bit[15] */
+    float outlier_scale = 1.0f;
+    {
+        float max_abs = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            float a = fabsf(x[j]);
+            if (a > max_abs) max_abs = a;
+        }
+        if (max_abs > max_centroid) {
+            outlier_scale = max_abs / max_centroid;
+            float inv_scale = 1.0f / outlier_scale;
+            for (int j = 0; j < 128; j++) x[j] *= inv_scale;
+        }
+    }
     // 4-bit quantization: find nearest of 16 centroids, pack 2 per byte
     for (int j = 0; j < 128; j += 2) {
         uint8_t idx0 = turbo_find_nearest_4bit(x[j]);
@@ -528,7 +544,8 @@ void quantize_f32_turbo4_0_block(const float * src, block_turbo4_0 * dst) {
         recon_sq += r * r;
     }
     float recon_norm = sqrtf(recon_sq);
-    float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    float effective_norm = norm * outlier_scale;
+    float corrected = (recon_norm > 1e-10f) ? effective_norm / recon_norm : effective_norm;
     dst->norm = __float2half(corrected * d_turbo4_alpha);
 }
 

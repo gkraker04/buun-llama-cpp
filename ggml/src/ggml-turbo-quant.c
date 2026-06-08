@@ -897,20 +897,44 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         /* Step 2: WHT rotate */
         turbo_wht_forward(normalized, d);
 
+        /* Step 2b: Adaptive outlier scaling — if any WHT component exceeds the
+         * centroid range, scale down the entire WHT vector to fit and compensate
+         * by scaling up the norm. This prevents clipping of outlier blocks
+         * (e.g. special token embeddings) while remaining fully backward compatible
+         * with the existing block format and vec_dot code. */
+        const float max_centroid = CENTROIDS_4BIT[15];  /* 0.241556 */
+        float outlier_scale = 1.0f;
+        {
+            float max_abs = 0.0f;
+            for (int i = 0; i < d; i++) {
+                float a = fabsf(normalized[i]);
+                if (a > max_abs) max_abs = a;
+            }
+            if (max_abs > max_centroid) {
+                outlier_scale = max_abs / max_centroid;
+                float inv_scale = 1.0f / outlier_scale;
+                for (int i = 0; i < d; i++) {
+                    normalized[i] *= inv_scale;
+                }
+                /* norm will be multiplied by outlier_scale in norm correction */
+            }
+        }
+
         /* Step 3: 4-bit quantization — find nearest of 16 centroids */
         uint8_t indices[TURBO_D];
         for (int i = 0; i < d; i++) {
             indices[i] = (uint8_t)nearest_centroid_4bit(normalized[i]);
         }
 
-        /* Step 4: Norm correction */
+        /* Step 4: Norm correction — include outlier_scale compensation */
         float recon_sq = 0.0f;
         for (int i = 0; i < d; i++) {
             float r = CENTROIDS_4BIT[indices[i]];
             recon_sq += r * r;
         }
         float recon_norm = sqrtf(recon_sq);
-        y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
+        float effective_norm = norm * outlier_scale;
+        y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? effective_norm / recon_norm : effective_norm);
 
         /* Pack 4-bit indices: 2 per byte, low nibble first */
         for (int i = 0; i < d; i += 2) {
