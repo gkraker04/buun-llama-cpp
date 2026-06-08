@@ -1230,27 +1230,22 @@ void ggml_cuda_mul_mat_vec_q(
     // WHT pre-rotation: rotate activations to WHT space, then use raw centroid vec_dot.
     // This is faster than applying iWHT to centroids in the vec_dot (~30 tok/s vs ~7 tok/s).
     // By Parseval's theorem: dot(iWHT(C), A) = dot(C, WHT_fwd(A))
-    const float * activation_data;
-    ggml_cuda_pool_alloc<float> src1_wht(ctx.pool(), ne11 * ne10);
-    
     if (src0->type == GGML_TYPE_TURBO4_0 && ne11 == 1) {
-        // Decode path: apply WHT forward to activations, use raw vec_dot (no iWHT)
-        ggml_cuda_turbo_wht_forward(src1_d, src1_wht.get(), ne10, stream);
-        activation_data = src1_wht.get();
+        // Decode path: fused WHT forward + q8_1 quantization (eliminates intermediate fp32 buffer)
+        ggml_cuda_turbo_wht_q8_1(src1_d, src1_q8_1.get(), ne10, stream);
         int raw_mode = 1;
         cudaMemcpyToSymbolAsync(g_turbo4_raw_mode, &raw_mode, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
     } else {
         // Prefill path or non-turbo: no WHT pre-rotation, use iWHT vec_dot
-        activation_data = src1_d;
+        const float * activation_data = src1_d;
         int raw_mode = 0;
         cudaMemcpyToSymbolAsync(g_turbo4_raw_mode, &raw_mode, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
-    }
-
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(activation_data, nullptr, src1_q8_1.get(), dispatch_type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        {
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(activation_data, nullptr, src1_q8_1.get(), dispatch_type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = dispatch_type == GGML_TYPE_Q8_0 ? ne00 / QK8_0 : dispatch_type == GGML_TYPE_TURBO4_0 ? ne00 / ggml_blck_size(dispatch_type) : src0->nb[1] / ts_src0;

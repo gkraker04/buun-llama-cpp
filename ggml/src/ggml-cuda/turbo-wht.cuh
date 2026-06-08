@@ -5,7 +5,10 @@ __global__ void k_turbo_wht(
     const float * __restrict__ src, float * __restrict__ dst,
     const int64_t n_elements, const int direction);
 
-// Raw-buffer wrapper for WHT rotation (non-static, cross-TU safe)
+// Fused WHT forward + q8_1 quantization (eliminates intermediate fp32 buffer)
+void ggml_cuda_turbo_wht_q8_1(const float * src, void * dst, int64_t n_elements, cudaStream_t stream);
+
+// Raw-buffer wrappers (fp32 → fp32)
 void ggml_cuda_turbo_wht_forward(const float * src, float * dst, int64_t n_elements, cudaStream_t stream);
 void ggml_cuda_turbo_wht_inverse(const float * src, float * dst, int64_t n_elements, cudaStream_t stream);
 
