@@ -158,11 +158,11 @@ static __device__ __forceinline__ float vec_dot_turbo4_0_q8_1_raw(
     return norm * sum;
 }
 
-// === Default vec_dot (iWHT version for backward compatibility) ===
-// Runtime flag to switch between iWHT and raw modes:
-//   0 = iWHT mode (apply iWHT to centroids, dot with unrotated activations)
-//   1 = raw mode (no iWHT, dot raw centroids with WHT-pre-rotated activations)
-static __device__ int g_turbo4_raw_mode = 0;
+// === Default vec_dot with runtime mode switch ===
+// Mode is set by mmvq.cu via cudaMemcpyToSymbolAsync before kernel launch:
+//   0 = iWHT mode (for prefill or non-turbo: no WHT pre-rotation)
+//   1 = raw mode (for turbo4 decode: WHT pre-rotation active)
+__device__ int g_turbo4_raw_mode = 0;
 
 static __device__ __forceinline__ float vec_dot_turbo4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,

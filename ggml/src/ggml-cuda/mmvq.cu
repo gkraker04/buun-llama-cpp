@@ -1234,10 +1234,9 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_pool_alloc<float> src1_wht(ctx.pool(), ne11 * ne10);
     
     if (src0->type == GGML_TYPE_TURBO4_0 && ne11 == 1) {
-        // Decode path: apply WHT forward to activations, use raw vec_dot
+        // Decode path: apply WHT forward to activations, use raw vec_dot (no iWHT)
         ggml_cuda_turbo_wht_forward(src1_d, src1_wht.get(), ne10, stream);
         activation_data = src1_wht.get();
-        // Switch to raw vec_dot (no iWHT) — set device flag
         int raw_mode = 1;
         cudaMemcpyToSymbolAsync(g_turbo4_raw_mode, &raw_mode, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
     } else {
