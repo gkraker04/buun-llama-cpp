@@ -1227,9 +1227,25 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 
-    // No WHT pre-rotation — the vec_dot kernel applies iWHT to centroids directly.
-    // Activations are q8_1-quantized in their original (unrotated) domain.
-    const float * activation_data = src1_d;
+    // WHT pre-rotation: rotate activations to WHT space, then use raw centroid vec_dot.
+    // This is faster than applying iWHT to centroids in the vec_dot (~30 tok/s vs ~7 tok/s).
+    // By Parseval's theorem: dot(iWHT(C), A) = dot(C, WHT_fwd(A))
+    const float * activation_data;
+    ggml_cuda_pool_alloc<float> src1_wht(ctx.pool(), ne11 * ne10);
+    
+    if (src0->type == GGML_TYPE_TURBO4_0 && ne11 == 1) {
+        // Decode path: apply WHT forward to activations, use raw vec_dot
+        ggml_cuda_turbo_wht_forward(src1_d, src1_wht.get(), ne10, stream);
+        activation_data = src1_wht.get();
+        // Switch to raw vec_dot (no iWHT) — set device flag
+        int raw_mode = 1;
+        cudaMemcpyToSymbolAsync(g_turbo4_raw_mode, &raw_mode, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
+    } else {
+        // Prefill path or non-turbo: no WHT pre-rotation, use iWHT vec_dot
+        activation_data = src1_d;
+        int raw_mode = 0;
+        cudaMemcpyToSymbolAsync(g_turbo4_raw_mode, &raw_mode, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
+    }
 
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
