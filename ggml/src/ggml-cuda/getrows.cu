@@ -3,6 +3,80 @@
 #include "convert.cuh"
 #include "turbo-quant-cuda.cuh"
 
+// WHT sign arrays for inverse transform (from turbo-wht.cu)
+static __constant__ float d_getrows_wht_s1[128] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1};
+static __constant__ float d_getrows_wht_s2[128] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1};
+
+// Specialized get_rows kernel for turbo4 that applies inverse WHT
+// Each block handles one row, 128 threads per block (one per element in turbo4 block)
+template<typename dst_t>
+static __global__ void k_get_rows_turbo4_iwht(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    __shared__ float buf[128];
+
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const char * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+        // Process each 128-element turbo4 block in the row
+        const int n_blocks = ne00 / 128;
+        for (int block_idx = 0; block_idx < n_blocks; block_idx++) {
+            const block_turbo4_0 * blk = (const block_turbo4_0 *)(src0_row + block_idx * sizeof(block_turbo4_0));
+            const float norm = __half2float(blk->norm);
+
+            // Each thread loads one centroid value
+            const int i = threadIdx.x;
+            uint8_t idx = (i & 1) ? (blk->qs[i / 2] >> 4) : (blk->qs[i / 2] & 0xF);
+            buf[i] = d_turbo_centroids_4bit[idx] * norm;
+            __syncthreads();
+
+            // Apply inverse WHT: s2 first, then butterfly, then s1
+            // Step 1: Apply s2 signs
+            buf[i] = buf[i] * d_getrows_wht_s2[i];
+            __syncthreads();
+
+            // Step 2: FWHT butterfly (7 passes for 128 elements)
+            for (int h = 1; h < 128; h *= 2) {
+                if (threadIdx.x < 64) {
+                    int j = (threadIdx.x / h) * (2 * h) + (threadIdx.x % h);
+                    float a = buf[j], b = buf[j + h];
+                    buf[j] = a + b;
+                    buf[j + h] = a - b;
+                }
+                __syncthreads();
+            }
+
+            // Step 3: Normalize and apply s1 signs
+            constexpr float inv_sqrt_128 = 0.08838834764831845f;
+            float result = buf[i] * inv_sqrt_128 * d_getrows_wht_s1[i];
+            __syncthreads();
+
+            // Write output
+            dst_row[block_idx * 128 + i] = ggml_cuda_cast<dst_t>(result);
+        }
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -228,8 +302,24 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_TURBO4_0:
-            get_rows_cuda_q<QK_TURBO4, QR_TURBO4_0, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            // Use specialized kernel that applies iWHT to full 128-element blocks
+            {
+                const dim3 block_dims(128, 1, 1);
+                const dim3 block_nums(ne10, 1, MIN(ne11*ne12, UINT16_MAX));
+                const size_t s1 = nb1 / sizeof(dst_t);
+                const size_t s2 = nb2 / sizeof(dst_t);
+                const size_t s3 = nb3 / sizeof(dst_t);
+                const size_t s10 = nb10 / sizeof(int32_t);
+                const size_t s11 = nb11 / sizeof(int32_t);
+                const size_t s12 = nb12 / sizeof(int32_t);
+                const uint3 ne12_fdv = init_fastdiv_values(ne12);
+                k_get_rows_turbo4_iwht<<<block_nums, block_dims, 0, stream>>>(
+                    src0_d, src1_d, dst_d,
+                    ne00, ne11, ne12_fdv,
+                    s1, s2, s3,
+                    nb01, nb02, nb03,
+                    s10, s11, s12);
+            }
             break;
         case GGML_TYPE_TURBO3_TCQ:
             get_rows_cuda_q<QK_TURBO3_TCQ, QR_TURBO3_TCQ, dequantize_turbo3_tcq>(src0_d, src1_d, dst_d,
