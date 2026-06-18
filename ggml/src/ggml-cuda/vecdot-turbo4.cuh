@@ -240,20 +240,33 @@ static __device__ __forceinline__ float vec_dot_turbo4_0_q8_1_dp4a(
     int sum_i32_1 = 0;  // accumulator for second q8_1 block (elements 32-63)
 
     // Pack centroids and activations into int32, then dp4a
+    // Use uint32_t for packing to avoid sign extension, then cast to int for dp4a
     #pragma unroll
     for (int i = 0; i < 32; i += 4) {
         // First q8_1 block (elements 0-31)
-        int c_packed = (int)((uint8_t)c_i8[i+0] | ((uint8_t)c_i8[i+1] << 8) |
-                             ((uint8_t)c_i8[i+2] << 16) | ((uint8_t)c_i8[i+3] << 24));
-        int a_packed = (int)((uint8_t)qs0[i+0] | ((uint8_t)qs0[i+1] << 8) |
-                             ((uint8_t)qs0[i+2] << 16) | ((uint8_t)qs0[i+3] << 24));
+        uint32_t c_packed_u = ((uint32_t)(uint8_t)c_i8[i+0]) |
+                              ((uint32_t)(uint8_t)c_i8[i+1] << 8) |
+                              ((uint32_t)(uint8_t)c_i8[i+2] << 16) |
+                              ((uint32_t)(uint8_t)c_i8[i+3] << 24);
+        int c_packed = (int)c_packed_u;
+        uint32_t a_packed_u = ((uint32_t)(uint8_t)qs0[i+0]) |
+                              ((uint32_t)(uint8_t)qs0[i+1] << 8) |
+                              ((uint32_t)(uint8_t)qs0[i+2] << 16) |
+                              ((uint32_t)(uint8_t)qs0[i+3] << 24);
+        int a_packed = (int)a_packed_u;
         sum_i32_0 = ggml_cuda_dp4a(c_packed, a_packed, sum_i32_0);
 
         // Second q8_1 block (elements 32-63)
-        c_packed = (int)((uint8_t)c_i8[32+i+0] | ((uint8_t)c_i8[32+i+1] << 8) |
-                         ((uint8_t)c_i8[32+i+2] << 16) | ((uint8_t)c_i8[32+i+3] << 24));
-        a_packed = (int)((uint8_t)qs1[i+0] | ((uint8_t)qs1[i+1] << 8) |
-                         ((uint8_t)qs1[i+2] << 16) | ((uint8_t)qs1[i+3] << 24));
+        c_packed_u = ((uint32_t)(uint8_t)c_i8[32+i+0]) |
+                     ((uint32_t)(uint8_t)c_i8[32+i+1] << 8) |
+                     ((uint32_t)(uint8_t)c_i8[32+i+2] << 16) |
+                     ((uint32_t)(uint8_t)c_i8[32+i+3] << 24);
+        c_packed = (int)c_packed_u;
+        a_packed_u = ((uint32_t)(uint8_t)qs1[i+0]) |
+                     ((uint32_t)(uint8_t)qs1[i+1] << 8) |
+                     ((uint32_t)(uint8_t)qs1[i+2] << 16) |
+                     ((uint32_t)(uint8_t)qs1[i+3] << 24);
+        a_packed = (int)a_packed_u;
         sum_i32_1 = ggml_cuda_dp4a(c_packed, a_packed, sum_i32_1);
     }
 
