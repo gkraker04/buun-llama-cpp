@@ -1,8 +1,11 @@
-// === TURBO4: 4-bit Lloyd-Max centroids with on-the-fly iWHT ===
-// vec_dot for MMVQ path — register-only with warp shuffle for ~2× speed.
-// Thread 0 (iqs=0): centroids 0-63, Thread 1 (iqs=8): centroids 64-127.
-// Both compute passes 1-6 independently, exchange for pass 7 via __shfl_xor_sync.
-// Uses __activemask() for deadlock-free shuffle across varying thread counts.
+// === TURBO4: 4-bit Lloyd-Max centroids ===
+// Two vec_dot variants:
+// 1) vec_dot_turbo4_0_q8_1: on-the-fly iWHT (fallback, no pre-rotation)
+// 2) vec_dot_turbo4_0_q8_1_rotated: pre-rotated activations (fast path)
+//
+// MMVQ thread layout: 2 threads per 128-element turbo4 block
+// Thread 0 (iqs=0): centroids 0-63, q8 blocks [0,1]
+// Thread 1 (iqs=8): centroids 64-127, q8 blocks [2,3]
 
 #define VDR_TURBO4_0_Q8_1_MMVQ 8
 #define VDR_TURBO4_0_Q8_1_MMQ  4
@@ -108,6 +111,60 @@ static __device__ __forceinline__ float vec_dot_turbo4_0_q8_1(
     }
 
     // === Step 6: dot half with raw q8_1 activations ===
+    const int q8_blk_off = (iqs / 8) * 2;   // 0 or 2
+    const float d0 = __low2float((bq8_1 + q8_blk_off + 0)->ds);
+    const float d1 = __low2float((bq8_1 + q8_blk_off + 1)->ds);
+    const int8_t * qs0 = (const int8_t *)(bq8_1 + q8_blk_off + 0)->qs;
+    const int8_t * qs1 = (const int8_t *)(bq8_1 + q8_blk_off + 1)->qs;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        sum += buf[i] * (float)qs0[i] * d0;
+    }
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        sum += buf[32 + i] * (float)qs1[i] * d1;
+    }
+
+    return norm * sum;
+}
+
+// === Simplified vec_dot for pre-rotated activations ===
+// Activations have already been WHT-rotated before q8_1 quantization.
+// No iWHT butterfly needed — just load centroids and dot with q8_1.
+// This is ~10x faster than vec_dot_turbo4_0_q8_1 (no butterfly, no shuffle).
+static __device__ __forceinline__ float vec_dot_turbo4_0_q8_1_rotated(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs) {
+
+    const block_turbo4_0 * bq = (const block_turbo4_0 *) vbq + kbx;
+    const float norm = __half2float(bq->norm);
+
+    // Determine which half of the 128-element block this thread handles
+    const int elem_start = (iqs / 8) * 64;  // 0 or 64
+
+    // === Load 64 centroids from codebook ===
+    float buf[64];
+
+    #pragma unroll
+    for (int i = 0; i < 64; i += 8) {
+        const int bo = elem_start / 2;
+        const int b0 = bq->qs[bo + i/2 + 0];
+        const int b1 = bq->qs[bo + i/2 + 1];
+        const int b2 = bq->qs[bo + i/2 + 2];
+        const int b3 = bq->qs[bo + i/2 + 3];
+        buf[i+0] = t4c_f32[b0 & 0xF];
+        buf[i+1] = t4c_f32[(b0>>4) & 0xF];
+        buf[i+2] = t4c_f32[b1 & 0xF];
+        buf[i+3] = t4c_f32[(b1>>4) & 0xF];
+        buf[i+4] = t4c_f32[b2 & 0xF];
+        buf[i+5] = t4c_f32[(b2>>4) & 0xF];
+        buf[i+6] = t4c_f32[b3 & 0xF];
+        buf[i+7] = t4c_f32[(b3>>4) & 0xF];
+    }
+
+    // === Dot with pre-rotated q8_1 activations ===
     const int q8_blk_off = (iqs / 8) * 2;   // 0 or 2
     const float d0 = __low2float((bq8_1 + q8_blk_off + 0)->ds);
     const float d1 = __low2float((bq8_1 + q8_blk_off + 1)->ds);

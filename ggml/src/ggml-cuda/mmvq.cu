@@ -35,7 +35,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
-        case GGML_TYPE_TURBO4_0: return vec_dot_turbo4_0_q8_1;
+        case GGML_TYPE_TURBO4_0: return vec_dot_turbo4_0_q8_1_rotated;
         default:                return nullptr;
     }
 }
@@ -1216,7 +1216,7 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    // Native turbo4 MMVQ: dispatch directly to vec_dot_turbo4_0_q8_1.
+    // Native turbo4 MMVQ: dispatch directly to vec_dot_turbo4_0_q8_1_rotated.
     // For correctness, activations must be WHT-rotated before q8_1 quantization:
     //   Σ iWHT(C)·A = Σ C·WHT(A)  (Parseval / orthogonality of WHT)
     // One WHT pre-rotation per activation row, then our vec_dot kernel can
@@ -1227,9 +1227,16 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 
-    // No WHT pre-rotation — the vec_dot kernel applies iWHT to centroids directly.
-    // Activations are q8_1-quantized in their original (unrotated) domain.
+    // WHT pre-rotation for turbo4: rotate activations before quantization
     const float * activation_data = src1_d;
+    ggml_cuda_pool_alloc<float> src1_rotated;
+
+    if (src0->type == GGML_TYPE_TURBO4_0) {
+        const int64_t n_elements = ne10 * ne11 * ne12 * ne13;
+        src1_rotated.alloc(ctx.pool(), n_elements);
+        ggml_cuda_turbo_wht_forward(src1_d, src1_rotated.get(), n_elements, stream);
+        activation_data = src1_rotated.get();
+    }
 
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
