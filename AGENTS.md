@@ -1,27 +1,27 @@
-# TURBO4 STATUS — 2026-06-04 (16:00)
+# TURBO4 STATUS — 2026-06-18 (01:30)
 
-**Branch:** `experiments/turbo4-quantize` (commit `252d11e14`)
+**Branch:** `experiments/turbo4-dp4a-fusion` (commit `d61726155`)
 **Build:** `build_turbo4.bat` — CUDA 13.2, Ninja, MSVC vcvars64, sm_86
-**Model:** Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v6-i3.gguf
-**Server:** Port 8082, `test_start_mmvq.bat` (no MTP, f16 cache, --no-warmup)
+**Model:** Ornstein3.6-27B-MTP-NSC-ACE-SABER-turbo4-MTP-v10-i6.gguf
+**Server:** Port 8082, `experiments/turbo4-weight-quant/test_start_server.bat` (no MTP, f16 cache)
 
 ══════════════════════════════════════════════
-CURRENT STATE — MMVQ WORKING ✓
+CURRENT STATE — WHT PRE-ROTATION WORKING ✓
 ══════════════════════════════════════════════
 
 **MMVQ vec_dot (decode, ne11=1):**
 - ✅ **Correct output** — " Paris." for "The capital of France is"
-- ✅ **6.51 tok/s** (128-token benchmark, 8-token prefill, 19.7s decode)
+- ✅ **21-22 tok/s** generation (64-128 token benchmark)
+- ✅ **24-32 tok/s** prompt processing (short prompts)
 - ✅ **No CUDA graph hangs**, no deadlocks
-- ✅ Uses `__shfl_xor_sync` with `__activemask()` for warp-level cooperation
 
 **Approach:**
-- Register-only iWHT on centroids (s2→butterfly→s1×inv_sqrt)
-- Thread pair (2 threads per turbo4 block): each does 64-element butterfly passes 1-6, exchange for pass 7 via warp shuffle
-- Float dot product with unrotated q8_1 activations
-- No shared memory, no dp4a, no int8 approximation
+- Forward WHT pre-rotation on activations (once per row, before q8_1 quantization)
+- Simplified vec_dot: codebook lookup + dot product (no iWHT butterfly)
+- Uses `ggml_cuda_turbo_wht_forward` from `turbo-wht.cu`
+- Parseval identity: Σ iWHT(C)·A = Σ C·WHT(A)
 
-**Prefill (ne11>1):** Falls back to cuBLAS (3.7–4.2 tok/s)
+**Prefill (ne11>1):** Falls back to cuBLAS (untested with new approach)
 
 ══════════════════════════════════════════════
 HISTORY
@@ -38,10 +38,15 @@ HISTORY
 - Each thread independently computed ALL 128 iWHT values, then dotted with its 64-element half
 - Correct but 1.24 tok/s — each thread did 7-pass 128-element butterfly + 64-element dot
 
-**Stage 3 — Shuffle-optimized ✓ (current)**
+**Stage 3 — Shuffle-optimized iWHT ✓ (previous best)**
 - Thread pair: 64-element butterfly each, exchange for pass 7 via __shfl_xor_sync
 - 6.51 tok/s — correct, ~5× faster than naive float
 - __activemask() ensures deadlock-free across varying iteration counts
+
+**Stage 4 — WHT pre-rotation ✓ (current)**
+- Pre-rotate activations with forward WHT before q8_1 quantization
+- Simplified vec_dot: no iWHT butterfly, just codebook lookup + dot
+- 21-22 tok/s — ~35% faster than Stage 3, ~17× faster than Stage 2
 
 ══════════════════════════════════════════════
 PERFORMANCE
@@ -54,9 +59,10 @@ PERFORMANCE
 | q8_1 vec_dot | ~1.09 tok/s | ✅ | Centroid LUT × norm × q8_1 |
 | WHT pre-rot (broken) | ~31 tok/s | ❌ | Wrong sign convention |
 | Naive float iWHT | 1.24 tok/s | ✅ | Stage 2: full 128-element per thread |
-| Shuffle iWHT | **6.51 tok/s** | ✅ | Stage 3: current best |
+| Shuffle iWHT | 6.51 tok/s | ✅ | Stage 3: previous best |
+| **WHT pre-rotation** | **21-22 tok/s** | ✅ | Stage 4: current best |
 
-**Prefill (cuBLAS fallback, ne11>1):** 3.7–4.2 tok/s
+**Prefill (cuBLAS fallback, ne11>1):** 3.7–4.2 tok/s (untested with new approach)
 
 **Q4_K_M baseline (reference):** ~15-18 tok/s decode
 
@@ -69,7 +75,7 @@ PERFORMANCE
 ROOT CAUSE ANALYSIS
 ══════════════════════════════════════════════
 
-**Why WHT pre-rotation produced garbage:**
+**Why WHT pre-rotation produced garbage (Stage 1):**
 The WHT forward and inverse transforms differ in their sign application order:
 - Forward: s1 → butterfly → s2 × inv_sqrt
 - Inverse: s2 → butterfly → s1 × inv_sqrt
@@ -81,45 +87,53 @@ The sign mismatch causes element-level corruption, explaining the "garbage outpu
 **Key lesson:** Always match the CPU dequant transform exactly. The CPU applies
 inverse WHT to centroids (s2→butterfly→s1). The vec_dot must do the same.
 
+**Why Stage 4 works:** Forward WHT on activations (direction=0: s1→butterfly→s2×inv_sqrt)
+gives a_rot such that Σ iWHT(C)·A = Σ C·a_rot (Parseval identity).
+The vec_dot then just loads centroids and dots with pre-rotated q8_1 activations.
+
 ══════════════════════════════════════════════
 OUTLOOK
 ══════════════════════════════════════════════
 
-**Current speed:** 6.51 tok/s decode. Usable but ~2.5× slower than Q4_K_M.
+**Current speed:** 21-22 tok/s decode. ~30% short of buun's dp4a target (29-30 tok/s).
 
-**The bottleneck:** ~1152 float ops per vec_dot call (WHT butterfly + dot product)
-vs ~4 int ops for Q4_K_M's dp4a path. The iWHT mixes ALL 128 elements, preventing
-simple dp4a lookup. A precomputed lookup table would need 16^128 entries.
+**Remaining gap analysis:**
+- The vec_dot itself is now O(1) per element (just lookup + multiply-add)
+- Bottleneck likely: q8_1 quantization overhead, memory bandwidth, or register pressure
+- CUDA profiling needed to pinpoint exact bottleneck
 
 **Potential speedups from here:**
-1. Dequant turbo4→fp16 once at layer load time, cache in temp buffer, use fp16 MMVQ
-2. Fuse iWHT into the weight-quantization step (store weights pre-iWHT'd in GGUF)
-   — Would need modified quantizer and new model file. ~31 tok/s reachable.
-3. Write a custom CUDA kernel that does iWHT + dp4a in one pass
-4. Accept 6.5 tok/s as the fast-correct baseline and move on to other work
+1. Fuse WHT pre-rotation into q8_1 quantization kernel (avoid separate pass)
+2. Try different memory layout (interleave activations for better coalescing)
+3. Profile with nvprof/nsight to find exact bottleneck
+4. Explore dp4a-style integer operations if activations can be pre-quantized
+5. Accept 22 tok/s as viable baseline and move on to other work
+
+**Target:** 29-30 tok/s (buun's dp4a baseline for turbo4 KV cache)
 
 ══════════════════════════════════════════════
 MODIFIED FILES
 ══════════════════════════════════════════════
 
-- `ggml/src/ggml-cuda/vecdot-turbo4.cuh` — Shuffle-optimized iWHT vec_dot
-- `ggml/src/ggml-cuda/mmvq.cu` — WHT pre-rotation removed, clean dispatch
-- `ggml/src/ggml-cuda/ggml-cuda.cu` — Non-LIFO pool fix
-- `experiments/turbo4-weight-quant/test_start_mmvq.bat` — Added --no-warmup
-- `experiments/turbo4-weight-quant/bench_mmvq.py` — Benchmark script
+- `ggml/src/ggml-cuda/vecdot-turbo4.cuh` — Added vec_dot_turbo4_0_q8_1_rotated (simplified)
+- `ggml/src/ggml-cuda/mmvq.cu` — WHT pre-rotation dispatch, calls ggml_cuda_turbo_wht_forward
+- `ggml/src/ggml-cuda/turbo-wht.cu` — Forward/inverse WHT kernels (direction=0/1)
+- `ggml/src/ggml-cuda/turbo-wht.cuh` — Header declarations
+- `experiments/turbo4-weight-quant/test_start_server.bat` — Test server on port 8082
+- `bench_turbo4.py` — Benchmark script (requests-based)
 
 ══════════════════════════════════════════════
 MEMORY (your personal notes)
 ══════════════════════════════════════════════
-- MMVQ vec_dot working correctly at 6.51 tok/s with shuffle-optimized iWHT approach
-- WHT pre-rotation was fundamentally wrong (s1≠s2 sign pattern breaks Parseval)
+- MMVQ vec_dot working correctly at 21-22 tok/s with WHT pre-rotation approach
+- Stage 4: forward WHT on activations (direction=0) + simplified vec_dot = 35% speedup
 - Always match CPU dequant: iWHT on centroids (s2→butterfly→s1), not WHT on activations
-- __shfl_xor_sync with __activemask() for deadlock-free warp cooperation
-- --no-warmup needed for testing (float iWHT is slow enough that warmup takes >60s)
-- test_start_mmvq.bat at port 8082, api-key dummythicc, flash-attn on, f16 cache
+- __shfl_xor_sync with __activemask() for deadlock-free warp cooperation (Stage 3)
+- test_start_server.bat at port 8082, api-key dummythicc, flash-attn on, f16 cache
 - build_turbo4.bat for builds, _just_ninja.bat for quick iter
-- Current branch: experiments/turbo4-quantize on buun/master
-- Speed comparison: 31 tok/s dp4a (broken) vs 6.5 tok/s float iWHT (correct)
+- Current branch: experiments/turbo4-dp4a-fusion on buun/master
+- Speed comparison: 31 tok/s dp4a (broken) vs 22 tok/s WHT pre-rot (correct)
 - ~1152 float ops per turbo4 block per vec_dot call. Bottleneck is compute, not bandwidth.
 - Potential 2×: fuse iWHT into quantizer (pre-iWHT centroids in GGUF). Would need new model.
-- Server WITHOUT --no-warmup takes ~2min to warm up at 1-6 tok/s
+- Server WITHOUT --no-warmup takes ~2min to warm up at 1-6 tok/s (Stage 3)
+- Stage 4 server warms up faster (~45s for model load)
