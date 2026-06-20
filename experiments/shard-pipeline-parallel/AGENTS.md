@@ -589,16 +589,36 @@ MTP is tuned for single-GPU inference. Over WAN with higher latency, acceptance 
 
 ---
 
-## Next Steps
+## Execution Plan
 
-1. **Review this document** — ensure all technical details are correct
-2. **Prioritize phases** — decide which phases to tackle first
-3. **Assign work** — break phases into tasks, assign to lesser models
-4. **Start Phase 1** — async RPC is the critical path
-5. **Benchmark early** — verify async RPC works on LAN before WAN
+**See [`PLAN.md`](./PLAN.md) for the detailed execution plan.**
+
+The plan was reviewed by GLM-5.2 (big model pass) and contains:
+
+- **17 atomic tasks** across 4 phases, each scoped for lesser-model execution (1-3 sessions per task)
+- **Revised effort estimate: 5-6 weeks** (down from 7-11 in the original analysis)
+- **Key discovery: Phase 1 is ~200 lines, not 500-800.** GRAPH_COMPUTE is already fire-and-forget (no response). Async RPC only needs a SYNC command + event functions + flipping caps flags.
+- **Blocking events first, non-blocking as follow-up.** The simplest correct implementation uses blocking event_wait (send SYNC, wait for response). Non-blocking async tensor copy is a separate optimization.
+- **Direct-return merged into Phase 2** (was a separate tier in original analysis)
+- **Dependency graph** showing critical path and parallelizable tasks
+- **"What NOT to do" section** — prevent wasted effort on connection pools, scheduler changes, DFlash
+
+### Critical Path
+
+```
+T0.1 (baseline) → T1.1 (SYNC cmd) → T1.2 (events) → T1.3 (caps) → T1.4 (multi-RPC test)
+→ T2.1 (direct-return) → T2.2 (coordinator) → T2.3 (KV crop) → T2.4 (pipelining)
+→ T2.5 (e2e test) → T2.6 (tuning) → T4.3 (WAN bench)
+```
+
+### Parallelizable
+
+- T4.1 (tensor compression) and T4.2 (topology solver) can be done at any time
+- T3.x (MTP integration) can start after T2.2
 
 ---
 
-**Document version:** 1.0  
+**Document version:** 2.0  
 **Last updated:** 2026-06-20  
-**Author:** Hermes Agent (with research from Mercury and researcher subagents)
+**Author:** Hermes Agent (with research from Mercury and researcher subagents)  
+**Reviewer:** GLM-5.2 (big model plan review)
