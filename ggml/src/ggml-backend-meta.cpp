@@ -588,6 +588,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
         }
+        if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis <= GGML_BACKEND_SPLIT_AXIS_3
+                && src_ss[0].axis == src_ss[1].axis) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return src_ss[0];
+        }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
     };
@@ -688,6 +693,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
             }
             GGML_ABORT("fatal error");
+        }
+        if (!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis == GGML_BACKEND_SPLIT_AXIS_3) {
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] > 1 && tensor->nb[dim] == tensor->src[0]->nb[3]) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, 1};
+                }
+            }
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
@@ -895,7 +907,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_SET: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_CPY: {
                 split_state = handle_cpy(src_ss);
@@ -973,7 +985,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_TRI: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_FILL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -994,9 +1006,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_ADD_REL_POS:
             case GGML_OP_RWKV_WKV6:
             case GGML_OP_GATED_LINEAR_ATTN:
-            case GGML_OP_RWKV_WKV7:
-            case GGML_OP_SOLVE_TRI: {
+            case GGML_OP_RWKV_WKV7: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_SOLVE_TRI: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);

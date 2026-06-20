@@ -571,6 +571,51 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
     }
 }
 
+// Turbo8 tile loader: reads raw turbo8_0 bytes from GMEM, dequants to half2, writes to shmem tile.
+// 1 byte per value (no nibble packing), 256-entry uniform centroid table read directly from
+// constant memory (too large to precompute centroid*norm into registers). Each row has D/128
+// turbo8 blocks (1 for D=128, 2 for D=256); each block is 130 bytes (2-byte norm + 128 qs bytes).
+template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo8_load_tile(
+        const char * __restrict__ K_raw,
+        half2      * __restrict__ tile_KV,
+        const int stride_bytes,
+        const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_row = D / 128;
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+
+    for (int row = tid; row < nbatch_fa; row += nthreads) {
+        if (oob_check && row >= i_sup) {
+#pragma unroll
+            for (int b = 0; b < D/2; ++b) {
+                tile_KV[row * stride_tile + b] = make_half2(0.0f, 0.0f);
+            }
+            continue;
+        }
+
+        const char * row_ptr = K_raw + (int64_t)row * stride_bytes;
+
+#pragma unroll
+        for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+            const block_turbo8_0 * blk = (const block_turbo8_0 *)(row_ptr) + blk_idx;
+            const float norm = __half2float(blk->norm);
+            // Uniform centroid table is affine: centroid[q]*norm = (q-127.5)/127.5*norm
+            // = q*s - norm, with s = norm/127.5. Skip the 256-entry constant-mem lookup
+            // and dequant with a single FMA (matches Q8's tile-load cost).
+            const float s = norm * (1.0f / 127.5f);
+#pragma unroll
+            for (int b = 0; b < 64; ++b) {
+                const uint8_t q0 = blk->qs[2*b];
+                const uint8_t q1 = blk->qs[2*b + 1];
+                tile_KV[row * stride_tile + blk_idx * 64 + b] = __halves2half2(
+                    __float2half(q0 * s - norm),
+                    __float2half(q1 * s - norm));
+            }
+        }
+    }
+}
+
 // Generalized turbo tile loader for non-turbo4 types (turbo3_0, turbo2_0, turbo3_tcq, turbo2_tcq).
 // Reads raw quantized bytes from K/V cache, dequants to half2 in shared memory tile.
 // is_value selects V alpha (adaptive) vs K alpha (static) for TCQ types.
@@ -777,6 +822,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo4_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
+                    K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TURBO8_0) {
+                const char * K_raw = (const char *)K_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo8_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
             } else {
                 const char * K_raw = (const char *)K_h2;
@@ -1142,6 +1192,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const char * V_raw = (const char *)V_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo4_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
+                    V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
+                __syncthreads();
+            } else if constexpr (type_V == GGML_TYPE_TURBO8_0) {
+                const char * V_raw = (const char *)V_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo8_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
                 __syncthreads();
             } else {

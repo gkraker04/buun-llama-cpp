@@ -154,9 +154,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     cb(attn, "attn", il);
 
     ggml_tensor * identity;
-    identity = ggml_view_1d(ctx0, attn, CS, 0);
-    identity = ggml_fill   (ctx0, identity, 1.0f);
-    identity = ggml_diag   (ctx0, identity);
+    identity = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, CS);
+    identity = ggml_fill(ctx0, identity, 1.0f);
+    identity = ggml_diag(ctx0, identity);
 
     ggml_tensor * lhs = ggml_add(ctx0, attn, identity);
     cb(lhs, "dnet_add_ch_lhs", il);
@@ -462,7 +462,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states = build_rs_in(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
