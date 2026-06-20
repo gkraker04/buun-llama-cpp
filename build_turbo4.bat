@@ -29,7 +29,7 @@ cmake .. -G Ninja -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON 
 if {%errorlevel%} neq {0} exit /b 1
 
 echo === Ninja build ===
-ninja llama-quantize llama-server llama-imatrix -j12 >>%LOGFILE% 2>&1
+ninja llama-quantize llama-server llama-imatrix rpc-server -j12 >>%LOGFILE% 2>&1
 if {%errorlevel%} neq {0} exit /b 1
 
 echo === DONE ===
