@@ -5041,7 +5041,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 #if defined(_WIN32)
     // On Windows, cudaMemGetInfo reports per-context memory only — each process gets its own context.
     // Use nvidia-smi for system-wide cross-process memory reporting.
-    FILE* pipe = _popen("nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader -i 0", "r");
+    char nvidia_smi_cmd[512];
+    snprintf(nvidia_smi_cmd, sizeof(nvidia_smi_cmd), "nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader -i %d", ctx->device);
+    FILE* pipe = _popen(nvidia_smi_cmd, "r");
     if (pipe) {
         char line[256];
         if (fgets(line, sizeof(line), pipe)) {
