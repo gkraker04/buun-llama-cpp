@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
 #include <vector>
 #include <cstddef>
 
@@ -30,17 +29,10 @@ struct common_ngram_mod {
     size_t size()       const;
     size_t size_bytes() const;
 
-    // persist the hash table to/from disk
-    bool save(const std::string & filename) const;
-    bool load(const std::string & filename);
-
 private:
     size_t n; // ngram size to hash
 
     size_t used;
 
-    size_t full_hash(const entry_t * tokens) const;
-
     std::vector<entry_t> entries;
-    std::vector<size_t>  key_hashes; // full 64-bit hash of the ngram key, 0 = EMPTY
 };

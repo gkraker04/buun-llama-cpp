@@ -1843,17 +1843,6 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         SPC_TRC("- mod size=%zu (%.3f MB)\n",
                 mod.size(), (float)(mod.size_bytes())/1024/1024);
 
-        if (!this->params.cache_path.empty()) {
-            LOG_INF("%s: loading ngram-mod cache from '%s'\n", __func__, this->params.cache_path.c_str());
-            if (mod.load(this->params.cache_path)) {
-                LOG_INF("%s: loaded %zu entries\n", __func__, mod.get_used());
-            } else {
-                LOG_WRN("%s: failed to load ngram-mod cache, starting fresh\n", __func__);
-                // create empty cache file so it exists for future saves
-                mod.save(this->params.cache_path);
-            }
-        }
-
         if (this->params.n_match < 16) {
             SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
                     "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
@@ -1882,20 +1871,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const double f = (double)mod.get_used() / (double)mod.size();
         SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
 
-        // with verified lookups, collisions produce misses not wrong tokens,
-        // so the cache can safely fill much higher before pruning is needed
-        constexpr double f_thold = 0.75;
+        constexpr double f_thold = 0.25;
         if (f > f_thold) {
             SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
 
             mod.reset();
-        }
-
-        // flush cache to disk after every occupancy check
-        if (!this->params.cache_path.empty()) {
-            if (mod.save(this->params.cache_path)) {
-                LOG_INF("%s: flushed ngram-mod cache (%zu entries)\n", __func__, mod.get_used());
-            }
         }
     }
 
@@ -1987,11 +1967,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {
                     if (verbose) {
-                        LOG_WRN("%s: low acceptance streak (%d) - verified lookups prevent collisions from poisoning drafts, skipping reset\n", __func__, sinfo.n_low);
+                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
                     }
 
-                    // with verified lookups, collisions produce misses not wrong tokens,
-                    // so resetting the cache is no longer needed — it self-maintains
+                    mod.reset();
                     sinfo.n_low = 0;
                     sinfo.i_last = 0;
                 }
@@ -2003,18 +1982,6 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
-    }
-
-    ~common_speculative_impl_ngram_mod() {
-        if (!this->params.cache_path.empty()) {
-            LOG_INF("%s: saving ngram-mod cache to '%s'\n", __func__, this->params.cache_path.c_str());
-            if (mod.save(this->params.cache_path)) {
-                LOG_INF("%s: saved %zu entries (%.3f MB)\n", __func__,
-                        mod.get_used(), (float)(mod.size_bytes())/1024/1024);
-            } else {
-                LOG_WRN("%s: failed to save ngram-mod cache\n", __func__);
-            }
-        }
     }
 };
 

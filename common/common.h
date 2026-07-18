@@ -363,8 +363,6 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
-
-    std::string cache_path; // path for persistent ngram-mod cache (empty = no persistence)
 };
 
 struct common_params_speculative_ngram_map {
@@ -589,9 +587,8 @@ struct common_params {
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
-    std::string path_prompt_cache          = ""; // path to file for saving/loading prompt eval state       // NOLINT
-    std::string cache_disk_path            = ""; // path to directory for disk prompt cache (server)       // NOLINT
-    std::string input_prefix               = ""; // string to prefix user inputs with                       // NOLINT
+    std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
+    std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
@@ -744,7 +741,6 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t cache_disk_mib      = 0;     // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

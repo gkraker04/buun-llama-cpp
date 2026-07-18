@@ -1764,22 +1764,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         params.lr.init();
 
-        // Auto-derive ngram-mod cache path from model path if not explicitly set
-        if (params.speculative.ngram_mod.cache_path.empty() && !params.model.path.empty()) {
-            if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                          COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != params.speculative.types.end()) {
-                std::string model_dir = params.model.path;
-                size_t last_sep = model_dir.find_last_of("/\\");
-                if (last_sep != std::string::npos) {
-                    model_dir = model_dir.substr(0, last_sep);
-                } else {
-                    model_dir = ".";
-                }
-                params.speculative.ngram_mod.cache_path = model_dir + "/.cache/ngram-mod/ngram-mod.cache";
-                LOG_INF("ngram-mod: auto-derived cache path: %s\n", params.speculative.ngram_mod.cache_path.c_str());
-            }
-        }
-
         // DFlash-safe defaults. The drafter's block_size=16 / internal max
         // batch=64 means it only needs a tiny graph, and multi-slot target
         // activation memory scales as n_ubatch * n_parallel — stock ub=512
@@ -2215,20 +2199,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"-cd", "--cache-disk"}, "N",
-        string_format("set the maximum disk prompt cache size in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_mib),
-        [](common_params & params, int value) {
-            params.cache_disk_mib = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-disk-path"}, "PATH",
-        "path to directory for disk prompt cache (default: disabled)",
-        [](common_params & params, const std::string & value) {
-            params.cache_disk_path = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -4680,14 +4650,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_match = value;
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-
-    add_opt(common_arg(
-        {"--spec-ngram-mod-cache"}, "FILE",
-        "path to save/load persistent ngram-mod cache between sessions (default: none)",
-        [](common_params & params, const std::string & value) {
-            params.speculative.ngram_mod.cache_path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
