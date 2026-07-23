@@ -2471,8 +2471,15 @@ private:
                     ? params_base.lora_adapters
                     : construct_lora_list(task.params.lora);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras))) {
-                    ret->prompt_clear();
+                // Only restore from the host cache when the selected slot's current adapter identity
+                // already matches the incoming request's [finding 1]. Otherwise launch_slot_with_task
+                // clears this slot for the adapter change, so a restore here would consume a cache
+                // entry only to have it immediately wiped. (Cross-identity reuse -- moving a request
+                // onto a differently-bound LRU slot -- needs identity-aware selection, deferred.)
+                if (are_lora_equal(incoming_loras, ret->lora)) {
+                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras))) {
+                        ret->prompt_clear();
+                    }
                 }
 
                 prompt_cache->update();

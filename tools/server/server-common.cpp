@@ -534,8 +534,11 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 
             GGML_ASSERT(a_chunk && b_chunk);
 
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+            // compare via C strings to keep this prefix scan allocation-free: it runs inside the
+            // exception-sensitive prompt-cache save/load paths where an OOM mid-scan must not leave
+            // the cache partially mutated (mtmd_input_chunk_get_id returns the id's c_str()).
+            const char * id_ai = mtmd_input_chunk_get_id(a_chunk.get());
+            const char * id_bi = mtmd_input_chunk_get_id(b_chunk.get());
 
             const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
@@ -544,7 +547,7 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             // content hash on expansion and carry id == "". Matching "" == "" would reuse one
             // video's KV for a different video of the same shape, so fail closed — an empty-id chunk
             // is always a divergence point. Images/audio carry the FNV content hash, unaffected. [I6]
-            if (!id_ai.empty() && id_ai == id_bi && n_tok_a == n_tok_b) {
+            if (id_ai && id_ai[0] != '\0' && id_bi && std::strcmp(id_ai, id_bi) == 0 && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;

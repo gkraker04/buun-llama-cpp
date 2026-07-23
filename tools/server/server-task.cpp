@@ -1680,8 +1680,13 @@ bool server_prompt_cache::contains(const server_tokens & tokens, const std::stri
             continue;
         }
 
+        // EXACT match only [I6/durability]: a prefix hit (tokens is a prefix of a LONGER cached
+        // prompt) does not make this state durable for recurrent/hybrid memory -- the state after
+        // "P || X" is not the state after "P" without an exact checkpoint at P. Requiring identical
+        // token length ensures clearing the live slot cannot discard an exact frontier the cache
+        // could not reconstruct.
         const int lcp_len = st.prompt.tokens.get_common_prefix(tokens);
-        if (lcp_len == (int) tokens.size()) {
+        if (lcp_len == (int) tokens.size() && st.prompt.tokens.size() == tokens.size()) {
             return true;
         }
     }
@@ -1733,14 +1738,18 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
         return;
     }
 
-    const auto & staged = entry.front();
+    // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably
+    // linked before any potentially-throwing comparison below. Then remove cached prompts of the
+    // SAME adapter identity fully contained in the new (larger) prompt [I6] -- a contained entry
+    // under a different adapter config is a distinct valid state and is kept. If a comparison throws
+    // (OOM) mid-loop, the new entry is already safely in `states`; at worst a few obsolete entries
+    // remain (benign, FIFO-evicted later) -- never a lost node or partial corruption.
+    states.splice(states.end(), entry);
+    const auto self = std::prev(states.end());
 
-    // remove cached prompts of the SAME adapter identity that are fully contained in the new
-    // (larger) prompt [I6]; a contained entry under a different adapter config is a distinct valid
-    // state and must be kept. Compare against the staged node before splicing it in.
     for (auto it = states.begin(); it != states.end();) {
-        if (it->adapter_config_key == staged.adapter_config_key) {
-            const int len = it->prompt.tokens.get_common_prefix(staged.prompt.tokens);
+        if (it != self && it->adapter_config_key == self->adapter_config_key) {
+            const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
             if (len == (int) it->prompt.tokens.size()) {
                 SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
                 it = states.erase(it);
@@ -1750,11 +1759,10 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
         ++it;
     }
 
-    // splice the pre-allocated node in (no allocation, no throw), then enforce the cache limits
-    // through the single canonical eviction primitive. The entry's bytes are already committed, so a
-    // local make-room loop would prevent no memory spike and, being size-only, would skip the token
-    // limit. update() enforces both limits and evicts oldest-first, leaving the just-added entry.
-    states.splice(states.end(), entry);
+    // enforce the cache limits through the single canonical eviction primitive. The entry's bytes
+    // are already committed, so a local make-room loop would prevent no memory spike and, being
+    // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
+    // preserving the just-added entry.
     update();
 }
 
