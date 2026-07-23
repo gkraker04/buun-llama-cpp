@@ -3555,6 +3555,18 @@ private:
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // Server semantic envelope [I10]: the lib slot file carries the checksummed state
+                    // but no adapter identity, and a restore into a slot bound to a different adapter
+                    // is NOT caught by the launch-time check (that compares against slot.lora, not the
+                    // file). Record the adapter identity this state was computed under in a sidecar so
+                    // the restore can reject a cross-adapter mismatch.
+                    if (nwrite > 0) {
+                        std::ofstream f(filepath + ".lora", std::ios::binary | std::ios::trunc);
+                        if (f) {
+                            f << lora_config_identity(slot->lora);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3587,6 +3599,21 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    // Server semantic envelope [I10]: reject a cross-adapter restore BEFORE mutating
+                    // the target -- restoring state computed under one adapter into a slot bound to a
+                    // different one would serve the wrong adapter's KV. Sidecar-absent (legacy/base)
+                    // files are allowed for back-compat.
+                    {
+                        std::ifstream f(filepath + ".lora", std::ios::binary);
+                        if (f) {
+                            const std::string saved_identity((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                            if (saved_identity != lora_config_identity(slot->lora)) {
+                                send_error(task, "Slot file was saved under a different adapter configuration than the target slot", ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                        }
+                    }
 
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
