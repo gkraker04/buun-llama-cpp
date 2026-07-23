@@ -1672,16 +1672,24 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
-    // first check if the current state is contained fully in the cache
+bool server_prompt_cache::contains(const server_tokens & tokens, const std::string & adapter_config_key) const {
     for (const auto & st : states) {
-        const int lcp_len = st.prompt.tokens.get_common_prefix(prompt.tokens);
-        if (lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+        // identity-scoped [I6]: a token-identical entry under a DIFFERENT adapter config is not a
+        // durable copy of THIS state and must not suppress its save
+        if (st.adapter_config_key != adapter_config_key) {
+            continue;
+        }
+
+        const int lcp_len = st.prompt.tokens.get_common_prefix(tokens);
+        if (lcp_len == (int) tokens.size()) {
+            return true;
         }
     }
 
+    return false;
+}
+
+std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
@@ -1690,64 +1698,63 @@ std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const serv
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
+    // this state can't be cached at all; report failure (the caller keeps the live slot)
     if (limit_size > 0 && state_size_new > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
+        return {};
     }
 
-    // allocate the entry OUTSIDE `states` (not yet published); eviction happens in publish() only
-    // once the caller has filled and validated the state bytes. This is the transactional guard:
-    // a failed fill simply drops this object, so `states` is never mutated for a save that fails.
-    auto entry = std::make_unique<server_prompt_cache_state>();
-
+    // Allocate the entry as a DETACHED single-node list, entirely outside `states`. Every allocation
+    // that can throw (the list node, the state vectors, the token clone, the checkpoint copy) is
+    // performed here; on any failure we return an empty list and leave the cache completely
+    // untouched — no eviction, no limit reduction for a save that did not happen [I7]. publish()
+    // then splices this node in without allocating.
+    std::list<server_prompt_cache_state> staged;
     try {
-        entry->data.main.resize(state_size_tgt);
-        entry->data.drft.resize(state_size_dft);
+        staged.emplace_back();
+        auto & entry = staged.back();
+
+        entry.data.main.resize(state_size_tgt);
+        entry.data.drft.resize(state_size_dft);
+        entry.prompt.tokens      = prompt.tokens.clone();
+        entry.prompt.checkpoints = prompt.checkpoints;
+        entry.adapter_config_key = std::move(adapter_config_key);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
+        return {};
     }
 
-    entry->prompt.tokens      = prompt.tokens.clone();
-    entry->prompt.checkpoints = prompt.checkpoints;
-    entry->adapter_config_key = std::move(adapter_config_key);
-
-    return entry;
+    return staged;
 }
 
-void server_prompt_cache::publish(std::unique_ptr<server_prompt_cache_state> entry) {
-    if (!entry) {
+void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
+    if (entry.empty()) {
         return;
     }
 
-    // remove any cached prompts that are fully contained in the new (larger) prompt
+    const auto & staged = entry.front();
+
+    // remove cached prompts of the SAME adapter identity that are fully contained in the new
+    // (larger) prompt [I6]; a contained entry under a different adapter config is a distinct valid
+    // state and must be kept. Compare against the staged node before splicing it in.
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(entry->prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
+        if (it->adapter_config_key == staged.adapter_config_key) {
+            const int len = it->prompt.tokens.get_common_prefix(staged.prompt.tokens);
+            if (len == (int) it->prompt.tokens.size()) {
+                SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+                it = states.erase(it);
+                continue;
+            }
         }
+        ++it;
     }
 
-    states.push_back(std::move(*entry));
-
-    // enforce the cache limits through the single canonical eviction primitive: the entry's bytes
-    // are already committed (stage() allocated them), so a local make-room loop would prevent no
-    // memory spike and, being size-only, would skip the token limit. update() enforces both limits
-    // and evicts oldest-first, leaving the just-added entry in place.
+    // splice the pre-allocated node in (no allocation, no throw), then enforce the cache limits
+    // through the single canonical eviction primitive. The entry's bytes are already committed, so a
+    // local make-room loop would prevent no memory spike and, being size-only, would skip the token
+    // limit. update() enforces both limits and evicts oldest-first, leaving the just-added entry.
+    states.splice(states.end(), entry);
     update();
 }
 

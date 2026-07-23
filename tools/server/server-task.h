@@ -656,13 +656,18 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    // Transactional save is a stage -> fill -> publish sequence [I7]. stage() allocates the entry
-    // WITHOUT touching `states` (no eviction, no insertion); the caller fills + validates the state
-    // bytes; publish() then evicts to make room and inserts the completed entry. A failed fill drops
-    // the staged entry and leaves the cache untouched — never a poisoned/half-filled published entry,
-    // never an eviction that bought nothing.
-    std::unique_ptr<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
-    void publish(std::unique_ptr<server_prompt_cache_state> entry);
+    // true if a token-identical entry with the SAME adapter identity is already fully cached, i.e.
+    // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
+    bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
+
+    // Transactional save is a stage -> fill -> publish sequence [I7]. stage() allocates a DETACHED
+    // single-node list WITHOUT touching `states`; any allocation failure there leaves the cache
+    // completely untouched (no eviction, no limit change). The caller fills + validates the state
+    // bytes; publish() then removes now-obsolete entries and splices the completed node in (no
+    // allocation, no throw). A failed fill drops the staged node — never a poisoned/half-filled
+    // published entry, never an eviction that bought nothing.
+    std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
+    void publish(std::list<server_prompt_cache_state> entry);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key);
 

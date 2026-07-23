@@ -187,6 +187,19 @@ struct server_batch {
     }
 };
 
+// outcome of an attempt to save a slot's state to the host prompt cache [I7]. A live slot may be
+// cleared without losing state only when its state is now durable in the cache (published OR already
+// cached under the same identity); a `failed` save must NOT be followed by a clear.
+enum class prompt_save_result {
+    published,       // a new entry was saved to the cache
+    already_durable, // the state was already fully cached under this adapter identity
+    failed,          // could not be cached (empty prompt, zero/short state, over-limit, OOM, short write)
+};
+
+static inline bool prompt_save_durable(prompt_save_result r) {
+    return r == prompt_save_result::published || r == prompt_save_result::already_durable;
+}
+
 struct server_slot {
     int id;
 
@@ -254,49 +267,65 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    prompt_save_result prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
-            return false;
+            return prompt_save_result::failed;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        // A zero-size declared state is never a valid snapshot [I10]: an empty target would publish
+        // an entry that "restores" as a 0 == 0 false success, and an empty draft alongside a valid
+        // target would restore target-only, leaving the two sides on different states. Require a
+        // non-empty target, and a non-empty draft whenever a draft context exists.
+        if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
+            SLT_WRN(*this, "prompt cache save skipped: zero-size state (target %zu, draft %zu)\n", cur_size_tgt, cur_size_dft);
+            return prompt_save_result::failed;
+        }
 
+        const std::string adapter_key = lora_config_identity(lora);
+
+        // already fully cached under this identity: the state is durable, nothing to do
+        if (prompt_cache.contains(prompt.tokens, adapter_key)) {
+            return prompt_save_result::already_durable;
+        }
+
+        const size_t cur_size = cur_size_tgt + cur_size_dft;
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        // stage -> fill -> validate -> publish [I7]. Fill the staged entry and verify the writer
-        // returned the exact declared length BEFORE publishing; a short/zero write (e.g. a dynamic
-        // VBR state_write refusal after a degrade) aborts the save without touching the cache,
-        // instead of publishing a truncated/empty entry [I10].
-        auto entry = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, lora_config_identity(lora));
-        if (!entry) {
-            return false;
+        // stage -> fill -> validate -> publish [I7]. Fill the staged node and verify the writer
+        // returned the exact declared length BEFORE publishing; a short write (e.g. a dynamic VBR
+        // state_write refusal after a degrade) aborts the save without touching the cache, instead
+        // of publishing a truncated entry [I10]. On any failure the state is NOT durable.
+        auto staged = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, adapter_key);
+        if (staged.empty()) {
+            return prompt_save_result::failed;
         }
+        auto & entry = staged.front();
 
-        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (n_tgt != cur_size_tgt) {
             SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
-            return false;
+            return prompt_save_result::failed;
         }
 
         if (ctx_dft) {
-            const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry.data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (n_dft != cur_size_dft) {
                 SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
-                return false;
+                return prompt_save_result::failed;
             }
         }
 
-        prompt_cache.publish(std::move(entry));
+        prompt_cache.publish(std::move(staged));
 
-        return true;
+        return prompt_save_result::published;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, lora_config_identity(lora));
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, adapter_config_key);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1191,9 +1220,11 @@ private:
         }
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-        slot.prompt_save(*prompt_cache);
-        slot.prompt_clear(); // #25649 dropped the fork's bool allow_processing param (now no-arg)
-        prompt_cache->update();
+        // clear the live slot only if its state is now durable in the cache [I7]; a failed save must
+        // not destroy the only copy of the state. publish() enforces the cache limits on success.
+        if (prompt_save_durable(slot.prompt_save(*prompt_cache))) {
+            slot.prompt_clear(); // #25649 dropped the fork's bool allow_processing param (now no-arg)
+        }
     }
 
     // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
@@ -2430,9 +2461,17 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // save the displaced slot's state under ITS current adapter identity (prompt_save
+                // reads slot.lora), then load using the INCOMING request's identity [I6/finding 4]:
+                // selection runs before launch_slot_with_task rebinds slot.lora, so slot.lora is
+                // still the previous occupant's config here and would mis-key the cache lookup.
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const auto incoming_loras = task.params.lora.empty()
+                    ? params_base.lora_adapters
+                    : construct_lora_list(task.params.lora);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras))) {
                     ret->prompt_clear();
                 }
 
@@ -3376,12 +3415,14 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const prompt_save_result saved = slot.prompt_save(*prompt_cache);
+                                if (saved == prompt_save_result::published) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                // clear the live slot only if its state is now durable in the cache
+                                // [I7]; a failed save must not destroy the only copy of the state
+                                if (params_base.kv_unified && prompt_save_durable(saved)) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
