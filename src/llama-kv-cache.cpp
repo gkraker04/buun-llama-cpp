@@ -1546,6 +1546,11 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
         }
     }
+
+    // Clearing severs every checkpoint's attention representation, even when only metadata is
+    // requested. Keep this separate from vbr_full_reset(): clear may leave the tier cursor in
+    // place until the next empty-cache boundary, and both mutations must remain observable.
+    vbr_representation_changed();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -2492,6 +2497,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
+    bool reused_occupied_cell = false;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
@@ -2501,6 +2507,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                reused_occupied_cell = true;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -2525,6 +2532,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
         }
+    }
+
+    // Appending into empty cells does not alter a checkpoint's attention prefix. Reusing an
+    // occupied SWA/ring cell does: the following graph overwrites bytes a checkpoint may still
+    // reference, so make that ownership/representation change visible before graph execution.
+    if (reused_occupied_cell) {
+        vbr_representation_changed();
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -3414,6 +3428,13 @@ char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
     return (char *) ggml_backend_buffer_get_base(p.stash_buf);
 }
 
+void llama_kv_cache::vbr_representation_changed() {
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+    }
+}
+
 // The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS — unlike
 // container promotion this genuinely restores quality, because all future content is new. Flip
 // every tensor back to its entry tier, rewind the price cursor, drop the (now stale) sink
@@ -3462,6 +3483,9 @@ void llama_kv_cache::vbr_full_reset() {
     vbr_budget_warned_     = false;
     vbr_stash_dirty_       = false;
     vbr_quiet_boundaries_  = 0;
+    // Deliberately bumps even though the cursor is now 0: this is the low-LCP/empty-cache ABA
+    // that a recurrent-only checkpoint must detect.
+    vbr_representation_changed();
     LLAMA_LOG_INFO("%s: VBR full reset: cache empty — %zu tensors back at their entry tier, pools released "
             "(%.2f MiB mapped)\n", __func__, undone, mapped/1024.0/1024.0);
 }
@@ -3642,6 +3666,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         }
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
+        vbr_representation_changed();
         vbr_degrade_cursor_--;
 
         for (const auto & [pp, ep] : units) {
@@ -3776,6 +3801,9 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
+        // Demand sheds route through this same mutation, so every shed transcode is covered here
+        // without double-counting it in vbr_execute_shed().
+        vbr_representation_changed();
         return true;
     }
     return false;
@@ -4047,6 +4075,7 @@ double llama_kv_cache::kv_bpv() const {
 
 llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
     llama_memory_vbr_state_data st = {};
+    st.representation_epoch = vbr_representation_epoch();
 
     // full-reset feasibility: used cells the asking seq does not exclusively own. Cells above
     // used_max_p1 are empty by definition, so the scan is bounded by live occupancy.
@@ -5693,6 +5722,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("n_stream mismatch");
     }
 
+    bool imported = false;
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
@@ -5722,6 +5752,13 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             }
             throw std::runtime_error("failed to restore kv cache");
         }
+        imported = true;
+    }
+
+    // state_read_data adopts bytes in their native current tier (including mixed-tier caches).
+    // Count the completed adoption once, independently of how many streams it populated.
+    if (imported) {
+        vbr_representation_changed();
     }
 }
 

@@ -153,6 +153,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build(test-vbr-representation-epoch.cpp)
+    target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -217,6 +220,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-vbr-representation-epoch
+        LABEL cuda
+        ARGS "${MODEL_DIR}/gemma2-dense.gguf"
+    )
+    set_tests_properties(test-vbr-representation-epoch PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 

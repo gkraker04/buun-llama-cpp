@@ -179,6 +179,12 @@ public:
     // e.g. the gemma4 MTP assistant, follow the target's VBR tier changes this way).
     uint64_t vbr_tier_epoch() const { return other ? other->vbr_tier_epoch() : vbr_tier_epoch_; }
 
+    // Checkpoint-facing semantic counter: unlike the graph tier fence, this also covers
+    // clear/reset/import. It never resets, so cursor rewind cannot create an ABA.
+    uint64_t vbr_representation_epoch() const {
+        return other ? other->vbr_representation_epoch() : vbr_representation_epoch_;
+    }
+
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
@@ -382,6 +388,9 @@ private:
     // a free-VRAM-clamp wave (or a promote map-retry) can flip tiers MID-band where the n_kv
     // shape check alone would still allow reuse.
     uint64_t vbr_tier_epoch_ = 0;
+    // Bumped once per representation-changing operation (degrade, promote, occupied-cell reuse,
+    // clear/full-reset, native state import). Never derive this from or reset it with the cursor.
+    uint64_t vbr_representation_epoch_ = 0;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
@@ -516,6 +525,7 @@ private:
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
     bool   vbr_stash_dirty_   = false;
     void     vbr_full_reset();                        // cache empty: undo every degrade (lossless)
+    void     vbr_representation_changed();             // monotone checkpoint change detector
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
@@ -608,6 +618,8 @@ private:
     // Permanent transcode oracle (env VBR_TRANSCODE_TEST): synthetic turbo8 A->A byte round-trip +
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
     void vbr_transcode_anchor_test();
+
+    friend struct llama_kv_cache_vbr_epoch_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)

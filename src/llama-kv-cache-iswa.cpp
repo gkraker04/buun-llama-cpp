@@ -313,6 +313,10 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     r.deficit_clamped  = std::max(b.deficit_clamped, s.deficit_clamped);
     r.cursor           = b.cursor + s.cursor;
     r.used_cells_other = b.used_cells_other + s.used_cells_other;
+    // Representation epochs are identities, not quantities: preserve the ordered child tuple.
+    // Addition would make (base + 1, swa) collide with (base, swa + 1).
+    r.representation_epoch     = b.representation_epoch;
+    r.representation_epoch_swa = s.representation_epoch;
 
     // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
     double bits_base = 0.0, vals_base = 0.0;

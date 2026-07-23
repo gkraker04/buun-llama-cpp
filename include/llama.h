@@ -844,6 +844,10 @@ extern "C" {
         uint32_t used_cells_other; // used cells NOT owned exclusively by seq_id (seq_id < 0
                                    // counts every used cell) -- 0 means removing seq_id's cells
                                    // would empty the cache (full-reset feasibility)
+        uint64_t representation_epoch;     // monotone representation-change counter for the
+                                           // single/primary (non-SWA) VBR controller
+        uint64_t representation_epoch_swa; // monotone counter for the SWA controller when this
+                                           // state aggregates iSWA; 0 for a single controller
     };
 
     // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
