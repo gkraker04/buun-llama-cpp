@@ -81,10 +81,14 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
-    // per-seq rollback index
+    // per-seq rollback index and number of snapshot planes known to match the active frontier
     std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rollback_valid_depth;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+    void reset_rollback_state(llama_seq_id seq_id);
+    void invalidate_rollback(const llama_ubatch & ubatch);
+    void commit_rollback(const llama_ubatch & ubatch);
 
     // computed before each graph build
     uint32_t n = 0;

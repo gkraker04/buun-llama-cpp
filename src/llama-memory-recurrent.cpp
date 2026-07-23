@@ -45,6 +45,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rollback_valid_depth.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -170,6 +171,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rollback_valid_depth.begin(), rollback_valid_depth.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -186,9 +188,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         if (seq_id >= 0) {
-            set_rs_idx(seq_id, 0);
+            reset_rollback_state(seq_id);
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(rollback_valid_depth.begin(), rollback_valid_depth.end(), 0);
         }
     }
 
@@ -206,7 +209,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                GGML_ASSERT((size_t) seq_id < rollback_valid_depth.size());
+                GGML_ASSERT(rollback_valid_depth[seq_id] <= n_rs_seq);
+                if (rollback >= 1 && rollback > (llama_pos) rollback_valid_depth[seq_id]) {
+                    return false;
+                }
+                if (rollback >= 1) {
+                    GGML_ASSERT(rollback <= (llama_pos) n_rs_seq);
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                 }
@@ -301,6 +310,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
                 empty_cell.seq_id.insert(seq_id_dst);
                 tail_dst_meta.tail = next_empty_cell;
                 used += 1;
+
+                // copy_cell() installs only the active row; rollback planes are not migrated.
+                reset_rollback_state(seq_id_dst);
+                GGML_ASSERT(rollback_valid_depth[seq_id_dst] == 0);
             } else {
                 LLAMA_LOG_ERROR("%s: failed to find available cell for copy\n", __func__);
             }
@@ -310,6 +323,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    for (llama_seq_id s = 0; (size_t) s < rollback_valid_depth.size(); ++s) {
+        if (s != seq_id) {
+            reset_rollback_state(s);
+        }
+    }
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -433,6 +452,48 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
         return;
     }
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
+}
+
+void llama_memory_recurrent::reset_rollback_state(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= rollback_valid_depth.size()) {
+        return;
+    }
+
+    set_rs_idx(seq_id, 0);
+    rollback_valid_depth[seq_id] = 0;
+}
+
+void llama_memory_recurrent::invalidate_rollback(const llama_ubatch & ubatch) {
+    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(n_seq_tokens > 0);
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s * n_seq_tokens;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            reset_rollback_state(ubatch.seq_id[i][j]);
+        }
+    }
+}
+
+void llama_memory_recurrent::commit_rollback(const llama_ubatch & ubatch) {
+    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    GGML_ASSERT(ubatch.equal_seqs());
+    GGML_ASSERT(n_seq_tokens > 0);
+
+    const uint32_t valid_depth = std::min(n_rs_seq, n_seq_tokens - 1);
+    GGML_ASSERT(valid_depth <= n_rs_seq);
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s * n_seq_tokens;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rollback_valid_depth.size());
+            rollback_valid_depth[seq_id] = valid_depth;
+        }
+    }
 }
 
 void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
@@ -597,6 +658,12 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
     ctxs_bufs = std::move(new_ctxs_bufs);
     cells.resize(new_mem_size);
     size = new_mem_size;
+
+    // Resizing replaces the backing tensors and remaps snapshot-plane row strides.
+    rs_idx.resize(new_mem_size, 0);
+    rollback_valid_depth.resize(new_mem_size, 0);
+    std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rollback_valid_depth.begin(), rollback_valid_depth.end(), 0);
 
     uint32_t used_new = 0;
     for (auto & cell : cells) {
@@ -1113,12 +1180,14 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         throw std::runtime_error("failed to restore kv cache");
     }
 
-    if (n_rs_seq != 0) {
-        if (seq_id == -1) {
-            std::fill(rs_idx.begin(), rs_idx.end(), 0);
-        } else {
-            set_rs_idx(seq_id, 0);
-        }
+    if (seq_id == -1) {
+        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rollback_valid_depth.begin(), rollback_valid_depth.end(), 0);
+        GGML_ASSERT(std::all_of(rollback_valid_depth.begin(), rollback_valid_depth.end(),
+                    [](uint32_t depth) { return depth == 0; }));
+    } else {
+        reset_rollback_state(seq_id);
+        GGML_ASSERT(rollback_valid_depth[seq_id] == 0);
     }
 }
 
@@ -1464,6 +1533,9 @@ llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 bool llama_memory_recurrent_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    // graph_compute() succeeded for the current ubatch before the caller advances us
+    mem->commit_rollback(ubatches[i_next]);
+
     if (++i_next >= ubatches.size()) {
         return false;
     }
@@ -1482,6 +1554,9 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    // A failed/aborted graph may have partially mutated the device planes. Invalidate
+    // before submission, then publish the exact written depth only from next().
+    mem->invalidate_rollback(ubatches[i_next]);
     mem->find_slot(ubatches[i_next]);
 
     return true;
