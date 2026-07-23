@@ -612,6 +612,45 @@ struct server_slot {
                 prompt_clear();
             }
 
+            // [P0b/C] A checkpoint beyond the request prompt is generation-phase, but generated
+            // tokens normally become the next turn's prefix. Keep those checkpoints while their
+            // logical frontier is still represented by prompt.tokens. Only a checkpoint beyond
+            // BOTH the request prompt and the accepted/retained token ledger is unreachable by
+            // any future LCP and therefore genuinely dead (for example, an abandoned speculative
+            // branch). This is position-layout independent: recurrent pos_min is the full sequence
+            // frontier, so the upstream `pos_min > prompt_end` test would erase every recurrent
+            // generation checkpoint. Erasing metadata here cannot alter the live model state, and
+            // retaining continuation checkpoints is the output-neutral choice when lineage is not
+            // provably dead. Child slots were cleared above and deliberately skip this lifecycle.
+            if (!task->is_child()) {
+                const int64_t prompt_end   = task->n_tokens();
+                const int64_t retained_end = prompt.n_tokens();
+                int n_erased = 0;
+
+                for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+                    const bool is_generation_checkpoint = it->n_tokens > prompt_end;
+                    const bool is_outside_retained       = it->n_tokens > retained_end;
+
+                    if (is_generation_checkpoint && is_outside_retained) {
+                        SLT_DBG(*this,
+                                "release: erasing dead generation checkpoint "
+                                "(n_tokens=%" PRId64 ", prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
+                                it->n_tokens, prompt_end, retained_end);
+                        it = prompt.checkpoints.erase(it);
+                        n_erased++;
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (n_erased > 0) {
+                    SLT_INF(*this,
+                            "release: erased %d dead generation checkpoint(s) "
+                            "(prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
+                            n_erased, prompt_end, retained_end);
+                }
+            }
+
             reset();
 
             callback_on_release(id);
@@ -4254,7 +4293,9 @@ private:
                         }*/
 
                         // keep track how many tokens we can reuse from the previous state
-                        int n_past = 0;
+                        int    n_past        = 0;
+                        size_t n_past_common = 0;
+                        size_t n_past_keep   = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4316,6 +4357,14 @@ private:
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
+
+                                // [P0b/A] Preserve the true token LCP before checkpoint restore
+                                // rewinds n_past to a smaller physical frontier. n_past_keep is the
+                                // separately bounded amount that prompt.tokens may continue to
+                                // claim after restore; see the restore-site recurrent guard below.
+                                // Keeping token bookkeeping never mutates KV/state by itself.
+                                n_past_common = n_past;
+                                n_past_keep   = n_past_common;
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
@@ -4512,6 +4561,22 @@ private:
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
 
+                                            // [P0b/A] Attention/SWA follows upstream #24891: the
+                                            // checkpoint's logical token count bounds the true LCP
+                                            // retained in bookkeeping. Recurrent/hybrid PARTIAL_ONLY
+                                            // restore is different: it installs recurrent state only
+                                            // at the checkpoint frontier, so even a matching later
+                                            // token prefix is not backed by that state. Cap to n_past,
+                                            // which was derived from BOTH restored pos_next and
+                                            // checkpoint.n_tokens. Thus keep_first below can never
+                                            // claim a token beyond the restored recurrent frontier;
+                                            // the conservative replay changes work only, never output.
+                                            if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+                                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                            } else {
+                                                n_past_keep = std::min(n_past_keep, (size_t) it->n_tokens);
+                                            }
+
                                             if (slot.can_speculate() && !it->ring_data.empty()) {
                                                 common_speculative_ring_state_load(slot.get_spec(), it->ring_data.data(), it->ring_data.size());
                                             }
@@ -4531,16 +4596,42 @@ private:
                                             : "full reprocess: no reusable context checkpoint";
                                         pos_next = 0;
                                         n_past = 0;
+                                        n_past_keep = 0;
                                     }
                                 }
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // [P0b/B] pos_next may have been rewound by restore and is not an
+                                // invalidation frontier. Use the real physical end of the incoming
+                                // prompt, as upstream #24891 does, plus the logical true LCP as a
+                                // lineage guard. A checkpoint after the true LCP may describe the old
+                                // branch even when its position fits inside the new prompt; recurrent
+                                // state makes that especially dangerous because it summarizes every
+                                // preceding token. Checkpoint.n_tokens is the architecture-neutral
+                                // capture frontier (unlike recurrent pos_min), so checkpoints through
+                                // the true LCP survive even when restore rewound n_past below them.
+                                // This changes only checkpoint metadata retention; N1-A selection
+                                // (strict pos_max < pos_next) and I9 epoch rejection above are
+                                // untouched. Every retained checkpoint is on the verified common
+                                // lineage and within the new physical prompt; erasure can only cause
+                                // replay, never install a different state.
+                                const llama_pos prompt_pos_end = input_tokens.pos_next();
+                                const llama_pos common_pos_end = slot.prompt.tokens.pos_next(n_past_common);
+
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    const bool beyond_prompt = cur.pos_max > prompt_pos_end;
+                                    const bool beyond_lcp    = cur.n_tokens > (int64_t) n_past_common;
+                                    const bool invalidated   = beyond_prompt || beyond_lcp;
+
+                                    if (invalidated) {
+                                        SLT_TRC(slot,
+                                                "erased invalidated context checkpoint "
+                                                "(pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                                ", n_swa = %d, prompt_pos_end = %d, common_pos_end = %d, size = %.3f MiB)\n",
+                                                cur.pos_min, cur.pos_max, cur.n_tokens, n_swa,
+                                                prompt_pos_end, common_pos_end, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4552,19 +4643,30 @@ private:
                         // dynamic VBR: trade a token-trivial reusable prefix for the lossless
                         // full reset (n_past -> 0 makes the seq_rm below a full clear; the
                         // cache empties and the next prepare restores every entry tier)
-                        n_past = vbr_reset_on_low_lcp(slot, n_past);
+                        {
+                            const int n_past_before_vbr_reset = n_past;
+                            n_past = vbr_reset_on_low_lcp(slot, n_past);
+                            if (n_past < n_past_before_vbr_reset) {
+                                // A VBR reset physically cleared state; do not let true-LCP token
+                                // retention claim the cleared prefix.
+                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                            }
+                        }
 
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
+                            // The last token must really be re-evaluated for logits; preserving it
+                            // only in token bookkeeping would skip that decode.
+                            n_past_keep = std::min(n_past_keep, (size_t) n_past);
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
-                        slot.prompt.tokens.keep_first(n_past);
+                        slot.prompt.tokens.keep_first(std::max(n_past_keep, (size_t) n_past));
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
