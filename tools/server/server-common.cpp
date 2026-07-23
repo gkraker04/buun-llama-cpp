@@ -499,7 +499,15 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
 
-            if (id_ai == id_bi && n_tok_a == n_tok_b) {
+            // An empty chunk id means the media content is unidentified: video frame chunks are
+            // expanded from a lazy bitmap and never receive the file-level content hash, so they
+            // carry id == "". Matching "" == "" would reuse one video's KV for a *different* video
+            // of the same resolution/length/fps (identical token skeleton). Fail closed: an
+            // empty-id chunk is always a divergence point, so unidentified media is reprocessed
+            // rather than crossed. Images/audio always carry the FNV content hash and are
+            // unaffected. [I6] (Making video cacheable — propagating a per-frame content id — is a
+            // separate, non-correctness enhancement.)
+            if (!id_ai.empty() && id_ai == id_bi && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;
