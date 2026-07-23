@@ -267,15 +267,30 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
+        // stage -> fill -> validate -> publish [I7]. Fill the staged entry and verify the writer
+        // returned the exact declared length BEFORE publishing; a short/zero write (e.g. a dynamic
+        // VBR state_write refusal after a degrade) aborts the save without touching the cache,
+        // instead of publishing a truncated/empty entry [I10].
+        auto entry = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft);
+        if (!entry) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt != cur_size_tgt) {
+            SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
+            return false;
         }
+
+        if (ctx_dft) {
+            const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft != cur_size_dft) {
+                SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
+                return false;
+            }
+        }
+
+        prompt_cache.publish(std::move(entry));
 
         return true;
     }

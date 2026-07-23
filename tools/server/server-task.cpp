@@ -1672,12 +1672,11 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+    for (const auto & st : states) {
+        const int lcp_len = st.prompt.tokens.get_common_prefix(prompt.tokens);
+        if (lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1698,36 +1697,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+    // allocate the entry OUTSIDE `states` (not yet published); eviction happens in publish() only
+    // once the caller has filled and validated the state bytes. This is the transactional guard:
+    // a failed fill simply drops this object, so `states` is never mutated for a save that fails.
+    auto entry = std::make_unique<server_prompt_cache_state>();
 
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
-    }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
-    // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        entry->data.main.resize(state_size_tgt);
+        entry->data.drft.resize(state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1740,18 +1717,43 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
+    entry->prompt.tokens      = prompt.tokens.clone();
+    entry->prompt.checkpoints = prompt.checkpoints;
 
-    return &states.back();
+    return entry;
+}
+
+void server_prompt_cache::publish(std::unique_ptr<server_prompt_cache_state> entry) {
+    if (!entry) {
+        return;
+    }
+
+    const size_t state_size_new = entry->size();
+
+    // remove any cached prompts that are fully contained in the new (larger) prompt
+    for (auto it = states.begin(); it != states.end();) {
+        const int len = it->prompt.tokens.get_common_prefix(entry->prompt.tokens);
+
+        if (len == (int) it->prompt.tokens.size()) {
+            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+
+            it = states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (limit_size > 0) {
+        // make room only now that we hold a fully-filled, validated entry
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
+        }
+    }
+
+    states.push_back(std::move(*entry));
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -1766,6 +1768,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // never select a structurally-empty entry [I7/I10]: a size-0 main would "restore" as a
+        // false success (0 == 0) and leave the slot on empty state, then continue as if a prefix
+        // were present -> pos_min == -1 with n_past > 0 abort. The transactional save/load here
+        // never produces an empty-main entry, but guard the selector so a stray one is inert.
+        if (it->data.main.empty()) {
+            continue;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1784,47 +1794,41 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
-
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+    if (it_best == states.end()) {
+        // nothing better than the slot's current state; leave the slot as-is
+        return true;
     }
+
+    SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+
+    // NON-CONSUMING restore [I7]: do NOT clear the entry's bytes while restoring, and remove the
+    // entry only after BOTH sides restore successfully. The previous code cleared main after
+    // restoring it, then attempted the draft restore — a draft failure returned with main already
+    // freed, leaving a poisoned (empty-main, tokens-intact) entry that later passed the 0 == 0
+    // false-success check and crashed. On any failure here we leave the entry fully intact and
+    // return false; the caller (update_slots) then calls prompt_clear(), which resets both the
+    // target and draft sequences, so the slot is never left in a half-restored state.
+    {
+        const size_t size_tgt = it_best->data.main.size();
+        const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0);
+        if (n_tgt != size_tgt) {
+            SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
+            return false;
+        }
+    }
+
+    if (ctx_dft && !it_best->data.drft.empty()) {
+        const size_t size_dft = it_best->data.drft.size();
+        const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, it_best->data.drft.data(), size_dft, id_slot, 0);
+        if (n_dft != size_dft) {
+            SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);
+            return false;
+        }
+    }
+
+    // both sides restored: now it is safe to consume the entry
+    prompt = std::move(it_best->prompt);
+    states.erase(it_best);
 
     return true;
 }

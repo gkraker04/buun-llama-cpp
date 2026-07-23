@@ -652,7 +652,13 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // Transactional save is a stage -> fill -> publish sequence [I7]. stage() allocates the entry
+    // WITHOUT touching `states` (no eviction, no insertion); the caller fills + validates the state
+    // bytes; publish() then evicts to make room and inserts the completed entry. A failed fill drops
+    // the staged entry and leaves the cache untouched — never a poisoned/half-filled published entry,
+    // never an eviction that bought nothing.
+    std::unique_ptr<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    void publish(std::unique_ptr<server_prompt_cache_state> entry);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
