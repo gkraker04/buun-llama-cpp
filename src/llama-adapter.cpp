@@ -4,10 +4,270 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
-#include <map>
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstring>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+
+namespace {
+
+// Compact SHA-256 implementation for adapter identities. The digest serialization below is
+// versioned independently so it can be extended without silently aliasing the current domain.
+class adapter_sha256 {
+public:
+    adapter_sha256() {
+        state = {
+            0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+            0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+        };
+    }
+
+    void update(const void * src, size_t len) {
+        const uint8_t * data = static_cast<const uint8_t *>(src);
+        total_len += len;
+
+        while (len > 0) {
+            const size_t n = std::min(len, block.size() - block_len);
+            memcpy(block.data() + block_len, data, n);
+            block_len += n;
+            data += n;
+            len -= n;
+
+            if (block_len == block.size()) {
+                transform(block.data());
+                block_len = 0;
+            }
+        }
+    }
+
+    std::array<uint8_t, 32> finish() {
+        const uint64_t bit_len = total_len * 8;
+        const uint8_t one = 0x80;
+        update(&one, 1);
+
+        const uint8_t zero = 0;
+        while (block_len != 56) {
+            update(&zero, 1);
+        }
+
+        uint8_t len_be[8];
+        for (size_t i = 0; i < sizeof(len_be); ++i) {
+            len_be[i] = uint8_t(bit_len >> (56 - 8*i));
+        }
+        update(len_be, sizeof(len_be));
+
+        std::array<uint8_t, 32> result;
+        for (size_t i = 0; i < state.size(); ++i) {
+            result[4*i + 0] = uint8_t(state[i] >> 24);
+            result[4*i + 1] = uint8_t(state[i] >> 16);
+            result[4*i + 2] = uint8_t(state[i] >>  8);
+            result[4*i + 3] = uint8_t(state[i] >>  0);
+        }
+        return result;
+    }
+
+private:
+    static uint32_t rotr(uint32_t x, uint32_t n) {
+        return (x >> n) | (x << (32 - n));
+    }
+
+    void transform(const uint8_t * data) {
+        static const uint32_t k[64] = {
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+        };
+
+        uint32_t w[64];
+        for (size_t i = 0; i < 16; ++i) {
+            w[i] = (uint32_t(data[4*i + 0]) << 24) |
+                   (uint32_t(data[4*i + 1]) << 16) |
+                   (uint32_t(data[4*i + 2]) <<  8) |
+                   (uint32_t(data[4*i + 3]) <<  0);
+        }
+        for (size_t i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15],  7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>  3);
+            const uint32_t s1 = rotr(w[i -  2], 17) ^ rotr(w[i -  2], 19) ^ (w[i -  2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+
+        uint32_t a = state[0];
+        uint32_t b = state[1];
+        uint32_t c = state[2];
+        uint32_t d = state[3];
+        uint32_t e = state[4];
+        uint32_t f = state[5];
+        uint32_t g = state[6];
+        uint32_t h = state[7];
+
+        for (size_t i = 0; i < 64; ++i) {
+            const uint32_t s1  = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch  = (e & f) ^ (~e & g);
+            const uint32_t t1  = h + s1 + ch + k[i] + w[i];
+            const uint32_t s0  = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2  = s0 + maj;
+
+            h = g;
+            g = f;
+            f = e;
+            e = d + t1;
+            d = c;
+            c = b;
+            b = a;
+            a = t1 + t2;
+        }
+
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+        state[5] += f;
+        state[6] += g;
+        state[7] += h;
+    }
+
+    std::array<uint32_t, 8> state;
+    std::array<uint8_t, 64> block = {};
+    uint64_t total_len = 0;
+    size_t block_len = 0;
+};
+
+class adapter_digest_writer {
+public:
+    void bytes(const void * data, size_t size) {
+        hash.update(data, size);
+    }
+
+    void u32(uint32_t value) {
+        uint8_t data[4];
+        for (size_t i = 0; i < sizeof(data); ++i) {
+            data[i] = uint8_t(value >> (8*i));
+        }
+        bytes(data, sizeof(data));
+    }
+
+    void u64(uint64_t value) {
+        uint8_t data[8];
+        for (size_t i = 0; i < sizeof(data); ++i) {
+            data[i] = uint8_t(value >> (8*i));
+        }
+        bytes(data, sizeof(data));
+    }
+
+    void string(const std::string & value) {
+        u64(value.size());
+        bytes(value.data(), value.size());
+    }
+
+    void tensor(const ggml_tensor * tensor) {
+        u32(uint32_t(tensor->type));
+        for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+            u64(uint64_t(tensor->ne[i]));
+        }
+
+        const size_t size = ggml_nbytes(tensor);
+        u64(size);
+
+        // CPU/host buffers can be hashed in place. Device buffers use the same backend read path
+        // as state serialization; this happens once at adapter load, outside graph construction.
+        if (tensor->data != nullptr && ggml_backend_buffer_is_host(tensor->buffer)) {
+            bytes(tensor->data, size);
+        } else {
+            std::vector<uint8_t> data(size);
+            ggml_backend_tensor_get(tensor, data.data(), 0, size);
+            bytes(data.data(), data.size());
+        }
+    }
+
+    std::array<uint8_t, 32> finish() {
+        return hash.finish();
+    }
+
+private:
+    adapter_sha256 hash;
+};
+
+static void llama_adapter_lora_set_digest(llama_adapter_lora & adapter) {
+    adapter_digest_writer digest;
+    static const char domain[] = "llama.cpp lora execution digest";
+    digest.bytes(domain, sizeof(domain) - 1);
+    digest.u32(1); // serialization version
+
+    std::vector<std::pair<std::string, const llama_adapter_lora_weight *>> weights;
+    weights.reserve(adapter.ab_map.size());
+    for (const auto & entry : adapter.ab_map) {
+        weights.emplace_back(entry.first, &entry.second);
+    }
+    std::sort(weights.begin(), weights.end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.first < rhs.first;
+    });
+
+    digest.u64(weights.size());
+    for (const auto & entry : weights) {
+        digest.string(entry.first);
+        digest.tensor(entry.second->a);
+        digest.tensor(entry.second->b);
+    }
+
+    float alpha = adapter.alpha;
+    if (alpha == 0.0f) {
+        alpha = 0.0f; // normalize -0.0: both signs select the no-alpha execution path
+    }
+    uint32_t alpha_bits;
+    static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha), "unexpected float size");
+    memcpy(&alpha_bits, &alpha, sizeof(alpha_bits));
+    digest.u32(alpha_bits);
+
+    digest.u64(adapter.alora_invocation_tokens.size());
+    for (llama_token token : adapter.alora_invocation_tokens) {
+        digest.u32(uint32_t(token));
+    }
+
+    // Only metadata interpreted by the current execution loader belongs in the semantic domain.
+    // alpha and aLoRA tokens are encoded above in their native representation. Rank semantics are
+    // encoded by every A/B shape; also preserve either customary scalar rank spelling if present.
+    static const std::array<const char *, 3> semantic_keys = {
+        "general.type",
+        "general.architecture",
+        "adapter.type",
+    };
+    static const std::array<const char *, 2> optional_rank_keys = {
+        "adapter.lora.rank",
+        "adapter.lora.r",
+    };
+
+    size_t n_semantic_keys = semantic_keys.size();
+    for (const char * key : optional_rank_keys) {
+        n_semantic_keys += adapter.gguf_kv.count(key);
+    }
+    digest.u64(n_semantic_keys);
+    for (const char * key : semantic_keys) {
+        digest.string(key);
+        const auto it = adapter.gguf_kv.find(key);
+        digest.string(it == adapter.gguf_kv.end() ? std::string() : it->second);
+    }
+    for (const char * key : optional_rank_keys) {
+        const auto it = adapter.gguf_kv.find(key);
+        if (it != adapter.gguf_kv.end()) {
+            digest.string(key);
+            digest.string(it->second);
+        }
+    }
+
+    adapter.digest = digest.finish();
+}
+
+} // namespace
 
 // vec
 
@@ -411,6 +671,8 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
+    llama_adapter_lora_set_digest(adapter);
+
     // register adapter with model
     model.loras.insert(&adapter);
 
@@ -469,6 +731,12 @@ int32_t llama_adapter_meta_val_str_by_index(const llama_adapter_lora * adapter, 
     auto it = adapter->gguf_kv.begin();
     std::advance(it, i);
     return snprintf(buf, buf_size, "%s", it->second.c_str());
+}
+
+void llama_adapter_meta_digest(const llama_adapter_lora * adapter, uint8_t * out) {
+    GGML_ASSERT(adapter != nullptr);
+    GGML_ASSERT(out != nullptr);
+    memcpy(out, adapter->digest.data(), adapter->digest.size());
 }
 
 void llama_adapter_lora_free(llama_adapter_lora * adapter) {

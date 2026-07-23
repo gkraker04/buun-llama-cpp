@@ -719,8 +719,8 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
+    const llama_adapter_cvec          * cvec;
+    const llama_adapter_loras_ordered * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_tree_mask        * tree_mask = nullptr;
@@ -974,8 +974,8 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
+    const llama_adapter_cvec          * cvec;
+    const llama_adapter_loras_ordered * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_tree_mask        * tree_mask;

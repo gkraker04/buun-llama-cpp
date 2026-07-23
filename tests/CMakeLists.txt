@@ -195,6 +195,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-lora-determinism.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -216,6 +217,28 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
         FIXTURES_REQUIRED generate-models
+    )
+
+    set(LORA_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-lora-models/")
+    file(MAKE_DIRECTORY "${LORA_MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-lora-model
+        LABEL main
+        ARGS -a qwen35 -s 0 -o "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-lora-model PROPERTIES
+        FIXTURES_SETUP generate-lora-model
+    )
+
+    llama_test(
+        test-lora-determinism
+        LABEL main
+        ARGS "${LORA_MODEL_DIR}/qwen35-dense.gguf" "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-lora-determinism PROPERTIES
+        FIXTURES_REQUIRED generate-lora-model
     )
 endif()
 

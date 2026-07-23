@@ -105,6 +105,7 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
+    loras_ordered(std::make_unique<llama_adapter_loras_ordered>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
@@ -3195,22 +3196,57 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    if (adapters_lora_are_same(adapters, n_adapters, scales)) {
-        return;
-    }
-
-    loras.reset(new llama_adapter_loras());
-
-    for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] != 0.0f) {
-            loras->insert({adapters[i], scales[i]});
+    for (size_t i = 0; i < n_adapters; ++i) {
+        if (!std::isfinite(scales[i])) {
+            LLAMA_LOG_ERROR("%s: adapter scale at index %zu must be finite\n", __func__, i);
+            return false;
         }
     }
 
+    if (adapters_lora_are_same(adapters, n_adapters, scales)) {
+        return true;
+    }
+
+    auto new_loras = std::make_unique<llama_adapter_loras>();
+
+    for (size_t i = 0; i < n_adapters; i ++) {
+        if (scales[i] != 0.0f) {
+            new_loras->insert({adapters[i], scales[i]});
+        }
+    }
+
+    auto new_loras_ordered = std::make_unique<llama_adapter_loras_ordered>(
+            new_loras->begin(), new_loras->end());
+
+    auto scale_bits = [](float scale) {
+        // The sort key is the raw request-level scale, not the rank/alpha-adjusted graph scale.
+        // Both zero signs are inactive above; normalize defensively before serializing the bits.
+        static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
+                "LoRA scale ordering requires IEEE-754 binary32");
+        if (scale == 0.0f) {
+            scale = 0.0f;
+        }
+        uint32_t bits;
+        memcpy(&bits, &scale, sizeof(bits));
+        return bits;
+    };
+    std::sort(new_loras_ordered->begin(), new_loras_ordered->end(),
+            [&](const auto & lhs, const auto & rhs) {
+        if (lhs.first->digest != rhs.first->digest) {
+            return lhs.first->digest < rhs.first->digest;
+        }
+        return scale_bits(lhs.second) < scale_bits(rhs.second);
+    });
+
+    // Keep the pointer map for active-set equality checks. The graph consumes only this sorted
+    // vector; equal digest/scale entries are deliberately retained as separate FP additions.
+    loras = std::move(new_loras);
+    loras_ordered = std::move(new_loras_ordered);
     sched_need_reserve = true;
+    return true;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -4524,7 +4560,7 @@ llm_graph_params llama_context::graph_params(
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
+        /*.loras       =*/ loras_ordered.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
@@ -6194,9 +6230,7 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    return ctx->set_adapters_lora(adapters, n_adapters, scales) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(

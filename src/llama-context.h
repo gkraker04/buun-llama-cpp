@@ -320,7 +320,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -484,6 +484,7 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+    llama_adapter_loras_ordered_ptr loras_ordered;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
