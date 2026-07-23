@@ -4537,9 +4537,28 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // Checkpoint restores reset recurrent rollback depth. In particular,
+                    // [TAG_PROMPT_LOGITS] can move p0 one token behind the restored
+                    // frontier, making this bounded trim legitimately fallible.
+                    bool trim_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1);
+                    if (trim_ok && ctx_dft) {
+                        trim_ok = llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1);
+                    }
+
+                    if (!trim_ok) {
+                        SLT_WRN(slot, "memory_seq_rm [%d, end) rejected; falling back to full prompt re-processing\n", p0);
+
+                        // Full removal is infallible for memory implementations and retains
+                        // common_context_seq_rm's asserting contract. Clear both target and
+                        // draft so a failure on either side cannot leave them out of sync.
+                        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                        }
+
+                        slot.prompt.tokens.keep_first(0);
+                        slot.n_prompt_tokens_cache = 0;
+                        slot.n_prompt_tokens_processed = 0;
                     }
 
                     // If using an alora, there may be uncached tokens that come

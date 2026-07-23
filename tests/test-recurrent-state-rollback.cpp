@@ -214,9 +214,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to retain pre-rm reference\n", __func__);
         return 1;
     }
-    // Exercise the owned recurrent operation directly: llama_memory_hybrid::seq_rm()
-    // currently continues into attention removal after a recurrent false.
-    if (get_recurrent(ctx_test.get())->seq_rm(0, 3, -1)) {
+    // Exercise the composite memory operation. For hybrid models, a rejected
+    // recurrent rollback must not remove the corresponding attention entries.
+    if (llama_memory_seq_rm(llama_get_memory(ctx_test.get()), 0, 3, -1)) {
         fprintf(stderr, "%s : stale rollback unexpectedly succeeded after restore + decode\n", __func__);
         return 1;
     }
