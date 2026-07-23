@@ -3577,13 +3577,23 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.clear(); // KV may already been invalidated?
+                        // a partial/failed load may have written some target cells; prompt_clear()
+                        // (seq_rm) resets the target AND draft sequences, not just the bookkeeping
+                        // that the struct-level prompt.clear() would [R7/N7]
+                        slot->prompt_clear();
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // the slot file carries only the target state; reset the draft/speculative side
+                    // so it rebuilds from the restored prompt on the next decode instead of
+                    // continuing the previous conversation's stale draft KV [R7/N7]
+                    if (ctx_dft) {
+                        common_context_seq_rm(ctx_dft.get(), slot->id, -1, -1);
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -5257,8 +5267,18 @@ private:
                             for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
                                 common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
                             }
-                            llama_decode(ctx_tgt, batch_reeval);
+                            const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
                             llama_batch_free(batch_reeval);
+                            if (ret_reeval != 0) {
+                                // the backup was restored to n_past_before but slot.prompt.tokens
+                                // already holds the accepted tokens, so a failed re-decode leaves
+                                // memory and bookkeeping desynced. Abort this slot and reset it
+                                // coherently rather than generating on inconsistent state [R8/N8].
+                                SLT_ERR(slot, "failed to re-decode accepted tokens after partial accept (ret = %d)\n", ret_reeval);
+                                send_error(slot, "Compute error re-decoding accepted tokens");
+                                slot.release();
+                                slot.prompt_clear();
+                            }
                         }
                     }
                 }
