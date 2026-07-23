@@ -332,6 +332,13 @@ MTMD_API struct mtmd_caps mtmd_get_cap_from_file(const char * mmproj_fname);
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 
+// test function: build one standalone IMAGE chunk with a caller-chosen id and token count.
+// an empty id ("") reproduces an unidentified video-frame chunk (frames drop the file-level
+// content hash on lazy-bitmap expansion), used by test-server-media-prefix to exercise the
+// empty-id fail-closed guard in server_tokens::get_common_prefix. caller owns the result
+// (mtmd_input_chunk_free), or hands it to a copying consumer such as server_tokens::push_back.
+MTMD_API mtmd_input_chunk * mtmd_test_create_image_chunk(const char * id, size_t n_tokens);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -2000,6 +2000,22 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     return chunks;
 }
 
+mtmd_input_chunk * mtmd_test_create_image_chunk(const char * id, size_t n_tokens) {
+    GGML_ASSERT(n_tokens > 0);
+    // nx*ny*nz with ny=1 and a single batch entry (nz=1) => n_tokens() == nx.
+    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+    image_tokens->nx = (uint32_t) n_tokens;
+    image_tokens->ny = 1;
+    image_tokens->batch_f32.entries.resize(1);
+    image_tokens->id = id ? id : "";
+    return new mtmd_input_chunk{
+        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+        {}, // text tokens
+        std::move(image_tokens),
+        nullptr, // audio tokens
+    };
+}
+
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : clip_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;

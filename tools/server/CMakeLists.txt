@@ -61,3 +61,16 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# C++ unit test for server_tokens::get_common_prefix (U3 empty-id media guard). Lives here rather
+# than tests/ because that subdir is configured before tools/, so server-context/mtmd targets are
+# not yet defined there. No model or mmproj needed — runs on CPU.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-server-media-prefix ${CMAKE_SOURCE_DIR}/tests/test-server-media-prefix.cpp)
+    target_link_libraries(test-server-media-prefix PRIVATE server-context mtmd llama llama-common)
+    target_include_directories(test-server-media-prefix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-media-prefix PRIVATE cxx_std_17)
+    add_test(NAME test-server-media-prefix COMMAND test-server-media-prefix)
+    set_property(TEST test-server-media-prefix PROPERTY LABELS main)
+endif()
