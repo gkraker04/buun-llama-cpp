@@ -2476,21 +2476,27 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                // if lora has changed, check to see if the cache should be cleared
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.clear();
-                } else {
-                    SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
-                }
-                slot.lora = task_loras;
+        // process per-request lora adapters (fall back to the server's base adapters when the
+        // request carries none). Identity is checked for BOTH branches [I6]: a slot that computed
+        // its prompt state under one adapter set must not silently continue it under a different
+        // one. The previous code checked equality only for the per-request branch and rebound the
+        // no-lora branch unconditionally, so a request with no `lora` field could keep the KV/
+        // recurrent state built under a per-request adapter. Also use prompt_clear() (not the
+        // struct-only prompt.clear()) so the recurrent state is reset too on hybrid models — a
+        // token-only clear leaves stale recurrent state that the reprocess would continue from.
+        const auto task_loras = task.params.lora.empty()
+            ? params_base.lora_adapters
+            : construct_lora_list(task.params.lora);
+
+        if (!are_lora_equal(task_loras, slot.lora)) {
+            // called only after establishing inequality, as lora_should_clear_cache requires
+            if (lora_should_clear_cache(slot.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+                slot.prompt_clear();
+            } else {
+                SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-        } else {
-            slot.lora = params_base.lora_adapters;
+            slot.lora = task_loras;
         }
 
         // if using alora, make sure it's only a single one requested and active
