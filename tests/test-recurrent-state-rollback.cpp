@@ -34,6 +34,17 @@ static llama_memory_recurrent * get_recurrent(llama_context * ctx) {
     return nullptr;
 }
 
+static llama_pos get_attention_pos_max(llama_context * ctx, llama_seq_id seq_id) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    return -1;
+}
+
 static bool check_depth(llama_context * ctx, llama_seq_id seq_id, uint32_t expected, const char * label) {
     const auto * recurrent = get_recurrent(ctx);
     if (recurrent == nullptr || seq_id < 0 || (size_t) seq_id >= recurrent->rollback_valid_depth.size()) {
@@ -82,9 +93,12 @@ static bool decode_equal_split(
     return ok;
 }
 
-static std::vector<uint8_t> save_seq(llama_context * ctx, llama_seq_id seq_id) {
-    std::vector<uint8_t> state(llama_state_seq_get_size(ctx, seq_id));
-    const size_t n = llama_state_seq_get_data(ctx, state.data(), state.size(), seq_id);
+static std::vector<uint8_t> save_seq(
+        llama_context *       ctx,
+        llama_seq_id          seq_id,
+        llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE) {
+    std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx, seq_id, flags));
+    const size_t n = llama_state_seq_get_data_ext(ctx, state.data(), state.size(), seq_id, flags);
     if (n != state.size()) {
         state.clear();
     }
@@ -93,6 +107,16 @@ static std::vector<uint8_t> save_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 static bool load_seq(llama_context * ctx, const std::vector<uint8_t> & state, llama_seq_id seq_id) {
     return !state.empty() && llama_state_seq_set_data(ctx, state.data(), state.size(), seq_id) == state.size();
+}
+
+static bool seq_state_payload_equal(
+        const std::vector<uint8_t> & lhs,
+        const std::vector<uint8_t> & rhs) {
+    // The in-memory sequence envelope starts with magic + source seq_id. The memory
+    // payload that follows must be identical when comparing two different sequence ids.
+    constexpr size_t envelope_size = sizeof(uint32_t) + sizeof(llama_seq_id);
+    return lhs.size() == rhs.size() && lhs.size() >= envelope_size &&
+        std::equal(lhs.begin() + envelope_size, lhs.end(), rhs.begin() + envelope_size);
 }
 
 static std::vector<float> copy_logits(llama_context * ctx, int n_vocab) {
@@ -159,7 +183,7 @@ int main(int argc, char ** argv) {
     auto ctx_src      = make_ctx(params, model);
     auto ctx_test     = make_ctx(params, model);
     auto ctx_ref      = make_ctx(params, model);
-    auto ctx_parallel = make_ctx(params, model, 2);
+    auto ctx_parallel = make_ctx(params, model, 3);
     if (!ctx_src || !ctx_test || !ctx_ref || !ctx_parallel) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
@@ -295,7 +319,82 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Equal-split batching publishes each participating sequence independently.
+    // A successful detectable copy into an empty destination copies the composite state.
+    // Give the empty destination synthetic rollback metadata to prove that the copied active
+    // row resets it rather than inheriting the source's valid planes.
+    if (!decode_range(ctx_parallel.get(), tokens, 0, 4, 1) ||
+        !check_depth(ctx_parallel.get(), 1, 3, "seq_cp source")) {
+        fprintf(stderr, "%s : successful seq_cp setup failed\n", __func__);
+        return 1;
+    }
+    const auto source_state = save_seq(ctx_parallel.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    auto * recurrent_parallel = get_recurrent(ctx_parallel.get());
+    recurrent_parallel->set_rs_idx(0, 3);
+    recurrent_parallel->rollback_valid_depth[0] = 3;
+    const bool copy_succeeded = llama_get_memory(ctx_parallel.get())->try_seq_cp(1, 0, -1, -1);
+    const auto destination_state = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (!copy_succeeded ||
+        !seq_state_payload_equal(source_state, destination_state) ||
+        !check_depth(ctx_parallel.get(), 0, 0, "seq_cp destination") ||
+        !check_depth(ctx_parallel.get(), 1, 3, "seq_cp source")) {
+        size_t first_diff = 0;
+        while (first_diff < source_state.size() &&
+               first_diff < destination_state.size() &&
+               source_state[first_diff] == destination_state[first_diff]) {
+            ++first_diff;
+        }
+        fprintf(stderr, "%s : successful seq_cp details: result=%s, source=%zu B, destination=%zu B, first_diff=%zu\n",
+                __func__, copy_succeeded ? "true" : "false",
+                source_state.size(), destination_state.size(), first_diff);
+        fprintf(stderr, "%s : successful seq_cp did not copy state or reset destination depth\n", __func__);
+        return 1;
+    }
+
+    // Fill every recurrent cell, then exercise the recurrent implementation directly.
+    // Reserve-before-clear must report exhaustion while preserving the occupied destination
+    // byte-for-byte, including its rollback metadata.
+    llama_memory_clear(llama_get_memory(ctx_parallel.get()), true);
+    if (!decode_equal_split(ctx_parallel.get(), tokens, 4, 3)) {
+        fprintf(stderr, "%s : seq_cp exhaustion setup failed\n", __func__);
+        return 1;
+    }
+    recurrent_parallel = get_recurrent(ctx_parallel.get());
+    const auto exhausted_dst_state = save_seq(ctx_parallel.get(), 0);
+    const int32_t exhausted_dst_tail = recurrent_parallel->cells[0].tail;
+    const llama_pos exhausted_dst_pos = recurrent_parallel->seq_pos_max(0);
+    const uint32_t exhausted_dst_rs_idx = recurrent_parallel->rs_idx[0];
+    const uint32_t exhausted_dst_depth = recurrent_parallel->rollback_valid_depth[0];
+    const uint32_t exhausted_used = recurrent_parallel->used;
+    if (recurrent_parallel->try_seq_cp(1, 0, -1, -1) ||
+        exhausted_dst_state != save_seq(ctx_parallel.get(), 0) ||
+        recurrent_parallel->cells[0].tail != exhausted_dst_tail ||
+        recurrent_parallel->seq_pos_max(0) != exhausted_dst_pos ||
+        recurrent_parallel->rs_idx[0] != exhausted_dst_rs_idx ||
+        recurrent_parallel->rollback_valid_depth[0] != exhausted_dst_depth ||
+        recurrent_parallel->used != exhausted_used) {
+        fprintf(stderr, "%s : exhausted recurrent seq_cp succeeded or mutated destination\n", __func__);
+        return 1;
+    }
+
+    // The hybrid fallback cannot roll back the attention copy, so detected failure
+    // invalidates both children. The destination is empty and therefore never selectable
+    // as a half-copied composite checkpoint.
+    llama_memory_t mem_parallel = llama_get_memory(ctx_parallel.get());
+    if (dynamic_cast<llama_memory_hybrid *>(mem_parallel) != nullptr ||
+        dynamic_cast<llama_memory_hybrid_iswa *>(mem_parallel) != nullptr) {
+        if (mem_parallel->try_seq_cp(1, 0, -1, -1) ||
+            recurrent_parallel->get_cell_count(0) != 0 ||
+            recurrent_parallel->seq_pos_max(0) != -1 ||
+            get_attention_pos_max(ctx_parallel.get(), 0) != -1 ||
+            llama_memory_seq_pos_max(mem_parallel, 0) != -1 ||
+            !check_depth(ctx_parallel.get(), 0, 0, "failed hybrid seq_cp destination")) {
+            fprintf(stderr, "%s : failed hybrid seq_cp left an incoherent destination\n", __func__);
+            return 1;
+        }
+    }
+
+    // Equal-split batching still publishes each participating sequence independently.
+    llama_memory_clear(llama_get_memory(ctx_parallel.get()), true);
     if (!decode_equal_split(ctx_parallel.get(), tokens, 4, 2) ||
         !check_depth(ctx_parallel.get(), 0, 3, "equal split seq 0") ||
         !check_depth(ctx_parallel.get(), 1, 3, "equal split seq 1") ||
@@ -303,12 +402,6 @@ int main(int argc, char ** argv) {
         !check_depth(ctx_parallel.get(), 0, 0, "narrow seq 0") ||
         !check_depth(ctx_parallel.get(), 1, 3, "untouched seq 1")) {
         fprintf(stderr, "%s : per-sequence equal-split assignment failed\n", __func__);
-        return 1;
-    }
-    llama_memory_seq_cp(llama_get_memory(ctx_parallel.get()), 1, 0, -1, -1);
-    if (!check_depth(ctx_parallel.get(), 0, 0, "seq_cp destination") ||
-        !check_depth(ctx_parallel.get(), 1, 3, "seq_cp source")) {
-        fprintf(stderr, "%s : seq_cp did not reset destination rollback depth\n", __func__);
         return 1;
     }
 

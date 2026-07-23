@@ -264,8 +264,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 }
 
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    (void) try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_recurrent::try_seq_cp(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos    p0,
+        llama_pos    p1) {
     if (seq_id_src == seq_id_dst) {
-        return;
+        return true;
     }
 
     if (p0 < 0) {
@@ -276,49 +284,62 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
-        auto & tail_src_meta = cells[seq_id_src];
-        auto & tail_dst_meta = cells[seq_id_dst];
+    if ((uint32_t) seq_id_dst >= size || (uint32_t) seq_id_src >= size) {
+        LLAMA_LOG_ERROR("%s: invalid sequence ids for copy: src = %d, dst = %d, size = %u\n",
+                __func__, seq_id_src, seq_id_dst, size);
+        return false;
+    }
 
-        if (tail_dst_meta.tail >= 0) {
-            // clear destination seq_id if it wasn't empty
-            seq_rm(seq_id_dst, -1, -1);
+    auto & tail_src_meta = cells[seq_id_src];
+    auto & tail_dst_meta = cells[seq_id_dst];
+
+    uint32_t next_empty_cell = size;
+    if (tail_src_meta.tail >= 0) {
+        // Recurrent states must not share a mutable cell. Reserve the replacement before
+        // clearing the current destination so exhaustion leaves that destination untouched.
+        for (uint32_t i = head; i < head + size; ++i) {
+            const uint32_t idx = i % size;
+            if (cells[idx].is_empty()) {
+                next_empty_cell = idx;
+                break;
+            }
         }
 
-        if (tail_src_meta.tail >= 0) {
-            auto & cell_src = cells[tail_src_meta.tail];
-
-            // For recurrent models, we must copy the state to a new cell
-            // Otherwise, both sequences would share the same mutable state
-            uint32_t next_empty_cell = size;
-            for (uint32_t i = head; i < head + size; ++i) {
-                uint32_t idx = i % size;
-                if (cells[idx].is_empty()) {
-                    next_empty_cell = idx;
-                    break;
-                }
-            }
-
-            if (next_empty_cell != size) {
-                auto & empty_cell = cells[next_empty_cell];
-
-                // Copy tensors data
-                copy_cell(tail_src_meta.tail, next_empty_cell);
-
-                empty_cell.pos = cell_src.pos;
-                empty_cell.src = next_empty_cell; // results in a copy in the graph if needed
-                empty_cell.seq_id.insert(seq_id_dst);
-                tail_dst_meta.tail = next_empty_cell;
-                used += 1;
-
-                // copy_cell() installs only the active row; rollback planes are not migrated.
-                reset_rollback_state(seq_id_dst);
-                GGML_ASSERT(rollback_valid_depth[seq_id_dst] == 0);
-            } else {
-                LLAMA_LOG_ERROR("%s: failed to find available cell for copy\n", __func__);
-            }
+        if (next_empty_cell == size) {
+            LLAMA_LOG_ERROR("%s: failed to find available cell for copy\n", __func__);
+            return false;
         }
     }
+
+    if (tail_dst_meta.tail >= 0) {
+        // Reservation succeeded (or the source is empty), so replacing the destination is safe.
+        const bool removed = seq_rm(seq_id_dst, -1, -1);
+        GGML_ASSERT(removed);
+        GGML_UNUSED(removed);
+    }
+
+    if (tail_src_meta.tail < 0) {
+        return true;
+    }
+
+    const int32_t src_cell_id = tail_src_meta.tail;
+    auto & cell_src = cells[src_cell_id];
+    auto & empty_cell = cells[next_empty_cell];
+
+    // Copy tensors data
+    copy_cell(src_cell_id, next_empty_cell);
+
+    empty_cell.pos = cell_src.pos;
+    empty_cell.src = next_empty_cell; // results in a copy in the graph if needed
+    empty_cell.seq_id.insert(seq_id_dst);
+    tail_dst_meta.tail = next_empty_cell;
+    used += 1;
+
+    // copy_cell() installs only the active row; rollback planes are not migrated.
+    reset_rollback_state(seq_id_dst);
+    GGML_ASSERT(rollback_valid_depth[seq_id_dst] == 0);
+
+    return true;
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {

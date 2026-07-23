@@ -160,8 +160,27 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    (void) try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid_iswa::try_seq_cp(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos    p0,
+        llama_pos    p1) {
+    // Keep the established success-path ordering. If either child reports failure,
+    // invalidate the composite destination so it can never expose a split timeline.
+    if (mem_attn->try_seq_cp(seq_id_src, seq_id_dst, p0, p1) &&
+        mem_recr->try_seq_cp(seq_id_src, seq_id_dst, p0, p1)) {
+        return true;
+    }
+
+    const bool removed_recr = mem_recr->seq_rm(seq_id_dst, -1, -1);
+    const bool removed_attn = mem_attn->seq_rm(seq_id_dst, -1, -1);
+    GGML_ASSERT(removed_recr && removed_attn);
+    GGML_UNUSED(removed_recr);
+    GGML_UNUSED(removed_attn);
+    return false;
 }
 
 void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {
