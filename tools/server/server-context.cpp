@@ -310,7 +310,8 @@ struct server_slot {
             }
             auto & entry = staged.front();
 
-            const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
             if (n_tgt != cur_size_tgt) {
                 SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
                 return prompt_save_result::failed;

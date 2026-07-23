@@ -1827,7 +1827,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // target and draft sequences, so the slot is never left in a half-restored state.
     {
         const size_t size_tgt = it_best->data.main.size();
-        const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0);
+        size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0);
+        if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // [P0 gate]
         if (n_tgt != size_tgt) {
             SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
             return false;

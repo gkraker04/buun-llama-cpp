@@ -126,6 +126,14 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // under one adapter set is never restored for a request with a different one.
 std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras);
 
+// Test-only fault injection [P0 gate]. LLAMA_SERVER_FAULT is a comma-separated list of tags;
+// server_fault(tag) is true when the tag is present. Lets tests drive the prompt-cache / checkpoint
+// transactional failure paths (I7 "save failure retains live state", I10 "short write rejected",
+// non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
+//   save_short  - force the state-save writer to report a short write (aborts the save)
+//   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
+bool server_fault(const char * tag);
+
 //
 // server_tokens
 //
