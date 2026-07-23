@@ -3,7 +3,13 @@
 #include "log.h"
 #include "llama-cpp.h"
 
+#include <algorithm>
 #include <clocale>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -346,6 +352,193 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     return true;
 }
 
+// Test 6: sequence file integrity envelope
+// - round-trip a sequence file and compare the exact in-memory sequence state
+// - reject truncation, a same-length payload bit flip, v2, and foreign magic
+// - verify every rejected file leaves the destination sequence and outputs unchanged
+static bool test_seq_file_integrity(
+        struct llama_model         * model,
+        const struct common_params & params,
+        const llama_tokens         & tokens) {
+    static constexpr size_t SEQ_FILE_HEADER_SIZE = 24;
+
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 1;
+    params_ctx.kv_unified = true;
+
+    auto ctx_src = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    auto ctx_dst = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx_src || !ctx_dst) {
+        LOG_ERR("%s: failed to create contexts\n", __func__);
+        return false;
+    }
+
+    LOG("\n=== Test 6: sequence file integrity envelope ===\n");
+
+    const size_t n_tokens = std::min<size_t>(tokens.size(), 64);
+    if (n_tokens == 0) {
+        LOG_ERR("%s: no tokens available\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr batch((int32_t) n_tokens, 0, 1);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch.get(), tokens[i], (llama_pos) i, { 0 }, false);
+    }
+    if (llama_decode(ctx_src.get(), batch.get())) {
+        LOG_ERR("%s: failed to decode source sequence\n", __func__);
+        return false;
+    }
+
+    const auto get_seq_state = [&](llama_context * ctx, std::vector<uint8_t> & state) {
+        const size_t state_size = llama_state_seq_get_size(ctx, 0);
+        if (state_size == 0) {
+            LOG_ERR("%s: sequence state is empty\n", __func__);
+            return false;
+        }
+
+        state.resize(state_size);
+        const size_t ncopy = llama_state_seq_get_data(ctx, state.data(), state.size(), 0);
+        if (ncopy != state.size()) {
+            LOG_ERR("%s: sequence state length %zu does not match expected length %zu\n",
+                    __func__, ncopy, state.size());
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<uint8_t> state_src;
+    if (!get_seq_state(ctx_src.get(), state_src)) {
+        return false;
+    }
+
+    const std::string seq_path = params.out_file + ".seq-integrity";
+    const std::string bad_path = seq_path + ".bad";
+    const size_t saved_size = llama_state_seq_save_file(
+            ctx_src.get(), seq_path.c_str(), 0, tokens.data(), n_tokens);
+    if (saved_size == 0) {
+        LOG_ERR("%s: failed to save sequence state file\n", __func__);
+        return false;
+    }
+
+    std::ifstream input(seq_path, std::ios::binary);
+    std::vector<uint8_t> file_bytes(
+            (std::istreambuf_iterator<char>(input)),
+             std::istreambuf_iterator<char>());
+    if (!input.is_open() || file_bytes.size() != saved_size || file_bytes.size() <= SEQ_FILE_HEADER_SIZE) {
+        LOG_ERR("%s: failed to read saved sequence state file (%zu bytes, expected %zu)\n",
+                __func__, file_bytes.size(), saved_size);
+        return false;
+    }
+
+    uint64_t declared_size = 0;
+    memcpy(&declared_size, file_bytes.data() + 2*sizeof(uint32_t), sizeof(declared_size));
+    if (declared_size != file_bytes.size()) {
+        LOG_ERR("%s: declared file size %" PRIu64 " does not match actual size %zu\n",
+                __func__, declared_size, file_bytes.size());
+        return false;
+    }
+
+    llama_tokens tokens_out(n_tokens, LLAMA_TOKEN_NULL);
+    size_t n_token_count_out = 0;
+    const size_t loaded_size = llama_state_seq_load_file(
+            ctx_dst.get(), seq_path.c_str(), 0,
+            tokens_out.data(), tokens_out.size(), &n_token_count_out);
+    if (loaded_size != saved_size ||
+            n_token_count_out != n_tokens ||
+            !std::equal(tokens.begin(), tokens.begin() + n_tokens, tokens_out.begin())) {
+        LOG_ERR("%s: sequence state round-trip metadata mismatch\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> state_dst;
+    if (!get_seq_state(ctx_dst.get(), state_dst) || state_dst != state_src) {
+        LOG_ERR("%s: sequence state differs after file round-trip\n", __func__);
+        return false;
+    }
+
+    const auto expect_rejected_unchanged = [&](const std::vector<uint8_t> & damaged, const char * fault) {
+        {
+            std::ofstream output(bad_path, std::ios::binary | std::ios::trunc);
+            if (!damaged.empty()) {
+                output.write((const char *) damaged.data(), damaged.size());
+            }
+            if (!output) {
+                LOG_ERR("%s: failed to write %s test file\n", __func__, fault);
+                return false;
+            }
+        }
+
+        llama_tokens rejected_tokens(n_tokens, LLAMA_TOKEN_NULL);
+        const llama_tokens rejected_tokens_before = rejected_tokens;
+        size_t rejected_count = std::numeric_limits<size_t>::max();
+        if (llama_state_seq_load_file(
+                    ctx_dst.get(), bad_path.c_str(), 0,
+                    rejected_tokens.data(), rejected_tokens.size(), &rejected_count) != 0) {
+            LOG_ERR("%s: %s sequence state file was accepted\n", __func__, fault);
+            return false;
+        }
+
+        std::vector<uint8_t> state_after;
+        if (!get_seq_state(ctx_dst.get(), state_after) || state_after != state_dst) {
+            LOG_ERR("%s: %s sequence state file changed the destination sequence\n", __func__, fault);
+            return false;
+        }
+        if (rejected_tokens != rejected_tokens_before ||
+                rejected_count != std::numeric_limits<size_t>::max()) {
+            LOG_ERR("%s: %s sequence state file changed token outputs\n", __func__, fault);
+            return false;
+        }
+        return true;
+    };
+
+    const std::vector<size_t> truncation_offsets = {
+        0,
+        2*sizeof(uint32_t) - 1,
+        SEQ_FILE_HEADER_SIZE - 1,
+        file_bytes.size()/2,
+        file_bytes.size() - 1,
+    };
+    for (size_t offset : truncation_offsets) {
+        std::vector<uint8_t> truncated(file_bytes.begin(), file_bytes.begin() + offset);
+        if (!expect_rejected_unchanged(truncated, "truncated")) {
+            return false;
+        }
+    }
+
+    const size_t state_offset =
+            SEQ_FILE_HEADER_SIZE + sizeof(uint32_t) + n_tokens*sizeof(llama_token);
+    if (state_offset >= file_bytes.size()) {
+        LOG_ERR("%s: saved sequence state has no raw state payload\n", __func__);
+        return false;
+    }
+    std::vector<uint8_t> flipped = file_bytes;
+    flipped[state_offset + (flipped.size() - state_offset)/2] ^= 0x80;
+    if (!expect_rejected_unchanged(flipped, "bit-flipped")) {
+        return false;
+    }
+
+    std::vector<uint8_t> old_version = file_bytes;
+    const uint32_t version_v2 = 2;
+    memcpy(old_version.data() + sizeof(uint32_t), &version_v2, sizeof(version_v2));
+    if (!expect_rejected_unchanged(old_version, "v2")) {
+        return false;
+    }
+
+    std::vector<uint8_t> foreign_magic = file_bytes;
+    const uint32_t bad_magic = 0;
+    memcpy(foreign_magic.data(), &bad_magic, sizeof(bad_magic));
+    if (!expect_rejected_unchanged(foreign_magic, "foreign-magic")) {
+        return false;
+    }
+
+    std::remove(seq_path.c_str());
+    std::remove(bad_path.c_str());
+    LOG("PASS\n");
+    return true;
+}
+
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -431,6 +624,11 @@ int main(int argc, char ** argv) {
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return 1;
+    }
+
+    // Test 6: checksummed sequence file envelope and staged loading
+    if (!test_seq_file_integrity(model, params, tokens)) {
         return 1;
     }
 
