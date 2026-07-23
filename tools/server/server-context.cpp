@@ -1857,6 +1857,19 @@ private:
             }
         }
 
+        // cache_reuse splices the ATTENTION KV to close the gap left by a mid-prompt edit, but the
+        // recurrent state is a running frontier the splice does not correct: afterwards it still
+        // encodes the pre-splice token sequence, and the position-only checkpoint selector would
+        // pair that stale recurrent state with the spliced attention timeline -> silent wrong state
+        // [I12/N2]. llama_memory_can_shift() above reports only the ATTENTION child's capability for
+        // hybrid models (recurrent get_can_shift() returns true unconditionally), so the gate does
+        // not catch this. Disable cache_reuse for any recurrent/hybrid model.
+        if (params_base.n_cache_reuse &&
+            (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+            params_base.n_cache_reuse = 0;
+            SRV_WRN("%s\n", "cache_reuse is not supported by recurrent/hybrid models (the recurrent state cannot be spliced), it will be disabled");
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
