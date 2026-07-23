@@ -2091,14 +2091,16 @@ private:
                 SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
             }
             // Context checkpoints (PARTIAL_ONLY):
-            //   hybrid models  — routed to the recurrent state only (attention KV skipped, see
-            //     llama_memory_hybrid::state_write): tier-agnostic and load-bearing for prompt
-            //     rewind, so they stay ENABLED;
-            //   iSWA models    — llama_kv_cache_iswa::state_write DOES serialize the SWA
-            //     attention KV under PARTIAL_ONLY; once a tier flips every restore would fail
-            //     (clean fallback, but the checkpoints are dead weight) — disable them.
+            //   ordinary hybrid (swa_type == NONE, n_swa == 0) — routed to the recurrent state only
+            //     (attention KV skipped, see llama_memory_hybrid::state_write): tier-agnostic and
+            //     load-bearing for prompt rewind, so they stay ENABLED (the n_swa > 0 gate is false);
+            //   ANY SWA model (n_swa > 0), INCLUDING hybrid+iSWA — the SWA attention KV IS serialized
+            //     under PARTIAL_ONLY (llama_kv_cache_iswa::state_write, reached for pure iSWA and, via
+            //     llama_memory_hybrid_iswa, for hybrid+iSWA too), so once a tier flips every restore
+            //     would fail: disable them. The previous `!is_hybrid` term wrongly exempted the
+            //     hybrid+iSWA case, whose checkpoints carry tier-sensitive attention bytes. [I8]
             if (params_base.n_ctx_checkpoints > 0 &&
-                llama_model_n_swa(model_tgt) > 0 && !llama_model_is_hybrid(model_tgt)) {
+                llama_model_n_swa(model_tgt) > 0) {
                 params_base.n_ctx_checkpoints = 0;
                 SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR on SWA models (the SWA attention KV is part of the checkpoint), they will be disabled");
             }
@@ -4420,9 +4422,14 @@ private:
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // for hybrid/recurrent models (DeltaNet, Mamba), pos_min always equals
                                             // the full sequence length, so the SWA-based pos_min check always fails.
-                                            // use pos_max <= pos_next instead to find the most recent valid checkpoint.
+                                            // use pos_max < pos_next to find the most recent valid checkpoint whose
+                                            // frontier is at or before the divergence point [I11/N1]: pos_max == pos_next
+                                            // (frontier == pos_next+1) would include the first divergent token, so restoring
+                                            // it and trimming to pos_next demands a 1-token recurrent rollback of a
+                                            // just-restored state (valid depth 0 -> rejected). Strictly earlier frontiers
+                                            // replay forward with no rollback.
                                             if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
-                                                return cur.pos_max <= pos_next;
+                                                return cur.pos_max < pos_next;
                                             }
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
