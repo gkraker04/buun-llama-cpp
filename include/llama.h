@@ -780,6 +780,18 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Same as llama_memory_seq_cp, but returns false if the copy could not be performed [I13]
+    // (e.g. a recurrent pool has no free cell). On failure the destination is left unchanged for a
+    // single memory, or cleared for a composite (hybrid) memory so it is never a half-copy. Callers
+    // that depend on the copy (speculative backup, sequence clone) must not treat the destination as
+    // valid when this returns false.
+    LLAMA_API bool llama_memory_try_seq_cp(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

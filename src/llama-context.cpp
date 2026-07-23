@@ -6310,6 +6310,19 @@ void llama_memory_seq_cp(
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_try_seq_cp(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {

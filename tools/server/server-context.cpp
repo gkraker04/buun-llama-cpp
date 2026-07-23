@@ -805,15 +805,21 @@ struct server_slot {
         return res;
     }
 
-    void copy_state_to(server_slot & other) const {
+    // returns false if the state copy could not be performed [I13] (e.g. the recurrent pool has no
+    // free cell for the child) -- the caller must not run the child on empty state
+    bool copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        common_context_seq_rm(ctx_tgt, other.id,     -1, -1);
-        common_context_seq_cp(ctx_tgt, id, other.id, -1, -1);
+        common_context_seq_rm(ctx_tgt, other.id, -1, -1);
+        if (!llama_memory_try_seq_cp(llama_get_memory(ctx_tgt), id, other.id, -1, -1)) {
+            return false;
+        }
 
         if (ctx_dft) {
-            common_context_seq_rm(ctx_dft, other.id,     -1, -1);
-            common_context_seq_cp(ctx_dft, id, other.id, -1, -1);
+            common_context_seq_rm(ctx_dft, other.id, -1, -1);
+            if (!llama_memory_try_seq_cp(llama_get_memory(ctx_dft), id, other.id, -1, -1)) {
+                return false;
+            }
         }
 
         other.n_decoded   = n_decoded;
@@ -827,6 +833,7 @@ struct server_slot {
 
         other.prompt = prompt.clone();
         other.init_sampler();
+        return true;
     }
 
     // returns 0 on success
@@ -4108,9 +4115,19 @@ private:
                             const llama_seq_id seq_backup = slot.id + n_parallel_user;
                             auto * mem = llama_get_memory(ctx_tgt);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                            llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
-                            slot.has_draft_backup = true;
-                            slot.seq_id_backup = seq_backup;
+                            // Arm the rollback backup only if the copy actually succeeded [I13/N4].
+                            // A recurrent-pool exhaustion previously left the backup empty while
+                            // has_draft_backup stayed true, so a later partial accept "restored" the
+                            // empty backup over the live state. On failure, fall back to the
+                            // plane-based bounded rollback (has_draft_backup == false path).
+                            if (llama_memory_try_seq_cp(mem, slot.id, seq_backup, -1, -1)) {
+                                slot.has_draft_backup = true;
+                                slot.seq_id_backup = seq_backup;
+                            } else {
+                                SLT_WRN(slot, "%s\n", "speculative backup copy failed (recurrent pool full); using plane-based rollback");
+                                slot.has_draft_backup = false;
+                                slot.seq_id_backup = -1;
+                            }
                         }
                     }
 
@@ -4953,7 +4970,15 @@ private:
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
-                    slot.copy_state_to(*child);
+                    if (!slot.copy_state_to(*child)) {
+                        // the recurrent pool had no free cell to clone into: fail the child rather
+                        // than run it on empty state [I13/N4]
+                        SLT_ERR(*child, "%s\n", "failed to copy parent state to child (recurrent pool full)");
+                        send_error(*child, "Failed to clone parent state to child slot");
+                        child->release();
+                        child->prompt_clear();
+                        continue;
+                    }
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }
@@ -5257,27 +5282,38 @@ private:
                         const int n_past_before = slot.n_tokens_before_draft;
 
                         llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
-                        llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        if (!llama_memory_try_seq_cp(mem, seq_backup, slot.id, -1, -1)) {
+                            // could not restore the backup into the slot (recurrent pool exhausted):
+                            // the slot is left at n_past_before with the accepted tokens unresolved.
+                            // Reset it coherently rather than continue on inconsistent state [I13].
+                            SLT_ERR(slot, "%s\n", "failed to restore speculative backup; resetting slot");
+                            send_error(slot, "Compute error restoring speculative backup");
+                            slot.release();
+                            slot.prompt_clear();
+                            slot.has_draft_backup = false;
+                            slot.seq_id_backup = -1;
+                        } else {
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
 
-                        const int n_reeval = slot.prompt.n_tokens() - n_past_before;
-                        if (n_reeval > 0) {
-                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                            const auto & toks = slot.prompt.tokens.get_text_tokens();
-                            for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
-                                common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
-                            }
-                            const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
-                            llama_batch_free(batch_reeval);
-                            if (ret_reeval != 0) {
-                                // the backup was restored to n_past_before but slot.prompt.tokens
-                                // already holds the accepted tokens, so a failed re-decode leaves
-                                // memory and bookkeeping desynced. Abort this slot and reset it
-                                // coherently rather than generating on inconsistent state [R8/N8].
-                                SLT_ERR(slot, "failed to re-decode accepted tokens after partial accept (ret = %d)\n", ret_reeval);
-                                send_error(slot, "Compute error re-decoding accepted tokens");
-                                slot.release();
-                                slot.prompt_clear();
+                            const int n_reeval = slot.prompt.n_tokens() - n_past_before;
+                            if (n_reeval > 0) {
+                                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                                for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
+                                    common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                                }
+                                const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
+                                llama_batch_free(batch_reeval);
+                                if (ret_reeval != 0) {
+                                    // the backup was restored to n_past_before but slot.prompt.tokens
+                                    // already holds the accepted tokens, so a failed re-decode leaves
+                                    // memory and bookkeeping desynced. Abort this slot and reset it
+                                    // coherently rather than generating on inconsistent state [R8/N8].
+                                    SLT_ERR(slot, "failed to re-decode accepted tokens after partial accept (ret = %d)\n", ret_reeval);
+                                    send_error(slot, "Compute error re-decoding accepted tokens");
+                                    slot.release();
+                                    slot.prompt_clear();
+                                }
                             }
                         }
                     }
