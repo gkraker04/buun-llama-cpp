@@ -271,7 +271,7 @@ struct server_slot {
         // returned the exact declared length BEFORE publishing; a short/zero write (e.g. a dynamic
         // VBR state_write refusal after a degrade) aborts the save without touching the cache,
         // instead of publishing a truncated/empty entry [I10].
-        auto entry = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft);
+        auto entry = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, lora_config_identity(lora));
         if (!entry) {
             return false;
         }
@@ -296,7 +296,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, lora_config_identity(lora));
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }

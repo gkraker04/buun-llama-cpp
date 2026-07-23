@@ -623,6 +623,10 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // canonical identity of the adapter configuration this state was computed under [I6]; a load is
+    // only served from an entry whose key matches the requesting slot's current adapter config
+    std::string adapter_config_key;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -657,10 +661,10 @@ struct server_prompt_cache {
     // bytes; publish() then evicts to make room and inserts the completed entry. A failed fill drops
     // the staged entry and leaves the cache untouched — never a poisoned/half-filled published entry,
     // never an eviction that bought nothing.
-    std::unique_ptr<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    std::unique_ptr<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
     void publish(std::unique_ptr<server_prompt_cache_state> entry);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key);
 
     void update();
 };

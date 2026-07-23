@@ -1672,7 +1672,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
     // first check if the current state is contained fully in the cache
     for (const auto & st : states) {
         const int lcp_len = st.prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1719,6 +1719,7 @@ std::unique_ptr<server_prompt_cache_state> server_prompt_cache::stage(const serv
 
     entry->prompt.tokens      = prompt.tokens.clone();
     entry->prompt.checkpoints = prompt.checkpoints;
+    entry->adapter_config_key = std::move(adapter_config_key);
 
     return entry;
 }
@@ -1727,8 +1728,6 @@ void server_prompt_cache::publish(std::unique_ptr<server_prompt_cache_state> ent
     if (!entry) {
         return;
     }
-
-    const size_t state_size_new = entry->size();
 
     // remove any cached prompts that are fully contained in the new (larger) prompt
     for (auto it = states.begin(); it != states.end();) {
@@ -1743,20 +1742,16 @@ void server_prompt_cache::publish(std::unique_ptr<server_prompt_cache_state> ent
         }
     }
 
-    if (limit_size > 0) {
-        // make room only now that we hold a fully-filled, validated entry
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
-    }
-
     states.push_back(std::move(*entry));
+
+    // enforce the cache limits through the single canonical eviction primitive: the entry's bytes
+    // are already committed (stage() allocated them), so a local make-room loop would prevent no
+    // memory spike and, being size-only, would skip the token limit. update() enforces both limits
+    // and evicts oldest-first, leaving the just-added entry in place.
+    update();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1773,6 +1768,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // were present -> pos_min == -1 with n_past > 0 abort. The transactional save/load here
         // never produces an empty-main entry, but guard the selector so a stray one is inert.
         if (it->data.main.empty()) {
+            continue;
+        }
+
+        // never serve state built under a different adapter configuration [I6]: token-LCP alone
+        // would hand adapter A's KV to a base/adapter-B request. Live-slot rebinds are caught at
+        // launch, but a host-cache entry is restored here during prefill, after that check.
+        if (it->adapter_config_key != adapter_config_key) {
             continue;
         }
 
