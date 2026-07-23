@@ -1234,6 +1234,14 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // VBR representation epochs at capture time [I9]. A recurrent-only checkpoint restores exact
+    // recurrent state, but the attention KV it is paired with on restore degrades/relocates in place
+    // under dynamic VBR. If the representation changed since capture (epoch bumped by a transcode,
+    // cell-reuse, reset or import), the checkpoint is stale and must not be restored (fail closed).
+    // Both are 0 when VBR is inactive, making the restore-time check a no-op.
+    uint64_t representation_epoch     = 0;
+    uint64_t representation_epoch_swa = 0;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
     std::vector<uint8_t> ring_data; // fork: DFlash ring buffer state

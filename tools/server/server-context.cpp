@@ -4426,6 +4426,12 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // [I9] current VBR representation epoch(s); a recurrent-only checkpoint
+                                    // captured against a different epoch is stale (its attention KV moved
+                                    // tier / cells were reused / the controller was reset). All-zero when
+                                    // VBR is inactive, so this rejects nothing then.
+                                    const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4442,6 +4448,14 @@ private:
                                             // just-restored state (valid depth 0 -> rejected). Strictly earlier frontiers
                                             // replay forward with no rollback.
                                             if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+                                                // [I9] fail closed on a changed attention representation: pairing the
+                                                // exact recurrent state with a moved/reused attention KV is not the
+                                                // captured state. Conservative (rejects tier-only changes too); P0
+                                                // fails closed, a later phase may admit a validated live_rebased.
+                                                if (cur.representation_epoch     != vbr_now.representation_epoch ||
+                                                    cur.representation_epoch_swa != vbr_now.representation_epoch_swa) {
+                                                    return false;
+                                                }
                                                 return cur.pos_max < pos_next;
                                             }
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -4789,6 +4803,16 @@ private:
                         cur.pos_max  = pos_max;
                         cur.n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
                         cur.data_tgt.resize(checkpoint_size);
+
+                        // [I9] stamp the attention KV's VBR representation epoch(s) this recurrent
+                        // state was captured against; a change by restore time means the paired
+                        // attention representation moved and the checkpoint is stale (all-zero when
+                        // VBR is inactive).
+                        {
+                            const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+                            cur.representation_epoch     = vbr_now.representation_epoch;
+                            cur.representation_epoch_swa = vbr_now.representation_epoch_swa;
+                        }
 
                         llama_state_seq_get_data_ext(ctx_tgt, cur.data_tgt.data(), checkpoint_size, slot.id,
                                                      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
