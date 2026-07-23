@@ -6265,6 +6265,10 @@ void llama_memory_breathe(llama_memory_t mem) {
     mem->breathe();
 }
 
+bool llama_memory_can_seq_rm_partial(llama_memory_t mem) {
+    return mem && mem->can_seq_rm_partial();
+}
+
 void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
     llama_vram_plan_hint_set(device_id, bytes);
 }

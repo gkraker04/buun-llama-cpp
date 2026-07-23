@@ -112,6 +112,8 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    // Compressed caches support only state-dependent suffix removals, not arbitrary ranges.
+    bool can_seq_rm_partial() const override { return false; }
 
     // no VBR params are threaded to the children today, so this is a no-op — kept for
     // coverage symmetry should that ever change

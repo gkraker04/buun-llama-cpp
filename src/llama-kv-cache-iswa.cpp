@@ -49,7 +49,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    const llama_memory_vbr_params & vbr) : unified(unified) {
+    const llama_memory_vbr_params & vbr) : swa_full(swa_full), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {

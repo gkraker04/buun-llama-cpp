@@ -66,6 +66,8 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    // A bounded SWA cache does not retain enough history for arbitrary partial removal.
+    bool can_seq_rm_partial() const override { return swa_full; }
 
     double kv_bpv() const override; // value-weighted combination of the base and SWA caches
 
@@ -122,6 +124,7 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    const bool swa_full;
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;

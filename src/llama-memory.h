@@ -135,6 +135,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether arbitrary token ranges can be removed without discarding the whole sequence
+    // default to the conservative answer for out-of-tree memory implementations
+    virtual bool can_seq_rm_partial() const { return false; }
+
     // effective bits/value of the attention KV storage, aggregated over all KV tensors at
     // their CURRENT types (dynamic VBR tier flips move this at runtime; f16 = 16, q8_0 = 8.5,
     // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
