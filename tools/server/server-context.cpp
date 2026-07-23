@@ -284,44 +284,53 @@ struct server_slot {
             return prompt_save_result::failed;
         }
 
-        const std::string adapter_key = lora_config_identity(lora);
+        // Everything below allocates (identity key, staged node, token/checkpoint clones). Any OOM
+        // must degrade the save to `failed` (the caller keeps the live slot) rather than escape and
+        // abort the server. stage() is already allocation-neutral internally; this catch also covers
+        // the identity-string construction and the by-value key hand-off.
+        try {
+            const std::string adapter_key = lora_config_identity(lora);
 
-        // already fully cached under this identity: the state is durable, nothing to do
-        if (prompt_cache.contains(prompt.tokens, adapter_key)) {
-            return prompt_save_result::already_durable;
-        }
+            // already fully cached under this identity: the state is durable, nothing to do
+            if (prompt_cache.contains(prompt.tokens, adapter_key)) {
+                return prompt_save_result::already_durable;
+            }
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+            const size_t cur_size = cur_size_tgt + cur_size_dft;
+            SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                    (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        // stage -> fill -> validate -> publish [I7]. Fill the staged node and verify the writer
-        // returned the exact declared length BEFORE publishing; a short write (e.g. a dynamic VBR
-        // state_write refusal after a degrade) aborts the save without touching the cache, instead
-        // of publishing a truncated entry [I10]. On any failure the state is NOT durable.
-        auto staged = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, adapter_key);
-        if (staged.empty()) {
-            return prompt_save_result::failed;
-        }
-        auto & entry = staged.front();
-
-        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (n_tgt != cur_size_tgt) {
-            SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
-            return prompt_save_result::failed;
-        }
-
-        if (ctx_dft) {
-            const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry.data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (n_dft != cur_size_dft) {
-                SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
+            // stage -> fill -> validate -> publish [I7]. Fill the staged node and verify the writer
+            // returned the exact declared length BEFORE publishing; a short write (e.g. a dynamic VBR
+            // state_write refusal after a degrade) aborts the save without touching the cache,
+            // instead of publishing a truncated entry [I10]. On any failure the state is NOT durable.
+            auto staged = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, adapter_key);
+            if (staged.empty()) {
                 return prompt_save_result::failed;
             }
+            auto & entry = staged.front();
+
+            const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_tgt != cur_size_tgt) {
+                SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
+                return prompt_save_result::failed;
+            }
+
+            if (ctx_dft) {
+                const size_t n_dft = llama_state_seq_get_data_ext(ctx_dft, entry.data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n_dft != cur_size_dft) {
+                    SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
+                    return prompt_save_result::failed;
+                }
+            }
+
+            prompt_cache.publish(std::move(staged));
+
+            return prompt_save_result::published;
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(*this, "%s", "prompt cache save aborted: out of memory\n");
+            return prompt_save_result::failed;
         }
-
-        prompt_cache.publish(std::move(staged));
-
-        return prompt_save_result::published;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key) {
