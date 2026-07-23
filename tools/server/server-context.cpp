@@ -389,6 +389,11 @@ struct server_slot {
     llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
+    // [obs] human-readable reason for how the last prompt's prefix was (or wasn't) reused, surfaced
+    // in GET /slots so a user can see WHY a request cold-processed instead of guessing. Set at the
+    // prompt-reuse decision points; greppable by tests (e.g. the I9 VBR-reject reason).
+    std::string cache_status;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -787,6 +792,9 @@ struct server_slot {
             res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
             res["n_prompt_tokens_processed"] = n_prompt_tokens_processed;
             res["n_prompt_tokens_cache"]     = n_prompt_tokens_cache;
+            if (!cache_status.empty()) {
+                res["cache_status"] = cache_status; // [obs] why the last prompt (partially) reprocessed
+            }
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = {
                 {
@@ -4416,6 +4424,10 @@ private:
                                     // VBR is inactive, so this rejects nothing then.
                                     const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
 
+                                    // [obs] count checkpoints rejected specifically for a changed VBR
+                                    // representation, to explain a resulting cold reprocess in /slots
+                                    int n_ckpt_rejected_vbr = 0;
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4438,6 +4450,7 @@ private:
                                                 // fails closed, a later phase may admit a validated live_rebased.
                                                 if (cur.representation_epoch     != vbr_now.representation_epoch ||
                                                     cur.representation_epoch_swa != vbr_now.representation_epoch_swa) {
+                                                    n_ckpt_rejected_vbr++;
                                                     return false;
                                                 }
                                                 return cur.pos_max < pos_next;
@@ -4477,12 +4490,18 @@ private:
                                             }
 
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                            slot.cache_status = "restored context checkpoint";
                                         }
                                     }
 
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        // [obs] explain the cold reprocess: a checkpoint rejected for a
+                                        // changed VBR representation [I9] is the common surprising cause
+                                        slot.cache_status = n_ckpt_rejected_vbr > 0
+                                            ? "full reprocess: checkpoint(s) rejected -- VBR representation changed [I9]"
+                                            : "full reprocess: no reusable context checkpoint";
                                         pos_next = 0;
                                         n_past = 0;
                                     }
