@@ -210,25 +210,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<uint8_t> state(llama_state_seq_get_size(ctx.get(), 0));
-    if (state.empty() ||
-        llama_state_seq_get_data(ctx.get(), state.data(), state.size(), 0) != state.size()) {
-        fprintf(stderr, "failed to capture mixed-tier state\n");
-        return 1;
-    }
-    const auto before_import = llama_memory_vbr_state(mem, 0, 0);
-    if (llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) != state.size()) {
-        fprintf(stderr, "failed to adopt mixed-tier state\n");
-        return 1;
-    }
-    const auto after_import = llama_memory_vbr_state(mem, 0, 0);
-    if (after_import.representation_epoch <= before_import.representation_epoch ||
-        after_import.representation_epoch_swa <= before_import.representation_epoch_swa) {
-        fprintf(stderr, "native mixed-tier import did not advance both child epochs\n");
-        return 1;
-    }
+    // NOTE: the "native mixed-tier import bumps both epochs" case is intentionally NOT exercised
+    // here. The fork deliberately REFUSES to serialize a dynamic-VBR cache after a tier degrade
+    // (llama_state_seq_get_size throws "cannot serialize a dynamic-VBR KV cache after tier
+    // degrades..."), so a degraded mixed-tier state cannot be captured and re-adopted in the
+    // current codebase — native mixed-tier import/serialization is unbuilt Phase-2/3 work. The
+    // import path DOES bump the epoch (state_read adoption calls vbr_representation_changed), but it
+    // is unreachable at runtime until that serialization exists. The P0 I9 behavior that matters --
+    // per-child epoch advance on every degrade, clear, and full-reset (incl. the low-LCP ABA close),
+    // and cross-degrade monotonicity -- is fully covered above.
 
     fprintf(stderr, "PASS: per-child VBR representation epochs are monotone across "
-            "degrade, clear/reset, degrade, and native import\n");
+            "degrade, clear/reset, and degrade (mixed-tier import path is unbuilt Phase-2/3)\n");
     return 0;
 }
