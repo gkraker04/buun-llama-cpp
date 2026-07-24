@@ -4528,6 +4528,12 @@ private:
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            // A capture is durable only after its target payload is
+                                            // complete. Old/foreign half-filled entries must never
+                                            // reach the mutating restore path.
+                                            if (cur.empty()) {
+                                                return false;
+                                            }
                                             // for hybrid/recurrent models (DeltaNet, Mamba), pos_min always equals
                                             // the full sequence length, so the SWA-based pos_min check always fails.
                                             // use pos_max < pos_next to find the most recent valid checkpoint whose
@@ -4594,12 +4600,32 @@ private:
                                                 n_past_keep = std::min(n_past_keep, (size_t) it->n_tokens);
                                             }
 
-                                            if (slot.can_speculate() && !it->ring_data.empty()) {
-                                                common_speculative_ring_state_load(slot.get_spec(), it->ring_data.data(), it->ring_data.size());
+                                            bool checkpoint_aux_ok = true;
+                                            if (slot.can_speculate() && !it->ring_data.empty() &&
+                                                !common_speculative_ring_state_load(
+                                                    slot.get_spec(), it->ring_data.data(), it->ring_data.size())) {
+                                                SLT_ERR(slot,
+                                                        "failed to restore checkpoint DFlash ring state "
+                                                        "(n_tokens = %" PRId64 ", ring size = %zu) -- failing closed\n",
+                                                        it->n_tokens, it->ring_data.size());
+                                                checkpoint_aux_ok = false;
                                             }
 
-                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
-                                            slot.cache_status = "restored context checkpoint";
+                                            if (!checkpoint_aux_ok) {
+                                                do_reset = true;
+                                            } else {
+                                                // [WS-1 / #25592] The checkpoint that successfully
+                                                // restored this task is now part of this task's active
+                                                // lineage. Adopt it here, unconditionally, rather than
+                                                // relying on a later create-time dedup: ordinary
+                                                // mid-prompt batches suppress checkpoint creation, and
+                                                // the next min-step thinning pass could otherwise erase
+                                                // the exact anchor we just restored.
+                                                it->id_task = slot.task->id;
+
+                                                SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                                slot.cache_status = "restored context checkpoint";
+                                            }
                                         }
                                     }
 
@@ -4928,6 +4954,9 @@ private:
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
 
+                    const bool checkpoint_exact_frontier =
+                        llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+
                     // [WS-1 / #25592 frontier validity] A hybrid/recurrent checkpoint captures a
                     // point-in-time state valid ONLY at its exact frontier -- never a [pos_min, pos_max]
                     // range. If seq_pos_min and seq_pos_max disagree (a hybrid whose attention and
@@ -4937,8 +4966,7 @@ private:
                     // existing good checkpoints (do NOT evict for one we won't create). In a coherent
                     // recurrent/hybrid cache equality holds (one recurrent frontier row) so this should
                     // never fire; if it does, it is a real memory-frontier bug worth the loud warning.
-                    if (do_checkpoint && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) &&
-                        pos_min != pos_max) {
+                    if (do_checkpoint && checkpoint_exact_frontier && pos_min != pos_max) {
                         SLT_WRN(slot, "[frontier-validity] skipping context checkpoint: recurrent/hybrid seq_pos_min (%d) != seq_pos_max (%d) -- range invalid for a point-in-time state\n",
                                 pos_min, pos_max);
                         do_checkpoint = false;
@@ -4948,18 +4976,86 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     const int ckpt_id_task = slot.task->id;
+                    const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+                    const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
+                    llama_memory_vbr_state_data vbr_now = {};
+                    if (do_checkpoint) {
+                        vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+                    }
 
                     // [WS-1 / #25592] dedup: an equivalent checkpoint already exists (e.g. one just
-                    // restored, or an unchanged frontier) -- same logical length AND same physical
-                    // frontier position. Don't pay a second state_get; adopt it (refresh id_task so the
-                    // min-step thinning below treats it as current) and skip creation.
-                    if (do_checkpoint && !slot.prompt.checkpoints.empty() &&
-                        slot.prompt.checkpoints.back().n_tokens == slot.prompt.n_tokens() - n_tokens_cur &&
-                        slot.prompt.checkpoints.back().pos_max  == pos_max) {
-                        slot.prompt.checkpoints.back().id_task = ckpt_id_task;
-                        SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_max = %d -- adopting\n",
-                                slot.prompt.n_tokens() - n_tokens_cur, pos_max);
-                        do_checkpoint = false;
+                    // restored, or an unchanged frontier). Length + pos_max alone are NOT an
+                    // identity: SWA may have a different pos_min, and VBR can change the paired
+                    // attention representation without moving the logical frontier. Only adopt a
+                    // complete snapshot whose full validity and representation key match.
+                    if (do_checkpoint && !slot.prompt.checkpoints.empty()) {
+                        auto & last = slot.prompt.checkpoints.back();
+                        if (!last.empty() &&
+                            last.n_tokens                == ckpt_n_tokens &&
+                            last.pos_min                 == ckpt_pos_min &&
+                            last.pos_max                 == pos_max &&
+                            last.representation_epoch     == vbr_now.representation_epoch &&
+                            last.representation_epoch_swa == vbr_now.representation_epoch_swa) {
+                            last.id_task = ckpt_id_task;
+                            SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, VBR epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
+                                    ckpt_n_tokens, ckpt_pos_min, pos_max,
+                                    vbr_now.representation_epoch, vbr_now.representation_epoch_swa);
+                            do_checkpoint = false;
+                        }
+                    }
+
+                    std::list<common_prompt_checkpoint> staged;
+                    if (do_checkpoint) {
+                        // Stage the complete checkpoint in a detached list node before evicting
+                        // anything. Allocation failure or a short state write must retain every good
+                        // published checkpoint and must never leave a half-filled entry selectable.
+                        try {
+                            staged.emplace_back(); // allocate the eventual list node before mutation
+                            auto & next = staged.back();
+
+                            next.id_task  = ckpt_id_task;
+                            next.pos_min  = ckpt_pos_min;
+                            next.pos_max  = pos_max;
+                            next.n_tokens = ckpt_n_tokens;
+                            next.representation_epoch     = vbr_now.representation_epoch;
+                            next.representation_epoch_swa = vbr_now.representation_epoch_swa;
+
+                            const size_t checkpoint_size =
+                                llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (checkpoint_size == 0) {
+                                SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
+                                staged.clear();
+                            } else {
+                                next.data_tgt.resize(checkpoint_size);
+                                const size_t n = llama_state_seq_get_data_ext(
+                                    ctx_tgt, next.data_tgt.data(), checkpoint_size, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                if (n != checkpoint_size) {
+                                    SLT_ERR(slot,
+                                            "skipping context checkpoint: target state short write (expected %zu, got %zu)\n",
+                                            checkpoint_size, n);
+                                    staged.clear();
+                                }
+                            }
+
+                            // Allocate the optional DFlash ring while still detached, then fill it.
+                            // Its save routine is exact-size and non-consuming.
+                            if (!staged.empty() && slot.can_speculate()) {
+                                const size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
+                                if (ring_size > 0) {
+                                    next.ring_data.resize(ring_size);
+                                    common_speculative_ring_state_save(
+                                        slot.get_spec(), next.ring_data.data(), ring_size);
+                                }
+                            }
+                        } catch (const std::exception & e) {
+                            SLT_ERR(slot, "skipping context checkpoint: staging failed: %s\n", e.what());
+                            staged.clear();
+                        }
+
+                        if (staged.empty()) {
+                            do_checkpoint = false;
+                        }
                     }
 
                     if (do_checkpoint) {
@@ -4995,46 +5091,8 @@ private:
                             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
                         }
 
-                        const size_t checkpoint_size =
-                            llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                        auto & cur = slot.prompt.checkpoints.emplace_back();
-                        cur.id_task  = ckpt_id_task; // [WS-1 / #25592] protects this checkpoint from min-step thinning by its own task
-                        cur.pos_min  = pos_min;
-                        cur.pos_max  = pos_max;
-                        // [WS-1 / #25592, TAG_CHECKPOINTS_FIX_POS_MIN] Record the exact validity: a
-                        // hybrid/recurrent checkpoint is valid ONLY at its frontier. A frontier
-                        // disagreement (pos_min != pos_max) already failed the capture closed above, so
-                        // here pos_min == pos_max -- collapse it explicitly (correctness-by-construction,
-                        // not reliant on the seq_pos_min quirk). NOTE the restore at :4578 reads pos_min,
-                        // so this recorded value is load-bearing, not cosmetic.
-                        if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
-                            cur.pos_min = cur.pos_max;
-                        }
-                        cur.n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
-                        cur.data_tgt.resize(checkpoint_size);
-
-                        // [I9] stamp the attention KV's VBR representation epoch(s) this recurrent
-                        // state was captured against; a change by restore time means the paired
-                        // attention representation moved and the checkpoint is stale (all-zero when
-                        // VBR is inactive).
-                        {
-                            const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
-                            cur.representation_epoch     = vbr_now.representation_epoch;
-                            cur.representation_epoch_swa = vbr_now.representation_epoch_swa;
-                        }
-
-                        llama_state_seq_get_data_ext(ctx_tgt, cur.data_tgt.data(), checkpoint_size, slot.id,
-                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                        // save DFlash ring buffer alongside the recurrent state checkpoint
-                        if (slot.can_speculate()) {
-                            size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
-                            if (ring_size > 0) {
-                                cur.ring_data.resize(ring_size);
-                                common_speculative_ring_state_save(slot.get_spec(), cur.ring_data.data(), ring_size);
-                            }
-                        }
+                        slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), staged);
+                        const auto & cur = slot.prompt.checkpoints.back();
 
                         SLT_WRN(slot,
                                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
