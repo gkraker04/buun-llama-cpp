@@ -4931,9 +4931,44 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
+                    const int ckpt_id_task = slot.task->id;
+
+                    // [WS-1 / #25592] dedup: an equivalent checkpoint already exists (e.g. one just
+                    // restored, or an unchanged frontier) -- same logical length AND same physical
+                    // frontier position. Don't pay a second state_get; adopt it (refresh id_task so the
+                    // min-step thinning below treats it as current) and skip creation.
+                    if (do_checkpoint && !slot.prompt.checkpoints.empty() &&
+                        slot.prompt.checkpoints.back().n_tokens == slot.prompt.n_tokens() - n_tokens_cur &&
+                        slot.prompt.checkpoints.back().pos_max  == pos_max) {
+                        slot.prompt.checkpoints.back().id_task = ckpt_id_task;
+                        SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_max = %d -- adopting\n",
+                                slot.prompt.n_tokens() - n_tokens_cur, pos_max);
+                        do_checkpoint = false;
+                    }
+
                     if (do_checkpoint) {
+                        // [WS-1 / #25592] eviction: first THIN checkpoints that sit within
+                        // checkpoint_min_step of the previous KEPT one (redundantly close), never
+                        // evicting the current task's own -- this keeps early anchors alive across
+                        // edited/compacted agentic histories instead of FIFO-dropping the oldest.
+                        {
+                            int64_t last = -1;
+                            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                                if (it->id_task != ckpt_id_task && last >= 0 &&
+                                    it->n_tokens <= last + params_base.checkpoint_min_step) {
+                                    SLT_TRC(slot,
+                                            "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
+                                            it->pos_min, it->pos_max, it->n_tokens);
+                                    it = slot.prompt.checkpoints.erase(it);
+                                    continue;
+                                }
+                                last = it->n_tokens;
+                                ++it;
+                            }
+                        }
+
                         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-                            // make room for the new checkpoint, if needed
+                            // make room for the new checkpoint, if needed (FIFO fallback after thinning)
                             const auto & cur = slot.prompt.checkpoints.front();
 
                             SLT_WRN(slot,
@@ -4948,6 +4983,7 @@ private:
                             llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         auto & cur = slot.prompt.checkpoints.emplace_back();
+                        cur.id_task  = ckpt_id_task; // [WS-1 / #25592] protects this checkpoint from min-step thinning by its own task
                         cur.pos_min  = pos_min;
                         cur.pos_max  = pos_max;
                         // [WS-1 / #25592 frontier validity, TAG_CHECKPOINTS_FIX_POS_MIN] A
