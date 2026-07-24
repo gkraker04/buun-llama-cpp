@@ -91,6 +91,65 @@ struct dflash_tape_gpu {
     }
 };
 
+// WS-2 Gate-3 prototype: one minimal-F32 record per physical ring slot.
+// Payload tensors are layer-major; this metadata supplies the logical identity
+// that a circular index alone cannot.
+struct dflash_window_record {
+    llama_pos pos = -1;
+    llama_seq_id seq_id = -1;
+    bool valid = false;
+};
+
+struct dflash_window_layer {
+    ggml_tensor * qkv  = nullptr; // [conv_channels, capacity]
+    ggml_tensor * gate = nullptr; // [H_v, capacity], pre-exp
+    ggml_tensor * beta = nullptr; // [H_v, capacity], pre-sigmoid
+    ggml_tensor * r[2] = {};      // two complete conv boundary copies
+    ggml_tensor * s[2] = {};      // two complete GDN boundary copies
+};
+
+struct dflash_window {
+    bool enabled = false;
+    llama_seq_id seq_id = -1;
+    int capacity = 0;
+    int head = 0;
+    int count = 0;
+    llama_pos boundary_pos = -1;
+    llama_pos frontier_pos = -1;
+    int published_idx = 0;
+
+    // A failed append retains the just-decoded token in the fixed tape staging
+    // buffers and blocks the next decode until retry succeeds.
+    bool capture_pending = false;
+    llama_pos pending_pos = -1;
+    llama_seq_id pending_seq_id = -1;
+
+    // One-shot fault point: after private GPU state is complete and fenced, but
+    // before published_idx / boundary_pos / head / count commit.
+    bool fail_publish_once = false;
+    bool last_publish_failed = false;
+
+    // Last non-published reconstruction target, for the Gate-3 oracle.
+    int reconstructed_idx = -1;
+    llama_pos reconstructed_pos = -1;
+
+    std::vector<dflash_window_record> records;
+    std::vector<dflash_window_layer> layers;
+    std::vector<int32_t> layer_ids;
+    std::vector<int> gpu_layer_indices;
+
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t scratch = nullptr;
+    size_t scratch_size = 0;
+
+    ~dflash_window() {
+        if (scratch) ggml_backend_buffer_free(scratch);
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
 enum dflash_tape_type {
     DFLASH_TAPE_K    = 0,
     DFLASH_TAPE_V    = 1,
@@ -124,6 +183,7 @@ struct dflash_capture_data {
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
+    std::unique_ptr<dflash_window> window;           // Gate-3 rolling-window prototype
 
     // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
     // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
@@ -624,6 +684,11 @@ public:
 
     void set_tape_recording(bool enable);
     void set_tape_minimal_replay(bool enable);
+    bool dflash_window_enable(llama_seq_id seq_id, int capacity);
+    bool dflash_window_capture_last(llama_seq_id seq_id, llama_pos pos);
+    bool dflash_window_retry_capture();
+    bool dflash_window_reconstruct(llama_pos pos);
+    void dflash_window_inject_publish_failure();
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,

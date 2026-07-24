@@ -1923,6 +1923,506 @@ static void dflash_build_gdn_state_update(
     ggml_build_forward_expand(graph, ggml_cpy(ctx, result_state, s_write));
 }
 
+static ggml_backend_dev_t dflash_tensor_device(const ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) {
+        return nullptr;
+    }
+    auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
+    return buft ? ggml_backend_buft_get_device(buft) : nullptr;
+}
+
+static bool dflash_window_copy_boundary(
+        llama_context * ctx,
+        int             src_idx,
+        int             dst_idx) {
+    auto & window = *ctx->dflash_capture->window;
+    if (src_idx == dst_idx) {
+        return true;
+    }
+
+    for (auto & layer : window.layers) {
+        ggml_backend_tensor_copy(layer.r[src_idx], layer.r[dst_idx]);
+        ggml_backend_tensor_copy(layer.s[src_idx], layer.s[dst_idx]);
+    }
+    ggml_backend_synchronize(ctx->find_gpu_backend());
+    return true;
+}
+
+// Apply one minimal-F32 ring record to one non-published boundary copy. The graph is
+// the Gate-2 reconstruction path specialized to one normal-decode token, plus the
+// conv-window shift written into the same private copy.
+static bool dflash_window_apply_record(
+        llama_context * ctx,
+        int             record_slot,
+        int             dst_idx) {
+    auto & cap = *ctx->dflash_capture;
+    auto & window = *cap.window;
+    const auto & hparams = ctx->get_model().hparams;
+    const int n_rec = (int) window.layer_ids.size();
+    ggml_backend_t gpu_backend = ctx->find_gpu_backend();
+    if (!gpu_backend || record_slot < 0 || record_slot >= window.capacity ||
+        dst_idx < 0 || dst_idx > 1) {
+        return false;
+    }
+
+    // Gate-2 budgets 36 tensors / 32 nodes per layer for this same
+    // reconstruction+GDN tail. Allow the additional conv-state shift/copy and
+    // some descriptor headroom so an undersized no-alloc context cannot abort.
+    const size_t tensors_per_layer = 44;
+    const size_t nodes_per_layer = 40;
+    const size_t ctx_mem =
+        ggml_tensor_overhead() * ((size_t) n_rec * tensors_per_layer + 8) +
+        ggml_graph_overhead_custom((size_t) n_rec * nodes_per_layer, false);
+    ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+    ggml_context * graph_ctx = ggml_init(ctx_params);
+    if (!graph_ctx) {
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(
+        graph_ctx, (size_t) n_rec * nodes_per_layer, false);
+
+    for (int li = 0; li < n_rec; ++li) {
+        const int il = window.layer_ids[li];
+        auto & layer = window.layers[li];
+        ggml_tensor * conv_kernel = ctx->get_model().layers[il].ssm_conv1d;
+
+        const int64_t S = hparams.ssm_d_state;
+        const int64_t H_k = hparams.ssm_n_group;
+        const int64_t H_v = hparams.ssm_dt_rank;
+        const int64_t conv_channels = layer.qkv->ne[0];
+        const int64_t conv_window = conv_kernel->ne[0] - 1;
+        const int64_t n_embd_r = conv_window * conv_channels;
+
+        ggml_tensor * r_state = layer.r[dst_idx];
+        ggml_tensor * s_state = layer.s[dst_idx];
+        GGML_ASSERT(r_state->ne[0] == n_embd_r);
+        GGML_ASSERT(s_state->ne[0] == S * S * H_v);
+        GGML_ASSERT(conv_channels == 2 * S * H_k + S * H_v);
+
+        ggml_tensor * r_view = ggml_reshape_3d(
+            graph_ctx, r_state, conv_window, conv_channels, (int64_t) 1);
+        ggml_tensor * qkv = ggml_view_2d(
+            graph_ctx, layer.qkv, conv_channels, (int64_t) 1,
+            layer.qkv->nb[1], (size_t) record_slot * layer.qkv->nb[1]);
+        ggml_tensor * conv_input = ggml_concat(
+            graph_ctx, r_view, ggml_transpose(graph_ctx, qkv), 0);
+        ggml_tensor * conv_silu = ggml_silu(
+            graph_ctx, ggml_ssm_conv(graph_ctx, conv_input, conv_kernel));
+
+        const int64_t conv_row = conv_channels * ggml_element_size(conv_silu);
+        ggml_tensor * k = ggml_view_4d(
+            graph_ctx, conv_silu, S, H_k, (int64_t) 1, (int64_t) 1,
+            ggml_row_size(conv_silu->type, S), conv_row, conv_row,
+            S * H_k * ggml_element_size(conv_silu));
+        ggml_tensor * v = ggml_view_4d(
+            graph_ctx, conv_silu, S, H_v, (int64_t) 1, (int64_t) 1,
+            ggml_row_size(conv_silu->type, S), conv_row, conv_row,
+            2 * S * H_k * ggml_element_size(conv_silu));
+        k = ggml_l2_norm(graph_ctx, k, hparams.f_norm_rms_eps);
+
+        ggml_tensor * gate = ggml_view_3d(
+            graph_ctx, layer.gate, (int64_t) 1, H_v, (int64_t) 1,
+            sizeof(float), H_v * sizeof(float),
+            (size_t) record_slot * layer.gate->nb[1]);
+        ggml_tensor * beta = ggml_view_3d(
+            graph_ctx, layer.beta, (int64_t) 1, H_v, (int64_t) 1,
+            sizeof(float), H_v * sizeof(float),
+            (size_t) record_slot * layer.beta->nb[1]);
+        ggml_tensor * q = ggml_scale(graph_ctx, k, 0.0f);
+
+        dflash_build_gdn_state_update(
+            graph_ctx, graph, q, k, v, gate, beta,
+            s_state, 0, S, H_v, 1);
+
+        // Shift the private conv boundary by the same record. conv_input is
+        // [old window | qkv]; dropping its first column yields the new window.
+        ggml_tensor * r_next = ggml_view_3d(
+            graph_ctx, conv_input, conv_window, conv_channels, (int64_t) 1,
+            conv_input->nb[1], conv_input->nb[2], conv_input->nb[0]);
+        ggml_build_forward_expand(
+            graph, ggml_cpy(graph_ctx, r_next, r_state));
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(graph_ctx, buft);
+    if (needed > window.scratch_size) {
+        ggml_backend_buffer_t replacement = ggml_backend_buft_alloc_buffer(buft, needed);
+        if (!replacement) {
+            ggml_free(graph_ctx);
+            return false;
+        }
+        if (window.scratch) {
+            ggml_backend_buffer_free(window.scratch);
+        }
+        window.scratch = replacement;
+        window.scratch_size = ggml_backend_buffer_get_size(replacement);
+    }
+
+    {
+        ggml_tallocr talloc = ggml_tallocr_new(window.scratch);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(graph_ctx);
+             tensor;
+             tensor = ggml_get_next_tensor(graph_ctx, tensor)) {
+            if (tensor->data == nullptr && tensor->view_src == nullptr) {
+                ggml_tallocr_alloc(&talloc, tensor);
+            } else if (tensor->view_src != nullptr && tensor->buffer == nullptr) {
+                ggml_backend_view_init(tensor);
+            }
+        }
+    }
+
+    const ggml_status status = ggml_backend_graph_compute(gpu_backend, graph);
+    ggml_backend_synchronize(gpu_backend);
+    ggml_free(graph_ctx);
+    return status == GGML_STATUS_SUCCESS;
+}
+
+static bool dflash_window_advance_boundary(llama_context * ctx) {
+    auto & window = *ctx->dflash_capture->window;
+    if (window.count <= 0) {
+        return false;
+    }
+
+    const int record_slot = window.head;
+    const auto record = window.records[record_slot];
+    if (!record.valid ||
+        record.seq_id != window.seq_id ||
+        record.pos != window.boundary_pos + 1) {
+        LLAMA_LOG_WARN("%s: non-contiguous or wrong-owner record at slot %d\n",
+            __func__, record_slot);
+        return false;
+    }
+
+    const int private_idx = 1 - window.published_idx;
+    if (!dflash_window_copy_boundary(ctx, window.published_idx, private_idx) ||
+        !dflash_window_apply_record(ctx, record_slot, private_idx)) {
+        return false;
+    }
+
+    // Fault point is deliberately after all private GPU writes are complete and
+    // fenced, but before any published metadata or ring-retirement mutation.
+    if (window.fail_publish_once) {
+        window.fail_publish_once = false;
+        window.last_publish_failed = true;
+        return false;
+    }
+
+    // Single decode-thread logical commit. Readers select one complete boundary
+    // exclusively through published_idx; the previous copy remained untouched
+    // through the fence and index swap.
+    window.published_idx = private_idx;
+    window.boundary_pos = record.pos;
+    window.reconstructed_idx = -1;
+    window.reconstructed_pos = -1;
+
+    // Retire only after publication.
+    window.records[record_slot].valid = false;
+    window.head = (window.head + 1) % window.capacity;
+    window.count--;
+    window.last_publish_failed = false;
+    return true;
+}
+
+bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
+    if (!dflash_capture || !dflash_capture->tape_enabled ||
+        seq_id < 0 || seq_id >= (llama_seq_id) dflash_capture->tapes.size() ||
+        !dflash_capture->tapes[seq_id] || capacity <= 0) {
+        return false;
+    }
+
+    auto * mem_recurrent = get_recurrent_mem(memory.get());
+    ggml_backend_t gpu_backend = find_gpu_backend();
+    if (!mem_recurrent || !gpu_backend ||
+        !dflash_states_on_one_device(model.hparams, mem_recurrent) ||
+        seq_id < 0 || (uint32_t) seq_id >= mem_recurrent->size) {
+        return false;
+    }
+
+    const int32_t tail = mem_recurrent->cells[seq_id].tail;
+    if (tail < 0) {
+        return false;
+    }
+    synchronize();
+
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    const int n_rec = (int) rec_ids.size();
+    const ggml_backend_dev_t gpu_dev = ggml_backend_get_device(gpu_backend);
+    if (n_rec == 0) {
+        return false;
+    }
+
+    auto window = std::make_unique<dflash_window>();
+    window->seq_id = seq_id;
+    window->capacity = capacity;
+    window->records.resize(capacity);
+    window->layers.resize(n_rec);
+    window->layer_ids = rec_ids;
+    window->gpu_layer_indices.resize(n_rec, -1);
+
+    const auto & tape_gpu = *dflash_capture->tapes[seq_id];
+    for (int li = 0; li < n_rec; ++li) {
+        for (int i = 0; i < (int) tape_gpu.layer_ids.size(); ++i) {
+            if (tape_gpu.layer_ids[i] == rec_ids[li]) {
+                window->gpu_layer_indices[li] = i;
+                break;
+            }
+        }
+        if (window->gpu_layer_indices[li] < 0 ||
+            window->gpu_layer_indices[li] >= (int) tape_gpu.layers.size()) {
+            return false;
+        }
+    }
+
+    const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_rec * 7 + 4);
+    ggml_init_params params = { ctx_mem, nullptr, true };
+    window->ctx = ggml_init(params);
+    if (!window->ctx) {
+        return false;
+    }
+
+    for (int li = 0; li < n_rec; ++li) {
+        const int il = rec_ids[li];
+        ggml_tensor * r_live = mem_recurrent->r_l[il];
+        ggml_tensor * s_live = mem_recurrent->s_l[il];
+        ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
+        if (!r_live || !s_live || !conv_kernel ||
+            r_live->type != GGML_TYPE_F32 ||
+            s_live->type != GGML_TYPE_F32 ||
+            conv_kernel->type != GGML_TYPE_F32 ||
+            dflash_tensor_device(r_live) != gpu_dev ||
+            dflash_tensor_device(s_live) != gpu_dev ||
+            dflash_tensor_device(conv_kernel) != gpu_dev ||
+            conv_kernel->ne[0] <= 1 ||
+            hparams.n_embd_r() % (conv_kernel->ne[0] - 1) != 0 ||
+            (int64_t) hparams.n_embd_s() !=
+                hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank) {
+            return false;
+        }
+
+        const int64_t conv_channels =
+            (int64_t) hparams.n_embd_r() / (conv_kernel->ne[0] - 1);
+        const int64_t H_v = hparams.ssm_dt_rank;
+        if (conv_channels !=
+            2 * hparams.ssm_d_state * hparams.ssm_n_group +
+                hparams.ssm_d_state * H_v) {
+            return false;
+        }
+        auto & layer = window->layers[li];
+        layer.qkv = ggml_new_tensor_2d(
+            window->ctx, GGML_TYPE_F32, conv_channels, capacity);
+        layer.gate = ggml_new_tensor_2d(
+            window->ctx, GGML_TYPE_F32, H_v, capacity);
+        layer.beta = ggml_new_tensor_2d(
+            window->ctx, GGML_TYPE_F32, H_v, capacity);
+        for (int copy = 0; copy < 2; ++copy) {
+            layer.r[copy] = ggml_new_tensor_1d(
+                window->ctx, GGML_TYPE_F32, hparams.n_embd_r());
+            layer.s[copy] = ggml_new_tensor_1d(
+                window->ctx, GGML_TYPE_F32, hparams.n_embd_s());
+        }
+        ggml_format_name(layer.qkv, "dflash_window_qkv_l%d", il);
+        ggml_format_name(layer.gate, "dflash_window_gate_l%d", il);
+        ggml_format_name(layer.beta, "dflash_window_beta_l%d", il);
+    }
+
+    window->buf = ggml_backend_alloc_ctx_tensors(window->ctx, gpu_backend);
+    if (!window->buf) {
+        return false;
+    }
+
+    const auto & cell = mem_recurrent->cells[tail];
+    const uint32_t base_row = cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail;
+    const uint32_t row = mem_recurrent->rs_idx[seq_id] * mem_recurrent->size + base_row;
+
+    const size_t copy_ctx_mem =
+        ggml_tensor_overhead() * ((size_t) n_rec * 2 + 2);
+    ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
+    ggml_context * copy_ctx = ggml_init(copy_params);
+    if (!copy_ctx) {
+        return false;
+    }
+    for (int li = 0; li < n_rec; ++li) {
+        const int il = rec_ids[li];
+        ggml_tensor * r_live = mem_recurrent->r_l[il];
+        ggml_tensor * s_live = mem_recurrent->s_l[il];
+        ggml_tensor * r_src = ggml_view_1d(
+            copy_ctx, r_live, r_live->ne[0], (size_t) row * r_live->nb[1]);
+        ggml_tensor * s_src = ggml_view_1d(
+            copy_ctx, s_live, s_live->ne[0], (size_t) row * s_live->nb[1]);
+        r_src->buffer = r_live->buffer;
+        s_src->buffer = s_live->buffer;
+        ggml_backend_tensor_copy(r_src, window->layers[li].r[0]);
+        ggml_backend_tensor_copy(s_src, window->layers[li].s[0]);
+    }
+    ggml_free(copy_ctx);
+    ggml_backend_synchronize(gpu_backend);
+
+    window->boundary_pos = cell.pos;
+    window->frontier_pos = cell.pos;
+    window->published_idx = 0;
+    window->enabled = true;
+    dflash_capture->window = std::move(window);
+    return true;
+}
+
+bool llama_context::dflash_window_capture_last(llama_seq_id seq_id, llama_pos pos) {
+    if (!dflash_capture || !dflash_capture->window ||
+        !dflash_capture->window->enabled) {
+        return false;
+    }
+    auto & window = *dflash_capture->window;
+    if (seq_id != window.seq_id || pos != window.frontier_pos + 1) {
+        return false;
+    }
+    auto retain_staged = [&]() {
+        window.capture_pending = true;
+        window.pending_seq_id = seq_id;
+        window.pending_pos = pos;
+        return false;
+    };
+
+    // The fixed tape is the incoming-record staging area. Synchronize before
+    // reading it; on failure it remains intact for retry.
+    synchronize();
+    dflash_tape_gpu * tape_gpu =
+        seq_id >= 0 && seq_id < (llama_seq_id) dflash_capture->tapes.size()
+            ? dflash_capture->tapes[seq_id].get()
+            : nullptr;
+    if (!tape_gpu) {
+        return retain_staged();
+    }
+    for (const auto & tape : dflash_capture->tape_layers) {
+        if (tape.n_tokens != 1 ||
+            tape.n_seqs != 1 ||
+            tape.seq_ids[0] != seq_id ||
+            tape.conv_channels <= 0 ||
+            tape.qkv_mixed.size() != (size_t) tape.conv_channels) {
+            return retain_staged();
+        }
+    }
+
+    for (size_t li = 0; li < window.layers.size(); ++li) {
+        const int gpu_li = window.gpu_layer_indices[li];
+        const auto & host = dflash_capture->tape_layers[li];
+        const auto & dst = window.layers[li];
+        if (gpu_li < 0 || gpu_li >= (int) tape_gpu->layers.size() ||
+            dst.qkv->ne[0] != host.conv_channels ||
+            dst.gate->ne[0] != tape_gpu->layers[gpu_li].gate->ne[1] ||
+            dst.beta->ne[0] != tape_gpu->layers[gpu_li].beta->ne[1]) {
+            return retain_staged();
+        }
+    }
+
+    // Allocate every host descriptor needed for the incoming payload before a
+    // full ring can advance. Thus allocation failure also leaves [b,f] intact.
+    const size_t copy_ctx_mem =
+        ggml_tensor_overhead() * (window.layers.size() * 4 + 2);
+    ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
+    ggml_context * copy_ctx = ggml_init(copy_params);
+    if (!copy_ctx) {
+        return retain_staged();
+    }
+
+    if (window.count == window.capacity &&
+        !dflash_window_advance_boundary(this)) {
+        ggml_free(copy_ctx);
+        return retain_staged();
+    }
+
+    const int slot = (window.head + window.count) % window.capacity;
+
+    for (size_t li = 0; li < window.layers.size(); ++li) {
+        auto & src = tape_gpu->layers[window.gpu_layer_indices[li]];
+        auto & dst = window.layers[li];
+        auto & host = dflash_capture->tape_layers[li];
+        const size_t qkv_bytes = host.qkv_mixed.size() * sizeof(float);
+        ggml_backend_tensor_set(
+            dst.qkv, host.qkv_mixed.data(),
+            (size_t) slot * dst.qkv->nb[1], qkv_bytes);
+
+        const int64_t H_v = dst.gate->ne[0];
+        ggml_tensor * gate_src = ggml_view_1d(
+            copy_ctx, src.gate, H_v, 0);
+        ggml_tensor * beta_src = ggml_view_1d(
+            copy_ctx, src.beta, H_v, 0);
+        ggml_tensor * gate_dst = ggml_view_1d(
+            copy_ctx, dst.gate, H_v, (size_t) slot * dst.gate->nb[1]);
+        ggml_tensor * beta_dst = ggml_view_1d(
+            copy_ctx, dst.beta, H_v, (size_t) slot * dst.beta->nb[1]);
+        gate_src->buffer = src.gate->buffer;
+        beta_src->buffer = src.beta->buffer;
+        gate_dst->buffer = dst.gate->buffer;
+        beta_dst->buffer = dst.beta->buffer;
+        ggml_backend_tensor_copy(gate_src, gate_dst);
+        ggml_backend_tensor_copy(beta_src, beta_dst);
+    }
+    ggml_free(copy_ctx);
+    ggml_backend_synchronize(find_gpu_backend());
+
+    // Payload is complete and fenced; publish record metadata last.
+    window.records[slot] = { pos, seq_id, true };
+    window.count++;
+    window.frontier_pos = pos;
+    window.capture_pending = false;
+    window.pending_seq_id = -1;
+    window.pending_pos = -1;
+    return true;
+}
+
+bool llama_context::dflash_window_retry_capture() {
+    if (!dflash_capture || !dflash_capture->window) {
+        return false;
+    }
+    auto & window = *dflash_capture->window;
+    if (!window.capture_pending) {
+        return true;
+    }
+    return dflash_window_capture_last(
+        window.pending_seq_id, window.pending_pos);
+}
+
+void llama_context::dflash_window_inject_publish_failure() {
+    if (dflash_capture && dflash_capture->window) {
+        dflash_capture->window->fail_publish_once = true;
+    }
+}
+
+bool llama_context::dflash_window_reconstruct(llama_pos pos) {
+    if (!dflash_capture || !dflash_capture->window) {
+        return false;
+    }
+    auto & window = *dflash_capture->window;
+    if (!window.enabled || window.capture_pending ||
+        pos < window.boundary_pos || pos > window.frontier_pos) {
+        return false;
+    }
+
+    const int private_idx = 1 - window.published_idx;
+    if (!dflash_window_copy_boundary(this, window.published_idx, private_idx)) {
+        return false;
+    }
+
+    llama_pos expected = window.boundary_pos + 1;
+    for (int i = 0; i < window.count && expected <= pos; ++i, ++expected) {
+        const int slot = (window.head + i) % window.capacity;
+        const auto & record = window.records[slot];
+        if (!record.valid ||
+            record.seq_id != window.seq_id ||
+            record.pos != expected ||
+            !dflash_window_apply_record(this, slot, private_idx)) {
+            return false;
+        }
+    }
+    if (expected != pos + 1) {
+        return false;
+    }
+
+    window.reconstructed_idx = private_idx;
+    window.reconstructed_pos = pos;
+    return true;
+}
+
 void llama_context::tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
                                      int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
     const auto & hparams = model.hparams;
@@ -3879,6 +4379,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // Gate-3 prototype contract: while a rolling window is enabled, normal
+    // decode is deliberately restricted to one explicitly-positioned token
+    // owned by the window sequence. A failed append leaves that token in the
+    // fixed tape staging buffers, so another decode must not overwrite it.
+    bool window_capture = false;
+    llama_seq_id window_seq = -1;
+    llama_pos window_pos = -1;
+    if (dflash_capture && dflash_capture->window &&
+        dflash_capture->window->enabled) {
+        auto & window = *dflash_capture->window;
+        if (window.capture_pending) {
+            LLAMA_LOG_ERROR("%s: rolling-window capture is pending; retry before decoding\n", __func__);
+            return -1;
+        }
+        const int n_seq_id = batch_inp.n_seq_id ? batch_inp.n_seq_id[0] : 1;
+        window_seq = batch_inp.seq_id ? batch_inp.seq_id[0][0] : 0;
+        window_pos = batch_inp.pos ? batch_inp.pos[0] : window.frontier_pos + 1;
+        if (batch_inp.n_tokens != 1 || n_seq_id != 1 ||
+            window_seq != window.seq_id ||
+            window_pos != window.frontier_pos + 1) {
+            LLAMA_LOG_ERROR(
+                "%s: rolling-window prototype requires one contiguous token for seq %d "
+                "(got n_tokens=%d, n_seq_id=%d, seq=%d, pos=%d, expected=%d)\n",
+                __func__, window.seq_id, batch_inp.n_tokens, n_seq_id,
+                window_seq, window_pos, window.frontier_pos + 1);
+            return -1;
+        }
+        window_capture = true;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -4372,6 +4902,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (window_capture && !dflash_window_capture_last(window_seq, window_pos)) {
+        // The model decode itself succeeded. Keep its record staged and make
+        // the capture failure observable through capture_pending/retry rather
+        // than reporting a decode failure after live state has already moved.
+        LLAMA_LOG_WARN(
+            "%s: decoded token %d for seq %d, but rolling-window publication is pending\n",
+            __func__, window_pos, window_seq);
+    }
 
     return 0;
 }
@@ -6376,6 +6915,31 @@ void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {
 
 bool llama_dflash_tape_replay_available(llama_context * ctx) {
     return ctx->tape_replay_available();
+}
+
+bool llama_dflash_window_enable(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        int             capacity) {
+    return ctx->dflash_window_enable(seq_id, capacity);
+}
+
+bool llama_dflash_window_capture_pending(llama_context * ctx) {
+    return ctx->dflash_capture &&
+           ctx->dflash_capture->window &&
+           ctx->dflash_capture->window->capture_pending;
+}
+
+bool llama_dflash_window_retry_capture(llama_context * ctx) {
+    return ctx->dflash_window_retry_capture();
+}
+
+void llama_dflash_window_inject_publish_failure(llama_context * ctx) {
+    ctx->dflash_window_inject_publish_failure();
+}
+
+bool llama_dflash_window_reconstruct(llama_context * ctx, llama_pos pos) {
+    return ctx->dflash_window_reconstruct(pos);
 }
 
 void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {

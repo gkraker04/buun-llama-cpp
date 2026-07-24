@@ -159,6 +159,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-dflash-tape-vs-plane.cpp)
     target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build(test-dflash-tape-window.cpp)
+    target_include_directories(test-dflash-tape-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)

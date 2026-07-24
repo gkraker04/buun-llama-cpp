@@ -1220,6 +1220,27 @@ extern "C" {
     // the default. The mode currently targets single-device GPU replay only.
     LLAMA_API void llama_set_tape_minimal_replay(struct llama_context * ctx, bool enable);
 
+    // WS-2 Gate-3 rolling-window prototype (single GPU / single sequence).
+    // Enable snapshots the recurrent state at the sequence's current frontier as
+    // boundary b. Subsequent one-token normal decodes append minimal-F32 records.
+    LLAMA_API bool llama_dflash_window_enable(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int                    capacity);
+
+    // A publication fault leaves the decoded token staged in the fixed tape and
+    // blocks further windowed decodes until this retry succeeds.
+    LLAMA_API bool llama_dflash_window_capture_pending(struct llama_context * ctx);
+    LLAMA_API bool llama_dflash_window_retry_capture(struct llama_context * ctx);
+
+    // One-shot Gate-3 test fault: fail after private boundary computation/fence,
+    // immediately before logical publication.
+    LLAMA_API void llama_dflash_window_inject_publish_failure(struct llama_context * ctx);
+
+    // Reconstruct recurrent state at pos into the non-published boundary copy.
+    // This is a prototype/test oracle and does not mutate the live recurrent cache.
+    LLAMA_API bool llama_dflash_window_reconstruct(struct llama_context * ctx, llama_pos pos);
+
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
     //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
