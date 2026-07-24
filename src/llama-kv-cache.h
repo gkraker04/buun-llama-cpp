@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -527,8 +528,9 @@ private:
     // WS-0 (P1) schedule-trace recorder — env VBR_TRACE=<path>, TEST/GATING ONLY. One line per
     // boundary: phase, boundary#, degrade cursor, tier-vector FNV digest, watermark, used cells,
     // mapped bytes. The L2 null arm needs two runs proven schedule-IDENTICAL (not just same output);
-    // this makes the schedule diffable and localizes the first divergent boundary. nullptr => no-op.
-    FILE *   vbr_trace_fp_         = nullptr;
+    // this makes the schedule diffable and localizes the first divergent boundary. null => no-op.
+    // RAII (Sol review F5): a throwing ctor after the open still closes the handle during unwinding.
+    std::unique_ptr<std::FILE, int (*)(std::FILE *)> vbr_trace_fp_{nullptr, &std::fclose};
     void     vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used);
     // what this pool's device can give it right now: device_share x (mapped + free - headroom),
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.

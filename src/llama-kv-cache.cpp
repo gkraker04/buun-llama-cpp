@@ -1321,12 +1321,19 @@ llama_kv_cache::llama_kv_cache(
             }
             // WS-0 (P1) schedule-trace recorder (test/gating only): open the sink if requested.
             if (const char * tp = turbo_vbr_getenv("VBR_TRACE")) {
-                vbr_trace_fp_ = fopen(tp, "w");
-                if (vbr_trace_fp_ != nullptr) {
-                    fprintf(vbr_trace_fp_, "# phase\tboundary\tcursor\ttier_fnv\twm\tused\tmapped_bytes\n");
-                    LLAMA_LOG_INFO("%s: VBR_TRACE -> %s (per-boundary tier-schedule trace)\n", __func__, tp);
+                // per-child suffix (Sol F2): iSWA base/SWA caches must not both truncate the same
+                // path. Standalone caches (trace_label == nullptr) keep the bare path unchanged.
+                std::string trace_path = tp;
+                if (vbr_params_.trace_label != nullptr) {
+                    trace_path += '.';
+                    trace_path += vbr_params_.trace_label;
+                }
+                vbr_trace_fp_.reset(fopen(trace_path.c_str(), "w"));
+                if (vbr_trace_fp_) {
+                    fprintf(vbr_trace_fp_.get(), "# phase\tboundary\tcursor\ttier_fnv\twm\tused\tmapped_bytes\n");
+                    LLAMA_LOG_INFO("%s: VBR_TRACE -> %s (per-boundary tier-schedule trace)\n", __func__, trace_path.c_str());
                 } else {
-                    LLAMA_LOG_WARN("%s: VBR_TRACE=%s could not be opened for writing\n", __func__, tp);
+                    LLAMA_LOG_WARN("%s: VBR_TRACE=%s could not be opened for writing\n", __func__, trace_path.c_str());
                 }
             }
             // growth headroom: env override > fit target (threaded) > 1 GiB default
@@ -1507,10 +1514,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
-    if (vbr_trace_fp_ != nullptr) {
-        fclose(vbr_trace_fp_);
-        vbr_trace_fp_ = nullptr;
-    }
+    // vbr_trace_fp_ closes itself (RAII unique_ptr, Sol review F5)
     for (auto & p : vbr_pools_) {
         if (p.backend != nullptr) {
             // S5: a degrade wave may still be in flight on the side stream — it must finish before
@@ -2112,7 +2116,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // projected <= budget_eff whenever the sub-band ladder still works, which must
             // not hide the demand (the band is what peers owe; the sub-band walk is the
             // demander's own sacrifice)
-            vbr_runtime_demand_update(wm_next, vbr_was_over);
+            if (!vbr_freeze_) { // WS-0 freeze (Sol F3): don't publish outbound co-tenancy demand
+                vbr_runtime_demand_update(wm_next, vbr_was_over);
+            }
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
             // boundary once ≥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
@@ -2147,6 +2153,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // rename-free co-tenant would otherwise never publish its runtime demand and
             // livelock on failing batches
             vbr_ledger_force_ = true;
+            // Sol F4: this boundary's degrade may already have flipped tiers, so trace it (distinct
+            // phase, counter not advanced) instead of silently dropping it under OOM/fault validation.
+            vbr_trace_emit("prepare_mapfail", wm_next, used_now);
             return {};
         }
         // free-running boundary counter: drives the auto-budget re-derive throttle above and the
@@ -2793,7 +2802,7 @@ void llama_kv_cache::vbr_rederive_budget() {
 // order, folded into an FNV-1a digest; two runs whose (boundary,cursor,digest,wm,used) columns match
 // at every boundary took the identical tier schedule. No effect on the schedule itself.
 void llama_kv_cache::vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used) {
-    if (vbr_trace_fp_ == nullptr) {
+    if (!vbr_trace_fp_) {
         return;
     }
     uint64_t fnv    = 1469598103934665603ull;
@@ -2809,7 +2818,7 @@ void llama_kv_cache::vbr_trace_emit(const char * phase, uint32_t wm, uint32_t us
             mapped += p.be->vmm_pool_mapped(p.vmm);
         }
     }
-    fprintf(vbr_trace_fp_, "%s\t%llu\t%zu\t%016llx\t%u\t%u\t%zu\n",
+    fprintf(vbr_trace_fp_.get(), "%s\t%llu\t%zu\t%016llx\t%u\t%u\t%zu\n",
             phase, (unsigned long long) vbr_boundary_count_, vbr_degrade_cursor_,
             (unsigned long long) fnv, wm, used, mapped);
 }
@@ -3003,7 +3012,9 @@ void llama_kv_cache::breathe() {
             vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
         }
     }
-    vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
+    if (!vbr_freeze_) { // WS-0 freeze (Sol F3): suppress outbound co-tenancy demand publication
+        vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
+    }
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
     // grows here, so the general over-budget loop cannot fire — only demand decrements
     // (band-capped, in the scan) shed. Promotes get their idle chance under the same
@@ -4361,6 +4372,14 @@ uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
 }
 
 bool llama_kv_cache::vbr_presence_quiet() const {
+    // WS-0 freeze (Sol review F3): the presence census is fed by the ledger scan, which freeze
+    // disables -- so vbr_scan_events_ stays 0 and this would be permanently false, DISABLING
+    // promotion under freeze (the frozen schedule would be degrade-only, structurally unlike
+    // production). Single-tenant frozen has no presence changes by definition -> always quiet,
+    // leaving promotion gated only by the deterministic vbr_quiet_boundaries_ cooldown.
+    if (vbr_freeze_) {
+        return true;
+    }
     return vbr_scan_events_ - vbr_nlive_change_scan_ >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
 }
 

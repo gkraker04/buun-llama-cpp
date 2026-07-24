@@ -87,6 +87,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // would target ~2x the configured mapped-physical total before degrading
     llama_memory_vbr_params vbr_base = vbr;
     llama_memory_vbr_params vbr_swa  = vbr;
+    // WS-0 (P1) trace: distinct VBR_TRACE files per child so BOTH schedules are recorded without
+    // the second open truncating the first (Sol review F2).
+    vbr_base.trace_label = "base";
+    vbr_swa.trace_label  = "swa";
     if (vbr.dynamic || vbr.budget_bytes > 0) {
         uint64_t n_base_l = 0;
         uint64_t n_swa_l  = 0;

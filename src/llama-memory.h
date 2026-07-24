@@ -49,6 +49,9 @@ struct llama_memory_vbr_params {
     // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
     bool     pin_v = false;
+    // WS-0 (P1) trace: VBR_TRACE path suffix so iSWA base/SWA children write to DISTINCT files
+    // instead of both truncating the same path (Sol review F2). nullptr for a standalone cache.
+    const char * trace_label = nullptr;
 };
 
 enum llama_memory_status {
