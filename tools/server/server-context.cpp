@@ -4950,6 +4950,23 @@ private:
                         auto & cur = slot.prompt.checkpoints.emplace_back();
                         cur.pos_min  = pos_min;
                         cur.pos_max  = pos_max;
+                        // [WS-1 / #25592 frontier validity, TAG_CHECKPOINTS_FIX_POS_MIN] A
+                        // hybrid/recurrent checkpoint is a point-in-time state snapshot -- valid ONLY
+                        // at the exact frontier position it was saved at, never a [pos_min, pos_max]
+                        // range. Record that exact validity instead of trusting seq_pos_min's reported
+                        // value. Our fork is already safe (selection + erase use pos_max for recurrent,
+                        // and seq_pos_min incidentally reports the frontier here -- the I11/N1 quirk),
+                        // so this is the dual-write/agreement step: assert the reported pos_min agrees
+                        // with the exact pos_max (so a future divergence is caught loudly), then record
+                        // the exact value correctness-by-construction. No recurrent reader consults
+                        // pos_min, so collapsing it changes no behavior today.
+                        if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+                            if (cur.pos_min != cur.pos_max) {
+                                SLT_WRN(slot, "[frontier-validity] recurrent checkpoint seq_pos_min (%d) != seq_pos_max (%d) -- recording exact validity pos_min = pos_max = %d\n",
+                                        cur.pos_min, cur.pos_max, cur.pos_max);
+                            }
+                            cur.pos_min = cur.pos_max;
+                        }
                         cur.n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
                         cur.data_tgt.resize(checkpoint_size);
 
