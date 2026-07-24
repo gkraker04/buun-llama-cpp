@@ -8,6 +8,7 @@
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
+#include <cstdio>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -523,6 +524,12 @@ private:
     // OFF => every gated branch runs verbatim: a freeze-off build is bit-identical to a pre-freeze
     // build (the P0 base-numerics ratchet). Never a production degrade-policy lever.
     bool     vbr_freeze_           = false;
+    // WS-0 (P1) schedule-trace recorder — env VBR_TRACE=<path>, TEST/GATING ONLY. One line per
+    // boundary: phase, boundary#, degrade cursor, tier-vector FNV digest, watermark, used cells,
+    // mapped bytes. The L2 null arm needs two runs proven schedule-IDENTICAL (not just same output);
+    // this makes the schedule diffable and localizes the first divergent boundary. nullptr => no-op.
+    FILE *   vbr_trace_fp_         = nullptr;
+    void     vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used);
     // what this pool's device can give it right now: device_share x (mapped + free - headroom),
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.

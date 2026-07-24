@@ -1319,6 +1319,16 @@ llama_kv_cache::llama_kv_cache(
                             __func__);
                 }
             }
+            // WS-0 (P1) schedule-trace recorder (test/gating only): open the sink if requested.
+            if (const char * tp = turbo_vbr_getenv("VBR_TRACE")) {
+                vbr_trace_fp_ = fopen(tp, "w");
+                if (vbr_trace_fp_ != nullptr) {
+                    fprintf(vbr_trace_fp_, "# phase\tboundary\tcursor\ttier_fnv\twm\tused\tmapped_bytes\n");
+                    LLAMA_LOG_INFO("%s: VBR_TRACE -> %s (per-boundary tier-schedule trace)\n", __func__, tp);
+                } else {
+                    LLAMA_LOG_WARN("%s: VBR_TRACE=%s could not be opened for writing\n", __func__, tp);
+                }
+            }
             // growth headroom: env override > fit target (threaded) > 1 GiB default
             vbr_growth_headroom_ = (size_t) vbr_params_.growth_headroom_bytes;
             if (const char * env = getenv("VBR_GROWTH_HEADROOM_MIB")) {
@@ -1497,6 +1507,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    if (vbr_trace_fp_ != nullptr) {
+        fclose(vbr_trace_fp_);
+        vbr_trace_fp_ = nullptr;
+    }
     for (auto & p : vbr_pools_) {
         if (p.backend != nullptr) {
             // S5: a degrade wave may still be in flight on the side stream — it must finish before
@@ -2140,6 +2154,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // which path ran, so the %8 cadence is real wall-boundary time.
         vbr_boundary_count_++;
         vbr_last_used_ = used_now;
+        vbr_trace_emit("prepare", wm_next, used_now);
     }
 
     // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
@@ -2773,6 +2788,32 @@ void llama_kv_cache::vbr_rederive_budget() {
     }
 }
 
+// WS-0 (P1) schedule-trace recorder (test/gating only). One line per boundary. The tier vector is
+// the live type of every populated (layer,side) extent across all pools, in a stable pool->ikv->k,v
+// order, folded into an FNV-1a digest; two runs whose (boundary,cursor,digest,wm,used) columns match
+// at every boundary took the identical tier schedule. No effect on the schedule itself.
+void llama_kv_cache::vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used) {
+    if (vbr_trace_fp_ == nullptr) {
+        return;
+    }
+    uint64_t fnv    = 1469598103934665603ull;
+    size_t   mapped = 0;
+    for (const auto & p : vbr_pools_) {
+        for (size_t ikv = 0; ikv < p.k.size(); ++ikv) {
+            const uint8_t kt = p.k[ikv].t != nullptr ? (uint8_t) p.k[ikv].t->type : 0xFF;
+            const uint8_t vt = p.v[ikv].t != nullptr ? (uint8_t) p.v[ikv].t->type : 0xFF;
+            fnv = (fnv ^ kt) * 1099511628211ull;
+            fnv = (fnv ^ vt) * 1099511628211ull;
+        }
+        if (p.vmm != nullptr) {
+            mapped += p.be->vmm_pool_mapped(p.vmm);
+        }
+    }
+    fprintf(vbr_trace_fp_, "%s\t%llu\t%zu\t%016llx\t%u\t%u\t%zu\n",
+            phase, (unsigned long long) vbr_boundary_count_, vbr_degrade_cursor_,
+            (unsigned long long) fnv, wm, used, mapped);
+}
+
 bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     for (const auto & p : vbr_pools_) {
         if (p.vmm == nullptr) {
@@ -2971,6 +3012,7 @@ void llama_kv_cache::breathe() {
     vbr_maybe_promote(wm_next);
     vbr_arm_wave_fences();
     vbr_boundary_count_++;
+    vbr_trace_emit("breathe", wm_next, used_now);
 }
 
 // S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
