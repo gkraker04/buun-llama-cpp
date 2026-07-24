@@ -4927,6 +4927,22 @@ private:
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    // [WS-1 / #25592 frontier validity] A hybrid/recurrent checkpoint captures a
+                    // point-in-time state valid ONLY at its exact frontier -- never a [pos_min, pos_max]
+                    // range. If seq_pos_min and seq_pos_max disagree (a hybrid whose attention and
+                    // recurrent frontiers diverged), that range is a LIE for this state: a later restore
+                    // reads pos_min (see :4578) and would install the frontier state at the wrong
+                    // position -> wrong continuation. Fail CLOSED here -- skip the capture and keep
+                    // existing good checkpoints (do NOT evict for one we won't create). In a coherent
+                    // recurrent/hybrid cache equality holds (one recurrent frontier row) so this should
+                    // never fire; if it does, it is a real memory-frontier bug worth the loud warning.
+                    if (do_checkpoint && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) &&
+                        pos_min != pos_max) {
+                        SLT_WRN(slot, "[frontier-validity] skipping context checkpoint: recurrent/hybrid seq_pos_min (%d) != seq_pos_max (%d) -- range invalid for a point-in-time state\n",
+                                pos_min, pos_max);
+                        do_checkpoint = false;
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -4986,21 +5002,13 @@ private:
                         cur.id_task  = ckpt_id_task; // [WS-1 / #25592] protects this checkpoint from min-step thinning by its own task
                         cur.pos_min  = pos_min;
                         cur.pos_max  = pos_max;
-                        // [WS-1 / #25592 frontier validity, TAG_CHECKPOINTS_FIX_POS_MIN] A
-                        // hybrid/recurrent checkpoint is a point-in-time state snapshot -- valid ONLY
-                        // at the exact frontier position it was saved at, never a [pos_min, pos_max]
-                        // range. Record that exact validity instead of trusting seq_pos_min's reported
-                        // value. Our fork is already safe (selection + erase use pos_max for recurrent,
-                        // and seq_pos_min incidentally reports the frontier here -- the I11/N1 quirk),
-                        // so this is the dual-write/agreement step: assert the reported pos_min agrees
-                        // with the exact pos_max (so a future divergence is caught loudly), then record
-                        // the exact value correctness-by-construction. No recurrent reader consults
-                        // pos_min, so collapsing it changes no behavior today.
+                        // [WS-1 / #25592, TAG_CHECKPOINTS_FIX_POS_MIN] Record the exact validity: a
+                        // hybrid/recurrent checkpoint is valid ONLY at its frontier. A frontier
+                        // disagreement (pos_min != pos_max) already failed the capture closed above, so
+                        // here pos_min == pos_max -- collapse it explicitly (correctness-by-construction,
+                        // not reliant on the seq_pos_min quirk). NOTE the restore at :4578 reads pos_min,
+                        // so this recorded value is load-bearing, not cosmetic.
                         if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
-                            if (cur.pos_min != cur.pos_max) {
-                                SLT_WRN(slot, "[frontier-validity] recurrent checkpoint seq_pos_min (%d) != seq_pos_max (%d) -- recording exact validity pos_min = pos_max = %d\n",
-                                        cur.pos_min, cur.pos_max, cur.pos_max);
-                            }
                             cur.pos_min = cur.pos_max;
                         }
                         cur.n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
