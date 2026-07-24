@@ -4446,8 +4446,25 @@ private:
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
-                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
+                                    // [WS-1] fail-closed coordinated restore. The token ledger claims a
+                                    // prefix (n_past > 0) but this sequence's KV is empty (pos_min == -1) --
+                                    // a token-ledger/KV desync. Upstream GGML_ABORTs here, taking down the
+                                    // WHOLE server (every client) on a "should not happen" invariant. P0's
+                                    // I7/I10 closed the known host-cache route (empty-main select + non-
+                                    // consuming both-or-nothing load); this converts any remaining/latent
+                                    // desync into a per-slot recovery, matching the fork's recoverable-failure
+                                    // rule (llama-kv-cache.cpp VBR try_map: "fail this batch recoverably
+                                    // instead of a process abort killing every client"). Coordinate the two
+                                    // structures -- clear KV (tgt+dft) + the stale ledger via prompt_clear --
+                                    // and full-reprocess. Loud ERR so a real desync is never silently masked.
+                                    SLT_ERR(slot, "token-ledger/KV desync (n_past = %d, pos_min = -1, tokens = %d, seq_id = %d) -- failing closed: clearing slot and reprocessing from scratch\n",
+                                            n_past, (int) slot.prompt.tokens.size(), slot.id);
+                                    slot.prompt_clear();
+                                    n_past            = 0;
+                                    n_past_common     = 0;
+                                    n_past_keep       = 0;
+                                    pos_next          = 0;
+                                    slot.cache_status = "full reprocess: token-ledger/KV desync recovered [WS-1]";
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
