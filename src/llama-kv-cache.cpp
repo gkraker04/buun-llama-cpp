@@ -1305,6 +1305,20 @@ llama_kv_cache::llama_kv_cache(
                 vbr_budget_bytes_    = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
                 vbr_budget_explicit_ = true; // forced-budget instrumentation must never grow
             }
+            // WS-0 (P1): deterministic freeze — TEST/GATING ONLY (see header). Read after the budget
+            // is final so the explicit-budget precondition is decided. Skips the vbr_budget_eff live
+            // clamp + the ledger; a fixed budget + no clamp makes degrade waves a pure function of
+            // occupancy (deterministic "scripted" waves). No effect on any production run.
+            vbr_freeze_ = turbo_vbr_env_enabled("VBR_FREEZE");
+            if (vbr_freeze_) {
+                LLAMA_LOG_INFO("%s: VBR_FREEZE active — live-VRAM clamp + ledger disabled "
+                        "(deterministic tier schedule; test/gating only)\n", __func__);
+                if (!vbr_budget_explicit_) {
+                    LLAMA_LOG_WARN("%s: VBR_FREEZE without an explicit VBR_BUDGET_MIB — the auto-budget "
+                            "re-derivation reads live free VRAM and is NOT frozen; set VBR_BUDGET_MIB\n",
+                            __func__);
+                }
+            }
             // growth headroom: env override > fit target (threaded) > 1 GiB default
             vbr_growth_headroom_ = (size_t) vbr_params_.growth_headroom_bytes;
             if (const char * env = getenv("VBR_GROWTH_HEADROOM_MIB")) {
@@ -1987,8 +2001,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
-        // a peer's rename (new claim, offer change) forces the full controller path
-        vbr_ledger_precheck();
+        // a peer's rename (new claim, offer change) forces the full controller path.
+        // WS-0 (P1) freeze: ledger off (test/gating) — skip so the schedule ignores co-tenant
+        // state; vbr_ledger_force_ stays clear and the scan below is skipped too.
+        if (!vbr_freeze_) {
+            vbr_ledger_precheck();
+        }
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
@@ -2084,9 +2102,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
             // boundary once ≥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
-            if (vbr_ledger_force_ ||
+            if (!vbr_freeze_ && (vbr_ledger_force_ ||
                 (vbr_boundary_count_ % 8 == 0 &&
-                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
+                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull))) {
                 vbr_ledger_scan_service(wm_next);
             }
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
@@ -2655,7 +2673,6 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
 // then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
-    const size_t headroom = llama_vram_headroom_bytes();
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
     // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
@@ -2664,36 +2681,45 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
         return p.budget_eff_cache;
     }
     size_t budget_eff = p.budget;
-    size_t free_b = 0, total_b = 0;
-    p.be->get_device_memory(p.device, &free_b, &total_b);
-    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    // P3 fairness: headroom scales with the presence census (every live fork process has
-    // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
-    // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
-    // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
-    // single-tenant behavior; the quantization alone would cost up to 64 MiB).
-    const uint32_t n_live = vbr_pool_n_live(p);
-    const size_t headroom_eff = headroom * n_live;
-    if (n_live > 1) {
-        constexpr size_t quantum = 64ull * 1024 * 1024;
-        size_t va_total = 0;
-        for (const auto & q : vbr_pools_) {
-            va_total += q.vmm != nullptr ? q.size : 0;
+    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm); // deterministic (pool mapped bytes)
+    // WS-0 (P1) freeze: skip every live-VRAM / co-tenancy input — the live free-VRAM clamp
+    // (cudaMemGetInfo), the N_live>1 fair-share relax, and the grant-decrement subtraction — so
+    // budget_eff stays the fixed armed budget (still floored at mapped_now below). This clamp is the
+    // ONLY live-VRAM path that fires under an explicit budget, so neutralizing it makes both the pp
+    // one-shot fit and the tg degrade trajectory a pure function of the fixed budget + occupancy.
+    // OFF => this block runs verbatim, so a freeze-off build is bit-identical (the P0 ratchet).
+    if (!vbr_freeze_) {
+        const size_t headroom = llama_vram_headroom_bytes();
+        size_t free_b = 0, total_b = 0;
+        p.be->get_device_memory(p.device, &free_b, &total_b);
+        // P3 fairness: headroom scales with the presence census (every live fork process has
+        // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
+        // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
+        // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
+        // single-tenant behavior; the quantization alone would cost up to 64 MiB).
+        const uint32_t n_live = vbr_pool_n_live(p);
+        const size_t headroom_eff = headroom * n_live;
+        if (n_live > 1) {
+            constexpr size_t quantum = 64ull * 1024 * 1024;
+            size_t va_total = 0;
+            for (const auto & q : vbr_pools_) {
+                va_total += q.vmm != nullptr ? q.size : 0;
+            }
+            const size_t floor_share = va_total > 0
+                ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
+            const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
+            budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
         }
-        const size_t floor_share = va_total > 0
-            ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
-        const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
-        budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
+        const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
+        if (cap < budget_eff) {
+            budget_eff = cap;
+        }
+        // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
+        // decrements, then floor at mapped — the floor binds precisely in the shed->flush
+        // window so no consumer (including our own degrade loop) ever sees a budget below
+        // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
+        budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
     }
-    const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
-    if (cap < budget_eff) {
-        budget_eff = cap;
-    }
-    // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
-    // decrements, then floor at mapped — the floor binds precisely in the shed->flush
-    // window so no consumer (including our own degrade loop) ever sees a budget below
-    // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
-    budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
     if (budget_eff < mapped_now) {
         budget_eff = mapped_now;
     }
@@ -2927,10 +2953,14 @@ void llama_kv_cache::breathe() {
     }
     const uint32_t wm_next = vbr_watermark_cells(0);
     vbr_shrink_watermark();
-    vbr_ledger_precheck();
-    if (vbr_ledger_force_ ||
-        llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
-        vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+    // WS-0 (P1) freeze: ledger off (test/gating) — skip precheck + idle scan for a deterministic
+    // idle path. OFF => both run verbatim (bit-identical).
+    if (!vbr_freeze_) {
+        vbr_ledger_precheck();
+        if (vbr_ledger_force_ ||
+            llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
+            vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+        }
     }
     vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing

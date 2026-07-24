@@ -515,6 +515,14 @@ private:
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
     bool     vbr_budget_explicit_  = false;
+    // WS-0 (P1) deterministic freeze mode — env VBR_FREEZE, TEST/GATING ONLY. Neutralizes the two
+    // live-VRAM / co-tenancy inputs that make the tier schedule irreproducible run-to-run: the
+    // vbr_budget_eff clamp (live cudaMemGetInfo) and the ledger scan/precheck + wall-clock gates,
+    // so the schedule becomes a pure function of the fixed budget + occupancy. Requires an explicit
+    // VBR_BUDGET_MIB (else vbr_pool_reach re-derivation, which is !explicit-gated, is not frozen).
+    // OFF => every gated branch runs verbatim: a freeze-off build is bit-identical to a pre-freeze
+    // build (the P0 base-numerics ratchet). Never a production degrade-policy lever.
+    bool     vbr_freeze_           = false;
     // what this pool's device can give it right now: device_share x (mapped + free - headroom),
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.
