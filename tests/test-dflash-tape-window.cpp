@@ -20,8 +20,8 @@ static llama_context_ptr make_ctx(const common_params & params, llama_model * mo
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 1;
     cparams.n_rs_seq  = 0; // Gate 3 tests the replacement window, not rollback planes.
-    cparams.n_batch   = std::max(cparams.n_batch,  16);
-    cparams.n_ubatch  = std::max(cparams.n_ubatch, 16);
+    cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) 16);
+    cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) 16);
     return llama_context_ptr(llama_init_from_model(model, cparams));
 }
 
