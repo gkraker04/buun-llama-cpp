@@ -18,7 +18,7 @@
 
 static llama_context_ptr make_ctx(const common_params & params, llama_model * model) {
     auto cparams = common_context_params_to_llama(params);
-    cparams.n_seq_max = 1;
+    cparams.n_seq_max = 2;
     cparams.n_rs_seq  = 0; // Gate 3 tests the replacement window, not rollback planes.
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) 16);
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) 16);
@@ -43,11 +43,44 @@ static bool decode_range(
         llama_context *                  ctx,
         const std::vector<llama_token> & tokens,
         uint32_t                         begin,
-        uint32_t                         count) {
+        uint32_t                         count,
+        llama_seq_id                     seq_id = 0) {
     llama_batch batch = llama_batch_init(count, 0, 1);
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t pos = begin + i;
-        common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == count);
+        const size_t token_idx =
+            (pos + (size_t) std::max(seq_id, 0) * 5) % tokens.size();
+        common_batch_add(
+            batch, tokens[token_idx], pos, { seq_id }, i + 1 == count);
+    }
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static bool decode_two_equal_ranges(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & tokens,
+        uint32_t                         begin_0,
+        uint32_t                         begin_1,
+        uint32_t                         count,
+        bool                             reverse_owners = false) {
+    llama_batch batch = llama_batch_init(2 * count, 0, 1);
+    auto add_range = [&](llama_seq_id seq_id, uint32_t begin) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t pos = begin + i;
+            const size_t token_idx =
+                (pos + (size_t) std::max(seq_id, 0) * 5) % tokens.size();
+            common_batch_add(
+                batch, tokens[token_idx], pos, { seq_id }, i + 1 == count);
+        }
+    };
+    if (reverse_owners) {
+        add_range(1, begin_1);
+        add_range(0, begin_0);
+    } else {
+        add_range(0, begin_0);
+        add_range(1, begin_1);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -87,8 +120,9 @@ static bool read_tensor(
 static bool read_live_state(
         llama_context *            ctx,
         llama_memory_recurrent *   mem,
+        llama_seq_id                seq_id,
         std::vector<state_piece> & out) {
-    auto & window = *ctx->dflash_capture->window;
+    auto & window = *ctx->dflash_capture->windows[seq_id];
     const int32_t tail = mem->cells[window.seq_id].tail;
     if (tail < 0) {
         return false;
@@ -110,9 +144,10 @@ static bool read_live_state(
 
 static bool read_window_state(
         llama_context *            ctx,
+        llama_seq_id                seq_id,
         int                        copy,
         std::vector<state_piece> & out) {
-    auto & window = *ctx->dflash_capture->window;
+    auto & window = *ctx->dflash_capture->windows[seq_id];
     if (copy < 0 || copy > 1) {
         return false;
     }
@@ -198,6 +233,114 @@ static bool ring_is(
     return true;
 }
 
+static bool host_qkv_is_packed(
+        llama_context *                    ctx,
+        int                                n_tokens,
+        const std::vector<llama_seq_id> & seq_ids) {
+    if (ctx->dflash_capture->tape_layers.empty()) {
+        return false;
+    }
+    for (const auto & tape : ctx->dflash_capture->tape_layers) {
+        if (tape.n_tokens != n_tokens ||
+            tape.n_seqs != (int) seq_ids.size() ||
+            tape.conv_channels <= 0 ||
+            tape.qkv_mixed.size() !=
+                (size_t) tape.conv_channels * tape.n_tokens * tape.n_seqs) {
+            return false;
+        }
+        for (llama_seq_id seq_id : seq_ids) {
+            bool found = false;
+            for (int s = 0; s < tape.n_seqs; ++s) {
+                found |= tape.seq_ids[s] == seq_id;
+            }
+            if (!found) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ownership_payload_matches(
+        llama_context *       ctx,
+        const dflash_window & window,
+        int                   logical_record,
+        int                   source_token) {
+    if (logical_record < 0 || logical_record >= window.count) {
+        return false;
+    }
+    const int slot = (window.head + logical_record) % window.capacity;
+    auto * tape_gpu = ctx->dflash_capture->tapes[window.seq_id].get();
+    if (!tape_gpu) {
+        return false;
+    }
+    for (size_t li = 0; li < window.layers.size(); ++li) {
+        const auto & host = ctx->dflash_capture->tape_layers[li];
+        const int gpu_li = window.gpu_layer_indices[li];
+        if (gpu_li < 0 || source_token < 0 ||
+            source_token >= host.n_tokens) {
+            return false;
+        }
+        const auto & src = tape_gpu->layers[gpu_li];
+        const auto & dst = window.layers[li];
+        const size_t qkv_n = (size_t) host.conv_channels;
+        std::vector<float> expected_qkv(qkv_n);
+        std::vector<float> got_qkv(qkv_n);
+        if (src.qkv) {
+            ggml_backend_tensor_get(
+                src.qkv, expected_qkv.data(),
+                (size_t) source_token * src.qkv->nb[1],
+                qkv_n * sizeof(float));
+        } else {
+            int seq_axis = -1;
+            for (int s = 0; s < host.n_seqs; ++s) {
+                if (host.seq_ids[s] == window.seq_id) {
+                    seq_axis = s;
+                    break;
+                }
+            }
+            if (seq_axis < 0) {
+                return false;
+            }
+            const size_t qkv_off =
+                ((size_t) seq_axis * host.n_tokens + source_token) * qkv_n;
+            std::memcpy(
+                expected_qkv.data(), host.qkv_mixed.data() + qkv_off,
+                qkv_n * sizeof(float));
+        }
+        ggml_backend_tensor_get(
+            dst.qkv, got_qkv.data(), (size_t) slot * dst.qkv->nb[1],
+            qkv_n * sizeof(float));
+        if (std::memcmp(
+                got_qkv.data(), expected_qkv.data(),
+                qkv_n * sizeof(float)) != 0) {
+            return false;
+        }
+
+        const size_t h_v = (size_t) dst.gate->ne[0];
+        std::vector<float> src_values(h_v);
+        std::vector<float> dst_values(h_v);
+        for (int kind = 0; kind < 2; ++kind) {
+            ggml_tensor * src_tensor = kind == 0 ? src.gate : src.beta;
+            ggml_tensor * dst_tensor = kind == 0 ? dst.gate : dst.beta;
+            ggml_backend_tensor_get(
+                src_tensor, src_values.data(),
+                (size_t) source_token * src_tensor->nb[2],
+                h_v * sizeof(float));
+            ggml_backend_tensor_get(
+                dst_tensor, dst_values.data(),
+                (size_t) slot * dst_tensor->nb[1],
+                h_v * sizeof(float));
+            if (std::memcmp(
+                    src_values.data(), dst_values.data(),
+                    h_v * sizeof(float)) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -234,15 +377,17 @@ int main(int argc, char ** argv) {
     }
 
     ggml_backend_t gpu_backend = ctx->find_gpu_backend();
+    ggml_backend_t meta_backend = ctx->find_meta_backend();
     ggml_backend_dev_t gpu_device = gpu_backend ? ggml_backend_get_device(gpu_backend) : nullptr;
     const char * gpu_name = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
-    if (!gpu_name || !std::strstr(gpu_name, "CUDA")) {
-        fprintf(stderr, "%s: skipping because Gate 3 targets single-device CUDA\n", __func__);
+    const bool tensor_split = meta_backend != nullptr;
+    if ((!gpu_name || !std::strstr(gpu_name, "CUDA")) && !tensor_split) {
+        fprintf(stderr, "%s: skipping because Gate 3/4 targets CUDA\n", __func__);
         return 0;
     }
 
     llama_set_dflash_capture(ctx.get(), nullptr, 0);
-    llama_dflash_allocate_slots(ctx.get(), 1);
+    llama_dflash_allocate_slots(ctx.get(), 2);
     llama_set_tape_recording(ctx.get(), true);
     if (!llama_dflash_tape_replay_available(ctx.get())) {
         fprintf(stderr, "%s: skipping because lossless single-device GPU tape replay is unavailable\n",
@@ -251,16 +396,20 @@ int main(int argc, char ** argv) {
     }
 
     constexpr uint32_t prefix = 3;
-    constexpr int capacity = 3;
+    const int capacity = tensor_split ? 8 : 3;
     constexpr uint32_t final_pos = 8;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    std::vector<llama_token> tokens(final_pos + 1);
+    std::vector<llama_token> tokens(14);
     for (size_t i = 0; i < tokens.size(); ++i) {
         tokens[i] = (llama_token) ((i + 1) % std::max(n_vocab, 1));
     }
 
     if (!decode_range(ctx.get(), tokens, 0, prefix)) {
-        fprintf(stderr, "%s: prefix decode failed\n", __func__);
+        fprintf(stderr, "%s: seq-0 prefix decode failed\n", __func__);
+        return 1;
+    }
+    if (!decode_range(ctx.get(), tokens, 0, prefix, 1)) {
+        fprintf(stderr, "%s: seq-1 prefix decode failed\n", __func__);
         return 1;
     }
     llama_synchronize(ctx.get());
@@ -269,22 +418,75 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (!llama_dflash_window_enable(ctx.get(), 0, capacity)) {
-        fprintf(stderr, "%s: failed to enable rolling tape window\n", __func__);
+        fprintf(stderr, "%s: failed to enable seq-0 rolling tape window\n", __func__);
+        return 1;
+    }
+    if (!llama_dflash_window_enable(ctx.get(), 1, capacity)) {
+        fprintf(stderr, "%s: failed to enable seq-1 rolling tape window\n", __func__);
         return 1;
     }
 
-    auto & window = *ctx->dflash_capture->window;
+    auto & window = *ctx->dflash_capture->windows[0];
+    auto & window_1 = *ctx->dflash_capture->windows[1];
     if (window.boundary_pos != (llama_pos) prefix - 1 ||
         window.frontier_pos != (llama_pos) prefix - 1 ||
-        window.head != 0 || window.count != 0) {
+        window.head != 0 || window.count != 0 ||
+        window_1.boundary_pos != (llama_pos) prefix - 1 ||
+        window_1.frontier_pos != (llama_pos) prefix - 1 ||
+        window_1.head != 0 || window_1.count != 0) {
         fprintf(stderr, "%s: initial window metadata is wrong\n", __func__);
         return 1;
     }
 
+    if (tensor_split) {
+        if (!window.ownership_only || !window_1.ownership_only) {
+            fprintf(stderr, "%s: tensor-split windows did not enter ownership-trace mode\n",
+                    __func__);
+            return 1;
+        }
+
+        // Multi-device Gate-4 arm: validate the actual meta-tape gather/transfer
+        // against both host ring payloads, not only the echoed input metadata.
+        if (!decode_two_equal_ranges(ctx.get(), tokens, 3, 3, 2, true) ||
+            llama_dflash_window_capture_pending(ctx.get()) ||
+            !ring_is(window, 2, 0, { 3, 4 }) ||
+            !ring_is(window_1, 2, 0, { 3, 4 }) ||
+            !ownership_payload_matches(ctx.get(), window, 0, 0) ||
+            !ownership_payload_matches(ctx.get(), window, 1, 1) ||
+            !ownership_payload_matches(ctx.get(), window_1, 0, 0) ||
+            !ownership_payload_matches(ctx.get(), window_1, 1, 1)) {
+            fprintf(stderr, "%s: tensor-split payload ownership/transfer mismatch\n",
+                    __func__);
+            return 1;
+        }
+
+        llama_dflash_window_set_speculative(ctx.get(), true);
+        if (!decode_two_equal_ranges(ctx.get(), tokens, 5, 5, 3, true) ||
+            !llama_dflash_window_capture_pending(ctx.get()) ||
+            !llama_dflash_window_commit(ctx.get(), 0, 2) ||
+            !llama_dflash_window_capture_pending(ctx.get()) ||
+            !llama_dflash_window_commit(ctx.get(), 1, 1) ||
+            llama_dflash_window_capture_pending(ctx.get()) ||
+            !ring_is(window, 2, 0, { 3, 4, 5, 6 }) ||
+            !ring_is(window_1, 2, 0, { 3, 4, 5 }) ||
+            !ownership_payload_matches(ctx.get(), window, 2, 0) ||
+            !ownership_payload_matches(ctx.get(), window, 3, 1) ||
+            !ownership_payload_matches(ctx.get(), window_1, 2, 0)) {
+            fprintf(stderr, "%s: tensor-split speculative ownership mismatch\n", __func__);
+            return 1;
+        }
+        llama_dflash_window_set_speculative(ctx.get(), false);
+        fprintf(stderr,
+                "%s: PASS (tensor-split normal/speculative multi-sequence "
+                "positions and minimal-F32 payload transfers preserve ownership)\n",
+                __func__);
+        return 0;
+    }
+
     std::vector<state_piece> initial_live;
     std::vector<state_piece> initial_boundary;
-    if (!read_live_state(ctx.get(), recurrent, initial_live) ||
-        !read_window_state(ctx.get(), window.published_idx, initial_boundary) ||
+    if (!read_live_state(ctx.get(), recurrent, 0, initial_live) ||
+        !read_window_state(ctx.get(), 0, window.published_idx, initial_boundary) ||
         !states_bit_equal(initial_live, initial_boundary, "initial boundary snapshot")) {
         return 1;
     }
@@ -310,12 +512,12 @@ int main(int argc, char ** argv) {
     const int old_count = window.count;
     const auto old_record = window.records[window.head];
     std::vector<state_piece> before_fault;
-    if (!read_window_state(ctx.get(), old_published_idx, before_fault)) {
+    if (!read_window_state(ctx.get(), 0, old_published_idx, before_fault)) {
         fprintf(stderr, "%s: failed to read pre-fault boundary\n", __func__);
         return 1;
     }
 
-    llama_dflash_window_inject_publish_failure(ctx.get());
+    llama_dflash_window_inject_publish_failure_seq(ctx.get(), 0);
     if (!decode_one(ctx.get(), tokens, 6)) {
         fprintf(stderr, "%s: model decode failed while injecting publication fault\n", __func__);
         return 1;
@@ -334,7 +536,7 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<state_piece> after_fault;
-    if (!read_window_state(ctx.get(), window.published_idx, after_fault) ||
+    if (!read_window_state(ctx.get(), 0, window.published_idx, after_fault) ||
         !states_bit_equal(before_fault, after_fault, "failed publication boundary")) {
         return 1;
     }
@@ -361,8 +563,8 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<state_piece> live_final;
-    if (!read_live_state(ctx.get(), recurrent, live_final) ||
-        !llama_dflash_window_reconstruct(ctx.get(), final_pos)) {
+    if (!read_live_state(ctx.get(), recurrent, 0, live_final) ||
+        !llama_dflash_window_reconstruct_seq(ctx.get(), 0, final_pos)) {
         fprintf(stderr, "%s: failed to reconstruct the frontier after wraparound\n", __func__);
         return 1;
     }
@@ -373,14 +575,78 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<state_piece> reconstructed;
-    if (!read_window_state(ctx.get(), window.reconstructed_idx, reconstructed) ||
+    if (!read_window_state(ctx.get(), 0, window.reconstructed_idx, reconstructed) ||
         !states_bit_equal(live_final, reconstructed, "post-wrap frontier reconstruction")) {
         return 1;
     }
 
+    // Gate 4, normal path: one decode carries two contiguous tokens for each of
+    // two sequences. The fixed tape packs QKV sequence-major and routes gate/beta
+    // to per-sequence GPU tapes; both rolling rings must retain the exact owner
+    // and absolute position after their independent left-edge advances.
+    // Reverse first-owner order deliberately: recurrent split_equal emits one
+    // ubatch per owner, so the callback accumulator must join both QKV chunks
+    // into one transaction-wide packed image.
+    if (!decode_two_equal_ranges(ctx.get(), tokens, 9, 3, 2, true) ||
+        llama_dflash_window_capture_pending(ctx.get()) ||
+        !host_qkv_is_packed(ctx.get(), 2, { 0, 1 }) ||
+        !ring_is(window, 7, 2, { 8, 9, 10 }) ||
+        !ring_is(window_1, 2, 0, { 3, 4 })) {
+        fprintf(stderr, "%s: multi-token/multi-sequence normal capture routed incorrectly\n",
+                __func__);
+        return 1;
+    }
+
+    for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+        auto & seq_window = *ctx->dflash_capture->windows[seq_id];
+        std::vector<state_piece> live;
+        std::vector<state_piece> rebuilt;
+        if (!read_live_state(ctx.get(), recurrent, seq_id, live) ||
+            !llama_dflash_window_reconstruct_seq(
+                ctx.get(), seq_id, seq_window.frontier_pos) ||
+            !read_window_state(
+                ctx.get(), seq_id, seq_window.reconstructed_idx, rebuilt) ||
+            !states_bit_equal(live, rebuilt, "multi-sequence frontier reconstruction")) {
+            return 1;
+        }
+    }
+
+    // Gate 4, speculative path: decode three candidates for each owner, then
+    // commit different accepted prefixes. An undecided owner keeps staging
+    // live and blocks overwrite; rejected suffixes never receive ring metadata.
+    llama_dflash_window_set_speculative(ctx.get(), true);
+    if (!decode_two_equal_ranges(ctx.get(), tokens, 11, 5, 3, true) ||
+        !llama_dflash_window_capture_pending(ctx.get()) ||
+        !ring_is(window, 7, 2, { 8, 9, 10 }) ||
+        !ring_is(window_1, 2, 0, { 3, 4 })) {
+        fprintf(stderr, "%s: speculative candidates published before acceptance\n", __func__);
+        return 1;
+    }
+    if (decode_one(ctx.get(), tokens, 11)) {
+        fprintf(stderr, "%s: unresolved speculative staging did not block overwrite\n", __func__);
+        return 1;
+    }
+    if (!llama_dflash_window_commit(ctx.get(), 0, 2) ||
+        !llama_dflash_window_capture_pending(ctx.get()) ||
+        !host_qkv_is_packed(ctx.get(), 3, { 0, 1 }) ||
+        !ring_is(window, 9, 1, { 10, 11, 12 }) ||
+        !ring_is(window_1, 2, 0, { 3, 4 })) {
+        fprintf(stderr, "%s: first speculative owner committed the wrong prefix\n", __func__);
+        return 1;
+    }
+    if (!llama_dflash_window_commit(ctx.get(), 1, 1) ||
+        llama_dflash_window_capture_pending(ctx.get()) ||
+        !ring_is(window, 9, 1, { 10, 11, 12 }) ||
+        !ring_is(window_1, 2, 0, { 3, 4, 5 })) {
+        fprintf(stderr, "%s: speculative accept/reject ownership is wrong\n", __func__);
+        return 1;
+    }
+    llama_dflash_window_set_speculative(ctx.get(), false);
+
     fprintf(stderr,
             "%s: PASS (fault retained b=2 + record 3; wrapped window [5,8] "
-            "reconstructed live state bit-for-bit on %s)\n",
+            "reconstructed live state bit-for-bit; normal multi-token/multi-seq "
+            "and speculative accept/reject preserved ownership on %s)\n",
             __func__, gpu_name);
     return 0;
 }

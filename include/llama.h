@@ -1220,26 +1220,52 @@ extern "C" {
     // the default. The mode currently targets single-device GPU replay only.
     LLAMA_API void llama_set_tape_minimal_replay(struct llama_context * ctx, bool enable);
 
-    // WS-2 Gate-3 rolling-window prototype (single GPU / single sequence).
-    // Enable snapshots the recurrent state at the sequence's current frontier as
-    // boundary b. Subsequent one-token normal decodes append minimal-F32 records.
+    // WS-2 rolling-window prototype. Each enable snapshots one sequence's
+    // recurrent state at its current frontier as boundary b. Multiple sequences
+    // may be enabled independently; normal multi-token decode appends records in
+    // absolute-position order. Tensor-split contexts use this Gate-4 API as a
+    // bounded device-to-host ownership trace only: replay/left-edge advance is
+    // intentionally unavailable until cross-device arithmetic is separately gated.
     LLAMA_API bool llama_dflash_window_enable(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             int                    capacity);
 
-    // A publication fault leaves the decoded token staged in the fixed tape and
-    // blocks further windowed decodes until this retry succeeds.
+    // Select whether the next windowed decode is a speculative verification.
+    // In speculative mode the decoded records stay staged until commit reports
+    // the accepted prefix for every participating sequence; rejected suffixes
+    // are discarded and never become durable ring entries. This only commits
+    // the tape window; the caller must still perform its ordinary live-cache
+    // rollback before the next decode.
+    LLAMA_API void llama_dflash_window_set_speculative(
+            struct llama_context * ctx,
+            bool                   speculative);
+    LLAMA_API bool llama_dflash_window_commit(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int                    n_accepted);
+
+    // A publication/copy fault leaves the undecided or uncommitted records in
+    // fixed-tape staging and blocks another windowed decode until retry succeeds.
     LLAMA_API bool llama_dflash_window_capture_pending(struct llama_context * ctx);
     LLAMA_API bool llama_dflash_window_retry_capture(struct llama_context * ctx);
 
     // One-shot Gate-3 test fault: fail after private boundary computation/fence,
     // immediately before logical publication.
     LLAMA_API void llama_dflash_window_inject_publish_failure(struct llama_context * ctx);
+    LLAMA_API void llama_dflash_window_inject_publish_failure_seq(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id);
 
     // Reconstruct recurrent state at pos into the non-published boundary copy.
     // This is a prototype/test oracle and does not mutate the live recurrent cache.
-    LLAMA_API bool llama_dflash_window_reconstruct(struct llama_context * ctx, llama_pos pos);
+    LLAMA_API bool llama_dflash_window_reconstruct(
+            struct llama_context * ctx,
+            llama_pos              pos);
+    LLAMA_API bool llama_dflash_window_reconstruct_seq(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos);
 
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:

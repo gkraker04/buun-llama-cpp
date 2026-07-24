@@ -57,7 +57,7 @@ void build_dflash_tape_copies(ggml_context * ctx0, ggml_cgraph * gf, const llama
 
         // qkv staging (tensor split): conv-rebuild source, replaces the eval-callback
         // capture whose meta get_tensor gather misorders the segmented channels
-        if (tl.qkv && n_seqs == 1) {
+        if (tl.qkv) {
             ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed,
                 qkv_mixed->ne[0], n_seq_tokens, qkv_mixed->nb[1], s * qkv_mixed->nb[2]);
             ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);

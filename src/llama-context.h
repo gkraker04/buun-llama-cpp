@@ -79,8 +79,8 @@ struct dflash_tape_gpu {
     int max_tokens = 0;                         // allocated capacity
     int n_tokens = 0;                           // actual tokens recorded this pass
 
-    // qkv is graph-staged for this tape (single-seq staged decodes bypass the eval
-    // callback entirely) — the one predicate every staging consumer must agree on
+    // qkv is graph-staged per sequence for this tape. In a multi-sequence
+    // ubatch, every participating tape receives its own [channels, tokens] slice.
     bool qkv_staged() const {
         return !layers.empty() && layers[0].qkv != nullptr;
     }
@@ -110,6 +110,9 @@ struct dflash_window_layer {
 
 struct dflash_window {
     bool enabled = false;
+    // Tensor-split Gate-4 mode captures/validates minimal payload ownership in
+    // host storage. It deliberately does not claim cross-device exact replay.
+    bool ownership_only = false;
     llama_seq_id seq_id = -1;
     int capacity = 0;
     int head = 0;
@@ -117,12 +120,6 @@ struct dflash_window {
     llama_pos boundary_pos = -1;
     llama_pos frontier_pos = -1;
     int published_idx = 0;
-
-    // A failed append retains the just-decoded token in the fixed tape staging
-    // buffers and blocks the next decode until retry succeeds.
-    bool capture_pending = false;
-    llama_pos pending_pos = -1;
-    llama_seq_id pending_seq_id = -1;
 
     // One-shot fault point: after private GPU state is complete and fenced, but
     // before published_idx / boundary_pos / head / count commit.
@@ -147,6 +144,41 @@ struct dflash_window {
         if (scratch) ggml_backend_buffer_free(scratch);
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
+    }
+};
+
+// Gate-4 capture is a two-phase transaction. A successful decode first records
+// the absolute positions and their sequence owners here while the fixed per-seq
+// GPU tapes still hold the payload. Normal decode assigns commit_count eagerly;
+// speculative verification leaves it unset until the caller reports acceptance.
+struct dflash_window_pending_seq {
+    llama_seq_id seq_id = -1;
+    std::vector<llama_pos> positions;
+    int commit_count = -1;
+    int copied_count = 0;
+};
+
+struct dflash_window_pending {
+    bool active = false;
+    bool speculative = false;
+    bool qkv_materialized = false;
+    bool qkv_capture_failed = false;
+    std::vector<dflash_window_pending_seq> seqs;
+    // Decode-scoped callback accumulation. Each layer is preallocated as one
+    // packed [channels, tokens, pending owners] image before model mutation;
+    // qkv_received is [layer][owner] and permits owners to arrive in separate
+    // recurrent-memory ubatches without sharing/overwriting callback storage.
+    std::vector<dflash_tape_layer> qkv_layers;
+    std::vector<int> qkv_received;
+
+    void clear() {
+        active = false;
+        speculative = false;
+        qkv_materialized = false;
+        qkv_capture_failed = false;
+        seqs.clear();
+        qkv_layers.clear();
+        qkv_received.clear();
     }
 };
 
@@ -183,7 +215,15 @@ struct dflash_capture_data {
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
-    std::unique_ptr<dflash_window> window;           // Gate-3 rolling-window prototype
+    // One independent rolling boundary/ring per sequence. Payload ownership is
+    // still redundantly stamped into every physical record and checked on use.
+    std::vector<std::unique_ptr<dflash_window>> windows;
+    // Private decode-scoped accumulator. It is moved into window_pending only
+    // after the complete forward succeeds, so callbacks from separate ubatches
+    // cannot last-write-win the shared legacy tape_layers buffer.
+    dflash_window_pending window_staging;
+    dflash_window_pending window_pending;
+    bool window_speculative_capture = false;
 
     // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
     // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
@@ -219,8 +259,10 @@ struct dflash_capture_data {
     bool stage_active = false;
     int stage_n_tokens = 0;
 
-    // tokens covered by the graph-staged qkv tape copies in the last tape-enabled decode
-    // (0 = staging did not cover it; the eval-callback capture holds the data instead)
+    // Per-sequence tokens captured by the fixed GPU tape in the last covered
+    // ubatch. This includes single-device CUDA, where QKV arrives through the
+    // eval callback. Consumers that specifically require device-staged QKV must
+    // additionally test dflash_tape_gpu::qkv_staged().
     int tape_stage_n_tokens = 0;
 
     dflash_tape_gpu * active_tape() const {
@@ -685,10 +727,14 @@ public:
     void set_tape_recording(bool enable);
     void set_tape_minimal_replay(bool enable);
     bool dflash_window_enable(llama_seq_id seq_id, int capacity);
-    bool dflash_window_capture_last(llama_seq_id seq_id, llama_pos pos);
+    dflash_window * dflash_window_for_seq(llama_seq_id seq_id) const;
+    bool dflash_window_stage_decode(
+            dflash_window_pending && staged,
+            bool speculative);
+    bool dflash_window_commit(llama_seq_id seq_id, int n_accepted);
     bool dflash_window_retry_capture();
-    bool dflash_window_reconstruct(llama_pos pos);
-    void dflash_window_inject_publish_failure();
+    bool dflash_window_reconstruct(llama_seq_id seq_id, llama_pos pos);
+    void dflash_window_inject_publish_failure(llama_seq_id seq_id);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,

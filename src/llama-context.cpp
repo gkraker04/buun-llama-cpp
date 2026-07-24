@@ -1237,6 +1237,94 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
     dflash_read_tensor_to(t, dst.data(), n_floats);
 }
 
+// For equal-sequence ubatches, graph tensor axis order follows the sequence-set
+// order chosen by split_equal(), which is not necessarily seq_id_unq's sorted
+// order. Rolling-window ownership must follow tensor axes, not the sorted set.
+static llama_seq_id dflash_ubatch_axis_seq(
+        const llama_ubatch * ub,
+        uint32_t             axis) {
+    if (!ub || axis >= ub->n_seqs) {
+        return -1;
+    }
+    const size_t token_idx = (size_t) axis * ub->n_seq_tokens;
+    if (ub->b_equal_seqs && token_idx < ub->n_tokens &&
+        ub->n_seq_id[token_idx] == 1) {
+        return ub->seq_id[token_idx][0];
+    }
+    return axis < ub->n_seqs_unq ? ub->seq_id_unq[axis] : -1;
+}
+
+static void dflash_window_accumulate_qkv(
+        dflash_capture_data *   cap,
+        int                     layer_idx,
+        const dflash_tape_layer & src) {
+    auto & staged = cap->window_staging;
+    if (!staged.active || staged.qkv_layers.empty() ||
+        staged.qkv_capture_failed) {
+        return;
+    }
+
+    auto fail = [&](const char * reason) {
+        LLAMA_LOG_ERROR(
+            "%s: layer %d rejected callback QKV chunk: %s\n",
+            __func__, layer_idx, reason);
+        staged.qkv_capture_failed = true;
+    };
+
+    const size_t n_owners = staged.seqs.size();
+    if (layer_idx < 0 || layer_idx >= (int) staged.qkv_layers.size() ||
+        n_owners == 0 ||
+        staged.qkv_received.size() != staged.qkv_layers.size() * n_owners) {
+        fail("invalid decode-scoped accumulator geometry");
+        return;
+    }
+
+    auto & dst = staged.qkv_layers[layer_idx];
+    if (src.conv_channels != dst.conv_channels ||
+        src.n_tokens <= 0 ||
+        src.n_seqs <= 0 ||
+        src.qkv_mixed.size() !=
+            (size_t) src.conv_channels * src.n_tokens * src.n_seqs ||
+        dst.qkv_mixed.size() !=
+            (size_t) dst.conv_channels * dst.n_tokens * dst.n_seqs) {
+        fail("callback/source dimensions disagree with preallocated image");
+        return;
+    }
+
+    for (int src_axis = 0; src_axis < src.n_seqs; ++src_axis) {
+        const llama_seq_id seq_id = src.seq_ids[src_axis];
+        const auto owner = std::find_if(
+            staged.seqs.begin(), staged.seqs.end(),
+            [seq_id](const dflash_window_pending_seq & seq) {
+                return seq.seq_id == seq_id;
+            });
+        if (owner == staged.seqs.end()) {
+            fail("callback owner is absent from the pending transaction");
+            return;
+        }
+        const size_t dst_axis =
+            (size_t) std::distance(staged.seqs.begin(), owner);
+        int & received =
+            staged.qkv_received[(size_t) layer_idx * n_owners + dst_axis];
+        if (received < 0 || received + src.n_tokens > dst.n_tokens) {
+            fail("callback owner supplied duplicate or excess tokens");
+            return;
+        }
+
+        const size_t chunk_elems =
+            (size_t) src.conv_channels * src.n_tokens;
+        const size_t src_off = (size_t) src_axis * chunk_elems;
+        const size_t dst_off =
+            ((size_t) dst_axis * dst.n_tokens + received) *
+            (size_t) dst.conv_channels;
+        std::memcpy(
+            dst.qkv_mixed.data() + dst_off,
+            src.qkv_mixed.data() + src_off,
+            chunk_elems * sizeof(float));
+        received += src.n_tokens;
+    }
+}
+
 // DFlash eval callback: captures hidden state tensors + tape data during graph execution
 // without modifying the compute graph (zero FP impact on model computation)
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -1261,10 +1349,23 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                 if (it == cap->tape_name_map.end() || it->second.second != DFLASH_TAPE_QKV) {
                     return false;
                 }
-                // Tensor split: QKV is graph-staged too (single-seq) — the callback's
-                // meta get_tensor gather would misorder the segmented channels, and the
-                // chop would force a per-layer all-device sync
-                return !(cap->active_tape()->qkv_staged() && n_seqs_unq <= 1);
+                // Tensor split: QKV is graph-staged into every participating
+                // sequence's own split-aware tape. The callback's inferred meta
+                // gather can misorder segmented channels, so use it only when
+                // at least one owner lacks authoritative staging.
+                bool all_qkv_staged = ub && n_seqs_unq > 0;
+                for (uint32_t s = 0; all_qkv_staged && s < n_seqs_unq; ++s) {
+                    const llama_seq_id seq_id =
+                        cap->window_staging.active
+                            ? dflash_ubatch_axis_seq(ub, s)
+                            : ub->seq_id_unq[s];
+                    all_qkv_staged =
+                        seq_id >= 0 &&
+                        seq_id < (llama_seq_id) cap->tapes.size() &&
+                        cap->tapes[seq_id] &&
+                        cap->tapes[seq_id]->qkv_staged();
+                }
+                return !all_qkv_staged;
             }
             // CPU tape fallback: no multi-seq support
             if (n_seqs_unq > 1) {
@@ -1379,13 +1480,21 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                     if (ub && n_seqs_unq > 1) {
                         tape.n_seqs = std::min((int) n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
                         for (int s = 0; s < tape.n_seqs; ++s) {
-                            tape.seq_ids[s] = ub->seq_id_unq[s];
+                            tape.seq_ids[s] =
+                                cap->window_staging.active
+                                    ? dflash_ubatch_axis_seq(ub, s)
+                                    : ub->seq_id_unq[s];
                         }
                     } else {
                         tape.n_seqs = 1;
-                        tape.seq_ids[0] = ub ? ub->seq_id_unq[0] : 0;
+                        tape.seq_ids[0] = ub
+                            ? (cap->window_staging.active
+                                ? dflash_ubatch_axis_seq(ub, 0)
+                                : ub->seq_id_unq[0])
+                            : 0;
                     }
                     dflash_read_tensor(t, tape.qkv_mixed, n_elem);
+                    dflash_window_accumulate_qkv(cap, layer_idx, tape);
                     break;
             }
             return true;
@@ -1933,9 +2042,9 @@ static ggml_backend_dev_t dflash_tensor_device(const ggml_tensor * tensor) {
 
 static bool dflash_window_copy_boundary(
         llama_context * ctx,
+        dflash_window &  window,
         int             src_idx,
         int             dst_idx) {
-    auto & window = *ctx->dflash_capture->window;
     if (src_idx == dst_idx) {
         return true;
     }
@@ -1953,10 +2062,9 @@ static bool dflash_window_copy_boundary(
 // conv-window shift written into the same private copy.
 static bool dflash_window_apply_record(
         llama_context * ctx,
+        dflash_window &  window,
         int             record_slot,
         int             dst_idx) {
-    auto & cap = *ctx->dflash_capture;
-    auto & window = *cap.window;
     const auto & hparams = ctx->get_model().hparams;
     const int n_rec = (int) window.layer_ids.size();
     ggml_backend_t gpu_backend = ctx->find_gpu_backend();
@@ -2077,8 +2185,9 @@ static bool dflash_window_apply_record(
     return status == GGML_STATUS_SUCCESS;
 }
 
-static bool dflash_window_advance_boundary(llama_context * ctx) {
-    auto & window = *ctx->dflash_capture->window;
+static bool dflash_window_advance_boundary(
+        llama_context * ctx,
+        dflash_window &  window) {
     if (window.count <= 0) {
         return false;
     }
@@ -2094,8 +2203,8 @@ static bool dflash_window_advance_boundary(llama_context * ctx) {
     }
 
     const int private_idx = 1 - window.published_idx;
-    if (!dflash_window_copy_boundary(ctx, window.published_idx, private_idx) ||
-        !dflash_window_apply_record(ctx, record_slot, private_idx)) {
+    if (!dflash_window_copy_boundary(ctx, window, window.published_idx, private_idx) ||
+        !dflash_window_apply_record(ctx, window, record_slot, private_idx)) {
         return false;
     }
 
@@ -2123,8 +2232,17 @@ static bool dflash_window_advance_boundary(llama_context * ctx) {
     return true;
 }
 
+dflash_window * llama_context::dflash_window_for_seq(llama_seq_id seq_id) const {
+    if (!dflash_capture || seq_id < 0 ||
+        seq_id >= (llama_seq_id) dflash_capture->windows.size()) {
+        return nullptr;
+    }
+    return dflash_capture->windows[seq_id].get();
+}
+
 bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
     if (!dflash_capture || !dflash_capture->tape_enabled ||
+        dflash_capture->window_pending.active ||
         seq_id < 0 || seq_id >= (llama_seq_id) dflash_capture->tapes.size() ||
         !dflash_capture->tapes[seq_id] || capacity <= 0) {
         return false;
@@ -2132,8 +2250,12 @@ bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
 
     auto * mem_recurrent = get_recurrent_mem(memory.get());
     ggml_backend_t gpu_backend = find_gpu_backend();
-    if (!mem_recurrent || !gpu_backend ||
-        !dflash_states_on_one_device(model.hparams, mem_recurrent) ||
+    ggml_backend_t meta_backend = find_meta_backend();
+    const bool exact_single_gpu =
+        mem_recurrent && gpu_backend &&
+        dflash_states_on_one_device(model.hparams, mem_recurrent);
+    const bool ownership_only = !exact_single_gpu && meta_backend;
+    if (!mem_recurrent || (!exact_single_gpu && !ownership_only) ||
         seq_id < 0 || (uint32_t) seq_id >= mem_recurrent->size) {
         return false;
     }
@@ -2147,12 +2269,14 @@ bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     const int n_rec = (int) rec_ids.size();
-    const ggml_backend_dev_t gpu_dev = ggml_backend_get_device(gpu_backend);
+    const ggml_backend_dev_t gpu_dev =
+        exact_single_gpu ? ggml_backend_get_device(gpu_backend) : nullptr;
     if (n_rec == 0) {
         return false;
     }
 
     auto window = std::make_unique<dflash_window>();
+    window->ownership_only = ownership_only;
     window->seq_id = seq_id;
     window->capacity = capacity;
     window->records.resize(capacity);
@@ -2174,7 +2298,9 @@ bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
         }
     }
 
-    const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_rec * 7 + 4);
+    const size_t tensors_per_layer = ownership_only ? 3 : 7;
+    const size_t ctx_mem =
+        ggml_tensor_overhead() * ((size_t) n_rec * tensors_per_layer + 4);
     ggml_init_params params = { ctx_mem, nullptr, true };
     window->ctx = ggml_init(params);
     if (!window->ctx) {
@@ -2190,9 +2316,9 @@ bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
             r_live->type != GGML_TYPE_F32 ||
             s_live->type != GGML_TYPE_F32 ||
             conv_kernel->type != GGML_TYPE_F32 ||
-            dflash_tensor_device(r_live) != gpu_dev ||
-            dflash_tensor_device(s_live) != gpu_dev ||
-            dflash_tensor_device(conv_kernel) != gpu_dev ||
+            (!ownership_only && dflash_tensor_device(r_live) != gpu_dev) ||
+            (!ownership_only && dflash_tensor_device(s_live) != gpu_dev) ||
+            (!ownership_only && dflash_tensor_device(conv_kernel) != gpu_dev) ||
             conv_kernel->ne[0] <= 1 ||
             hparams.n_embd_r() % (conv_kernel->ne[0] - 1) != 0 ||
             (int64_t) hparams.n_embd_s() !=
@@ -2215,191 +2341,550 @@ bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
             window->ctx, GGML_TYPE_F32, H_v, capacity);
         layer.beta = ggml_new_tensor_2d(
             window->ctx, GGML_TYPE_F32, H_v, capacity);
-        for (int copy = 0; copy < 2; ++copy) {
-            layer.r[copy] = ggml_new_tensor_1d(
-                window->ctx, GGML_TYPE_F32, hparams.n_embd_r());
-            layer.s[copy] = ggml_new_tensor_1d(
-                window->ctx, GGML_TYPE_F32, hparams.n_embd_s());
+        if (!ownership_only) {
+            for (int copy = 0; copy < 2; ++copy) {
+                layer.r[copy] = ggml_new_tensor_1d(
+                    window->ctx, GGML_TYPE_F32, hparams.n_embd_r());
+                layer.s[copy] = ggml_new_tensor_1d(
+                    window->ctx, GGML_TYPE_F32, hparams.n_embd_s());
+            }
         }
         ggml_format_name(layer.qkv, "dflash_window_qkv_l%d", il);
         ggml_format_name(layer.gate, "dflash_window_gate_l%d", il);
         ggml_format_name(layer.beta, "dflash_window_beta_l%d", il);
     }
 
-    window->buf = ggml_backend_alloc_ctx_tensors(window->ctx, gpu_backend);
+    window->buf = ggml_backend_alloc_ctx_tensors(
+        window->ctx, ownership_only ? backend_cpu : gpu_backend);
     if (!window->buf) {
         return false;
     }
 
     const auto & cell = mem_recurrent->cells[tail];
-    const uint32_t base_row = cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail;
-    const uint32_t row = mem_recurrent->rs_idx[seq_id] * mem_recurrent->size + base_row;
-
-    const size_t copy_ctx_mem =
-        ggml_tensor_overhead() * ((size_t) n_rec * 2 + 2);
-    ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
-    ggml_context * copy_ctx = ggml_init(copy_params);
-    if (!copy_ctx) {
-        return false;
+    if (!ownership_only) {
+        const uint32_t base_row =
+            cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail;
+        const uint32_t row =
+            mem_recurrent->rs_idx[seq_id] * mem_recurrent->size + base_row;
+        const size_t copy_ctx_mem =
+            ggml_tensor_overhead() * ((size_t) n_rec * 2 + 2);
+        ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
+        ggml_context * copy_ctx = ggml_init(copy_params);
+        if (!copy_ctx) {
+            return false;
+        }
+        for (int li = 0; li < n_rec; ++li) {
+            const int il = rec_ids[li];
+            ggml_tensor * r_live = mem_recurrent->r_l[il];
+            ggml_tensor * s_live = mem_recurrent->s_l[il];
+            ggml_tensor * r_src = ggml_view_1d(
+                copy_ctx, r_live, r_live->ne[0], (size_t) row * r_live->nb[1]);
+            ggml_tensor * s_src = ggml_view_1d(
+                copy_ctx, s_live, s_live->ne[0], (size_t) row * s_live->nb[1]);
+            r_src->buffer = r_live->buffer;
+            s_src->buffer = s_live->buffer;
+            ggml_backend_tensor_copy(r_src, window->layers[li].r[0]);
+            ggml_backend_tensor_copy(s_src, window->layers[li].s[0]);
+        }
+        ggml_free(copy_ctx);
+        ggml_backend_synchronize(gpu_backend);
     }
-    for (int li = 0; li < n_rec; ++li) {
-        const int il = rec_ids[li];
-        ggml_tensor * r_live = mem_recurrent->r_l[il];
-        ggml_tensor * s_live = mem_recurrent->s_l[il];
-        ggml_tensor * r_src = ggml_view_1d(
-            copy_ctx, r_live, r_live->ne[0], (size_t) row * r_live->nb[1]);
-        ggml_tensor * s_src = ggml_view_1d(
-            copy_ctx, s_live, s_live->ne[0], (size_t) row * s_live->nb[1]);
-        r_src->buffer = r_live->buffer;
-        s_src->buffer = s_live->buffer;
-        ggml_backend_tensor_copy(r_src, window->layers[li].r[0]);
-        ggml_backend_tensor_copy(s_src, window->layers[li].s[0]);
-    }
-    ggml_free(copy_ctx);
-    ggml_backend_synchronize(gpu_backend);
 
     window->boundary_pos = cell.pos;
     window->frontier_pos = cell.pos;
     window->published_idx = 0;
     window->enabled = true;
-    dflash_capture->window = std::move(window);
+    if (dflash_capture->windows.size() <= (size_t) seq_id) {
+        dflash_capture->windows.resize((size_t) seq_id + 1);
+    }
+    dflash_capture->windows[seq_id] = std::move(window);
     return true;
 }
 
-bool llama_context::dflash_window_capture_last(llama_seq_id seq_id, llama_pos pos) {
-    if (!dflash_capture || !dflash_capture->window ||
-        !dflash_capture->window->enabled) {
-        return false;
-    }
-    auto & window = *dflash_capture->window;
-    if (seq_id != window.seq_id || pos != window.frontier_pos + 1) {
-        return false;
-    }
-    auto retain_staged = [&]() {
-        window.capture_pending = true;
-        window.pending_seq_id = seq_id;
-        window.pending_pos = pos;
-        return false;
-    };
+static int dflash_window_tape_seq_axis(
+        const dflash_tape_layer & tape,
+        llama_seq_id              seq_id);
 
-    // The fixed tape is the incoming-record staging area. Synchronize before
-    // reading it; on failure it remains intact for retry.
-    synchronize();
+static bool dflash_window_materialize_qkv(
+        llama_context *         ctx,
+        dflash_window_pending & pending) {
+    auto & cap = *ctx->dflash_capture;
+    if (pending.qkv_materialized) {
+        return true;
+    }
+    if (pending.seqs.empty() || cap.tape_layers.empty()) {
+        LLAMA_LOG_ERROR("%s: no pending owners or recurrent tape layers\n", __func__);
+        return false;
+    }
+    if (pending.seqs.size() > LLAMA_DFLASH_MAX_SLOTS) {
+        LLAMA_LOG_ERROR("%s: %zu pending owners exceed the packed-tape limit %d\n",
+            __func__, pending.seqs.size(), LLAMA_DFLASH_MAX_SLOTS);
+        return false;
+    }
+
+    const int n_tokens = (int) pending.seqs.front().positions.size();
+    if (n_tokens <= 0) {
+        LLAMA_LOG_ERROR("%s: pending owner has no token positions\n", __func__);
+        return false;
+    }
+    for (const auto & seq : pending.seqs) {
+        if ((int) seq.positions.size() != n_tokens ||
+            seq.seq_id < 0 ||
+            seq.seq_id >= (llama_seq_id) cap.tapes.size() ||
+            !cap.tapes[seq.seq_id]) {
+            LLAMA_LOG_ERROR(
+                "%s: invalid pending owner seq=%d tokens=%zu (expected %d)\n",
+                __func__, seq.seq_id, seq.positions.size(), n_tokens);
+            return false;
+        }
+    }
+
+    bool any_staged = false;
+    bool all_staged = true;
+    for (const auto & seq : pending.seqs) {
+        const bool staged = cap.tapes[seq.seq_id]->qkv_staged();
+        any_staged |= staged;
+        all_staged &= staged;
+    }
+    if (any_staged != all_staged) {
+        LLAMA_LOG_ERROR("%s: participating sequences mix staged and callback QKV\n", __func__);
+        return false;
+    }
+
+    if (!all_staged) {
+        // Callback QKV can arrive as one ubatch per sequence. It accumulated
+        // into a detached packed image during the decode; validate every
+        // layer/owner before publishing any of it to the legacy host tape.
+        if (pending.qkv_capture_failed ||
+            pending.qkv_layers.size() != cap.tape_layers.size() ||
+            pending.qkv_received.size() !=
+                pending.qkv_layers.size() * pending.seqs.size()) {
+            LLAMA_LOG_ERROR(
+                "%s: callback QKV accumulator is incomplete or failed\n",
+                __func__);
+            return false;
+        }
+        for (size_t li = 0; li < pending.qkv_layers.size(); ++li) {
+            const auto & tape = pending.qkv_layers[li];
+            if (tape.n_tokens != n_tokens ||
+                tape.n_seqs != (int) pending.seqs.size() ||
+                tape.conv_channels <= 0 ||
+                tape.qkv_mixed.size() !=
+                    (size_t) tape.conv_channels * n_tokens * tape.n_seqs) {
+                LLAMA_LOG_ERROR(
+                    "%s: layer %zu callback QKV geometry mismatch "
+                    "(tokens=%d/%d, seqs=%d/%zu, channels=%" PRId64 ", floats=%zu)\n",
+                    __func__, li, tape.n_tokens, n_tokens,
+                    tape.n_seqs, pending.seqs.size(), tape.conv_channels,
+                    tape.qkv_mixed.size());
+                return false;
+            }
+            for (size_t s = 0; s < pending.seqs.size(); ++s) {
+                if (tape.seq_ids[s] != pending.seqs[s].seq_id ||
+                    pending.qkv_received[
+                        li * pending.seqs.size() + s] != n_tokens) {
+                    LLAMA_LOG_ERROR(
+                        "%s: layer %zu callback QKV incomplete for seq %d "
+                        "(received=%d/%d)\n",
+                        __func__, li, pending.seqs[s].seq_id,
+                        pending.qkv_received[
+                            li * pending.seqs.size() + s],
+                        n_tokens);
+                    return false;
+                }
+            }
+        }
+
+        // Vector swaps and scalar metadata writes cannot allocate. Only now,
+        // after complete validation, publish the transaction-wide packed image.
+        for (size_t li = 0; li < pending.qkv_layers.size(); ++li) {
+            auto & src = pending.qkv_layers[li];
+            auto & dst = cap.tape_layers[li];
+            dst.qkv_mixed.swap(src.qkv_mixed);
+            dst.conv_channels = src.conv_channels;
+            dst.n_tokens = src.n_tokens;
+            dst.n_seqs = src.n_seqs;
+            for (int s = 0; s < src.n_seqs; ++s) {
+                dst.seq_ids[s] = src.seq_ids[s];
+            }
+        }
+        pending.qkv_layers.clear();
+        pending.qkv_received.clear();
+        pending.qkv_materialized = true;
+        return true;
+    }
+
+    // Tensor split: every sequence owns an authoritative named QKV tape. Gather
+    // all owners into detached layer buffers first, then publish the packed host
+    // image as one transaction so no per-sequence materialization can clobber it.
+    struct staged_layer {
+        int64_t conv_channels = 0;
+        std::vector<float> qkv_mixed;
+    };
+    std::vector<staged_layer> staged;
+    try {
+        staged.resize(cap.tape_layers.size());
+        for (size_t li = 0; li < cap.tape_layers.size(); ++li) {
+            auto & layer = staged[li];
+            for (size_t s = 0; s < pending.seqs.size(); ++s) {
+                const llama_seq_id seq_id = pending.seqs[s].seq_id;
+                auto & tape_gpu = *cap.tapes[seq_id];
+                if (li >= tape_gpu.layers.size() || !tape_gpu.layers[li].qkv) {
+                    LLAMA_LOG_ERROR(
+                        "%s: layer %zu seq %d has no staged QKV tensor\n",
+                        __func__, li, seq_id);
+                    return false;
+                }
+                ggml_tensor * qkv = tape_gpu.layers[li].qkv;
+                if (qkv->ne[1] < n_tokens ||
+                    (layer.conv_channels != 0 &&
+                     layer.conv_channels != qkv->ne[0])) {
+                    LLAMA_LOG_ERROR(
+                        "%s: layer %zu seq %d staged QKV shape mismatch "
+                        "(channels=%" PRId64 ", capacity=%" PRId64 ", tokens=%d)\n",
+                        __func__, li, seq_id, qkv->ne[0], qkv->ne[1], n_tokens);
+                    return false;
+                }
+                if (layer.conv_channels == 0) {
+                    layer.conv_channels = qkv->ne[0];
+                    layer.qkv_mixed.resize(
+                        (size_t) layer.conv_channels * n_tokens *
+                        pending.seqs.size());
+                }
+                float * dst = layer.qkv_mixed.data() +
+                    s * (size_t) layer.conv_channels * n_tokens;
+                ggml_backend_tensor_get(
+                    qkv, dst, 0, (size_t) n_tokens * qkv->nb[1]);
+            }
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: could not allocate packed QKV staging: %s\n",
+            __func__, err.what());
+        return false;
+    }
+
+    for (size_t li = 0; li < staged.size(); ++li) {
+        auto & tape = cap.tape_layers[li];
+        tape.qkv_mixed.swap(staged[li].qkv_mixed);
+        tape.conv_channels = staged[li].conv_channels;
+        tape.n_tokens = n_tokens;
+        tape.n_seqs = (int) pending.seqs.size();
+        for (size_t s = 0; s < pending.seqs.size(); ++s) {
+            tape.seq_ids[s] = pending.seqs[s].seq_id;
+        }
+    }
+    pending.qkv_materialized = true;
+    return true;
+}
+
+static int dflash_window_tape_seq_axis(
+        const dflash_tape_layer & tape,
+        llama_seq_id              seq_id) {
+    for (int s = 0; s < tape.n_seqs; ++s) {
+        if (tape.seq_ids[s] == seq_id) {
+            return s;
+        }
+    }
+    return -1;
+}
+
+static bool dflash_window_append_staged(
+        llama_context * ctx,
+        dflash_window &  window,
+        llama_pos       pos,
+        int             source_token) {
+    auto & cap = *ctx->dflash_capture;
+    const llama_seq_id seq_id = window.seq_id;
     dflash_tape_gpu * tape_gpu =
-        seq_id >= 0 && seq_id < (llama_seq_id) dflash_capture->tapes.size()
-            ? dflash_capture->tapes[seq_id].get()
+        seq_id >= 0 && seq_id < (llama_seq_id) cap.tapes.size()
+            ? cap.tapes[seq_id].get()
             : nullptr;
     if (!tape_gpu) {
-        return retain_staged();
+        LLAMA_LOG_ERROR("%s: seq %d has no fixed GPU tape\n", __func__, seq_id);
+        return false;
     }
-    for (const auto & tape : dflash_capture->tape_layers) {
-        if (tape.n_tokens != 1 ||
-            tape.n_seqs != 1 ||
-            tape.seq_ids[0] != seq_id ||
-            tape.conv_channels <= 0 ||
-            tape.qkv_mixed.size() != (size_t) tape.conv_channels) {
-            return retain_staged();
-        }
+    if (pos != window.frontier_pos + 1) {
+        LLAMA_LOG_ERROR(
+            "%s: seq %d non-contiguous record pos=%d after frontier=%d\n",
+            __func__, seq_id, pos, window.frontier_pos);
+        return false;
     }
 
     for (size_t li = 0; li < window.layers.size(); ++li) {
         const int gpu_li = window.gpu_layer_indices[li];
-        const auto & host = dflash_capture->tape_layers[li];
+        const auto & host = cap.tape_layers[li];
         const auto & dst = window.layers[li];
-        if (gpu_li < 0 || gpu_li >= (int) tape_gpu->layers.size() ||
-            dst.qkv->ne[0] != host.conv_channels ||
+        const int seq_axis = dflash_window_tape_seq_axis(host, seq_id);
+        if (gpu_li < 0 || gpu_li >= (int) tape_gpu->layers.size()) {
+            LLAMA_LOG_ERROR(
+                "%s: seq %d layer %zu has invalid GPU tape index %d/%zu\n",
+                __func__, seq_id, li, gpu_li, tape_gpu->layers.size());
+            return false;
+        }
+        if (source_token < 0 || source_token >= host.n_tokens) {
+            LLAMA_LOG_ERROR(
+                "%s: seq %d layer %zu source token %d outside host tape length %d\n",
+                __func__, seq_id, li, source_token, host.n_tokens);
+            return false;
+        }
+        if (seq_axis < 0) {
+            LLAMA_LOG_ERROR(
+                "%s: seq %d layer %zu absent from packed host QKV\n",
+                __func__, seq_id, li);
+            return false;
+        }
+        if (host.conv_channels <= 0 ||
+            host.qkv_mixed.size() !=
+                (size_t) host.conv_channels * host.n_tokens * host.n_seqs) {
+            LLAMA_LOG_ERROR(
+                "%s: layer %zu invalid packed QKV geometry "
+                "(channels=%" PRId64 ", tokens=%d, seqs=%d, floats=%zu)\n",
+                __func__, li, host.conv_channels, host.n_tokens,
+                host.n_seqs, host.qkv_mixed.size());
+            return false;
+        }
+        if (dst.qkv->ne[0] != host.conv_channels ||
             dst.gate->ne[0] != tape_gpu->layers[gpu_li].gate->ne[1] ||
             dst.beta->ne[0] != tape_gpu->layers[gpu_li].beta->ne[1]) {
-            return retain_staged();
+            LLAMA_LOG_ERROR(
+                "%s: seq %d layer %zu ring/fixed-tape dimensions disagree\n",
+                __func__, seq_id, li);
+            return false;
         }
     }
 
-    // Allocate every host descriptor needed for the incoming payload before a
-    // full ring can advance. Thus allocation failure also leaves [b,f] intact.
-    const size_t copy_ctx_mem =
-        ggml_tensor_overhead() * (window.layers.size() * 4 + 2);
-    ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
-    ggml_context * copy_ctx = ggml_init(copy_params);
-    if (!copy_ctx) {
-        return retain_staged();
+    ggml_context * copy_ctx = nullptr;
+    if (!window.ownership_only) {
+        // Allocate every host descriptor before a full ring may advance. If the
+        // advance or copy then fails, the pending descriptor continues to own
+        // the fixed tape and blocks another decode from overwriting it.
+        const size_t copy_ctx_mem =
+            ggml_tensor_overhead() * (window.layers.size() * 4 + 2);
+        ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
+        copy_ctx = ggml_init(copy_params);
+        if (!copy_ctx) {
+            LLAMA_LOG_ERROR("%s: could not allocate copy descriptors for seq %d\n",
+                __func__, seq_id);
+            return false;
+        }
     }
 
-    if (window.count == window.capacity &&
-        !dflash_window_advance_boundary(this)) {
-        ggml_free(copy_ctx);
-        return retain_staged();
+    if (window.count == window.capacity) {
+        // Tensor-split Gate-4 mode is intentionally an ownership/transfer
+        // trace, not a claim that the CPU arithmetic can publish an exact
+        // replacement for the cross-device forward state.
+        if (window.ownership_only ||
+            !dflash_window_advance_boundary(ctx, window)) {
+            LLAMA_LOG_ERROR(
+                "%s: seq %d could not advance its full rolling window "
+                "(ownership_only=%d)\n",
+                __func__, seq_id, window.ownership_only ? 1 : 0);
+            if (copy_ctx) {
+                ggml_free(copy_ctx);
+            }
+            return false;
+        }
     }
 
     const int slot = (window.head + window.count) % window.capacity;
-
     for (size_t li = 0; li < window.layers.size(); ++li) {
         auto & src = tape_gpu->layers[window.gpu_layer_indices[li]];
         auto & dst = window.layers[li];
-        auto & host = dflash_capture->tape_layers[li];
-        const size_t qkv_bytes = host.qkv_mixed.size() * sizeof(float);
+        const auto & host = cap.tape_layers[li];
+        const int seq_axis = dflash_window_tape_seq_axis(host, seq_id);
+        const size_t qkv_elem_offset =
+            ((size_t) seq_axis * host.n_tokens + source_token) *
+            (size_t) host.conv_channels;
+        const size_t qkv_bytes =
+            (size_t) host.conv_channels * sizeof(float);
         ggml_backend_tensor_set(
-            dst.qkv, host.qkv_mixed.data(),
+            dst.qkv, host.qkv_mixed.data() + qkv_elem_offset,
             (size_t) slot * dst.qkv->nb[1], qkv_bytes);
 
         const int64_t H_v = dst.gate->ne[0];
-        ggml_tensor * gate_src = ggml_view_1d(
-            copy_ctx, src.gate, H_v, 0);
-        ggml_tensor * beta_src = ggml_view_1d(
-            copy_ctx, src.beta, H_v, 0);
-        ggml_tensor * gate_dst = ggml_view_1d(
-            copy_ctx, dst.gate, H_v, (size_t) slot * dst.gate->nb[1]);
-        ggml_tensor * beta_dst = ggml_view_1d(
-            copy_ctx, dst.beta, H_v, (size_t) slot * dst.beta->nb[1]);
-        gate_src->buffer = src.gate->buffer;
-        beta_src->buffer = src.beta->buffer;
-        gate_dst->buffer = dst.gate->buffer;
-        beta_dst->buffer = dst.beta->buffer;
-        ggml_backend_tensor_copy(gate_src, gate_dst);
-        ggml_backend_tensor_copy(beta_src, beta_dst);
+        const size_t source_offset = (size_t) source_token * src.gate->nb[2];
+        if (window.ownership_only) {
+            std::vector<float> transfer((size_t) H_v);
+            ggml_backend_tensor_get(
+                src.gate, transfer.data(), source_offset,
+                (size_t) H_v * sizeof(float));
+            ggml_backend_tensor_set(
+                dst.gate, transfer.data(), (size_t) slot * dst.gate->nb[1],
+                (size_t) H_v * sizeof(float));
+            ggml_backend_tensor_get(
+                src.beta, transfer.data(), source_offset,
+                (size_t) H_v * sizeof(float));
+            ggml_backend_tensor_set(
+                dst.beta, transfer.data(), (size_t) slot * dst.beta->nb[1],
+                (size_t) H_v * sizeof(float));
+        } else {
+            ggml_tensor * gate_src = ggml_view_1d(
+                copy_ctx, src.gate, H_v, source_offset);
+            ggml_tensor * beta_src = ggml_view_1d(
+                copy_ctx, src.beta, H_v, source_offset);
+            ggml_tensor * gate_dst = ggml_view_1d(
+                copy_ctx, dst.gate, H_v, (size_t) slot * dst.gate->nb[1]);
+            ggml_tensor * beta_dst = ggml_view_1d(
+                copy_ctx, dst.beta, H_v, (size_t) slot * dst.beta->nb[1]);
+            gate_src->buffer = src.gate->buffer;
+            beta_src->buffer = src.beta->buffer;
+            gate_dst->buffer = dst.gate->buffer;
+            beta_dst->buffer = dst.beta->buffer;
+            ggml_backend_tensor_copy(gate_src, gate_dst);
+            ggml_backend_tensor_copy(beta_src, beta_dst);
+        }
     }
-    ggml_free(copy_ctx);
-    ggml_backend_synchronize(find_gpu_backend());
+    if (copy_ctx) {
+        ggml_free(copy_ctx);
+    }
+    if (!window.ownership_only) {
+        ggml_backend_synchronize(ctx->find_gpu_backend());
+    }
 
-    // Payload is complete and fenced; publish record metadata last.
+    // Publish the payload's absolute identity only after all layer copies fence.
     window.records[slot] = { pos, seq_id, true };
     window.count++;
     window.frontier_pos = pos;
-    window.capture_pending = false;
-    window.pending_seq_id = -1;
-    window.pending_pos = -1;
     return true;
 }
 
-bool llama_context::dflash_window_retry_capture() {
-    if (!dflash_capture || !dflash_capture->window) {
+bool llama_context::dflash_window_stage_decode(
+        dflash_window_pending && staged,
+        bool speculative) {
+    if (!dflash_capture || staged.seqs.empty() ||
+        dflash_capture->window_pending.active) {
         return false;
     }
-    auto & window = *dflash_capture->window;
-    if (!window.capture_pending) {
+    for (const auto & seq : staged.seqs) {
+        auto * window = dflash_window_for_seq(seq.seq_id);
+        if (!window || !window->enabled || seq.positions.empty()) {
+            return false;
+        }
+    }
+
+    staged.active = true;
+    staged.speculative = speculative;
+    auto & pending = dflash_capture->window_pending;
+    pending = std::move(staged);
+    if (!speculative) {
+        for (auto & seq : pending.seqs) {
+            seq.commit_count = (int) seq.positions.size();
+        }
+        return dflash_window_retry_capture();
+    }
+    return true;
+}
+
+bool llama_context::dflash_window_commit(
+        llama_seq_id seq_id,
+        int          n_accepted) {
+    if (!dflash_capture || !dflash_capture->window_pending.active ||
+        !dflash_capture->window_pending.speculative) {
+        return false;
+    }
+    for (auto & seq : dflash_capture->window_pending.seqs) {
+        if (seq.seq_id != seq_id) {
+            continue;
+        }
+        if (seq.commit_count >= 0 ||
+            n_accepted < 0 || n_accepted > (int) seq.positions.size()) {
+            return false;
+        }
+        seq.commit_count = n_accepted;
+        return dflash_window_retry_capture();
+    }
+    return false;
+}
+
+bool llama_context::dflash_window_retry_capture() {
+    if (!dflash_capture) {
+        return false;
+    }
+    auto & pending = dflash_capture->window_pending;
+    if (!pending.active) {
         return true;
     }
-    return dflash_window_capture_last(
-        window.pending_seq_id, window.pending_pos);
-}
 
-void llama_context::dflash_window_inject_publish_failure() {
-    if (dflash_capture && dflash_capture->window) {
-        dflash_capture->window->fail_publish_once = true;
-    }
-}
-
-bool llama_context::dflash_window_reconstruct(llama_pos pos) {
-    if (!dflash_capture || !dflash_capture->window) {
+    synchronize();
+    if (!dflash_window_materialize_qkv(this, pending)) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to materialize packed QKV for %zu pending owner(s)\n",
+            __func__, pending.seqs.size());
         return false;
     }
-    auto & window = *dflash_capture->window;
-    if (!window.enabled || window.capture_pending ||
+    for (auto & seq : pending.seqs) {
+        if (seq.commit_count < 0) {
+            continue; // speculative owner has not supplied its decision yet
+        }
+        auto * window = dflash_window_for_seq(seq.seq_id);
+        if (!window) {
+            LLAMA_LOG_ERROR("%s: pending seq %d has no rolling window\n",
+                __func__, seq.seq_id);
+            return false;
+        }
+        while (seq.copied_count < seq.commit_count) {
+            const int source_token = seq.copied_count;
+            bool appended = false;
+            try {
+                appended = dflash_window_append_staged(
+                    this, *window, seq.positions[source_token], source_token);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_WARN("%s: staged window copy failed: %s\n",
+                    __func__, err.what());
+            }
+            if (!appended) {
+                LLAMA_LOG_ERROR(
+                    "%s: failed to append seq %d token %d/%d at pos %d; "
+                    "pending capture retained\n",
+                    __func__, seq.seq_id, source_token,
+                    seq.commit_count, seq.positions[source_token]);
+                return false;
+            }
+            seq.copied_count++;
+        }
+    }
+
+    const bool complete = std::all_of(
+        pending.seqs.begin(), pending.seqs.end(),
+        [](const dflash_window_pending_seq & seq) {
+            return seq.commit_count >= 0 &&
+                   seq.copied_count == seq.commit_count;
+        });
+    if (complete) {
+        pending.clear(); // rejected suffixes were never copied
+    }
+    return true;
+}
+
+void llama_context::dflash_window_inject_publish_failure(llama_seq_id seq_id) {
+    if (auto * window = dflash_window_for_seq(seq_id)) {
+        window->fail_publish_once = true;
+    }
+}
+
+bool llama_context::dflash_window_reconstruct(
+        llama_seq_id seq_id,
+        llama_pos    pos) {
+    auto * window_ptr = dflash_window_for_seq(seq_id);
+    if (!window_ptr) {
+        return false;
+    }
+    auto & window = *window_ptr;
+    if (!window.enabled || window.ownership_only ||
+        (dflash_capture->window_pending.active &&
+         std::any_of(
+             dflash_capture->window_pending.seqs.begin(),
+             dflash_capture->window_pending.seqs.end(),
+             [seq_id](const dflash_window_pending_seq & seq) {
+                 return seq.seq_id == seq_id;
+             })) ||
         pos < window.boundary_pos || pos > window.frontier_pos) {
         return false;
     }
 
     const int private_idx = 1 - window.published_idx;
-    if (!dflash_window_copy_boundary(this, window.published_idx, private_idx)) {
+    if (!dflash_window_copy_boundary(
+            this, window, window.published_idx, private_idx)) {
         return false;
     }
 
@@ -2410,7 +2895,7 @@ bool llama_context::dflash_window_reconstruct(llama_pos pos) {
         if (!record.valid ||
             record.seq_id != window.seq_id ||
             record.pos != expected ||
-            !dflash_window_apply_record(this, slot, private_idx)) {
+            !dflash_window_apply_record(this, window, slot, private_idx)) {
             return false;
         }
     }
@@ -4379,34 +4864,152 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
-    // Gate-3 prototype contract: while a rolling window is enabled, normal
-    // decode is deliberately restricted to one explicitly-positioned token
-    // owned by the window sequence. A failed append leaves that token in the
-    // fixed tape staging buffers, so another decode must not overwrite it.
+    // Rolling-window capture owns the fixed tape until every normal record has
+    // been copied, or every speculative sequence has supplied its accepted
+    // prefix. No later decode may overwrite an unresolved payload.
     bool window_capture = false;
-    llama_seq_id window_seq = -1;
-    llama_pos window_pos = -1;
-    if (dflash_capture && dflash_capture->window &&
-        dflash_capture->window->enabled) {
-        auto & window = *dflash_capture->window;
-        if (window.capture_pending) {
+    bool window_speculative = false;
+    std::vector<dflash_window_pending_seq> window_seqs;
+    if (dflash_capture) {
+        const bool any_window = std::any_of(
+            dflash_capture->windows.begin(), dflash_capture->windows.end(),
+            [](const std::unique_ptr<dflash_window> & window) {
+                return window && window->enabled;
+            });
+        if (dflash_capture->window_pending.active) {
             LLAMA_LOG_ERROR("%s: rolling-window capture is pending; retry before decoding\n", __func__);
             return -1;
         }
-        const int n_seq_id = batch_inp.n_seq_id ? batch_inp.n_seq_id[0] : 1;
-        window_seq = batch_inp.seq_id ? batch_inp.seq_id[0][0] : 0;
-        window_pos = batch_inp.pos ? batch_inp.pos[0] : window.frontier_pos + 1;
-        if (batch_inp.n_tokens != 1 || n_seq_id != 1 ||
-            window_seq != window.seq_id ||
-            window_pos != window.frontier_pos + 1) {
-            LLAMA_LOG_ERROR(
-                "%s: rolling-window prototype requires one contiguous token for seq %d "
-                "(got n_tokens=%d, n_seq_id=%d, seq=%d, pos=%d, expected=%d)\n",
-                __func__, window.seq_id, batch_inp.n_tokens, n_seq_id,
-                window_seq, window_pos, window.frontier_pos + 1);
-            return -1;
+        dflash_capture->window_staging.clear();
+        if (any_window) {
+            // Gate-4's bounded path requires one owner per token and one equal
+            // contiguous run per enabled sequence. Recurrent memory may still
+            // split owners into separate ubatches; decode-scoped QKV staging
+            // accumulates those callbacks by absolute sequence ownership.
+            for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+                const int n_seq_id = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
+                const llama_seq_id seq_id =
+                    batch_inp.seq_id ? batch_inp.seq_id[i][0] : 0;
+                auto * window = dflash_window_for_seq(seq_id);
+                if (n_seq_id != 1 || !window || !window->enabled) {
+                    LLAMA_LOG_ERROR(
+                        "%s: windowed batch token %d has no unique enabled owner "
+                        "(n_seq_id=%d, seq=%d)\n",
+                        __func__, i, n_seq_id, seq_id);
+                    return -1;
+                }
+                auto it = std::find_if(
+                    window_seqs.begin(), window_seqs.end(),
+                    [seq_id](const dflash_window_pending_seq & seq) {
+                        return seq.seq_id == seq_id;
+                    });
+                if (it == window_seqs.end()) {
+                    window_seqs.push_back({ seq_id, {}, -1, 0 });
+                    it = std::prev(window_seqs.end());
+                }
+                const llama_pos pos = batch_inp.pos
+                    ? batch_inp.pos[i]
+                    : window->frontier_pos + (llama_pos) it->positions.size() + 1;
+                const llama_pos expected =
+                    window->frontier_pos + (llama_pos) it->positions.size() + 1;
+                if (pos != expected) {
+                    LLAMA_LOG_ERROR(
+                        "%s: non-contiguous window position for seq %d "
+                        "(got %d, expected %d)\n",
+                        __func__, seq_id, pos, expected);
+                    return -1;
+                }
+                it->positions.push_back(pos);
+            }
+
+            const size_t n_seq_tokens = window_seqs.empty()
+                ? 0 : window_seqs.front().positions.size();
+            const bool equal_runs = n_seq_tokens > 0 &&
+                std::all_of(
+                    window_seqs.begin(), window_seqs.end(),
+                    [n_seq_tokens](const dflash_window_pending_seq & seq) {
+                        return seq.positions.size() == n_seq_tokens;
+                    });
+            const dflash_tape_gpu * tape = window_seqs.empty()
+                ? nullptr
+                : dflash_capture->tapes[window_seqs.front().seq_id].get();
+            if (!equal_runs || !tape ||
+                n_seq_tokens > (size_t) tape->max_tokens ||
+                batch_inp.n_tokens > (int32_t) cparams.n_ubatch) {
+                LLAMA_LOG_ERROR(
+                    "%s: windowed decode must fit one equal-sequence tape ubatch "
+                    "(tokens=%d, per_seq=%zu, ubatch=%u)\n",
+                    __func__, batch_inp.n_tokens, n_seq_tokens, cparams.n_ubatch);
+                return -1;
+            }
+
+            bool any_qkv_staged = false;
+            bool all_qkv_staged = true;
+            for (const auto & seq : window_seqs) {
+                const bool staged =
+                    dflash_capture->tapes[seq.seq_id]->qkv_staged();
+                any_qkv_staged |= staged;
+                all_qkv_staged &= staged;
+            }
+            if (any_qkv_staged != all_qkv_staged) {
+                LLAMA_LOG_ERROR(
+                    "%s: windowed batch mixes callback and graph-staged QKV owners\n",
+                    __func__);
+                return -1;
+            }
+
+            dflash_window_pending staged;
+            staged.active = true;
+            staged.seqs = std::move(window_seqs);
+            if (!all_qkv_staged) {
+                const int64_t conv_window =
+                    (int64_t) model.hparams.ssm_d_conv - 1;
+                const int64_t conv_channels = conv_window > 0
+                    ? (int64_t) model.hparams.n_embd_r() / conv_window
+                    : 0;
+                if (conv_channels <= 0 ||
+                    dflash_capture->tape_layers.empty() ||
+                    staged.seqs.size() > LLAMA_DFLASH_MAX_SLOTS) {
+                    LLAMA_LOG_ERROR(
+                        "%s: cannot size decode-scoped callback QKV staging\n",
+                        __func__);
+                    return -1;
+                }
+                try {
+                    staged.qkv_layers.resize(
+                        dflash_capture->tape_layers.size());
+                    staged.qkv_received.assign(
+                        staged.qkv_layers.size() * staged.seqs.size(), 0);
+                    const size_t packed_elems =
+                        (size_t) conv_channels * n_seq_tokens *
+                        staged.seqs.size();
+                    for (size_t li = 0; li < staged.qkv_layers.size(); ++li) {
+                        auto & layer = staged.qkv_layers[li];
+                        layer.conv_channels = conv_channels;
+                        layer.n_tokens = (int) n_seq_tokens;
+                        layer.n_seqs = (int) staged.seqs.size();
+                        layer.qkv_mixed.resize(packed_elems);
+                        // The legacy callback still reads each ubatch through
+                        // cap.tape_layers before scattering it. Reserve its
+                        // worst-case chunk now so no vector allocation can fail
+                        // after the live forward has started.
+                        dflash_capture->tape_layers[li].qkv_mixed.reserve(
+                            packed_elems);
+                        for (size_t s = 0; s < staged.seqs.size(); ++s) {
+                            layer.seq_ids[s] = staged.seqs[s].seq_id;
+                        }
+                    }
+                } catch (const std::exception & err) {
+                    LLAMA_LOG_ERROR(
+                        "%s: could not preallocate callback QKV staging: %s\n",
+                        __func__, err.what());
+                    return -1;
+                }
+            }
+            dflash_capture->window_staging = std::move(staged);
+            window_capture = true;
+            window_speculative = dflash_capture->window_speculative_capture;
         }
-        window_capture = true;
     }
 
     if (!memory) {
@@ -4568,7 +5171,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 cparams.tape_gpu_n_seqs = ns;
 
                 for (int s = 0; s < ns; ++s) {
-                    const llama_seq_id seq = ubatch.seq_id_unq[s];
+                    const llama_seq_id seq =
+                        dflash_capture->window_staging.active
+                            ? dflash_ubatch_axis_seq(&ubatch, s)
+                            : ubatch.seq_id_unq[s];
                     dflash_tape_gpu * tp = nullptr;
                     if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                         tp = dflash_capture->tapes[seq].get();
@@ -4585,11 +5191,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // sentinel for "GPU tape is enabled"
                 cparams.tape_gpu = cparams.tape_gpu_seqs[0];
 
-                // graph-staged qkv coverage for this decode (mirrors the builder guard:
-                // single-seq and within tape capacity)
-                if (cparams.tape_gpu && ubatch.n_seqs_unq == 1 &&
-                    (int) ubatch.n_tokens <= cparams.tape_gpu->max_tokens) {
-                    dflash_capture->tape_stage_n_tokens = (int) ubatch.n_tokens;
+                // Fixed-tape coverage is independent of how QKV is captured:
+                // plain CUDA uses the eval callback, while tensor split uses
+                // the per-sequence graph-staged QKV tensor. Preserve the
+                // historical token-count meaning for both paths; consumers
+                // needing the latter also test qkv_staged().
+                bool all_tapes_covered = ns > 0;
+                for (int s = 0; all_tapes_covered && s < ns; ++s) {
+                    all_tapes_covered =
+                        cparams.tape_gpu_seqs[s] &&
+                        (int) ubatch.n_seq_tokens <=
+                            cparams.tape_gpu_seqs[s]->max_tokens;
+                }
+                if (all_tapes_covered) {
+                    dflash_capture->tape_stage_n_tokens =
+                        (int) ubatch.n_seq_tokens;
                 }
 
                 // graph nodes hold references to tape tensors — invalidate if set changed
@@ -4903,13 +5519,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    if (window_capture && !dflash_window_capture_last(window_seq, window_pos)) {
-        // The model decode itself succeeded. Keep its record staged and make
-        // the capture failure observable through capture_pending/retry rather
-        // than reporting a decode failure after live state has already moved.
+    if (window_capture &&
+        !dflash_window_stage_decode(
+            std::move(dflash_capture->window_staging),
+            window_speculative)) {
+        // The model decode itself succeeded. Keep the fixed-tape payload
+        // reserved and report pending status rather than claiming the live
+        // recurrent mutation failed after the fact.
         LLAMA_LOG_WARN(
-            "%s: decoded token %d for seq %d, but rolling-window publication is pending\n",
-            __func__, window_pos, window_seq);
+            "%s: decoded %d rolling-window token(s), but publication is pending\n",
+            __func__, batch_inp.n_tokens);
     }
 
     return 0;
@@ -6926,8 +7545,22 @@ bool llama_dflash_window_enable(
 
 bool llama_dflash_window_capture_pending(llama_context * ctx) {
     return ctx->dflash_capture &&
-           ctx->dflash_capture->window &&
-           ctx->dflash_capture->window->capture_pending;
+           ctx->dflash_capture->window_pending.active;
+}
+
+void llama_dflash_window_set_speculative(
+        llama_context * ctx,
+        bool            speculative) {
+    if (ctx->dflash_capture) {
+        ctx->dflash_capture->window_speculative_capture = speculative;
+    }
+}
+
+bool llama_dflash_window_commit(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        int             n_accepted) {
+    return ctx->dflash_window_commit(seq_id, n_accepted);
 }
 
 bool llama_dflash_window_retry_capture(llama_context * ctx) {
@@ -6935,11 +7568,26 @@ bool llama_dflash_window_retry_capture(llama_context * ctx) {
 }
 
 void llama_dflash_window_inject_publish_failure(llama_context * ctx) {
-    ctx->dflash_window_inject_publish_failure();
+    ctx->dflash_window_inject_publish_failure(0);
 }
 
-bool llama_dflash_window_reconstruct(llama_context * ctx, llama_pos pos) {
-    return ctx->dflash_window_reconstruct(pos);
+void llama_dflash_window_inject_publish_failure_seq(
+        llama_context * ctx,
+        llama_seq_id    seq_id) {
+    ctx->dflash_window_inject_publish_failure(seq_id);
+}
+
+bool llama_dflash_window_reconstruct(
+        llama_context * ctx,
+        llama_pos       pos) {
+    return ctx->dflash_window_reconstruct(0, pos);
+}
+
+bool llama_dflash_window_reconstruct_seq(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        llama_pos       pos) {
+    return ctx->dflash_window_reconstruct(seq_id, pos);
 }
 
 void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {
