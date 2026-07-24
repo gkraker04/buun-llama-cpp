@@ -117,6 +117,10 @@ struct dflash_capture_data {
 
     // tape recording (for DeltaNet state rollback)
     bool tape_enabled = false;
+    // WS-2 gated prototype: reconstruct post-conv K/V from qkv_mixed at replay.
+    // False keeps the shipped redundant K/V tape path unchanged.
+    bool tape_minimal_replay = false;
+    bool replay_minimal_last = false;
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
@@ -619,6 +623,7 @@ public:
     void dflash_ensure_recurrent_setup();
 
     void set_tape_recording(bool enable);
+    void set_tape_minimal_replay(bool enable);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,

@@ -1607,6 +1607,14 @@ void llama_context::set_tape_recording(bool enable) {
     }
 }
 
+void llama_context::set_tape_minimal_replay(bool enable) {
+    tape_replay_sync();
+    if (dflash_capture) {
+        dflash_capture->tape_minimal_replay = enable;
+        dflash_capture->replay_minimal_last = false;
+    }
+}
+
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
 static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_memory_recurrent * mem_recurrent);
 
@@ -2068,6 +2076,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     // ensure any previous async replay is complete before launching a new one
     tape_replay_sync();
+    dflash_capture->replay_minimal_last = false;
 
     if (dflash_capture->tape_layers.empty()) {
         return;
@@ -2140,12 +2149,17 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     if (n_rec == 0) goto conv_rebuild;
 
     {
-        // per layer: k_view + v_view + g_view + b_view + q + b_sigmoid + s_view + GDN + result_state + s_write + cpy = ~11 tensors
-        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * 14 + 4) + ggml_graph_overhead_custom(n_rec * 12, false);
+        // Minimal replay adds qkv upload/view + conv-state view + transpose/concat +
+        // SSM_CONV/SILU + K/V split + L2 normalization before the existing GDN tail.
+        const bool minimal_requested = dflash_capture->tape_minimal_replay;
+        const size_t tensors_per_layer = minimal_requested ? 36 : 14;
+        const size_t nodes_per_layer   = minimal_requested ? 32 : 12;
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * tensors_per_layer + 8) +
+                         ggml_graph_overhead_custom(n_rec * nodes_per_layer, false);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * ctx = ggml_init(ctx_params);
 
-        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 12, false);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * nodes_per_layer, false);
 
         struct replay_input {
             ggml_tensor * q;
@@ -2153,8 +2167,11 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             ggml_tensor * v;
             ggml_tensor * g;
             ggml_tensor * b;
+            ggml_tensor * qkv;
             size_t tape_li;
+            size_t qkv_host_offset;
             bool gpu_tape; // k/v/g/b are views into GPU tape (skip CPU upload)
+            bool qkv_host; // qkv is a replay input populated from the host minimal record
         };
         std::vector<replay_input> inputs;
         inputs.reserve(n_rec);
@@ -2163,6 +2180,87 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         dflash_tape_gpu * tgpu = nullptr;
         if (seq_id >= 0 && seq_id < (int) dflash_capture->tapes.size()) {
             tgpu = dflash_capture->tapes[seq_id].get();
+        }
+
+        // Fail the prototype mode closed as one unit: never mix reconstructed and
+        // redundant layers in a replay advertised as minimal. Reconstructing on this
+        // direct-backend path also requires every conv weight and R-state row on the
+        // same device as the replay backend.
+        bool use_minimal = minimal_requested && tgpu != nullptr;
+        if (use_minimal) {
+            const ggml_backend_dev_t replay_dev = ggml_backend_get_device(gpu_backend);
+            for (int li = 0; li < n_rec && use_minimal; ++li) {
+                const int il = rec_ids[li];
+                auto & tape = tape_layers[li];
+
+                int gpu_li = -1;
+                for (int i = 0; i < (int) tgpu->layer_ids.size(); ++i) {
+                    if (tgpu->layer_ids[i] == il) {
+                        gpu_li = i;
+                        break;
+                    }
+                }
+
+                ggml_tensor * r_tensor = mem_recurrent->r_l[il];
+                ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
+                auto tensor_device = [](const ggml_tensor * t) -> ggml_backend_dev_t {
+                    if (!t || !t->buffer) {
+                        return nullptr;
+                    }
+                    auto * buft = ggml_backend_buffer_get_type(t->buffer);
+                    return buft ? ggml_backend_buft_get_device(buft) : nullptr;
+                };
+
+                if (gpu_li < 0 || tape.n_tokens <= 0 || n_accepted > tape.n_tokens ||
+                    !r_tensor || !conv_kernel ||
+                    tensor_device(r_tensor) != replay_dev ||
+                    tensor_device(conv_kernel) != replay_dev) {
+                    use_minimal = false;
+                    break;
+                }
+
+                auto & tl = tgpu->layers[gpu_li];
+                const int64_t S = tl.k->ne[0];
+                const int64_t H_k = tl.k->ne[1];
+                const int64_t H_v = tl.v->ne[1];
+                const int64_t conv_channels = tape.conv_channels > 0
+                    ? tape.conv_channels
+                    : (tl.qkv ? tl.qkv->ne[0] : 0);
+                if (r_tensor->type != GGML_TYPE_F32 ||
+                    conv_kernel->type != GGML_TYPE_F32 ||
+                    conv_kernel->ne[0] <= 1 ||
+                    conv_channels != 2 * S * H_k + S * H_v ||
+                    (conv_kernel->ne[0] - 1) * conv_channels != (int64_t) hparams.n_embd_r()) {
+                    use_minimal = false;
+                    break;
+                }
+
+                if (tl.qkv == nullptr) {
+                    size_t qkv_seq_offset = 0;
+                    bool found = tape.n_seqs <= 1;
+                    if (tape.n_seqs > 1) {
+                        for (int s = 0; s < tape.n_seqs; ++s) {
+                            if (tape.seq_ids[s] == seq_id) {
+                                found = true;
+                                break;
+                            }
+                            qkv_seq_offset += (size_t) tape.n_tokens * (size_t) tape.conv_channels;
+                        }
+                    }
+                    const size_t qkv_elems = (size_t) tape.n_tokens * (size_t) tape.conv_channels;
+                    if (!found || tape.conv_channels <= 0 ||
+                        qkv_seq_offset + qkv_elems > tape.qkv_mixed.size()) {
+                        use_minimal = false;
+                    }
+                } else if (tl.qkv->type != GGML_TYPE_F32 ||
+                           tl.qkv->ne[0] != conv_channels ||
+                           tl.qkv->ne[1] < tape.n_tokens) {
+                    use_minimal = false;
+                }
+            }
+            if (!use_minimal) {
+                LLAMA_LOG_WARN("%s: minimal-F32 reconstruction unavailable; using redundant K/V tape\n", __func__);
+            }
         }
 
         for (int li = 0; li < n_rec; ++li) {
@@ -2181,6 +2279,9 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             int64_t S, H_k, H_v;
             ggml_tensor * k_in, * v_in, * g_in, * b_in;
+            ggml_tensor * qkv_in = nullptr;
+            size_t qkv_host_offset = 0;
+            bool qkv_host = false;
             bool use_gpu_tape = (gpu_li >= 0);
 
             if (use_gpu_tape) {
@@ -2188,11 +2289,71 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 S   = tl.k->ne[0];
                 H_k = tl.k->ne[1];
                 H_v = tl.v->ne[1];
-                // views into GPU tape buffers — already populated by graph-embedded copies
-                k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
-                                    tl.k->nb[1], tl.k->nb[2], 0);
-                v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
-                                    tl.v->nb[1], tl.v->nb[2], 0);
+
+                if (use_minimal) {
+                    const int n_recorded = tape.n_tokens;
+                    const int64_t conv_channels = tape.conv_channels > 0
+                        ? tape.conv_channels
+                        : (tl.qkv ? tl.qkv->ne[0] : 0);
+                    ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
+                    ggml_tensor * r_tensor = mem_recurrent->r_l[il];
+                    const int64_t conv_kernel_size = conv_kernel->ne[0];
+                    const int64_t conv_window = conv_kernel_size - 1;
+                    const int64_t n_embd_r = conv_window * conv_channels;
+                    const size_t r_esz = ggml_element_size(r_tensor);
+                    const size_t r_byte_offset = (size_t) cell_idx * n_embd_r * r_esz;
+
+                    GGML_ASSERT(conv_channels == 2 * S * H_k + S * H_v);
+                    GGML_ASSERT((int64_t) hparams.n_embd_r() == n_embd_r);
+
+                    ggml_tensor * r_view = ggml_view_3d(
+                        ctx, r_tensor, conv_window, conv_channels, (int64_t) 1,
+                        conv_window * r_esz, n_embd_r * r_esz, r_byte_offset);
+
+                    if (tl.qkv != nullptr) {
+                        qkv_in = ggml_view_2d(ctx, tl.qkv, conv_channels, n_recorded, tl.qkv->nb[1], 0);
+                    } else {
+                        qkv_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_channels, n_recorded);
+                        ggml_set_input(qkv_in);
+                        qkv_host = true;
+                        if (tape.n_seqs > 1) {
+                            for (int s = 0; s < tape.n_seqs; ++s) {
+                                if (tape.seq_ids[s] == seq_id) {
+                                    break;
+                                }
+                                qkv_host_offset += (size_t) n_recorded * (size_t) conv_channels;
+                            }
+                        }
+                    }
+
+                    // Rebuild the full captured verify length, not merely n_accepted.
+                    // This preserves the forward SSM_CONV kernel specialization/grid and
+                    // the L2_NORM grid/reduction shape; only then slice the accepted prefix.
+                    ggml_tensor * conv_input = ggml_concat(ctx, r_view, ggml_transpose(ctx, qkv_in), 0);
+                    ggml_tensor * conv_silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv_kernel));
+                    const int64_t conv_row = conv_channels * ggml_element_size(conv_silu);
+
+                    ggml_tensor * k_full = ggml_view_4d(
+                        ctx, conv_silu, S, H_k, n_recorded, (int64_t) 1,
+                        ggml_row_size(conv_silu->type, S), conv_row,
+                        conv_row * n_recorded, S * H_k * ggml_element_size(conv_silu));
+                    ggml_tensor * v_full = ggml_view_4d(
+                        ctx, conv_silu, S, H_v, n_recorded, (int64_t) 1,
+                        ggml_row_size(conv_silu->type, S), conv_row,
+                        conv_row * n_recorded, 2 * S * H_k * ggml_element_size(conv_silu));
+
+                    k_full = ggml_l2_norm(ctx, k_full, hparams.f_norm_rms_eps);
+                    k_in = ggml_view_3d(ctx, k_full, S, H_k, (int64_t) n_accepted,
+                                       k_full->nb[1], k_full->nb[2], 0);
+                    v_in = ggml_view_3d(ctx, v_full, S, H_v, (int64_t) n_accepted,
+                                       v_full->nb[1], v_full->nb[2], 0);
+                } else {
+                    // views into GPU tape buffers — already populated by graph-embedded copies
+                    k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
+                                        tl.k->nb[1], tl.k->nb[2], 0);
+                    v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
+                                        tl.v->nb[1], tl.v->nb[2], 0);
+                }
                 g_in = ggml_view_3d(ctx, tl.gate, (int64_t)1, H_v, (int64_t)n_accepted,
                                     tl.gate->nb[1], tl.gate->nb[2], 0);
                 b_in = ggml_view_3d(ctx, tl.beta, (int64_t)1, H_v, (int64_t)n_accepted,
@@ -2222,7 +2383,10 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             dflash_build_gdn_state_update(ctx, graph, q_in, k_in, v_in, g_in, b_in,
                 s_tensor, s_byte_offset, S, H_v, n_accepted);
 
-            inputs.push_back({ q_in, k_in, v_in, g_in, b_in, (size_t)li, use_gpu_tape });
+            inputs.push_back({
+                q_in, k_in, v_in, g_in, b_in, qkv_in,
+                (size_t) li, qkv_host_offset, use_gpu_tape, qkv_host,
+            });
         }
 
         if (inputs.empty()) {
@@ -2244,6 +2408,14 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         }
 
         if (!dflash_capture->replay_buf) {
+            if (use_minimal) {
+                // The CPU hand recurrence is neither the Gate-2 path nor bit-exact with
+                // CUDA. Leave the restored boundary untouched and make the prototype
+                // failure observable instead of silently publishing a mixed result.
+                LLAMA_LOG_WARN("%s: failed to allocate GPU buffer for minimal-F32 replay; state left at boundary\n", __func__);
+                ggml_free(ctx);
+                return;
+            }
             LLAMA_LOG_WARN("%s: failed to allocate GPU buffer for tape replay, falling back to CPU\n", __func__);
             ggml_free(ctx);
             tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
@@ -2289,6 +2461,15 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
                 ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
             }
+            if (inp.qkv_host) {
+                auto & tape = tape_layers[inp.tape_li];
+                const size_t qkv_elems = (size_t) tape.conv_channels * (size_t) tape.n_tokens;
+                ggml_backend_tensor_set(
+                    inp.qkv,
+                    tape.qkv_mixed.data() + inp.qkv_host_offset,
+                    0,
+                    qkv_elems * sizeof(float));
+            }
         }
 
         // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
@@ -2302,6 +2483,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         dflash_capture->replay_cell_idx = cell_idx;
         dflash_capture->replay_seq_id = seq_id;
         dflash_capture->replay_mem_recurrent = mem_recurrent;
+        dflash_capture->replay_minimal_last = use_minimal;
         return; // conv rebuild deferred to tape_replay_sync()
     }
 
@@ -6171,6 +6353,10 @@ void llama_set_dflash_n_slots(llama_context * ctx, int n) {
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
+}
+
+void llama_set_tape_minimal_replay(llama_context * ctx, bool enable) {
+    ctx->set_tape_minimal_replay(enable);
 }
 
 void llama_set_force_split_seq(llama_context * ctx, bool force) {

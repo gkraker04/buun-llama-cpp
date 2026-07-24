@@ -305,19 +305,63 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<state_piece> replay_state;
-    if (!read_state(recurrent, 0, replay_state)) {
-        fprintf(stderr, "%s : failed to read tape-replayed state\n", __func__);
+    std::vector<state_piece> redundant_state;
+    if (!read_state(recurrent, 0, redundant_state)) {
+        fprintf(stderr, "%s : failed to read redundant-tape-replayed state\n", __func__);
         return 1;
     }
 
-    if (!states_bit_equal(plane_state, replay_state)) {
+    if (!states_bit_equal(plane_state, redundant_state)) {
         fprintf(stderr, "%s : F32 tape replay is not bit-exact with the rollback plane on %s\n",
                 __func__, gpu_name);
         return 1;
     }
 
-    fprintf(stderr, "%s : PASS (plane rollback == F32 tape replay bit-for-bit on %s)\n",
+    // Gate 2: restore the same immutable boundary again, poison redundant K/V,
+    // and replay from qkv_mixed + gate + beta only. Poisoning makes an accidental
+    // read from either redundant tensor fail loudly rather than yielding a false pass.
+    if (!recurrent->seq_rm(0, -1, -1) ||
+        !recurrent->try_seq_cp(1, 0, -1, -1)) {
+        fprintf(stderr, "%s : failed to restore pre-verify backup for minimal replay\n", __func__);
+        return 1;
+    }
+
+    auto * active_tape = ctx->dflash_capture->active_tape();
+    if (active_tape == nullptr) {
+        fprintf(stderr, "%s : active GPU tape disappeared before minimal replay\n", __func__);
+        return 1;
+    }
+    for (auto & layer : active_tape->layers) {
+        ggml_backend_tensor_memset(layer.k, 0xa5, 0, ggml_nbytes(layer.k));
+        ggml_backend_tensor_memset(layer.v, 0xa5, 0, ggml_nbytes(layer.v));
+    }
+
+    llama_set_tape_minimal_replay(ctx.get(), true);
+    llama_tape_replay(ctx.get(), 0, n_accepted);
+    llama_tape_replay_sync(ctx.get());
+
+    if (!ctx->dflash_capture->replay_minimal_last) {
+        fprintf(stderr, "%s : requested minimal-F32 replay fell back to the redundant path\n", __func__);
+        return 1;
+    }
+    if (recurrent->rs_idx[0] != 0 || recurrent->seq_pos_max(0) != keep_end - 1) {
+        fprintf(stderr, "%s : minimal replay selected row %u at pos %d, expected row 0 at pos %d\n",
+                __func__, recurrent->rs_idx[0], recurrent->seq_pos_max(0), (int) keep_end - 1);
+        return 1;
+    }
+
+    std::vector<state_piece> minimal_state;
+    if (!read_state(recurrent, 0, minimal_state)) {
+        fprintf(stderr, "%s : failed to read minimal-F32 replay state\n", __func__);
+        return 1;
+    }
+    if (!states_bit_equal(redundant_state, minimal_state)) {
+        fprintf(stderr, "%s : minimal-F32 conv reconstruction is not bit-exact with redundant tape replay on %s\n",
+                __func__, gpu_name);
+        return 1;
+    }
+
+    fprintf(stderr, "%s : PASS (plane == redundant F32 tape == minimal-F32 conv replay bit-for-bit on %s)\n",
             __func__, gpu_name);
     return 0;
 }

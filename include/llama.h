@@ -1215,6 +1215,11 @@ extern "C" {
     // Must be called after restoring from backup (seq_cp) and before the next decode
     LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
 
+    // WS-2 gated prototype: when enabled, GPU tape replay ignores captured post-conv K/V
+    // and reconstructs them from the F32 qkv_mixed record. Redundant K/V replay remains
+    // the default. The mode currently targets single-device GPU replay only.
+    LLAMA_API void llama_set_tape_minimal_replay(struct llama_context * ctx, bool enable);
+
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
     //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
