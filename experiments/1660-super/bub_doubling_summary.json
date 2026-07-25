@@ -1,0 +1,80 @@
+{
+  "meta": {
+    "model": "Ornstein-3.5-9B-V2 Q4_K_M",
+    "model_path": "K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf",
+    "model_size_gib": 5.37,
+    "model_params": "9.2B",
+    "bench_tool": "llama-bench",
+    "build": "aa6f56b6c (10453)",
+    "device": "GTX 1660 SUPER (CUDA1, 6GB, cc7.5, no tensor cores)",
+    "flash_attn": true,
+    "kv_cache": "f16",
+    "n_gpu_layers": 99,
+    "n_prompt": 512,
+    "n_gen": 128,
+    "n_depth": 0,
+    "timestamp": "2026-07-25T13:00Z",
+    "branch": "1660-super-baseline",
+    "task": "t_139013e5 - b/ub doubling sweep (corrected)",
+    "notes": "Fit-target adjusted per batch: larger batches need tighter margin. b=1024+ OOM regardless."
+  },
+  "results": {
+    "b128_ub128": {
+      "batch": 128,
+      "ubatch": 128,
+      "pp_tok_s": 112.709814,
+      "pp_stddev": 2.641707,
+      "tg_tok_s": 24.153217,
+      "tg_stddev": 0.622362,
+      "samples_tg": [
+        24.3025,
+        24.1403,
+        24.31,
+        24.8608,
+        23.1524
+      ],
+      "reps": 5,
+      "fit_target_mb": 200
+    },
+    "b256_ub256": {
+      "batch": 256,
+      "ubatch": 256,
+      "pp_tok_s": 120.443255,
+      "pp_stddev": 2.891137,
+      "tg_tok_s": 24.48006,
+      "tg_stddev": 0.39136,
+      "samples_tg": [
+        24.5646,
+        24.8222,
+        24.0533
+      ],
+      "reps": 3,
+      "fit_target_mb": 200
+    },
+    "b512_ub512": {
+      "batch": 512,
+      "ubatch": 512,
+      "pp_tok_s": 125.9338,
+      "pp_stddev": 3.626361,
+      "tg_tok_s": 29.285611,
+      "tg_stddev": 1.218194,
+      "samples_tg": [
+        30.6479,
+        28.3009,
+        28.908
+      ],
+      "reps": 3,
+      "fit_target_mb": 50
+    }
+  },
+  "peak_config": "b=512, ub=512",
+  "peak_decode_tok_s": 29.285611,
+  "b128_to_b512_improvement_pct": 21.2,
+  "vram_wall_at_batch": 1024,
+  "correction_notes": [
+    "Prior sweep #1: 42.55 t/s at b=128 \u2014 not reproducible without fit-target, suspect dual-GPU leak.",
+    "Prior sweep #2: 9.39 t/s at b=128 with --fit-target=1000 \u2014 1GB margin forced CPU offload, artificially slow.",
+    "This sweep: minimal fit-target (200 MiB for b=128/256, 50 MiB for b=512) to max GPU layers.",
+    "Model 5.37 GiB needs ~5.5 GiB with CUDA overhead on 6 GB card."
+  ]
+}
