@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "task": "t_81416c18",
+    "title": "Clean b/ub doubling sweep on 1660 Super",
+    "model": "Ornstein-3.5-9B-V2 Q4_K_M (5.78 GB, 9.20B params)",
+    "gpu": "NVIDIA GeForce GTX 1660 SUPER (CUDA1, 6 GB, MMQ-only, cc 7.5, no tensor cores)",
+    "build": "aa6f56b6c build 10453",
+    "binary": "G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe",
+    "flags": "-dev CUDA1 -p 512 -n 128 -ngl 99 -fa 1 -ctk f16 -ctv f16 -fitt 200 -r 3 -o json --no-warmup",
+    "timestamp": "2026-07-25T13:02-13:05Z",
+    "sacred_process": "PID 19608 (8081 server on GPU 0) untouched"
+  },
+  "matched_pair_sweep_b_equals_ub": {
+    "description": "b=ub matched pair doubling sweep per task spec",
+    "b128_ub128": {
+      "status": "PASS",
+      "pp_tok_s": 114.69,
+      "tg_tok_s": 24.30,
+      "tg_stddev": 0.25,
+      "tg_samples": [24.065, 24.5595, 24.2826],
+      "n_gen": 128,
+      "n_prompt": 512,
+      "detail": "Peak for matched-pair sweep"
+    },
+    "b256_ub256": {
+      "status": "OOM",
+      "detail": "exit code 9 - model too large for 6 GB VRAM with ub=256"
+    },
+    "conclusion": "Matched-pair sweep stopped at b=128 (b256/ub256 OOM). Optimal matched pair: b=128, ub=128."
+  },
+  "extended_sweep_ub128_fixed": {
+    "description": "Extended sweep with ub=128 fixed (prior baseline showed this is optimal ubatch)",
+    "b128_ub128": {
+      "pp_tok_s": 114.69,
+      "tg_tok_s": 24.30,
+      "tg_stddev": 0.25,
+      "delta_vs_peak_pct": 0.0
+    },
+    "b256_ub128": {
+      "pp_tok_s": 114.93,
+      "tg_tok_s": 22.92,
+      "tg_stddev": 0.63,
+      "delta_vs_peak_pct": -5.68,
+      "detail": "Below 5% threshold from b128 peak (24.30 * 0.95 = 23.09). Would stop here per sweep rules."
+    },
+    "b512_ub128": {
+      "pp_tok_s": 113.89,
+      "tg_tok_s": 25.43,
+      "tg_stddev": 1.16,
+      "delta_vs_peak_pct": 4.65,
+      "detail": "New peak! ub=128 allows b=512 to fit within 6 GB"
+    },
+    "peak_config": {
+      "b": 512,
+      "ub": 128,
+      "pp_tok_s": 113.89,
+      "tg_tok_s": 25.43,
+      "note": "Matches prior baseline finding (t_72cf1cc5)"
+    }
+  },
+  "conclusions": [
+    "Matched-pair (b=ub) sweep: b=128/ub=128 peak at 24.30 t/s; b=256/ub=256 OOM on 6GB card",
+    "Extended with ub=128 fixed: b=512/ub=128 gives 25.43 t/s (+4.6% vs b=128/ub=128)",
+    "GTX 1660 Super (6GB MMQ-only) can only handle ub=128 at higher batch sizes",
+    "Optimal config for this GPU: b=512, ub=128 (matches prior baseline)",
+    "PP speed stable at ~114 t/s across all tested configs",
+    "TG limited by MMQ kernel performance on cc 7.5 GPU without tensor cores"
+  ]
+}
