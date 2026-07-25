@@ -1,0 +1,68 @@
+{
+  "benchmark": "b/ub doubling sweep #2 - GTX 1660 Super (CUDA1) sequential matched pairs",
+  "model": "Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf",
+  "model_size_bytes": 5769121792,
+  "model_n_params": 9197093888,
+  "gpu": "NVIDIA GeForce GTX 1660 SUPER (6GB, no tensor cores)",
+  "device": "CUDA1",
+  "build_commit": "aa6f56b6c",
+  "build_number": 10453,
+  "test_params": "p=512, n=128, depth=0, r=3, --no-warmup --fit-target=1000, sequential matched b=ub pairs",
+  "timestamp": "2026-07-25T12:51-12:55Z",
+  "notes": "Sequential sweep: b=128, ub=128 ran first. b=256, ub=256 showed >5% TG falloff from b=128 baseline, so sweep stopped per spec.",
+  "results": [
+    {
+      "b": 128, "ub": 128, "matched": true,
+      "pp_tok_s": 71.61, "pp_stddev": 2.28,
+      "tg_tok_s": 9.39, "tg_stddev": 0.42,
+      "tg_samples": [9.87, 9.11, 9.19],
+      "repetitions": 3,
+      "status": "ok",
+      "note": "Baseline - best decode speed on 1660 Super"
+    },
+    {
+      "b": 256, "ub": 256, "matched": true,
+      "pp_tok_s": 91.62, "pp_stddev": 3.61,
+      "tg_tok_s": 6.90, "tg_stddev": 2.03,
+      "tg_samples": [4.64, 7.51, 8.55],
+      "repetitions": 3,
+      "status": "ok",
+      "note": "High variance. First sample anomalously slow (4.64 t/s). 26.5% falloff from b=128 baseline -> sweep stopped."
+    },
+    {
+      "b": 512, "ub": 512, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "repetitions": 0,
+      "status": "not_attempted",
+      "note": "Not attempted - b=256 already >5% falloff"
+    },
+    {
+      "b": 1024, "ub": 1024, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "repetitions": 0,
+      "status": "not_attempted",
+      "note": "Not attempted - sweep stopped at b=256"
+    },
+    {
+      "b": 2048, "ub": 2048, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "repetitions": 0,
+      "status": "not_attempted",
+      "note": "Not attempted - sweep stopped at b=256"
+    },
+    {
+      "b": 4096, "ub": 4096, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "repetitions": 0,
+      "status": "not_attempted",
+      "note": "Not attempted - sweep stopped at b=256"
+    }
+  ],
+  "analysis": {
+    "best_tg": {"b": 128, "ub": 128, "t_s": 9.39},
+    "best_pp": {"b": 256, "ub": 256, "t_s": 91.62},
+    "max_matched_pair_viable": {"b": 128, "ub": 128, "t_s": 9.39},
+    "falloff_128_to_256": "-26.5%",
+    "conclusion": "On GTX 1660 Super (no tensor cores, 6GB), decode speed drops significantly when b/ub increases from 128 to 256. b=128, ub=128 is optimal for both decode speed and stability. Larger batch sizes hurt decode latency on this GPU - likely due to no tensor cores and limited memory bandwidth (192-bit GDDR6)."
+  }
+}
