@@ -4572,7 +4572,11 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         // with its own grants, decrements and pending. Non-iSWA: sibling is null and the
         // whole target is ours.
         // (our_offer + sib_offer > 0 guaranteed by the continue above)
+#ifdef _MSC_VER
+        const uint64_t own_target = (uint64_t) ((double) target * our_offer / (our_offer + sib_offer));
+#else
         const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
+#endif
         size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
         grants_changed = grants_changed || freed_own > 0;
         if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
