@@ -550,6 +550,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
         }
+        // A sharded operand combined with a full-width MIRRORED one (e.g. the turbo V-mean tap
+        // adding a per-channel mu row to a channel-sharded attention output). The fast path above
+        // only covers a mirrored operand that BROADCASTS along the split axis (ne[axis] == 1);
+        // here mu is full width, so it is resident in its entirety on every device and each shard
+        // uses its own slice. Result keeps the src[0] split.
+        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
