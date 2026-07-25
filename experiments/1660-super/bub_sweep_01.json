@@ -1,0 +1,99 @@
+{
+  "benchmark": "b/ub doubling sweep - GTX 1660 Super (CUDA1)",
+  "model": "Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf",
+  "model_size_bytes": 5769121792,
+  "model_n_params": 9197093888,
+  "gpu": "NVIDIA GeForce GTX 1660 SUPER (6GB)",
+  "device": "CUDA1",
+  "build_commit": "aa6f56b6c",
+  "test_params": "p=512, n=128, depth=0, r=3 (unless noted)",
+  "timestamp": "2026-07-25T12:48-13:00Z",
+  "results": [
+    {
+      "b": 128, "ub": 128, "matched": true,
+      "pp_tok_s": 147.24, "tg_tok_s": 42.55,
+      "tg_stddev": 0.0, "repetitions": 1,
+      "status": "ok",
+      "note": "Baseline - best decode speed"
+    },
+    {
+      "b": 256, "ub": 256, "matched": true,
+      "pp_tok_s": 146.44, "tg_tok_s": 42.52,
+      "tg_stddev": 0.10, "repetitions": 3,
+      "status": "ok",
+      "note": "2nd matching pair - within 0.07% of peak"
+    },
+    {
+      "b": 512, "ub": 512, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Failed to create context - out of memory"
+    },
+    {
+      "b": 1024, "ub": 1024, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Failed to create context - out of memory"
+    },
+    {
+      "b": 2048, "ub": 2048, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Not attempted - b=1024 already OOM"
+    },
+    {
+      "b": 4096, "ub": 4096, "matched": true,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Not attempted - b=1024 already OOM"
+    },
+    {
+      "b": 128, "ub": 256, "matched": false,
+      "pp_tok_s": 147.29, "tg_tok_s": 42.80,
+      "tg_stddev": 0.11, "repetitions": 5,
+      "status": "ok",
+      "note": "b=128 with ub=256 - slightly slower"
+    },
+    {
+      "b": 128, "ub": 512, "matched": false,
+      "pp_tok_s": 146.19, "tg_tok_s": 42.33,
+      "tg_stddev": 0.70, "repetitions": 5,
+      "status": "ok",
+      "note": "b=128 with ub=512 - more variance"
+    },
+    {
+      "b": 256, "ub": 128, "matched": false,
+      "pp_tok_s": 146.70, "tg_tok_s": 42.41,
+      "tg_stddev": 0.09, "repetitions": 5,
+      "status": "ok",
+      "note": "b=256 with ub=128 - slightly slower"
+    },
+    {
+      "b": 512, "ub": 128, "matched": false,
+      "pp_tok_s": 147.84, "tg_tok_s": 42.27,
+      "tg_stddev": 0.22, "repetitions": 3,
+      "status": "ok",
+      "note": "b=512 with ub=128 - max b that works"
+    },
+    {
+      "b": 1024, "ub": 128, "matched": false,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Exit code 9 - SIGKILL/OOM"
+    },
+    {
+      "b": 512, "ub": 256, "matched": false,
+      "pp_tok_s": null, "tg_tok_s": null,
+      "status": "OOM",
+      "note": "Exit code 9 - SIGKILL/OOM"
+    }
+  ],
+  "analysis": {
+    "best_tg": {"b": 128, "ub": 128, "t_s": 42.55},
+    "max_matched_pair": {"b": 256, "ub": 256, "t_s": 42.52},
+    "max_batch_with_ub128": {"b": 512, "ub": 128, "t_s": 42.27},
+    "falloff_128_to_256": "-0.07%",
+    "falloff_128_to_512_ub128": "-0.66%",
+    "conclusion": "Matching b=ub pairs up to 256 viable. Decode speed flat across all configs (~42-43 t/s). VRAM limit (6GB) prevents b>=512 with matching ub. b=128, ub=128 is optimal for decode speed on 1660 Super with 9B Q4_K_M."
+  }
+}
