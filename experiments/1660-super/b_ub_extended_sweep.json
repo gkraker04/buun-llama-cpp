@@ -1,0 +1,229 @@
+{
+  "meta": {
+    "tool": "llama-bench",
+    "model": "K:\\models\\GestaltLabs\\Ornstein-3.5-9B-V2-GGUF\\ornstein-v2-Q4_K_M.gguf",
+    "args": "-ngl 99 -dev CUDA1 -fa on -ctk f16 -ctv f16 -p 128 -n 128 -r 5",
+    "b_values": [
+      8192,
+      16384,
+      32768
+    ],
+    "n_rounds": 5,
+    "early_stop_threshold_pct": 12.0,
+    "gpu": "GTX 1660 Super (CUDA1, 6GB)",
+    "timestamp": "2026-07-25T16:30",
+    "branch": "1660-super-baseline",
+    "prompt_tokens": 128,
+    "gen_tokens": 128,
+    "flash_attn": true,
+    "kv_cache": "f16",
+    "original_peak": {
+      "b": 64,
+      "ub": 64,
+      "tg_s": 42.608
+    }
+  },
+  "configs": [
+    {
+      "b": 8192,
+      "ub": 64,
+      "tg_s_mean": 42.845,
+      "tg_s_std": 0.051,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 128,
+      "tg_s_mean": 42.519,
+      "tg_s_std": 0.017,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 256,
+      "tg_s_mean": 42.515,
+      "tg_s_std": 0.027,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 512,
+      "tg_s_mean": 42.456,
+      "tg_s_std": 0.089,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 1024,
+      "tg_s_mean": 42.39,
+      "tg_s_std": 0.075,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 2048,
+      "tg_s_mean": 42.287,
+      "tg_s_std": 0.055,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 4096,
+      "tg_s_mean": 42.319,
+      "tg_s_std": 0.033,
+      "n_rounds": 5
+    },
+    {
+      "b": 8192,
+      "ub": 8192,
+      "tg_s_mean": 42.301,
+      "tg_s_std": 0.025,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 64,
+      "tg_s_mean": 42.283,
+      "tg_s_std": 0.091,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 128,
+      "tg_s_mean": 42.286,
+      "tg_s_std": 0.08,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 256,
+      "tg_s_mean": 42.304,
+      "tg_s_std": 0.02,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 512,
+      "tg_s_mean": 42.282,
+      "tg_s_std": 0.027,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 1024,
+      "tg_s_mean": 42.322,
+      "tg_s_std": 0.014,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 2048,
+      "tg_s_mean": 42.255,
+      "tg_s_std": 0.025,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 4096,
+      "tg_s_mean": 42.275,
+      "tg_s_std": 0.098,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 8192,
+      "tg_s_mean": 42.299,
+      "tg_s_std": 0.014,
+      "n_rounds": 5
+    },
+    {
+      "b": 16384,
+      "ub": 16384,
+      "tg_s_mean": 42.229,
+      "tg_s_std": 0.073,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 64,
+      "tg_s_mean": 42.263,
+      "tg_s_std": 0.127,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 128,
+      "tg_s_mean": 42.257,
+      "tg_s_std": 0.07,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 256,
+      "tg_s_mean": 42.31,
+      "tg_s_std": 0.029,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 512,
+      "tg_s_mean": 42.278,
+      "tg_s_std": 0.028,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 1024,
+      "tg_s_mean": 42.316,
+      "tg_s_std": 0.018,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 2048,
+      "tg_s_mean": 42.224,
+      "tg_s_std": 0.07,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 4096,
+      "tg_s_mean": 42.267,
+      "tg_s_std": 0.054,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 8192,
+      "tg_s_mean": 42.088,
+      "tg_s_std": 0.151,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 16384,
+      "tg_s_mean": 41.872,
+      "tg_s_std": 0.066,
+      "n_rounds": 5
+    },
+    {
+      "b": 32768,
+      "ub": 32768,
+      "tg_s_mean": 42.279,
+      "tg_s_std": 0.021,
+      "n_rounds": 5
+    }
+  ],
+  "summary": {
+    "original_peak_tg_s": 42.608,
+    "original_peak_config": "b=64/ub=64",
+    "extended_lowest_tg_s": 41.872,
+    "extended_lowest_config": "b=32768/ub=16384",
+    "max_drop_below_peak_pct": 1.73,
+    "significant_falloff_found": false,
+    "falloff_threshold_pct": 12.0,
+    "oom_configs": [],
+    "limiter_interference": false,
+    "exit_code_9_occurrences": 0
+  }
+}
