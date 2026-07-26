@@ -97,6 +97,9 @@ struct llama_cparams {
     // Populated by the decode loop before each process_ubatch().
     dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
     int tape_gpu_n_seqs = 0;
+    // Minimal-F32 mode omits redundant post-conv K/V graph copies. QKV,
+    // gate, and beta remain authoritative for exact reconstruction.
+    bool tape_minimal_capture = false;
 
     // DFlash GPU capture staging: graph-embedded copies of each captured layer's l_out
     // into capture_stage[i] (one [n_embd, max_tokens] tensor per entry of

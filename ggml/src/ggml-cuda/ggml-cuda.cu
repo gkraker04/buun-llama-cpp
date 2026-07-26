@@ -71,6 +71,8 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
+#include <cuda_profiler_api.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -5445,6 +5447,16 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
     return &iface;
 }
 
+// Test/benchmark-only profiler range hooks. They are resolved dynamically by
+// the Gate-5 harness, so libllama and CPU-only builds acquire no CUDA linkage.
+static int dflash_cuda_profiler_start(void) {
+    return (int) cudaProfilerStart();
+}
+
+static int dflash_cuda_profiler_stop(void) {
+    return (int) cudaProfilerStop();
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
@@ -5488,6 +5500,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_gpu_set_tensor;
+    }
+    if (strcmp(name, "dflash_cuda_profiler_start") == 0) {
+        return (void *)dflash_cuda_profiler_start;
+    }
+    if (strcmp(name, "dflash_cuda_profiler_stop") == 0) {
+        return (void *)dflash_cuda_profiler_stop;
     }
     return nullptr;
 }

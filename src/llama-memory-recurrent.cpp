@@ -263,6 +263,46 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+llama_memory_resume_plan llama_memory_recurrent::plan_resume(
+        llama_seq_id seq_id,
+        llama_pos    target_pos) const {
+    llama_memory_resume_plan plan = {};
+    plan.full_replay = true;
+
+    if (seq_id < 0 || target_pos < 0 || (size_t) seq_id >= cells.size()) {
+        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_INVALID_ARGUMENT;
+        return plan;
+    }
+    if (target_pos == 0) {
+        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_TARGET_BEFORE_COVERAGE;
+        return plan;
+    }
+
+    const llama_pos pos_max = seq_pos_max(seq_id);
+    if (pos_max < 0) {
+        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_EMPTY_SEQUENCE;
+        return plan;
+    }
+
+    const int64_t live_next = (int64_t) pos_max + 1;
+    plan.replay_tokens = live_next;
+    if ((int64_t) target_pos > live_next) {
+        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER;
+        return plan;
+    }
+
+    // A recurrent checkpoint supplies the state at target_pos - 1. Unlike attention KV,
+    // the current recurrent row is not coverage for earlier positions and is not counted as
+    // reusable tokens; it only proves this sequence has a live component to replace.
+    plan.resumable     = true;
+    plan.full_replay   = false;
+    plan.components    = LLAMA_MEMORY_RESUME_COMPONENT_RECURRENT;
+    plan.reuse_tokens  = 0;
+    plan.replay_tokens = live_next - target_pos;
+    plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_NONE;
+    return plan;
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     (void) try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }

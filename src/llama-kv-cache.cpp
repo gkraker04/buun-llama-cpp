@@ -1331,6 +1331,7 @@ llama_kv_cache::llama_kv_cache(
                 vbr_trace_fp_.reset(fopen(trace_path.c_str(), "w"));
                 if (vbr_trace_fp_) {
                     fprintf(vbr_trace_fp_.get(), "# phase\tboundary\tcursor\ttier_fnv\twm\tused\tmapped_bytes\n");
+                    fflush(vbr_trace_fp_.get());
                     LLAMA_LOG_INFO("%s: VBR_TRACE -> %s (per-boundary tier-schedule trace)\n", __func__, trace_path.c_str());
                 } else {
                     LLAMA_LOG_WARN("%s: VBR_TRACE=%s could not be opened for writing\n", __func__, trace_path.c_str());
@@ -2025,7 +2026,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (!vbr_freeze_) {
             vbr_ledger_precheck();
         }
-        bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
+        const bool vbr_reconcile_now = vbr_retier_take_reconcile("prepare");
+        bool vbr_stable = (vbr_retier_freeze_depth_ == 0 && !vbr_reconcile_now &&
+                           vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
                            !vbr_ledger_force_);
@@ -2084,21 +2087,28 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                     }
                 }
             }
-            while (vbr_over_budget(wm_next)) {
-                vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                if (!vbr_degrade_next(wm_next)) {
-                    if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
-                        vbr_budget_warned_ = true;
-                        size_t projected_total = 0;
-                        for (const auto & p : vbr_pools_) {
-                            projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+            if (vbr_retier_freeze_depth_ > 0 && vbr_over_budget(wm_next)) {
+                // The preflight should make this unreachable for a correctly bounded consumer,
+                // but keep decode/bookkeeping live and remember the pressure if a caller grows
+                // past its declared bound. Never interpret "frozen" as ladder exhaustion.
+                vbr_retier_defer("degrade_pressure");
+            } else {
+                while (vbr_over_budget(wm_next)) {
+                    vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
+                    if (!vbr_degrade_next(wm_next)) {
+                        if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
+                            vbr_budget_warned_ = true;
+                            size_t projected_total = 0;
+                            for (const auto & p : vbr_pools_) {
+                                projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+                            }
+                            LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
+                                    __func__, vbr_budget_bytes_/1024.0/1024.0,
+                                    vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
+                                    projected_total/1024.0/1024.0, wm_next);
                         }
-                        LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
-                                __func__, vbr_budget_bytes_/1024.0/1024.0,
-                                vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
-                                projected_total/1024.0/1024.0, wm_next);
+                        break;
                     }
-                    break;
                 }
             }
             // per-pool budget/occupancy trace for multi-GPU verification (visible with -v)
@@ -2704,6 +2714,13 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     if (p.budget_eff_stamp == vbr_boundary_count_) {
         return p.budget_eff_cache;
     }
+    const size_t budget_eff = vbr_budget_eff_uncached(p);
+    p.budget_eff_stamp = vbr_boundary_count_;
+    p.budget_eff_cache = budget_eff;
+    return budget_eff;
+}
+
+size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
     size_t budget_eff = p.budget;
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm); // deterministic (pool mapped bytes)
     // WS-0 (P1) freeze: skip every live-VRAM / co-tenancy input — the live free-VRAM clamp
@@ -2750,8 +2767,6 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 #ifndef NDEBUG
     GGML_ASSERT(budget_eff >= mapped_now);
 #endif
-    p.budget_eff_stamp = vbr_boundary_count_;
-    p.budget_eff_cache = budget_eff;
     return budget_eff;
 }
 
@@ -2821,6 +2836,9 @@ void llama_kv_cache::vbr_trace_emit(const char * phase, uint32_t wm, uint32_t us
     fprintf(vbr_trace_fp_.get(), "%s\t%llu\t%zu\t%016llx\t%u\t%u\t%zu\n",
             phase, (unsigned long long) vbr_boundary_count_, vbr_degrade_cursor_,
             (unsigned long long) fnv, wm, used, mapped);
+    // Traces are test evidence for fail-closed and injected-abort arms. Do not leave the latest
+    // completed boundary stranded in stdio buffering when a later assertion terminates the run.
+    fflush(vbr_trace_fp_.get());
 }
 
 bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
@@ -2875,7 +2893,8 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
-        if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+        bool reserved = p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes);
+        if (!reserved) {
             // First-activation transient: the wave that just took this side off f16 queued its
             // freed tier-A tail pages as deferred unmaps (released at the NEXT boundary), so the
             // bytes the wave freed are physically unavailable to the very reserve it triggered.
@@ -2884,10 +2903,13 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
                     "flushing deferred unmaps and retrying\n",
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
             vbr_flush_deferred_unmaps();
-            if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+            reserved = p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes);
+            if (!reserved) {
                 return false;
             }
         }
+        p.scratch_k_reserved = std::max(p.scratch_k_reserved, k_bytes);
+        p.scratch_v_reserved = std::max(p.scratch_v_reserved, v_bytes);
     }
     return true;
 }
@@ -2982,6 +3004,7 @@ void llama_kv_cache::breathe() {
     if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
         return;
     }
+    vbr_retier_take_reconcile("breathe");
     if (vbr_stash_dirty_) {
         for (auto & p : vbr_pools_) {
             for (size_t j = 0; j < layers.size(); ++j) {
@@ -3518,6 +3541,33 @@ void llama_kv_cache::vbr_representation_changed() {
     }
 }
 
+bool llama_kv_cache::vbr_retier_defer(const char * decision) {
+    if (vbr_retier_freeze_depth_ == 0) {
+        return false;
+    }
+    vbr_retier_deferred_decisions_++;
+    vbr_retier_reconcile_pending_ = true;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=defer controller=%s decision=%s depth=%u deferred_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            decision, vbr_retier_freeze_depth_,
+            (unsigned long long) vbr_retier_deferred_decisions_);
+    return true;
+}
+
+bool llama_kv_cache::vbr_retier_take_reconcile(const char * boundary) {
+    if (vbr_retier_freeze_depth_ > 0 || !vbr_retier_reconcile_pending_) {
+        return false;
+    }
+    // Do not replay a queued promote/degrade choice: only force the ordinary controller off
+    // its stable fast path, where it recomputes watermark, occupancy and budgets from scratch.
+    vbr_retier_reconcile_pending_ = false;
+    vbr_retier_reconciles_++;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=reconcile controller=%s boundary=%s reconciles_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            boundary, (unsigned long long) vbr_retier_reconciles_);
+    return true;
+}
+
 // The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS — unlike
 // container promotion this genuinely restores quality, because all future content is new. Flip
 // every tensor back to its entry tier, rewind the price cursor, drop the (now stale) sink
@@ -3525,6 +3575,9 @@ void llama_kv_cache::vbr_representation_changed() {
 // start (prefill-direct). Fires lazily from prepare() at the first decode after the cache
 // empties, whatever emptied it (clear, seq_rm, server slot recycle).
 void llama_kv_cache::vbr_full_reset() {
+    if (vbr_retier_defer("full_reset")) {
+        return;
+    }
     // in-flight safety before ripping pages: settle the side streams and the devices once
     // (session-boundary event — the sync cost is irrelevant)
     vbr_flush_deferred_unmaps();
@@ -3617,6 +3670,9 @@ void llama_kv_cache::vbr_shrink_watermark() {
 // per call; the in-place transcode runs descending tiles (see vbr-transcode.cu) after the grown
 // extent is mapped up front.
 bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
+    if (vbr_retier_defer("promote")) {
+        return false;
+    }
     while (vbr_degrade_cursor_ > 0) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_ - 1];
         const auto it = map_layer_ids.find(st.il);
@@ -3764,6 +3820,9 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
 }
 
 bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+    if (vbr_retier_defer("degrade")) {
+        return false;
+    }
     while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
 
@@ -4159,6 +4218,12 @@ double llama_kv_cache::kv_bpv() const {
 llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
     llama_memory_vbr_state_data st = {};
     st.representation_epoch = vbr_representation_epoch();
+    st.retier_freeze_depth       = other ? other->vbr_retier_freeze_depth_       : vbr_retier_freeze_depth_;
+    st.retier_env_freeze         = other ? other->vbr_freeze_                    : vbr_freeze_;
+    st.retier_freeze_enters      = other ? other->vbr_retier_freeze_enters_      : vbr_retier_freeze_enters_;
+    st.retier_freeze_exits       = other ? other->vbr_retier_freeze_exits_       : vbr_retier_freeze_exits_;
+    st.retier_deferred_decisions = other ? other->vbr_retier_deferred_decisions_ : vbr_retier_deferred_decisions_;
+    st.retier_reconciles         = other ? other->vbr_retier_reconciles_         : vbr_retier_reconciles_;
 
     // full-reset feasibility: used cells the asking seq does not exclusively own. Cells above
     // used_max_p1 are empty by definition, so the scan is bounded by live occupancy.
@@ -4250,6 +4315,151 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
     return st;
+}
+
+uint64_t llama_kv_cache::vbr_retier_freeze_begin(const char * owner) {
+    if (other) {
+        return other->vbr_retier_freeze_begin(owner);
+    }
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return 0;
+    }
+    const uint64_t now = llama_vram_ledger_now_ns();
+    if (vbr_retier_freeze_depth_ == 0) {
+        vbr_retier_outer_deferred_base_ = vbr_retier_deferred_decisions_;
+    }
+    vbr_retier_freeze_depth_++;
+    vbr_retier_freeze_enters_++;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=enter controller=%s owner=%s depth=%u env_freeze=%u enters_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            owner != nullptr ? owner : "-", vbr_retier_freeze_depth_, vbr_freeze_ ? 1u : 0u,
+            (unsigned long long) vbr_retier_freeze_enters_);
+    return now != 0 ? now : 1;
+}
+
+void llama_kv_cache::vbr_retier_freeze_end(
+        const char * owner, uint64_t started_ns) {
+    if (other) {
+        other->vbr_retier_freeze_end(owner, started_ns);
+        return;
+    }
+    GGML_ASSERT(vbr_retier_freeze_depth_ > 0);
+    const uint64_t now = llama_vram_ledger_now_ns();
+    vbr_retier_freeze_depth_--;
+    vbr_retier_freeze_exits_++;
+    const uint64_t duration_us =
+        now > started_ns ? (now - started_ns) / 1000 : 0;
+    const uint64_t deferred_scope =
+        vbr_retier_deferred_decisions_ - vbr_retier_outer_deferred_base_;
+    if (vbr_retier_freeze_depth_ == 0 && !vbr_freeze_) {
+        // Even a no-op trim can change the controller's future occupancy inputs. Force a fresh
+        // decision pass at the next safe boundary; never execute a stale queued choice here.
+        vbr_retier_reconcile_pending_ = true;
+    }
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s depth=%u duration_us=%llu "
+            "deferred_scope=%llu deferred_total=%llu exits_total=%llu action=%s\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            owner != nullptr ? owner : "-", vbr_retier_freeze_depth_,
+            (unsigned long long) duration_us,
+            (unsigned long long) deferred_scope,
+            (unsigned long long) vbr_retier_deferred_decisions_,
+            (unsigned long long) vbr_retier_freeze_exits_,
+            vbr_retier_freeze_depth_ > 0
+                ? "remain_frozen"
+                : vbr_retier_reconcile_pending_
+                    ? "reevaluate_next_boundary"
+                    : "env_freeze_noop");
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
+        uint32_t n_tokens_extra) const {
+    if (other) {
+        return other->vbr_retier_preflight(n_tokens_extra);
+    }
+    llama_memory_vbr_preflight_data r = {};
+    r.fits = true;
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return r;
+    }
+    r.active = true;
+    r.watermark_cells = vbr_watermark_cells(n_tokens_extra);
+    struct device_growth {
+        const ggml_vbr_backend_iface * be = nullptr;
+        size_t kv = 0;
+        size_t scratch_k_need = 0;
+        size_t scratch_v_need = 0;
+        size_t scratch_k_have = 0;
+        size_t scratch_v_have = 0;
+    };
+    std::map<int, device_growth> growth;
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        const size_t needed   = vbr_vmm_projected_bytes(p, r.watermark_cells);
+        // A restore can begin after a long idle period but before another decode boundary.
+        // The controller memo is boundary-scoped, so preflight must sample live capacity now.
+        const size_t available = vbr_budget_eff_uncached(p);
+        const int64_t deficit =
+            needed > available ? (int64_t) (needed - available) : 0;
+        r.pools++;
+        r.bytes_needed    += needed;
+        r.bytes_available += available;
+        r.max_deficit = std::max(r.max_deficit, deficit);
+        r.fits = r.fits && deficit == 0;
+
+        // The KV budget deliberately excludes fattn's shared per-device f16 dequant scratch
+        // (#88). A frozen-tier replay can grow both, so price their physical deltas together.
+        auto & g = growth[p.device];
+        g.be = p.be;
+        const size_t mapped = p.be->vmm_pool_mapped(p.vmm);
+        g.kv += needed > mapped ? needed - mapped : 0;
+        size_t k_row = 0;
+        size_t v_row = 0;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            const ggml_tensor * tk = p.k[ikv].t;
+            const ggml_tensor * tv = p.v[ikv].t;
+            bool need_k = false;
+            bool need_v = false;
+            ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                      tv ? tv->type : GGML_TYPE_F16,
+                                      &need_k, &need_v);
+            if (need_k && tk) {
+                k_row = std::max(k_row,
+                        ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+            }
+            if (need_v && tv) {
+                v_row = std::max(v_row,
+                        ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+            }
+        }
+        // The backend scratch is shared per device and sized by a max, not a sum.
+        g.scratch_k_need = std::max(
+            g.scratch_k_need, k_row * (size_t) r.watermark_cells);
+        g.scratch_v_need = std::max(
+            g.scratch_v_need, v_row * (size_t) r.watermark_cells);
+        g.scratch_k_have = std::max(g.scratch_k_have, p.scratch_k_reserved);
+        g.scratch_v_have = std::max(g.scratch_v_have, p.scratch_v_reserved);
+    }
+    for (const auto & [device, g] : growth) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        g.be->get_device_memory(device, &free_b, &total_b);
+        const size_t scratch_k_delta =
+            g.scratch_k_need > g.scratch_k_have
+                ? g.scratch_k_need - g.scratch_k_have : 0;
+        const size_t scratch_v_delta =
+            g.scratch_v_need > g.scratch_v_have
+                ? g.scratch_v_need - g.scratch_v_have : 0;
+        const size_t physical_need = g.kv + scratch_k_delta + scratch_v_delta;
+        const int64_t physical_deficit =
+            physical_need > free_b ? (int64_t) (physical_need - free_b) : 0;
+        r.physical_growth_needed += physical_need;
+        r.physical_growth_available += free_b;
+        r.max_deficit = std::max(r.max_deficit, physical_deficit);
+        r.fits = r.fits && physical_deficit == 0;
+    }
+    return r;
 }
 
 // co-tenancy: the marker-published donation offer. Walks the REMAINING consent window
@@ -4709,6 +4919,9 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
 // the bytes freed on the DEMANDED device.
 size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
     if (target == 0) {
+        return 0;
+    }
+    if (vbr_retier_defer("peer_shed")) {
         return 0;
     }
     vbr_pool * demanded_pool = vbr_find_pool(c.busid);

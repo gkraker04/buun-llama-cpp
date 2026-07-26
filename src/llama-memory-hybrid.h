@@ -69,6 +69,16 @@ public:
         return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
     }
 
+    uint64_t vbr_retier_freeze_begin(const char * owner) override {
+        return mem_attn->vbr_retier_freeze_begin(owner);
+    }
+    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override {
+        mem_attn->vbr_retier_freeze_end(owner, started_ns);
+    }
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override {
+        return mem_attn->vbr_retier_preflight(n_tokens_extra);
+    }
+
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
         return mem_attn->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
     }
@@ -86,7 +96,10 @@ public:
 
     void clear(bool data) override;
 
+    llama_memory_resume_plan plan_resume(llama_seq_id seq_id, llama_pos target_pos) const override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;

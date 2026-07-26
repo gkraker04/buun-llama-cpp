@@ -153,6 +153,15 @@ struct llama_memory_i {
         return {};
     }
 
+    // Scoped dynamic-VBR representation freeze. Non-VBR memories use the inert defaults.
+    virtual uint64_t vbr_retier_freeze_begin(const char * /*owner*/) { return 0; }
+    virtual void vbr_retier_freeze_end(const char * /*owner*/, uint64_t /*started_ns*/) {}
+    virtual llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t /*n_tokens_extra*/) const {
+        llama_memory_vbr_preflight_data r = {};
+        r.fits = true;
+        return r;
+    }
+
     // per-token KV bits of the layout the --vbr-floor clamp lands on when walking the degrade
     // order from the given entry types (GGML_TYPE_COUNT = each tensor's current type;
     // floor_bpv <= 0 = bottom-tier default). 0 = no VBR-capable cache. The fit pass calls this
@@ -181,10 +190,17 @@ struct llama_memory_i {
     // ops
     //
 
+    // Default memory kind is attention-only. Composite/recurrent implementations override the
+    // component contract while reusing the same position/frontier arithmetic.
+    virtual llama_memory_resume_plan plan_resume(llama_seq_id seq_id, llama_pos target_pos) const;
+
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+    virtual bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     // Internal detectable copy path. Memory implementations whose seq_cp cannot fail use
     // this fallback; composite/recurrent memories override it to report transactional failure.

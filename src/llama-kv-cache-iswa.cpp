@@ -321,6 +321,16 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     // Addition would make (base + 1, swa) collide with (base, swa + 1).
     r.representation_epoch     = b.representation_epoch;
     r.representation_epoch_swa = s.representation_epoch;
+    // Scoped entry/exit is parent-coordinated, so depth and scope counts agree whenever both
+    // children are active. max also handles a model whose base or SWA side has no VBR layers.
+    r.retier_freeze_depth  = std::max(b.retier_freeze_depth, s.retier_freeze_depth);
+    r.retier_env_freeze    = std::max(b.retier_env_freeze,   s.retier_env_freeze);
+    r.retier_freeze_enters = std::max(b.retier_freeze_enters, s.retier_freeze_enters);
+    r.retier_freeze_exits  = std::max(b.retier_freeze_exits,  s.retier_freeze_exits);
+    r.retier_reconciles    = std::max(b.retier_reconciles,    s.retier_reconciles);
+    // Decisions are per-controller (base and SWA may see different pressure), so preserve both.
+    r.retier_deferred_decisions =
+        b.retier_deferred_decisions + s.retier_deferred_decisions;
 
     // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
     double bits_base = 0.0, vals_base = 0.0;
@@ -331,6 +341,54 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     r.bpv_if_degraded = vals_sum > 0.0
         ? (b.bpv_if_degraded * vals_base + s.bpv_if_degraded * vals_swa) / vals_sum
         : 0.0;
+    return r;
+}
+
+uint64_t llama_kv_cache_iswa::vbr_retier_freeze_begin(const char * owner) {
+    const uint64_t b = kv_base->vbr_retier_freeze_begin(owner);
+    const uint64_t s = kv_swa ->vbr_retier_freeze_begin(owner);
+    return b != 0 ? b : s;
+}
+
+void llama_kv_cache_iswa::vbr_retier_freeze_end(
+        const char * owner, uint64_t started_ns) {
+    // A child with no VBR layers returned an inert begin and must not receive an unmatched end.
+    if (kv_base->vbr_retier_freeze_active()) {
+        kv_base->vbr_retier_freeze_end(owner, started_ns);
+    }
+    if (kv_swa->vbr_retier_freeze_active()) {
+        kv_swa->vbr_retier_freeze_end(owner, started_ns);
+    }
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache_iswa::vbr_retier_preflight(
+        uint32_t n_tokens_extra) const {
+    const auto b = kv_base->vbr_retier_preflight(n_tokens_extra);
+    const auto s = kv_swa ->vbr_retier_preflight(n_tokens_extra);
+    llama_memory_vbr_preflight_data r = {};
+    r.active          = b.active || s.active;
+    r.fits            = b.fits && s.fits;
+    r.pools           = b.pools + s.pools;
+    r.watermark_cells = std::max(b.watermark_cells, s.watermark_cells);
+    r.bytes_needed    = b.bytes_needed + s.bytes_needed;
+    r.bytes_available = b.bytes_available + s.bytes_available;
+    // iSWA children normally share the same device set. Charge both growth requirements against
+    // one copy of the live-free pool (min of the child totals), not two: summing availability would
+    // false-accept two individually fitting children whose combined growth does not fit. On a
+    // future asymmetric multi-device layout this remains conservative (possible false reject).
+    r.physical_growth_needed =
+        b.physical_growth_needed + s.physical_growth_needed;
+    r.physical_growth_available = b.active && s.active
+        ? std::min(b.physical_growth_available, s.physical_growth_available)
+        : b.physical_growth_available + s.physical_growth_available;
+    const int64_t physical_deficit =
+        r.physical_growth_needed > r.physical_growth_available
+            ? (int64_t) (r.physical_growth_needed -
+                         r.physical_growth_available)
+            : 0;
+    r.max_deficit     = std::max(b.max_deficit, s.max_deficit);
+    r.max_deficit     = std::max(r.max_deficit, physical_deficit);
+    r.fits            = r.fits && physical_deficit == 0;
     return r;
 }
 

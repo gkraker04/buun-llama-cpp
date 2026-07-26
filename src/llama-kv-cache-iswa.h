@@ -72,6 +72,9 @@ public:
     double kv_bpv() const override; // value-weighted combination of the base and SWA caches
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    uint64_t vbr_retier_freeze_begin(const char * owner) override;
+    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
 
     // summed across both children: each context token holds one row in each cache, so the
     // per-token floor cost is additive (SWA rows recycle, but the fit's measured KV bytes

@@ -192,6 +192,12 @@ public:
     double kv_bpv() const override;
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    uint64_t vbr_retier_freeze_begin(const char * owner) override;
+    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
+    bool vbr_retier_freeze_active() const {
+        return other ? other->vbr_retier_freeze_active() : vbr_retier_freeze_depth_ > 0;
+    }
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
@@ -364,6 +370,8 @@ private:
         uint64_t scratch_rows_epoch = ~0ull;
         size_t   scratch_k_row      = 0;
         size_t   scratch_v_row      = 0;
+        size_t   scratch_k_reserved = 0; // largest successful backend-global reserve requested here
+        size_t   scratch_v_reserved = 0;
         // co-tenancy (P2): PCI bus id (resolved once from the backend device; empty = none)
         // and the summed unamortized grant decrement vbr_budget_eff subtracts
         std::string busid;
@@ -525,6 +533,17 @@ private:
     // OFF => every gated branch runs verbatim: a freeze-off build is bit-identical to a pre-freeze
     // build (the P0 base-numerics ratchet). Never a production degrade-policy lever.
     bool     vbr_freeze_           = false;
+    // WS-6: production scoped freeze of representation mutation. Orthogonal to WS-0's
+    // deterministic-input freeze above: nesting never changes the ledger/presence machinery.
+    uint32_t vbr_retier_freeze_depth_       = 0;
+    uint64_t vbr_retier_freeze_enters_      = 0;
+    uint64_t vbr_retier_freeze_exits_       = 0;
+    uint64_t vbr_retier_deferred_decisions_ = 0;
+    uint64_t vbr_retier_reconciles_         = 0;
+    uint64_t vbr_retier_outer_deferred_base_ = 0;
+    bool     vbr_retier_reconcile_pending_  = false;
+    bool     vbr_retier_defer(const char * decision);
+    bool     vbr_retier_take_reconcile(const char * boundary);
     // WS-0 (P1) schedule-trace recorder — env VBR_TRACE=<path>, TEST/GATING ONLY. One line per
     // boundary: phase, boundary#, degrade cursor, tier-vector FNV digest, watermark, used cells,
     // mapped bytes. The L2 null arm needs two runs proven schedule-IDENTICAL (not just same output);
@@ -554,6 +573,7 @@ private:
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;
     size_t   vbr_budget_eff(const vbr_pool & p) const; // live-clamped per-pool budget (shared basis)
+    size_t   vbr_budget_eff_uncached(const vbr_pool & p) const; // restore preflight: fresh live capacity
     bool     vbr_vmm_active() const;                  // any pool is VMM-backed
     bool     vbr_over_budget(uint32_t wm_cells) const; // any VMM pool projected past its budget
     vbr_pool *       vbr_pool_of(const ggml_tensor * t);       // pool owning the tensor (by buffer)

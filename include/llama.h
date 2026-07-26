@@ -763,12 +763,59 @@ extern "C" {
     // This is a non-mutating capability query.
     LLAMA_API bool llama_memory_can_seq_rm_partial(llama_memory_t mem);
 
+    enum llama_memory_resume_component {
+        LLAMA_MEMORY_RESUME_COMPONENT_NONE      = 0,
+        LLAMA_MEMORY_RESUME_COMPONENT_ATTN      = 1 << 0,
+        LLAMA_MEMORY_RESUME_COMPONENT_RECURRENT = 1 << 1,
+    };
+
+    enum llama_memory_resume_reject_reason {
+        LLAMA_MEMORY_RESUME_REJECT_NONE = 0,
+        LLAMA_MEMORY_RESUME_REJECT_NO_MEMORY,
+        LLAMA_MEMORY_RESUME_REJECT_INVALID_ARGUMENT,
+        LLAMA_MEMORY_RESUME_REJECT_EMPTY_SEQUENCE,
+        LLAMA_MEMORY_RESUME_REJECT_TARGET_BEFORE_COVERAGE,
+        LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER,
+        LLAMA_MEMORY_RESUME_REJECT_ATTN_NOT_READY,
+        LLAMA_MEMORY_RESUME_REJECT_RECURRENT_NOT_READY,
+        LLAMA_MEMORY_RESUME_REJECT_COMPONENT_MISMATCH,
+    };
+
+    // Non-mutating, memory-local resume plan for a checkpoint whose recurrent/frontier state
+    // ends at target_pos - 1. Counts are memory-local effective-position spans (and therefore
+    // token counts only for canonical unit-position sequences); a server planner translates
+    // them through its computation-frontier token ledger. The caller must also conjoin checkpoint
+    // identity, captured representation epochs, and serialized-component validity; those records
+    // live above libllama. [EXPERIMENTAL]
+    struct llama_memory_resume_plan {
+        bool                            resumable;
+        bool                            full_replay;
+        uint32_t                        components;
+        int64_t                         reuse_tokens;
+        int64_t                         replay_tokens;
+        enum llama_memory_resume_reject_reason reject_reason;
+    };
+
+    LLAMA_API struct llama_memory_resume_plan llama_memory_plan_resume(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos target_pos);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_seq_rm(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Remove only the attention component over [p0, p1). Hybrid memories leave recurrent
+    // state untouched; non-hybrid attention memories are identical to llama_memory_seq_rm;
+    // recurrent-only memories reject. [EXPERIMENTAL]
+    LLAMA_API bool llama_memory_seq_rm_attn(
             llama_memory_t mem,
               llama_seq_id seq_id,
                  llama_pos p0,
@@ -864,12 +911,48 @@ extern "C" {
                                            // single/primary (non-SWA) VBR controller
         uint64_t representation_epoch_swa; // monotone counter for the SWA controller when this
                                            // state aggregates iSWA; 0 for a single controller
+        uint32_t retier_freeze_depth;       // active scoped retier-freeze nesting depth
+        uint32_t retier_env_freeze;         // WS-0 deterministic env freeze is active
+        uint64_t retier_freeze_enters;      // successful scoped-freeze entries this boot
+        uint64_t retier_freeze_exits;       // matching scoped-freeze exits this boot
+        uint64_t retier_deferred_decisions; // representation-mutation decisions deferred by scopes
+        uint64_t retier_reconciles;         // mandatory fresh controller passes after outer exits
     };
 
     // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
     // decoded on top of the current occupancy (a launch passes the incoming prompt's suffix).
     LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
             llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
+    // Dynamic-VBR scoped retier freeze. This suspends representation mutations only; ordinary
+    // memory bookkeeping and decode remain live. The outermost exit arms a fresh controller
+    // evaluation at the next safe decode/idle boundary. begin returns a timestamp token for end,
+    // or 0 when this memory has no active dynamic-VBR controller. owner must remain valid until end.
+    // [EXPERIMENTAL]
+    LLAMA_API uint64_t llama_memory_vbr_retier_freeze_begin(
+            llama_memory_t mem, const char * owner);
+
+    LLAMA_API void llama_memory_vbr_retier_freeze_end(
+            llama_memory_t mem, const char * owner, uint64_t started_ns);
+
+    // Non-mutating footprint check at the CURRENT tiers. Every VMM pool must fit independently;
+    // bytes_needed/available are sums for observability, while max_deficit and fits preserve the
+    // tightest per-pool result (important for tensor split and iSWA). n_tokens_extra is the bounded
+    // replay/fill still to come while retiering is frozen. [EXPERIMENTAL]
+    struct llama_memory_vbr_preflight_data {
+        bool     active;
+        bool     fits;
+        uint32_t pools;
+        uint32_t watermark_cells;
+        uint64_t bytes_needed;
+        uint64_t bytes_available;
+        uint64_t physical_growth_needed;    // additional KV maps + dequant scratch growth
+        uint64_t physical_growth_available; // live free bytes on the corresponding devices
+        int64_t  max_deficit;
+    };
+
+    LLAMA_API struct llama_memory_vbr_preflight_data llama_memory_vbr_retier_preflight(
+            llama_memory_t mem, uint32_t n_tokens_extra);
 
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
@@ -1206,14 +1289,15 @@ extern "C" {
     // the forward pass). Requires a GPU/IGPU-typed backend (tensor-split's meta backend
     // is neither) and all recurrent states resident on a single non-host device. When
     // false, callers should not record a tape: replay degrades to the CPU path, which
-    // cannot read the GPU tape and silently leaves rolled-back recurrent state stale —
-    // roll back by re-decoding the accepted tokens instead.
+    // does not provide the exact GPU namespace — roll back by re-decoding the
+    // accepted tokens instead.
     LLAMA_API bool llama_dflash_tape_replay_available(struct llama_context * ctx);
 
-    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
-    // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
-    // Must be called after restoring from backup (seq_cp) and before the next decode
-    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
+    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance.
+    // Must be called after restoring from backup (seq_cp) and before the next decode.
+    // Returns false when the exact GPU replay cannot be launched; callers must retain
+    // their backup and restore/re-decode rather than continue from the boundary state.
+    LLAMA_API bool llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
 
     // WS-2 gated prototype: when enabled, GPU tape replay ignores captured post-conv K/V
     // and reconstructs them from the F32 qkv_mixed record. Redundant K/V replay remains
@@ -1230,6 +1314,61 @@ extern "C" {
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             int                    capacity);
+
+    // Gate-5 launch-amortization prototype. Guarantees retained_depth records
+    // while reserving advance_batch-1 headroom records; a full ring applies and
+    // publishes advance_batch left-edge transitions in one transaction.
+    // The ordinary enable API is exactly equivalent to advance_batch=1.
+    LLAMA_API bool llama_dflash_window_enable_batched(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int                    retained_depth,
+            int                    advance_batch);
+
+    // Gate-6 approximate rolling-window prototype. Persistent
+    // qkv_mixed+gate+beta records use F16 (half the exact F32 payload); replay
+    // materializes detached F32 records before applying recurrent updates.
+    // This is a distinct lossy namespace and is never selected by the exact
+    // enable APIs above. Enabling it also selects minimal tape capture for
+    // subsequent decodes; disabling minimal capture while it is live makes
+    // record publication fail closed.
+    LLAMA_API bool llama_dflash_window_enable_batched_f16(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int                    retained_depth,
+            int                    advance_batch);
+
+    enum llama_dflash_window_codec {
+        LLAMA_DFLASH_WINDOW_CODEC_NONE = 0,
+        LLAMA_DFLASH_WINDOW_CODEC_F32  = 1,
+        LLAMA_DFLASH_WINDOW_CODEC_F16  = 2,
+    };
+
+    struct llama_dflash_window_info {
+        bool enabled;
+        enum llama_dflash_window_codec codec;
+        llama_seq_id seq_id;
+        llama_pos boundary_pos;
+        llama_pos frontier_pos;
+        int32_t retained_depth;
+        int32_t advance_batch;
+        int32_t record_count;
+        bool capture_pending;
+    };
+
+    // Read-only identity/range query for coordinated product restore and
+    // non-vacuous test evidence. Returns false when seq_id has no live window.
+    LLAMA_API bool llama_dflash_window_get_info(
+            struct llama_context *           ctx,
+            llama_seq_id                     seq_id,
+            struct llama_dflash_window_info * info);
+
+    // Drop one sequence's rolling history. This never mutates model memory.
+    // A sole pending capture owned by seq_id is discarded as part of the reset;
+    // a mixed-owner pending transaction is retained and makes the call fail.
+    LLAMA_API bool llama_dflash_window_discard_seq(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id);
 
     // Select whether the next windowed decode is a speculative verification.
     // In speculative mode the decoded records stay staged until commit reports
@@ -1267,25 +1406,60 @@ extern "C" {
             llama_seq_id           seq_id,
             llama_pos              pos);
 
+    // Install a successfully reconstructed private boundary copy into the live
+    // recurrent row. This is a recurrent-only prototype/benchmark primitive,
+    // not a coordinated hybrid restore: it deliberately does not trim
+    // attention memory. Restricted to single-device windows with no rollback
+    // planes; installing an F16 window remains in the explicit approximate
+    // namespace selected at enable time.
+    LLAMA_API bool llama_dflash_window_install_reconstructed(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos);
+
+    // Coordinated hybrid restore: reconstruct the recurrent frontier at pos,
+    // trim only attention memory from attention_p0 onward, then install the
+    // reconstructed recurrent state. The private reconstruction is completed
+    // before either live child is touched. False is fail-closed: callers must
+    // clear/reprocess the sequence rather than continue from a split timeline.
+    LLAMA_API bool llama_dflash_window_restore_seq(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos,
+            llama_pos              attention_p0);
+
+    // After a successful coordinated restore, promote its private state copy
+    // to the new rolling boundary and retire the old-branch records in place.
+    // Allocation-free: product restore must not require a second ring's peak
+    // memory merely to start capturing the new branch.
+    LLAMA_API bool llama_dflash_window_commit_branch(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos);
+
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
     //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
     //   - Recurrent state: restores from backup + tape replay for accepted tokens
     // This replaces the manual seq_rm/seq_cp + tape_replay sequence
-    LLAMA_API void llama_dflash_rollback(
+    // Returns false without consuming seq_backup when exact tape replay cannot
+    // be launched, allowing the caller to restore and re-decode exactly.
+    LLAMA_API bool llama_dflash_rollback(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
             int                    n_past_before,
             int                    n_accepted);
 
-    // DFlash: wait for async tape replay to complete (must be called before next verify)
-    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+    // DFlash: wait for async tape replay to complete (must be called before next verify).
+    // False means the deferred conv-state publication failed and the slot must
+    // be reset rather than used as an exact recurrent frontier.
+    LLAMA_API bool llama_tape_replay_sync(struct llama_context * ctx);
 
     // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
     // Restores recurrent state from backup and tape-replays to given depth.
     // Does NOT touch attention KV cache or destroy the backup.
-    LLAMA_API void llama_dflash_prepare_branch(
+    LLAMA_API bool llama_dflash_prepare_branch(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
