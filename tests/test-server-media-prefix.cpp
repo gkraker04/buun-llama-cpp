@@ -28,6 +28,24 @@ static int check(const char * name, size_t got, size_t want) {
     return got == want ? 0 : 1;
 }
 
+static int check_identity(
+        const char * name,
+        server_tokens & tokens,
+        int64_t n_tokens,
+        bool want_valid,
+        std::string * out = nullptr) {
+    std::string identity;
+    const bool valid =
+        tokens.media_content_identity(n_tokens, identity);
+    printf("%-26s identity_valid=%d (want %d) %s\n",
+           name, valid, want_valid,
+           valid == want_valid ? "OK" : "FAIL");
+    if (out != nullptr) {
+        *out = std::move(identity);
+    }
+    return valid == want_valid ? 0 : 1;
+}
+
 int main() {
     const std::vector<llama_token> lead = { 10, 11 }; // 2 shared leading text tokens
     int fails = 0;
@@ -50,6 +68,29 @@ int main() {
         server_tokens a = make("sha:abc", 3, lead);
         server_tokens b = make("sha:xyz", 3, lead);
         fails += check("diff content-id diverge", a.get_common_prefix(b), 2);
+    }
+    // Frontier records must reject the same unidentified/partial media cases,
+    // while identical content yields an exact canonical comparison key.
+    {
+        server_tokens a = make("", 3, lead);
+        fails += check_identity("empty-id identity", a, 5, false);
+    }
+    {
+        server_tokens a = make("sha:abc", 3, lead);
+        fails += check_identity("partial-media identity", a, 3, false);
+    }
+    {
+        server_tokens a = make("sha:abc", 3, lead);
+        server_tokens b = make("sha:abc", 3, lead);
+        server_tokens c = make("sha:xyz", 3, lead);
+        std::string ia;
+        std::string ib;
+        std::string ic;
+        fails += check_identity("same-id identity A", a, 5, true, &ia);
+        fails += check_identity("same-id identity B", b, 5, true, &ib);
+        fails += check_identity("diff-id identity", c, 5, true, &ic);
+        fails += check("identity equality", ia == ib, true);
+        fails += check("identity distinction", ia != ic, true);
     }
 
     if (fails) {

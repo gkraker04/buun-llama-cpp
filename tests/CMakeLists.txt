@@ -162,6 +162,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-dflash-tape-window.cpp)
     target_include_directories(test-dflash-tape-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build(test-dflash-tape-cost.cpp)
+    target_include_directories(test-dflash-tape-cost PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build(test-dflash-tape-approx.cpp)
+    target_include_directories(test-dflash-tape-approx PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -229,14 +235,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
-    llama_test(
-        test-vbr-representation-epoch
-        LABEL cuda
-        ARGS "${MODEL_DIR}/gemma2-dense.gguf"
-    )
-    set_tests_properties(test-vbr-representation-epoch PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
+    # test-vbr-representation-epoch requires an iSWA Gemma-4 fixture. test-llama-archs
+    # deliberately does not save Gemma-4 yet (its synthetic model/context support is
+    # incomplete), so registering this target against a generated non-iSWA model is
+    # a false gate. Hardware validation invokes the built binary with the canonical
+    # real Gemma-4 fixture explicitly.
 
     set(LORA_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-lora-models/")
     file(MAKE_DIRECTORY "${LORA_MODEL_DIR}")

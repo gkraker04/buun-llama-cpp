@@ -212,6 +212,40 @@ static bool states_bit_equal(
     return true;
 }
 
+static bool states_nrmse_below(
+        const std::vector<state_piece> & reference,
+        const std::vector<state_piece> & candidate,
+        double                           limit,
+        double &                         max_nrmse) {
+    if (reference.size() != candidate.size()) {
+        return false;
+    }
+    max_nrmse = 0.0;
+    for (size_t p = 0; p < reference.size(); ++p) {
+        const auto & ref = reference[p];
+        const auto & got = candidate[p];
+        if (ref.layer != got.layer || ref.kind != got.kind ||
+            ref.values.size() != got.values.size()) {
+            return false;
+        }
+        double err2 = 0.0;
+        double ref2 = 0.0;
+        for (size_t i = 0; i < ref.values.size(); ++i) {
+            if (!std::isfinite(got.values[i])) {
+                return false;
+            }
+            const double delta =
+                (double) got.values[i] - ref.values[i];
+            err2 += delta * delta;
+            ref2 += (double) ref.values[i] * ref.values[i];
+        }
+        const double nrmse =
+            std::sqrt(err2 / std::max(ref2, 1e-300));
+        max_nrmse = std::max(max_nrmse, nrmse);
+    }
+    return max_nrmse <= limit;
+}
+
 static bool ring_is(
         const dflash_window & window,
         llama_pos             boundary,
@@ -233,10 +267,31 @@ static bool ring_is(
     return true;
 }
 
-static bool host_qkv_is_packed(
+static bool qkv_capture_is_complete(
         llama_context *                    ctx,
         int                                n_tokens,
         const std::vector<llama_seq_id> & seq_ids) {
+    const bool all_device_staged = std::all_of(
+        seq_ids.begin(), seq_ids.end(),
+        [ctx, n_tokens](llama_seq_id seq_id) {
+            if (seq_id < 0 ||
+                seq_id >= (llama_seq_id) ctx->dflash_capture->tapes.size() ||
+                !ctx->dflash_capture->tapes[seq_id] ||
+                !ctx->dflash_capture->tapes[seq_id]->qkv_staged()) {
+                return false;
+            }
+            return std::all_of(
+                ctx->dflash_capture->tapes[seq_id]->layers.begin(),
+                ctx->dflash_capture->tapes[seq_id]->layers.end(),
+                [n_tokens](const dflash_tape_gpu_layer & layer) {
+                    return layer.qkv &&
+                           layer.qkv->type == GGML_TYPE_F32 &&
+                           layer.qkv->ne[1] >= n_tokens;
+                });
+        });
+    if (all_device_staged) {
+        return true;
+    }
     if (ctx->dflash_capture->tape_layers.empty()) {
         return false;
     }
@@ -341,6 +396,35 @@ static bool ownership_payload_matches(
     return true;
 }
 
+static void poison_redundant_tape(llama_context * ctx) {
+    for (auto & tape : ctx->dflash_capture->tapes) {
+        for (auto & layer : tape->layers) {
+            ggml_backend_tensor_memset(layer.k, 0xa5, 0, ggml_nbytes(layer.k));
+            ggml_backend_tensor_memset(layer.v, 0xa5, 0, ggml_nbytes(layer.v));
+        }
+    }
+}
+
+static bool redundant_tape_still_poisoned(llama_context * ctx) {
+    for (const auto & tape : ctx->dflash_capture->tapes) {
+        for (const auto & layer : tape->layers) {
+            for (const ggml_tensor * tensor : { layer.k, layer.v }) {
+                const size_t probe_bytes =
+                    std::min<size_t>(tensor->nb[2], 4096);
+                std::vector<uint8_t> probe(probe_bytes);
+                ggml_backend_tensor_get(
+                    tensor, probe.data(), 0, probe.size());
+                if (!std::all_of(
+                        probe.begin(), probe.end(),
+                        [](uint8_t byte) { return byte == 0xa5; })) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -389,10 +473,19 @@ int main(int argc, char ** argv) {
     llama_set_dflash_capture(ctx.get(), nullptr, 0);
     llama_dflash_allocate_slots(ctx.get(), 2);
     llama_set_tape_recording(ctx.get(), true);
+    llama_set_tape_minimal_replay(ctx.get(), true);
     if (!llama_dflash_tape_replay_available(ctx.get())) {
         fprintf(stderr, "%s: skipping because lossless single-device GPU tape replay is unavailable\n",
                 __func__);
         return 0;
+    }
+    if (!ctx->get_cparams().tape_minimal_capture) {
+        fprintf(stderr, "%s: minimal capture mode did not reach the graph config\n",
+                __func__);
+        return 1;
+    }
+    if (!tensor_split) {
+        poison_redundant_tape(ctx.get());
     }
 
     constexpr uint32_t prefix = 3;
@@ -413,6 +506,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
     llama_synchronize(ctx.get());
+    if (!tensor_split && !redundant_tape_still_poisoned(ctx.get())) {
+        fprintf(stderr, "%s: minimal capture overwrote redundant K/V tape\n",
+                __func__);
+        return 1;
+    }
     if (!ctx->get_cparams().fused_gdn_ar || !ctx->get_cparams().fused_gdn_ch) {
         fprintf(stderr, "%s: skipping because the CUDA fused-GDN path is not active\n", __func__);
         return 0;
@@ -491,8 +589,36 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // The first packed record must also remain a valid fixed-tape replay input:
+    // restore the immutable b=2 boundary, apply the just-captured token through
+    // the shipped replay/host-conv path, and recover the forward state exactly.
+    if (!decode_one(ctx.get(), tokens, prefix) ||
+        llama_dflash_window_capture_pending(ctx.get())) {
+        fprintf(stderr, "%s: first packed capture failed\n", __func__);
+        return 1;
+    }
+    std::vector<state_piece> packed_forward;
+    std::vector<state_piece> packed_replay;
+    if (!read_live_state(ctx.get(), recurrent, 0, packed_forward) ||
+        !llama_dflash_window_reconstruct_seq(
+            ctx.get(), 0, window.boundary_pos) ||
+        !llama_dflash_window_install_reconstructed(
+            ctx.get(), 0, window.boundary_pos) ||
+        !llama_tape_replay(ctx.get(), 0, 1) ||
+        !llama_tape_replay_sync(ctx.get()) ||
+        !ctx->dflash_capture->replay_minimal_last ||
+        !read_live_state(ctx.get(), recurrent, 0, packed_replay) ||
+        !states_bit_equal(
+            packed_forward, packed_replay,
+            "packed fixed-tape replay")) {
+        fprintf(stderr,
+                "%s: packed minimal record did not reproduce its forward state\n",
+                __func__);
+        return 1;
+    }
+
     // Fill the ring exactly: logical records [3,4,5] occupy physical slots [0,1,2].
-    for (uint32_t pos = prefix; pos <= 5; ++pos) {
+    for (uint32_t pos = prefix + 1; pos <= 5; ++pos) {
         if (!decode_one(ctx.get(), tokens, pos) ||
             llama_dflash_window_capture_pending(ctx.get())) {
             fprintf(stderr, "%s: normal-decode capture failed at pos %u\n", __func__, pos);
@@ -580,6 +706,30 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Gate 5 needs a completed recurrent-side restore, not only a private
+    // reconstruction oracle. Install an interior point, verify the live row,
+    // then restore the frontier before continuing the ownership tests.
+    constexpr llama_pos install_pos = 6;
+    std::vector<state_piece> install_expected;
+    std::vector<state_piece> install_live;
+    if (!llama_dflash_window_reconstruct_seq(ctx.get(), 0, install_pos) ||
+        !read_window_state(
+            ctx.get(), 0, window.reconstructed_idx, install_expected) ||
+        !llama_dflash_window_install_reconstructed(
+            ctx.get(), 0, install_pos) ||
+        recurrent->seq_pos_max(0) != install_pos ||
+        !read_live_state(ctx.get(), recurrent, 0, install_live) ||
+        !states_bit_equal(
+            install_expected, install_live, "installed interior reconstruction") ||
+        !llama_dflash_window_reconstruct_seq(ctx.get(), 0, final_pos) ||
+        !llama_dflash_window_install_reconstructed(
+            ctx.get(), 0, final_pos) ||
+        !read_live_state(ctx.get(), recurrent, 0, install_live) ||
+        !states_bit_equal(
+            live_final, install_live, "restored post-install frontier")) {
+        return 1;
+    }
+
     // Gate 4, normal path: one decode carries two contiguous tokens for each of
     // two sequences. The fixed tape packs QKV sequence-major and routes gate/beta
     // to per-sequence GPU tapes; both rolling rings must retain the exact owner
@@ -589,10 +739,33 @@ int main(int argc, char ** argv) {
     // into one transaction-wide packed image.
     if (!decode_two_equal_ranges(ctx.get(), tokens, 9, 3, 2, true) ||
         llama_dflash_window_capture_pending(ctx.get()) ||
-        !host_qkv_is_packed(ctx.get(), 2, { 0, 1 }) ||
+            !qkv_capture_is_complete(ctx.get(), 2, { 0, 1 }) ||
         !ring_is(window, 7, 2, { 8, 9, 10 }) ||
         !ring_is(window_1, 2, 0, { 3, 4 })) {
         fprintf(stderr, "%s: multi-token/multi-sequence normal capture routed incorrectly\n",
+                __func__);
+        return 1;
+    }
+
+    // A multi-token packed fixed replay makes gate genuinely pitched across
+    // tokens. Restore seq-0 to p=8, replay the two-token fixed record [9,10],
+    // and require the exact forward state. This catches a missing contiguity
+    // materialization before ggml_gated_delta_net rather than letting q=1
+    // vacuously satisfy the op contract.
+    std::vector<state_piece> packed_q2_forward;
+    std::vector<state_piece> packed_q2_replay;
+    if (!read_live_state(ctx.get(), recurrent, 0, packed_q2_forward) ||
+        !llama_dflash_window_reconstruct_seq(ctx.get(), 0, 8) ||
+        !llama_dflash_window_install_reconstructed(ctx.get(), 0, 8) ||
+        !llama_tape_replay(ctx.get(), 0, 2) ||
+        !llama_tape_replay_sync(ctx.get()) ||
+        !ctx->dflash_capture->replay_minimal_last ||
+        !read_live_state(ctx.get(), recurrent, 0, packed_q2_replay) ||
+        !states_bit_equal(
+            packed_q2_forward, packed_q2_replay,
+            "packed q=2 fixed-tape replay")) {
+        fprintf(stderr,
+                "%s: pitched packed gate did not reproduce the q=2 forward state\n",
                 __func__);
         return 1;
     }
@@ -628,7 +801,7 @@ int main(int argc, char ** argv) {
     }
     if (!llama_dflash_window_commit(ctx.get(), 0, 2) ||
         !llama_dflash_window_capture_pending(ctx.get()) ||
-        !host_qkv_is_packed(ctx.get(), 3, { 0, 1 }) ||
+            !qkv_capture_is_complete(ctx.get(), 3, { 0, 1 }) ||
         !ring_is(window, 9, 1, { 10, 11, 12 }) ||
         !ring_is(window_1, 2, 0, { 3, 4 })) {
         fprintf(stderr, "%s: first speculative owner committed the wrong prefix\n", __func__);
@@ -643,10 +816,266 @@ int main(int argc, char ** argv) {
     }
     llama_dflash_window_set_speculative(ctx.get(), false);
 
+    // Gate 5 launch-amortization arm. Use a fresh context so the q=1 G3/G4
+    // proof above stays byte-for-byte comparable with its validated baseline.
+    // retained=3, q=3 allocates five physical slots. A full append must apply
+    // records [b+1,b+3] in one transaction, retain all five records on failure,
+    // and publish/retire all three together on retry.
+    auto batched_ctx = make_ctx(params, model);
+    if (!batched_ctx) {
+        fprintf(stderr, "%s: failed to init batched-window context\n", __func__);
+        return 1;
+    }
+    auto * batched_recurrent = get_recurrent(batched_ctx.get());
+    llama_set_dflash_capture(batched_ctx.get(), nullptr, 0);
+    llama_dflash_allocate_slots(batched_ctx.get(), 1);
+    llama_set_tape_recording(batched_ctx.get(), true);
+    llama_set_tape_minimal_replay(batched_ctx.get(), true);
+    if (!batched_recurrent ||
+        !decode_range(batched_ctx.get(), tokens, 0, prefix) ||
+        !llama_dflash_window_enable_batched(
+            batched_ctx.get(), 0, /*retained_depth=*/3, /*advance_batch=*/3)) {
+        fprintf(stderr, "%s: failed to enable batched rolling window\n", __func__);
+        return 1;
+    }
+    auto & batched = *batched_ctx->dflash_capture->windows[0];
+    for (uint32_t pos = prefix; pos <= 7; ++pos) {
+        if (!decode_one(batched_ctx.get(), tokens, pos)) {
+            fprintf(stderr, "%s: batched fill failed at pos %u\n", __func__, pos);
+            return 1;
+        }
+    }
+    if (batched.capacity != 5 || batched.retained_depth != 3 ||
+        batched.advance_batch != 3 ||
+        !ring_is(batched, 2, 0, { 3, 4, 5, 6, 7 })) {
+        fprintf(stderr, "%s: batched full-ring layout is wrong\n", __func__);
+        return 1;
+    }
+
+    const int batched_old_published = batched.published_idx;
+    std::vector<state_piece> batched_before_fault;
+    if (!read_window_state(
+            batched_ctx.get(), 0, batched_old_published,
+            batched_before_fault)) {
+        return 1;
+    }
+    llama_dflash_window_inject_publish_failure_seq(batched_ctx.get(), 0);
+    if (!decode_one(batched_ctx.get(), tokens, 8) ||
+        !llama_dflash_window_capture_pending(batched_ctx.get()) ||
+        !batched.last_publish_failed ||
+        batched.published_idx != batched_old_published ||
+        !ring_is(batched, 2, 0, { 3, 4, 5, 6, 7 })) {
+        fprintf(stderr, "%s: failed batched publication mutated the window\n", __func__);
+        return 1;
+    }
+    std::vector<state_piece> batched_after_fault;
+    if (!read_window_state(
+            batched_ctx.get(), 0, batched.published_idx,
+            batched_after_fault) ||
+        !states_bit_equal(
+            batched_before_fault, batched_after_fault,
+            "failed batched publication boundary")) {
+        return 1;
+    }
+
+    if (!llama_dflash_window_retry_capture(batched_ctx.get()) ||
+        llama_dflash_window_capture_pending(batched_ctx.get()) ||
+        !ring_is(batched, 5, 3, { 6, 7, 8 }) ||
+        !decode_one(batched_ctx.get(), tokens, 9) ||
+        !decode_one(batched_ctx.get(), tokens, 10) ||
+        !ring_is(batched, 5, 3, { 6, 7, 8, 9, 10 }) ||
+        !decode_one(batched_ctx.get(), tokens, 11) ||
+        !ring_is(batched, 8, 1, { 9, 10, 11 })) {
+        fprintf(stderr, "%s: clean batched retry/wrap committed wrong metadata\n",
+                __func__);
+        return 1;
+    }
+    std::vector<state_piece> batched_live;
+    std::vector<state_piece> batched_rebuilt;
+    if (!read_live_state(
+            batched_ctx.get(), batched_recurrent, 0, batched_live) ||
+        !llama_dflash_window_reconstruct_seq(
+            batched_ctx.get(), 0, batched.frontier_pos) ||
+        !read_window_state(
+            batched_ctx.get(), 0, batched.reconstructed_idx,
+            batched_rebuilt) ||
+        !states_bit_equal(
+            batched_live, batched_rebuilt,
+            "batched post-wrap frontier reconstruction")) {
+        return 1;
+    }
+
+    // Cache 1 has now executed twice (direct warmup, then capture/instantiate).
+    // Fill to the next private-1 advance and fault its graph-reuse execution:
+    // graph launch must preserve the same old-boundary/unretired-record
+    // transaction semantics as the uncached path.
+    if (!decode_one(batched_ctx.get(), tokens, 12) ||
+        !decode_one(batched_ctx.get(), tokens, 13) ||
+        !ring_is(batched, 8, 1, { 9, 10, 11, 12, 13 })) {
+        fprintf(stderr, "%s: cached-graph fault setup is wrong\n", __func__);
+        return 1;
+    }
+    const int cached_old_published = batched.published_idx;
+    std::vector<state_piece> cached_before_fault;
+    if (!read_window_state(
+            batched_ctx.get(), 0, cached_old_published,
+            cached_before_fault)) {
+        return 1;
+    }
+    llama_dflash_window_inject_publish_failure_seq(batched_ctx.get(), 0);
+    if (!decode_one(batched_ctx.get(), tokens, 14) ||
+        !llama_dflash_window_capture_pending(batched_ctx.get()) ||
+        !batched.last_publish_failed ||
+        batched.published_idx != cached_old_published ||
+        !ring_is(batched, 8, 1, { 9, 10, 11, 12, 13 })) {
+        fprintf(stderr,
+                "%s: cached q=3 graph failure mutated the transaction\n",
+                __func__);
+        return 1;
+    }
+    std::vector<state_piece> cached_after_fault;
+    if (!read_window_state(
+            batched_ctx.get(), 0, batched.published_idx,
+            cached_after_fault) ||
+        !states_bit_equal(
+            cached_before_fault, cached_after_fault,
+            "failed cached-graph publication boundary") ||
+        !llama_dflash_window_retry_capture(batched_ctx.get()) ||
+        llama_dflash_window_capture_pending(batched_ctx.get()) ||
+        !ring_is(batched, 11, 4, { 12, 13, 14 })) {
+        return 1;
+    }
+    if (!read_live_state(
+            batched_ctx.get(), batched_recurrent, 0, batched_live) ||
+        !llama_dflash_window_reconstruct_seq(
+            batched_ctx.get(), 0, batched.frontier_pos) ||
+        !read_window_state(
+            batched_ctx.get(), 0, batched.reconstructed_idx,
+            batched_rebuilt) ||
+        !states_bit_equal(
+            batched_live, batched_rebuilt,
+            "cached-graph clean retry reconstruction")) {
+        return 1;
+    }
+    if (!batched.advance_cache[0].graph ||
+        !batched.advance_cache[1].graph) {
+        fprintf(stderr,
+                "%s: periodic q=3 advance graphs were not retained for "
+                "both private boundary copies\n",
+                __func__);
+        return 1;
+    }
+
+    // Gate-6 integrated storage arm. This repeats the q=3 failure/wrap
+    // transaction with persistent F16 records. The published boundary must
+    // remain byte-identical across the injected failure; the clean retry is
+    // intentionally approximate relative to the live F32 forward state.
+    auto f16_ctx = make_ctx(params, model);
+    if (!f16_ctx) {
+        fprintf(stderr, "%s: failed to init F16-window context\n", __func__);
+        return 1;
+    }
+    auto * f16_recurrent = get_recurrent(f16_ctx.get());
+    llama_set_dflash_capture(f16_ctx.get(), nullptr, 0);
+    llama_dflash_allocate_slots(f16_ctx.get(), 1);
+    llama_set_tape_recording(f16_ctx.get(), true);
+    if (!f16_recurrent ||
+        !decode_range(f16_ctx.get(), tokens, 0, prefix) ||
+        !llama_dflash_window_enable_batched_f16(
+            f16_ctx.get(), 0, /*retained_depth=*/3,
+            /*advance_batch=*/3) ||
+        !f16_ctx->get_cparams().tape_minimal_capture) {
+        fprintf(stderr, "%s: failed to enable F16 rolling window\n", __func__);
+        return 1;
+    }
+    auto & f16_window = *f16_ctx->dflash_capture->windows[0];
+    for (uint32_t pos = prefix; pos <= 7; ++pos) {
+        if (!decode_one(f16_ctx.get(), tokens, pos)) {
+            fprintf(stderr, "%s: F16 fill failed at pos %u\n", __func__, pos);
+            return 1;
+        }
+    }
+    const size_t f16_row = ggml_row_size(
+        f16_window.record_packed->type, f16_window.record_floats);
+    const size_t f32_row = ggml_row_size(
+        GGML_TYPE_F32, f16_window.record_floats);
+    if (f16_window.record_type != GGML_TYPE_F16 ||
+        f16_window.record_packed->type != GGML_TYPE_F16 ||
+        f16_row * 2 != f32_row ||
+        !ring_is(f16_window, 2, 0, { 3, 4, 5, 6, 7 })) {
+        fprintf(stderr, "%s: F16 persistent record layout is wrong\n", __func__);
+        return 1;
+    }
+    const int f16_old_published = f16_window.published_idx;
+    std::vector<state_piece> f16_before_fault;
+    std::vector<state_piece> f16_after_fault;
+    if (!read_window_state(
+            f16_ctx.get(), 0, f16_old_published, f16_before_fault)) {
+        return 1;
+    }
+    llama_dflash_window_inject_publish_failure_seq(f16_ctx.get(), 0);
+    if (!decode_one(f16_ctx.get(), tokens, 8) ||
+        !llama_dflash_window_capture_pending(f16_ctx.get()) ||
+        !f16_window.last_publish_failed ||
+        f16_window.published_idx != f16_old_published ||
+        !ring_is(f16_window, 2, 0, { 3, 4, 5, 6, 7 }) ||
+        !read_window_state(
+            f16_ctx.get(), 0, f16_window.published_idx,
+            f16_after_fault) ||
+        !states_bit_equal(
+            f16_before_fault, f16_after_fault,
+            "failed F16 publication boundary")) {
+        fprintf(stderr, "%s: failed F16 publication mutated the window\n",
+                __func__);
+        return 1;
+    }
+    if (!llama_dflash_window_retry_capture(f16_ctx.get()) ||
+        llama_dflash_window_capture_pending(f16_ctx.get()) ||
+        !ring_is(f16_window, 5, 3, { 6, 7, 8 }) ||
+        !decode_one(f16_ctx.get(), tokens, 9) ||
+        !decode_one(f16_ctx.get(), tokens, 10) ||
+        !decode_one(f16_ctx.get(), tokens, 11) ||
+        !ring_is(f16_window, 8, 1, { 9, 10, 11 })) {
+        fprintf(stderr, "%s: F16 retry/wrap committed wrong metadata\n",
+                __func__);
+        return 1;
+    }
+    std::vector<state_piece> f16_live;
+    std::vector<state_piece> f16_rebuilt;
+    double f16_nrmse = 0.0;
+    if (!read_live_state(
+            f16_ctx.get(), f16_recurrent, 0, f16_live) ||
+        !llama_dflash_window_reconstruct_seq(
+            f16_ctx.get(), 0, f16_window.frontier_pos) ||
+        !read_window_state(
+            f16_ctx.get(), 0, f16_window.reconstructed_idx,
+            f16_rebuilt) ||
+        !states_nrmse_below(
+            f16_live, f16_rebuilt, 1e-2, f16_nrmse)) {
+        fprintf(stderr,
+            "%s: F16 post-wrap reconstruction is invalid "
+            "(max_nrmse=%g)\n", __func__, f16_nrmse);
+        return 1;
+    }
+    if (!tensor_split &&
+        (window.packed_record_copies == 0 ||
+         window_1.packed_record_copies == 0 ||
+         batched.packed_record_copies == 0)) {
+        fprintf(stderr,
+                "%s: direct-GPU minimal capture did not use the packed "
+                "one-copy record publication path\n",
+                __func__);
+        return 1;
+    }
+
     fprintf(stderr,
             "%s: PASS (fault retained b=2 + record 3; wrapped window [5,8] "
             "reconstructed live state bit-for-bit; normal multi-token/multi-seq "
-            "and speculative accept/reject preserved ownership on %s)\n",
-            __func__, gpu_name);
+            "and speculative accept/reject preserved ownership; q=3 fault "
+            "retained five records, cached-graph fault retained them again, "
+            "both exact retries reconstructed bit-for-bit, and the F16 "
+            "persistent ring retained its fault transaction and reconstructed "
+            "with max_nrmse=%g on %s)\n",
+            __func__, f16_nrmse, gpu_name);
     return 0;
 }

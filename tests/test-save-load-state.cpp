@@ -539,6 +539,109 @@ static bool test_seq_file_integrity(
     return true;
 }
 
+// Test 7: non-hybrid attention-only trim equivalence + resume planning
+// - plan an exact-frontier hit, a partial reuse, and an unavailable future target
+// - clone the same attention state into two contexts
+// - compare the new attention-only operation with the legacy whole-memory operation
+static bool test_resume_plan_attn_trim_nonhybrid(
+        struct llama_model         * model,
+        const struct common_params & params,
+        const llama_tokens         & tokens) {
+    if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+        LOG("\n=== Test 7: non-hybrid attention trim (skipped for recurrent/hybrid model) ===\n");
+        return true;
+    }
+
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx = 256;
+    params_ctx.n_seq_max = 1;
+    params_ctx.kv_unified = true;
+
+    auto ctx_attn = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    auto ctx_full = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx_attn || !ctx_full) {
+        LOG_ERR("%s: failed to create contexts\n", __func__);
+        return false;
+    }
+
+    LOG("\n=== Test 7: non-hybrid resume plan + attention trim equivalence ===\n");
+
+    const size_t n_tokens = std::min<size_t>(tokens.size(), 8);
+    if (n_tokens < 4) {
+        LOG_ERR("%s: need at least four tokens\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr batch((int32_t) n_tokens, 0, 1);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch.get(), tokens[i], (llama_pos) i, { 0 }, false);
+    }
+    if (llama_decode(ctx_attn.get(), batch.get())) {
+        LOG_ERR("%s: failed to decode source sequence\n", __func__);
+        return false;
+    }
+    llama_synchronize(ctx_attn.get());
+
+    const llama_pos target = (llama_pos) n_tokens - 2;
+    const auto hit = llama_memory_plan_resume(
+        llama_get_memory(ctx_attn.get()), 0, (llama_pos) n_tokens);
+    const auto partial = llama_memory_plan_resume(
+        llama_get_memory(ctx_attn.get()), 0, target);
+    const auto reject = llama_memory_plan_resume(
+        llama_get_memory(ctx_attn.get()), 0, (llama_pos) n_tokens + 1);
+    if (!hit.resumable || hit.full_replay ||
+        hit.components != LLAMA_MEMORY_RESUME_COMPONENT_ATTN ||
+        hit.reuse_tokens != (int64_t) n_tokens || hit.replay_tokens != 0 ||
+        !partial.resumable || partial.full_replay ||
+        partial.components != LLAMA_MEMORY_RESUME_COMPONENT_ATTN ||
+        partial.reuse_tokens != target || partial.replay_tokens != 2 ||
+        reject.resumable || !reject.full_replay ||
+        reject.components != LLAMA_MEMORY_RESUME_COMPONENT_NONE ||
+        reject.reject_reason != LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER) {
+        LOG_ERR("%s: plan_resume truth table mismatch\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> initial(llama_state_seq_get_size(ctx_attn.get(), 0));
+    if (initial.empty() ||
+        llama_state_seq_get_data(
+            ctx_attn.get(), initial.data(), initial.size(), 0) != initial.size() ||
+        llama_state_seq_set_data(
+            ctx_full.get(), initial.data(), initial.size(), 0) != initial.size()) {
+        LOG_ERR("%s: failed to clone source sequence\n", __func__);
+        return false;
+    }
+
+    if (!llama_memory_seq_rm_attn(
+            llama_get_memory(ctx_attn.get()), 0, target, -1) ||
+        !llama_memory_seq_rm(
+            llama_get_memory(ctx_full.get()), 0, target, -1)) {
+        LOG_ERR("%s: trim operation failed\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> attn_state(
+        llama_state_seq_get_size(ctx_attn.get(), 0));
+    std::vector<uint8_t> full_state(
+        llama_state_seq_get_size(ctx_full.get(), 0));
+    if (attn_state.empty() || attn_state.size() != full_state.size() ||
+        llama_state_seq_get_data(
+            ctx_attn.get(), attn_state.data(), attn_state.size(), 0) !=
+            attn_state.size() ||
+        llama_state_seq_get_data(
+            ctx_full.get(), full_state.data(), full_state.size(), 0) !=
+            full_state.size() ||
+        attn_state != full_state ||
+        llama_memory_seq_pos_max(llama_get_memory(ctx_attn.get()), 0) != target - 1 ||
+        llama_memory_seq_pos_max(llama_get_memory(ctx_full.get()), 0) != target - 1) {
+        LOG_ERR("%s: attention-only trim differs from non-hybrid seq_rm\n", __func__);
+        return false;
+    }
+
+    LOG("PASS\n");
+    return true;
+}
+
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -629,6 +732,11 @@ int main(int argc, char ** argv) {
 
     // Test 6: checksummed sequence file envelope and staged loading
     if (!test_seq_file_integrity(model, params, tokens)) {
+        return 1;
+    }
+
+    // Test 7: non-hybrid plan truth table and trim equivalence
+    if (!test_resume_plan_attn_trim_nonhybrid(model, params, tokens)) {
         return 1;
     }
 

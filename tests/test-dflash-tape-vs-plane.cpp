@@ -8,6 +8,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <clocale>
 #include <cmath>
 #include <cstdint>
@@ -151,6 +152,143 @@ static bool states_bit_equal(
     return true;
 }
 
+static llama_pos get_attention_pos_max(
+        llama_context * ctx,
+        llama_seq_id    seq_id) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    return -1;
+}
+
+static bool test_resume_plan_and_attn_trim(
+        const common_params &             params,
+        llama_model *                     model,
+        const std::vector<llama_token> & tokens) {
+    auto ctx = make_ctx(params, model);
+    auto * recurrent = ctx ? get_recurrent(ctx.get()) : nullptr;
+    if (!ctx || !recurrent) {
+        fprintf(stderr, "%s : failed to create recurrent test context\n", __func__);
+        return false;
+    }
+
+    if (!llama_model_is_hybrid(model)) {
+        if (!decode_range(ctx.get(), tokens, 0, 3)) {
+            fprintf(stderr, "%s : recurrent-only prefix decode failed\n", __func__);
+            return false;
+        }
+        llama_synchronize(ctx.get());
+
+        std::vector<state_piece> before;
+        std::vector<state_piece> after;
+        const llama_pos pos_before = recurrent->seq_pos_max(0);
+        if (!read_state(recurrent, 0, before) ||
+            llama_memory_seq_rm_attn(llama_get_memory(ctx.get()), 0, 3, -1) ||
+            !read_state(recurrent, 0, after) ||
+            recurrent->seq_pos_max(0) != pos_before ||
+            !states_bit_equal(before, after)) {
+            fprintf(stderr, "%s : recurrent-only attention trim did not reject without mutation\n",
+                    __func__);
+            return false;
+        }
+        return true;
+    }
+
+    constexpr uint32_t n_checkpoint = 5;
+    constexpr uint32_t n_live = 7;
+    if (tokens.size() < n_live ||
+        !decode_range(ctx.get(), tokens, 0, n_checkpoint)) {
+        fprintf(stderr, "%s : hybrid checkpoint-prefix decode failed\n", __func__);
+        return false;
+    }
+    llama_synchronize(ctx.get());
+
+    const uint32_t partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> checkpoint(
+        llama_state_seq_get_size_ext(ctx.get(), 0, partial_flags));
+    if (checkpoint.empty() ||
+        llama_state_seq_get_data_ext(
+            ctx.get(), checkpoint.data(), checkpoint.size(), 0, partial_flags) !=
+            checkpoint.size()) {
+        fprintf(stderr, "%s : failed to capture recurrent checkpoint\n", __func__);
+        return false;
+    }
+
+    if (!decode_range(ctx.get(), tokens, n_checkpoint, n_live - n_checkpoint)) {
+        fprintf(stderr, "%s : hybrid live-suffix decode failed\n", __func__);
+        return false;
+    }
+    llama_synchronize(ctx.get());
+
+    const uint32_t both =
+        LLAMA_MEMORY_RESUME_COMPONENT_ATTN |
+        LLAMA_MEMORY_RESUME_COMPONENT_RECURRENT;
+    const auto hit = llama_memory_plan_resume(
+        llama_get_memory(ctx.get()), 0, n_live);
+    if (!hit.resumable || hit.full_replay || hit.components != both ||
+        hit.reuse_tokens != n_live || hit.replay_tokens != 0 ||
+        hit.reject_reason != LLAMA_MEMORY_RESUME_REJECT_NONE) {
+        fprintf(stderr, "%s : plan_resume misreported an exact-frontier hit\n", __func__);
+        return false;
+    }
+
+    const auto partial = llama_memory_plan_resume(
+        llama_get_memory(ctx.get()), 0, n_checkpoint);
+    if (!partial.resumable || partial.full_replay || partial.components != both ||
+        partial.reuse_tokens != n_checkpoint ||
+        partial.replay_tokens != n_live - n_checkpoint ||
+        partial.reject_reason != LLAMA_MEMORY_RESUME_REJECT_NONE) {
+        fprintf(stderr, "%s : plan_resume misreported a partial restore\n", __func__);
+        return false;
+    }
+
+    const auto reject = llama_memory_plan_resume(
+        llama_get_memory(ctx.get()), 0, n_live + 1);
+    if (reject.resumable || !reject.full_replay ||
+        reject.components != LLAMA_MEMORY_RESUME_COMPONENT_NONE ||
+        reject.reject_reason != LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER) {
+        fprintf(stderr, "%s : plan_resume accepted an unavailable future frontier\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data_ext(
+            ctx.get(), checkpoint.data(), checkpoint.size(), 0, partial_flags) !=
+            checkpoint.size()) {
+        fprintf(stderr, "%s : failed to install recurrent checkpoint\n", __func__);
+        return false;
+    }
+
+    std::vector<state_piece> recurrent_before_trim;
+    std::vector<state_piece> recurrent_after_trim;
+    if (!read_state(recurrent, 0, recurrent_before_trim) ||
+        recurrent->seq_pos_max(0) != (llama_pos) n_checkpoint - 1 ||
+        get_attention_pos_max(ctx.get(), 0) != (llama_pos) n_live - 1) {
+        fprintf(stderr, "%s : checkpoint install did not create the expected split frontier\n",
+                __func__);
+        return false;
+    }
+
+    if (!llama_memory_seq_rm_attn(
+            llama_get_memory(ctx.get()), 0, n_checkpoint, -1) ||
+        !read_state(recurrent, 0, recurrent_after_trim) ||
+        !states_bit_equal(recurrent_before_trim, recurrent_after_trim) ||
+        recurrent->seq_pos_max(0) != (llama_pos) n_checkpoint - 1 ||
+        get_attention_pos_max(ctx.get(), 0) != (llama_pos) n_checkpoint - 1) {
+        fprintf(stderr, "%s : attention-only trim changed recurrent state or missed its suffix\n",
+                __func__);
+        return false;
+    }
+
+    fprintf(stderr,
+            "%s : PASS (resume hit/partial/reject truth table; hybrid recurrent state preserved)\n",
+            __func__);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -222,6 +360,10 @@ int main(int argc, char ** argv) {
         tokens[i] = (llama_token) ((i + 1) % std::max(n_vocab, 1));
     }
 
+    if (!test_resume_plan_and_attn_trim(params, model, tokens)) {
+        return 1;
+    }
+
     if (!decode_range(ctx.get(), tokens, 0, n_prefix)) {
         fprintf(stderr, "%s : prefix decode failed\n", __func__);
         return 1;
@@ -259,10 +401,27 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : recurrent model exposed no DFlash tape layers\n", __func__);
         return 1;
     }
+    auto * active_tape = ctx->dflash_capture->active_tape();
+    if (active_tape == nullptr ||
+        active_tape->layers.size() != ctx->dflash_capture->tape_layers.size() ||
+        !active_tape->qkv_staged()) {
+        fprintf(stderr, "%s : device-resident conv tape is unavailable\n", __func__);
+        return 1;
+    }
     for (size_t li = 0; li < ctx->dflash_capture->tape_layers.size(); ++li) {
         const auto & tape = ctx->dflash_capture->tape_layers[li];
-        if (tape.n_tokens != (int) n_verify || tape.qkv_mixed.empty()) {
-            fprintf(stderr, "%s : layer %zu has incomplete conv tape (%d tokens, %zu values)\n",
+        const ggml_tensor * qkv = active_tape->layers[li].qkv;
+        if (!qkv || qkv->type != GGML_TYPE_F32 ||
+            qkv->ne[0] <= 0 || qkv->ne[1] < (int64_t) n_verify ||
+            qkv->nb[1] != (size_t) qkv->ne[0] * sizeof(float)) {
+            fprintf(stderr, "%s : layer %zu has incomplete device conv tape\n",
+                    __func__, li);
+            return 1;
+        }
+        if (tape.n_tokens != 0 || !tape.qkv_mixed.empty()) {
+            fprintf(stderr,
+                    "%s : layer %zu eagerly populated host conv tape "
+                    "(%d tokens, %zu values)\n",
                     __func__, li, tape.n_tokens, tape.qkv_mixed.size());
             return 1;
         }
@@ -296,8 +455,43 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_tape_replay(ctx.get(), 0, n_accepted);
-    llama_tape_replay_sync(ctx.get());
+    if (!llama_tape_replay(ctx.get(), 0, n_accepted) ||
+        !llama_tape_replay_sync(ctx.get())) {
+        fprintf(stderr, "%s : redundant exact tape replay failed\n", __func__);
+        return 1;
+    }
+
+    // The shipped conv-state rebuild is still host-based. Its input must be
+    // gathered lazily at replay sync, and it must be byte-identical to the
+    // graph-staged device tape before the R-state comparison below can pass.
+    for (size_t li = 0; li < ctx->dflash_capture->tape_layers.size(); ++li) {
+        const auto & tape = ctx->dflash_capture->tape_layers[li];
+        const ggml_tensor * qkv = active_tape->layers[li].qkv;
+        const size_t qkv_values = (size_t) qkv->ne[0] * n_verify;
+        if (tape.n_tokens != (int) n_verify ||
+            tape.conv_channels != qkv->ne[0] ||
+            tape.n_seqs != 1 || tape.seq_ids[0] != 0 ||
+            tape.qkv_mixed.size() != qkv_values) {
+            fprintf(stderr,
+                    "%s : layer %zu lazy host conv gather is incomplete "
+                    "(tokens=%d, channels=%" PRId64 ", values=%zu)\n",
+                    __func__, li, tape.n_tokens,
+                    tape.conv_channels, tape.qkv_mixed.size());
+            return 1;
+        }
+        std::vector<float> device_qkv(qkv_values);
+        ggml_backend_tensor_get(
+                qkv, device_qkv.data(), 0,
+                device_qkv.size() * sizeof(float));
+        if (std::memcmp(
+                device_qkv.data(), tape.qkv_mixed.data(),
+                device_qkv.size() * sizeof(float)) != 0) {
+            fprintf(stderr,
+                    "%s : layer %zu lazy host conv gather differs from device tape\n",
+                    __func__, li);
+            return 1;
+        }
+    }
 
     if (recurrent->rs_idx[0] != 0 || recurrent->seq_pos_max(0) != keep_end - 1) {
         fprintf(stderr, "%s : tape replay selected row %u at pos %d, expected row 0 at pos %d\n",
@@ -317,6 +511,44 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Exact replay must fail closed on scratch OOM. In particular, it must not
+    // run the hand-written CPU recurrence (different reduction order), advance
+    // R-state/position, or consume a previously-good persistent scratch buffer.
+    if (!recurrent->seq_rm(0, -1, -1) ||
+        !recurrent->try_seq_cp(1, 0, -1, -1)) {
+        fprintf(stderr, "%s : failed to restore backup for replay allocation fault\n", __func__);
+        return 1;
+    }
+    std::vector<state_piece> allocation_fault_boundary;
+    if (!read_state(recurrent, 0, allocation_fault_boundary)) {
+        fprintf(stderr, "%s : failed to read allocation-fault boundary\n", __func__);
+        return 1;
+    }
+    const llama_pos allocation_fault_pos = recurrent->seq_pos_max(0);
+    ggml_backend_buffer_t replay_buf_before = ctx->dflash_capture->replay_buf;
+    const size_t replay_buf_size_before = ctx->dflash_capture->replay_buf_size;
+    ctx->dflash_capture->replay_force_alloc_failure_once = true;
+    if (llama_tape_replay(ctx.get(), 0, n_accepted)) {
+        fprintf(stderr, "%s : exact tape replay reported success under injected scratch failure\n", __func__);
+        return 1;
+    }
+    if (!llama_tape_replay_sync(ctx.get())) {
+        fprintf(stderr, "%s : failed launch unexpectedly left deferred replay state\n", __func__);
+        return 1;
+    }
+    std::vector<state_piece> allocation_fault_after;
+    if (!read_state(recurrent, 0, allocation_fault_after) ||
+        !states_bit_equal(allocation_fault_boundary, allocation_fault_after) ||
+        recurrent->seq_pos_max(0) != allocation_fault_pos) {
+        fprintf(stderr, "%s : replay allocation failure mutated the restored boundary\n", __func__);
+        return 1;
+    }
+    if (ctx->dflash_capture->replay_buf != replay_buf_before ||
+        ctx->dflash_capture->replay_buf_size != replay_buf_size_before) {
+        fprintf(stderr, "%s : replay allocation failure consumed the previous scratch buffer\n", __func__);
+        return 1;
+    }
+
     // Gate 2: restore the same immutable boundary again, poison redundant K/V,
     // and replay from qkv_mixed + gate + beta only. Poisoning makes an accidental
     // read from either redundant tensor fail loudly rather than yielding a false pass.
@@ -326,19 +558,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    auto * active_tape = ctx->dflash_capture->active_tape();
-    if (active_tape == nullptr) {
-        fprintf(stderr, "%s : active GPU tape disappeared before minimal replay\n", __func__);
-        return 1;
-    }
     for (auto & layer : active_tape->layers) {
         ggml_backend_tensor_memset(layer.k, 0xa5, 0, ggml_nbytes(layer.k));
         ggml_backend_tensor_memset(layer.v, 0xa5, 0, ggml_nbytes(layer.v));
     }
+    for (auto & tape : ctx->dflash_capture->tape_layers) {
+        tape.qkv_mixed.clear();
+        tape.n_tokens = 0;
+        tape.conv_channels = 0;
+    }
 
     llama_set_tape_minimal_replay(ctx.get(), true);
-    llama_tape_replay(ctx.get(), 0, n_accepted);
-    llama_tape_replay_sync(ctx.get());
+    if (!llama_tape_replay(ctx.get(), 0, n_accepted) ||
+        !llama_tape_replay_sync(ctx.get())) {
+        fprintf(stderr, "%s : minimal exact tape replay failed\n", __func__);
+        return 1;
+    }
 
     if (!ctx->dflash_capture->replay_minimal_last) {
         fprintf(stderr, "%s : requested minimal-F32 replay fell back to the redundant path\n", __func__);
