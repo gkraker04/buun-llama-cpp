@@ -1,0 +1,212 @@
+[14:17:09.867] ============================================================
+[14:17:09.867] PRODUCTION KV CACHE SWEEP v2
+[14:17:09.868] Started: 2026-07-26 14:17:09.868076
+[14:17:09.868] Configs: 8 KV types x 2 depths = 16 total
+[14:17:09.868] GPU: GTX 1660 Super (CUDA1)
+[14:17:09.868] ============================================================
+[14:17:09.868] --- GPU CLEANUP ---
+[14:17:09.943] taskkill: 
+[14:17:25.065] GPU is clean.
+[14:17:25.065] 
+============================================================
+[14:17:25.065] DEPTH: d=16384
+[14:17:25.065] ============================================================
+[14:17:25.067] 
+--------------------------------------------------
+[14:17:25.067] CONFIG: 16384_f16
+[14:17:25.067] --------------------------------------------------
+[14:17:25.067] --- GPU CLEANUP ---
+[14:17:25.142] taskkill: 
+[14:17:40.274] GPU is clean.
+[14:17:40.274] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk f16 -ctv f16 -r 5 -o jsonl --progress
+[14:17:55.627] Exit code: 1
+[14:17:55.628] OOM: 16384_f16 - valid result, recording and moving on.
+[14:17:55.628] 
+--------------------------------------------------
+[14:17:55.628] CONFIG: 16384_q8_0
+[14:17:55.629] --------------------------------------------------
+[14:17:55.629] --- GPU CLEANUP ---
+[14:17:55.697] taskkill: 
+[14:18:10.821] GPU is clean.
+[14:18:10.821] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk q8_0 -ctv q8_0 -r 5 -o jsonl --progress
+[14:21:08.733] Exit code: 0
+[14:21:08.733] SUCCESS: 16384_q8_0
+[14:21:08.733]   TG: N/A
+[14:21:08.736] 
+--------------------------------------------------
+[14:21:08.736] CONFIG: 16384_q4_0
+[14:21:08.736] --------------------------------------------------
+[14:21:08.736] --- GPU CLEANUP ---
+[14:21:08.808] taskkill: 
+[14:21:23.936] GPU is clean.
+[14:21:23.937] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk q4_0 -ctv q4_0 -r 5 -o jsonl --progress
+[14:24:23.500] Exit code: 0
+[14:24:23.500] SUCCESS: 16384_q4_0
+[14:24:23.500]   TG: N/A
+[14:24:23.500] 
+--------------------------------------------------
+[14:24:23.500] CONFIG: 16384_turbo8
+[14:24:23.501] --------------------------------------------------
+[14:24:23.501] --- GPU CLEANUP ---
+[14:24:23.570] taskkill: 
+[14:24:38.695] GPU is clean.
+[14:24:38.695] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk turbo8 -ctv turbo8 -r 5 -o jsonl --progress
+[14:27:45.734] Exit code: 0
+[14:27:45.735] SUCCESS: 16384_turbo8
+[14:27:45.735]   TG: N/A
+[14:27:45.735] 
+--------------------------------------------------
+[14:27:45.735] CONFIG: 16384_turbo4
+[14:27:45.736] --------------------------------------------------
+[14:27:45.736] --- GPU CLEANUP ---
+[14:27:45.809] taskkill: 
+[14:28:00.934] GPU is clean.
+[14:28:00.934] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk turbo4 -ctv turbo4 -r 5 -o jsonl --progress
+[14:31:04.310] Exit code: 0
+[14:31:04.310] SUCCESS: 16384_turbo4
+[14:31:04.310]   TG: N/A
+[14:31:04.311] 
+--------------------------------------------------
+[14:31:04.311] CONFIG: 16384_turbo3
+[14:31:04.311] --------------------------------------------------
+[14:31:04.311] --- GPU CLEANUP ---
+[14:31:04.385] taskkill: 
+[14:31:19.503] GPU is clean.
+[14:31:19.503] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk turbo3 -ctv turbo3 -r 5 -o jsonl --progress
+[14:34:23.878] Exit code: 0
+[14:34:23.878] SUCCESS: 16384_turbo3
+[14:34:23.879]   TG: N/A
+[14:34:23.879] 
+--------------------------------------------------
+[14:34:23.879] CONFIG: 16384_turbo2
+[14:34:23.879] --------------------------------------------------
+[14:34:23.879] --- GPU CLEANUP ---
+[14:34:23.955] taskkill: 
+[14:34:39.087] GPU is clean.
+[14:34:39.087] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk turbo2 -ctv turbo2 -r 5 -o jsonl --progress
+[14:37:41.030] Exit code: 0
+[14:37:41.030] SUCCESS: 16384_turbo2
+[14:37:41.030]   TG: N/A
+[14:37:41.031] 
+--------------------------------------------------
+[14:37:41.031] CONFIG: 16384_vbr
+[14:37:41.031] --------------------------------------------------
+[14:37:41.031] --- GPU CLEANUP ---
+[14:37:41.103] taskkill: 
+[14:37:56.220] GPU is clean.
+[14:37:56.220] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 16384 --no-warmup -ctk vbr -ctv vbr -r 5 -o jsonl --progress
+[14:47:56.909] TIMEOUT: 16384_vbr exceeded 600s
+[14:47:56.909] 
+============================================================
+[14:47:56.910] DEPTH: d=32768
+[14:47:56.910] ============================================================
+[14:47:56.910] 
+--------------------------------------------------
+[14:47:56.910] CONFIG: 32768_f16
+[14:47:56.910] --------------------------------------------------
+[14:47:56.910] --- GPU CLEANUP ---
+[14:47:56.986] taskkill: 
+[14:48:12.098] GPU is clean.
+[14:48:12.099] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk f16 -ctv f16 -r 5 -o jsonl --progress
+[14:48:27.504] Exit code: 1
+[14:48:27.504] OOM: 32768_f16 - valid result, recording and moving on.
+[14:48:27.505] 
+--------------------------------------------------
+[14:48:27.505] CONFIG: 32768_q8_0
+[14:48:27.505] --------------------------------------------------
+[14:48:27.505] --- GPU CLEANUP ---
+[14:48:27.573] taskkill: 
+[14:48:42.702] GPU is clean.
+[14:48:42.702] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk q8_0 -ctv q8_0 -r 5 -o jsonl --progress
+[14:48:58.093] Exit code: 1
+[14:48:58.093] OOM: 32768_q8_0 - valid result, recording and moving on.
+[14:48:58.093] 
+--------------------------------------------------
+[14:48:58.093] CONFIG: 32768_q4_0
+[14:48:58.093] --------------------------------------------------
+[14:48:58.094] --- GPU CLEANUP ---
+[14:48:58.162] taskkill: 
+[14:49:13.303] GPU is clean.
+[14:49:13.304] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk q4_0 -ctv q4_0 -r 5 -o jsonl --progress
+[14:55:10.325] Exit code: 0
+[14:55:10.326] SUCCESS: 32768_q4_0
+[14:55:10.326]   TG: N/A
+[14:55:10.326] 
+--------------------------------------------------
+[14:55:10.326] CONFIG: 32768_turbo8
+[14:55:10.326] --------------------------------------------------
+[14:55:10.326] --- GPU CLEANUP ---
+[14:55:10.398] taskkill: 
+[14:55:25.527] GPU is clean.
+[14:55:25.528] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk turbo8 -ctv turbo8 -r 5 -o jsonl --progress
+[14:55:40.914] Exit code: 1
+[14:55:40.914] OOM: 32768_turbo8 - valid result, recording and moving on.
+[14:55:40.915] 
+--------------------------------------------------
+[14:55:40.915] CONFIG: 32768_turbo4
+[14:55:40.915] --------------------------------------------------
+[14:55:40.915] --- GPU CLEANUP ---
+[14:55:40.989] taskkill: 
+[14:55:56.114] GPU is clean.
+[14:55:56.114] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk turbo4 -ctv turbo4 -r 5 -o jsonl --progress
+[15:00:11.123] Exit code: 3221226505
+[15:00:11.123] OOM: 32768_turbo4 - valid result, recording and moving on.
+[15:00:11.124] 
+--------------------------------------------------
+[15:00:11.124] CONFIG: 32768_turbo3
+[15:00:11.124] --------------------------------------------------
+[15:00:11.124] --- GPU CLEANUP ---
+[15:00:11.199] taskkill: 
+[15:00:26.325] GPU is clean.
+[15:00:26.326] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk turbo3 -ctv turbo3 -r 5 -o jsonl --progress
+[15:06:32.984] Exit code: 0
+[15:06:32.984] SUCCESS: 32768_turbo3
+[15:06:32.985]   TG: N/A
+[15:06:32.985] 
+--------------------------------------------------
+[15:06:32.985] CONFIG: 32768_turbo2
+[15:06:32.985] --------------------------------------------------
+[15:06:32.985] --- GPU CLEANUP ---
+[15:06:33.059] taskkill: 
+[15:06:48.179] GPU is clean.
+[15:06:48.179] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk turbo2 -ctv turbo2 -r 5 -o jsonl --progress
+[15:12:50.542] Exit code: 0
+[15:12:50.542] SUCCESS: 32768_turbo2
+[15:12:50.542]   TG: N/A
+[15:12:50.543] 
+--------------------------------------------------
+[15:12:50.543] CONFIG: 32768_vbr
+[15:12:50.543] --------------------------------------------------
+[15:12:50.543] --- GPU CLEANUP ---
+[15:12:50.614] taskkill: 
+[15:13:05.744] GPU is clean.
+[15:13:05.744] RUNNING: G:/hermes/buun-llama-cpp/build/bin/llama-bench.exe -m K:/models/GestaltLabs/Ornstein-3.5-9B-V2-GGUF/ornstein-v2-Q4_K_M.gguf -dev CUDA1 -ngl 99 -fa 1 -b 64 -ub 64 -n 256 -p 0 -d 32768 --no-warmup -ctk vbr -ctv vbr -r 5 -o jsonl --progress
+[15:23:06.468] TIMEOUT: 32768_vbr exceeded 600s
+[15:23:06.469] 
+============================================================
+[15:23:06.469] SWEEP COMPLETE
+[15:23:06.469] ============================================================
+[15:23:06.469] 
+Summary:
+[15:23:06.469] KV Type         d=16384 TG      d=32768 TG      d=32768 OOM?   
+[15:23:06.469] ---------------------------------------------------------------
+[15:23:06.469] f16             OOM                             OOM            
+[15:23:06.470] q8_0            33.42                           OOM            
+[15:23:06.470] q4_0            32.76           26.48                          
+[15:23:06.470] turbo8          29.38                           OOM            
+[15:23:06.470] turbo4          31.14                           OOM            
+[15:23:06.470] turbo3          29.97           23.35                          
+[15:23:06.470] turbo2          31.37           24.98                          
+[15:23:06.470] vbr                                                            
+[15:23:06.471] 
+Results saved to: G:/hermes/buun-llama-cpp/experiments/1660-super\kv_prod_sweep_v2_results.jsonl
+[15:23:06.471] Log saved to: G:/hermes/buun-llama-cpp/experiments/1660-super\kv_prod_sweep_v2_log.txt
+[15:23:06.471] 
+OOM configs (5):
+[15:23:06.471]   - 16384_f16
+[15:23:06.471]   - 32768_f16
+[15:23:06.471]   - 32768_q8_0
+[15:23:06.471]   - 32768_turbo8
+[15:23:06.471]   - 32768_turbo4
+[15:23:06.471] 
+Finished: 2026-07-26 15:23:06.471941

@@ -1,0 +1,98 @@
+{
+  "sweep": "kv_prod_sweep_v2",
+  "date": "2026-07-26",
+  "gpu": "NVIDIA GTX 1660 Super",
+  "gpu_vram": 6144,
+  "model": "Ornstein-3.5-9B-V2 (Q4_K_M)",
+  "model_size_gb": 5.76,
+  "device": "CUDA1",
+  "settings": {
+    "n_gpu_layers": 99,
+    "flash_attention": true,
+    "batch_size": 64,
+    "ubatch_size": 64,
+    "n_gen": 256,
+    "n_prompt": 0,
+    "reps": 5,
+    "no_warmup": true
+  },
+  "results": {
+    "d=16384": {
+      "f16": {
+        "status": "OOM",
+        "tg_tps": null
+      },
+      "q8_0": {
+        "status": "SUCCESS",
+        "tg_tps": 33.42,
+        "stddev": 0.095
+      },
+      "q4_0": {
+        "status": "SUCCESS",
+        "tg_tps": 32.76
+      },
+      "turbo8": {
+        "status": "SUCCESS",
+        "tg_tps": 29.38
+      },
+      "turbo4": {
+        "status": "SUCCESS",
+        "tg_tps": 31.14
+      },
+      "turbo3": {
+        "status": "SUCCESS",
+        "tg_tps": 29.97
+      },
+      "turbo2": {
+        "status": "SUCCESS",
+        "tg_tps": 31.37
+      },
+      "vbr": {
+        "status": "TIMEOUT",
+        "tg_tps": null
+      }
+    },
+    "d=32768": {
+      "f16": {
+        "status": "OOM",
+        "tg_tps": null
+      },
+      "q8_0": {
+        "status": "OOM",
+        "tg_tps": null
+      },
+      "q4_0": {
+        "status": "SUCCESS",
+        "tg_tps": 26.48
+      },
+      "turbo8": {
+        "status": "OOM",
+        "tg_tps": null
+      },
+      "turbo4": {
+        "status": "OOM",
+        "tg_tps": null
+      },
+      "turbo3": {
+        "status": "SUCCESS",
+        "tg_tps": 23.35
+      },
+      "turbo2": {
+        "status": "SUCCESS",
+        "tg_tps": 24.98
+      },
+      "vbr": {
+        "status": "TIMEOUT",
+        "tg_tps": null
+      }
+    }
+  },
+  "observations": [
+    "On GTX 1660 Super (no tensor cores), standard q8_0 is the fastest KV cache type at d=16384 (33.42 t/s)",
+    "Turbo4 is 2nd fastest at d=16384 (31.14 t/s), ~7% slower than q8_0",
+    "At d=32768, only 4-bit types fit: q4_0 fastest (26.48), then turbo2 (24.98), then turbo3 (23.35)",
+    "VBR times out at both depths — dynamic allocation overhead too high for this GPU",
+    "Turbo types don't outperform standard quantized types on non-tensor-core hardware",
+    "f16 KV cache can only fit at shallow depths (d=0 or very small contexts) on a 6GB GPU"
+  ]
+}
