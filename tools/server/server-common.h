@@ -132,6 +132,8 @@ std::string lora_config_identity(const std::vector<common_adapter_lora_info> & l
 // non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
 //   save_short  - force the state-save writer to report a short write (aborts the save)
 //   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
+//   frontier_disagree_after_flip - make the frontier selector disagree only after
+//                                  it owns reads (exercises fail-closed legacy fallback)
 bool server_fault(const char * tag);
 
 //
@@ -192,6 +194,12 @@ public:
 
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
+
+    // Canonical comparison key for every media chunk wholly contained in the
+    // first n_tokens logical tokens. Returns false when the prefix cuts through
+    // a media chunk or a chunk has no content identity; callers must then fail
+    // closed rather than publish a reusable frontier.
+    bool media_content_identity(int64_t n_tokens, std::string & out) const;
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
@@ -391,3 +399,25 @@ server_tokens format_prompt_rerank(
         mtmd_context * mctx,
         const std::string & query,
         const std::string & doc);
+
+// ---- cache receipt (PROPOSAL §7.7, Phase 1) ----
+// Untrusted divergence-location hint attached to responses when enabled: a
+// keyed, chained block-hash vector over the slot's cached token prefix,
+// versioned against tokenizer/template identity. Never authorization.
+struct server_cache_receipt {
+    uint32_t                 version = 1;
+    uint32_t                 block_tokens = 1024;
+    std::string              hash_spec;      // "sha256-chain-trunc64/v1" or unkeyed-debug variant
+    std::string              model_identity; // model name/id the chain is scoped to
+    uint64_t                 sequence_epoch = 0;
+    int64_t                  token_count = 0;
+    std::string              adapter_identity;
+    std::vector<std::string> chain;          // one truncated hex digest per block
+};
+
+// Chained keyed hash over token ids: h_i = trunc64(SHA256(key || h_{i-1} || block_i)).
+// Empty key is permitted only when unkeyed_debug is set (caller enforces policy).
+std::vector<std::string> cache_receipt_chain(
+        const std::vector<llama_token> & tokens,
+        uint32_t                          block_tokens,
+        const std::string &               key);

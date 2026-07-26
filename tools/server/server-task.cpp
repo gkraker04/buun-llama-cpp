@@ -403,6 +403,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (!cache_receipt.is_null()) {
+        res["cache_receipt"] = cache_receipt;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -1724,6 +1727,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
         entry.data.drft.resize(state_size_dft);
         entry.prompt.tokens      = prompt.tokens.clone();
         entry.prompt.checkpoints = prompt.checkpoints;
+        entry.prompt.sequence_epoch = prompt.sequence_epoch;
         entry.adapter_config_key = std::move(adapter_config_key);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());

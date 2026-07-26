@@ -380,6 +380,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
+    // cache receipt (§7.7): serialized JSON attached verbatim when enabled;
+    // empty = no receipt. Built in send_final_response from slot state.
+    json cache_receipt;
+
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
     }
@@ -593,9 +597,15 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Server-local lineage for the computation-frontier migration [WS-4].
+    // It moves with host-cache/child-slot prompt clones and resets whenever
+    // the prompt ledger is structurally cleared.
+    uint64_t sequence_epoch = 0;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        sequence_epoch = 0;
     }
 
     int n_tokens() const {
@@ -606,6 +616,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            sequence_epoch,
         };
     }
 };

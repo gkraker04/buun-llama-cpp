@@ -275,6 +275,18 @@ bool server_http_context::init(const common_params & params) {
         return true;
     };
 
+    // cache receipt (§7.7 security contract): dynamic API responses must not be
+    // cached by intermediaries once receipts ride on them. Frontend assets keep
+    // their own caching headers. Post-routing so it stamps every handler's
+    // response; frontend_paths is a function-static and outlives this handler.
+    if (params.cache_receipt) {
+        srv->set_post_routing_handler([](const httplib::Request & req, httplib::Response & res) {
+            if (!frontend_paths.count(req.path)) {
+                res.set_header("Cache-Control", "no-store");
+            }
+        });
+    }
+
     // register server middlewares
     srv->set_pre_routing_handler([&params, middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
         if (params.cors_credentials && params.cors_origins == "*") {

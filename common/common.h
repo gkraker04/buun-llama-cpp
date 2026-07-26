@@ -748,6 +748,9 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t dflash_window_depth   = 0;     // retained rolling GDN records; 0 disables server integration
+    int32_t dflash_window_advance = 16;    // records per left-edge publication transaction
+    std::string dflash_window_codec = "f32"; // exact f32 or explicit approximate f16
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -803,6 +806,12 @@ struct common_params {
 
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
+
+    // cache receipt (PROPOSAL §7.7 Phase 1): untrusted divergence-location hint
+    // on responses. Keyed chain by default; unkeyed only behind the debug flag.
+    bool        cache_receipt = false;
+    std::string cache_receipt_key;          // per-session/tenant comparison key
+    bool        cache_receipt_unkeyed_debug = false;
 
     float slot_prompt_similarity = 0.1f;
 
@@ -1225,6 +1234,51 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Server/common-layer logical computation frontier [WS-4]. This is the state after
+// processing the half-open logical prefix [0, token_count); next_position is the next
+// effective model position for that prefix. The three identity keys are opaque,
+// comparison-only server keys:
+//   - execution_identity: this loaded model/runtime instance
+//   - adapter_config_identity: active adapter weights + exact scales
+//   - media_content_identity: media content/shape in the logical prefix
+//
+// This deliberately lives beside common_prompt_checkpoint rather than in libllama:
+// sequence lineage, per-request adapters and mtmd media are server-layer concepts.
+// version == 0 means a legacy checkpoint with no dual-written frontier.
+struct common_computation_frontier {
+    static constexpr uint32_t VERSION = 1;
+
+    uint32_t version = 0;
+
+    uint64_t sequence_epoch = 0;
+    int64_t  token_count    = 0;
+    llama_pos next_position = 0;
+
+    std::string execution_identity;
+    std::string adapter_config_identity;
+    std::string media_content_identity;
+
+    bool valid() const {
+        return version == VERSION &&
+               sequence_epoch != 0 &&
+               token_count >= 0 &&
+               next_position >= 0 &&
+               !execution_identity.empty() &&
+               !adapter_config_identity.empty() &&
+               !media_content_identity.empty();
+    }
+
+    void clear() {
+        version = 0;
+        sequence_epoch = 0;
+        token_count = 0;
+        next_position = 0;
+        execution_identity.clear();
+        adapter_config_identity.clear();
+        media_content_identity.clear();
+    }
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1242,13 +1296,33 @@ struct common_prompt_checkpoint {
     uint64_t representation_epoch     = 0;
     uint64_t representation_epoch_swa = 0;
 
+    // Logical validity record, dual-written beside the legacy physical fields
+    // during the Phase-1 migration. Legacy checkpoints have version == 0.
+    common_computation_frontier computation_frontier;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
-    std::vector<uint8_t> ring_data; // fork: DFlash ring buffer state
 
-    // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
-    std::vector<uint8_t> data_spec;
+    // Typed accelerator state stashed with the checkpoint (Phase-1 typed
+    // accelerators). Exact restore readiness is conjunctive (PROPOSAL §6
+    // invariant 3): a component that is mandatory-on-presence and fails to
+    // apply fails the WHOLE checkpoint restore fail-closed; purely optional
+    // components may degrade drafting quality only, never correctness.
+    struct accel_state {
+        // DFlash drafter ring buffer bytes. Mandatory-on-presence: a non-empty
+        // ring that fails to load fails the restore (shipped behavior at the
+        // ring-restore site).
+        std::vector<uint8_t> ring;
+
+        // Speculative-impl state (e.g. eagle3's deferred-boundary g_embd row).
+        // Applied unconditionally; absence resets the impl state. Optional.
+        std::vector<uint8_t> spec;
+
+        size_t size()  const { return ring.size() + spec.size(); }
+        bool   empty() const { return ring.empty() && spec.empty(); }
+        void   clear()       { ring.clear(); spec.clear(); }
+    };
+    accel_state accel;
 
     size_t size() const;
 

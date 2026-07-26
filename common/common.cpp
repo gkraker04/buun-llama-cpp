@@ -2063,7 +2063,7 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size() + ring_data.size(); // ring_data was omitted [R6]
+    return data_tgt.size() + data_dft.size() + accel.size(); // accel.ring was omitted pre-[R6]
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2080,10 +2080,11 @@ void common_prompt_checkpoint::clear() {
     representation_epoch     = 0; // [I9]
     representation_epoch_swa = 0;
 
+    computation_frontier.clear();
+
     data_tgt.clear();
     data_dft.clear();
-    data_spec.clear();
-    ring_data.clear(); // was omitted [R6]
+    accel.clear(); // ring omission fixed in [R6]
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2173,5 +2174,5 @@ void common_prompt_checkpoint::clear_tgt() {
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
-    data_spec.clear();
+    accel.spec.clear();
 }

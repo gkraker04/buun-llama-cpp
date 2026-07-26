@@ -20,10 +20,13 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <filesystem>
@@ -51,6 +54,57 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 static bool server_vbr_dynamic_active(const common_params & params) {
     return params.vbr_dynamic();
 }
+
+// A flip is deliberately per-boot: persisting migration confidence across a
+// binary/model/config change would turn yesterday's evidence into authority for
+// different code. Zero keeps the frontier path in permanent shadow mode.
+static uint64_t server_frontier_ratchet_min_agreements() {
+    static constexpr uint64_t DEFAULT_MIN_AGREEMENTS = 1024;
+
+    const char * env = std::getenv("LLAMA_FRONTIER_RATCHET_MIN_AGREEMENTS");
+    if (env == nullptr || env[0] == '\0') {
+        return DEFAULT_MIN_AGREEMENTS;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0') {
+        SRV_WRN("invalid LLAMA_FRONTIER_RATCHET_MIN_AGREEMENTS='%s'; using %" PRIu64 "\n",
+                env, DEFAULT_MIN_AGREEMENTS);
+        return DEFAULT_MIN_AGREEMENTS;
+    }
+
+    return (uint64_t) parsed;
+}
+
+// WS-6: keep the C-style memory API balanced across every server early return. A scope only
+// becomes active for a dynamic-VBR memory; non-VBR checkpoints preserve their old path exactly.
+class server_vbr_retier_freeze_scope {
+public:
+    server_vbr_retier_freeze_scope(llama_memory_t mem, const char * owner) :
+        mem(mem), owner(owner),
+        started_ns(llama_memory_vbr_retier_freeze_begin(mem, owner)) {
+    }
+
+    ~server_vbr_retier_freeze_scope() {
+        if (started_ns != 0) {
+            llama_memory_vbr_retier_freeze_end(mem, owner, started_ns);
+        }
+    }
+
+    server_vbr_retier_freeze_scope(const server_vbr_retier_freeze_scope &) = delete;
+    server_vbr_retier_freeze_scope & operator=(const server_vbr_retier_freeze_scope &) = delete;
+
+    bool active() const {
+        return started_ns != 0;
+    }
+
+private:
+    llama_memory_t mem;
+    const char * owner;
+    uint64_t started_ns;
+};
 
 // defined near get_model_info(); shared by the /props and /models responses
 static json server_vbr_meta_json(const server_context_meta * meta);
@@ -335,6 +389,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key) {
+        // A host snapshot replaces the live frontier wholesale. Any rolling
+        // tape rooted in the displaced frontier is no longer a valid lineage.
+        if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
+            SLT_ERR(*this, "%s", "cannot discard mixed-owner rolling-window capture before prompt load\n");
+            return false;
+        }
+        dflash_window_identity.clear();
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, adapter_config_key);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -346,6 +407,14 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
+            // The server integration currently rejects --parallel > 1, so a
+            // mixed-owner pending transaction is an invariant failure rather
+            // than an expected runtime case. Keep it loud; continuing would
+            // make the next decode consume a stale branch.
+            SLT_ERR(*this, "%s", "failed to discard rolling-window state while clearing slot\n");
+        }
+        dflash_window_identity.clear();
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
@@ -383,6 +452,10 @@ struct server_slot {
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
+    // Gate-5 observation: exact joint distribution needed to weight plane-vs-tape
+    // capture and rollback costs. Outer index = generated draft length; inner
+    // index = rejected target rows (rollback depth).
+    std::vector<std::vector<int32_t>> n_verify_rollback;
 
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
@@ -393,6 +466,102 @@ struct server_slot {
     // in GET /slots so a user can see WHY a request cold-processed instead of guessing. Set at the
     // prompt-reuse decision points; greppable by tests (e.g. the I9 VBR-reject reason).
     std::string cache_status;
+    std::string dflash_window_identity;
+
+    // Phase-1 computation-frontier read ratchet [WS-4]. Only checkpoint-selection
+    // decisions qualify the agreement streak; other consistency checks may
+    // reset/fallback it but cannot make a vacuous workload flip authority.
+    uint64_t frontier_ratchet_min_agreements = 1024;
+    uint64_t frontier_ratchet_agreement_streak = 0;
+    uint64_t frontier_ratchet_agreements_total = 0;
+    uint64_t frontier_ratchet_disagreements_total = 0;
+    uint64_t frontier_ratchet_flips_total = 0;
+    uint64_t frontier_ratchet_fallbacks_total = 0;
+    bool frontier_ratchet_flipped = false;
+
+    void frontier_ratchet_disagreement(
+            const char * site,
+            int64_t legacy_choice,
+            int64_t frontier_choice) {
+        frontier_ratchet_disagreements_total++;
+        frontier_ratchet_agreement_streak = 0;
+
+        if (frontier_ratchet_flipped) {
+            frontier_ratchet_flipped = false;
+            frontier_ratchet_fallbacks_total++;
+            SLT_ERR(*this,
+                    "FRONTIER_RATCHET event=post_flip_disagreement action=fallback_legacy "
+                    "site=%s legacy=%" PRId64 " frontier=%" PRId64
+                    " disagreements=%" PRIu64 " fallbacks=%" PRIu64 "\n",
+                    site, legacy_choice, frontier_choice,
+                    frontier_ratchet_disagreements_total,
+                    frontier_ratchet_fallbacks_total);
+        } else {
+            SLT_WRN(*this,
+                    "FRONTIER_RATCHET event=shadow_disagreement action=keep_legacy "
+                    "site=%s legacy=%" PRId64 " frontier=%" PRId64
+                    " disagreements=%" PRIu64 "\n",
+                    site, legacy_choice, frontier_choice,
+                    frontier_ratchet_disagreements_total);
+        }
+    }
+
+    // Returns whether the frontier path owns this selection. `eligible` means
+    // at least one dual-written record was actually evaluated; empty/legacy-only
+    // scans do not count toward "sustained".
+    bool frontier_ratchet_selection(
+            bool eligible,
+            bool agreement,
+            int64_t legacy_choice,
+            int64_t frontier_choice) {
+        if (!eligible) {
+            if (frontier_ratchet_flipped) {
+                frontier_ratchet_disagreement(
+                    "checkpoint_selection_no_frontier_record",
+                    legacy_choice, frontier_choice);
+            }
+            return false;
+        }
+
+        if (!agreement) {
+            frontier_ratchet_disagreement(
+                "checkpoint_selection", legacy_choice, frontier_choice);
+            return false;
+        }
+
+        frontier_ratchet_agreements_total++;
+        if (!frontier_ratchet_flipped &&
+            frontier_ratchet_min_agreements > 0) {
+            frontier_ratchet_agreement_streak++;
+            if (frontier_ratchet_agreement_streak >=
+                    frontier_ratchet_min_agreements) {
+                frontier_ratchet_flipped = true;
+                frontier_ratchet_flips_total++;
+                SLT_INF(*this,
+                        "FRONTIER_RATCHET event=flip action=frontier_reads "
+                        "streak=%" PRIu64 " threshold=%" PRIu64
+                        " flips=%" PRIu64 "\n",
+                        frontier_ratchet_agreement_streak,
+                        frontier_ratchet_min_agreements,
+                        frontier_ratchet_flips_total);
+            }
+        }
+
+        return frontier_ratchet_flipped;
+    }
+
+    // Last coordinated rolling-window restore. Exposed in GET /slots and
+    // logged as one structured line so quality gates can prove that their
+    // second request used the requested codec, identity and depth.
+    uint64_t dflash_window_restore_generation = 0;
+    llama_dflash_window_codec dflash_window_restore_codec = LLAMA_DFLASH_WINDOW_CODEC_NONE;
+    llama_pos dflash_window_restore_boundary = -1;
+    llama_pos dflash_window_restore_frontier = -1;
+    llama_pos dflash_window_restore_target = -1;
+    int32_t dflash_window_restore_depth = 0;
+    int32_t dflash_window_restore_task = -1;
+    std::string dflash_window_restore_identity;
+    std::string dflash_window_restore_result;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -421,6 +590,7 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+        n_verify_rollback.clear();
         has_draft_backup = false;
         seq_id_backup = -1;
         n_tokens_before_draft = 0;
@@ -678,7 +848,7 @@ struct server_slot {
         }
 
         // live effective KV bits/value (moves under dynamic VBR as tiers degrade/reset)
-        if (ctx_tgt != nullptr) {
+            if (ctx_tgt != nullptr) {
             timings.kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
         }
 
@@ -790,6 +960,26 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            std::string verify_rollback_hist;
+            for (size_t n_draft = 0; n_draft < n_verify_rollback.size(); ++n_draft) {
+                for (size_t rollback = 0;
+                     rollback < n_verify_rollback[n_draft].size();
+                     ++rollback) {
+                    const int32_t count = n_verify_rollback[n_draft][rollback];
+                    if (count == 0) {
+                        continue;
+                    }
+                    if (!verify_rollback_hist.empty()) {
+                        verify_rollback_hist += ", ";
+                    }
+                    verify_rollback_hist += string_format(
+                        "%zu/%zu:%d", n_draft, rollback, count);
+                }
+            }
+            SLT_INF(*this,
+                    "verify/rollback histogram (draft/rejected:cycles) = (%s)\n",
+                    verify_rollback_hist.c_str());
         }
 
         common_speculative_print_stats(spec.get());
@@ -803,6 +993,15 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"computation_frontier_ratchet", {
+                {"read_path", frontier_ratchet_flipped ? "frontier" : "legacy"},
+                {"threshold", frontier_ratchet_min_agreements},
+                {"agreement_streak", frontier_ratchet_agreement_streak},
+                {"agreements_total", frontier_ratchet_agreements_total},
+                {"disagreements_total", frontier_ratchet_disagreements_total},
+                {"flips_total", frontier_ratchet_flips_total},
+                {"fallbacks_total", frontier_ratchet_fallbacks_total},
+            }},
         };
 
         // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
@@ -822,6 +1021,17 @@ struct server_slot {
                     { "grant_pending",   ct.grant_pending },
                 };
             }
+            const auto vbr = llama_memory_vbr_state(llama_get_memory(ctx_tgt), id, 0);
+            if (vbr.retier_freeze_enters > 0 || vbr.retier_freeze_depth > 0) {
+                res["vbr_retier_freeze"] = json {
+                    { "depth",              vbr.retier_freeze_depth },
+                    { "env_freeze",         vbr.retier_env_freeze != 0 },
+                    { "enters_total",       vbr.retier_freeze_enters },
+                    { "exits_total",        vbr.retier_freeze_exits },
+                    { "deferred_total",     vbr.retier_deferred_decisions },
+                    { "reconciles_total",   vbr.retier_reconciles },
+                };
+            }
         }
 
         const auto & ptask = task ? task : task_prev;
@@ -833,6 +1043,25 @@ struct server_slot {
             res["n_prompt_tokens_cache"]     = n_prompt_tokens_cache;
             if (!cache_status.empty()) {
                 res["cache_status"] = cache_status; // [obs] why the last prompt (partially) reprocessed
+            }
+            if (dflash_window_restore_generation > 0) {
+                const char * restore_codec =
+                    dflash_window_restore_codec == LLAMA_DFLASH_WINDOW_CODEC_F16
+                        ? "f16"
+                        : dflash_window_restore_codec == LLAMA_DFLASH_WINDOW_CODEC_F32
+                            ? "f32"
+                            : "none";
+                res["dflash_window_restore"] = {
+                    { "generation", dflash_window_restore_generation },
+                    { "codec", restore_codec },
+                    { "boundary", dflash_window_restore_boundary },
+                    { "frontier", dflash_window_restore_frontier },
+                    { "target", dflash_window_restore_target },
+                    { "depth", dflash_window_restore_depth },
+                    { "id_task", dflash_window_restore_task },
+                    { "identity", dflash_window_restore_identity },
+                    { "result", dflash_window_restore_result },
+                };
             }
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = {
@@ -1123,6 +1352,56 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // In-process execution/lineage namespace for computation-frontier records.
+    // Checkpoints are never portable across this random model-instance key;
+    // slot-file restore explicitly invalidates them below.
+    std::string frontier_execution_identity;
+    uint64_t frontier_next_sequence_epoch = 1;
+    uint64_t frontier_ratchet_threshold = 1024;
+
+    uint64_t ensure_frontier_sequence_epoch(server_prompt & prompt) {
+        if (prompt.sequence_epoch == 0) {
+            GGML_ASSERT(frontier_next_sequence_epoch != 0);
+            prompt.sequence_epoch = frontier_next_sequence_epoch++;
+            GGML_ASSERT(frontier_next_sequence_epoch != 0);
+        }
+        return prompt.sequence_epoch;
+    }
+
+    static bool computation_frontiers_equal(
+            const common_computation_frontier & a,
+            const common_computation_frontier & b) {
+        return a.version == b.version &&
+               a.sequence_epoch == b.sequence_epoch &&
+               a.token_count == b.token_count &&
+               a.next_position == b.next_position &&
+               a.execution_identity == b.execution_identity &&
+               a.adapter_config_identity == b.adapter_config_identity &&
+               a.media_content_identity == b.media_content_identity;
+    }
+
+    bool checkpoint_frontier_is_current(
+            const server_slot & slot,
+            const common_prompt_checkpoint & checkpoint,
+            const std::string & adapter_identity) const {
+        const auto & frontier = checkpoint.computation_frontier;
+        if (!frontier.valid() ||
+            frontier.sequence_epoch != slot.prompt.sequence_epoch ||
+            frontier.execution_identity != frontier_execution_identity ||
+            frontier.adapter_config_identity != adapter_identity ||
+            frontier.token_count != checkpoint.n_tokens ||
+            checkpoint.pos_max < 0 ||
+            frontier.next_position <= 0 ||
+            frontier.next_position - 1 != checkpoint.pos_max) {
+            return false;
+        }
+
+        std::string media_identity;
+        return slot.prompt.tokens.media_content_identity(
+                   frontier.token_count, media_identity) &&
+               media_identity == frontier.media_content_identity;
+    }
+
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1135,6 +1414,82 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    bool dflash_window_server_enabled() const {
+        return params_base.dflash_window_depth > 0;
+    }
+
+    bool dflash_window_lora_supported(
+            const std::vector<common_adapter_lora_info> & loras) const {
+        // The canonical identity is "0" only when no non-zero-scale adapter
+        // participates in computation. Rolling-window LoRA support is deferred:
+        // reject rather than publishing a binary adapter key as API evidence.
+        return lora_config_identity(loras) == "0";
+    }
+
+    bool dflash_window_enable_slot(server_slot & slot) {
+        if (!dflash_window_server_enabled()) {
+            return true;
+        }
+        if (slot.prompt.tokens.has_media() || slot.prompt.tokens.empty()) {
+            return false;
+        }
+
+        // Defense in depth for internal boundary-restart paths. Normal requests
+        // are rejected earlier, before adapter rebinding or token evaluation.
+        if (!dflash_window_lora_supported(slot.lora)) {
+            SLT_ERR(slot, "%s",
+                    "rolling DFlash tape server mode does not yet support active LoRA adapters\n");
+            return false;
+        }
+        const std::string identity = "base:no-lora";
+
+        llama_dflash_window_info info = {};
+        if (llama_dflash_window_get_info(ctx_tgt, slot.id, &info)) {
+            if (slot.dflash_window_identity != identity) {
+                SLT_ERR(slot,
+                        "rolling DFlash tape identity mismatch "
+                        "(window=%s live=%s)\n",
+                        slot.dflash_window_identity.c_str(),
+                        identity.c_str());
+                return false;
+            }
+            return true;
+        }
+
+        llama_dflash_set_active_slot(ctx_tgt, slot.id);
+        const bool ok = params_base.dflash_window_codec == "f16"
+            ? llama_dflash_window_enable_batched_f16(
+                ctx_tgt, slot.id,
+                params_base.dflash_window_depth,
+                params_base.dflash_window_advance)
+            : llama_dflash_window_enable_batched(
+                ctx_tgt, slot.id,
+                params_base.dflash_window_depth,
+                params_base.dflash_window_advance);
+        if (!ok) {
+            SLT_ERR(slot,
+                    "failed to snapshot rolling DFlash tape boundary "
+                    "(codec=%s depth=%d advance=%d)\n",
+                    params_base.dflash_window_codec.c_str(),
+                    params_base.dflash_window_depth,
+                    params_base.dflash_window_advance);
+            return false;
+        }
+
+        if (!llama_dflash_window_get_info(ctx_tgt, slot.id, &info)) {
+            SLT_ERR(slot, "%s", "rolling DFlash tape enabled without queryable identity\n");
+            return false;
+        }
+        slot.dflash_window_identity = identity;
+        SLT_INF(slot,
+                "DFLASH_WINDOW_BOUNDARY codec=%s seq=%d boundary=%d "
+                "frontier=%d depth=%d advance=%d\n",
+                info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16 ? "f16" : "f32",
+                info.seq_id, info.boundary_pos, info.frontier_pos,
+                info.retained_depth, info.advance_batch);
+        return true;
+    }
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1900,6 +2255,17 @@ private:
 
         }
 
+        // cache receipt (§7.7 security contract): keyed by default; an unkeyed
+        // chain leaks prompt-content comparability and requires the explicit
+        // debug flag. Fail closed at startup, never silently downgrade.
+        if (params_base.cache_receipt &&
+            params_base.cache_receipt_key.empty() &&
+            !params_base.cache_receipt_unkeyed_debug) {
+            SRV_ERR("%s\n", "--cache-receipt requires --cache-receipt-key "
+                    "(or --cache-receipt-unkeyed-debug for trusted local use)");
+            return false;
+        }
+
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -1946,6 +2312,16 @@ private:
         }
 
         slots.clear();
+        frontier_execution_identity =
+            "server-execution-v1:" + random_string();
+        frontier_next_sequence_epoch = 1;
+        frontier_ratchet_threshold =
+            server_frontier_ratchet_min_agreements();
+        SRV_INF(
+            "computation-frontier ratchet: legacy reads authoritative, "
+            "flip after %" PRIu64 " qualifying agreements%s\n",
+            frontier_ratchet_threshold,
+            frontier_ratchet_threshold == 0 ? " (shadow-only)" : "");
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -2025,6 +2401,8 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
             slot.n_ctx   = n_ctx_slot;
+            slot.frontier_ratchet_min_agreements =
+                frontier_ratchet_threshold;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2096,6 +2474,61 @@ private:
         // buffers, which every DFlash target needs (the unused tape itself is small).
         if (dflash_slots_cap > 0) {
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
+        }
+
+        if (params_base.dflash_window_depth > 0) {
+            // Server prototype integration is intentionally narrower than the G4
+            // ownership prototype. Lazy boundary admission and host-cache
+            // replacement are coordinated for one live slot here; admitting a
+            // new slot into an already-windowed mixed batch needs a separate
+            // transaction and must not be implied by G4's replay arithmetic.
+            if (n_parallel_user != 1) {
+                SRV_ERR("rolling DFlash tape currently requires --parallel 1 (got %d)\n",
+                        n_parallel_user);
+                return false;
+            }
+            if (!needs_reeval) {
+                SRV_ERR("%s", "rolling DFlash tape requires a recurrent or hybrid target\n");
+                return false;
+            }
+            if (server_vbr_dynamic_active(params_base)) {
+                SRV_ERR("%s",
+                        "rolling DFlash tape is not yet coordinated with dynamic VBR retiering "
+                        "(WS-3); disable dynamic VBR or the rolling window\n");
+                return false;
+            }
+            if (!dflash_window_lora_supported(params_base.lora_adapters)) {
+                SRV_ERR("%s",
+                        "rolling DFlash tape server mode does not yet support active LoRA adapters; "
+                        "disable LoRA or the rolling window\n");
+                return false;
+            }
+            if (params_base.dflash_window_codec != "f32" &&
+                params_base.dflash_window_codec != "f16") {
+                SRV_ERR("invalid rolling DFlash tape codec '%s'\n",
+                        params_base.dflash_window_codec.c_str());
+                return false;
+            }
+
+            // A DFlash drafter already installed capture metadata. Standalone
+            // edit-window mode has no drafter, so create the same recurrent
+            // tape setup without requesting hidden-layer capture.
+            if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_set_dflash_capture(ctx_tgt, nullptr, 0);
+            }
+            llama_set_tape_recording(ctx_tgt, true);
+            llama_dflash_allocate_slots(ctx_tgt, 1);
+
+            if (!llama_dflash_tape_replay_available(ctx_tgt)) {
+                SRV_ERR("%s", "rolling DFlash tape requires all recurrent state on one GPU\n");
+                return false;
+            }
+            SRV_INF(
+                "rolling DFlash tape enabled: codec=%s depth=%d advance=%d "
+                "(single-slot, text-only)\n",
+                params_base.dflash_window_codec.c_str(),
+                params_base.dflash_window_depth,
+                params_base.dflash_window_advance);
         }
 
         // Under --split-mode tensor the load-time capability probe was predictive; now
@@ -2616,6 +3049,14 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (dflash_window_server_enabled() && task.tokens.has_media()) {
+            send_error(
+                task,
+                "rolling DFlash tape server mode is currently text-only",
+                ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // process per-request lora adapters (fall back to the server's base adapters when the
         // request carries none). Identity is checked for BOTH branches [I6]: a slot that computed
         // its prompt state under one adapter set must not silently continue it under a different
@@ -2627,6 +3068,18 @@ private:
         const auto task_loras = task.params.lora.empty()
             ? params_base.lora_adapters
             : construct_lora_list(task.params.lora);
+
+        // Per-request adapter selection cannot be decided at server startup.
+        // Reject before rebinding the slot or evaluating any token so a failed
+        // admission cannot leave a window or recurrent frontier under LoRA.
+        if (dflash_window_server_enabled() &&
+            !dflash_window_lora_supported(task_loras)) {
+            send_error(
+                task,
+                "rolling DFlash tape server mode does not yet support active LoRA adapters",
+                ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
 
         if (!are_lora_equal(task_loras, slot.lora)) {
             // called only after establishing inequality, as lora_should_clear_cache requires
@@ -3168,6 +3621,34 @@ private:
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
+        // cache receipt (§7.7): keyed chained block-hash over the slot's cached
+        // token prefix + frontier identity. Untrusted hint, never authorization.
+        // Portable tokenizer/template digests are §7.2 scope; the chain is
+        // versioned by hash_spec + model identity here.
+        if (params_base.cache_receipt) {
+            const llama_tokens receipt_tokens = slot.prompt.tokens.get_text_tokens();
+            std::string identity = lora_config_identity(slot.lora);
+            if (identity == "0") {
+                identity = "base:no-lora";
+            }
+            const bool keyed = !params_base.cache_receipt_key.empty();
+            res->cache_receipt = json {
+                {"version",          1},
+                {"hash_spec",        keyed ? "sha256-chain-trunc64/v1"
+                                           : "sha256-chain-trunc64-unkeyed-debug/v1"},
+                {"block_tokens",     1024},
+                {"model",            slot.task->params.oaicompat_model.empty()
+                                         ? params_base.model.path
+                                         : slot.task->params.oaicompat_model},
+                {"sequence_epoch",   slot.prompt.sequence_epoch},
+                {"token_count",      (int64_t) receipt_tokens.size()},
+                {"adapter_identity", identity},
+                {"chain",            cache_receipt_chain(
+                                         receipt_tokens, 1024,
+                                         params_base.cache_receipt_key)},
+            };
+        }
+
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
         res->include_usage     = slot.task->params.include_usage;
@@ -3354,9 +3835,13 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     // note: the former create_checkpoint() helper was dead (zero callers) and diverged from the live
-    // capture path below (it alone populated data_dft/data_spec via update_dft/common_speculative_get_state,
+    // capture path below (it alone populated data_dft/spec state via update_dft/common_speculative_get_state,
     // which the live path never fills). Removed [R6/N5]; the single capture path is the inline one in
-    // update_slots. Draft/speculative checkpoint state is a Phase-1 typed-accelerator concern.
+    // update_slots. Draft/speculative checkpoint aux state now lives in the typed
+    // common_prompt_checkpoint::accel record (Phase-1 typed accelerators): ring is
+    // mandatory-on-presence (fail-closed at the restore site), spec is optional.
+    // The live capture path fills accel.ring only; accel.spec remains a stash slot
+    // for spec impls that need it (e.g. eagle3), applied on restore when present.
 
     void process_single_task(server_task && task) {
         switch (task.type) {
@@ -3667,6 +4152,15 @@ private:
                         break;
                     }
                     tokens.resize(token_count);
+                    if (slot->prompt.sequence_epoch != 0 ||
+                        !slot->prompt.checkpoints.empty()) {
+                        SLT_INF(*slot,
+                                "FRONTIER_RECORD event=invalidate "
+                                "reason=slot_file_restore checkpoints=%zu "
+                                "sequence_epoch=%" PRIu64 "\n",
+                                slot->prompt.checkpoints.size(),
+                                slot->prompt.sequence_epoch);
+                    }
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
@@ -3749,6 +4243,14 @@ private:
             case SERVER_TASK_TYPE_SET_LORA:
                 {
                     auto new_loras = construct_lora_list(task.set_lora);
+                    if (dflash_window_server_enabled() &&
+                        !dflash_window_lora_supported(new_loras)) {
+                        send_error(
+                            task,
+                            "rolling DFlash tape server mode does not yet support active LoRA adapters",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
                         SRV_TRC("set lora adapter idx=%zu scale=%f\n", i, new_loras[i].scale);
@@ -4022,6 +4524,10 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
+                    throw std::runtime_error(
+                        "cannot discard rolling window before context shift");
+                }
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
@@ -4047,6 +4553,11 @@ private:
                 }
 
                 slot.truncated = true;
+                if (dflash_window_server_enabled() &&
+                    !dflash_window_enable_slot(slot)) {
+                    throw std::runtime_error(
+                        "cannot restart rolling window after context shift");
+                }
             }
         });
 
@@ -4135,6 +4646,21 @@ private:
                     draft.resize(n_draft_max);
                 }
 
+                if (needs_reeval &&
+                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    !llama_tape_replay_sync(ctx_tgt)) {
+                    // A deferred exact replay could not publish its conv
+                    // frontier. Abort before adding this slot to the decode
+                    // batch; the rollback backup was consumed after launch.
+                    SLT_ERR(slot, "%s\n", "exact tape replay synchronization failed; resetting slot");
+                    send_error(slot, "Compute error completing exact tape replay");
+                    slot.release();
+                    slot.prompt_clear();
+                    slot.has_draft_backup = false;
+                    slot.seq_id_backup = -1;
+                    return;
+                }
+
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
 
                 slot.spec_i_batch.push_back(batch.size());
@@ -4166,7 +4692,6 @@ private:
 
                     if (needs_reeval) {
                         if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                            llama_tape_replay_sync(ctx_tgt);
                             const int n_batch_tokens = 1 + (int) draft.size();
                             std::vector<int32_t> linear_parents(n_batch_tokens);
                             linear_parents[0] = -1;
@@ -4265,6 +4790,11 @@ private:
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
+                    std::unique_ptr<server_vbr_retier_freeze_scope> vbr_restore_freeze;
+                    bool return_after_vbr_restore_trim = false;
+                    bool checkpoint_tgt_recurrent_installed = false;
+                    bool checkpoint_dft_recurrent_installed = false;
+                    llama_pos checkpoint_installed_pos = -1;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4273,6 +4803,17 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
+
+                        slot.dflash_window_restore_generation++;
+                        slot.dflash_window_restore_codec = LLAMA_DFLASH_WINDOW_CODEC_NONE;
+                        slot.dflash_window_restore_boundary = -1;
+                        slot.dflash_window_restore_frontier = -1;
+                        slot.dflash_window_restore_target = -1;
+                        slot.dflash_window_restore_depth = 0;
+                        slot.dflash_window_restore_task = slot.task->id;
+                        slot.dflash_window_restore_identity.clear();
+                        slot.dflash_window_restore_result =
+                            dflash_window_server_enabled() ? "not_used" : "disabled";
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -4348,9 +4889,19 @@ private:
                                 return;
                             }
 
+                            // Gate-5 edit-regime observation. Capture the logical
+                            // branch point before checkpoint restore or VBR policy
+                            // can rewind the physical frontier. The raw token LCP
+                            // and actually reusable LCP are intentionally separate:
+                            // adapter/alora constraints can add replay work without
+                            // changing where the user's content diverged.
+                            const size_t n_cached_before = slot.prompt.tokens.size();
+                            const size_t n_content_lcp =
+                                slot.prompt.tokens.get_common_prefix(input_tokens);
+
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                n_past = (int) n_content_lcp;
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -4368,7 +4919,13 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // Chunk-shift reuse mutates the live attention
+                                // timeline before the rolling restore transaction
+                                // can validate and reconstruct its lineage. The
+                                // deep window is the reuse mechanism in this
+                                // mode; do not combine the two mutations.
                                 const bool can_cache_reuse =
+                                    !dflash_window_server_enabled() &&
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
                                     !slot.prompt.tokens.has_mtmd;
 
@@ -4406,6 +4963,19 @@ private:
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
                                             //}
 
+                                            // The splice rewrites live cell positions (and later
+                                            // re-RoPEs their K bytes) beneath any retained context
+                                            // checkpoint. On non-hybrid (e.g. pure-SWA) models the
+                                            // checkpoint selector has no epoch guard, so a stale
+                                            // checkpoint over spliced cells would restore silently
+                                            // wrong state. Invalidate before the first mutation.
+                                            // [WS-7 review F7]
+                                            if (!slot.prompt.checkpoints.empty()) {
+                                                SLT_WRN(slot, "cache-reuse splice invalidates %zu context checkpoint(s)\n",
+                                                        slot.prompt.checkpoints.size());
+                                                slot.prompt.checkpoints.clear();
+                                            }
+
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
                                             common_context_seq_rm (ctx_tgt, slot.id, head_p, head_c);
@@ -4435,6 +5005,26 @@ private:
                                 n_past = 0;
                             }
 
+                            const size_t n_reusable_lcp =
+                                slot.task->params.cache_prompt ? n_past_common : 0;
+                            const size_t n_rewind =
+                                n_cached_before > n_content_lcp
+                                    ? n_cached_before - n_content_lcp
+                                    : 0;
+                            const size_t n_append =
+                                input_tokens.size() > n_content_lcp
+                                    ? input_tokens.size() - n_content_lcp
+                                    : 0;
+                            SLT_INF(
+                                slot,
+                                "edit/divergence sample "
+                                "(cached/incoming/lcp/reusable/rewind/append/cache_prompt) = "
+                                "(%zu/%zu/%zu/%zu/%zu/%zu/%d)\n",
+                                n_cached_before, input_tokens.size(),
+                                n_content_lcp, n_reusable_lcp,
+                                n_rewind, n_append,
+                                slot.task->params.cache_prompt ? 1 : 0);
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -4443,7 +5033,132 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            bool window_restored = false;
+                            if (dflash_window_server_enabled() && n_past > 0) {
+                                // Preserve the logits contract up front. If the
+                                // whole prompt matches, state through its final
+                                // token cannot provide logits for that same token;
+                                // reconstruct one token earlier and re-evaluate it.
+                                int n_window_past = n_past;
+                                if (n_window_past == slot.task->n_tokens()) {
+                                    n_window_past--;
+                                }
+
+                                if (n_window_past > 0) {
+                                    const llama_pos attention_p0 =
+                                        slot.prompt.tokens.pos_next(n_window_past);
+                                    const llama_pos target_pos = attention_p0 - 1;
+                                    llama_dflash_window_info info = {};
+                                    if (llama_dflash_window_get_info(
+                                            ctx_tgt, slot.id, &info)) {
+                                        slot.dflash_window_restore_codec = info.codec;
+                                        slot.dflash_window_restore_boundary = info.boundary_pos;
+                                        slot.dflash_window_restore_frontier = info.frontier_pos;
+                                        slot.dflash_window_restore_target = target_pos;
+                                        slot.dflash_window_restore_depth =
+                                            info.frontier_pos - target_pos;
+                                        std::string live_identity =
+                                            lora_config_identity(slot.lora);
+                                        // no-lora identity is "0" (count
+                                        // prefix), never empty.
+                                        if (live_identity == "0") {
+                                            live_identity = "base:no-lora";
+                                        }
+                                        slot.dflash_window_restore_identity =
+                                            slot.dflash_window_identity;
+
+                                        if (slot.dflash_window_identity !=
+                                                live_identity) {
+                                            slot.dflash_window_restore_result =
+                                                "identity_mismatch";
+                                            if (!llama_dflash_window_discard_seq(
+                                                    ctx_tgt, slot.id)) {
+                                                SLT_ERR(slot, "%s", "cannot discard identity-mismatched rolling window\n");
+                                            }
+                                            slot.dflash_window_identity.clear();
+                                        } else if (!info.capture_pending &&
+                                            target_pos >= info.boundary_pos &&
+                                            target_pos <= info.frontier_pos) {
+                                            if (llama_dflash_window_restore_seq(
+                                                    ctx_tgt, slot.id,
+                                                    target_pos, attention_p0) &&
+                                                llama_dflash_window_commit_branch(
+                                                    ctx_tgt, slot.id,
+                                                    target_pos)) {
+                                                n_past = n_window_past;
+                                                n_past_keep = std::min(
+                                                    n_past_keep, (size_t) n_past);
+                                                pos_next = attention_p0;
+                                                window_restored = true;
+                                                slot.cache_status =
+                                                    "restored rolling DFlash window";
+                                                slot.dflash_window_restore_result =
+                                                    "installed";
+                                                SLT_INF(
+                                                    slot,
+                                                    "DFLASH_WINDOW_RESTORE "
+                                                    "result=installed task=%d seq=%d "
+                                                    "codec=%s boundary=%d frontier=%d "
+                                                    "target=%d depth=%d identity=%s\n",
+                                                    slot.task->id, slot.id,
+                                                    info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16
+                                                        ? "f16" : "f32",
+                                                    info.boundary_pos,
+                                                    info.frontier_pos,
+                                                    target_pos,
+                                                    info.frontier_pos - target_pos,
+                                                    slot.dflash_window_restore_identity.c_str());
+                                            } else {
+                                                // restore_seq may already have
+                                                // trimmed attention. A restart
+                                                // allocation can also fail after
+                                                // recurrent install. Never hand
+                                                // either split state to checkpoint
+                                                // selection: clear both timelines.
+                                                slot.dflash_window_restore_result =
+                                                    "failed_closed";
+                                                SLT_ERR(
+                                                    slot,
+                                                    "DFLASH_WINDOW_RESTORE "
+                                                    "result=failed_closed task=%d "
+                                                    "seq=%d codec=%s boundary=%d "
+                                                    "frontier=%d target=%d depth=%d\n",
+                                                    slot.task->id, slot.id,
+                                                    info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16
+                                                        ? "f16" : "f32",
+                                                    info.boundary_pos,
+                                                    info.frontier_pos,
+                                                    target_pos,
+                                                    info.frontier_pos - target_pos);
+                                                slot.prompt_clear();
+                                                n_past = 0;
+                                                n_past_common = 0;
+                                                n_past_keep = 0;
+                                                pos_next = 0;
+                                                slot.cache_status =
+                                                    "full reprocess: rolling DFlash restore failed closed";
+                                            }
+                                        } else {
+                                            slot.dflash_window_restore_result =
+                                                info.capture_pending
+                                                    ? "capture_pending"
+                                                    : "out_of_range";
+                                            if (!llama_dflash_window_discard_seq(
+                                                    ctx_tgt, slot.id)) {
+                                                SLT_ERR(slot, "%s", "cannot discard unusable rolling window\n");
+                                            }
+                                            slot.dflash_window_identity.clear();
+                                        }
+                                    } else {
+                                        slot.dflash_window_restore_result =
+                                            "no_window";
+                                        slot.dflash_window_identity.clear();
+                                    }
+                                }
+                            }
+
+                            if (!window_restored &&
+                                n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     // [WS-1] fail-closed coordinated restore. The token ledger claims a
@@ -4521,8 +5236,9 @@ private:
                                     // representation, to explain a resulting cold reprocess in /slots
                                     int n_ckpt_rejected_vbr = 0;
 
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
+                                    // Legacy selection remains authoritative while the
+                                    // computation-frontier path runs in shadow [WS-4].
+                                    const auto it_legacy = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
@@ -4562,24 +5278,172 @@ private:
                                         }
                                     );
 
+                                    // Shadow the same choice from the dual-written logical
+                                    // frontier. pos_min remains the physical attention-coverage
+                                    // guard until plan_resume lands; logical eligibility comes
+                                    // from next_position rather than pos_max.
+                                    std::string frontier_adapter_identity;
+                                    bool frontier_eligible = false;
+                                    auto it_frontier =
+                                        slot.prompt.checkpoints.rend();
+                                    bool frontier_shadow_available = true;
+                                    try {
+                                        frontier_adapter_identity =
+                                            lora_config_identity(slot.lora);
+                                        it_frontier = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [&](const auto & cur) {
+                                                if (slot.frontier_ratchet_flipped &&
+                                                    server_fault(
+                                                        "frontier_disagree_after_flip")) {
+                                                    return false;
+                                                }
+                                                if (cur.empty() ||
+                                                    !checkpoint_frontier_is_current(
+                                                        slot, cur,
+                                                        frontier_adapter_identity)) {
+                                                    return false;
+                                                }
+                                                frontier_eligible = true;
+                                                if (llama_model_is_recurrent(model_tgt) ||
+                                                    llama_model_is_hybrid(model_tgt)) {
+                                                    if (cur.representation_epoch !=
+                                                            vbr_now.representation_epoch ||
+                                                        cur.representation_epoch_swa !=
+                                                            vbr_now.representation_epoch_swa) {
+                                                        return false;
+                                                    }
+                                                    return cur.computation_frontier.next_position <=
+                                                           pos_next;
+                                                }
+                                                if (cur.computation_frontier.next_position - 1 >
+                                                    pos_next) {
+                                                    return false;
+                                                }
+                                                return cur.pos_min < pos_min_thold ||
+                                                       cur.pos_min == 0;
+                                            }
+                                        );
+                                    } catch (const std::exception & e) {
+                                        // Shadow bookkeeping must never make the
+                                        // authoritative legacy selector less available.
+                                        frontier_shadow_available = false;
+                                        SLT_WRN(slot,
+                                                "FRONTIER_RATCHET "
+                                                "event=shadow_unavailable "
+                                                "action=keep_legacy error=%s\n",
+                                                e.what());
+                                    }
+
+                                    const auto choice_index = [&](const auto & choice) {
+                                        return choice ==
+                                                slot.prompt.checkpoints.rend()
+                                            ? int64_t(-1)
+                                            : (int64_t) std::distance(
+                                                slot.prompt.checkpoints.rbegin(),
+                                                choice);
+                                    };
+                                    const int64_t legacy_choice =
+                                        choice_index(it_legacy);
+                                    const int64_t frontier_choice =
+                                        choice_index(it_frontier);
+                                    bool use_frontier = false;
+                                    if (frontier_shadow_available) {
+                                        use_frontier =
+                                            slot.frontier_ratchet_selection(
+                                                frontier_eligible,
+                                                it_legacy == it_frontier,
+                                                legacy_choice,
+                                                frontier_choice);
+                                    } else {
+                                        slot.frontier_ratchet_disagreement(
+                                            "checkpoint_selection_shadow_unavailable",
+                                            legacy_choice, -2);
+                                    }
+                                    const auto it =
+                                        use_frontier ? it_frontier : it_legacy;
+
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    bool vbr_preflight_rejected = false;
+
+                                    if (!do_reset) {
+                                        // [WS-6] A live_rebased PARTIAL_ONLY restore keeps the
+                                        // current attention representation. Prove the current-tier
+                                        // footprint fits before either the restore or its later
+                                        // suffix trim mutates state, then hold a scoped retier
+                                        // freeze across both. This consumer performs no bounded
+                                        // replay inside the scope, so n_tokens_extra is exactly 0.
+                                        const auto preflight =
+                                            llama_memory_vbr_retier_preflight(
+                                                llama_get_memory(ctx_tgt), 0);
+                                        if (preflight.active) {
+                                            const bool preflight_fault =
+                                                server_fault("vbr_retier_preflight_fail");
+                                            const bool preflight_fits =
+                                                preflight.fits && !preflight_fault;
+                                            SLT_INF(slot,
+                                                    "VBR_RETIER_PREFLIGHT owner=server_checkpoint_restore "
+                                                    "result=%s fault=%u pools=%u watermark=%u needed=%" PRIu64
+                                                    " available=%" PRIu64 " physical_growth=%" PRIu64
+                                                    " physical_free=%" PRIu64 " max_deficit=%" PRId64 "\n",
+                                                    preflight_fits ? "fits" : "reject",
+                                                    preflight_fault ? 1u : 0u,
+                                                    preflight.pools,
+                                                    preflight.watermark_cells,
+                                                    preflight.bytes_needed,
+                                                    preflight.bytes_available,
+                                                    preflight.physical_growth_needed,
+                                                    preflight.physical_growth_available,
+                                                    preflight.max_deficit);
+                                            if (!preflight_fits) {
+                                                SLT_WRN(slot, "%s",
+                                                        "checkpoint restore rejected before mutation: "
+                                                        "current VBR tiers cannot cover the frozen footprint\n");
+                                                slot.cache_status =
+                                                    "full reprocess: VBR frozen-footprint preflight rejected";
+                                                vbr_preflight_rejected = true;
+                                                do_reset = true;
+                                            } else {
+                                                vbr_restore_freeze =
+                                                    std::make_unique<server_vbr_retier_freeze_scope>(
+                                                        llama_get_memory(ctx_tgt),
+                                                        "server_checkpoint_restore");
+                                                if (!vbr_restore_freeze->active()) {
+                                                    SLT_ERR(slot, "%s",
+                                                            "VBR preflight was active but scoped freeze acquisition failed\n");
+                                                    vbr_restore_freeze.reset();
+                                                    do_reset = true;
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         // note: keep the raw size-checked restore (instead of it->load_tgt which aborts on
                                         //       mismatch) so a failed restore falls back to a full re-process (do_reset)
+                                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
+                                            SLT_ERR(slot, "%s", "cannot discard rolling window before checkpoint restore\n");
+                                            do_reset = true;
+                                        }
+                                        slot.dflash_window_identity.clear();
                                         const size_t checkpoint_size = it->data_tgt.size();
-                                        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it->data_tgt.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const size_t n = do_reset ? 0 :
+                                            llama_state_seq_set_data_ext(
+                                                ctx_tgt, it->data_tgt.data(),
+                                                checkpoint_size, slot.id,
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        if (n != checkpoint_size) {
+                                        if (!do_reset && n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                             do_reset = true;
-                                        } else {
+                                        } else if (!do_reset) {
                                             // restore the draft-side state, if any (draft-model checkpoints)
                                             it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                             // restore the drafter's speculative state (per-slot spec or shared)
-                                            common_speculative_set_state(slot.get_spec(), slot.id, it->data_spec);
+                                            common_speculative_set_state(slot.get_spec(), slot.id, it->accel.spec);
 
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -4601,19 +5465,27 @@ private:
                                             }
 
                                             bool checkpoint_aux_ok = true;
-                                            if (slot.can_speculate() && !it->ring_data.empty() &&
+                                            if (slot.can_speculate() && !it->accel.ring.empty() &&
                                                 !common_speculative_ring_state_load(
-                                                    slot.get_spec(), it->ring_data.data(), it->ring_data.size())) {
+                                                    slot.get_spec(), it->accel.ring.data(), it->accel.ring.size())) {
                                                 SLT_ERR(slot,
                                                         "failed to restore checkpoint DFlash ring state "
                                                         "(n_tokens = %" PRId64 ", ring size = %zu) -- failing closed\n",
-                                                        it->n_tokens, it->ring_data.size());
+                                                        it->n_tokens, it->accel.ring.size());
                                                 checkpoint_aux_ok = false;
                                             }
 
                                             if (!checkpoint_aux_ok) {
                                                 do_reset = true;
                                             } else {
+                                                checkpoint_tgt_recurrent_installed =
+                                                    llama_model_is_hybrid(model_tgt);
+                                                checkpoint_dft_recurrent_installed =
+                                                    ctx_dft && model_dft &&
+                                                    llama_model_is_hybrid(model_dft.get()) &&
+                                                    !it->data_dft.empty();
+                                                checkpoint_installed_pos = it->pos_max;
+
                                                 // [WS-1 / #25592] The checkpoint that successfully
                                                 // restored this task is now part of this task's active
                                                 // lineage. Adopt it here, unconditionally, rather than
@@ -4632,11 +5504,17 @@ private:
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
+                                            SLT_ERR(slot, "%s", "cannot discard rolling window before full reprocess\n");
+                                        }
+                                        slot.dflash_window_identity.clear();
                                         // [obs] explain the cold reprocess: a checkpoint rejected for a
                                         // changed VBR representation [I9] is the common surprising cause
-                                        slot.cache_status = n_ckpt_rejected_vbr > 0
-                                            ? "full reprocess: checkpoint(s) rejected -- VBR representation changed [I9]"
-                                            : "full reprocess: no reusable context checkpoint";
+                                        slot.cache_status = vbr_preflight_rejected
+                                            ? "full reprocess: VBR frozen-footprint preflight rejected"
+                                            : n_ckpt_rejected_vbr > 0
+                                                ? "full reprocess: checkpoint(s) rejected -- VBR representation changed [I9]"
+                                                : "full reprocess: no reusable context checkpoint";
                                         pos_next = 0;
                                         n_past = 0;
                                         n_past_keep = 0;
@@ -4693,6 +5571,13 @@ private:
                                 // A VBR reset physically cleared state; do not let true-LCP token
                                 // retention claim the cleared prefix.
                                 n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                if (n_past == 0 &&
+                                    !llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
+                                    SLT_ERR(slot, "%s", "cannot discard rolling window for VBR full reprocess\n");
+                                }
+                                if (n_past == 0) {
+                                    slot.dflash_window_identity.clear();
+                                }
                             }
                         }
 
@@ -4726,7 +5611,13 @@ private:
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
-                            return;
+                            // A checkpoint restore's scoped VBR freeze must cover the paired
+                            // attention trim below. Delay only this lambda return until the trim;
+                            // unscoped/non-VBR behavior remains byte-for-byte on the old branch.
+                            if (!vbr_restore_freeze) {
+                                return;
+                            }
+                            return_after_vbr_restore_trim = true;
                         }
                     }
 
@@ -4742,9 +5633,34 @@ private:
                     // Checkpoint restores reset recurrent rollback depth. In particular,
                     // [TAG_PROMPT_LOGITS] can move p0 one token behind the restored
                     // frontier, making this bounded trim legitimately fallible.
-                    bool trim_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1);
+                    // A successful PARTIAL_ONLY hybrid restore has already installed the
+                    // recurrent row at checkpoint_installed_pos. When the suffix begins at
+                    // exactly the next position, trimming that row only to reinstall the same
+                    // checkpoint bytes is redundant. Keep the old whole-memory path for every
+                    // other case, especially [TAG_PROMPT_LOGITS]'s one-behind trim: recurrent
+                    // rollback depth is then a real validity check and must still fail closed.
+                    const bool trim_tgt_attn_only =
+                        checkpoint_tgt_recurrent_installed &&
+                        (int64_t) p0 == (int64_t) checkpoint_installed_pos + 1;
+                    const bool trim_dft_attn_only =
+                        checkpoint_dft_recurrent_installed &&
+                        (int64_t) p0 == (int64_t) checkpoint_installed_pos + 1;
+                    if (trim_tgt_attn_only || trim_dft_attn_only) {
+                        SLT_INF(slot,
+                                "CHECKPOINT_ATTN_ONLY_TRIM p0=%d target=%u draft=%u\n",
+                                p0,
+                                trim_tgt_attn_only ? 1u : 0u,
+                                trim_dft_attn_only ? 1u : 0u);
+                    }
+                    bool trim_ok = trim_tgt_attn_only
+                        ? llama_memory_seq_rm_attn(llama_get_memory(ctx_tgt), slot.id, p0, -1)
+                        : llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1);
                     if (trim_ok && ctx_dft) {
-                        trim_ok = llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, p0, -1);
+                        trim_ok = trim_dft_attn_only
+                            ? llama_memory_seq_rm_attn(
+                                llama_get_memory(ctx_dft.get()), slot.id, p0, -1)
+                            : llama_memory_seq_rm(
+                                llama_get_memory(ctx_dft.get()), slot.id, p0, -1);
                     }
 
                     if (!trim_ok) {
@@ -4753,6 +5669,10 @@ private:
                         // Full removal is infallible for memory implementations and retains
                         // common_context_seq_rm's asserting contract. Clear both target and
                         // draft so a failure on either side cannot leave them out of sync.
+                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
+                            SLT_ERR(slot, "%s", "cannot discard rolling window after trim rejection\n");
+                        }
+                        slot.dflash_window_identity.clear();
                         common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
                         if (ctx_dft) {
                             common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
@@ -4761,6 +5681,13 @@ private:
                         slot.prompt.tokens.keep_first(0);
                         slot.n_prompt_tokens_cache = 0;
                         slot.n_prompt_tokens_processed = 0;
+                    }
+
+                    // Retiering resumes only after the coordinated restore+trim transaction.
+                    // The outer exit arms a fresh controller pass at the next safe boundary.
+                    vbr_restore_freeze.reset();
+                    if (return_after_vbr_restore_trim) {
+                        return;
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -4842,7 +5769,18 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    llama_dflash_window_info live_window = {};
+                    const bool window_batch_limited =
+                        dflash_window_server_enabled() &&
+                        llama_dflash_window_get_info(
+                            ctx_tgt, slot.id, &live_window);
+                    const int32_t slot_batch_end = window_batch_limited
+                        ? std::min<int32_t>(
+                            n_batch,
+                            n_tokens_prev + LLAMA_DFLASH_MAX_VERIFY_TOKENS)
+                        : n_batch;
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           batch.size() < slot_batch_end) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4983,6 +5921,54 @@ private:
                         vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
                     }
 
+                    common_computation_frontier ckpt_frontier;
+                    if (do_checkpoint) {
+                        try {
+                            ckpt_frontier.version =
+                                common_computation_frontier::VERSION;
+                            ckpt_frontier.sequence_epoch =
+                                ensure_frontier_sequence_epoch(slot.prompt);
+                            ckpt_frontier.token_count = ckpt_n_tokens;
+                            ckpt_frontier.next_position =
+                                slot.prompt.tokens.pos_next(ckpt_n_tokens);
+                            ckpt_frontier.execution_identity =
+                                frontier_execution_identity;
+                            ckpt_frontier.adapter_config_identity =
+                                lora_config_identity(slot.lora);
+
+                            if (!slot.prompt.tokens.media_content_identity(
+                                    ckpt_n_tokens,
+                                    ckpt_frontier.media_content_identity)) {
+                                SLT_WRN(slot,
+                                        "FRONTIER_RECORD event=capture_reject "
+                                        "reason=unverifiable_media "
+                                        "n_tokens=%" PRId64 "\n",
+                                        ckpt_n_tokens);
+                                do_checkpoint = false;
+                            } else if (pos_max < 0 ||
+                                       ckpt_frontier.next_position <= 0 ||
+                                       ckpt_frontier.next_position - 1 != pos_max) {
+                                // Dual-write only records a frontier when the live
+                                // logical ledger and legacy physical end agree.
+                                SLT_WRN(slot,
+                                        "FRONTIER_RECORD event=capture_reject "
+                                        "reason=legacy_frontier_disagreement "
+                                        "n_tokens=%" PRId64
+                                        " next_position=%d pos_max=%d\n",
+                                        ckpt_n_tokens,
+                                        ckpt_frontier.next_position,
+                                        pos_max);
+                                do_checkpoint = false;
+                            }
+                        } catch (const std::exception & e) {
+                            SLT_WRN(slot,
+                                    "FRONTIER_RECORD event=capture_reject "
+                                    "reason=identity_failure error=%s\n",
+                                    e.what());
+                            do_checkpoint = false;
+                        }
+                    }
+
                     // [WS-1 / #25592] dedup: an equivalent checkpoint already exists (e.g. one just
                     // restored, or an unchanged frontier). Length + pos_max alone are NOT an
                     // identity: SWA may have a different pos_min, and VBR can change the paired
@@ -4995,7 +5981,10 @@ private:
                             last.pos_min                 == ckpt_pos_min &&
                             last.pos_max                 == pos_max &&
                             last.representation_epoch     == vbr_now.representation_epoch &&
-                            last.representation_epoch_swa == vbr_now.representation_epoch_swa) {
+                            last.representation_epoch_swa == vbr_now.representation_epoch_swa &&
+                            computation_frontiers_equal(
+                                last.computation_frontier,
+                                ckpt_frontier)) {
                             last.id_task = ckpt_id_task;
                             SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, VBR epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
                                     ckpt_n_tokens, ckpt_pos_min, pos_max,
@@ -5019,6 +6008,7 @@ private:
                             next.n_tokens = ckpt_n_tokens;
                             next.representation_epoch     = vbr_now.representation_epoch;
                             next.representation_epoch_swa = vbr_now.representation_epoch_swa;
+                            next.computation_frontier = ckpt_frontier;
 
                             const size_t checkpoint_size =
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5043,9 +6033,9 @@ private:
                             if (!staged.empty() && slot.can_speculate()) {
                                 const size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
                                 if (ring_size > 0) {
-                                    next.ring_data.resize(ring_size);
+                                    next.accel.ring.resize(ring_size);
                                     common_speculative_ring_state_save(
-                                        slot.get_spec(), next.ring_data.data(), ring_size);
+                                        slot.get_spec(), next.accel.ring.data(), ring_size);
                                 }
                             }
                         } catch (const std::exception & e) {
@@ -5118,6 +6108,16 @@ private:
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
+        }
+        if (dflash_window_server_enabled()) {
+            const bool window_speculative = std::any_of(
+                slots.begin(), slots.end(),
+                [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_GENERATING &&
+                           !slot.spec_draft.empty();
+                });
+            llama_dflash_window_set_speculative(
+                ctx_tgt, window_speculative);
         }
 
         // allow multi-seq batching when the batch is pure TG (no prompt tokens).
@@ -5219,6 +6219,59 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        if (dflash_window_server_enabled()) {
+            const bool speculative_window_batch = std::any_of(
+                slots.begin(), slots.end(),
+                [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_GENERATING &&
+                           !slot.spec_draft.empty();
+                });
+            if (!speculative_window_batch &&
+                llama_dflash_window_capture_pending(ctx_tgt)) {
+                const bool retried =
+                    llama_dflash_window_retry_capture(ctx_tgt);
+                if (!retried ||
+                    llama_dflash_window_capture_pending(ctx_tgt)) {
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SLT_ERR(slot, "%s",
+                                    "rolling-window publication remained pending; resetting slot\n");
+                            send_error(
+                                slot,
+                                "Compute error publishing rolling DFlash tape",
+                                ERROR_TYPE_SERVER);
+                            slot.release();
+                            slot.prompt_clear();
+                        }
+                    }
+                    throw std::runtime_error(
+                        "rolling DFlash tape publication failed");
+                }
+            }
+
+            // The first prefill chunk establishes the boundary; subsequent
+            // chunks are then captured into the rolling ring. Waiting until
+            // DONE_PROMPT would make the entire first request older than the
+            // window and render a two-request edit gate vacuous.
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    llama_dflash_window_info info = {};
+                    if (!llama_dflash_window_get_info(
+                            ctx_tgt, slot.id, &info) &&
+                        !dflash_window_enable_slot(slot)) {
+                        send_error(
+                            slot,
+                            "Failed to establish rolling DFlash tape boundary",
+                            ERROR_TYPE_SERVER);
+                        slot.release();
+                        slot.prompt_clear();
+                        throw std::runtime_error(
+                            "rolling DFlash tape boundary creation failed");
+                    }
+                }
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -5307,6 +6360,18 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (dflash_window_server_enabled() &&
+                    !dflash_window_enable_slot(slot)) {
+                    send_error(
+                        slot,
+                        "Failed to establish rolling DFlash tape boundary",
+                        ERROR_TYPE_SERVER);
+                    slot.release();
+                    slot.prompt_clear();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
@@ -5501,6 +6566,27 @@ private:
             // the accepted tokens from the speculation
             const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
 
+            if (dflash_window_server_enabled() &&
+                !llama_dflash_window_commit(
+                    ctx_tgt, slot.id, (int) ids.size())) {
+                // The verification payload is still staged and the next decode
+                // is intentionally blocked. Clearing the sole server slot
+                // discards that undecided transaction and both live timelines.
+                SLT_ERR(slot,
+                        "failed to commit %zu accepted rolling-window record(s); "
+                        "resetting slot\n",
+                        ids.size());
+                send_error(
+                    slot,
+                    "Compute error committing rolling DFlash tape",
+                    ERROR_TYPE_SERVER);
+                slot.release();
+                slot.prompt_clear();
+                slot.has_draft_backup = false;
+                slot.seq_id_backup = -1;
+                continue;
+            }
+
             // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
             // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
             // slot.spec_draft so batch_tokens reflects the full verification batch [id_last, drafts].
@@ -5524,6 +6610,22 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+
+            // Verification evaluates [sampled, draft...]. The sampled row is
+            // always retained; rollback depth is exactly the rejected draft
+            // suffix. Preserve the joint distribution because marginal
+            // acceptance rates cannot recover capture cost by verify length.
+            const size_t n_accepted_draft = ids.size() - 1;
+            GGML_ASSERT(n_accepted_draft <= n_draft);
+            const size_t rollback_depth = n_draft - n_accepted_draft;
+            if (slot.n_verify_rollback.size() <= n_draft) {
+                slot.n_verify_rollback.resize(n_draft + 1);
+            }
+            auto & rollback_counts = slot.n_verify_rollback[n_draft];
+            if (rollback_counts.size() <= rollback_depth) {
+                rollback_counts.resize(rollback_depth + 1, 0);
+            }
+            rollback_counts[rollback_depth]++;
 
             // per-position acceptance histogram (/metrics)
             if (slot.n_accepted_per_pos.empty()) {
@@ -5552,12 +6654,23 @@ private:
                     llama_clear_tree_parent_ids(ctx_tgt);
                 }
 
+                bool restored_by_tape = false;
                 if (is_dflash && !all_accepted && dflash_tape_ok) {
                     // lossless GPU tape replay of the accepted tokens' GDN state updates
-                    llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
-                } else {
+                    restored_by_tape = llama_dflash_rollback(
+                        ctx_tgt, slot.id, seq_backup,
+                        slot.n_tokens_before_draft, (int) ids.size());
+                    if (!restored_by_tape) {
+                        SLT_WRN(
+                            slot, "%s\n",
+                            "exact tape replay launch failed; restoring backup and re-decoding accepted tokens");
+                    }
+                }
+                if (!restored_by_tape) {
                     // no tape recorded (see dflash_tape_active) or non-DFlash drafter:
-                    // restore from backup and re-decode the accepted tokens (exact, replay-free)
+                    // restore from backup and re-decode the accepted tokens (exact,
+                    // replay-free). dflash_rollback deliberately retains the backup
+                    // when its exact replay launch fails.
                     auto * mem = llama_get_memory(ctx_tgt);
 
                     if (all_accepted) {
@@ -6037,8 +7150,11 @@ private:
         // after the first decode) keeps recording active across all sub-batches,
         // which matters when multiple slots share one pass and the combined
         // verify batch spans more than one ubatch.
-        if (dflash_tape_active) {
+        if (dflash_tape_active && !dflash_window_server_enabled()) {
             llama_set_tape_recording(ctx_tgt, false);
+        }
+        if (dflash_window_server_enabled()) {
+            llama_dflash_window_set_speculative(ctx_tgt, false);
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)
