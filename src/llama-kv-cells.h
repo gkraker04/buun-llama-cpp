@@ -359,6 +359,23 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // Exact cardinality from the canonical ownership index. Revision-9 A1 uses this instead of
+    // trusting the covered mask's subset count. It allocates nothing and never scans empty
+    // physical cells; A2 supplies the child visibility/serializer-manifest filter.
+    uint32_t seq_pos_count_before(llama_seq_id seq_id, llama_pos frontier) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        uint32_t count = 0;
+        for (auto it = seq_pos[seq_id].begin(); it != seq_pos[seq_id].end() && it->first < frontier; ++it) {
+            assert(it->second > 0);
+            count += static_cast<uint32_t>(it->second);
+        }
+        return count;
+    }
+
+    const std::set<uint32_t> & used_indices() const { return used; }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

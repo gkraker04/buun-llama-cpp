@@ -1,6 +1,7 @@
 #include "common.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-vbr-generation-oracle.h"
 #include "llama.h"
 
 #include <cstdio>
@@ -14,6 +15,42 @@
 struct llama_kv_cache_vbr_epoch_test {
     static bool active(const llama_kv_cache * kv) {
         return kv->vbr_vmm_active() && kv->vbr_budget_bytes_ > 0;
+    }
+
+    static bool generation_seeded(const llama_kv_cache * kv) {
+        const auto * tracker = kv->vbr_generation_tracker_get();
+        if (tracker == nullptr || !tracker->active() || !tracker->stable()) {
+            return false;
+        }
+        for (uint32_t stream = 0; stream < tracker->stream_count(); ++stream) {
+            for (uint32_t cell = 0; cell < tracker->cell_count(); ++cell) {
+                if (tracker->dependency_generation(stream, cell) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool generation_units_match(const llama_kv_cache * kv) {
+        const auto * tracker = kv->vbr_generation_tracker_get();
+        if (tracker == nullptr || !tracker->stable() ||
+                tracker->unit_count() != kv->layers.size() * 2) {
+            return false;
+        }
+        for (size_t ikv = 0; ikv < kv->layers.size(); ++ikv) {
+            for (uint32_t side = 0; side < 2; ++side) {
+                const auto * tensor = side != 0 ? kv->layers[ikv].v : kv->layers[ikv].k;
+                const auto unit =
+                        tracker->unit_generation(static_cast<uint32_t>(ikv * 2 + side));
+                const int32_t live_type =
+                        tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
+                if (unit.current_type != live_type) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     static bool has_mapped_degradable_unit(const llama_kv_cache * kv) {
@@ -145,9 +182,333 @@ static void unset_test_env(const char * name) {
 #endif
 }
 
+struct a1_membership_fixture {
+    std::vector<uint8_t> present;
+};
+
+static bool a1_cell_has_seq(const void * context, uint32_t, uint32_t cell, llama_seq_id seq_id) {
+    const auto * fixture = static_cast<const a1_membership_fixture *>(context);
+    return seq_id == 0 && cell < fixture->present.size() && fixture->present[cell] != 0;
+}
+
+static vbr_checkpoint_generation_record a1_make_record(
+        const vbr_generation_tracker & tracker,
+        const vbr_checkpoint_generation_stream & stream) {
+    vbr_checkpoint_generation_controller controller;
+    vbr_checkpoint_generation_record record;
+    if (!vbr_generation_capture_controller(
+                tracker, 0, checkpoint_child_dependency_mode::live_guarded, {stream}, controller)) {
+        return record;
+    }
+    record.status = vbr_checkpoint_generation_status::complete;
+    record.controllers.push_back(std::move(controller));
+    return record;
+}
+
+static vbr_generation_live_view a1_make_live(
+        const vbr_generation_tracker & tracker,
+        const a1_membership_fixture & membership,
+        uint32_t exact_count,
+        llama_pos computation_frontier = 400) {
+    vbr_generation_live_stream_view stream;
+    stream.stream_index           = 0;
+    stream.dependency_seq_id      = 0;
+    stream.computation_frontier   = computation_frontier;
+    stream.exact_dependency_count = exact_count;
+    stream.membership_context     = &membership;
+    stream.cell_has_seq           = a1_cell_has_seq;
+
+    vbr_generation_live_controller_view controller;
+    controller.child_id        = 0;
+    controller.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+    controller.tracker         = &tracker;
+    controller.streams.push_back(stream);
+
+    vbr_generation_live_view live;
+    live.legacy_eligible = true;
+    live.controllers.push_back(std::move(controller));
+    return live;
+}
+
+static bool run_a1_cpu_tests() {
+    llama_kv_cells ownership_index;
+    ownership_index.resize(4);
+    ownership_index.pos_set(0, 5);
+    ownership_index.seq_add(0, 0);
+    ownership_index.pos_set(1, 15);
+    ownership_index.seq_add(1, 0);
+    if (ownership_index.seq_pos_count_before(0, 10) != 1 ||
+            ownership_index.seq_pos_count_before(0, 20) != 2) {
+        fprintf(stderr, "A1 canonical ownership index returned an inexact cardinality\n");
+        return false;
+    }
+
+    vbr_generation_tracker tracker(1, 768, 1);
+    if (!tracker.active() || !tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full)) {
+        fprintf(stderr, "A1 tracker did not initialize\n");
+        return false;
+    }
+    vbr_generation_tracker distinct_tracker(1, 768, 1);
+    if (distinct_tracker.pool_identity() == tracker.pool_identity()) {
+        fprintf(stderr, "A1 process-local pool UUID was reused\n");
+        return false;
+    }
+    auto foreign_event = distinct_tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency);
+    if (!foreign_event || tracker.stamp_cell(foreign_event, 10, 0) || !foreign_event.finish()) {
+        fprintf(stderr, "A1 tracker accepted an event owned by another controller\n");
+        return false;
+    }
+
+    auto append = tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency);
+    if (!append || !tracker.stamp_cell(append, 10, 0) ||
+            !tracker.stamp_cell(append, 300, 0) || !append.finish()) {
+        fprintf(stderr, "A1 dependency event did not publish atomically\n");
+        return false;
+    }
+    const uint32_t dependency_before = tracker.dependency_generation(0, 10);
+
+    auto share = tracker.begin_event(
+            vbr_mutation_registrant::seq_cp,
+            vbr_operation_class::prompt_share,
+            0,
+            vbr_generation_stamp_kind::membership);
+    if (!share || !tracker.stamp_cell(share, 10, 1) ||
+            tracker.dependency_generation(0, 10) != dependency_before ||
+            tracker.membership_generation(0, 10) == 0 || !share.finish()) {
+        fprintf(stderr, "A1 dependency/membership stamp split failed\n");
+        return false;
+    }
+
+    vbr_checkpoint_generation_stream stream;
+    if (!vbr_generation_capture_stream(tracker, 0, 0, 400, {10, 300}, stream) ||
+            stream.captured_dependency_count != 2 || stream.pages.size() != 2) {
+        fprintf(stderr, "A1 canonical covered-mask capture failed\n");
+        return false;
+    }
+
+    a1_membership_fixture membership;
+    membership.present.resize(768);
+    membership.present[10]  = 1;
+    membership.present[300] = 1;
+    auto record = a1_make_record(tracker, stream);
+    auto live   = a1_make_live(tracker, membership, 2);
+    auto result = checkpoint_vbr_eligibility(record, live);
+    if (!result.strict || result.reason != vbr_checkpoint_eligibility_reason::none) {
+        fprintf(stderr, "A1 strict evaluator rejected an exact record\n");
+        return false;
+    }
+
+    auto foreign_share = tracker.begin_event(
+            vbr_mutation_registrant::seq_cp,
+            vbr_operation_class::prompt_share,
+            0,
+            vbr_generation_stamp_kind::membership);
+    if (!foreign_share || !tracker.stamp_cell(foreign_share, 10, 2)) {
+        fprintf(stderr, "A1 membership-only refinement stamp failed\n");
+        return false;
+    }
+    if (checkpoint_vbr_eligibility(record, live).reason !=
+            vbr_checkpoint_eligibility_reason::controller_unstable) {
+        fprintf(stderr, "A1 evaluator observed an in-flight ownership event\n");
+        return false;
+    }
+    vbr_checkpoint_generation_controller unstable_capture;
+    if (vbr_generation_capture_controller(
+                tracker, 0, checkpoint_child_dependency_mode::live_guarded, {stream}, unstable_capture)) {
+        fprintf(stderr, "A1 capture observed an in-flight ownership event\n");
+        return false;
+    }
+    if (!foreign_share.finish() || !checkpoint_vbr_eligibility(record, live).strict) {
+        fprintf(stderr, "A1 membership-only refinement falsely rejected\n");
+        return false;
+    }
+
+    auto unrelated = tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency);
+    if (!unrelated || !tracker.stamp_cell(unrelated, 20, 1) ||
+            !tracker.stamp_cell(unrelated, 256, 1) ||
+            !tracker.stamp_cell(unrelated, 600, 1) || !unrelated.finish() ||
+            !checkpoint_vbr_eligibility(record, live).strict) {
+        fprintf(stderr, "A1 same-page/boundary/different-page append refinement rejected\n");
+        return false;
+    }
+
+    // NEW-1: the covered cells remain valid, but a newly-live dependency expands the exact set.
+    membership.present[20] = 1;
+    live.controllers[0].streams[0].exact_dependency_count = 3;
+    result = checkpoint_vbr_eligibility(record, live);
+    if (result.reason != vbr_checkpoint_eligibility_reason::dependency_cardinality) {
+        fprintf(stderr, "A1 NEW-1 dependency-set expansion was accepted\n");
+        return false;
+    }
+    membership.present[20] = 0;
+    live.controllers[0].streams[0].exact_dependency_count = 2;
+
+    membership.present[10] = 0;
+    live.controllers[0].streams[0].exact_dependency_count = 1;
+    result = checkpoint_vbr_eligibility(record, live);
+    if (result.reason != vbr_checkpoint_eligibility_reason::dependency_membership_lost) {
+        fprintf(stderr, "A1 dependency membership loss was not identified\n");
+        return false;
+    }
+    membership.present[10] = 1;
+    live.controllers[0].streams[0].exact_dependency_count = 2;
+
+    auto rewrite = tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency,
+            true);
+    if (!rewrite || !tracker.stamp_cell(rewrite, 10, 0) || !rewrite.finish()) {
+        fprintf(stderr, "A1 destructive dependency event did not publish atomically\n");
+        return false;
+    }
+    result = checkpoint_vbr_eligibility(record, live);
+    if (result.reason != vbr_checkpoint_eligibility_reason::dependency_changed ||
+            tracker.page_destructive_generation(0, 0) == 0) {
+        fprintf(stderr, "A1 destructive refinement was not rejected\n");
+        return false;
+    }
+    if (!tracker.global_transition(vbr_mutation_registrant::clear, vbr_operation_class::state_api) ||
+            checkpoint_vbr_eligibility(record, live).reason !=
+                    vbr_checkpoint_eligibility_reason::global_generation) {
+        fprintf(stderr, "A1 controller-global invalidation did not dominate stale page evidence\n");
+        return false;
+    }
+
+    // Durable transition provenance, not a debug-ring entry, is the only live_rebased proof.
+    vbr_generation_tracker rebased_tracker(1, 512, 1);
+    rebased_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+    auto rebased_append = rebased_tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency);
+    rebased_tracker.stamp_cell(rebased_append, 10, 0);
+    if (!rebased_append.finish()) {
+        fprintf(stderr, "A1 rebased fixture event did not publish atomically\n");
+        return false;
+    }
+    vbr_checkpoint_generation_stream rebased_stream;
+    vbr_generation_capture_stream(rebased_tracker, 0, 0, 20, {10}, rebased_stream);
+    auto rebased_record = a1_make_record(rebased_tracker, rebased_stream);
+    if (!rebased_tracker.publish_unit(
+                0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
+                vbr_repr_transition::degrade_f16_to_t8_admitted)) {
+        fprintf(stderr, "A1 durable transition publish failed\n");
+        return false;
+    }
+    a1_membership_fixture rebased_membership;
+    rebased_membership.present.resize(512);
+    rebased_membership.present[10] = 1;
+    auto rebased_live = a1_make_live(rebased_tracker, rebased_membership, 1, 20);
+    result = checkpoint_vbr_eligibility(rebased_record, rebased_live);
+    if (!result.live_rebased_shadow || result.strict) {
+        fprintf(stderr, "A1 admitted transition provenance was not shadow-classified\n");
+        return false;
+    }
+
+    vbr_generation_tracker unproven_tracker(1, 512, 1);
+    unproven_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+    auto unproven_append = unproven_tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency);
+    unproven_tracker.stamp_cell(unproven_append, 10, 0);
+    if (!unproven_append.finish()) {
+        fprintf(stderr, "A1 unproven fixture event did not publish atomically\n");
+        return false;
+    }
+    vbr_checkpoint_generation_stream unproven_stream;
+    vbr_generation_capture_stream(unproven_tracker, 0, 0, 20, {10}, unproven_stream);
+    auto unproven_record = a1_make_record(unproven_tracker, unproven_stream);
+    unproven_tracker.publish_unit(
+            0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
+            vbr_repr_transition::degrade_other);
+    auto unproven_live = a1_make_live(unproven_tracker, rebased_membership, 1, 20);
+    result = checkpoint_vbr_eligibility(unproven_record, unproven_live);
+    if (result.reason != vbr_checkpoint_eligibility_reason::live_rebased_transition) {
+        fprintf(stderr, "A1 accepted T8 without durable admitted-transition provenance\n");
+        return false;
+    }
+
+    auto malformed = rebased_record;
+    malformed.controllers[0].streams[0].pages.push_back(
+            malformed.controllers[0].streams[0].pages.front());
+    result = checkpoint_vbr_eligibility(malformed, rebased_live);
+    if (result.reason != vbr_checkpoint_eligibility_reason::malformed_page_refs) {
+        fprintf(stderr, "A1 duplicate/noncanonical page refs were accepted\n");
+        return false;
+    }
+
+    uint8_t bytes_a[] = {1, 2, 3};
+    uint8_t bytes_b[] = {4, 5};
+    std::vector<vbr_generation_oracle_cell> canonical = {
+        {10,  10,  true,  true, false, bytes_a, sizeof(bytes_a)},
+        {20,  20,  false, true, false, bytes_a, sizeof(bytes_a)},
+        {300, 300, true,  true, false, bytes_b, sizeof(bytes_b)},
+    };
+    unset_test_env("VBR_GENERATION_ORACLE");
+    const auto disabled_baseline = vbr_generation_oracle_capture(400, canonical);
+    const auto disabled = vbr_generation_oracle_audit(400, canonical, disabled_baseline, stream);
+    if (disabled.enabled) {
+        fprintf(stderr, "A1 byte oracle was not default-disabled\n");
+        return false;
+    }
+
+    set_test_env("VBR_GENERATION_ORACLE", "1");
+    const auto baseline = vbr_generation_oracle_capture(400, canonical);
+    auto audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
+    if (!audit.enabled || !audit.complete || !audit.set_equal || !audit.bytes_equal) {
+        fprintf(stderr, "A1 independent byte oracle rejected its exact baseline\n");
+        return false;
+    }
+    bytes_a[0] = 9;
+    audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
+    if (!audit.set_equal || audit.bytes_equal) {
+        fprintf(stderr, "A1 byte oracle missed a covered-byte mutation\n");
+        return false;
+    }
+    bytes_a[0] = 1;
+    auto undercovered = stream;
+    undercovered.pages.erase(undercovered.pages.begin());
+    audit = vbr_generation_oracle_audit(400, canonical, baseline, undercovered);
+    if (audit.set_equal) {
+        fprintf(stderr, "A1 independent oracle repeated production mask under-coverage\n");
+        return false;
+    }
+    auto incomplete = canonical;
+    incomplete[0].bytes = nullptr;
+    audit = vbr_generation_oracle_audit(400, incomplete, baseline, stream);
+    if (audit.complete || audit.bytes_equal) {
+        fprintf(stderr, "A1 byte oracle accepted an incomplete canonical observation\n");
+        return false;
+    }
+    unset_test_env("VBR_GENERATION_ORACLE");
+
+    fprintf(stderr, "A1 generation/evaluator/oracle CPU coverage PASS\n");
+    return true;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--a1-cpu") {
+        return run_a1_cpu_tests() ? 0 : 1;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL | --a1-cpu\n", argv[0]);
         return 1;
     }
 
@@ -181,6 +542,10 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "A0 registry reused an operation ID\n");
             return 1;
         }
+    }
+
+    if (!run_a1_cpu_tests()) {
+        return 1;
     }
 
     ggml_backend_load_all();
@@ -294,6 +659,11 @@ int main(int argc, char ** argv) {
     }
     if (!epochs_equal(seeded, initial)) {
         fprintf(stderr, "PRECONDITION failed: seed decode changed a representation epoch\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::generation_seeded(base) ||
+            !llama_kv_cache_vbr_epoch_test::generation_seeded(swa)) {
+        fprintf(stderr, "A1 dual-write did not stamp both armed iSWA children\n");
         return 1;
     }
     if (!llama_kv_cache_vbr_epoch_test::has_mapped_degradable_unit(base)) {
@@ -460,6 +830,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "base degrade unexpectedly changed the SWA epoch\n");
         return 1;
     }
+    if (!llama_kv_cache_vbr_epoch_test::generation_units_match(base)) {
+        fprintf(stderr, "A1 base unit tuple did not publish the degraded live types\n");
+        return 1;
+    }
 
     if (!llama_kv_cache_vbr_epoch_test::force_degrade(swa)) {
         fprintf(stderr, "failed to force SWA degrade\n");
@@ -474,6 +848,10 @@ int main(int argc, char ** argv) {
     if (both_degraded.representation_epoch_swa <=
         base_degraded.representation_epoch_swa) {
         fprintf(stderr, "SWA degrade did not advance the SWA epoch\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::generation_units_match(swa)) {
+        fprintf(stderr, "A1 SWA unit tuple did not publish the degraded live types\n");
         return 1;
     }
 
@@ -506,6 +884,11 @@ int main(int argc, char ** argv) {
     if (reset.representation_epoch_swa <=
         cleared.representation_epoch_swa) {
         fprintf(stderr, "full reset did not advance the SWA representation epoch\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::generation_units_match(base) ||
+            !llama_kv_cache_vbr_epoch_test::generation_units_match(swa)) {
+        fprintf(stderr, "A1 full reset did not republish both children at their live types\n");
         return 1;
     }
     if (!llama_kv_cache_vbr_epoch_test::map_seed_watermark(base)) {

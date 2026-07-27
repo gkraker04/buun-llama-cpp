@@ -271,6 +271,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-operation-registry.cmake
 )
 
+add_test(
+    NAME test-vbr-generation-isolation-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-generation-isolation.cmake
+)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

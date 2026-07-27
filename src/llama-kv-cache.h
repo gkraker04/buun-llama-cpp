@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-vbr-generation.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
@@ -189,6 +190,20 @@ public:
         return other ? other->vbr_representation_epoch() : vbr_representation_epoch_;
     }
 
+    // Revision-9 A1 adapters over the cache's canonical dependency index. These are
+    // read-only shadow helpers: A2 will compose child controllers and route selectors
+    // through checkpoint_vbr_eligibility(), but A1 changes no read authority.
+    bool vbr_generation_capture_live_guarded(
+            uint32_t child_id,
+            llama_seq_id seq_id,
+            llama_pos computation_frontier,
+            vbr_checkpoint_generation_controller & output) const;
+    bool vbr_generation_live_guarded_view(
+            uint32_t child_id,
+            llama_seq_id seq_id,
+            llama_pos computation_frontier,
+            vbr_generation_live_controller_view & output) const;
+
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
@@ -280,7 +295,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(
+            const slot_info & sinfo, const llama_ubatch & ubatch, bool generation_commit = true);
 
     //
     // input API
@@ -404,6 +420,10 @@ private:
     // Bumped once per representation-changing operation (degrade, promote, occupied-cell reuse,
     // clear/full-reset, native state import). Never derive this from or reset it with the cursor.
     uint64_t vbr_representation_epoch_ = 0;
+    // Revision-9 A1 shadow generations. Allocated only for a construction-final armed VBR
+    // controller; aliases delegate to their canonical owner and inert caches allocate nothing.
+    // No current checkpoint read consults this store until the A2 four-way ratchet lands.
+    std::unique_ptr<vbr_generation_tracker> vbr_generation_;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
@@ -571,6 +591,18 @@ private:
     bool   vbr_stash_dirty_   = false;
     void     vbr_full_reset();                        // cache empty: undo every degrade (lossless)
     void     vbr_representation_changed();             // monotone checkpoint change detector
+    vbr_generation_tracker *       vbr_generation_tracker_mut();
+    const vbr_generation_tracker * vbr_generation_tracker_get() const;
+    static bool vbr_generation_cell_has_seq_cb(
+            const void * context, uint32_t stream, uint32_t cell, llama_seq_id seq_id);
+    vbr_generation_event vbr_generation_begin(
+            vbr_mutation_registrant registrant,
+            vbr_operation_class operation_class,
+            uint32_t stream,
+            vbr_generation_stamp_kind stamp_kind,
+            bool destructive = false,
+            bool imported = false);
+    void vbr_generation_global(vbr_mutation_registrant registrant, vbr_operation_class operation_class);
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();

@@ -1,0 +1,759 @@
+#include "llama-vbr-generation.h"
+
+#include "ggml.h"
+#include "llama-cparams.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <limits>
+
+namespace {
+
+static_assert(LLAMA_MAX_SEQ <= std::numeric_limits<int16_t>::max(),
+              "A1 packed membership provenance must widen with LLAMA_MAX_SEQ");
+
+std::atomic<uint64_t> g_vbr_pool_uuid_counter{ 1 };
+std::atomic<bool>     g_vbr_pool_uuid_exhausted{ false };
+
+enum class generation_dispatch_effect : uint8_t {
+    dependency,
+    membership,
+    global,
+    unit,
+    delegated_transaction,
+};
+
+// VBR_GENERATION_MUTATION_DISPATCH_EXHAUSTIVE
+constexpr std::array<generation_dispatch_effect,
+                     static_cast<size_t>(vbr_mutation_registrant::count)>
+    VBR_GENERATION_DISPATCH = {
+        {
+         generation_dispatch_effect::dependency,             // apply_ubatch_append
+            generation_dispatch_effect::dependency,             // apply_ubatch_occupied_reuse
+            generation_dispatch_effect::membership,             // seq_rm
+            generation_dispatch_effect::membership,             // seq_cp
+            generation_dispatch_effect::membership,             // seq_keep
+            generation_dispatch_effect::dependency,             // seq_add
+            generation_dispatch_effect::dependency,             // seq_div
+            generation_dispatch_effect::delegated_transaction,  // state_read_meta
+            generation_dispatch_effect::delegated_transaction,  // state_read_data
+            generation_dispatch_effect::global,                 // state_read_install
+            generation_dispatch_effect::delegated_transaction,  // state_read_cleanup
+            generation_dispatch_effect::global,                 // whole_import
+            generation_dispatch_effect::global,                 // explicit_restore_adopt
+            generation_dispatch_effect::global,                 // clear
+            generation_dispatch_effect::global,                 // full_reset
+            generation_dispatch_effect::unit,                   // degrade_next
+            generation_dispatch_effect::unit,                   // promote_next
+            generation_dispatch_effect::delegated_transaction,  // execute_shed -> degrade_next
+            generation_dispatch_effect::global,                 // authenticated_recovery
+        }
+};
+static_assert(VBR_GENERATION_DISPATCH.size() == static_cast<size_t>(vbr_mutation_registrant::count),
+              "every closed A0 mutation registrant must have an A1 generation effect");
+
+uint16_t pack_provenance(vbr_mutation_family family, vbr_operation_class operation_class) {
+    return uint16_t(static_cast<uint8_t>(family)) | uint16_t(uint16_t(static_cast<uint8_t>(operation_class)) << 8);
+}
+
+const vbr_mutation_registration * registration_for(vbr_mutation_registrant registrant) {
+    const size_t index = static_cast<size_t>(registrant);
+    if (index >= VBR_MUTATION_REGISTRY.size()) {
+        return nullptr;
+    }
+    const auto & registration = VBR_MUTATION_REGISTRY[index];
+    return registration.registrant == registrant ? &registration : nullptr;
+}
+
+bool class_allowed(const vbr_mutation_registration & registration, vbr_operation_class operation_class) {
+    const size_t index = static_cast<size_t>(operation_class);
+    return index < static_cast<size_t>(vbr_operation_class::count) &&
+           (registration.allowed_classes & (uint16_t(1u) << index)) != 0;
+}
+
+uint32_t page_count(uint32_t cells) {
+    return (cells + VBR_GENERATION_PAGE_CELLS - 1) / VBR_GENERATION_PAGE_CELLS;
+}
+
+vbr_pool_uuid allocate_pool_uuid() {
+    if (g_vbr_pool_uuid_exhausted.load(std::memory_order_acquire)) {
+        return {};
+    }
+    uint64_t expected = g_vbr_pool_uuid_counter.load(std::memory_order_relaxed);
+    for (;;) {
+        if (expected == 0) {
+            g_vbr_pool_uuid_exhausted.store(true, std::memory_order_release);
+            return {};
+        }
+        const uint64_t next = expected == std::numeric_limits<uint64_t>::max() ? 0 : expected + 1;
+        if (g_vbr_pool_uuid_counter.compare_exchange_weak(expected, next, std::memory_order_acq_rel,
+                                                          std::memory_order_relaxed)) {
+            if (next == 0) {
+                g_vbr_pool_uuid_exhausted.store(true, std::memory_order_release);
+            }
+            return { UINT64_C(0x56425247454e4131), expected };
+        }
+    }
+}
+
+bool mask_test(const std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask, uint32_t offset) {
+    return (mask[offset / 64] & (uint64_t(1) << (offset % 64))) != 0;
+}
+
+void mask_set(std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask, uint32_t offset) {
+    mask[offset / 64] |= uint64_t(1) << (offset % 64);
+}
+
+uint32_t mask_popcount(const std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask) {
+    uint32_t result = 0;
+    for (uint64_t word : mask) {
+#if defined(__GNUC__) || defined(__clang__)
+        result += static_cast<uint32_t>(__builtin_popcountll(word));
+#else
+        while (word != 0) {
+            word &= word - 1;
+            ++result;
+        }
+#endif
+    }
+    return result;
+}
+
+bool unit_equal(const vbr_checkpoint_unit_generation & captured, const vbr_unit_generation & current) {
+    return captured.repr_gen == current.repr_gen && captured.current_type == current.current_type &&
+           captured.last_source_type == current.last_source_type && captured.domain == current.domain &&
+           captured.promote_hops == current.promote_hops && captured.last_transition == current.last_transition;
+}
+
+bool unit_live_rebased_shape(const vbr_checkpoint_unit_generation & captured, const vbr_unit_generation & current) {
+    return captured.current_type == GGML_TYPE_F16 && captured.domain == vbr_repr_domain::full &&
+           current.current_type == GGML_TYPE_TURBO8_0 && current.domain == vbr_repr_domain::full &&
+           captured.repr_gen != std::numeric_limits<uint64_t>::max() && current.repr_gen == captured.repr_gen + 1 &&
+           current.last_source_type == GGML_TYPE_F16 && current.promote_hops == captured.promote_hops;
+}
+
+bool unit_live_rebased(const vbr_checkpoint_unit_generation & captured, const vbr_unit_generation & current) {
+    return unit_live_rebased_shape(captured, current) &&
+           current.last_transition == vbr_repr_transition::degrade_f16_to_t8_admitted;
+}
+
+vbr_checkpoint_eligibility reject(
+    bool                                legacy,
+    vbr_checkpoint_eligibility_reason   reason,
+    vbr_checkpoint_eligibility_category category = vbr_checkpoint_eligibility_category::strict_reject) {
+    vbr_checkpoint_eligibility result;
+    result.legacy   = legacy;
+    result.category = category;
+    result.reason   = reason;
+    return result;
+}
+
+}  // namespace
+
+vbr_generation_event::~vbr_generation_event() {
+    if (owner_ != nullptr && !finish()) {
+        std::abort();
+    }
+}
+
+vbr_generation_event::vbr_generation_event(vbr_generation_event && other) noexcept :
+    serial(other.serial),
+    stream(other.stream),
+    stamp_kind(other.stamp_kind),
+    family(other.family),
+    operation_class(other.operation_class),
+    destructive(other.destructive),
+    imported(other.imported),
+    owner_(other.owner_) {
+    other.serial = 0;
+    other.owner_ = nullptr;
+}
+
+bool vbr_generation_event::finish() {
+    if (owner_ == nullptr) {
+        return false;
+    }
+    if (!owner_->finish_event(serial)) {
+        return false;
+    }
+    owner_ = nullptr;
+    serial = 0;
+    return true;
+}
+
+struct vbr_generation_tracker::stream_state {
+    std::vector<uint32_t> page_event_gen;
+    std::vector<uint32_t> page_last_destructive_gen;
+    std::vector<uint32_t> page_last_import_gen;
+    std::vector<uint64_t> page_event_serial;
+
+    std::vector<uint32_t> cell_last_dependency_gen;
+    std::vector<uint32_t> cell_last_membership_gen;
+    std::vector<uint16_t> cell_dependency_provenance;
+    std::vector<uint16_t> cell_membership_provenance;
+    std::vector<int16_t>  cell_last_membership_seq;
+};
+
+vbr_generation_tracker::~vbr_generation_tracker() {
+    if (active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0) {
+        std::abort();
+    }
+}
+
+vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cells, uint32_t n_units) :
+    n_cells_(n_cells),
+    streams_(n_stream),
+    units_(n_units) {
+    const uint32_t n_pages = page_count(n_cells);
+    for (auto & stream : streams_) {
+        stream.page_event_gen.resize(n_pages);
+        stream.page_last_destructive_gen.resize(n_pages);
+        stream.page_last_import_gen.resize(n_pages);
+        stream.page_event_serial.resize(n_pages);
+        stream.cell_last_dependency_gen.resize(n_cells);
+        stream.cell_last_membership_gen.resize(n_cells);
+        stream.cell_dependency_provenance.resize(n_cells);
+        stream.cell_membership_provenance.resize(n_cells);
+        stream.cell_last_membership_seq.resize(n_cells, -1);
+    }
+
+    // A process-local construction identity, not a security nonce. A fixed nonzero domain tag
+    // prevents the all-zero sentinel; exhaustion latches instead of wrapping into an ABA.
+    pool_uuid_ = allocate_pool_uuid();
+}
+
+bool vbr_generation_tracker::active() const {
+    return pool_uuid_.hi != 0 && pool_uuid_.lo != 0 && !streams_.empty() && n_cells_ != 0;
+}
+
+uint32_t vbr_generation_tracker::stream_count() const {
+    return static_cast<uint32_t>(streams_.size());
+}
+
+uint32_t vbr_generation_tracker::cell_count() const {
+    return n_cells_;
+}
+
+uint32_t vbr_generation_tracker::unit_count() const {
+    return static_cast<uint32_t>(units_.size());
+}
+
+bool vbr_generation_tracker::stable() const {
+    if ((mutation_serial_ & 1u) != 0) {
+        return false;
+    }
+    for (const auto & unit : units_) {
+        if ((unit.publish_seq & 1u) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+vbr_pool_uuid vbr_generation_tracker::pool_identity() const {
+    return pool_uuid_;
+}
+
+uint64_t vbr_generation_tracker::controller_generation() const {
+    return global_generation_;
+}
+
+vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant   registrant,
+                                                         vbr_operation_class       operation_class,
+                                                         uint32_t                  stream,
+                                                         vbr_generation_stamp_kind stamp_kind,
+                                                         bool                      destructive,
+                                                         bool                      imported) {
+    const auto * registration = registration_for(registrant);
+    const size_t registrant_index = static_cast<size_t>(registrant);
+    const generation_dispatch_effect expected_effect =
+            stamp_kind == vbr_generation_stamp_kind::dependency
+                    ? generation_dispatch_effect::dependency
+                    : generation_dispatch_effect::membership;
+    if (!active() || registration == nullptr || !class_allowed(*registration, operation_class) ||
+        registrant_index >= VBR_GENERATION_DISPATCH.size() ||
+        VBR_GENERATION_DISPATCH[registrant_index] != expected_effect ||
+        stream >= streams_.size() || event_serial_ == std::numeric_limits<uint64_t>::max() ||
+        active_event_depth_ == MAX_EVENT_DEPTH ||
+        (active_event_depth_ == 0 && mutation_serial_ == std::numeric_limits<uint64_t>::max())) {
+        return {};
+    }
+
+    if (active_event_depth_ == 0) {
+        ++mutation_serial_;
+    }
+    ++event_serial_;
+    active_event_stack_[active_event_depth_] = event_serial_;
+    ++active_event_depth_;
+    vbr_generation_event result;
+    result.serial          = event_serial_;
+    result.stream          = stream;
+    result.stamp_kind      = stamp_kind;
+    result.family          = registration->family;
+    result.operation_class = operation_class;
+    result.destructive     = destructive;
+    result.imported        = imported;
+    result.owner_          = this;
+    return result;
+}
+
+bool vbr_generation_tracker::finish_event(uint64_t serial) {
+    if (serial == 0 || active_event_depth_ == 0 || active_event_stack_[active_event_depth_ - 1] != serial ||
+        mutation_serial_ == std::numeric_limits<uint64_t>::max()) {
+        return false;
+    }
+    --active_event_depth_;
+    active_event_stack_[active_event_depth_] = 0;
+    if (active_event_depth_ == 0) {
+        ++mutation_serial_;
+    }
+    return true;
+}
+
+bool vbr_generation_tracker::stamp_cell(const vbr_generation_event & event,
+                                        uint32_t                     cell,
+                                        llama_seq_id                 membership_seq) {
+    bool event_is_live = false;
+    for (uint32_t depth = 0; depth < active_event_depth_; ++depth) {
+        event_is_live = event_is_live || active_event_stack_[depth] == event.serial;
+    }
+    if (!event || event.owner_ != this || !event_is_live ||
+        event.stream >= streams_.size() || cell >= n_cells_ || membership_seq < -1 ||
+        membership_seq > std::numeric_limits<int16_t>::max()) {
+        return false;
+    }
+
+    auto &         stream = streams_[event.stream];
+    const uint32_t page   = cell / VBR_GENERATION_PAGE_CELLS;
+    if (stream.page_event_serial[page] != event.serial) {
+        if (stream.page_event_gen[page] == std::numeric_limits<uint32_t>::max()) {
+            if (!reset_page_generations_before_wrap()) {
+                return false;
+            }
+        }
+        stream.page_event_serial[page] = event.serial;
+        ++stream.page_event_gen[page];
+        if (event.destructive) {
+            stream.page_last_destructive_gen[page] = stream.page_event_gen[page];
+        }
+        if (event.imported) {
+            stream.page_last_import_gen[page] = stream.page_event_gen[page];
+        }
+    }
+
+    const uint32_t generation = stream.page_event_gen[page];
+    const uint16_t provenance = pack_provenance(event.family, event.operation_class);
+    if (event.stamp_kind == vbr_generation_stamp_kind::dependency) {
+        stream.cell_last_dependency_gen[cell]   = generation;
+        stream.cell_dependency_provenance[cell] = provenance;
+    } else {
+        stream.cell_last_membership_gen[cell]   = generation;
+        stream.cell_membership_provenance[cell] = provenance;
+        stream.cell_last_membership_seq[cell]   = static_cast<int16_t>(membership_seq);
+    }
+    return true;
+}
+
+bool vbr_generation_tracker::reset_page_generations_before_wrap() {
+    if (global_generation_ == std::numeric_limits<uint64_t>::max() ||
+        (active_event_depth_ == 0 &&
+         mutation_serial_ > std::numeric_limits<uint64_t>::max() - 2)) {
+        return false;
+    }
+    const bool owns_stability_barrier = active_event_depth_ == 0;
+    if (owns_stability_barrier) {
+        ++mutation_serial_;
+    } else if ((mutation_serial_ & 1u) == 0) {
+        return false;
+    }
+    ++global_generation_;
+    for (auto & stream : streams_) {
+        std::fill(stream.page_event_gen.begin(), stream.page_event_gen.end(), 0);
+        std::fill(stream.page_last_destructive_gen.begin(), stream.page_last_destructive_gen.end(), 0);
+        std::fill(stream.page_last_import_gen.begin(), stream.page_last_import_gen.end(), 0);
+        std::fill(stream.page_event_serial.begin(), stream.page_event_serial.end(), 0);
+        std::fill(stream.cell_last_dependency_gen.begin(), stream.cell_last_dependency_gen.end(), 0);
+        std::fill(stream.cell_last_membership_gen.begin(), stream.cell_last_membership_gen.end(), 0);
+        std::fill(stream.cell_dependency_provenance.begin(), stream.cell_dependency_provenance.end(), 0);
+        std::fill(stream.cell_membership_provenance.begin(), stream.cell_membership_provenance.end(), 0);
+        std::fill(stream.cell_last_membership_seq.begin(), stream.cell_last_membership_seq.end(), -1);
+    }
+    if (owns_stability_barrier) {
+        ++mutation_serial_;
+    }
+    return true;
+}
+
+bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registrant,
+                                               vbr_operation_class     operation_class) {
+    const auto * registration = registration_for(registrant);
+    const size_t registrant_index = static_cast<size_t>(registrant);
+    if (!active() || registration == nullptr || !class_allowed(*registration, operation_class) ||
+        registrant_index >= VBR_GENERATION_DISPATCH.size() ||
+        VBR_GENERATION_DISPATCH[registrant_index] != generation_dispatch_effect::global ||
+        active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0 ||
+        global_generation_ == std::numeric_limits<uint64_t>::max() ||
+        mutation_serial_ > std::numeric_limits<uint64_t>::max() - 2) {
+        return false;
+    }
+    ++mutation_serial_;
+    ++global_generation_;
+    ++mutation_serial_;
+    return true;
+}
+
+bool vbr_generation_tracker::initialize_unit(uint32_t unit, int32_t type, vbr_repr_domain domain) {
+    if (unit >= units_.size()) {
+        return false;
+    }
+    auto & state           = units_[unit];
+    state.repr_gen         = 1;
+    state.current_type     = type;
+    state.last_source_type = type;
+    state.domain           = domain;
+    state.last_transition  = vbr_repr_transition::initial;
+    return true;
+}
+
+bool vbr_generation_tracker::publish_unit(uint32_t            unit,
+                                          int32_t             source_type,
+                                          int32_t             target_type,
+                                          vbr_repr_domain     domain,
+                                          uint8_t             promote_hops,
+                                          vbr_repr_transition transition) {
+    if (unit >= units_.size() || active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0 ||
+        units_[unit].current_type != source_type || (units_[unit].publish_seq & 1u) != 0) {
+        return false;
+    }
+    if ((units_[unit].repr_gen == std::numeric_limits<uint64_t>::max() ||
+         units_[unit].publish_seq > std::numeric_limits<uint64_t>::max() - 2) &&
+        !reset_unit_generations_before_wrap()) {
+        return false;
+    }
+    auto & state = units_[unit];
+    ++state.publish_seq;
+    ++state.repr_gen;
+    state.last_source_type = source_type;
+    state.current_type     = target_type;
+    state.domain           = domain;
+    state.promote_hops     = promote_hops;
+    state.last_transition  = transition;
+    ++state.publish_seq;
+    return true;
+}
+
+bool vbr_generation_tracker::reset_unit_generations_before_wrap() {
+    if (global_generation_ == std::numeric_limits<uint64_t>::max() ||
+        mutation_serial_ > std::numeric_limits<uint64_t>::max() - 2) {
+        return false;
+    }
+    for (const auto & unit : units_) {
+        if ((unit.publish_seq & 1u) != 0) {
+            return false;
+        }
+    }
+    ++mutation_serial_;
+    ++global_generation_;
+    for (auto & unit : units_) {
+        unit.repr_gen    = 1;
+        unit.publish_seq = 0;
+        unit.flags       = 0;
+    }
+    ++mutation_serial_;
+    return true;
+}
+
+uint32_t vbr_generation_tracker::page_generation(uint32_t stream, uint32_t page) const {
+    return streams_.at(stream).page_event_gen.at(page);
+}
+
+uint32_t vbr_generation_tracker::page_destructive_generation(uint32_t stream, uint32_t page) const {
+    return streams_.at(stream).page_last_destructive_gen.at(page);
+}
+
+uint32_t vbr_generation_tracker::page_import_generation(uint32_t stream, uint32_t page) const {
+    return streams_.at(stream).page_last_import_gen.at(page);
+}
+
+uint32_t vbr_generation_tracker::dependency_generation(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_last_dependency_gen.at(cell);
+}
+
+uint32_t vbr_generation_tracker::membership_generation(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_last_membership_gen.at(cell);
+}
+
+uint16_t vbr_generation_tracker::dependency_provenance(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_dependency_provenance.at(cell);
+}
+
+uint16_t vbr_generation_tracker::membership_provenance(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_membership_provenance.at(cell);
+}
+
+llama_seq_id vbr_generation_tracker::last_membership_seq(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_last_membership_seq.at(cell);
+}
+
+vbr_unit_generation vbr_generation_tracker::unit_generation(uint32_t unit) const {
+    return units_.at(unit);
+}
+
+bool vbr_generation_capture_stream(const vbr_generation_tracker &     tracker,
+                                   uint32_t                           stream,
+                                   llama_seq_id                       dependency_seq_id,
+                                   llama_pos                          computation_frontier,
+                                   const std::vector<uint32_t> &      canonical_dependency_cells,
+                                   vbr_checkpoint_generation_stream & output) {
+    if (!tracker.active() || !tracker.stable() || stream >= tracker.stream_count() || dependency_seq_id < 0 ||
+        computation_frontier < 0 ||
+        canonical_dependency_cells.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return false;
+    }
+
+    output                           = {};
+    output.stream_index              = stream;
+    output.dependency_seq_id         = dependency_seq_id;
+    output.computation_frontier      = computation_frontier;
+    output.captured_dependency_count = static_cast<uint32_t>(canonical_dependency_cells.size());
+
+    uint32_t previous = std::numeric_limits<uint32_t>::max();
+    for (uint32_t cell : canonical_dependency_cells) {
+        if (cell >= tracker.cell_count() || (previous != std::numeric_limits<uint32_t>::max() && cell <= previous)) {
+            output = {};
+            return false;
+        }
+        previous = cell;
+
+        const uint32_t page = cell / VBR_GENERATION_PAGE_CELLS;
+        if (output.pages.empty() || output.pages.back().page_index != page) {
+            vbr_generation_page_ref ref;
+            ref.page_index        = page;
+            ref.captured_page_gen = tracker.page_generation(stream, page);
+            output.pages.push_back(ref);
+        }
+        mask_set(output.pages.back().covered_mask, cell % VBR_GENERATION_PAGE_CELLS);
+    }
+    return true;
+}
+
+bool vbr_generation_capture_controller(const vbr_generation_tracker &                        tracker,
+                                       uint32_t                                              child_id,
+                                       checkpoint_child_dependency_mode                      dependency_mode,
+                                       const std::vector<vbr_checkpoint_generation_stream> & streams,
+                                       vbr_checkpoint_generation_controller &                output) {
+    if (!tracker.active() || !tracker.stable() || dependency_mode != checkpoint_child_dependency_mode::live_guarded) {
+        return false;
+    }
+
+    output                   = {};
+    output.child_id          = child_id;
+    output.dependency_mode   = dependency_mode;
+    output.pool_uuid         = tracker.pool_identity();
+    output.global_generation = tracker.controller_generation();
+    output.streams           = streams;
+    uint32_t previous_stream  = std::numeric_limits<uint32_t>::max();
+    for (const auto & stream : output.streams) {
+        if (stream.stream_index >= tracker.stream_count() ||
+            (previous_stream != std::numeric_limits<uint32_t>::max() &&
+             stream.stream_index <= previous_stream)) {
+            output = {};
+            return false;
+        }
+        previous_stream = stream.stream_index;
+        for (const auto & page : stream.pages) {
+            if (page.page_index >= page_count(tracker.cell_count()) ||
+                tracker.page_generation(stream.stream_index, page.page_index) !=
+                        page.captured_page_gen) {
+                output = {};
+                return false;
+            }
+        }
+    }
+    output.units.reserve(tracker.unit_count());
+    for (uint32_t unit = 0; unit < tracker.unit_count(); ++unit) {
+        const auto live_unit = tracker.unit_generation(unit);
+        if ((live_unit.publish_seq & 1u) != 0) {
+            output = {};
+            return false;
+        }
+        output.units.push_back({
+            live_unit.repr_gen,
+            live_unit.current_type,
+            live_unit.last_source_type,
+            live_unit.domain,
+            live_unit.promote_hops,
+            live_unit.last_transition,
+        });
+    }
+
+    if (!tracker.stable() || tracker.pool_identity() != output.pool_uuid ||
+        tracker.controller_generation() != output.global_generation) {
+        output = {};
+        return false;
+    }
+    for (uint32_t unit = 0; unit < tracker.unit_count(); ++unit) {
+        if (!unit_equal(output.units[unit], tracker.unit_generation(unit))) {
+            output = {};
+            return false;
+        }
+    }
+    for (const auto & stream : output.streams) {
+        for (const auto & page : stream.pages) {
+            if (tracker.page_generation(stream.stream_index, page.page_index) !=
+                    page.captured_page_gen) {
+                output = {};
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// VBR_GENERATION_ELIGIBILITY_AUTHORITY
+vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_generation_record & checkpoint,
+                                                      const vbr_generation_live_view &         live) {
+    if (!live.capability_applicable) {
+        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::capability_not_applicable,
+                      vbr_checkpoint_eligibility_category::not_applicable);
+    }
+    if (checkpoint.status != vbr_checkpoint_generation_status::complete) {
+        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::record_unknown,
+                      vbr_checkpoint_eligibility_category::generation_unknown);
+    }
+    if (checkpoint.version != 1) {
+        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::record_version);
+    }
+    if (!live.identity_frontier_eligible ||
+        checkpoint.identity_policy_order_digest != live.identity_policy_order_digest) {
+        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::identity_or_frontier);
+    }
+    if (checkpoint.controllers.empty() || checkpoint.controllers.size() != live.controllers.size()) {
+        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_shape);
+    }
+
+    bool any_live_rebased = false;
+    uint32_t previous_child = std::numeric_limits<uint32_t>::max();
+    for (size_t ci = 0; ci < checkpoint.controllers.size(); ++ci) {
+        const auto & captured = checkpoint.controllers[ci];
+        const auto & current  = live.controllers[ci];
+        if (captured.child_id != current.child_id ||
+            (previous_child != std::numeric_limits<uint32_t>::max() &&
+             captured.child_id <= previous_child)) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::child_order);
+        }
+        previous_child = captured.child_id;
+        if (captured.dependency_mode != current.dependency_mode) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::dependency_mode);
+        }
+        if (captured.dependency_mode == checkpoint_child_dependency_mode::absent ||
+            captured.dependency_mode == checkpoint_child_dependency_mode::payload_complete) {
+            if (!captured.streams.empty()) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_shape);
+            }
+            continue;
+        }
+        if (current.tracker == nullptr || !current.tracker->active()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_inactive,
+                          vbr_checkpoint_eligibility_category::not_applicable);
+        }
+        if (!current.tracker->stable()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_unstable);
+        }
+        if (captured.pool_uuid != current.tracker->pool_identity()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::pool_uuid);
+        }
+        if (captured.global_generation != current.tracker->controller_generation()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::global_generation);
+        }
+        if (captured.units.size() != current.tracker->unit_count()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::unit_shape);
+        }
+        for (size_t ui = 0; ui < captured.units.size(); ++ui) {
+            const auto current_unit = current.tracker->unit_generation(static_cast<uint32_t>(ui));
+            if ((current_unit.publish_seq & 1u) != 0) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::unit_unstable);
+            }
+            if (unit_equal(captured.units[ui], current_unit)) {
+                continue;
+            }
+            if (!unit_live_rebased(captured.units[ui], current_unit)) {
+                return reject(live.legacy_eligible, unit_live_rebased_shape(captured.units[ui], current_unit) ?
+                                                        vbr_checkpoint_eligibility_reason::live_rebased_transition :
+                                                        vbr_checkpoint_eligibility_reason::unit_generation);
+            }
+            any_live_rebased = true;
+        }
+
+        if (captured.streams.size() != current.streams.size()) {
+            return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_shape);
+        }
+        for (size_t si = 0; si < captured.streams.size(); ++si) {
+            const auto & stored_stream = captured.streams[si];
+            const auto & live_stream   = current.streams[si];
+            if (stored_stream.stream_index != live_stream.stream_index ||
+                stored_stream.stream_index >= current.tracker->stream_count()) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_order);
+            }
+            if (stored_stream.dependency_seq_id < 0 || stored_stream.computation_frontier < 0 ||
+                live_stream.cell_has_seq == nullptr) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_shape);
+            }
+            if (stored_stream.dependency_seq_id != live_stream.dependency_seq_id ||
+                stored_stream.computation_frontier != live_stream.computation_frontier) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::identity_or_frontier);
+            }
+
+            uint32_t covered_count = 0;
+            uint32_t previous_page = std::numeric_limits<uint32_t>::max();
+            for (const auto & page : stored_stream.pages) {
+                if ((previous_page != std::numeric_limits<uint32_t>::max() && page.page_index <= previous_page) ||
+                    mask_popcount(page.covered_mask) == 0) {
+                    return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::malformed_page_refs);
+                }
+                previous_page = page.page_index;
+                if (page.page_index >= page_count(current.tracker->cell_count())) {
+                    return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::page_out_of_range);
+                }
+
+                const uint32_t current_page_gen =
+                    current.tracker->page_generation(stored_stream.stream_index, page.page_index);
+                const bool     fast_match = current_page_gen == page.captured_page_gen;
+                const uint32_t base       = page.page_index * VBR_GENERATION_PAGE_CELLS;
+                for (uint32_t offset = 0; offset < VBR_GENERATION_PAGE_CELLS; ++offset) {
+                    if (!mask_test(page.covered_mask, offset)) {
+                        continue;
+                    }
+                    const uint32_t cell = base + offset;
+                    if (cell >= current.tracker->cell_count()) {
+                        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::page_out_of_range);
+                    }
+                    ++covered_count;
+                    if (!fast_match && current.tracker->dependency_generation(stored_stream.stream_index, cell) >
+                                           page.captured_page_gen) {
+                        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::dependency_changed);
+                    }
+                    if (!live_stream.cell_has_seq(live_stream.membership_context, stored_stream.stream_index, cell,
+                                                  stored_stream.dependency_seq_id)) {
+                        return reject(live.legacy_eligible,
+                                      vbr_checkpoint_eligibility_reason::dependency_membership_lost);
+                    }
+                }
+            }
+            if (covered_count != stored_stream.captured_dependency_count ||
+                live_stream.exact_dependency_count != stored_stream.captured_dependency_count) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::dependency_cardinality);
+            }
+        }
+    }
+
+    vbr_checkpoint_eligibility result;
+    result.legacy              = live.legacy_eligible;
+    result.strict              = !any_live_rebased;
+    result.live_rebased_shadow = any_live_rebased;
+    result.category            = any_live_rebased ? vbr_checkpoint_eligibility_category::live_rebased_shadow_accept :
+                                                    vbr_checkpoint_eligibility_category::strict_accept;
+    result.reason              = vbr_checkpoint_eligibility_reason::none;
+    return result;
+}

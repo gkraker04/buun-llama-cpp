@@ -37,6 +37,8 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
+            llama-vbr-generation.cpp
+            llama-vbr-generation-oracle.cpp
             llama-vbr-operation.cpp
             llama-vram-demand.cpp
             llama-vram-ledger.cpp

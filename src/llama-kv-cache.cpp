@@ -1410,6 +1410,29 @@ llama_kv_cache::llama_kv_cache(
                 LLAMA_LOG_INFO("%s: VBR f16 sink-stash: %u rows per (layer,side)\n",
                         __func__, vbr_stash_rows_);
             }
+
+            // Revision-9 A1 construction-final arming. This is shadow-only dual-write storage:
+            // current checkpoint selection still reads the legacy epoch exclusively. Allocate
+            // only after the effective budget is final, so an unarmed/static cache is byte-for-
+            // byte and allocation-for-allocation unchanged.
+            if (vbr_budget_bytes_ > 0) {
+                vbr_generation_ = std::make_unique<vbr_generation_tracker>(
+                        n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
+                GGML_ASSERT(vbr_generation_->active());
+                for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                    for (uint32_t side = 0; side < 2; ++side) {
+                        const ggml_tensor * tensor = side != 0 ? layers[ikv].v : layers[ikv].k;
+                        const int32_t type = tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
+                        const vbr_repr_domain domain =
+                                tensor != nullptr && ggml_is_turbo_kv_type(tensor->type) &&
+                                                tensor->type != GGML_TYPE_TURBO8_0
+                                        ? vbr_repr_domain::tapped
+                                        : vbr_repr_domain::full;
+                        GGML_ASSERT(vbr_generation_->initialize_unit(
+                                static_cast<uint32_t>(ikv * 2 + side), type, domain));
+                    }
+                }
+            }
         }
     }
 
@@ -1584,6 +1607,7 @@ void llama_kv_cache::clear(bool data) {
     // requested. Keep this separate from vbr_full_reset(): clear may leave the tier cursor in
     // place until the next empty-cache boundary, and both mutations must remain observable.
     vbr_representation_changed();
+    vbr_generation_global(vbr_mutation_registrant::clear, vbr_operation_class::state_api);
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1603,8 +1627,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t stream = seq_to_stream[seq_id];
+        auto & cells = v_cells[stream];
+        auto & head  = v_heads[stream];
+        const auto generation_event = vbr_generation_begin(
+                vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, stream,
+                vbr_generation_stamp_kind::membership);
 
         uint32_t new_head = cells.size();
 
@@ -1613,7 +1641,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+            if (cells.seq_has(i, seq_id)) {
+                const bool became_empty = cells.seq_rm(i, seq_id);
+                if (generation_event) {
+                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
+                }
+                if (!became_empty) {
+                    continue;
+                }
                 if (i < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
                 }
@@ -1632,6 +1667,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
+            const auto generation_event = vbr_generation_begin(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, s,
+                    vbr_generation_stamp_kind::membership);
 
             uint32_t new_head = cells.size();
 
@@ -1640,7 +1678,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     continue;
                 }
 
+                const bool had_membership = !cells.is_empty(i);
                 cells.rm(i);
+                if (had_membership && generation_event) {
+                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, -1));
+                }
                 if (i < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
                 }
@@ -1677,6 +1719,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         // we just have to update the cells meta data
 
         auto & cells = v_cells[s0];
+        const auto generation_event = vbr_generation_begin(
+                vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s0,
+                vbr_generation_stamp_kind::membership);
 
         if (seq_id_src == seq_id_dst) {
             return;
@@ -1695,8 +1740,11 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id_src)) {
+            if (cells.seq_has(i, seq_id_src) && !cells.seq_has(i, seq_id_dst)) {
                 cells.seq_add(i, seq_id_dst);
+                if (generation_event) {
+                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id_dst));
+                }
             }
         }
 
@@ -1721,7 +1769,18 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
+    const auto destination_reset_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
+            vbr_generation_stamp_kind::membership);
+    for (uint32_t i = 0; i < v_cells[s1].size(); ++i) {
+        if (!v_cells[s1].is_empty(i) && destination_reset_event) {
+            GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(destination_reset_event, i, -1));
+        }
+    }
     v_cells[s1].reset();
+    const auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
+            vbr_generation_stamp_kind::dependency, true);
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
             llama_pos pos   = v_cells[s0].pos_get(i);
@@ -1742,6 +1801,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
+            if (generation_event) {
+                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id_dst));
+            }
         }
     }
 
@@ -1760,16 +1822,25 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head  = v_heads[stream];
+    const auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_keep, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::membership);
 
     uint32_t new_head = cells.size();
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
+        const bool changed = !cells.is_empty(i) && (!cells.seq_has(i, seq_id) || cells.seq_count(i) > 1);
         if (cells.seq_keep(i, seq_id)) {
             if (new_head == cells.size()) {
                 new_head = i;
             }
+        }
+        if (changed && generation_event) {
+            GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(
+                    generation_event, i, cells.is_empty(i) ? -1 : seq_id));
         }
     }
 
@@ -1788,8 +1859,12 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head  = v_heads[stream];
+    const auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_add, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::dependency, true);
 
     if (shift == 0) {
         return;
@@ -1821,6 +1896,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
                     new_head = i;
                 }
             }
+            if (generation_event) {
+                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
+            }
         }
     }
 
@@ -1838,7 +1916,11 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    const auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_div, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::dependency, true);
 
     if (d == 1) {
         return;
@@ -1864,6 +1946,9 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
         if (cells.seq_has(i, seq_id)) {
             cells.pos_div(i, d);
+            if (generation_event) {
+                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
+            }
         }
     }
 }
@@ -2229,7 +2314,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // Slot planning mutates then restores cell metadata. Generation stamps belong only to
+        // the later committed apply() call; a failed/dry prepare must leave no shadow mutation.
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -2534,7 +2621,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(
+        const slot_info & sinfo, const llama_ubatch & ubatch, bool generation_commit) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2551,6 +2639,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     bool reused_occupied_cell = false;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t stream = sinfo.strm[s];
+        const auto append_event = generation_commit
+                ? vbr_generation_begin(
+                    vbr_mutation_registrant::apply_ubatch_append,
+                    vbr_operation_class::ordinary_decode,
+                    stream,
+                    vbr_generation_stamp_kind::dependency)
+                : vbr_generation_event{};
+        const auto reuse_event = generation_commit
+                ? vbr_generation_begin(
+                    vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+                    n_swa != 0
+                            ? vbr_operation_class::swa_wrap
+                            : vbr_operation_class::ordinary_decode,
+                    stream,
+                    vbr_generation_stamp_kind::dependency,
+                    true)
+                : vbr_generation_event{};
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -2558,7 +2664,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             const auto idx = sinfo.idxs[s][ii];
 
-            if (!cells.is_empty(idx)) {
+            const bool occupied = !cells.is_empty(idx);
+            if (occupied) {
                 reused_occupied_cell = true;
                 assert(cells.seq_count(idx) == 1);
 
@@ -2582,6 +2689,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
+            }
+
+            const auto & generation_event = occupied ? reuse_event : append_event;
+            if (generation_event) {
+                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(
+                        generation_event, idx, ubatch.n_seq_id[i] == 1 ? ubatch.seq_id[i][0] : -1));
             }
         }
     }
@@ -3541,6 +3654,133 @@ void llama_kv_cache::vbr_representation_changed() {
     }
 }
 
+vbr_generation_tracker * llama_kv_cache::vbr_generation_tracker_mut() {
+    return other != nullptr ? other->vbr_generation_tracker_mut() : vbr_generation_.get();
+}
+
+const vbr_generation_tracker * llama_kv_cache::vbr_generation_tracker_get() const {
+    return other != nullptr ? other->vbr_generation_tracker_get() : vbr_generation_.get();
+}
+
+bool llama_kv_cache::vbr_generation_cell_has_seq_cb(
+        const void * context, uint32_t stream, uint32_t cell, llama_seq_id seq_id) {
+    const auto * cache = static_cast<const llama_kv_cache *>(context);
+    if (cache == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+            stream >= cache->v_cells.size() || cell >= cache->v_cells[stream].size()) {
+        return false;
+    }
+    return !cache->v_cells[stream].is_empty(cell) && cache->v_cells[stream].seq_has(cell, seq_id);
+}
+
+bool llama_kv_cache::vbr_generation_capture_live_guarded(
+        uint32_t child_id,
+        llama_seq_id seq_id,
+        llama_pos computation_frontier,
+        vbr_checkpoint_generation_controller & output) const {
+    if (other != nullptr) {
+        return other->vbr_generation_capture_live_guarded(
+                child_id, seq_id, computation_frontier, output);
+    }
+
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+            computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size()) {
+        return false;
+    }
+
+    const auto & cells = v_cells[stream];
+    std::vector<uint32_t> dependency_cells;
+    dependency_cells.reserve(cells.seq_pos_count_before(seq_id, computation_frontier));
+    for (uint32_t cell : cells.used_indices()) {
+        if (cells.seq_has(cell, seq_id) && cells.pos_get(cell) < computation_frontier) {
+            dependency_cells.push_back(cell);
+        }
+    }
+    if (dependency_cells.size() != cells.seq_pos_count_before(seq_id, computation_frontier)) {
+        return false;
+    }
+
+    vbr_checkpoint_generation_stream captured_stream;
+    if (!vbr_generation_capture_stream(
+                *tracker, stream, seq_id, computation_frontier, dependency_cells, captured_stream)) {
+        return false;
+    }
+
+    return vbr_generation_capture_controller(
+            *tracker,
+            child_id,
+            checkpoint_child_dependency_mode::live_guarded,
+            {std::move(captured_stream)},
+            output);
+}
+
+bool llama_kv_cache::vbr_generation_live_guarded_view(
+        uint32_t child_id,
+        llama_seq_id seq_id,
+        llama_pos computation_frontier,
+        vbr_generation_live_controller_view & output) const {
+    if (other != nullptr) {
+        return other->vbr_generation_live_guarded_view(
+                child_id, seq_id, computation_frontier, output);
+    }
+
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+            computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size()) {
+        return false;
+    }
+
+    vbr_generation_live_stream_view live_stream;
+    live_stream.stream_index           = stream;
+    live_stream.dependency_seq_id      = seq_id;
+    live_stream.computation_frontier   = computation_frontier;
+    live_stream.exact_dependency_count = v_cells[stream].seq_pos_count_before(
+            seq_id, computation_frontier);
+    live_stream.membership_context = this;
+    live_stream.cell_has_seq       = vbr_generation_cell_has_seq_cb;
+
+    output.child_id        = child_id;
+    output.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+    output.tracker         = tracker;
+    output.streams         = {live_stream};
+    return true;
+}
+
+vbr_generation_event llama_kv_cache::vbr_generation_begin(
+        vbr_mutation_registrant registrant,
+        vbr_operation_class operation_class,
+        uint32_t stream,
+        vbr_generation_stamp_kind stamp_kind,
+        bool destructive,
+        bool imported) {
+    auto * tracker = vbr_generation_tracker_mut();
+    if (tracker == nullptr) {
+        return {};
+    }
+    auto event = tracker->begin_event(
+            registrant, operation_class, stream, stamp_kind, destructive, imported);
+    GGML_ASSERT(event);
+    return event;
+}
+
+void llama_kv_cache::vbr_generation_global(
+        vbr_mutation_registrant registrant, vbr_operation_class operation_class) {
+    auto * tracker = vbr_generation_tracker_mut();
+    if (tracker != nullptr) {
+        GGML_ASSERT(tracker->global_transition(registrant, operation_class));
+    }
+}
+
 bool llama_kv_cache::vbr_retier_defer(const char * decision) {
     if (vbr_retier_freeze_depth_ == 0) {
         return false;
@@ -3622,6 +3862,24 @@ void llama_kv_cache::vbr_full_reset() {
     // Deliberately bumps even though the cursor is now 0: this is the low-LCP/empty-cache ABA
     // that a recurrent-only checkpoint must detect.
     vbr_representation_changed();
+    vbr_generation_global(vbr_mutation_registrant::full_reset, vbr_operation_class::controller);
+    if (auto * tracker = vbr_generation_tracker_mut()) {
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (uint32_t side = 0; side < 2; ++side) {
+                const ggml_tensor * tensor = side != 0 ? layers[ikv].v : layers[ikv].k;
+                const uint32_t unit = static_cast<uint32_t>(ikv * 2 + side);
+                const auto before = tracker->unit_generation(unit);
+                const int32_t target = tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
+                GGML_ASSERT(tracker->publish_unit(
+                        unit,
+                        before.current_type,
+                        target,
+                        vbr_repr_domain::full,
+                        0,
+                        vbr_repr_transition::full_reset));
+            }
+        }
+    }
     LLAMA_LOG_INFO("%s: VBR full reset: cache empty — %zu tensors back at their entry tier, pools released "
             "(%.2f MiB mapped)\n", __func__, undone, mapped/1024.0/1024.0);
 }
@@ -3803,9 +4061,22 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 e.promote_hops++; // only live-row re-encodes count — a 0-cell flip is free re-typing
             }
         }
+        const ggml_type type_A = t->type;
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
         vbr_representation_changed();
+        if (auto * tracker = vbr_generation_tracker_mut()) {
+            const uint8_t promote_hops = units.empty() ? 0 : units.front().second->promote_hops;
+            GGML_ASSERT(tracker->publish_unit(
+                    static_cast<uint32_t>(ikv * 2 + (st.is_v != 0)),
+                    static_cast<int32_t>(type_A),
+                    static_cast<int32_t>(type_B),
+                    type_B == GGML_TYPE_F16 || type_B == GGML_TYPE_TURBO8_0
+                            ? vbr_repr_domain::full
+                            : vbr_repr_domain::tapped,
+                    promote_hops,
+                    vbr_repr_transition::promote));
+        }
         vbr_degrade_cursor_--;
 
         for (const auto & [pp, ep] : units) {
@@ -3941,11 +4212,27 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // flip metadata now (host state, consumed at graph BUILD time; shards flip in lockstep);
         // data ptr = fixed VA. The fence guarantees the built graph never RUNS before the bytes
         // are tier B.
+        const ggml_type type_A = t->type;
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
         // Demand sheds route through this same mutation, so every shed transcode is covered here
         // without double-counting it in vbr_execute_shed().
         vbr_representation_changed();
+        if (auto * tracker = vbr_generation_tracker_mut()) {
+            const uint8_t promote_hops = units.empty() ? 0 : units.front().second->promote_hops;
+            const auto transition = type_A == GGML_TYPE_F16 && type_B == GGML_TYPE_TURBO8_0
+                    ? vbr_repr_transition::degrade_f16_to_t8_admitted
+                    : vbr_repr_transition::degrade_other;
+            GGML_ASSERT(tracker->publish_unit(
+                    static_cast<uint32_t>(ikv * 2 + (st.is_v != 0)),
+                    static_cast<int32_t>(type_A),
+                    static_cast<int32_t>(type_B),
+                    type_B == GGML_TYPE_F16 || type_B == GGML_TYPE_TURBO8_0
+                            ? vbr_repr_domain::full
+                            : vbr_repr_domain::tapped,
+                    promote_hops,
+                    transition));
+        }
         return true;
     }
     return false;
@@ -6100,6 +6387,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     // Count the completed adoption once, independently of how many streams it populated.
     if (imported) {
         vbr_representation_changed();
+        vbr_generation_global(
+                seq_id == -1
+                        ? vbr_mutation_registrant::whole_import
+                        : vbr_mutation_registrant::state_read_install,
+                vbr_operation_class::state_api);
     }
 }
 
@@ -6303,7 +6595,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
-        apply_ubatch(sinfo, ubatch);
+        // Native import publishes one controller-global generation only after state_read_data
+        // completes. Do not misclassify its preparatory cell placement as an ordinary append.
+        apply_ubatch(sinfo, ubatch, false);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
