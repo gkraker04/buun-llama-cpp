@@ -66,6 +66,7 @@ MAX_RETRIES_PER_POINT       = 3
 MAX_CONSECUTIVE_FAILURES    = 5
 MAX_CONSECUTIVE_EXIT9       = 3
 MAX_RUNTIME_SECONDS         = 8 * 3600  # 8 hours
+MAX_RUNTIME_HOURS           = 8
 MAX_CONFIGS                 = 20
 
 EXIT9_WAIT          = 120  # seconds to wait after exit 9 before retry
@@ -276,7 +277,8 @@ def check_gpu_health():
         util = float(parts[1])
         mem_total = float(parts[2])  # MiB
         mem_used = float(parts[3])   # MiB
-        ecc_errors = float(parts[4])
+        ecc_raw = parts[4].strip().strip('[]')
+        ecc_errors = float(ecc_raw) if ecc_raw.upper() not in ('N/A', 'NONE', 'NOT_SUPPORTED', '') else 0.0
     except ValueError as e:
         return False, f"Failed to parse nvidia-smi values: {e} | raw: {output}"
 
