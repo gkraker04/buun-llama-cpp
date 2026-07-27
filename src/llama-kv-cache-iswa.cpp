@@ -344,21 +344,57 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     return r;
 }
 
-uint64_t llama_kv_cache_iswa::vbr_retier_freeze_begin(const char * owner) {
-    const uint64_t b = kv_base->vbr_retier_freeze_begin(owner);
-    const uint64_t s = kv_swa ->vbr_retier_freeze_begin(owner);
-    return b != 0 ? b : s;
+bool llama_kv_cache_iswa::vbr_operation_armed() const {
+    return kv_base->vbr_operation_armed() || kv_swa->vbr_operation_armed();
+}
+
+bool llama_kv_cache_iswa::vbr_retier_freeze_begin(
+        const char * owner, vbr_operation_id operation_id) {
+    const bool base_armed = kv_base->vbr_operation_armed();
+    const bool swa_armed  = kv_swa ->vbr_operation_armed();
+    if (!base_armed && !swa_armed) {
+        return false;
+    }
+    if (vbr_retier_freeze_depth_ >= VBR_RETIER_FREEZE_MAX_DEPTH) {
+        return false;
+    }
+    const bool base_ok = !base_armed ||
+        kv_base->vbr_retier_freeze_begin(owner, operation_id);
+    if (!base_ok) {
+        return false;
+    }
+    const bool swa_ok = !swa_armed ||
+        kv_swa->vbr_retier_freeze_begin(owner, operation_id);
+    if (!swa_ok) {
+        if (base_armed) {
+            kv_base->vbr_retier_freeze_end(owner, operation_id);
+        }
+        return false;
+    }
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_++] = {
+        operation_id,
+        base_armed,
+        swa_armed,
+    };
+    return true;
 }
 
 void llama_kv_cache_iswa::vbr_retier_freeze_end(
-        const char * owner, uint64_t started_ns) {
-    // A child with no VBR layers returned an inert begin and must not receive an unmatched end.
-    if (kv_base->vbr_retier_freeze_active()) {
-        kv_base->vbr_retier_freeze_end(owner, started_ns);
+        const char * owner, vbr_operation_id operation_id) {
+    GGML_ASSERT(vbr_retier_freeze_depth_ > 0);
+    const vbr_retier_freeze_children children =
+        vbr_retier_freeze_stack_[vbr_retier_freeze_depth_ - 1];
+    GGML_ASSERT(children.operation_id == operation_id);
+
+    // Pair against the immutable begin record, never the current budget/armed state.
+    if (children.froze_base) {
+        kv_base->vbr_retier_freeze_end(owner, operation_id);
     }
-    if (kv_swa->vbr_retier_freeze_active()) {
-        kv_swa->vbr_retier_freeze_end(owner, started_ns);
+    if (children.froze_swa) {
+        kv_swa->vbr_retier_freeze_end(owner, operation_id);
     }
+    vbr_retier_freeze_depth_--;
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {};
 }
 
 llama_memory_vbr_preflight_data llama_kv_cache_iswa::vbr_retier_preflight(

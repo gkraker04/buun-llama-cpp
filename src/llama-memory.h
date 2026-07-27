@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-vbr-operation.h"
 
 #include <map>
 #include <memory>
@@ -153,9 +154,13 @@ struct llama_memory_i {
         return {};
     }
 
-    // Scoped dynamic-VBR representation freeze. Non-VBR memories use the inert defaults.
-    virtual uint64_t vbr_retier_freeze_begin(const char * /*owner*/) { return 0; }
-    virtual void vbr_retier_freeze_end(const char * /*owner*/, uint64_t /*started_ns*/) {}
+    // Scoped dynamic-VBR representation freeze. The public top-level wrapper mints the
+    // process-global operation ID once; composites only forward it. Non-VBR memories stay inert.
+    virtual bool vbr_operation_armed() const { return false; }
+    virtual bool vbr_retier_freeze_begin(
+            const char * /*owner*/, vbr_operation_id /*operation_id*/) { return false; }
+    virtual void vbr_retier_freeze_end(
+            const char * /*owner*/, vbr_operation_id /*operation_id*/) {}
     virtual llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t /*n_tokens_extra*/) const {
         llama_memory_vbr_preflight_data r = {};
         r.fits = true;

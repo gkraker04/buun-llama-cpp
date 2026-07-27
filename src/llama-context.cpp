@@ -9519,18 +9519,41 @@ struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, ll
 
 uint64_t llama_memory_vbr_retier_freeze_begin(
         llama_memory_t mem, const char * owner) {
-    if (!mem) {
+    if (!mem || !mem->vbr_operation_armed()) {
         return 0;
     }
-    return mem->vbr_retier_freeze_begin(owner);
+
+    vbr_operation_binding binding = {};
+    binding.kind        = vbr_operation_kind::retier_freeze;
+    binding.child_phase = vbr_operation_phase::root;
+    const vbr_operation_id operation_id =
+        vbr_operation_registry_begin(binding);
+    if (!operation_id) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=allocator_or_registry_exhausted owner=%s\n",
+                owner != nullptr ? owner : "-");
+        return 0;
+    }
+    if (!mem->vbr_retier_freeze_begin(owner, operation_id)) {
+        const bool ended = vbr_operation_registry_end(operation_id);
+        GGML_ASSERT(ended);
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=child_bind_failed owner=%s "
+                "operation_id=%llu\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value);
+        return 0;
+    }
+    return operation_id.value;
 }
 
 void llama_memory_vbr_retier_freeze_end(
-        llama_memory_t mem, const char * owner, uint64_t started_ns) {
-    if (!mem || started_ns == 0) {
+        llama_memory_t mem, const char * owner, uint64_t operation_id_value) {
+    if (!mem || operation_id_value == 0) {
         return;
     }
-    mem->vbr_retier_freeze_end(owner, started_ns);
+    const vbr_operation_id operation_id = { operation_id_value };
+    GGML_ASSERT(vbr_operation_registry_is_live(operation_id));
+    mem->vbr_retier_freeze_end(owner, operation_id);
+    GGML_ASSERT(vbr_operation_registry_end(operation_id));
 }
 
 struct llama_memory_vbr_preflight_data llama_memory_vbr_retier_preflight(

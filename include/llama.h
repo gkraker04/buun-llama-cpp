@@ -926,14 +926,15 @@ extern "C" {
 
     // Dynamic-VBR scoped retier freeze. This suspends representation mutations only; ordinary
     // memory bookkeeping and decode remain live. The outermost exit arms a fresh controller
-    // evaluation at the next safe decode/idle boundary. begin returns a timestamp token for end,
-    // or 0 when this memory has no active dynamic-VBR controller. owner must remain valid until end.
+    // evaluation at the next safe decode/idle boundary. begin returns an opaque process-local
+    // operation ID for end, or 0 when this memory has no active dynamic-VBR controller. The ID is
+    // nonzero/non-reusing and is never serialized. owner must remain valid until end.
     // [EXPERIMENTAL]
     LLAMA_API uint64_t llama_memory_vbr_retier_freeze_begin(
             llama_memory_t mem, const char * owner);
 
     LLAMA_API void llama_memory_vbr_retier_freeze_end(
-            llama_memory_t mem, const char * owner, uint64_t started_ns);
+            llama_memory_t mem, const char * owner, uint64_t operation_id);
 
     // Non-mutating footprint check at the CURRENT tiers. Every VMM pool must fit independently;
     // bytes_needed/available are sums for observability, while max_deficit and fits preserve the

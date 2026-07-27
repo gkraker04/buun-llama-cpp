@@ -81,6 +81,20 @@ struct llama_kv_cache_vbr_epoch_test {
     static bool reconcile(llama_kv_cache * kv) {
         return kv->vbr_retier_take_reconcile("unit_test");
     }
+
+    static uint64_t freeze_operation_id(const llama_kv_cache * kv) {
+        if (kv->vbr_retier_freeze_depth_ == 0) {
+            return 0;
+        }
+        return kv->vbr_retier_freeze_stack_[kv->vbr_retier_freeze_depth_ - 1]
+            .operation_id.value;
+    }
+
+    static uint64_t set_budget_bytes(llama_kv_cache * kv, uint64_t budget_bytes) {
+        const uint64_t previous = kv->vbr_budget_bytes_;
+        kv->vbr_budget_bytes_ = budget_bytes;
+        return previous;
+    }
 };
 
 static bool decode_one(llama_context * ctx) {
@@ -135,6 +149,38 @@ int main(int argc, char ** argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s MODEL\n", argv[0]);
         return 1;
+    }
+
+    // A0 registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
+    // completed identity is never returned by the next operation.
+    uint64_t first_registry_id = 0;
+    {
+        vbr_operation_binding binding = {};
+        binding.kind = vbr_operation_kind::state_export;
+        vbr_operation_registry_guard guard(binding);
+        if (!guard.active()) {
+            fprintf(stderr, "A0 registry RAII guard failed to mint an operation ID\n");
+            return 1;
+        }
+        first_registry_id = guard.binding().operation_id.value;
+        if (!vbr_operation_registry_is_live(guard.binding().operation_id)) {
+            fprintf(stderr, "A0 registry did not expose its live RAII operation\n");
+            return 1;
+        }
+    }
+    if (vbr_operation_registry_is_live({ first_registry_id })) {
+        fprintf(stderr, "A0 registry RAII guard left a completed operation live\n");
+        return 1;
+    }
+    {
+        vbr_operation_binding binding = {};
+        binding.kind = vbr_operation_kind::state_export;
+        vbr_operation_registry_guard guard(binding);
+        if (!guard.active() ||
+            guard.binding().operation_id.value == first_registry_id) {
+            fprintf(stderr, "A0 registry reused an operation ID\n");
+            return 1;
+        }
     }
 
     ggml_backend_load_all();
@@ -295,6 +341,20 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "inner iSWA scoped freeze did not acquire\n");
         return 1;
     }
+    if (outer == inner) {
+        fprintf(stderr, "nested VBR operations reused an operation ID\n");
+        return 1;
+    }
+    if (!vbr_operation_registry_is_live({ outer }) ||
+        !vbr_operation_registry_is_live({ inner })) {
+        fprintf(stderr, "nested VBR operation IDs were not both live\n");
+        return 1;
+    }
+    if (llama_kv_cache_vbr_epoch_test::freeze_operation_id(base) != inner ||
+        llama_kv_cache_vbr_epoch_test::freeze_operation_id(swa)  != inner) {
+        fprintf(stderr, "iSWA children did not receive the identical inner operation ID\n");
+        return 1;
+    }
     if (nested.retier_freeze_depth != 2) {
         fprintf(stderr, "nested iSWA scoped freeze reported the wrong depth\n");
         return 1;
@@ -322,12 +382,35 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "scoped freeze counted an unexpected number of deferred child decisions\n");
         return 1;
     }
+    // A0 amendment: simulate future runtime budget renegotiation while the operation is live.
+    // iSWA end must pair from the immutable begin record even though base now reports disarmed.
+    const uint64_t base_budget =
+        llama_kv_cache_vbr_epoch_test::set_budget_bytes(base, 0);
     llama_memory_vbr_retier_freeze_end(mem, "epoch_test_inner", inner);
+    llama_kv_cache_vbr_epoch_test::set_budget_bytes(base, base_budget);
+    if (vbr_operation_registry_is_live({ inner })) {
+        fprintf(stderr, "inner VBR operation remained live after end\n");
+        return 1;
+    }
+    if (llama_kv_cache_vbr_epoch_test::freeze_operation_id(base) != outer ||
+        llama_kv_cache_vbr_epoch_test::freeze_operation_id(swa)  != outer) {
+        fprintf(stderr, "iSWA armed-flip pairing did not restore the identical outer operation ID\n");
+        return 1;
+    }
     if (llama_memory_vbr_state(mem, 0, 0).retier_freeze_depth != 1) {
         fprintf(stderr, "inner scoped-freeze exit released the outer scope\n");
         return 1;
     }
     llama_memory_vbr_retier_freeze_end(mem, "epoch_test_outer", outer);
+    if (vbr_operation_registry_is_live({ outer })) {
+        fprintf(stderr, "outer VBR operation remained live after end\n");
+        return 1;
+    }
+    if (llama_kv_cache_vbr_epoch_test::freeze_operation_id(base) != 0 ||
+        llama_kv_cache_vbr_epoch_test::freeze_operation_id(swa)  != 0) {
+        fprintf(stderr, "iSWA child retained an operation ID after outer end\n");
+        return 1;
+    }
     const auto unfrozen = llama_memory_vbr_state(mem, 0, 0);
     if (unfrozen.retier_freeze_depth != 0) {
         fprintf(stderr, "outer scoped-freeze exit left a nonzero depth\n");

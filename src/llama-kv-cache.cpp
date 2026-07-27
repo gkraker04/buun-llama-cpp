@@ -4317,38 +4317,72 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     return st;
 }
 
-uint64_t llama_kv_cache::vbr_retier_freeze_begin(const char * owner) {
+bool llama_kv_cache::vbr_operation_armed() const {
     if (other) {
-        return other->vbr_retier_freeze_begin(owner);
+        return other->vbr_operation_armed();
     }
-    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
-        return 0;
+    return vbr_vmm_active() && vbr_budget_bytes_ > 0;
+}
+
+bool llama_kv_cache::vbr_retier_freeze_begin(
+        const char * owner, vbr_operation_id operation_id) {
+    if (other) {
+        return other->vbr_retier_freeze_begin(owner, operation_id);
+    }
+    if (!vbr_operation_armed()) {
+        return false;
+    }
+    if (!vbr_operation_registry_is_live(operation_id)) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=unregistered_id owner=%s operation_id=%llu\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value);
+        return false;
+    }
+    if (vbr_retier_freeze_depth_ >= VBR_RETIER_FREEZE_MAX_DEPTH) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=freeze_depth_limit owner=%s "
+                "operation_id=%llu depth=%u\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value,
+                vbr_retier_freeze_depth_);
+        return false;
     }
     const uint64_t now = llama_vram_ledger_now_ns();
     if (vbr_retier_freeze_depth_ == 0) {
         vbr_retier_outer_deferred_base_ = vbr_retier_deferred_decisions_;
     }
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {
+        operation_id,
+        now != 0 ? now : 1,
+    };
     vbr_retier_freeze_depth_++;
     vbr_retier_freeze_enters_++;
-    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=enter controller=%s owner=%s depth=%u env_freeze=%u enters_total=%llu\n",
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=enter controller=%s owner=%s operation_id=%llu "
+            "depth=%u env_freeze=%u enters_total=%llu\n",
             vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
-            owner != nullptr ? owner : "-", vbr_retier_freeze_depth_, vbr_freeze_ ? 1u : 0u,
+            owner != nullptr ? owner : "-",
+            (unsigned long long) operation_id.value,
+            vbr_retier_freeze_depth_, vbr_freeze_ ? 1u : 0u,
             (unsigned long long) vbr_retier_freeze_enters_);
-    return now != 0 ? now : 1;
+    return true;
 }
 
 void llama_kv_cache::vbr_retier_freeze_end(
-        const char * owner, uint64_t started_ns) {
+        const char * owner, vbr_operation_id operation_id) {
     if (other) {
-        other->vbr_retier_freeze_end(owner, started_ns);
+        other->vbr_retier_freeze_end(owner, operation_id);
         return;
     }
     GGML_ASSERT(vbr_retier_freeze_depth_ > 0);
+    const vbr_retier_freeze_frame frame =
+        vbr_retier_freeze_stack_[vbr_retier_freeze_depth_ - 1];
+    GGML_ASSERT(frame.operation_id == operation_id);
+    GGML_ASSERT(vbr_operation_registry_is_live(operation_id));
     const uint64_t now = llama_vram_ledger_now_ns();
     vbr_retier_freeze_depth_--;
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {};
     vbr_retier_freeze_exits_++;
     const uint64_t duration_us =
-        now > started_ns ? (now - started_ns) / 1000 : 0;
+        now > frame.started_ns ? (now - frame.started_ns) / 1000 : 0;
     const uint64_t deferred_scope =
         vbr_retier_deferred_decisions_ - vbr_retier_outer_deferred_base_;
     if (vbr_retier_freeze_depth_ == 0 && !vbr_freeze_) {
@@ -4356,10 +4390,13 @@ void llama_kv_cache::vbr_retier_freeze_end(
         // decision pass at the next safe boundary; never execute a stale queued choice here.
         vbr_retier_reconcile_pending_ = true;
     }
-    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s depth=%u duration_us=%llu "
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s operation_id=%llu "
+            "depth=%u duration_us=%llu "
             "deferred_scope=%llu deferred_total=%llu exits_total=%llu action=%s\n",
             vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
-            owner != nullptr ? owner : "-", vbr_retier_freeze_depth_,
+            owner != nullptr ? owner : "-",
+            (unsigned long long) operation_id.value,
+            vbr_retier_freeze_depth_,
             (unsigned long long) duration_us,
             (unsigned long long) deferred_scope,
             (unsigned long long) vbr_retier_deferred_decisions_,

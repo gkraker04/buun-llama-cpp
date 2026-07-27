@@ -69,11 +69,14 @@ public:
         return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
     }
 
-    uint64_t vbr_retier_freeze_begin(const char * owner) override {
-        return mem_attn->vbr_retier_freeze_begin(owner);
+    bool vbr_operation_armed() const override {
+        return mem_attn->vbr_operation_armed();
     }
-    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override {
-        mem_attn->vbr_retier_freeze_end(owner, started_ns);
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override {
+        return mem_attn->vbr_retier_freeze_begin(owner, operation_id);
+    }
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override {
+        mem_attn->vbr_retier_freeze_end(owner, operation_id);
     }
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override {
         return mem_attn->vbr_retier_preflight(n_tokens_extra);

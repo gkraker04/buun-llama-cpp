@@ -2,6 +2,7 @@
 
 #include "llama-kv-cache.h"
 
+#include <array>
 #include <vector>
 
 //
@@ -72,8 +73,9 @@ public:
     double kv_bpv() const override; // value-weighted combination of the base and SWA caches
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
-    uint64_t vbr_retier_freeze_begin(const char * owner) override;
-    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override;
+    bool vbr_operation_armed() const override;
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
 
     // summed across both children: each context token holds one row in each cache, so the
@@ -127,11 +129,23 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    struct vbr_retier_freeze_children {
+        vbr_operation_id operation_id = {};
+        bool froze_base = false;
+        bool froze_swa  = false;
+    };
+    static constexpr size_t VBR_RETIER_FREEZE_MAX_DEPTH = 64;
+
     const bool swa_full;
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+
+    // Exact begin/end pairing must not consult mutable armed policy at end. Runtime budget
+    // renegotiation may change vbr_operation_armed() while a nested scope is live.
+    std::array<vbr_retier_freeze_children, VBR_RETIER_FREEZE_MAX_DEPTH> vbr_retier_freeze_stack_ = {};
+    uint32_t vbr_retier_freeze_depth_ = 0;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {

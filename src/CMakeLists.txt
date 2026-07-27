@@ -37,6 +37,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
+            llama-vbr-operation.cpp
             llama-vram-demand.cpp
             llama-vram-ledger.cpp
             unicode-data.cpp

@@ -264,6 +264,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 endif()
 
+add_test(
+    NAME test-vbr-operation-registry-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-operation-registry.cmake
+)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

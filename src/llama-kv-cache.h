@@ -8,6 +8,7 @@
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
+#include <array>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -192,8 +193,9 @@ public:
     double kv_bpv() const override;
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
-    uint64_t vbr_retier_freeze_begin(const char * owner) override;
-    void vbr_retier_freeze_end(const char * owner, uint64_t started_ns) override;
+    bool vbr_operation_armed() const override;
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
     bool vbr_retier_freeze_active() const {
         return other ? other->vbr_retier_freeze_active() : vbr_retier_freeze_depth_ > 0;
@@ -535,6 +537,12 @@ private:
     bool     vbr_freeze_           = false;
     // WS-6: production scoped freeze of representation mutation. Orthogonal to WS-0's
     // deterministic-input freeze above: nesting never changes the ledger/presence machinery.
+    struct vbr_retier_freeze_frame {
+        vbr_operation_id operation_id = {};
+        uint64_t started_ns = 0;
+    };
+    static constexpr size_t VBR_RETIER_FREEZE_MAX_DEPTH = 64;
+    std::array<vbr_retier_freeze_frame, VBR_RETIER_FREEZE_MAX_DEPTH> vbr_retier_freeze_stack_ = {};
     uint32_t vbr_retier_freeze_depth_       = 0;
     uint64_t vbr_retier_freeze_enters_      = 0;
     uint64_t vbr_retier_freeze_exits_       = 0;

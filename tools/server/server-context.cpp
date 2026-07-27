@@ -84,12 +84,12 @@ class server_vbr_retier_freeze_scope {
 public:
     server_vbr_retier_freeze_scope(llama_memory_t mem, const char * owner) :
         mem(mem), owner(owner),
-        started_ns(llama_memory_vbr_retier_freeze_begin(mem, owner)) {
+        operation_id(llama_memory_vbr_retier_freeze_begin(mem, owner)) {
     }
 
     ~server_vbr_retier_freeze_scope() {
-        if (started_ns != 0) {
-            llama_memory_vbr_retier_freeze_end(mem, owner, started_ns);
+        if (operation_id != 0) {
+            llama_memory_vbr_retier_freeze_end(mem, owner, operation_id);
         }
     }
 
@@ -97,13 +97,13 @@ public:
     server_vbr_retier_freeze_scope & operator=(const server_vbr_retier_freeze_scope &) = delete;
 
     bool active() const {
-        return started_ns != 0;
+        return operation_id != 0;
     }
 
 private:
     llama_memory_t mem;
     const char * owner;
-    uint64_t started_ns;
+    uint64_t operation_id;
 };
 
 // defined near get_model_info(); shared by the /props and /models responses
