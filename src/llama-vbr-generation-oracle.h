@@ -48,3 +48,15 @@ vbr_generation_oracle_result vbr_generation_oracle_audit(
     const std::vector<vbr_generation_oracle_cell> & canonical_cells,
     const vbr_generation_oracle_baseline &          baseline,
     const vbr_checkpoint_generation_stream &        production_record);
+
+// §6.2 strict-accept audit sampling policy. Pure and SHIPPED DISABLED: no production caller
+// until the commit-3 selection/evaluation consumer integrates it; never an admission input.
+// Destructive/import crossings always audit; append-only observations audit deterministically
+// at 1/256 keyed on the identity digest (same digest => same verdict); forced always audits.
+bool vbr_generation_oracle_audit_due(bool                            destructive_or_import_crossing,
+                                     const std::array<uint8_t, 32> & identity_digest,
+                                     bool                            forced_audit);
+
+// Env probe for the forced-audit override (VBR_GENERATION_FORCE_AUDIT), probed per call like
+// the oracle gate so tests can toggle it mid-process.
+bool vbr_generation_oracle_audit_forced();

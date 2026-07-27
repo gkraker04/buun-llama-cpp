@@ -1698,10 +1698,12 @@ bool server_prompt_cache::contains(const server_tokens & tokens, const std::stri
 }
 
 std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
-    // calculate checkpoints size to see if it will fit with the prompt
+    // calculate checkpoints size to see if it will fit with the prompt. This prices the
+    // invalidate-first COPY made below (checkpoint copies drop their generation-record shadow),
+    // so admission and eviction stay byte-identical to pre-shadow accounting.
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size += ckpt.size_without_shadow();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;

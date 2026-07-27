@@ -65,6 +65,8 @@ add_library(${TARGET}
     chat-peg-parser.h
     chat.cpp
     chat.h
+    common-checkpoint-shadow.cpp
+    common-checkpoint-shadow.h
     common.cpp
     common.h
     console.cpp
@@ -126,6 +128,12 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+# common-checkpoint-shadow.cpp is the ONE common TU allowed to reach the internal VBR
+# checkpoint bridge header — the include path is granted to that single source file, so the
+# compiler (not just the CI symbol scans in tests/check-vbr-generation-isolation.cmake)
+# enforces that no other common TU reaches libllama internals.
+set_source_files_properties(common-checkpoint-shadow.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

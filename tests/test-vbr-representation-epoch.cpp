@@ -1,6 +1,8 @@
 #include "common.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-vbr-checkpoint.h"
+#include "llama-vbr-checkpoint-compose.inc"
 #include "llama-vbr-generation-oracle.h"
 #include "llama.h"
 
@@ -134,6 +136,94 @@ struct llama_kv_cache_vbr_epoch_test {
         const uint64_t previous = kv->vbr_budget_bytes_;
         kv->vbr_budget_bytes_ = budget_bytes;
         return previous;
+    }
+
+    static vbr_generation_tracker * tracker_mut(llama_kv_cache * kv) {
+        return kv->vbr_generation_tracker_mut();
+    }
+
+    static const vbr_generation_tracker * tracker_get(const llama_kv_cache * kv) {
+        return kv->vbr_generation_tracker_get();
+    }
+
+    // C2 rows (b)/(c): a REAL provenance-bearing root scope with a deliberately narrow
+    // manifest (seq 0, positions [0,2)). Returned open so nested production mutations join
+    // it; closing WITHOUT succeed() is the production FAILED close (autorecords recovery).
+    static void * open_narrow_trim_scope(llama_kv_cache * kv) {
+        auto * tracker = kv->vbr_generation_tracker_mut();
+        if (tracker == nullptr) {
+            return nullptr;
+        }
+        const auto pool = tracker->pool_identity();
+        vbr_operation_binding binding;
+        binding.kind        = vbr_operation_kind::sequence_edit;
+        binding.child_phase = vbr_operation_phase::mutate;
+        binding.n_targets   = 2;
+        binding.targets[0]  = vbr_make_target(vbr_operation_kind::sequence_edit,
+                                              vbr_operation_class::explicit_destructive_trim,
+                                              pool.hi, pool.lo, 0, 0, 0, 2);
+        // real nested seq_rm authenticates as membership-only state_api
+        // (llama-kv-cache.cpp seq_rm scope); authorize that class on the SAME narrow range so
+        // its refusal happens at per-stamp range selection (positions >= 2), never at
+        // begin-time class authentication
+        binding.targets[1]  = vbr_make_target(vbr_operation_kind::sequence_edit,
+                                              vbr_operation_class::state_api,
+                                              pool.hi, pool.lo, 0, 0, 0, 2);
+        auto * op = new llama_kv_cache::vbr_mutation_op(kv, binding, /*provenance_bearing=*/true);
+        if (!op->active()) {
+            delete op;
+            return nullptr;
+        }
+        return op;
+    }
+
+    static void close_scope_without_success(void * scope) {
+        delete static_cast<llama_kv_cache::vbr_mutation_op *>(scope);
+    }
+
+    // C2 row (b): joined poison through the production citation/stamp path — the event cites
+    // the open root scope and the stamped pre-mutation position (100) is outside the
+    // manifest, so vbr_stamp() refuses it and poisons the root.
+    static bool stamp_outside_manifest(llama_kv_cache * kv, void * scope) {
+        auto * op = static_cast<llama_kv_cache::vbr_mutation_op *>(scope);
+        auto event = kv->vbr_generation_begin(
+                vbr_mutation_registrant::seq_rm,
+                vbr_operation_class::explicit_destructive_trim,
+                0,
+                vbr_generation_stamp_kind::membership,
+                /*destructive=*/true);
+        if (!event) {
+            return false;
+        }
+        kv->vbr_stamp(*op, event, /*cell=*/3, /*membership_seq=*/0, /*pre_mutation_pos=*/100);
+        return event.finish();
+    }
+
+    // C2 row (e): fence-race seam — after decode SUBMISSION and before the synchronize
+    // fence, one in-flight operation's per-target evidence goes stale via a slab reset. The
+    // fence's commit then fails through the REAL terminal path (latch + fail handles +
+    // FAILED close/report).
+    static bool inject_stale_submitted_extent(llama_kv_cache * kv) {
+        auto * tracker = kv->vbr_generation_tracker_mut();
+        if (tracker == nullptr) {
+            return false;
+        }
+        auto & store  = tracker->extent_store();
+        auto   handle = store.reserve(vbr_mutation_family::trim,
+                                      vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 1);
+        if (!handle || !store.submit(handle)) {
+            return false;
+        }
+        store.reset_all();  // slab reset: the submitted handle is obsolete at the fence
+        if (!kv->vbr_awaiting_commit_.empty()) {
+            kv->vbr_awaiting_commit_.front().extents[0] = handle;
+            return true;
+        }
+        if (!kv->vbr_pending_decode_ops_.empty()) {
+            kv->vbr_pending_decode_ops_.front().extents[0] = handle;
+            return true;
+        }
+        return false;
     }
 };
 
@@ -1534,6 +1624,853 @@ static bool run_a2_cpu_tests() {
     return true;
 }
 
+// --- C2 (commit 2): composite bridge assembly, identity digest, §6.2 policy, oracle rows ------
+
+struct c2_capture_fixture {
+    const vbr_generation_tracker *           tracker = nullptr;
+    const vbr_checkpoint_generation_stream * stream  = nullptr;
+};
+
+static bool c2_capture_cb(void * ctx, uint32_t child_id, vbr_checkpoint_generation_controller & out) {
+    const auto * fixture = static_cast<const c2_capture_fixture *>(ctx);
+    return vbr_generation_capture_controller(
+            *fixture->tracker, child_id, checkpoint_child_dependency_mode::live_guarded,
+            { *fixture->stream }, out);
+}
+
+static bool run_c2_cpu_tests() {
+    // armed-child fixture: one tracker with two stamped dependency cells and a captured stream
+    vbr_generation_tracker tracker(1, 512, 1);
+    if (!tracker.active() || !tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full)) {
+        fprintf(stderr, "C2 tracker did not initialize\n");
+        return false;
+    }
+    test_operation op(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+                      0, std::numeric_limits<llama_pos>::max(),
+                      vbr_operation_class::ordinary_decode);
+    auto append = tracker.begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode,
+            0,
+            vbr_generation_stamp_kind::dependency,
+            op.id());
+    if (!append || !tracker.stamp_cell(append, 10, 0) ||
+            !tracker.stamp_cell(append, 300, 0) || !append.finish()) {
+        fprintf(stderr, "C2 fixture event did not publish atomically\n");
+        return false;
+    }
+    vbr_checkpoint_generation_stream stream;
+    if (!vbr_generation_capture_stream(tracker, 0, 0, 400, { 10, 300 }, stream)) {
+        fprintf(stderr, "C2 fixture stream capture failed\n");
+        return false;
+    }
+    c2_capture_fixture fixture{ &tracker, &stream };
+
+    vbr_checkpoint_frontier_fields frontier;
+    const std::string exec_id    = "c2-exec-identity";
+    const std::string adapter_id = "c2-adapter-identity";
+    const std::string media_id   = "c2-media-identity";
+    frontier.execution_identity          = exec_id.c_str();
+    frontier.execution_identity_len      = exec_id.size();
+    frontier.adapter_config_identity     = adapter_id.c_str();
+    frontier.adapter_config_identity_len = adapter_id.size();
+    frontier.media_content_identity      = media_id.c_str();
+    frontier.media_content_identity_len  = media_id.size();
+    frontier.sequence_epoch = 7;
+    frontier.token_count    = 400;
+    frontier.next_position  = 400;
+
+    vbr_checkpoint_child_input armed_lg;
+    armed_lg.live_guarded = true;
+    armed_lg.armed        = true;
+    armed_lg.pool_uuid    = tracker.pool_identity();
+    armed_lg.capture      = c2_capture_cb;
+    armed_lg.capture_ctx  = &fixture;
+
+    // §11.1 row 16: an unarmed live_guarded child WITH nonempty live coverage makes the whole
+    // matrix unavailable — never server-invented coverage.
+    {
+        vbr_checkpoint_child_input unarmed_covered;
+        unarmed_covered.live_guarded = true;
+        unarmed_covered.live_covered = true;
+        vbr_checkpoint_generation_record record;
+        const auto reason = vbr_checkpoint_compose({ armed_lg, unarmed_covered }, frontier, record);
+        if (reason != vbr_checkpoint_capture_reason::unarmed_live_covered ||
+                record.status == vbr_checkpoint_generation_status::complete) {
+            fprintf(stderr, "C2 row 16: unarmed live-covered child did not refuse the capture\n");
+            return false;
+        }
+    }
+
+    // §11.1 row 17 + composite shape: an unarmed payload_complete child is a vacuous row inside
+    // a COMPLETE record; child ids are traversal ordinals.
+    vbr_checkpoint_generation_record record;
+    {
+        vbr_checkpoint_child_input unarmed_pc;
+        unarmed_pc.live_guarded = false;
+        const auto reason = vbr_checkpoint_compose({ armed_lg, unarmed_pc }, frontier, record);
+        if (reason != vbr_checkpoint_capture_reason::ok ||
+                record.status != vbr_checkpoint_generation_status::complete ||
+                record.controllers.size() != 2 ||
+                record.controllers[0].child_id != 0 ||
+                record.controllers[0].dependency_mode != checkpoint_child_dependency_mode::live_guarded ||
+                record.controllers[1].child_id != 1 ||
+                record.controllers[1].dependency_mode != checkpoint_child_dependency_mode::payload_complete ||
+                !record.controllers[1].streams.empty() ||
+                !record.controllers[1].units.empty() ||
+                record.controllers[1].pool_uuid.hi != 0 || record.controllers[1].pool_uuid.lo != 0) {
+            fprintf(stderr, "C2 row 17: unarmed payload_complete child was not a vacuous row\n");
+            return false;
+        }
+    }
+
+    // fully unarmed memory: not applicable, never a failure
+    {
+        vbr_checkpoint_child_input unarmed_lg;
+        unarmed_lg.live_guarded = true;
+        vbr_checkpoint_child_input unarmed_pc;
+        vbr_checkpoint_generation_record unused;
+        if (vbr_checkpoint_compose({ unarmed_lg, unarmed_pc }, frontier, unused) !=
+                vbr_checkpoint_capture_reason::not_applicable) {
+            fprintf(stderr, "C2 fully-unarmed composite was not classified not_applicable\n");
+            return false;
+        }
+    }
+
+    // F5: an armed payload_complete child must carry its exact nonzero pool identity
+    {
+        vbr_checkpoint_child_input armed_pc;
+        armed_pc.armed = true;  // pool_uuid deliberately zero
+        vbr_checkpoint_generation_record unused;
+        if (vbr_checkpoint_compose({ armed_lg, armed_pc }, frontier, unused) !=
+                vbr_checkpoint_capture_reason::child_capture_failed) {
+            fprintf(stderr, "C2 armed payload_complete child with zero pool identity was accepted\n");
+            return false;
+        }
+        armed_pc.pool_uuid = tracker.pool_identity();
+        if (vbr_checkpoint_compose({ armed_lg, armed_pc }, frontier, unused) !=
+                    vbr_checkpoint_capture_reason::ok ||
+                unused.controllers[1].pool_uuid != tracker.pool_identity()) {
+            fprintf(stderr, "C2 armed payload_complete child did not record its pool identity\n");
+            return false;
+        }
+    }
+
+    // F2: canonical digest — shared helper reproduces the record digest; identity and policy
+    // envelope changes both move it
+    {
+        std::vector<vbr_checkpoint_child_policy> policy;
+        for (const auto & controller : record.controllers) {
+            policy.push_back({ controller.child_id, controller.dependency_mode, controller.pool_uuid });
+        }
+        if (vbr_checkpoint_identity_digest(frontier, policy) != record.identity_policy_order_digest) {
+            fprintf(stderr, "C2 digest helper diverged from the composed record digest\n");
+            return false;
+        }
+        auto other_frontier = frontier;
+        const std::string other_adapter = "c2-adapter-identity-b";
+        other_frontier.adapter_config_identity     = other_adapter.c_str();
+        other_frontier.adapter_config_identity_len = other_adapter.size();
+        if (vbr_checkpoint_identity_digest(other_frontier, policy) == record.identity_policy_order_digest) {
+            fprintf(stderr, "C2 digest ignored an adapter identity change\n");
+            return false;
+        }
+        auto other_policy = policy;
+        other_policy[1].mode = checkpoint_child_dependency_mode::live_guarded;
+        if (vbr_checkpoint_identity_digest(frontier, other_policy) == record.identity_policy_order_digest) {
+            fprintf(stderr, "C2 digest ignored a dependency-mode change\n");
+            return false;
+        }
+    }
+
+    // the composed two-child record round-trips through the sole evaluator
+    a1_membership_fixture membership;
+    membership.present.resize(512);
+    membership.present[10]  = 1;
+    membership.present[300] = 1;
+    vbr_generation_live_view live;
+    {
+        live.legacy_eligible = true;
+        live.identity_policy_order_digest = record.identity_policy_order_digest;
+
+        vbr_generation_live_stream_view live_stream;
+        live_stream.stream_index           = 0;
+        live_stream.dependency_seq_id      = 0;
+        live_stream.computation_frontier   = 400;
+        live_stream.exact_dependency_count = 2;
+        live_stream.membership_context     = &membership;
+        live_stream.cell_has_seq           = a1_cell_has_seq;
+
+        vbr_generation_live_controller_view live_lg;
+        live_lg.child_id        = 0;
+        live_lg.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        live_lg.tracker         = &tracker;
+        live_lg.streams.push_back(live_stream);
+
+        vbr_generation_live_controller_view live_pc;
+        live_pc.child_id        = 1;
+        live_pc.dependency_mode = checkpoint_child_dependency_mode::payload_complete;
+
+        live.controllers.push_back(std::move(live_lg));
+        live.controllers.push_back(std::move(live_pc));
+    }
+    auto result = checkpoint_vbr_eligibility(record, live);
+    if (result.category != vbr_checkpoint_eligibility_category::strict_accept) {
+        fprintf(stderr, "C2 composed two-child record was not strict-accepted (reason %d)\n",
+                (int) result.reason);
+        return false;
+    }
+
+    // payload_complete controllers with nonzero streams reject
+    {
+        auto malformed = record;
+        malformed.controllers[1].streams.push_back(stream);
+        if (checkpoint_vbr_eligibility(malformed, live).reason !=
+                vbr_checkpoint_eligibility_reason::stream_shape) {
+            fprintf(stderr, "C2 payload_complete controller with streams was accepted\n");
+            return false;
+        }
+    }
+
+    // non-increasing child ids reject (child_order)
+    {
+        auto malformed   = record;
+        auto ordered_live = live;
+        malformed.controllers[0].child_id    = 1;
+        ordered_live.controllers[0].child_id = 1;
+        if (checkpoint_vbr_eligibility(malformed, ordered_live).reason !=
+                vbr_checkpoint_eligibility_reason::child_order) {
+            fprintf(stderr, "C2 non-increasing child order was accepted\n");
+            return false;
+        }
+    }
+
+    // §6.2 sampling policy: pure, deterministic, crossing/forced always audit
+    {
+        std::array<uint8_t, 32> digest = {};
+        digest[0] = 0;
+        if (!vbr_generation_oracle_audit_due(false, digest, false) ||
+                !vbr_generation_oracle_audit_due(true, digest, false)) {
+            fprintf(stderr, "C2 §6.2 policy missed a mandatory audit\n");
+            return false;
+        }
+        digest[0] = 1;
+        if (vbr_generation_oracle_audit_due(false, digest, false) ||
+                vbr_generation_oracle_audit_due(false, digest, false) !=
+                        vbr_generation_oracle_audit_due(false, digest, false)) {
+            fprintf(stderr, "C2 §6.2 append-only sample was not deterministic\n");
+            return false;
+        }
+        if (!vbr_generation_oracle_audit_due(true, digest, false) ||
+                !vbr_generation_oracle_audit_due(false, digest, true)) {
+            fprintf(stderr, "C2 §6.2 crossing/forced audit did not fire\n");
+            return false;
+        }
+        unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+        if (vbr_generation_oracle_audit_forced()) {
+            fprintf(stderr, "C2 forced-audit override was not default-off\n");
+            return false;
+        }
+        set_test_env("VBR_GENERATION_FORCE_AUDIT", "1");
+        if (!vbr_generation_oracle_audit_forced()) {
+            fprintf(stderr, "C2 forced-audit env override did not engage\n");
+            return false;
+        }
+        unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+    }
+
+    // F6: equal-cardinality wrong-cell injection — the independent oracle rejects a production
+    // mask that covers the right COUNT of cells but a wrong member
+    {
+        std::vector<vbr_generation_oracle_cell> canonical = {
+            { 10,  10,  true,  true, false, nullptr, 0 },
+            { 20,  20,  false, true, false, nullptr, 0 },
+            { 300, 300, true,  true, false, nullptr, 0 },
+        };
+        set_test_env("VBR_GENERATION_ORACLE", "1");
+        const auto baseline = vbr_generation_oracle_capture(400, canonical);
+
+        vbr_checkpoint_generation_stream wrong_cell;
+        wrong_cell.stream_index              = 0;
+        wrong_cell.dependency_seq_id         = 0;
+        wrong_cell.computation_frontier      = 400;
+        wrong_cell.captured_dependency_count = 2;
+        vbr_generation_page_ref page0;
+        page0.page_index = 0;
+        page0.covered_mask[10 / 64] |= uint64_t(1) << (10 % 64);
+        vbr_generation_page_ref page1;
+        page1.page_index = 1;
+        const uint32_t wrong_offset = 301 - VBR_GENERATION_PAGE_CELLS;  // covers 301, not 300
+        page1.covered_mask[wrong_offset / 64] |= uint64_t(1) << (wrong_offset % 64);
+        wrong_cell.pages = { page0, page1 };
+
+        const auto audit = vbr_generation_oracle_audit(400, canonical, baseline, wrong_cell);
+        if (!audit.enabled || audit.set_equal ||
+                audit.independent_count != wrong_cell.captured_dependency_count) {
+            fprintf(stderr, "C2 equal-cardinality wrong-cell production mask was not rejected\n");
+            return false;
+        }
+        unset_test_env("VBR_GENERATION_ORACLE");
+    }
+
+    fprintf(stderr, "C2 composite bridge/digest/policy CPU coverage PASS\n");
+    return true;
+}
+
+// --- C2-P9 rung-1 rows (a)-(e): queued commit-1 GPU evidence rows on the live armed fixture --
+// Each row builds its own context so latched/poisoned state never leaks across rows. Row
+// shapes were review-approved before the dorei gate; threshold/geometry constants (window
+// coverage margins, drain-decode budget) may be tuned on the gate box without changing the
+// asserted properties.
+
+static bool c2_gpu_context(llama_model * model, uint32_t n_ctx, uint32_t n_batch,
+                           uint32_t n_seq_max, llama_context_ptr & out, bool swa_full = false) {
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx                 = n_ctx;
+    cparams.n_batch               = n_batch;
+    cparams.n_ubatch              = 32;
+    cparams.n_seq_max             = n_seq_max;
+    cparams.n_threads             = 2;
+    cparams.n_threads_batch       = 2;
+    cparams.kv_unified            = true;
+    cparams.swa_full              = swa_full;
+    cparams.type_k                = GGML_TYPE_F16;
+    cparams.type_v                = GGML_TYPE_F16;
+    cparams.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.vbr_dynamic           = true;
+    cparams.vbr_budget_explicit   = true;
+    // generous budget: these rows exercise evidence/recovery, not the degrade ladder
+    cparams.vbr_vram_budget_bytes = 1024ull * 1024 * 1024;
+    out.reset(llama_init_from_model(model, cparams));
+    return static_cast<bool>(out);
+}
+
+static bool c2_gpu_children(llama_memory_t mem, llama_kv_cache *& base, llama_kv_cache *& swa) {
+    if (!get_iswa_children(mem, base, swa)) {
+        return false;
+    }
+    return llama_kv_cache_vbr_epoch_test::active(base) && llama_kv_cache_vbr_epoch_test::active(swa);
+}
+
+// batched decode of [pos_begin, pos_end) for one sequence, fenced (decode is asynchronous)
+static bool c2_gpu_decode_range(llama_context * ctx, llama_seq_id seq,
+                                llama_pos pos_begin, llama_pos pos_end, int32_t n_batch) {
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    for (llama_pos pos = pos_begin; pos < pos_end; ) {
+        common_batch_clear(batch);
+        const llama_pos stop = std::min<llama_pos>(pos_end, pos + n_batch);
+        for (; pos < stop; ++pos) {
+            common_batch_add(batch, 1, pos, { seq }, pos + 1 == stop);
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            return false;
+        }
+        llama_synchronize(ctx);
+    }
+    llama_batch_free(batch);
+    return true;
+}
+
+static bool c2_bridge_capture_ok(llama_memory_t mem, int64_t n_past,
+                                 vbr_checkpoint_capture_reason & reason) {
+    static const std::string exec_id    = "c2-gpu-exec";
+    static const std::string adapter_id = "c2-gpu-adapter";
+    static const std::string media_id   = "c2-gpu-media";
+    vbr_checkpoint_frontier_fields frontier;
+    frontier.execution_identity          = exec_id.c_str();
+    frontier.execution_identity_len      = exec_id.size();
+    frontier.adapter_config_identity     = adapter_id.c_str();
+    frontier.adapter_config_identity_len = adapter_id.size();
+    frontier.media_content_identity      = media_id.c_str();
+    frontier.media_content_identity_len  = media_id.size();
+    frontier.sequence_epoch = 1;
+    frontier.token_count    = n_past;
+    frontier.next_position  = (llama_pos) n_past;
+    llama_vbr_checkpoint_capture_result result;
+    llama_vbr_checkpoint_shadow_capture(mem, 0, &frontier, &result);
+    reason = result.reason;
+    const bool ok = result.handle != nullptr;
+    llama_vbr_checkpoint_shadow_free(result.handle);
+    return ok;
+}
+
+// recovery-ring census for one owner pool: every non-free record reserved on behalf of that
+// pool. Sampled before/after a scope lifetime, the delta is the exact mint count for the
+// whole logical operation tree (the reservation's owner pool is immutable, v4 review F2).
+static int32_t c2_recovery_census_pool(const vbr_pool_uuid & pool) {
+    int32_t count = 0;
+    vbr_failed_operation_record record;
+    for (int32_t i = 0; vbr_recovery_get_record(i, record); ++i) {
+        if (record.state != vbr_recovery_state::free_slot &&
+                record.owner_pool_hi == pool.hi && record.owner_pool_lo == pool.lo) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// production quarantine drain: recovery work resolves at real decode boundaries — loop a
+// bounded number of single-token decodes until the child rearms
+static bool c2_gpu_drain_until_rearmed(llama_context * ctx, llama_kv_cache * kv,
+                                       llama_pos & pos_cursor) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (!c2_gpu_decode_range(ctx, 0, pos_cursor, pos_cursor + 1, 32)) {
+            return false;
+        }
+        ++pos_cursor;
+        const auto * tracker = llama_kv_cache_vbr_epoch_test::tracker_get(kv);
+        if (tracker != nullptr && !tracker->shadow_unavailable()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// row (d): a single llama_decode spanning more than eight ubatches — the pending->awaiting
+// evidence transfer must survive (commit-1 F5 capacity growth) and leave capture available
+static int c2_gpu_row_d(llama_model * model) {
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, 512, 384, 1, ctx)) {
+        fprintf(stderr, "row d: context creation failed\n");
+        return 1;
+    }
+    llama_kv_cache * base = nullptr;
+    llama_kv_cache * swa  = nullptr;
+    if (!c2_gpu_children(llama_get_memory(ctx.get()), base, swa)) {
+        fprintf(stderr, "row d: armed iSWA children unavailable\n");
+        return 1;
+    }
+    // 288 tokens / 32-token ubatches = 9 ubatches in ONE decode call
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, 288, 288)) {
+        fprintf(stderr, "row d: >8-ubatch decode failed\n");
+        return 1;
+    }
+    const auto * tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
+    if (tracker == nullptr || !tracker->stable() || tracker->shadow_unavailable()) {
+        fprintf(stderr, "row d: base tracker not stable/armed after 9-ubatch decode\n");
+        return 1;
+    }
+    vbr_checkpoint_capture_reason reason;
+    if (!c2_bridge_capture_ok(llama_get_memory(ctx.get()), 288, reason)) {
+        fprintf(stderr, "row d: capture unavailable after 9-ubatch decode (reason=%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(reason));
+        return 1;
+    }
+    fprintf(stderr, "C2 GPU row (d) >8-ubatch evidence PASS\n");
+    return 0;
+}
+
+// row (b): joined poison through the REAL scope/citation/stamp path — an event citing the
+// open root scope stamps a position outside its authenticated manifest; the root poisons,
+// its FAILED close autorecords exactly one recovery entry, and the composite stays
+// unavailable until the real decode-boundary drain resolves it
+static int c2_gpu_row_b(llama_model * model) {
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, 128, 32, 1, ctx)) {
+        fprintf(stderr, "row b: context creation failed\n");
+        return 1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    llama_kv_cache * base = nullptr;
+    llama_kv_cache * swa  = nullptr;
+    if (!c2_gpu_children(mem, base, swa)) {
+        fprintf(stderr, "row b: armed iSWA children unavailable\n");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, 4, 32)) {
+        fprintf(stderr, "row b: seed decode failed\n");
+        return 1;
+    }
+    const auto * tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
+    const auto pool = tracker->pool_identity();
+    const int32_t census_before = c2_recovery_census_pool(pool);
+    {
+        void * scope = llama_kv_cache_vbr_epoch_test::open_narrow_trim_scope(base);
+        if (scope == nullptr) {
+            fprintf(stderr, "row b: root scope did not open\n");
+            return 1;
+        }
+        const bool stamped = llama_kv_cache_vbr_epoch_test::stamp_outside_manifest(base, scope);
+        // production FAILED close: no succeed() — the eager recovery reservation records
+        llama_kv_cache_vbr_epoch_test::close_scope_without_success(scope);
+        if (!stamped) {
+            fprintf(stderr, "row b: cited event was unavailable\n");
+            return 1;
+        }
+    }
+    if (!tracker->shadow_unavailable()) {
+        fprintf(stderr, "row b: refused stamp did not latch shadow-unavailable\n");
+        return 1;
+    }
+    // the root's failed close autorecorded EXACTLY ONE recovery entry for this pool
+    if (c2_recovery_census_pool(pool) != census_before + 1 ||
+            !vbr_recovery_pending_for(pool.hi, pool.lo)) {
+        fprintf(stderr, "row b: failed close did not autorecord exactly one recovery entry\n");
+        return 1;
+    }
+    vbr_checkpoint_capture_reason reason;
+    if (c2_bridge_capture_ok(mem, 4, reason) ||
+            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+        fprintf(stderr, "row b: poisoned child did not make the composite unavailable\n");
+        return 1;
+    }
+    if (llama_kv_cache_vbr_epoch_test::tracker_mut(base)->try_rearm()) {
+        fprintf(stderr, "row b: rearm succeeded with unresolved recovery work pending\n");
+        return 1;
+    }
+    llama_pos pos_cursor = 4;
+    if (!c2_gpu_drain_until_rearmed(ctx.get(), base, pos_cursor)) {
+        fprintf(stderr, "row b: decode-boundary quarantine drain did not rearm the child\n");
+        return 1;
+    }
+    if (vbr_recovery_pending_for(pool.hi, pool.lo)) {
+        fprintf(stderr, "row b: quarantine remained pending after the drain\n");
+        return 1;
+    }
+    if (!c2_bridge_capture_ok(mem, (int64_t) pos_cursor, reason)) {
+        fprintf(stderr, "row b: capture still unavailable after recovery (reason=%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(reason));
+        return 1;
+    }
+    fprintf(stderr, "C2 GPU row (b) joined-poison/recovery PASS\n");
+    return 0;
+}
+
+// row (c): a narrow-manifest parent held open across a REAL nested iSWA mutation — the base
+// child JOINS the parent (its trim stamps are outside the parent manifest and poison the
+// root) while the SWA sibling proceeds under the wrapper's adopted identity. The whole
+// refused tree mints exactly ONE recovery record (pool-keyed census delta), the sibling
+// stays healthy, and the drain must restore full capture.
+static int c2_gpu_row_c(llama_model * model) {
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, 128, 32, 1, ctx)) {
+        fprintf(stderr, "row c: context creation failed\n");
+        return 1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    llama_kv_cache * base = nullptr;
+    llama_kv_cache * swa  = nullptr;
+    if (!c2_gpu_children(mem, base, swa)) {
+        fprintf(stderr, "row c: armed iSWA children unavailable\n");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, 8, 32)) {
+        fprintf(stderr, "row c: seed decode failed\n");
+        return 1;
+    }
+    const auto * base_tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
+    const auto * swa_tracker  = llama_kv_cache_vbr_epoch_test::tracker_get(swa);
+    const auto pool = base_tracker->pool_identity();
+    const int32_t census_before = c2_recovery_census_pool(pool);
+    {
+        void * scope = llama_kv_cache_vbr_epoch_test::open_narrow_trim_scope(base);
+        if (scope == nullptr) {
+            fprintf(stderr, "row c: parent scope did not open\n");
+            return 1;
+        }
+        // REAL nested mutation through the iSWA parent: the base child joins the open parent
+        // (whose manifest does not cover positions >= 6 -> refused stamps -> root poison);
+        // the SWA sibling runs under the wrapper's own adopted identity and stays clean
+        if (!llama_memory_seq_rm(mem, 0, 6, -1)) {
+            llama_kv_cache_vbr_epoch_test::close_scope_without_success(scope);
+            fprintf(stderr, "row c: nested trim rejected unexpectedly\n");
+            return 1;
+        }
+        llama_kv_cache_vbr_epoch_test::close_scope_without_success(scope);
+    }
+    if (!base_tracker->shadow_unavailable()) {
+        fprintf(stderr, "row c: joined-poisoned base child did not latch\n");
+        return 1;
+    }
+    if (swa_tracker->shadow_unavailable()) {
+        fprintf(stderr, "row c: healthy sibling was latched by the refused parent\n");
+        return 1;
+    }
+    // one-mint census: the whole nested tree reserved exactly one recovery record
+    if (c2_recovery_census_pool(pool) != census_before + 1) {
+        fprintf(stderr, "row c: refused tree census delta != 1\n");
+        return 1;
+    }
+    vbr_checkpoint_capture_reason reason;
+    if (c2_bridge_capture_ok(mem, 6, reason) ||
+            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+        fprintf(stderr, "row c: poisoned root did not make the composite unavailable\n");
+        return 1;
+    }
+    llama_pos pos_cursor = 6;
+    if (!c2_gpu_drain_until_rearmed(ctx.get(), base, pos_cursor)) {
+        fprintf(stderr, "row c: decode-boundary drain did not rearm the base child\n");
+        return 1;
+    }
+    if (vbr_recovery_pending_for(pool.hi, pool.lo)) {
+        fprintf(stderr, "row c: recovery work remained pending after the drain\n");
+        return 1;
+    }
+    if (!c2_bridge_capture_ok(mem, (int64_t) pos_cursor, reason)) {
+        fprintf(stderr, "row c: capture did not recover after the drain (reason=%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(reason));
+        return 1;
+    }
+    fprintf(stderr, "C2 GPU row (c) joined/adopted parent one-mint census PASS\n");
+    return 0;
+}
+
+// row (e): mixed two-child FENCE outcome — one child's in-flight per-target evidence goes
+// stale between decode submission and the synchronize fence (slab-reset commit race). The
+// REAL fence terminal path must fail+latch that child, the sibling's committed evidence must
+// stay tracker-local and truthful, and recovery must restore the composite.
+static int c2_gpu_row_e(llama_model * model) {
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, 128, 32, 1, ctx)) {
+        fprintf(stderr, "row e: context creation failed\n");
+        return 1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    llama_kv_cache * base = nullptr;
+    llama_kv_cache * swa  = nullptr;
+    if (!c2_gpu_children(mem, base, swa)) {
+        fprintf(stderr, "row e: armed iSWA children unavailable\n");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, 8, 32)) {
+        fprintf(stderr, "row e: seed decode failed\n");
+        return 1;
+    }
+    // async decode: submit WITHOUT fencing, then stale one submitted extent on the base
+    // child before the synchronize fence commits it
+    {
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, 1, 8, { 0 }, true);
+        const bool decoded = llama_decode(ctx.get(), batch) == 0;
+        llama_batch_free(batch);
+        if (!decoded) {
+            fprintf(stderr, "row e: fence-row decode failed\n");
+            return 1;
+        }
+        if (!llama_kv_cache_vbr_epoch_test::inject_stale_submitted_extent(base)) {
+            fprintf(stderr, "row e: no in-flight base operation to stale (tune the seam)\n");
+            return 1;
+        }
+        llama_synchronize(ctx.get());  // the REAL fence: commit fails on the obsolete handle
+    }
+    const auto * base_tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
+    const auto * swa_tracker  = llama_kv_cache_vbr_epoch_test::tracker_get(swa);
+    if (!base_tracker->shadow_unavailable()) {
+        fprintf(stderr, "row e: fence commit failure did not latch the base child\n");
+        return 1;
+    }
+    if (swa_tracker->shadow_unavailable()) {
+        fprintf(stderr, "row e: sibling was latched by the other child's fence failure\n");
+        return 1;
+    }
+    // the sibling's committed evidence stays tracker-local and truthful
+    vbr_checkpoint_generation_controller swa_record;
+    if (!swa->vbr_generation_capture_live_guarded(0, 0, 9, swa_record)) {
+        fprintf(stderr, "row e: sibling capture failed after the mixed fence\n");
+        return 1;
+    }
+    vbr_generation_live_controller_view swa_view;
+    if (!swa->vbr_generation_live_guarded_view(0, 0, 9, swa_view)) {
+        fprintf(stderr, "row e: sibling live view unavailable\n");
+        return 1;
+    }
+    vbr_checkpoint_generation_record sibling;
+    sibling.status = vbr_checkpoint_generation_status::complete;
+    sibling.controllers.push_back(swa_record);
+    vbr_generation_live_view live;
+    live.legacy_eligible = true;
+    live.controllers.push_back(swa_view);
+    const auto sibling_result = checkpoint_vbr_eligibility(sibling, live);
+    if (sibling_result.category != vbr_checkpoint_eligibility_category::strict_accept) {
+        fprintf(stderr, "row e: sibling committed evidence was not preserved (reason %d)\n",
+                (int) sibling_result.reason);
+        return 1;
+    }
+    // the failed child blocks the composite until recovery resolves at a real boundary
+    vbr_checkpoint_capture_reason reason;
+    if (c2_bridge_capture_ok(mem, 9, reason) ||
+            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+        fprintf(stderr, "row e: failed child did not make the composite unavailable\n");
+        return 1;
+    }
+    llama_pos pos_cursor = 9;
+    if (!c2_gpu_drain_until_rearmed(ctx.get(), base, pos_cursor)) {
+        fprintf(stderr, "row e: failed child did not recover at the decode boundary\n");
+        return 1;
+    }
+    if (!c2_bridge_capture_ok(mem, (int64_t) pos_cursor, reason)) {
+        fprintf(stderr, "row e: composite still unavailable after child recovery (reason=%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(reason));
+        return 1;
+    }
+    fprintf(stderr, "C2 GPU row (e) mixed fence outcome PASS\n");
+    return 0;
+}
+
+// row (a): SWA wrap and cross-sequence reuse through REAL slot selection, in two arms sized
+// so slot selection MUST reuse captured cells (single-seq contexts get a windowed SWA cache;
+// n_seq_max>1 forces a full-size SWA cache, so the cross-seq arm fills it first). Each arm
+// prechecks that the captured set was actually disturbed — an undisturbed arm fails as
+// uncovered, never passes vacuously.
+//
+// SUBSTRATE NOTE (for the Sol delta review): on REAL same-seq wrap the reused cells keep seq
+// membership but move above the frontier, so the live dependency rank shrinks with lost==0 —
+// the evaluator's F7 captured-minus-lost reconciliation then flags dependency_cardinality and
+// classify_expected_tombstone() force-classifies UNEXPLAINED. §5.5 row 2 (swa_wrap) appears
+// unreachable on real geometry; the CPU row fabricated exact counts and masked this. The arm
+// asserts the reject and accepts either class, printing which one fired for the ruling.
+static int c2_gpu_row_a(llama_model * model) {
+    const int32_t n_swa = llama_model_n_swa(model);
+    if (n_swa <= 0 || n_swa > 1728) {
+        fprintf(stderr, "row a: SKIP — model window %d outside fixture range\n", n_swa);
+        return 0;
+    }
+    const llama_pos window = (llama_pos) n_swa;
+
+    // --- arm 1: same-sequence wrap (windowed SWA cache; n_seq_max = 1) -----------------------
+    {
+        const uint32_t n_ctx = (uint32_t) window + 640;  // > any padded SWA child size
+        llama_context_ptr ctx;
+        if (!c2_gpu_context(model, n_ctx, 64, 1, ctx)) {
+            fprintf(stderr, "row a: arm-1 context creation failed\n");
+            return 1;
+        }
+        llama_kv_cache * base = nullptr;
+        llama_kv_cache * swa  = nullptr;
+        if (!c2_gpu_children(llama_get_memory(ctx.get()), base, swa)) {
+            fprintf(stderr, "row a: arm-1 armed iSWA children unavailable\n");
+            return 1;
+        }
+        if ((uint32_t) swa->get_size() >= n_ctx) {
+            fprintf(stderr, "row a: arm-1 SWA cache is full-size (%u cells) — wrap unreachable, row uncovered\n",
+                    (unsigned) swa->get_size());
+            return 1;
+        }
+        const llama_pos frontier = window / 2;
+        if (!c2_gpu_decode_range(ctx.get(), 0, 0, frontier, 64)) {
+            fprintf(stderr, "row a: arm-1 seed decode failed\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_controller captured;
+        if (!swa->vbr_generation_capture_live_guarded(0, 0, frontier, captured)) {
+            fprintf(stderr, "row a: arm-1 SWA capture failed\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_record record;
+        record.status = vbr_checkpoint_generation_status::complete;
+        record.controllers.push_back(captured);
+
+        // decode past the SWA child's cell count so real slot selection wraps: logical
+        // positions leave the ownership index's positional domain, which latches the per-seq
+        // view unavailable (Rev-5 pin 3 fail-closed domain restriction). The honest wrap
+        // property on the REAL path is therefore fail-closed evidence UNAVAILABILITY —
+        // never acceptance, never fabricated coverage. ([I8] keeps wrapped-SWA live evidence
+        // out of production; §5.5 row 2 classification remains reachable only through
+        // in-domain reuse — see arm 2 and the worklog SUBSTRATE note for the Sol ruling.)
+        if (!c2_gpu_decode_range(ctx.get(), 0, frontier, (llama_pos) n_ctx - 1, 64)) {
+            fprintf(stderr, "row a: arm-1 wrap decode failed\n");
+            return 1;
+        }
+        vbr_generation_live_controller_view view;
+        if (swa->vbr_generation_live_guarded_view(0, 0, frontier, view)) {
+            fprintf(stderr, "row a: arm-1 wrapped view stayed available (out-of-domain positions must fail closed)\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_controller recapture;
+        if (swa->vbr_generation_capture_live_guarded(0, 0, frontier, recapture)) {
+            fprintf(stderr, "row a: arm-1 wrapped capture stayed available (must fail closed)\n");
+            return 1;
+        }
+        GGML_UNUSED(record);
+    }
+
+    // --- arm 2: cross-sequence reuse through real slot selection. Windowed SWA cache (the
+    // full-size cache deliberately never prunes, so a full unified cache just refuses the
+    // second sequence); positions are kept strictly inside the ownership index domain by
+    // sizing the fill from the ACTUAL SWA child cell count, so the captured view stays
+    // available while seq 1's allocation prunes/reuses expired seq-0 cells. ----------------
+    {
+        // unified multi-seq sizing gives the SWA child n_swa*n_seq_max + n_ubatch cells;
+        // the context must exceed that so the windowed child keeps prune slack
+        const uint32_t n_ctx = (uint32_t) window * 2 + 640;
+        llama_context_ptr ctx;
+        if (!c2_gpu_context(model, n_ctx, 64, 2, ctx)) {
+            fprintf(stderr, "row a: arm-2 context creation failed\n");
+            return 1;
+        }
+        llama_kv_cache * base = nullptr;
+        llama_kv_cache * swa  = nullptr;
+        if (!c2_gpu_children(llama_get_memory(ctx.get()), base, swa)) {
+            fprintf(stderr, "row a: arm-2 armed iSWA children unavailable\n");
+            return 1;
+        }
+        const uint32_t swa_size = swa->get_size();
+        if (swa_size >= n_ctx || swa_size < (uint32_t) window + 96) {
+            fprintf(stderr, "row a: arm-2 SWA child size %u leaves no expired-reuse slack — row uncovered\n",
+                    (unsigned) swa_size);
+            return 1;
+        }
+        // fill every SWA cell with seq 0 (positions 0..swa_size-1: all inside the index
+        // domain); cells at pos <= swa_size-1-window are expired-but-occupied
+        const llama_pos fill = (llama_pos) swa_size;
+        if (!c2_gpu_decode_range(ctx.get(), 0, 0, fill, 64)) {
+            fprintf(stderr, "row a: arm-2 fill decode failed\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_controller captured;
+        if (!swa->vbr_generation_capture_live_guarded(0, 0, fill, captured)) {
+            fprintf(stderr, "row a: arm-2 SWA capture failed\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_record record;
+        record.status = vbr_checkpoint_generation_status::complete;
+        record.controllers.push_back(captured);
+        // seq 1's allocation must prune/reuse expired seq-0 cells (zero free cells remain)
+        if (!c2_gpu_decode_range(ctx.get(), 1, 0, 64, 64)) {
+            fprintf(stderr, "row a: arm-2 cross-seq decode failed\n");
+            return 1;
+        }
+        vbr_generation_live_controller_view view;
+        if (!swa->vbr_generation_live_guarded_view(0, 0, fill, view)) {
+            fprintf(stderr, "row a: arm-2 live view unavailable after cross-seq reuse\n");
+            return 1;
+        }
+        if (view.streams.empty() ||
+                view.streams[0].exact_dependency_count >= captured.streams[0].captured_dependency_count) {
+            fprintf(stderr, "row a: arm-2 cross-seq decode left the captured set undisturbed — row uncovered\n");
+            return 1;
+        }
+        vbr_generation_live_view live;
+        live.legacy_eligible = true;
+        live.controllers.push_back(view);
+        const auto cross_result = checkpoint_vbr_eligibility(record, live);
+        if (cross_result.category == vbr_checkpoint_eligibility_category::strict_accept ||
+                cross_result.category == vbr_checkpoint_eligibility_category::live_rebased_shadow_accept) {
+            fprintf(stderr, "row a: arm-2 cross-seq record was accepted\n");
+            return 1;
+        }
+        if (cross_result.tombstone_class != vbr_expected_tombstone_class::unexplained) {
+            fprintf(stderr, "row a: arm-2 cross-seq reuse classified %d, expected unexplained\n",
+                    (int) cross_result.tombstone_class);
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "C2 GPU row (a) wrap/cross-seq slot selection PASS\n");
+    return 0;
+}
+
+static int run_c2_gpu_rows(llama_model * model) {
+    if (c2_gpu_row_d(model) != 0 || c2_gpu_row_b(model) != 0 ||
+            c2_gpu_row_c(model) != 0 || c2_gpu_row_e(model) != 0 ||
+            c2_gpu_row_a(model) != 0) {
+        return 1;
+    }
+    fprintf(stderr, "C2 GPU fixture rows (a)-(e) PASS\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--a1-cpu") {
         return run_a1_cpu_tests() ? 0 : 1;
@@ -1541,8 +2478,11 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--a2-cpu") {
         return run_a2_cpu_tests() ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--c2-cpu") {
+        return run_c2_cpu_tests() ? 0 : 1;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL | --a1-cpu | --a2-cpu\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL | --a1-cpu | --a2-cpu | --c2-cpu\n", argv[0]);
         return 1;
     }
 
@@ -1578,7 +2518,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!run_a1_cpu_tests() || !run_a2_cpu_tests()) {
+    if (!run_a1_cpu_tests() || !run_a2_cpu_tests() || !run_c2_cpu_tests()) {
         return 1;
     }
 
@@ -2087,6 +3027,10 @@ int main(int argc, char ** argv) {
     // is unreachable at runtime until that serialization exists. The P0 I9 behavior that matters --
     // per-child epoch advance on every degrade, clear, and full-reset (incl. the low-LCP ABA close),
     // and cross-degrade monotonicity -- is fully covered above.
+
+    if (run_c2_gpu_rows(model.get()) != 0) {
+        return 1;
+    }
 
     fprintf(stderr, "PASS: VBR scoped freeze is nested/iSWA-coherent, defers mutations, "
             "re-evaluates fresh on exit, composes with VBR_FREEZE, and preserves monotone "

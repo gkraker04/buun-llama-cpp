@@ -206,11 +206,23 @@ public:
             llama_pos computation_frontier,
             vbr_generation_live_controller_view & output) const;
 
+    // Debug-oracle trust domain (env-gated callers only): canonical per-cell observations built
+    // by a direct cell scan, deliberately WITHOUT the ownership index, so the independent
+    // reconstruction can catch an index that drifted from the canonical cells.
+    bool vbr_generation_oracle_observations(
+            llama_seq_id seq_id,
+            std::vector<struct vbr_generation_oracle_cell> & output) const;
+
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
     bool vbr_operation_armed() const override;
+    // C4 boundary service: true while this cache's tracker is latched unavailable or its pool
+    // has unresolved recovery-ring work. The update context reports an update NEEDED in this
+    // state so the quarantine drain + monotone re-arm in update() actually run at quiet decode
+    // boundaries (a NO_UPDATE short-circuit would starve recovery until an unrelated shift).
+    bool vbr_recovery_service_pending() const;
     bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;

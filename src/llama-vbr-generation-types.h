@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-vbr-checkpoint-types.h"
 
 #include <array>
 #include <cstdint>
@@ -22,6 +23,12 @@ inline bool operator==(const vbr_pool_uuid & lhs, const vbr_pool_uuid & rhs) {
 
 inline bool operator!=(const vbr_pool_uuid & lhs, const vbr_pool_uuid & rhs) {
     return !(lhs == rhs);
+}
+
+// The one definition of a real (non-sentinel) pool identity; matches the tracker's active()
+// convention.
+inline bool vbr_pool_uuid_is_set(const vbr_pool_uuid & uuid) {
+    return uuid.hi != 0 && uuid.lo != 0;
 }
 
 enum class vbr_repr_domain : uint8_t {
@@ -61,11 +68,6 @@ enum class checkpoint_child_dependency_mode : uint8_t {
     live_guarded,
 };
 
-enum class vbr_checkpoint_generation_status : uint8_t {
-    complete,
-    generation_unknown,
-};
-
 struct vbr_generation_page_ref {
     uint32_t                                        page_index        = 0;
     uint32_t                                        captured_page_gen = 0;
@@ -97,3 +99,35 @@ struct vbr_checkpoint_generation_record {
     std::array<uint8_t, 32>                           identity_policy_order_digest = {};
     std::vector<vbr_checkpoint_generation_controller> controllers;
 };
+
+// Record-vs-record deep equality (§9.2 dedup relation). This compares two captured checkpoint
+// records with each other — never a captured record against live tracker state, which remains
+// the exclusive province of checkpoint_vbr_eligibility().
+inline bool operator==(const vbr_checkpoint_unit_generation & lhs, const vbr_checkpoint_unit_generation & rhs) {
+    return lhs.repr_gen == rhs.repr_gen && lhs.current_type == rhs.current_type &&
+           lhs.last_source_type == rhs.last_source_type && lhs.domain == rhs.domain &&
+           lhs.promote_hops == rhs.promote_hops && lhs.last_transition == rhs.last_transition;
+}
+
+inline bool operator==(const vbr_generation_page_ref & lhs, const vbr_generation_page_ref & rhs) {
+    return lhs.page_index == rhs.page_index && lhs.captured_page_gen == rhs.captured_page_gen &&
+           lhs.covered_mask == rhs.covered_mask;
+}
+
+inline bool operator==(const vbr_checkpoint_generation_stream & lhs, const vbr_checkpoint_generation_stream & rhs) {
+    return lhs.stream_index == rhs.stream_index && lhs.dependency_seq_id == rhs.dependency_seq_id &&
+           lhs.computation_frontier == rhs.computation_frontier &&
+           lhs.captured_dependency_count == rhs.captured_dependency_count && lhs.pages == rhs.pages;
+}
+
+inline bool operator==(const vbr_checkpoint_generation_controller & lhs, const vbr_checkpoint_generation_controller & rhs) {
+    return lhs.child_id == rhs.child_id && lhs.dependency_mode == rhs.dependency_mode &&
+           lhs.pool_uuid == rhs.pool_uuid && lhs.global_generation == rhs.global_generation &&
+           lhs.units == rhs.units && lhs.streams == rhs.streams;
+}
+
+inline bool operator==(const vbr_checkpoint_generation_record & lhs, const vbr_checkpoint_generation_record & rhs) {
+    return lhs.version == rhs.version && lhs.status == rhs.status &&
+           lhs.identity_policy_order_digest == rhs.identity_policy_order_digest &&
+           lhs.controllers == rhs.controllers;
+}

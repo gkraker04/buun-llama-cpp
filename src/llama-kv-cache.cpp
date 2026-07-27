@@ -3948,6 +3948,49 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
             output);
 }
 
+// VBR_GENERATION_ORACLE_OBSERVER_REGION_BEGIN
+// Oracle trust domain (§6.2): the canonical observation builder must be a direct cell scan —
+// the production ownership index is a forbidden input here (the CI scan re-checks exactly this
+// region) — and must hold the same stable-read contract as ordinary capture: controller stable
+// before the scan and unchanged after it, else the observation is unavailable.
+bool llama_kv_cache::vbr_generation_oracle_observations(
+        llama_seq_id seq_id,
+        std::vector<vbr_generation_oracle_cell> & output) const {
+    if (other != nullptr) {
+        return other->vbr_generation_oracle_observations(seq_id, output);
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+        return false;
+    }
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size()) {
+        return false;
+    }
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr || !tracker->stable()) {
+        return false;
+    }
+    const uint64_t serial_at_scan_start = tracker->mutation_serial();
+    const auto & cells = v_cells[stream];
+    output.clear();
+    output.reserve(cells.size());
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        vbr_generation_oracle_cell cell;
+        cell.physical_cell = i;
+        const bool empty = cells.is_empty(i);
+        cell.position           = empty ? -1 : cells.pos_get(i);
+        cell.has_dependency_seq = !empty && cells.seq_has(i, seq_id);
+        cell.attention_visible  = !empty;
+        output.push_back(cell);
+    }
+    if (tracker->mutation_serial() != serial_at_scan_start || !tracker->stable()) {
+        output.clear();
+        return false;
+    }
+    return true;
+}
+// VBR_GENERATION_ORACLE_OBSERVER_REGION_END
+
 bool llama_kv_cache::vbr_generation_live_guarded_view(
         uint32_t child_id,
         llama_seq_id seq_id,
@@ -5331,6 +5374,18 @@ bool llama_kv_cache::vbr_operation_armed() const {
         return other->vbr_operation_armed();
     }
     return vbr_vmm_active() && vbr_budget_bytes_ > 0;
+}
+
+bool llama_kv_cache::vbr_recovery_service_pending() const {
+    if (other) {
+        return other->vbr_recovery_service_pending();
+    }
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr) {
+        return false;
+    }
+    const vbr_pool_uuid pool = tracker->pool_identity();
+    return tracker->shadow_unavailable() || vbr_recovery_pending_for(pool.hi, pool.lo);
 }
 
 bool llama_kv_cache::vbr_retier_freeze_begin(
@@ -7690,7 +7745,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_context * lctx,
         bool do_shift,
         stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+    // C4: unresolved recovery work IS an update — update() owns the quarantine drain and the
+    // monotone re-arm, and a NO_UPDATE short-circuit here would starve a latched tracker on
+    // quiet decode streams until an unrelated shift happened to run.
+    if (!do_shift && this->sc_info.empty() && !kv->vbr_recovery_service_pending()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }

@@ -183,6 +183,7 @@ void fill_audit(vbr_checkpoint_eligibility & result, const audit_state & audit) 
                                                      : vbr_observation_class::trivial_append;
 }
 
+// VBR_GENERATION_CLASSIFIER_REGION_BEGIN
 // §5.5 closed table. A strict reject is an expected tombstone ONLY when every rejecting covered
 // cell carries one uniform allowed (family, class) provenance whose committed extent entry — the
 // same single entry for all cells — satisfies the row's extent predicate. Anything mixed,
@@ -269,6 +270,7 @@ vbr_expected_tombstone_class classify_expected_tombstone(const std::vector<audit
     }
     return vbr_expected_tombstone_class::unexplained;
 }
+// VBR_GENERATION_CLASSIFIER_REGION_END
 
 }  // namespace
 
@@ -836,6 +838,7 @@ vbr_unit_generation vbr_generation_tracker::unit_generation(uint32_t unit) const
     return units_.at(unit);
 }
 
+// VBR_GENERATION_CAPTURE_REGION_BEGIN
 bool vbr_generation_capture_stream(const vbr_generation_tracker &     tracker,
                                    uint32_t                           stream,
                                    llama_seq_id                       dependency_seq_id,
@@ -947,7 +950,9 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
     }
     return true;
 }
+// VBR_GENERATION_CAPTURE_REGION_END
 
+// VBR_GENERATION_EVALUATOR_REGION_BEGIN
 // VBR_GENERATION_ELIGIBILITY_AUTHORITY
 vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_generation_record & checkpoint,
                                                       const vbr_generation_live_view &         live) {
@@ -1198,3 +1203,4 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
     fill_audit(result, audit);
     return result;
 }
+// VBR_GENERATION_EVALUATOR_REGION_END

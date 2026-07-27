@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "common-checkpoint-shadow.h"
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
@@ -1358,6 +1359,161 @@ private:
     std::string frontier_execution_identity;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
+
+    // §9.1–9.3 shadow lifecycle observability. Commit-2 scope: counters + SHADOW_LIFECYCLE log
+    // lines only; the /slots surface and the qualification consumer arrive with the commit-3
+    // coordinator (qualification_reset is COUNTED here, CONSUMED there [Q2]).
+    struct {
+        uint64_t capture_ok                              = 0;
+        uint64_t capture_failed                          = 0;
+        uint64_t qualification_reset                     = 0;
+        uint64_t distinct_but_legacy_dedup               = 0;
+        uint64_t duplicate_but_legacy_keep               = 0;
+        uint64_t refresh_ok                              = 0;
+        uint64_t refresh_refused                         = 0;
+        uint64_t refresh_nondeterministic_byte_mismatch  = 0;
+        uint64_t midlist_stale_no_refresh                = 0;
+    } shadow_counters;
+
+    // F5 (verify round): shadow applicability latched from capture OUTCOMES — `applicable`
+    // after any armed-path result (ok or an armed failure), `not_applicable` after an unarmed
+    // result. Restore-selection accounting keys on this, never on a particular record's
+    // completeness; truly unarmed runs stay at zero lifecycle lines.
+    enum class shadow_applicability_state : uint8_t { unknown, applicable, not_applicable };
+    shadow_applicability_state shadow_applicability = shadow_applicability_state::unknown;
+
+    // §9.1 shadow capture with owned failure accounting. Never throws and never touches legacy
+    // checkpoint state; failure leaves the shadow null (generation unknown by representation).
+    // Unarmed memories return not_applicable: zero counters, zero log lines.
+    common_checkpoint_shadow_reason shadow_try_capture(
+            server_slot &                       slot,
+            common_prompt_checkpoint &          ckpt,
+            const common_computation_frontier & frontier) {
+        auto reason = common_checkpoint_shadow_reason::internal_error;
+        try {
+            reason = common_checkpoint_shadow_capture(ckpt, ctx_tgt, slot.id, frontier);
+        } catch (...) {
+            reason = common_checkpoint_shadow_reason::internal_error;
+        }
+        switch (reason) {
+            case common_checkpoint_shadow_reason::not_applicable:
+                shadow_applicability = shadow_applicability_state::not_applicable;
+                break;
+            case common_checkpoint_shadow_reason::ok:
+            case common_checkpoint_shadow_reason::unarmed_live_covered:
+            case common_checkpoint_shadow_reason::child_capture_failed:
+            case common_checkpoint_shadow_reason::oracle_mismatch:
+                shadow_applicability = shadow_applicability_state::applicable;
+                break;
+            default:
+                break;  // invalid_arguments/internal_error prove nothing about armed-ness
+        }
+        if (reason != common_checkpoint_shadow_reason::ok &&
+            reason != common_checkpoint_shadow_reason::not_applicable) {
+            shadow_counters.capture_failed++;
+            shadow_counters.qualification_reset++;  // Q2: counted here, consumed by commit 3
+            SLT_WRN(slot,
+                    "SHADOW_LIFECYCLE event=capture_failed reason=%s total_failed=%" PRIu64 "\n",
+                    common_checkpoint_shadow_reason_name(reason),
+                    shadow_counters.capture_failed);
+        }
+        return reason;
+    }
+
+    // §9.3 refresh attempt at the sole back-adoption site: prove the current state reproduces
+    // EVERY retained payload byte-identically, then swap ONLY the shadow record [§1.6]. All
+    // serialization is detached and dropped; payload bytes are read only when the proof will
+    // actually compare them (a size mismatch refuses on the size alone). Counts its own
+    // outcome; never throws into the request path.
+    void shadow_try_refresh(
+            server_slot &                       slot,
+            common_prompt_checkpoint &          last,
+            const common_computation_frontier & frontier) {
+        try {
+            common_checkpoint_refresh_observation obs;
+            std::vector<uint8_t> cur_tgt;
+            std::vector<uint8_t> cur_dft;
+            std::vector<uint8_t> cur_ring;
+            std::vector<uint8_t> cur_spec;
+            {
+                const size_t sz = llama_state_seq_get_size_ext(
+                    ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (sz > 0) {
+                    cur_tgt.resize(sz);
+                    if (sz != last.data_tgt.size() ||
+                        llama_state_seq_get_data_ext(ctx_tgt, cur_tgt.data(), sz, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == sz) {
+                        obs.tgt = &cur_tgt;
+                    }
+                }
+            }
+            obs.dft_applicable = ctx_dft != nullptr;
+            if (ctx_dft) {
+                const size_t sz = llama_state_seq_get_size_ext(
+                    ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                cur_dft.resize(sz);
+                if (sz == 0 || sz != last.data_dft.size() ||
+                    llama_state_seq_get_data_ext(ctx_dft.get(), cur_dft.data(), sz, slot.id,
+                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == sz) {
+                    obs.dft = &cur_dft;
+                }
+            }
+            obs.ring_applicable = slot.can_speculate();
+            if (obs.ring_applicable) {
+                const size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
+                cur_ring.resize(ring_size);
+                if (ring_size > 0 && ring_size == last.accel.ring.size()) {
+                    common_speculative_ring_state_save(slot.get_spec(), cur_ring.data(), ring_size);
+                }
+                obs.ring = &cur_ring;
+            }
+            obs.spec_applicable = slot.can_speculate();
+            if (obs.spec_applicable &&
+                common_speculative_get_state(slot.get_spec(), slot.id, cur_spec)) {
+                obs.spec = &cur_spec;
+            }
+
+            const auto verdict = common_checkpoint_shadow_refresh_proof(last, obs);
+            if (verdict == common_checkpoint_refresh_verdict::proven) {
+                // §9.3 steps 4-5 (F2, verify round): the published record is a FRESH stable
+                // snapshot captured strictly AFTER the byte proof — the pre-proof §9.2 relation
+                // candidate is never adopted. Recapture failure leaves the old record untouched
+                // and refuses the refresh.
+                common_prompt_checkpoint post_proof;
+                auto post_reason = common_checkpoint_shadow_reason::internal_error;
+                if (!server_fault("shadow_post_proof_recapture")) {
+                    post_reason = shadow_try_capture(slot, post_proof, frontier);
+                }
+                if (post_reason == common_checkpoint_shadow_reason::ok) {
+                    common_checkpoint_shadow_adopt(last, post_proof);
+                    shadow_counters.refresh_ok++;
+                    SLT_INF(slot, "SHADOW_LIFECYCLE event=refresh_ok total=%" PRIu64 "\n",
+                            shadow_counters.refresh_ok);
+                } else {
+                    shadow_counters.refresh_refused++;
+                    SLT_WRN(slot,
+                            "SHADOW_LIFECYCLE event=refresh_refused "
+                            "reason=post_proof_capture_unavailable total=%" PRIu64 "\n",
+                            shadow_counters.refresh_refused);
+                }
+            } else if (verdict == common_checkpoint_refresh_verdict::refused_byte_mismatch) {
+                shadow_counters.refresh_nondeterministic_byte_mismatch++;
+                SLT_WRN(slot,
+                        "SHADOW_LIFECYCLE event=refresh_refused "
+                        "reason=shadow_refresh_nondeterministic_byte_mismatch total=%" PRIu64 "\n",
+                        shadow_counters.refresh_nondeterministic_byte_mismatch);
+            } else {
+                shadow_counters.refresh_refused++;
+                SLT_WRN(slot,
+                        "SHADOW_LIFECYCLE event=refresh_refused "
+                        "reason=cannot_reproduce total=%" PRIu64 "\n",
+                        shadow_counters.refresh_refused);
+            }
+        } catch (...) {
+            shadow_counters.refresh_refused++;
+            SLT_WRN(slot, "%s", "SHADOW_LIFECYCLE event=refresh_refused reason=internal_error\n");
+        }
+    }
 
     uint64_t ensure_frontier_sequence_epoch(server_prompt & prompt) {
         if (prompt.sequence_epoch == 0) {
@@ -5367,6 +5523,24 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
                                     bool vbr_preflight_rejected = false;
 
+                                    // §9.3 mid-list availability accounting [F8]: refresh exists
+                                    // only at the back-adoption site, so a selected mid-list
+                                    // checkpoint with a MISSING record is counted (subreason
+                                    // midlist_record_absent) — staleness is never inferred from
+                                    // record inequality; evaluator-proven staleness lands with
+                                    // the commit-3 selection evaluator. Gated on the capture-
+                                    // outcome applicability latch so unarmed runs stay at zero
+                                    // shadow lines without inferring from any one record.
+                                    if (!do_reset && it != slot.prompt.checkpoints.rbegin() &&
+                                        shadow_applicability == shadow_applicability_state::applicable &&
+                                        !common_checkpoint_shadow_complete(*it)) {
+                                        shadow_counters.midlist_stale_no_refresh++;
+                                        SLT_INF(slot,
+                                                "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
+                                                "subreason=midlist_record_absent total=%" PRIu64 "\n",
+                                                shadow_counters.midlist_stale_no_refresh);
+                                    }
+
                                     if (!do_reset) {
                                         // [WS-6] A live_rebased PARTIAL_ONLY restore keeps the
                                         // current attention representation. Prove the current-tier
@@ -5990,6 +6164,27 @@ private:
                                     ckpt_n_tokens, ckpt_pos_min, pos_max,
                                     vbr_now.representation_epoch, vbr_now.representation_epoch_swa);
                             do_checkpoint = false;
+
+                            // §9.2 shadow opinion + §9.3 proven refresh, at the sole
+                            // back-adoption site. The legacy dedup decision above is final;
+                            // everything below is counters, logs, and (only on a completed
+                            // byte-proof) a swap of the retained SHADOW record [§1.6]. The
+                            // frontier/identity equality gate is the dedup condition itself.
+                            {
+                                common_prompt_checkpoint fresh;
+                                const auto sreason =
+                                    shadow_try_capture(slot, fresh, ckpt_frontier);
+                                if (sreason == common_checkpoint_shadow_reason::ok &&
+                                    !common_checkpoint_shadow_equal(fresh, last)) {
+                                    // fresh is complete; retained is absent/unknown or unequal
+                                    // (records agreeing is the serialization-free fast path)
+                                    shadow_counters.distinct_but_legacy_dedup++;
+                                    SLT_INF(slot,
+                                            "SHADOW_LIFECYCLE event=shadow_distinct_but_legacy_dedup total=%" PRIu64 "\n",
+                                            shadow_counters.distinct_but_legacy_dedup);
+                                    shadow_try_refresh(slot, last, ckpt_frontier);
+                                }
+                            }
                         }
                     }
 
@@ -6045,6 +6240,32 @@ private:
 
                         if (staged.empty()) {
                             do_checkpoint = false;
+                        }
+                    }
+
+                    if (do_checkpoint) {
+                        // §9.1 shadow capture on the staged, detached checkpoint. Every outcome
+                        // leaves the legacy checkpoint intact: failure keeps the shadow null
+                        // (generation unknown by representation) and never changes staging,
+                        // eviction, order, or the splice below.
+                        auto & next = staged.back();
+                        if (shadow_try_capture(slot, next, ckpt_frontier) ==
+                                common_checkpoint_shadow_reason::ok) {
+                            shadow_counters.capture_ok++;
+                            SLT_INF(slot,
+                                    "SHADOW_LIFECYCLE event=capture_ok n_tokens=%" PRId64
+                                    " total_ok=%" PRIu64 "\n",
+                                    ckpt_n_tokens, shadow_counters.capture_ok);
+                            // §9.2: legacy decided to KEEP a new checkpoint whose record a
+                            // complete retained back() proves equal (dedup condition was
+                            // false). Metadata compare only; no legacy decision changes.
+                            if (!slot.prompt.checkpoints.empty() &&
+                                common_checkpoint_shadow_equal(next, slot.prompt.checkpoints.back())) {
+                                shadow_counters.duplicate_but_legacy_keep++;
+                                SLT_INF(slot,
+                                        "SHADOW_LIFECYCLE event=shadow_duplicate_but_legacy_keep total=%" PRIu64 "\n",
+                                        shadow_counters.duplicate_but_legacy_keep);
+                            }
                         }
                     }
 

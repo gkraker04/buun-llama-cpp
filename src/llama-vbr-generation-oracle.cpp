@@ -5,6 +5,11 @@
 
 namespace {
 
+bool env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
 uint64_t hash_bytes(uint64_t hash, const void * data, size_t size) {
     const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -75,8 +80,7 @@ std::vector<uint32_t> production_covered_set(const vbr_checkpoint_generation_str
 bool vbr_generation_oracle_enabled() {
     // Deliberately probed per call: tests toggle the gate mid-process, and the call is
     // boundary-rate (efficiency review's static-once idea traded away test agility for ~nothing).
-    const char * value = std::getenv("VBR_GENERATION_ORACLE");
-    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+    return env_flag("VBR_GENERATION_ORACLE");
 }
 
 vbr_generation_oracle_baseline vbr_generation_oracle_capture(
@@ -111,4 +115,18 @@ vbr_generation_oracle_result vbr_generation_oracle_audit(
     result.bytes_equal = result.complete &&
                          independent.dependency_byte_hash == baseline.dependency_byte_hash;
     return result;
+}
+
+bool vbr_generation_oracle_audit_due(bool                            destructive_or_import_crossing,
+                                     const std::array<uint8_t, 32> & identity_digest,
+                                     bool                            forced_audit) {
+    if (forced_audit || destructive_or_import_crossing) {
+        return true;
+    }
+    // deterministic 1/256 append-only sample: a pure function of the identity digest
+    return identity_digest[0] == 0;
+}
+
+bool vbr_generation_oracle_audit_forced() {
+    return env_flag("VBR_GENERATION_FORCE_AUDIT");
 }

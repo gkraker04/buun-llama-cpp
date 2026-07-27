@@ -156,6 +156,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-checkpoint-shadow-lifecycle.cpp)
+    target_include_directories(test-checkpoint-shadow-lifecycle PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build(test-dflash-tape-vs-plane.cpp)
     target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

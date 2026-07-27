@@ -2062,29 +2062,11 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + accel.size(); // accel.ring was omitted pre-[R6]
-}
+// common_prompt_checkpoint size()/clear() and its special members live in
+// common-checkpoint-shadow.cpp (the one TU that sees the shadow holder's insides).
 
 bool common_prompt_checkpoint::empty() const {
     return data_tgt.empty();
-}
-
-void common_prompt_checkpoint::clear() {
-    n_tokens = 0;
-    id_task  = -1; // was omitted [R6]
-
-    pos_min = 0;
-    pos_max = 0;
-
-    representation_epoch     = 0; // [I9]
-    representation_epoch_swa = 0;
-
-    computation_frontier.clear();
-
-    data_tgt.clear();
-    data_dft.clear();
-    accel.clear(); // ring omission fixed in [R6]
 }
 
 void common_prompt_checkpoint::update_pos(
