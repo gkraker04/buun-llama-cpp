@@ -78,6 +78,18 @@ public:
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override {
         mem_attn->vbr_retier_freeze_end(owner, operation_id);
     }
+    void vbr_commit_submitted() override {
+        mem_attn->vbr_commit_submitted();
+    }
+    void vbr_decode_ops_finish(bool ok) override {
+        mem_attn->vbr_decode_ops_finish(ok);
+    }
+    void vbr_adopt_operation(vbr_operation_id operation_id) override {
+        mem_attn->vbr_adopt_operation(operation_id);
+    }
+    void vbr_release_adopted() override {
+        mem_attn->vbr_release_adopted();
+    }
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override {
         return mem_attn->vbr_retier_preflight(n_tokens_extra);
     }

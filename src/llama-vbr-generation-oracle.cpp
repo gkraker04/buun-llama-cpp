@@ -73,6 +73,8 @@ std::vector<uint32_t> production_covered_set(const vbr_checkpoint_generation_str
 }  // namespace
 
 bool vbr_generation_oracle_enabled() {
+    // Deliberately probed per call: tests toggle the gate mid-process, and the call is
+    // boundary-rate (efficiency review's static-once idea traded away test agility for ~nothing).
     const char * value = std::getenv("VBR_GENERATION_ORACLE");
     return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }

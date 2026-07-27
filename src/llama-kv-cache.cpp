@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include "llama-vbr-generation-oracle.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1419,6 +1421,10 @@ llama_kv_cache::llama_kv_cache(
                 vbr_generation_ = std::make_unique<vbr_generation_tracker>(
                         n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
                 GGML_ASSERT(vbr_generation_->active());
+                // A2 dual-view ownership index (D-A2-1v2): physical masks for enumeration +
+                // per-active-seq logical-position order statistic for scan-free exact rank.
+                vbr_ownership_ = std::make_unique<vbr_ownership_index>(
+                        n_stream, static_cast<uint32_t>(seq_to_stream.size()), kv_size);
                 for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
                     for (uint32_t side = 0; side < 2; ++side) {
                         const ggml_tensor * tensor = side != 0 ? layers[ikv].v : layers[ikv].k;
@@ -1567,6 +1573,9 @@ llama_kv_cache::~llama_kv_cache() {
 }
 
 void llama_kv_cache::clear(bool data) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1608,6 +1617,9 @@ void llama_kv_cache::clear(bool data) {
     // place until the next empty-cache boundary, and both mutations must remain observable.
     vbr_representation_changed();
     vbr_generation_global(vbr_mutation_registrant::clear, vbr_operation_class::state_api);
+    if (vbr_ownership_) {
+        vbr_ownership_->clear_all();
+    }
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1626,11 +1638,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    // A2 operation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
+    // membership-only state_api (not provenance-bearing); the destructive §7.5 classes arrive
+    // with the classed server paths in the A2 coordinator commit.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+
     if (seq_id >= 0) {
         const uint32_t stream = seq_to_stream[seq_id];
         auto & cells = v_cells[stream];
         auto & head  = v_heads[stream];
-        const auto generation_event = vbr_generation_begin(
+        auto generation_event = vbr_generation_begin(
                 vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, stream,
                 vbr_generation_stamp_kind::membership);
 
@@ -1642,10 +1661,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id)) {
+                const llama_pos rm_pos = cells.pos_get(i);
                 const bool became_empty = cells.seq_rm(i, seq_id);
-                if (generation_event) {
-                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
+                if (vbr_ownership_) {
+                    vbr_ownership_->remove_cell(stream, seq_id, i, rm_pos);
                 }
+                vbr_stamp(mutation_op, generation_event, i, seq_id, rm_pos);
                 if (!became_empty) {
                     continue;
                 }
@@ -1662,12 +1683,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+        // Gap fix: a fully removed sequence releases its index view (frees the Fenwick).
+        if (vbr_ownership_ && cells.seq_pos_min(seq_id) < 0) {
+            vbr_ownership_->clear_seq(stream, seq_id);
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
-            const auto generation_event = vbr_generation_begin(
+            auto generation_event = vbr_generation_begin(
                     vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, s,
                     vbr_generation_stamp_kind::membership);
 
@@ -1679,9 +1704,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 const bool had_membership = !cells.is_empty(i);
+                const llama_pos any_rm_pos = had_membership ? cells.pos_get(i) : -1;
+                if (had_membership) {
+                    vbr_ownership_update_all_seqs(s, i, any_rm_pos, /*add=*/false);
+                }
                 cells.rm(i);
-                if (had_membership && generation_event) {
-                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, -1));
+                if (had_membership) {
+                    vbr_stamp(mutation_op, generation_event, i, -1, any_rm_pos);
                 }
                 if (i < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
@@ -1714,25 +1743,25 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
 
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+
+    // A2 operation scope. Cross-stream copies additionally reserve recovery + carry the
+    // source-stability token; that wiring rides the sc_info pending owner below.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id_dst, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+
     if (s0 == s1) {
         // since both sequences are in the same stream, no data copy is necessary
         // we just have to update the cells meta data
 
         auto & cells = v_cells[s0];
-        const auto generation_event = vbr_generation_begin(
+        auto generation_event = vbr_generation_begin(
                 vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s0,
                 vbr_generation_stamp_kind::membership);
 
         if (seq_id_src == seq_id_dst) {
-            return;
-        }
-
-        if (p0 < 0) {
-            p0 = 0;
-        }
-
-        if (p1 < 0) {
-            p1 = std::numeric_limits<llama_pos>::max();
+                return;
         }
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -1742,9 +1771,11 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
             if (cells.seq_has(i, seq_id_src) && !cells.seq_has(i, seq_id_dst)) {
                 cells.seq_add(i, seq_id_dst);
-                if (generation_event) {
-                    GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id_dst));
+                const llama_pos cp_pos = cells.pos_get(i);
+                if (vbr_ownership_) {
+                    vbr_ownership_->add_cell(s0, seq_id_dst, i, cp_pos);
                 }
+                vbr_stamp(mutation_op, generation_event, i, seq_id_dst, cp_pos);
             }
         }
 
@@ -1752,6 +1783,13 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     }
 
     // cross-stream sequence copies require to copy the actual buffer data
+
+    // A2: the deferred-copy fence (pending owner through stream_copy_info, commit at byte-copy
+    // completion) is NOT implemented — it is structurally unreachable because armed VBR
+    // requires n_stream == 1. Fail loudly if that invariant ever breaks rather than let a
+    // cross-stream copy close its operation before bytes land (design finding R3-4).
+    GGML_ASSERT(vbr_generation_tracker_mut() == nullptr &&
+                "cross-stream seq_cp under armed VBR requires the A2 pending-owner fence");
 
     bool is_full = true;
 
@@ -1769,16 +1807,16 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
-    const auto destination_reset_event = vbr_generation_begin(
+    auto destination_reset_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
             vbr_generation_stamp_kind::membership);
     for (uint32_t i = 0; i < v_cells[s1].size(); ++i) {
-        if (!v_cells[s1].is_empty(i) && destination_reset_event) {
-            GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(destination_reset_event, i, -1));
+        if (!v_cells[s1].is_empty(i)) {
+            vbr_stamp(mutation_op, destination_reset_event, i, -1);
         }
     }
     v_cells[s1].reset();
-    const auto generation_event = vbr_generation_begin(
+    auto generation_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
             vbr_generation_stamp_kind::dependency, true);
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
@@ -1801,9 +1839,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
-            if (generation_event) {
-                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id_dst));
-            }
+            vbr_stamp(mutation_op, generation_event, i, seq_id_dst);
         }
     }
 
@@ -1820,12 +1856,20 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    // A2 operation scope: whole-range membership edit. The manifest declares the SEQ
+    // WILDCARD (P1v2): keep removes membership from every sequence EXCEPT the kept one, so
+    // per-cell stamps carry whichever sequence remains (or none) — a single-seq claim would
+    // be a false declaration.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
     auto & head  = v_heads[stream];
-    const auto generation_event = vbr_generation_begin(
+    auto generation_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_keep, vbr_operation_class::state_api, stream,
             vbr_generation_stamp_kind::membership);
 
@@ -1833,14 +1877,18 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         const bool changed = !cells.is_empty(i) && (!cells.seq_has(i, seq_id) || cells.seq_count(i) > 1);
+        if (changed) {
+            vbr_ownership_update_all_seqs(stream, i, cells.pos_get(i), /*add=*/false,
+                                          /*exclude_seq=*/seq_id);
+        }
         if (cells.seq_keep(i, seq_id)) {
             if (new_head == cells.size()) {
                 new_head = i;
             }
         }
-        if (changed && generation_event) {
-            GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(
-                    generation_event, i, cells.is_empty(i) ? -1 : seq_id));
+        if (changed) {
+            vbr_stamp(mutation_op, generation_event, i, cells.is_empty(i) ? -1 : seq_id,
+                      cells.is_empty(i) ? -1 : cells.pos_get(i));
         }
     }
 
@@ -1862,7 +1910,12 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
     auto & head  = v_heads[stream];
-    const auto generation_event = vbr_generation_begin(
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+    // A2 operation scope: position shift is a dependency-changing edit over [p0,p1).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    auto generation_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_add, vbr_operation_class::state_api, stream,
             vbr_generation_stamp_kind::dependency, true);
 
@@ -1871,14 +1924,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     uint32_t new_head = cells.size();
-
-    if (p0 < 0) {
-        p0 = 0;
-    }
-
-    if (p1 < 0) {
-        p1 = std::numeric_limits<llama_pos>::max();
-    }
 
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
@@ -1891,14 +1936,21 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            const llama_pos old_pos = cells.pos_get(i);
+            const bool removed = cells.pos_add(i, shift);
+            if (vbr_ownership_) {
+                if (removed) {
+                    vbr_ownership_->remove_cell(stream, seq_id, i, old_pos);
+                } else {
+                    vbr_ownership_->move_cell(stream, seq_id, i, old_pos, old_pos + shift);
+                }
+            }
+            if (removed) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
             }
-            if (generation_event) {
-                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
-            }
+            vbr_stamp(mutation_op, generation_event, i, seq_id, old_pos);
         }
     }
 
@@ -1918,20 +1970,17 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
-    const auto generation_event = vbr_generation_begin(
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+    // A2 operation scope: position division is a dependency-changing edit over [p0,p1).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    auto generation_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_div, vbr_operation_class::state_api, stream,
             vbr_generation_stamp_kind::dependency, true);
 
     if (d == 1) {
         return;
-    }
-
-    if (p0 < 0) {
-        p0 = 0;
-    }
-
-    if (p1 < 0) {
-        p1 = std::numeric_limits<llama_pos>::max();
     }
 
     // If there is no range then return early to avoid looping over the cache.
@@ -1945,10 +1994,12 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
 
         if (cells.seq_has(i, seq_id)) {
+            const llama_pos old_pos = cells.pos_get(i);
             cells.pos_div(i, d);
-            if (generation_event) {
-                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(generation_event, i, seq_id));
+            if (vbr_ownership_) {
+                vbr_ownership_->move_cell(stream, seq_id, i, old_pos, cells.pos_get(i));
             }
+            vbr_stamp(mutation_op, generation_event, i, seq_id, old_pos);
         }
     }
 }
@@ -2342,6 +2393,36 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    // C4 (v3.2): this tracker's cache services its pending quarantines at the decode boundary
+    // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
+    // ring slot. Failures without capabilities resolve here too, keeping the ring live.
+    if (auto * tracker = vbr_generation_tracker_mut()) {
+        const vbr_pool_uuid pool = tracker->pool_identity();
+        vbr_recovery_advance_recorded(pool.hi, pool.lo);  // B3: recorded failures quarantine
+        for (;;) {
+            auto work = vbr_recovery_take_quarantine(pool.hi, pool.lo);
+            if (!work.token) {
+                break;
+            }
+            if (!tracker->global_invalidate_and_reset_extents(
+                        vbr_mutation_registrant::authenticated_recovery,
+                        vbr_operation_class::controller)) {
+                // Invalidation impossible right now (mid-mutation): latch unavailable,
+                // RELEASE the take so the record stays serviceable, and retry next boundary
+                // — never ack unperformed work.
+                tracker->set_shadow_unavailable();
+                GGML_ASSERT(vbr_recovery_untake_quarantine(work.token, pool.hi, pool.lo));
+                break;
+            }
+            GGML_ASSERT(vbr_recovery_ack_quarantine(work.token, pool.hi, pool.lo));
+        }
+        // B7/v4-F3 upgraded by P4v2 (v6): monotone re-arm — the tracker owns the whole
+        // availability-creating transition (ring + capacity proof, sanctioned invalidation,
+        // monotone clear). Never re-arms in the same pass that latched: the latch path above
+        // breaks with an un-acked record that the ring proof still sees.
+        tracker->try_rearm();
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -2637,26 +2718,62 @@ void llama_kv_cache::apply_ubatch(
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
+    // C1 (v3.1): one decode-kind operation scope per apply_ubatch commit. Recovery is EAGER
+    // (reserved in the ctor — the wrap class is provenance-bearing); the extents and the
+    // reuse EVENT are LAZY — reserved per SELECTED target at the first destructive stamp, so
+    // a wrap-free decode pays neither extent traffic nor a destructive event.
+    // P2v2 (v6): the ubatch target scan is ARMED-ONLY — non-VBR decode never pays it — and
+    // skipped entirely when a composite wrapper already supplied the manifest (adoption).
+    const bool decode_armed = generation_commit && vbr_generation_tracker_get() != nullptr;
+    const bool wrap_provenance = decode_armed && n_swa != 0;
+    const vbr_operation_class decode_class =
+            wrap_provenance ? vbr_operation_class::swa_wrap : vbr_operation_class::ordinary_decode;
+    const uint16_t extent_stream =
+            static_cast<uint16_t>(sinfo.n_stream() == 1 ? sinfo.strm[0] : VBR_STREAM_ANY);
+    const vbr_pool_uuid decode_pool = decode_armed ? vbr_pool_id() : vbr_pool_uuid{};
+    // v4 review F4: seq/range-bound manifest from the actual ubatch; ceiling overflow yields a
+    // zero-target binding, which the registry REFUSES -> fail-closed shadow-unavailable.
+    vbr_operation_binding decode_manifest;
+    decode_manifest.kind        = vbr_operation_kind::decode;
+    decode_manifest.child_phase = vbr_operation_phase::mutate;
+    if (decode_armed && !vbr_adopted_operation_ && !vbr_adopted_refused_) {
+        (void) vbr_decode_targets_from_ubatch(decode_manifest, decode_pool.hi, decode_pool.lo,
+                                              wrap_provenance, extent_stream, ubatch);
+    }
+    // v3.1 amendment 1 (fully applied per v4 review F1): EVERY async decode op reserves
+    // recovery eagerly; only the tombstone EXTENTS stay wrap-gated and lazy.
+    vbr_mutation_op mutation_op(
+            decode_armed ? this : nullptr,
+            decode_manifest,
+            /*provenance_bearing=*/decode_armed);
+    if (decode_armed) {
+        // pre-reserve pending capacity BEFORE any mutation (C1: allocation never follows
+        // apply); geometric growth so the ramp is O(k) copies, not O(k^2). v6-fix F5: the
+        // awaiting list must absorb EVERY accumulated pending record without allocating —
+        // terminal transfer runs inside the decode transaction's noexcept destructor.
+        if (vbr_pending_decode_ops_.capacity() == vbr_pending_decode_ops_.size()) {
+            vbr_pending_decode_ops_.reserve(
+                    std::max<size_t>(8, 2 * vbr_pending_decode_ops_.size() + 1));
+        }
+        const size_t awaiting_needed =
+                vbr_awaiting_commit_.size() + vbr_pending_decode_ops_.size() + 1;
+        if (vbr_awaiting_commit_.capacity() < awaiting_needed) {
+            vbr_awaiting_commit_.reserve(
+                    std::max(awaiting_needed, 2 * vbr_awaiting_commit_.capacity() + 8));
+        }
+    }
+
     bool reused_occupied_cell = false;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const uint32_t stream = sinfo.strm[s];
-        const auto append_event = generation_commit
+        auto append_event = decode_armed
                 ? vbr_generation_begin(
                     vbr_mutation_registrant::apply_ubatch_append,
                     vbr_operation_class::ordinary_decode,
                     stream,
                     vbr_generation_stamp_kind::dependency)
                 : vbr_generation_event{};
-        const auto reuse_event = generation_commit
-                ? vbr_generation_begin(
-                    vbr_mutation_registrant::apply_ubatch_occupied_reuse,
-                    n_swa != 0
-                            ? vbr_operation_class::swa_wrap
-                            : vbr_operation_class::ordinary_decode,
-                    stream,
-                    vbr_generation_stamp_kind::dependency,
-                    true)
-                : vbr_generation_event{};
+        std::optional<vbr_generation_event> reuse_event;  // lazily minted at first reuse (C1)
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -2665,15 +2782,27 @@ void llama_kv_cache::apply_ubatch(
             const auto idx = sinfo.idxs[s][ii];
 
             const bool occupied = !cells.is_empty(idx);
+            llama_pos  prior_pos = -1;
             if (occupied) {
+                if (decode_armed && !reuse_event.has_value()) {
+                    // P1v2 (v6): no eager extent — the destructive stamps below reserve
+                    // per-SELECTED-target extents through the event's trampoline.
+                    reuse_event.emplace(vbr_generation_begin(
+                            vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+                            decode_class, stream, vbr_generation_stamp_kind::dependency, true));
+                }
                 reused_occupied_cell = true;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
                 const llama_pos    pos    = cells.pos_get(idx);
+                prior_pos = pos;
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                if (decode_armed && vbr_ownership_) {
+                    vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
+                }
                 cells.rm(idx);
             }
 
@@ -2691,10 +2820,23 @@ void llama_kv_cache::apply_ubatch(
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
 
-            const auto & generation_event = occupied ? reuse_event : append_event;
-            if (generation_event) {
-                GGML_ASSERT(vbr_generation_tracker_mut()->stamp_cell(
-                        generation_event, idx, ubatch.n_seq_id[i] == 1 ? ubatch.seq_id[i][0] : -1));
+            if (decode_armed && vbr_ownership_) {
+                for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
+                    vbr_ownership_->add_cell(stream, ubatch.seq_id[i][s], idx, ubatch.pos[i]);
+                }
+            }
+
+            vbr_generation_event * generation_event =
+                    occupied ? (reuse_event.has_value() && *reuse_event ? &*reuse_event : nullptr)
+                             : (append_event ? &append_event : nullptr);
+            if (generation_event != nullptr) {
+                // P1v2 (v6): the stamp proves a covering target for EVERY member of the
+                // token's sequence set at its pre-mutation position; a refusal poisons the
+                // event, latches the shadow, and fails the operation (via vbr_stamp) — the
+                // decode proceeds untracked.
+                vbr_stamp(mutation_op, *generation_event, idx,
+                          ubatch.seq_id[i], ubatch.n_seq_id[i],
+                          occupied ? prior_pos : ubatch.pos[i]);
             }
         }
     }
@@ -2758,6 +2900,65 @@ void llama_kv_cache::apply_ubatch(
             }
         }
     }
+
+    // A2 (review F3): the decode operation outlives apply_ubatch — outcome is unknown until
+    // the graph result. Transfer op + extent + recovery reservation to the pending list;
+    // vbr_decode_ops_finish(ok) resolves them at the decode boundary (extent -> submitted on
+    // success, promoted to committed at the synchronize fence; everything fails closed on a
+    // decode error).
+    if (auto pending = mutation_op.detach_deferred()) {
+        vbr_pending_decode_ops_.push_back(std::move(*pending));
+    }
+}
+
+// Defined with the mutation-op implementation below.
+static void vbr_fail_extent_set(
+        vbr_generation_tracker * tracker,
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> & extents);
+
+void llama_kv_cache::vbr_commit_submitted() {
+    if (other) {
+        other->vbr_commit_submitted();
+        return;
+    }
+    if (vbr_awaiting_commit_.empty()) {
+        return;
+    }
+    // C1/Rev 5.1: the sync fence delivers the TERMINAL result to each pending owner. Commit
+    // success closes the operation committed and releases recovery; a failed commit (slab
+    // reset / obsolete handle) is counted, latches availability, and closes failed — never a
+    // silent vanish (#10). P1v2 (v6): every per-target handle commits; one failure fails the
+    // owner and every remaining handle.
+    auto * tracker = vbr_generation_tracker_mut();
+    for (auto & pending : vbr_awaiting_commit_) {
+        bool committed = true;
+        if (tracker != nullptr) {
+            for (auto & extent : pending.extents) {
+                if (extent && committed && !tracker->extent_store().commit(extent)) {
+                    committed = false;
+                    ++vbr_pending_commit_failures_;
+                    tracker->set_shadow_unavailable();
+                }
+            }
+            if (!committed) {
+                // The op terminal-fails: EVERY handle fails, including any committed before
+                // the failing one — failed operations leave no admissible evidence.
+                vbr_fail_extent_set(tracker, pending.extents);
+            }
+        }
+        if (pending.recovery_index >= 0 && committed) {
+            vbr_recovery_release_unused(pending.recovery_index, pending.operation_id);
+        }
+        if (pending.composite) {
+            // P3v2 (v6): the sealed aggregate owns the root close — this slot's terminal
+            // result feeds it, failure dominating.
+            pending.composite->report_terminal(committed);
+        } else if (pending.owns_close) {
+            vbr_operation_registry_close(pending.operation_id,
+                    committed ? vbr_operation_outcome::committed : vbr_operation_outcome::failed);
+        }
+    }
+    vbr_awaiting_commit_.clear();
 }
 
 // padded cell watermark: the extent get_n_kv derives read views from (256 = the fattn padding
@@ -3672,6 +3873,16 @@ bool llama_kv_cache::vbr_generation_cell_has_seq_cb(
     return !cache->v_cells[stream].is_empty(cell) && cache->v_cells[stream].seq_has(cell, seq_id);
 }
 
+llama_pos llama_kv_cache::vbr_generation_cell_pos_cb(
+        const void * context, uint32_t stream, uint32_t cell) {
+    const auto * cache = static_cast<const llama_kv_cache *>(context);
+    if (cache == nullptr || stream >= cache->v_cells.size() ||
+            cell >= cache->v_cells[stream].size() || cache->v_cells[stream].is_empty(cell)) {
+        return -1;
+    }
+    return cache->v_cells[stream].pos_get(cell);
+}
+
 bool llama_kv_cache::vbr_generation_capture_live_guarded(
         uint32_t child_id,
         llama_seq_id seq_id,
@@ -3693,16 +3904,34 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
         return false;
     }
 
+    // Gap fix (review): capture enumerates owned cells from the ownership-index masks in page
+    // order — never a legacy cell scan. The scan remains only as the env-gated oracle check.
     const auto & cells = v_cells[stream];
+    if (vbr_ownership_ == nullptr) {
+        return false;
+    }
+    uint32_t expected_rank = 0;
+    if (!vbr_ownership_->rank_below(stream, seq_id, computation_frontier, expected_rank)) {
+        return false;  // unavailable view: generation capture unavailable (fail-closed)
+    }
+    std::vector<uint32_t> owned_cells;
+    owned_cells.reserve(expected_rank);
+    if (!vbr_ownership_->enumerate_owned(stream, seq_id, owned_cells)) {
+        return false;
+    }
     std::vector<uint32_t> dependency_cells;
-    dependency_cells.reserve(cells.seq_pos_count_before(seq_id, computation_frontier));
-    for (uint32_t cell : cells.used_indices()) {
-        if (cells.seq_has(cell, seq_id) && cells.pos_get(cell) < computation_frontier) {
+    dependency_cells.reserve(expected_rank);
+    for (uint32_t cell : owned_cells) {
+        if (cells.pos_get(cell) < computation_frontier) {
             dependency_cells.push_back(cell);
         }
     }
-    if (dependency_cells.size() != cells.seq_pos_count_before(seq_id, computation_frontier)) {
+    if (dependency_cells.size() != expected_rank) {
         return false;
+    }
+    if (vbr_generation_oracle_enabled()) {
+        GGML_ASSERT(expected_rank == cells.seq_pos_count_before(seq_id, computation_frontier) &&
+                    "ownership index diverged from canonical cell scan at capture");
     }
 
     vbr_checkpoint_generation_stream captured_stream;
@@ -3744,16 +3973,449 @@ bool llama_kv_cache::vbr_generation_live_guarded_view(
     live_stream.stream_index           = stream;
     live_stream.dependency_seq_id      = seq_id;
     live_stream.computation_frontier   = computation_frontier;
-    live_stream.exact_dependency_count = v_cells[stream].seq_pos_count_before(
-            seq_id, computation_frontier);
+    // A2 (§5.3): exact dependency cardinality comes from the scan-free ownership index; the
+    // legacy cell scan remains ONLY as the independent oracle cross-check (env-gated). An
+    // unavailable index view makes generation capture unavailable for this checkpoint.
+    uint32_t index_rank = 0;
+    if (vbr_ownership_ == nullptr ||
+        !vbr_ownership_->rank_below(stream, seq_id, computation_frontier, index_rank)) {
+        return false;
+    }
+    live_stream.exact_dependency_count = index_rank;
+    if (vbr_generation_oracle_enabled()) {
+        const uint32_t scan_rank = v_cells[stream].seq_pos_count_before(seq_id, computation_frontier);
+        GGML_ASSERT(scan_rank == index_rank && "ownership index diverged from canonical cell scan");
+    }
     live_stream.membership_context = this;
     live_stream.cell_has_seq       = vbr_generation_cell_has_seq_cb;
+    live_stream.cell_pos           = vbr_generation_cell_pos_cb;
 
     output.child_id        = child_id;
     output.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
     output.tracker         = tracker;
     output.streams         = {live_stream};
     return true;
+}
+
+
+bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
+                                                    uint64_t pool_hi, uint64_t pool_lo,
+                                                    bool wrap_possible, uint16_t stream,
+                                                    const llama_ubatch & ubatch) {
+    // one (seq -> [min,max+1)) range per touched sequence
+    llama_seq_id seqs[vbr_operation_binding::MAX_TARGETS];
+    llama_pos    lo [vbr_operation_binding::MAX_TARGETS];
+    llama_pos    hi [vbr_operation_binding::MAX_TARGETS];
+    uint8_t      n_seqs = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq = ubatch.seq_id[i][s];
+            uint8_t j = 0;
+            while (j < n_seqs && seqs[j] != seq) {
+                ++j;
+            }
+            if (j == n_seqs) {
+                if (n_seqs == vbr_operation_binding::MAX_TARGETS) {
+                    binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+                    return false;
+                }
+                seqs[n_seqs] = seq;
+                lo[n_seqs]   = ubatch.pos[i];
+                hi[n_seqs]   = ubatch.pos[i] + 1;
+                ++n_seqs;
+            } else {
+                lo[j] = std::min(lo[j], ubatch.pos[i]);
+                hi[j] = std::max(hi[j], ubatch.pos[i] + 1);
+            }
+        }
+    }
+    const uint8_t per_seq = wrap_possible ? 2 : 1;
+    const uint8_t flat    = wrap_possible ? 1 : 0;
+    if (binding.n_targets + n_seqs * per_seq + flat > vbr_operation_binding::MAX_TARGETS) {
+        binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+        return false;
+    }
+    for (uint8_t j = 0; j < n_seqs; ++j) {
+        binding.targets[binding.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
+                pool_hi, pool_lo, stream, seqs[j], lo[j], hi[j]);
+        if (wrap_possible) {
+            // v6-fix F1: unified-SWA slot selection may reuse a masked cell of a DIFFERENT
+            // sequence whose position is unbounded by this batch (find_slot checks only the
+            // old owner's own SWA mask), so the destructive claim is the incoming sequence's
+            // whole range — the SELECTED target still binds the exact seq's damage extent.
+            binding.targets[binding.n_targets++] = vbr_make_target(
+                    vbr_operation_kind::decode, vbr_operation_class::swa_wrap,
+                    pool_hi, pool_lo, stream, seqs[j], 0,
+                    std::numeric_limits<llama_pos>::max());
+        }
+    }
+    if (wrap_possible) {
+        // Wrap overwrites force a prefix purge of the OVERWRITTEN cells' owners
+        // (apply_ubatch's nested seq_rm, the §7.3 composite purge). Those owners are chosen
+        // by slot selection INSIDE apply — unknowable at manifest build (the composite mints
+        // before its children run) — so the purge is DECLARED as one seq-wildcard whole-range
+        // target: still pool-exact, operation-bound, and confined to the generic seq_rm
+        // trim class (v6 P1: wildcards match only where the manifest declared them).
+        binding.targets[binding.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::state_api,
+                pool_hi, pool_lo, stream, -1, 0, std::numeric_limits<llama_pos>::max());
+    }
+    return true;
+}
+
+// The innermost open scope's id for cited global/unit publications (empty when none).
+#define vbr_cited_op() \
+    (vbr_current_mutation_ != nullptr && vbr_current_mutation_->active() \
+             ? vbr_current_mutation_->operation_id_ : vbr_operation_id{})
+
+// P1v2 (v6): one spelling of "fail every per-target handle" — shared by the scope, the
+// pending records, and the commit fence. A failed operation leaves NO admissible evidence,
+// including any handle that already reached committed before a later one failed.
+static void vbr_fail_extent_set(
+        vbr_generation_tracker * tracker,
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> & extents) {
+    if (tracker == nullptr) {
+        return;
+    }
+    for (auto & extent : extents) {
+        if (extent) {
+            tracker->extent_store().fail(extent);
+            extent = {};
+        }
+    }
+}
+
+llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *    cache,
+                                                 vbr_operation_kind  kind,
+                                                 vbr_operation_class operation_class,
+                                                 llama_seq_id        seq_id,
+                                                 llama_pos           p0,
+                                                 llama_pos           p1,
+                                                 bool                provenance_bearing,
+                                                 uint16_t            extent_stream)
+    : vbr_mutation_op(cache,
+                      cache != nullptr && cache->vbr_generation_tracker_mut() != nullptr
+                          ? vbr_mutation_binding(kind, seq_id, p0, p1, operation_class,
+                                                 cache->vbr_generation_tracker_mut()->pool_identity().hi,
+                                                 cache->vbr_generation_tracker_mut()->pool_identity().lo,
+                                                 extent_stream)
+                          : vbr_operation_binding{},
+                      provenance_bearing) {}
+
+llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              cache,
+                                                 const vbr_operation_binding & manifest,
+                                                 bool                          provenance_bearing) {
+    if (cache == nullptr || cache->vbr_generation_tracker_mut() == nullptr) {
+        return;  // inert: unarmed caches open no operations (armed-VBR-only scope)
+    }
+    cache_         = cache;
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+
+    kind_         = manifest.kind;
+    extent_owner_ = this;
+    // Review F10/C1: composite participation. A nested scope (library-internal composite,
+    // e.g. apply_ubatch's purge trims) borrows the outer identity fully. An ADOPTED scope
+    // (wrapper-forwarded, e.g. iSWA children under one decode id) shares the id but owns its
+    // tracker-local reservations (v2 finding 3).
+    if (cache_->vbr_current_mutation_ != nullptr) {
+        // v6-fix F3: ANY outer scope determines nested identity. An active outer is joined;
+        // a refused/poisoned/inactive outer makes this nested scope inert under the same
+        // ABSENT identity — it never falls through to mint (A0 one-id, including refusal).
+        joined_       = true;
+        operation_id_ = cache_->vbr_current_mutation_->operation_id_;  // empty when inactive
+        extent_owner_ = cache_->vbr_current_mutation_->extent_owner_;
+    } else if (cache_->vbr_adopted_refused_) {
+        // P2v2 (v6): the composite root's mint was REFUSED — this child fails closed under
+        // the one (absent) identity instead of minting independently (A0 one-id in refusal).
+        adopted_ = true;
+        abort_to_shadow_unavailable();
+    } else if (cache_->vbr_adopted_operation_) {
+        adopted_      = true;
+        operation_id_ = cache_->vbr_adopted_operation_;
+        composite_    = cache_->vbr_adopted_composite_;
+        if (composite_ != nullptr) {
+            // P3v2 (v6): claim the parent-declared participant slot BEFORE any mutation.
+            composite_->claim();
+        }
+        if (!vbr_operation_registry_binding(operation_id_, manifest_)) {
+            abort_to_shadow_unavailable();
+        }
+    } else {
+        owned_op_.emplace(manifest);
+        operation_id_ = owned_op_->id();
+        if (!operation_id_) {
+            // Review F2: registry refusal is FAIL-CLOSED — the shadow must not survive an
+            // untracked mutation. Invalidate before the legacy mutation proceeds, then FALL
+            // THROUGH to scope registration: the inert scope must still be current so event
+            // sites no-op instead of asserting (F2/#8).
+            abort_to_shadow_unavailable();
+        }
+    }
+
+    if (provenance_bearing && !joined_ && operation_id_) {
+        // v3.1 amendment 1: recovery reservation is EAGER — before any mutation (Rev 4 rule
+        // uncompromised). The provenance EXTENTS are lazy: reserved per SELECTED target by
+        // ensure_extent_for() at the first destructive stamp, so a wrap-free SWA decode pays
+        // no extent traffic.
+        const vbr_pool_uuid owner_pool = tracker->pool_identity();
+        recovery_index_ = owned_op_
+                ? vbr_recovery_reserve(owned_op_->binding(), owner_pool.hi, owner_pool.lo)
+                : vbr_recovery_reserve(operation_id_, owner_pool.hi, owner_pool.lo);
+        if (recovery_index_ < 0) {
+            abort_to_shadow_unavailable();
+        }
+    }
+    outer_                        = cache_->vbr_current_mutation_;
+    cache_->vbr_current_mutation_ = this;
+}
+
+llama_kv_cache::vbr_mutation_op::~vbr_mutation_op() {
+    if (cache_ == nullptr) {
+        return;
+    }
+    cache_->vbr_current_mutation_ = outer_;
+    if (joined_) {
+        return;  // borrowed identity: the owner resolves extent/recovery/close
+    }
+    if (adopted_) {
+        // P3v2 (v6): an adopted participant that never transferred its token is terminal
+        // here — setup refusal, poison, and exceptions before detach all report FAILED
+        // exactly once. Its evidence fails; the shared root's failed close autorecords this
+        // child's recovery reservation for the quarantine drain.
+        if (composite_ != nullptr && !detached_) {
+            composite_->report_terminal(false);
+        }
+        if (!detached_ && operation_id_) {
+            fail_extents();
+        }
+        return;
+    }
+    if (detached_) {
+        return;  // everything transferred to the pending record
+    }
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+    if (!succeeded_) {
+        fail_extents();
+    } else if (tracker != nullptr) {
+        for (auto & extent : extents_) {
+            if (extent) {
+                tracker->extent_store().commit(extent);
+                extent = {};
+            }
+        }
+    }
+    if (recovery_index_ >= 0 && succeeded_) {
+        vbr_recovery_release_unused(recovery_index_, operation_id_);
+    }
+    if (owned_op_) {
+        owned_op_->close(succeeded_ ? vbr_operation_outcome::committed
+                                    : vbr_operation_outcome::failed);
+    }
+}
+
+vbr_extent_handle llama_kv_cache::vbr_mutation_op::ensure_extent_for(uint8_t target_index) {
+    if (cache_ == nullptr || !active() || joined_ || target_index >= scope_manifest().n_targets) {
+        return {};
+    }
+    if (extents_[target_index]) {
+        return extents_[target_index];
+    }
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+    if (tracker == nullptr) {
+        return {};
+    }
+    // v3-B4 upgraded by P1v2 (v6): the extent copies the SELECTED covering target exactly —
+    // the tracker chose it per stamp by (seq, pre-mutation position), so the damage evidence
+    // is target-exact by construction.
+    const auto & target = scope_manifest().targets[target_index];
+    extents_[target_index] = tracker->extent_store().reserve(
+            vbr_operation_kind_family(kind_, target.operation_class), target.operation_class,
+            target.stream, target.seq_id, target.range.p0, target.range.p1);
+    if (!extents_[target_index]) {
+        abort_to_shadow_unavailable();
+    }
+    return extents_[target_index];
+}
+
+vbr_extent_handle llama_kv_cache::vbr_mutation_op::extent_trampoline(void * ctx, uint8_t target_index) {
+    return static_cast<vbr_mutation_op *>(ctx)->ensure_extent_for(target_index);
+}
+
+void llama_kv_cache::vbr_mutation_op::fail_extents() {
+    vbr_fail_extent_set(cache_ != nullptr ? cache_->vbr_generation_tracker_mut() : nullptr,
+                        extents_);
+}
+
+// The one spelling of the shadow-unavailable transition (altitude review): fail whatever
+// evidence this scope reserved, invalidate the shadow BEFORE the legacy mutation proceeds,
+// and leave the scope inert-but-open (its close stays clean). The recovery reservation is
+// deliberately KEPT (v6 P1): the operation closes FAILED, that close autorecords the slot,
+// and the boundary quarantine drain performs the sanctioned invalidation — the slot must
+// survive to that drain.
+void llama_kv_cache::vbr_mutation_op::abort_to_shadow_unavailable() {
+    auto * tracker = cache_ != nullptr ? cache_->vbr_generation_tracker_mut() : nullptr;
+    if (tracker == nullptr) {
+        return;
+    }
+    poisoned_ = true;
+    fail_extents();
+    (void) tracker->global_invalidate_and_reset_extents(
+            vbr_mutation_registrant::authenticated_recovery, vbr_operation_class::controller);
+    // P4v2 (v6): ALWAYS latch — even when the invalidation above succeeded. The legacy
+    // mutation that follows this scope is UNTRACKED; no capture may slip in between it and
+    // the next sanctioned transition, which try_clear now proves happened strictly later.
+    tracker->set_shadow_unavailable();
+    // The scope stays OPEN and inert (operation_id_ empty => events refuse politely); event
+    // sites see a current scope and no-op instead of asserting (F2/#8).
+    operation_id_ = {};
+    owned_op_.reset();
+}
+
+// Ownership transfer for deferred families (review F3 lifetime + altitude review): everything
+// the destructor would resolve moves to the pending record instead. Joined scopes own nothing.
+std::optional<llama_kv_cache::vbr_pending_decode_op> llama_kv_cache::vbr_mutation_op::detach_deferred() {
+    if (joined_) {
+        return std::nullopt;
+    }
+    if (!active() || poisoned_) {
+        // P1v2 (v6): a poisoned/refused decode op never transfers — the destructor reports
+        // its terminal FAILURE (aggregate report for composite children, failed close for
+        // owned scopes), and the failed close autorecords its recovery reservation.
+        return std::nullopt;
+    }
+    vbr_pending_decode_op pending;
+    pending.extents        = extents_;
+    extents_               = {};
+    pending.recovery_index = recovery_index_;
+    recovery_index_        = -1;
+    if (owned_op_) {
+        pending.operation_id = owned_op_->release();
+        pending.owns_close   = true;
+    } else {
+        // P3v2 (v6): detach transfers the still-OPEN participant token to the pending owner
+        // — never a terminal report; the sealed aggregate closes the root when every
+        // declared slot has terminated.
+        pending.operation_id = operation_id_;
+        pending.owns_close   = false;
+        pending.composite    = composite_;
+    }
+    detached_ = true;
+    if (!pending.operation_id) {
+        return std::nullopt;
+    }
+    return pending;
+}
+
+void llama_kv_cache::vbr_adopt_operation(vbr_operation_id operation_id) {
+    if (other) {
+        other->vbr_adopt_operation(operation_id);
+        return;
+    }
+    vbr_adopted_operation_ = operation_id;
+}
+
+void llama_kv_cache::vbr_adopt_composite(std::shared_ptr<vbr_composite_outcome> composite) {
+    if (other) {
+        other->vbr_adopt_composite(std::move(composite));
+        return;
+    }
+    vbr_adopted_composite_ = std::move(composite);
+}
+
+void llama_kv_cache::vbr_adopt_refused() {
+    if (other) {
+        other->vbr_adopt_refused();
+        return;
+    }
+    vbr_adopted_refused_ = true;
+}
+
+void llama_kv_cache::vbr_release_adopted() {
+    if (other) {
+        other->vbr_release_adopted();
+        return;
+    }
+    vbr_adopted_operation_ = {};
+    vbr_adopted_composite_.reset();
+    vbr_adopted_refused_   = false;
+}
+
+// P3v2 (v6): the fixed-participant aggregate. Defined here so the registry close stays in
+// the kv-cache trust domain; the iSWA wrapper only constructs/seals it.
+void llama_kv_cache::vbr_composite_outcome::claim() {
+    ++claimed;
+}
+
+void llama_kv_cache::vbr_composite_outcome::report_terminal(bool ok) {
+    failed = failed || !ok;
+    ++terminal;
+    try_close();
+}
+
+void llama_kv_cache::vbr_composite_outcome::seal(bool wrapper_ok) {
+    failed = failed || !wrapper_ok;
+    // Declared participants that never claimed their slot (an exception before a child's
+    // scope opened, or an armed child that never applied) are terminal failures by
+    // construction — every declared slot reports exactly once.
+    if (claimed < declared) {
+        failed    = true;
+        terminal += declared - claimed;
+        claimed   = declared;
+    }
+    sealed = true;
+    try_close();
+}
+
+void llama_kv_cache::vbr_composite_outcome::try_close() {
+    // Reports may accumulate before seal but can never close; the closed flag makes a late
+    // (over-declared) report inert instead of double-closing.
+    if (!sealed || closed || terminal < declared) {
+        return;
+    }
+    closed = true;
+    if (operation_id) {
+        vbr_operation_registry_close(operation_id,
+                failed ? vbr_operation_outcome::failed : vbr_operation_outcome::committed);
+    }
+}
+
+void llama_kv_cache::vbr_decode_ops_finish(bool ok) {
+    if (other) {
+        other->vbr_decode_ops_finish(ok);
+        return;
+    }
+    // C1 (scoped per v3 review B1): ok=false conservatively fails ONLY this decode's
+    // operations — awaiting records are PRIOR submitted decodes whose graphs already ran;
+    // only the scheduler fence may decide them. ok=true moves every per-target extent
+    // prepared -> submitted; operations + recovery reservations stay OPEN until the
+    // synchronize fence delivers the terminal result (Rev 5.1). A submit failure (obsolete
+    // post-reset handle) terminal-fails that owner now.
+    auto * tracker = vbr_generation_tracker_mut();
+    for (auto & pending : vbr_pending_decode_ops_) {
+        bool submitted = ok;
+        if (ok && tracker != nullptr) {
+            for (auto & extent : pending.extents) {
+                if (extent && !tracker->extent_store().submit(extent)) {
+                    ++vbr_pending_commit_failures_;
+                    submitted = false;
+                    break;
+                }
+            }
+        }
+        if (submitted) {
+            vbr_awaiting_commit_.push_back(std::move(pending));
+            continue;
+        }
+        vbr_fail_extent_set(tracker, pending.extents);
+        if (pending.composite) {
+            // P3v2 (v6): terminal failure feeds the sealed aggregate.
+            pending.composite->report_terminal(false);
+        } else if (pending.owns_close) {
+            vbr_operation_registry_close(pending.operation_id, vbr_operation_outcome::failed);
+        }
+    }
+    vbr_pending_decode_ops_.clear();
 }
 
 vbr_generation_event llama_kv_cache::vbr_generation_begin(
@@ -3767,18 +4429,59 @@ vbr_generation_event llama_kv_cache::vbr_generation_begin(
     if (tracker == nullptr) {
         return {};
     }
+    // A2: events cite the innermost open mutation scope (§7.2 explicit binding). A mutation
+    // reaching here without a scope is a wiring bug — refuse the event loudly rather than mint
+    // an uncited one. A scope that opened shadow-unavailable (registry refusal) yields inert
+    // events, matching the legacy-proceeds contract — and once a poison latched the shadow
+    // mid-decode, later events in the same decode are inert the same way.
+    GGML_ASSERT(vbr_current_mutation_ != nullptr && "mutation without an operation scope");
+    if (!vbr_current_mutation_->active() || tracker->shadow_unavailable()) {
+        return {};  // inert scope / latched shadow: legacy proceeds untracked
+    }
+    // The per-target extent supplier attaches only to provenance-relevant
+    // (destructive/imported) events: apply_ubatch mints an append event and a destructive
+    // reuse event under ONE scope, and only the latter's stamps reserve/cite the selected
+    // target's extent (§5.5 row 2). Joined scopes route to their root's extents.
+    const bool provenance = destructive || imported;
     auto event = tracker->begin_event(
-            registrant, operation_class, stream, stamp_kind, destructive, imported);
+            registrant, operation_class, stream, stamp_kind,
+            vbr_current_mutation_->operation_id_,
+            provenance ? &vbr_mutation_op::extent_trampoline : nullptr,
+            provenance ? static_cast<void *>(vbr_current_mutation_->extent_owner_) : nullptr,
+            destructive, imported);
     GGML_ASSERT(event);
     return event;
+}
+
+void llama_kv_cache::vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                               llama_seq_id membership_seq, llama_pos pre_mutation_pos) {
+    vbr_stamp(op, event, cell, &membership_seq, 1, pre_mutation_pos);
+}
+
+void llama_kv_cache::vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                               const llama_seq_id * seqs, int32_t n_seqs,
+                               llama_pos pre_mutation_pos) {
+    if (event &&
+        !vbr_generation_tracker_mut()->stamp_cell(event, cell, seqs, n_seqs, pre_mutation_pos)) {
+        op.poison();
+    }
 }
 
 void llama_kv_cache::vbr_generation_global(
         vbr_mutation_registrant registrant, vbr_operation_class operation_class) {
     auto * tracker = vbr_generation_tracker_mut();
-    if (tracker != nullptr) {
-        GGML_ASSERT(tracker->global_transition(registrant, operation_class));
+    if (tracker == nullptr) {
+        return;
     }
+    // #11 (v2 verdict): a global invalidation is ONE operation — pending decode owners resolve
+    // (conservatively failed) first, then the transition also obsoletes every stored extent
+    // reference and resets the slab, so old cells can never pin slab capacity into the next
+    // lineage epoch.
+    vbr_decode_ops_finish(false);
+    const vbr_operation_id citing =
+            vbr_current_mutation_ != nullptr && vbr_current_mutation_->active()
+                    ? vbr_current_mutation_->operation_id_ : vbr_operation_id{};
+    GGML_ASSERT(tracker->global_invalidate_and_reset_extents(registrant, operation_class, citing));
 }
 
 bool llama_kv_cache::vbr_retier_defer(const char * decision) {
@@ -3815,6 +4518,10 @@ bool llama_kv_cache::vbr_retier_take_reconcile(const char * boundary) {
 // start (prefill-direct). Fires lazily from prepare() at the first decode after the cache
 // empties, whatever emptied it (clear, seq_rm, server slot recycle).
 void llama_kv_cache::vbr_full_reset() {
+    // #9: the scope opens BEFORE the first observable mutation (type flips/unmaps below).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::controller, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     if (vbr_retier_defer("full_reset")) {
         return;
     }
@@ -3863,6 +4570,9 @@ void llama_kv_cache::vbr_full_reset() {
     // that a recurrent-only checkpoint must detect.
     vbr_representation_changed();
     vbr_generation_global(vbr_mutation_registrant::full_reset, vbr_operation_class::controller);
+    if (vbr_ownership_) {
+        vbr_ownership_->clear_all();
+    }
     if (auto * tracker = vbr_generation_tracker_mut()) {
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
             for (uint32_t side = 0; side < 2; ++side) {
@@ -3876,7 +4586,9 @@ void llama_kv_cache::vbr_full_reset() {
                         target,
                         vbr_repr_domain::full,
                         0,
-                        vbr_repr_transition::full_reset));
+                        vbr_repr_transition::full_reset,
+                        vbr_mutation_registrant::full_reset,
+                        vbr_cited_op()));
             }
         }
     }
@@ -3928,6 +4640,9 @@ void llama_kv_cache::vbr_shrink_watermark() {
 // per call; the in-place transcode runs descending tiles (see vbr-transcode.cu) after the grown
 // extent is mapped up front.
 bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
+            vbr_operation_class::controller, -1, -1, -1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     if (vbr_retier_defer("promote")) {
         return false;
     }
@@ -4075,7 +4790,9 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                             ? vbr_repr_domain::full
                             : vbr_repr_domain::tapped,
                     promote_hops,
-                    vbr_repr_transition::promote));
+                    vbr_repr_transition::promote,
+                    vbr_mutation_registrant::promote_next,
+                    vbr_cited_op()));
         }
         vbr_degrade_cursor_--;
 
@@ -4091,6 +4808,9 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
 }
 
 bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
+            vbr_operation_class::controller, -1, -1, -1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     if (vbr_retier_defer("degrade")) {
         return false;
     }
@@ -4231,7 +4951,9 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                             ? vbr_repr_domain::full
                             : vbr_repr_domain::tapped,
                     promote_hops,
-                    transition));
+                    transition,
+                    vbr_mutation_registrant::degrade_next,
+                    vbr_cited_op()));
         }
         return true;
     }
@@ -5227,10 +5949,41 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         // whole target is ours.
         // (our_offer + sib_offer > 0 guaranteed by the continue above)
         const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
+        // v3 review B6/§7.3: one shed operation spans own + sibling execution. The sibling
+        // cache joins by adoption; our own vbr_execute_shed scope nests. P5v2 (v6): the
+        // manifest declares BOTH armed pools exactly — the sibling's adopted unit
+        // publications authenticate against its own tracker, never through a wildcard.
+        vbr_operation_binding shed_binding;
+        shed_binding.kind        = vbr_operation_kind::controller_retier;
+        shed_binding.child_phase = vbr_operation_phase::mutate;
+        const vbr_pool_uuid shed_own_pool = vbr_pool_id();
+        vbr_binding_add_pool_target(shed_binding,
+                vbr_operation_kind::controller_retier, vbr_operation_class::controller,
+                shed_own_pool.hi, shed_own_pool.lo, VBR_STREAM_ANY, -1, -1, -1);
+        if (vbr_ledger_sibling_ != nullptr) {
+            const vbr_pool_uuid shed_sib_pool = vbr_ledger_sibling_->vbr_pool_id();
+            vbr_binding_add_pool_target(shed_binding,
+                    vbr_operation_kind::controller_retier, vbr_operation_class::controller,
+                    shed_sib_pool.hi, shed_sib_pool.lo, VBR_STREAM_ANY, -1, -1, -1);
+        }
+        vbr_mutation_op shed_op(this, shed_binding, /*provenance_bearing=*/false);
+        const vbr_mutation_op::success_on_return shed_ok(shed_op);
+        if (vbr_ledger_sibling_ != nullptr) {
+            if (shed_op.active()) {
+                vbr_ledger_sibling_->vbr_adopt_operation(shed_op.operation_id_);
+            } else if (vbr_generation_tracker_get() != nullptr) {
+                // P2v2 (v6): a refused shared-shed root propagates — the sibling must not
+                // mint independently under the same logical mutation.
+                vbr_ledger_sibling_->vbr_adopt_refused();
+            }
+        }
         size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
         grants_changed = grants_changed || freed_own > 0;
         if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
             vbr_ledger_sibling_->vbr_execute_shed(c, target - freed_own, wm_next);
+        }
+        if (vbr_ledger_sibling_ != nullptr) {
+            vbr_ledger_sibling_->vbr_release_adopted();
         }
     }
     return grants_changed;
@@ -5248,6 +6001,12 @@ size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_
     if (vbr_retier_defer("peer_shed")) {
         return 0;
     }
+    // #9/§7.3: one shed operation; every LOCAL degrade child nests into it (same-cache join).
+    // A sibling cache's shed opens its own operation on its own registry path — cross-cache
+    // composition is a later phase and is documented, not silent.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
+            vbr_operation_class::controller, -1, -1, -1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     vbr_pool * demanded_pool = vbr_find_pool(c.busid);
     if (demanded_pool == nullptr) {
         return 0;
@@ -6335,6 +7094,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // B6: imports are provenance-bearing — recovery reserved BEFORE the first read so a
+    // partial-import unwind autorecords and the boundary drain quarantines + invalidates.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::state_import,
+            vbr_operation_class::state_api, seq_id, 0, std::numeric_limits<llama_pos>::max(),
+            /*provenance_bearing=*/true);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -6392,6 +7157,44 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                         ? vbr_mutation_registrant::whole_import
                         : vbr_mutation_registrant::state_read_install,
                 vbr_operation_class::state_api);
+        vbr_ownership_rebuild();
+    }
+}
+
+// A2 (altitude review): the one spelling of "update the index for every seq that owns a cell".
+// exclude_seq = -1 means none excluded; add=false removes.
+void llama_kv_cache::vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
+                                                   bool add, llama_seq_id exclude_seq) {
+    if (!vbr_ownership_) {
+        return;
+    }
+    // O(occupants) via the cell's own membership bitset (efficiency review: the all-seq probe
+    // was 12.8M bit tests per whole-cache edit at 200k cells x 64 seqs).
+    v_cells[stream].seq_for_each(cell, [&](llama_seq_id seq) {
+        if (seq == exclude_seq) {
+            return;
+        }
+        if (add) {
+            vbr_ownership_->add_cell(stream, seq, cell, pos);
+        } else {
+            vbr_ownership_->remove_cell(stream, seq, cell, pos);
+        }
+    });
+}
+
+// A2: one-time index rebuild at import/install boundaries (infrequent, sanctioned scan class).
+void llama_kv_cache::vbr_ownership_rebuild() {
+    if (!vbr_ownership_) {
+        return;
+    }
+    vbr_ownership_->clear_all();
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i)) {
+                vbr_ownership_update_all_seqs(s, i, cells.pos_get(i), /*add=*/true);
+            }
+        }
     }
 }
 

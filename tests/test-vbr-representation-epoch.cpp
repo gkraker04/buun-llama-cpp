@@ -5,6 +5,9 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <limits>
+#include <atomic>
+#include <thread>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -230,6 +233,32 @@ static vbr_generation_live_view a1_make_live(
     return live;
 }
 
+// A2: every mutation event must cite a live registry operation. Tests reuse the production
+// RAII (reuse review) — one begin/close idiom in the whole tree. P5v2 (v6): mutation targets
+// carry exact nonzero pools, so every test operation is bound to its tracker's pool.
+struct test_operation {
+    vbr_scoped_operation op;
+    test_operation(vbr_operation_kind kind, vbr_pool_uuid pool, llama_seq_id seq = -1,
+                   llama_pos p0 = 0, llama_pos p1 = std::numeric_limits<llama_pos>::max(),
+                   vbr_operation_class operation_class = vbr_operation_class::state_api)
+        : op(vbr_mutation_binding(kind, seq, p0, p1, operation_class, pool.hi, pool.lo)) {}
+    vbr_operation_id id() const { return op.id(); }
+};
+
+// P1v2 (v6): destructive test events supply per-target extents through the production
+// callback shape; the supplier records which target index the tracker selected (single-target
+// fixtures just populate handles[0]).
+struct test_multi_extent_supplier {
+    std::array<vbr_extent_handle, 2> handles = {};
+    int                              last    = -1;
+};
+
+static vbr_extent_handle test_multi_extent_cb(void * ctx, uint8_t target_index) {
+    auto * supplier = static_cast<test_multi_extent_supplier *>(ctx);
+    supplier->last  = target_index;
+    return target_index < 2 ? supplier->handles[target_index] : vbr_extent_handle{};
+}
+
 static bool run_a1_cpu_tests() {
     llama_kv_cells ownership_index;
     ownership_index.resize(4);
@@ -253,11 +282,25 @@ static bool run_a1_cpu_tests() {
         fprintf(stderr, "A1 process-local pool UUID was reused\n");
         return false;
     }
+    test_operation a1_op(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+                         0, std::numeric_limits<llama_pos>::max(),
+                         vbr_operation_class::ordinary_decode);
+    test_operation a1_edit_op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), -1,
+                              0, std::numeric_limits<llama_pos>::max(),
+                              vbr_operation_class::prompt_share);
+    test_operation distinct_op(vbr_operation_kind::decode, distinct_tracker.pool_identity(), -1,
+                               0, std::numeric_limits<llama_pos>::max(),
+                               vbr_operation_class::ordinary_decode);
+    if (!a1_op.id() || !a1_edit_op.id() || !distinct_op.id()) {
+        fprintf(stderr, "A2 test operation failed to register\n");
+        return false;
+    }
     auto foreign_event = distinct_tracker.begin_event(
             vbr_mutation_registrant::apply_ubatch_append,
             vbr_operation_class::ordinary_decode,
             0,
-            vbr_generation_stamp_kind::dependency);
+            vbr_generation_stamp_kind::dependency,
+            distinct_op.id());
     if (!foreign_event || tracker.stamp_cell(foreign_event, 10, 0) || !foreign_event.finish()) {
         fprintf(stderr, "A1 tracker accepted an event owned by another controller\n");
         return false;
@@ -267,7 +310,8 @@ static bool run_a1_cpu_tests() {
             vbr_mutation_registrant::apply_ubatch_append,
             vbr_operation_class::ordinary_decode,
             0,
-            vbr_generation_stamp_kind::dependency);
+            vbr_generation_stamp_kind::dependency,
+            a1_op.id());
     if (!append || !tracker.stamp_cell(append, 10, 0) ||
             !tracker.stamp_cell(append, 300, 0) || !append.finish()) {
         fprintf(stderr, "A1 dependency event did not publish atomically\n");
@@ -279,7 +323,8 @@ static bool run_a1_cpu_tests() {
             vbr_mutation_registrant::seq_cp,
             vbr_operation_class::prompt_share,
             0,
-            vbr_generation_stamp_kind::membership);
+            vbr_generation_stamp_kind::membership,
+            a1_edit_op.id());
     if (!share || !tracker.stamp_cell(share, 10, 1) ||
             tracker.dependency_generation(0, 10) != dependency_before ||
             tracker.membership_generation(0, 10) == 0 || !share.finish()) {
@@ -310,7 +355,8 @@ static bool run_a1_cpu_tests() {
             vbr_mutation_registrant::seq_cp,
             vbr_operation_class::prompt_share,
             0,
-            vbr_generation_stamp_kind::membership);
+            vbr_generation_stamp_kind::membership,
+            a1_edit_op.id());
     if (!foreign_share || !tracker.stamp_cell(foreign_share, 10, 2)) {
         fprintf(stderr, "A1 membership-only refinement stamp failed\n");
         return false;
@@ -335,7 +381,8 @@ static bool run_a1_cpu_tests() {
             vbr_mutation_registrant::apply_ubatch_append,
             vbr_operation_class::ordinary_decode,
             0,
-            vbr_generation_stamp_kind::dependency);
+            vbr_generation_stamp_kind::dependency,
+            a1_op.id());
     if (!unrelated || !tracker.stamp_cell(unrelated, 20, 1) ||
             !tracker.stamp_cell(unrelated, 256, 1) ||
             !tracker.stamp_cell(unrelated, 600, 1) || !unrelated.finish() ||
@@ -370,6 +417,7 @@ static bool run_a1_cpu_tests() {
             vbr_operation_class::ordinary_decode,
             0,
             vbr_generation_stamp_kind::dependency,
+            a1_op.id(), nullptr, nullptr,
             true);
     if (!rewrite || !tracker.stamp_cell(rewrite, 10, 0) || !rewrite.finish()) {
         fprintf(stderr, "A1 destructive dependency event did not publish atomically\n");
@@ -391,11 +439,15 @@ static bool run_a1_cpu_tests() {
     // Durable transition provenance, not a debug-ring entry, is the only live_rebased proof.
     vbr_generation_tracker rebased_tracker(1, 512, 1);
     rebased_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+    test_operation rebased_op(vbr_operation_kind::decode, rebased_tracker.pool_identity(), -1,
+                              0, std::numeric_limits<llama_pos>::max(),
+                              vbr_operation_class::ordinary_decode);
     auto rebased_append = rebased_tracker.begin_event(
             vbr_mutation_registrant::apply_ubatch_append,
             vbr_operation_class::ordinary_decode,
             0,
-            vbr_generation_stamp_kind::dependency);
+            vbr_generation_stamp_kind::dependency,
+            rebased_op.id());
     rebased_tracker.stamp_cell(rebased_append, 10, 0);
     if (!rebased_append.finish()) {
         fprintf(stderr, "A1 rebased fixture event did not publish atomically\n");
@@ -406,7 +458,8 @@ static bool run_a1_cpu_tests() {
     auto rebased_record = a1_make_record(rebased_tracker, rebased_stream);
     if (!rebased_tracker.publish_unit(
                 0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
-                vbr_repr_transition::degrade_f16_to_t8_admitted)) {
+                vbr_repr_transition::degrade_f16_to_t8_admitted,
+                vbr_mutation_registrant::degrade_next)) {
         fprintf(stderr, "A1 durable transition publish failed\n");
         return false;
     }
@@ -422,11 +475,15 @@ static bool run_a1_cpu_tests() {
 
     vbr_generation_tracker unproven_tracker(1, 512, 1);
     unproven_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+    test_operation unproven_op(vbr_operation_kind::decode, unproven_tracker.pool_identity(), -1,
+                               0, std::numeric_limits<llama_pos>::max(),
+                               vbr_operation_class::ordinary_decode);
     auto unproven_append = unproven_tracker.begin_event(
             vbr_mutation_registrant::apply_ubatch_append,
             vbr_operation_class::ordinary_decode,
             0,
-            vbr_generation_stamp_kind::dependency);
+            vbr_generation_stamp_kind::dependency,
+            unproven_op.id());
     unproven_tracker.stamp_cell(unproven_append, 10, 0);
     if (!unproven_append.finish()) {
         fprintf(stderr, "A1 unproven fixture event did not publish atomically\n");
@@ -437,7 +494,8 @@ static bool run_a1_cpu_tests() {
     auto unproven_record = a1_make_record(unproven_tracker, unproven_stream);
     unproven_tracker.publish_unit(
             0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
-            vbr_repr_transition::degrade_other);
+            vbr_repr_transition::degrade_other,
+            vbr_mutation_registrant::degrade_next);
     auto unproven_live = a1_make_live(unproven_tracker, rebased_membership, 1, 20);
     result = checkpoint_vbr_eligibility(unproven_record, unproven_live);
     if (result.reason != vbr_checkpoint_eligibility_reason::live_rebased_transition) {
@@ -503,12 +561,988 @@ static bool run_a1_cpu_tests() {
     return true;
 }
 
+
+static bool run_a2_cpu_tests() {
+    // --- extent store lifecycle -------------------------------------------------------------
+    vbr_generation_tracker tracker(1, 768, 1);
+    test_operation op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 0, 0, 100);
+    auto & store = tracker.extent_store();
+
+    auto handle = store.reserve(vbr_mutation_family::trim,
+                                vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 100);
+    if (!handle) {
+        fprintf(stderr, "A2 extent reserve failed\n");
+        return false;
+    }
+    auto ref = store.add_ref(handle);
+    if (!ref || store.lookup_committed(ref) != nullptr) {
+        fprintf(stderr, "A2 prepared extent must not be admission evidence\n");
+        return false;
+    }
+    if (!store.submit(handle) || store.lookup_committed(ref) != nullptr) {
+        fprintf(stderr, "A2 submitted extent must not be admission evidence\n");
+        return false;
+    }
+    if (!store.commit(handle)) {
+        fprintf(stderr, "A2 extent commit from submitted failed\n");
+        return false;
+    }
+    const auto * entry = store.lookup_committed(ref);
+    if (entry == nullptr || entry->p0 != 0 || entry->p1 != 100 ||
+            entry->family != vbr_mutation_family::trim) {
+        fprintf(stderr, "A2 committed extent lookup returned wrong evidence\n");
+        return false;
+    }
+    // release-to-zero reclaims; a stale ref then fails ABA-safe
+    store.release_ref(ref);
+    if (store.lookup_committed(ref) != nullptr) {
+        fprintf(stderr, "A2 reclaimed extent slot admitted a stale reference (ABA)\n");
+        return false;
+    }
+    // failed entries are never evidence
+    auto fhandle = store.reserve(vbr_mutation_family::trim,
+                                 vbr_operation_class::dependency_seq_remove, 0, 1, 0,
+                                 std::numeric_limits<llama_pos>::max());
+    auto fref = store.add_ref(fhandle);
+    if (!store.fail(fhandle) || store.lookup_committed(fref) != nullptr) {
+        fprintf(stderr, "A2 failed extent leaked into evidence\n");
+        return false;
+    }
+    store.release_ref(fref);
+    // exhaustion-recovers semantics
+    {
+        std::vector<vbr_extent_handle> hoard;
+        for (;;) {
+            auto h = store.reserve(vbr_mutation_family::trim,
+                                   vbr_operation_class::state_api, 0, 0, 0, 1);
+            if (!h) {
+                break;
+            }
+            hoard.push_back(h);
+        }
+        if (!store.exhausted_latched()) {
+            fprintf(stderr, "A2 extent exhaustion did not latch\n");
+            return false;
+        }
+        store.reset_all();
+        if (store.exhausted_latched() || store.live_entries() != 0 ||
+                !store.reserve(vbr_mutation_family::trim, vbr_operation_class::state_api, 0, 0, 0, 1)) {
+            fprintf(stderr, "A2 extent exhaustion did not recover after slab reset\n");
+            return false;
+        }
+        store.reset_all();
+    }
+
+    // --- citation refusal -------------------------------------------------------------------
+    auto uncited = tracker.begin_event(
+            vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, 0,
+            vbr_generation_stamp_kind::membership, vbr_operation_id{});
+    if (uncited) {
+        fprintf(stderr, "A2 tracker minted an event without a live operation citation\n");
+        (void) uncited.finish();
+        return false;
+    }
+    vbr_operation_id dead_id;
+    {
+        test_operation ephemeral(vbr_operation_kind::sequence_edit, tracker.pool_identity());
+        dead_id = ephemeral.id();
+    }
+    auto dead_cited = tracker.begin_event(
+            vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, 0,
+            vbr_generation_stamp_kind::membership, dead_id);
+    if (dead_cited) {
+        fprintf(stderr, "A2 tracker accepted a dead operation citation\n");
+        (void) dead_cited.finish();
+        return false;
+    }
+
+    // --- ownership index: rank vs brute force incl. shifts + fail-closed domain --------------
+    {
+        vbr_ownership_index index(1, 8, 512);
+        uint64_t rng = 0x5eedULL;
+        std::vector<llama_pos> pos_of(512, -1);
+        auto next = [&rng]() { rng = rng * 6364136223846793005ULL + 1442695040888963407ULL; return (uint32_t)(rng >> 33); };
+        for (int step = 0; step < 4000; ++step) {
+            const uint32_t cell = next() % 512;
+            const uint32_t act  = next() % 3;
+            if (act == 0) {
+                const llama_pos p = (llama_pos)(next() % 512);
+                if (pos_of[cell] < 0 && index.add_cell(0, 3, cell, p)) {
+                    pos_of[cell] = p;
+                }
+            } else if (act == 1 && pos_of[cell] >= 0) {
+                index.remove_cell(0, 3, cell, pos_of[cell]);
+                pos_of[cell] = -1;
+            } else if (pos_of[cell] >= 0) {
+                const llama_pos np = (llama_pos)(next() % 512);
+                if (index.move_cell(0, 3, cell, pos_of[cell], np)) {
+                    pos_of[cell] = np;
+                }
+            }
+        }
+        for (llama_pos frontier : { (llama_pos) 0, (llama_pos) 100, (llama_pos) 511, (llama_pos) 512 }) {
+            uint32_t rank = 0;
+            uint32_t brute = 0;
+            for (uint32_t c = 0; c < 512; ++c) {
+                brute += pos_of[c] >= 0 && pos_of[c] < frontier ? 1 : 0;
+            }
+            if (!index.rank_below(0, 3, frontier, rank) || rank != brute) {
+                fprintf(stderr, "A2 ownership index rank mismatch at frontier %d (%u != %u)\n",
+                        (int) frontier, rank, brute);
+                return false;
+            }
+        }
+        // out-of-domain position: fail-closed unavailable
+        uint32_t free_cell = 0;
+        while (free_cell < 512 && pos_of[free_cell] >= 0) free_cell++;
+        if (index.add_cell(0, 3, free_cell, 9999) || index.available(0, 3)) {
+            fprintf(stderr, "A2 ownership index accepted an out-of-domain position\n");
+            return false;
+        }
+        uint32_t rank = 0;
+        if (index.rank_below(0, 3, 10, rank)) {
+            fprintf(stderr, "A2 unavailable index view still answered a rank query\n");
+            return false;
+        }
+        index.clear_seq(0, 3);
+        if (index.available(0, 3)) {
+            fprintf(stderr, "A2 cleared seq view should be absent\n");
+            return false;
+        }
+    }
+
+    // --- recovery ring + capability ----------------------------------------------------------
+    {
+        test_operation rop(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 2, 0, 64);
+        const int32_t idx = vbr_recovery_reserve(rop.id());
+        if (idx < 0 || !vbr_recovery_release_unused(idx, rop.id())) {
+            fprintf(stderr, "A2 recovery reserve/release failed\n");
+            return false;
+        }
+        const int32_t idx2 = vbr_recovery_reserve(rop.id());
+        if (idx2 < 0 ||
+                !vbr_recovery_record_failure(idx2, rop.id(), vbr_operation_phase::mutate,
+                                             vbr_recovery_failure_site::deferred_byte_copy, true)) {
+            fprintf(stderr, "A2 recovery record_failure failed\n");
+            return false;
+        }
+        {
+            auto capability = vbr_recovery_mint(idx2);
+            if (!capability || !capability.target_allowed(0, 2, 0, 64) ||
+                    capability.target_allowed(0, 2, 0, 65) || capability.target_allowed(0, 5, 0, 64)) {
+                fprintf(stderr, "A2 recovery capability target restriction failed\n");
+                return false;
+            }
+            // deliberately no resolve: destructor must fail-close to quarantined
+        }
+        // C4: the fail-closed destructor left the record awaiting_ack. Take it for the
+        // (wildcard-pool) target, ack with the token; a stale token must not ack twice.
+        auto work = vbr_recovery_take_quarantine(0, 0);
+        if (!work.token) {
+            fprintf(stderr, "C4 fail-closed capability left no pending quarantine\n");
+            return false;
+        }
+        if (!vbr_recovery_ack_quarantine(work.token, 0, 0) ||
+                vbr_recovery_ack_quarantine(work.token, 0, 0)) {
+            fprintf(stderr, "C4 quarantine token ack was not single-use\n");
+            return false;
+        }
+        if (vbr_recovery_take_quarantine(0, 0).token) {
+            fprintf(stderr, "C4 acked quarantine still pending\n");
+            return false;
+        }
+        auto remint = vbr_recovery_mint(idx2);
+        if (remint) {
+            fprintf(stderr, "A2 reclaimed recovery record allowed a second mint\n");
+            return false;
+        }
+    }
+
+    // --- registry binding retention + close(failed) autorecord --------------------------------
+    {
+        vbr_operation_binding probe;
+        test_operation bop(vbr_operation_kind::state_import, tracker.pool_identity(), 4, 10, 20);
+        if (!vbr_operation_registry_binding(bop.id(), probe) ||
+                probe.seq_id() != 4 || probe.range().p0 != 10 || probe.range().p1 != 20 ||
+                probe.kind != vbr_operation_kind::state_import) {
+            fprintf(stderr, "A2 registry did not retain the authenticated binding\n");
+            return false;
+        }
+        const int32_t ridx = vbr_recovery_reserve(bop.id());
+        const vbr_operation_id bop_id = bop.id();
+        if (ridx < 0 || !bop.op.close(vbr_operation_outcome::failed)) {
+            fprintf(stderr, "A2 close(failed) failed\n");
+            return false;
+        }
+        (void) bop_id;
+        vbr_failed_operation_record record;
+        if (!vbr_recovery_get_record(ridx, record) ||
+                record.state != vbr_recovery_state::recorded) {
+            fprintf(stderr, "A2 close(failed) did not autorecord the reserved recovery slot\n");
+            return false;
+        }
+        auto cleanup = vbr_recovery_mint(ridx);
+        cleanup.resolve_quarantined();
+    }
+
+    // --- §5.5 expected-tombstone classification ----------------------------------------------
+    // Build: capture two cells for seq 0 below frontier 400, then trim them under
+    // explicit_destructive_trim with a committed extent -> expected tombstone row 3.
+    {
+        vbr_generation_tracker t2(1, 768, 1);
+        t2.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+        test_operation cap_op(vbr_operation_kind::decode, t2.pool_identity(), -1,
+                              0, std::numeric_limits<llama_pos>::max(),
+                              vbr_operation_class::ordinary_decode);
+        {
+            auto seed = t2.begin_event(
+                    vbr_mutation_registrant::apply_ubatch_append, vbr_operation_class::ordinary_decode,
+                    0, vbr_generation_stamp_kind::dependency, cap_op.id());
+            if (!seed || !t2.stamp_cell(seed, 10, 0) || !t2.stamp_cell(seed, 300, 0) || !seed.finish()) {
+                fprintf(stderr, "A2 tombstone fixture seed failed\n");
+                return false;
+            }
+        }
+        vbr_checkpoint_generation_stream stream;
+        if (!vbr_generation_capture_stream(t2, 0, 0, 400, {10, 300}, stream)) {
+            fprintf(stderr, "A2 tombstone fixture capture failed\n");
+            return false;
+        }
+        vbr_checkpoint_generation_record record;
+        record.status  = vbr_checkpoint_generation_status::complete;
+        record.version = 1;
+        vbr_checkpoint_generation_controller controller;
+        if (!vbr_generation_capture_controller(t2, 0, checkpoint_child_dependency_mode::live_guarded,
+                                               {stream}, controller)) {
+            fprintf(stderr, "A2 tombstone fixture controller build failed\n");
+            return false;
+        }
+        record.controllers = {controller};
+
+        // destructive trim of both cells, provenance-bearing with committed extent
+        test_operation trim_op(vbr_operation_kind::sequence_edit, t2.pool_identity(), 0, 0, 400,
+                               vbr_operation_class::explicit_destructive_trim);
+        auto trim_extent = t2.extent_store().reserve(
+                vbr_mutation_family::trim, vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 400);
+        test_multi_extent_supplier trim_supplier;
+        trim_supplier.handles[0] = trim_extent;
+        {
+            auto trim = t2.begin_event(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::explicit_destructive_trim,
+                    0, vbr_generation_stamp_kind::membership, trim_op.id(),
+                    &test_multi_extent_cb, &trim_supplier, true);
+            // C2: stamps prove pre-mutation positions inside the committed [0,400) extent.
+            if (!trim || !t2.stamp_cell(trim, 10, 0, 10) || !t2.stamp_cell(trim, 300, 0, 300) || !trim.finish()) {
+                fprintf(stderr, "A2 tombstone trim events failed\n");
+                return false;
+            }
+        }
+        if (!t2.extent_store().commit(trim_extent)) {
+            fprintf(stderr, "A2 tombstone trim extent commit failed\n");
+            return false;
+        }
+
+        vbr_generation_live_view live;
+        live.legacy_eligible = true;
+        vbr_generation_live_controller_view live_controller;
+        live_controller.child_id        = controller.child_id;
+        live_controller.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        live_controller.tracker         = &t2;
+        vbr_generation_live_stream_view live_stream;
+        live_stream.stream_index           = 0;
+        live_stream.dependency_seq_id      = 0;
+        live_stream.computation_frontier   = 400;
+        live_stream.exact_dependency_count = 0;  // both trimmed away
+        live_stream.membership_context     = nullptr;
+        live_stream.cell_has_seq = [](const void *, uint32_t, uint32_t, llama_seq_id) { return false; };
+        live_stream.cell_pos     = [](const void *, uint32_t, uint32_t) -> llama_pos { return -1; };
+        live_controller.streams = {live_stream};
+        live.controllers        = {live_controller};
+
+        const auto verdict = checkpoint_vbr_eligibility(record, live);
+        if (verdict.strict ||
+                verdict.tombstone_class != vbr_expected_tombstone_class::explicit_destructive_trim ||
+                verdict.rejecting_cells != 2) {
+            fprintf(stderr, "A2 expected tombstone row 3 misclassified (class %d, cells %u)\n",
+                    (int) verdict.tombstone_class, verdict.rejecting_cells);
+            const auto mref10  = t2.membership_extent(0, 10);
+            const auto mref300 = t2.membership_extent(0, 300);
+            fprintf(stderr, "  mref10=(%u,%u) mref300=(%u,%u) lookup10=%p lookup300=%p reason=%d\n",
+                    mref10.index, mref10.expected_gen, mref300.index, mref300.expected_gen,
+                    (const void *) t2.extent_store().lookup_committed(mref10),
+                    (const void *) t2.extent_store().lookup_committed(mref300),
+                    (int) verdict.reason);
+            return false;
+        }
+    }
+
+    // --- review-fix coverage ------------------------------------------------------------------
+    // F4: a decode-kind operation must NOT authorize a prompt-share membership event.
+    {
+        vbr_generation_tracker t3(1, 256, 1);
+        test_operation decode_op(vbr_operation_kind::decode, t3.pool_identity(), -1,
+                                 0, std::numeric_limits<llama_pos>::max(),
+                                 vbr_operation_class::ordinary_decode);
+        auto misused = t3.begin_event(
+                vbr_mutation_registrant::seq_cp, vbr_operation_class::prompt_share,
+                0, vbr_generation_stamp_kind::membership, decode_op.id());
+        if (misused) {
+            fprintf(stderr, "F4: decode operation authorized a sequence-share event\n");
+            (void) misused.finish();
+            return false;
+        }
+        // P1v2 (v6) seq scope: an op bound to seq 2 stamps seq 2 fine; a seq-3 stamp has no
+        // covering target, so it POISONS the event and latches unavailable IMMEDIATELY, and
+        // every further stamp from the poisoned event is inert.
+        test_operation seq2_op(vbr_operation_kind::sequence_edit, t3.pool_identity(), 2, 0, 100);
+        auto scoped = t3.begin_event(
+                vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                0, vbr_generation_stamp_kind::membership, seq2_op.id());
+        if (!scoped || !t3.stamp_cell(scoped, 5, 2, 5)) {
+            fprintf(stderr, "F4: authorized seq-scope stamp failed\n");
+            return false;
+        }
+        if (t3.stamp_cell(scoped, 5, 3, 5) || !t3.shadow_unavailable()) {
+            fprintf(stderr, "P1v2: unauthorized seq stamp did not poison + latch immediately\n");
+            return false;
+        }
+        if (t3.stamp_cell(scoped, 5, 2, 5)) {
+            fprintf(stderr, "P1v2: poisoned event accepted a further stamp\n");
+            return false;
+        }
+        if (!scoped.finish()) {
+            fprintf(stderr, "P1v2: poisoned event did not finish cleanly\n");
+            return false;
+        }
+    }
+    // F6: resolved recovery records reclaim their slots — the ring survives > capacity cycles.
+    {
+        test_operation cyc_op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 0, 0, 8);
+        for (int cycle = 0; cycle < 70; ++cycle) {
+            const int32_t idx = vbr_recovery_reserve(cyc_op.id());
+            if (idx < 0) {
+                fprintf(stderr, "F6: recovery ring exhausted at cycle %d (leak)\n", cycle);
+                return false;
+            }
+            if (!vbr_recovery_record_failure(idx, cyc_op.id(), vbr_operation_phase::mutate,
+                                             vbr_recovery_failure_site::metadata_mutation, false)) {
+                fprintf(stderr, "F6: record_failure failed at cycle %d\n", cycle);
+                return false;
+            }
+            auto capability = vbr_recovery_mint(idx);
+            if (!capability || !capability.resolve_completed()) {
+                fprintf(stderr, "F6: resolve_completed failed at cycle %d\n", cycle);
+                return false;
+            }
+        }
+    }
+    // F7: with rejecting cells, live-count expansion must classify unexplained even when the
+    // reject provenance would otherwise satisfy a tombstone row. Reuse the row-3 fixture shape
+    // but report a live count that does NOT reconcile as captured-minus-lost.
+    {
+        vbr_generation_tracker t4(1, 768, 1);
+        t4.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+        test_operation cap_op(vbr_operation_kind::decode, t4.pool_identity(), -1,
+                              0, std::numeric_limits<llama_pos>::max(),
+                              vbr_operation_class::ordinary_decode);
+        {
+            auto seed = t4.begin_event(
+                    vbr_mutation_registrant::apply_ubatch_append, vbr_operation_class::ordinary_decode,
+                    0, vbr_generation_stamp_kind::dependency, cap_op.id());
+            if (!seed || !t4.stamp_cell(seed, 10, 0) || !t4.stamp_cell(seed, 300, 0) || !seed.finish()) {
+                return false;
+            }
+        }
+        vbr_checkpoint_generation_stream stream;
+        if (!vbr_generation_capture_stream(t4, 0, 0, 400, {10, 300}, stream)) {
+            return false;
+        }
+        vbr_checkpoint_generation_record record;
+        record.status  = vbr_checkpoint_generation_status::complete;
+        record.version = 1;
+        vbr_checkpoint_generation_controller controller;
+        if (!vbr_generation_capture_controller(t4, 0, checkpoint_child_dependency_mode::live_guarded,
+                                               {stream}, controller)) {
+            return false;
+        }
+        record.controllers = {controller};
+        test_operation trim_op(vbr_operation_kind::sequence_edit, t4.pool_identity(), 0, 0, 400,
+                               vbr_operation_class::explicit_destructive_trim);
+        auto trim_extent = t4.extent_store().reserve(
+                vbr_mutation_family::trim, vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 400);
+        test_multi_extent_supplier trim_supplier;
+        trim_supplier.handles[0] = trim_extent;
+        {
+            auto trim = t4.begin_event(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::explicit_destructive_trim,
+                    0, vbr_generation_stamp_kind::membership, trim_op.id(),
+                    &test_multi_extent_cb, &trim_supplier, true);
+            if (!trim || !t4.stamp_cell(trim, 10, 0, 10) || !t4.stamp_cell(trim, 300, 0, 300) || !trim.finish()) {
+                return false;
+            }
+        }
+        t4.extent_store().commit(trim_extent);
+        vbr_generation_live_view live;
+        live.legacy_eligible = true;
+        vbr_generation_live_controller_view live_controller;
+        live_controller.child_id        = controller.child_id;
+        live_controller.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        live_controller.tracker         = &t4;
+        vbr_generation_live_stream_view live_stream;
+        live_stream.stream_index           = 0;
+        live_stream.dependency_seq_id      = 0;
+        live_stream.computation_frontier   = 400;
+        live_stream.exact_dependency_count = 3;  // EXPANSION: does not reconcile with 2 captured - 2 lost
+        live_stream.membership_context     = nullptr;
+        live_stream.cell_has_seq = [](const void *, uint32_t, uint32_t, llama_seq_id) { return false; };
+        live_stream.cell_pos     = [](const void *, uint32_t, uint32_t) -> llama_pos { return -1; };
+        live_controller.streams = {live_stream};
+        live.controllers        = {live_controller};
+        const auto verdict = checkpoint_vbr_eligibility(record, live);
+        if (verdict.strict || verdict.tombstone_class != vbr_expected_tombstone_class::unexplained) {
+            fprintf(stderr, "F7: cardinality expansion under rejects was not unexplained (class %d)\n",
+                    (int) verdict.tombstone_class);
+            return false;
+        }
+    }
+
+    // --- v3 failure-path matrix (CPU rows) ----------------------------------------------------
+    // Forged-field matrix (§11.1): each forged manifest dimension must refuse the event.
+    {
+        vbr_generation_tracker t5(1, 256, 1);
+        const vbr_pool_uuid t5_pool = t5.pool_identity();
+        // wrong class
+        test_operation wrong_class(vbr_operation_kind::sequence_edit, t5_pool, 0, 0, 10,
+                                   vbr_operation_class::prompt_share);
+        auto e1 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                                 0, vbr_generation_stamp_kind::membership, wrong_class.id());
+        // wrong kind for registrant (controller_retier cannot authorize seq_rm)
+        test_operation wrong_kind(vbr_operation_kind::controller_retier, t5_pool, -1, -1, -1,
+                                  vbr_operation_class::state_api);
+        auto e2 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                                 0, vbr_generation_stamp_kind::membership, wrong_kind.id());
+        // wrong stream target
+        vbr_operation_binding far_stream = vbr_mutation_binding(
+                vbr_operation_kind::sequence_edit, 0, 0, 10, vbr_operation_class::state_api,
+                t5_pool.hi, t5_pool.lo, /*stream=*/7);
+        vbr_scoped_operation far_op(far_stream);
+        // foreign pool: a manifest bound to ANOTHER controller's pool never covers this one
+        vbr_generation_tracker t5_foreign(1, 64, 1);
+        test_operation foreign_pool(vbr_operation_kind::sequence_edit,
+                                    t5_foreign.pool_identity(), 0, 0, 10,
+                                    vbr_operation_class::state_api);
+        auto e3 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                                 0, vbr_generation_stamp_kind::membership, far_op.id());
+        auto e5 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                                 0, vbr_generation_stamp_kind::membership, foreign_pool.id());
+        if (e1 || e2 || e3 || e5) {
+            fprintf(stderr, "v3 forged-field matrix: a forged manifest authorized an event\n");
+            return false;
+        }
+        // correct manifest, wrong stamped seq (target seq 2, stamping seq 3): authorized
+        // stamp first, then the forged one — which poisons the event (P1v2).
+        test_operation seq_scope(vbr_operation_kind::sequence_edit, t5_pool, 2, 0, 10,
+                                 vbr_operation_class::state_api);
+        auto e4 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
+                                 0, vbr_generation_stamp_kind::membership, seq_scope.id());
+        if (!e4 || !t5.stamp_cell(e4, 1, 2, 5) || t5.stamp_cell(e4, 1, 3, 5) ||
+                !t5.shadow_unavailable() || !e4.finish()) {
+            fprintf(stderr, "v3 forged-field matrix: seq-scope stamp check failed\n");
+            return false;
+        }
+    }
+    // Committed evidence WITHOUT a positional proof (in_range false: stamp at an unknown
+    // position under a whole-range manifest) => row 3 must classify unexplained. The v5
+    // "out-of-extent" fixture is no longer constructible: a stamp outside the authenticated
+    // range now poisons instead of producing misattributed evidence (P1v2) — covered above.
+    {
+        vbr_generation_tracker t6(1, 768, 1);
+        t6.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+        test_operation cap_op6(vbr_operation_kind::decode, t6.pool_identity(), -1,
+                               0, std::numeric_limits<llama_pos>::max(),
+                               vbr_operation_class::ordinary_decode);
+        {
+            auto seed = t6.begin_event(
+                    vbr_mutation_registrant::apply_ubatch_append, vbr_operation_class::ordinary_decode,
+                    0, vbr_generation_stamp_kind::dependency, cap_op6.id());
+            if (!seed || !t6.stamp_cell(seed, 10, 0) || !seed.finish()) {
+                return false;
+            }
+        }
+        vbr_checkpoint_generation_stream stream6;
+        if (!vbr_generation_capture_stream(t6, 0, 0, 400, {10}, stream6)) {
+            return false;
+        }
+        vbr_checkpoint_generation_record record6;
+        record6.status  = vbr_checkpoint_generation_status::complete;
+        record6.version = 1;
+        vbr_checkpoint_generation_controller controller6;
+        if (!vbr_generation_capture_controller(t6, 0, checkpoint_child_dependency_mode::live_guarded,
+                                               {stream6}, controller6)) {
+            return false;
+        }
+        record6.controllers = {controller6};
+        // whole-range trim, stamped at an UNKNOWN position (-1): selection covers via the
+        // whole-range form, but the in_range proof bit stays false -> row 3 unexplained
+        test_operation trim6(vbr_operation_kind::sequence_edit, t6.pool_identity(), 0,
+                             0, std::numeric_limits<llama_pos>::max(),
+                             vbr_operation_class::explicit_destructive_trim);
+        auto extent6 = t6.extent_store().reserve(
+                vbr_mutation_family::trim, vbr_operation_class::explicit_destructive_trim, 0, 0,
+                0, std::numeric_limits<llama_pos>::max());
+        test_multi_extent_supplier supplier6;
+        supplier6.handles[0] = extent6;
+        {
+            auto trim = t6.begin_event(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::explicit_destructive_trim,
+                    0, vbr_generation_stamp_kind::membership, trim6.id(),
+                    &test_multi_extent_cb, &supplier6, true);
+            if (!trim || !t6.stamp_cell(trim, 10, 0, -1) || !trim.finish()) {
+                return false;
+            }
+        }
+        t6.extent_store().commit(extent6);
+        vbr_generation_live_view live6;
+        live6.legacy_eligible = true;
+        vbr_generation_live_controller_view lc6;
+        lc6.child_id        = controller6.child_id;
+        lc6.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        lc6.tracker         = &t6;
+        vbr_generation_live_stream_view ls6;
+        ls6.stream_index           = 0;
+        ls6.dependency_seq_id      = 0;
+        ls6.computation_frontier   = 400;
+        ls6.exact_dependency_count = 0;
+        ls6.cell_has_seq = [](const void *, uint32_t, uint32_t, llama_seq_id) { return false; };
+        ls6.cell_pos     = [](const void *, uint32_t, uint32_t) -> llama_pos { return -1; };
+        lc6.streams = {ls6};
+        live6.controllers = {lc6};
+        const auto verdict6 = checkpoint_vbr_eligibility(record6, live6);
+        if (verdict6.tombstone_class != vbr_expected_tombstone_class::unexplained) {
+            fprintf(stderr, "v3: out-of-extent trim classified as expected (class %d)\n",
+                    (int) verdict6.tombstone_class);
+            return false;
+        }
+    }
+    // Publish-injection between reads: direct interleave — evaluator must reject unit_unstable.
+    // (The tuple read itself is race-free by the units mutex; this exercises the F9 snapshot.)
+    // Simulated by capturing a record, publishing a unit, and evaluating: repr_gen changes make
+    // it unit_generation-reject; the F9 snapshot path is additionally covered by the two-thread
+    // stress below reaching stable states only.
+    // C5 row: clear_all -> add -> rank on the fixed slot map (the v2 critical-1 crash shape).
+    {
+        vbr_ownership_index idx5(1, 8, 512);
+        if (!idx5.add_cell(0, 1, 3, 30)) {
+            return false;
+        }
+        idx5.clear_all();
+        uint32_t rank5 = 0;
+        if (!idx5.add_cell(0, 1, 4, 40) || !idx5.rank_below(0, 1, 100, rank5) || rank5 != 1) {
+            fprintf(stderr, "C5: clear_all -> add -> rank failed (rank %u)\n", rank5);
+            return false;
+        }
+        std::vector<uint32_t> owned5;
+        if (!idx5.enumerate_owned(0, 1, owned5) || owned5.size() != 1 || owned5[0] != 4) {
+            fprintf(stderr, "C5: post-clear enumeration wrong\n");
+            return false;
+        }
+    }
+    // Two-thread stress: concurrent registry begin/end + recovery reserve/mint/resolve.
+    {
+        std::atomic<bool> failed{false};
+        const vbr_pool_uuid stress_pool = tracker.pool_identity();
+        auto worker = [&failed, stress_pool]() {
+            for (int i = 0; i < 2000 && !failed.load(); ++i) {
+                test_operation op(vbr_operation_kind::sequence_edit, stress_pool, i % 4, 0, 64,
+                                  vbr_operation_class::state_api);
+                if (!op.id()) {
+                    failed.store(true);
+                    break;
+                }
+                vbr_operation_binding probe;
+                if (!vbr_operation_registry_binding(op.id(), probe) ||
+                    probe.seq_id() != i % 4) {
+                    failed.store(true);
+                    break;
+                }
+                const int32_t r = vbr_recovery_reserve(op.id());
+                if (r >= 0) {
+                    if ((i & 1) != 0) {
+                        vbr_recovery_record_failure(r, op.id(), vbr_operation_phase::mutate,
+                                                    vbr_recovery_failure_site::metadata_mutation, false);
+                        auto capability = vbr_recovery_mint(r);
+                        if (capability) {
+                            capability.resolve_completed();
+                        }
+                    } else {
+                        vbr_recovery_release_unused(r, op.id());
+                    }
+                }
+            }
+        };
+        std::thread t1(worker), t2(worker);
+        t1.join();
+        t2.join();
+        if (failed.load()) {
+            fprintf(stderr, "v3 two-thread registry/recovery stress FAILED\n");
+            return false;
+        }
+    }
+
+    // --- v6 rows: P1v2 stamp-time selection + per-target extents --------------------------
+    {
+        vbr_generation_tracker t7(1, 768, 1);
+        vbr_operation_binding two_seq;
+        two_seq.kind        = vbr_operation_kind::decode;
+        two_seq.child_phase = vbr_operation_phase::mutate;
+        two_seq.targets[two_seq.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
+                t7.pool_identity().hi, t7.pool_identity().lo, VBR_STREAM_ANY, 0, 0, 200);
+        two_seq.targets[two_seq.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
+                t7.pool_identity().hi, t7.pool_identity().lo, VBR_STREAM_ANY, 1, 100, 300);
+        vbr_scoped_operation two_seq_op(two_seq);
+        if (!two_seq_op) {
+            fprintf(stderr, "P1v2: two-target selection manifest failed to mint\n");
+            return false;
+        }
+        test_multi_extent_supplier supplier;
+        supplier.handles[0] = t7.extent_store().reserve(
+                vbr_mutation_family::occupied_reuse, vbr_operation_class::ordinary_decode, 0, 0, 0, 200);
+        supplier.handles[1] = t7.extent_store().reserve(
+                vbr_mutation_family::occupied_reuse, vbr_operation_class::ordinary_decode, 0, 1, 100, 300);
+        {
+            auto reuse = t7.begin_event(
+                    vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+                    vbr_operation_class::ordinary_decode, 0,
+                    vbr_generation_stamp_kind::dependency, two_seq_op.id(),
+                    &test_multi_extent_cb, &supplier, true);
+            if (!reuse || !t7.stamp_cell(reuse, 10, 0, 50) || supplier.last != 0 ||
+                    !t7.stamp_cell(reuse, 20, 1, 150) || supplier.last != 1) {
+                fprintf(stderr, "P1v2: per-(seq,pos) selection picked the wrong target\n");
+                return false;
+            }
+            // seq 1 at a position only seq 0's target covers: no cover -> poison + latch
+            if (t7.stamp_cell(reuse, 30, 1, 50) || !t7.shadow_unavailable() ||
+                    t7.stamp_cell(reuse, 10, 0, 50) || !reuse.finish()) {
+                fprintf(stderr, "P1v2: uncovered (seq,pos) stamp did not poison + latch\n");
+                return false;
+            }
+        }
+        // the cells cite their SELECTED target's extent, never target zero's
+        t7.extent_store().commit(supplier.handles[0]);
+        t7.extent_store().commit(supplier.handles[1]);
+        const auto * seq1_evidence = t7.extent_store().lookup_committed(t7.dependency_extent(0, 20));
+        if (seq1_evidence == nullptr || seq1_evidence->seq_id != 1 || seq1_evidence->p0 != 100) {
+            fprintf(stderr, "P1v2: stamp did not bind the selected target's extent\n");
+            return false;
+        }
+        // P4v2 monotone re-arm: the latch recorded the generation; clearing needs a STRICTLY
+        // later sanctioned transition.
+        if (t7.try_clear_shadow_unavailable()) {
+            fprintf(stderr, "P4v2: latch cleared without a post-latch transition\n");
+            return false;
+        }
+        if (!t7.global_transition(vbr_mutation_registrant::clear, vbr_operation_class::state_api) ||
+                !t7.try_clear_shadow_unavailable() || t7.shadow_unavailable()) {
+            fprintf(stderr, "P4v2: latch did not clear after a post-latch transition\n");
+            return false;
+        }
+        t7.set_shadow_unavailable();
+        if (t7.try_clear_shadow_unavailable()) {
+            fprintf(stderr, "P4v2: re-latch reused a stale transition proof\n");
+            return false;
+        }
+        // P1v2 multi-seq target-set proof: every member covered -> stamp; any member
+        // uncovered -> poison. (Fresh tracker: t7 is latched again above.)
+        vbr_generation_tracker t7b(1, 768, 1);
+        vbr_operation_binding set_manifest;
+        set_manifest.kind        = vbr_operation_kind::decode;
+        set_manifest.child_phase = vbr_operation_phase::mutate;
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            set_manifest.targets[set_manifest.n_targets++] = vbr_make_target(
+                    vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
+                    t7b.pool_identity().hi, t7b.pool_identity().lo, VBR_STREAM_ANY, s, 0, 200);
+        }
+        vbr_scoped_operation set_op(set_manifest);
+        auto append = t7b.begin_event(
+                vbr_mutation_registrant::apply_ubatch_append, vbr_operation_class::ordinary_decode,
+                0, vbr_generation_stamp_kind::dependency, set_op.id());
+        const llama_seq_id both[2]     = { 0, 1 };
+        const llama_seq_id stranger[2] = { 0, 2 };
+        if (!append || !t7b.stamp_cell(append, 10, both, 2, 50)) {
+            fprintf(stderr, "P1v2: fully-covered shared-cell stamp refused\n");
+            return false;
+        }
+        if (t7b.stamp_cell(append, 11, stranger, 2, 50) || !t7b.shadow_unavailable() ||
+                !append.finish()) {
+            fprintf(stderr, "P1v2: uncovered shared-cell member did not poison\n");
+            return false;
+        }
+    }
+
+    // --- v6 rows: P5v2 closed mint predicates ---------------------------------------------
+    {
+        const vbr_pool_uuid pool = tracker.pool_identity();
+        auto refused = [](vbr_operation_binding b) {
+            vbr_scoped_operation probe(b);
+            return !probe;
+        };
+        const auto good = vbr_mutation_binding(
+                vbr_operation_kind::sequence_edit, 0, 0, 10,
+                vbr_operation_class::state_api, pool.hi, pool.lo);
+        auto zero_mask = good;
+        zero_mask.targets[0].registrant_mask = 0;
+        auto foreign_bit = good;
+        foreign_bit.targets[0].registrant_mask |=
+                vbr_registrant_bit(vbr_mutation_registrant::apply_ubatch_append);
+        auto subset_mask = good;
+        subset_mask.targets[0].registrant_mask = vbr_registrant_bit(vbr_mutation_registrant::seq_rm);
+        if (refused(good) ||                 // equality with the canonical mask is valid
+            !refused(zero_mask) ||           // mask != 0
+            !refused(foreign_bit) ||         // no out-of-kind bit
+            refused(subset_mask)) {          // nonzero subset is least privilege
+            fprintf(stderr, "P5v2: registrant-mask predicate matrix failed\n");
+            return false;
+        }
+        if (!refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, 0, 10,
+                                          vbr_operation_class::state_api, 0, 0))) {
+            fprintf(stderr, "P5v2: pool-wildcard mutation target minted\n");
+            return false;
+        }
+        if (!refused(vbr_mutation_binding(vbr_operation_kind::decode, 0, 5, 5,
+                                          vbr_operation_class::ordinary_decode, pool.hi, pool.lo))) {
+            fprintf(stderr, "P5v2: empty decode range minted (p0 < p1 required)\n");
+            return false;
+        }
+        if (refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, 5, 5,
+                                         vbr_operation_class::state_api, pool.hi, pool.lo))) {
+            fprintf(stderr, "P5v2: enumerated sequence_edit empty no-op form refused\n");
+            return false;
+        }
+        if (!refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, -1, -1,
+                                          vbr_operation_class::state_api, pool.hi, pool.lo))) {
+            fprintf(stderr, "P5v2: undeclared sequence_edit range wildcard minted\n");
+            return false;
+        }
+        if (refused(vbr_mutation_binding(vbr_operation_kind::controller_retier, -1, -1, -1,
+                                         vbr_operation_class::controller, pool.hi, pool.lo))) {
+            fprintf(stderr, "P5v2: declared controller_retier range wildcard refused\n");
+            return false;
+        }
+    }
+
+    // --- v6 rows: P3v2 fixed-participant sealed aggregate ---------------------------------
+    {
+        // seal marks never-claimed declared slots failed; pre-seal reports cannot close.
+        test_operation root(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+                            0, std::numeric_limits<llama_pos>::max(),
+                            vbr_operation_class::ordinary_decode);
+        const vbr_operation_id root_id = root.op.release();
+        llama_kv_cache::vbr_composite_outcome aggregate;
+        aggregate.operation_id = root_id;
+        aggregate.declared     = 2;
+        aggregate.claim();
+        aggregate.report_terminal(false);
+        if (!vbr_operation_registry_is_live(root_id)) {
+            fprintf(stderr, "P3v2: pre-seal terminal report closed the root\n");
+            return false;
+        }
+        aggregate.seal(true);
+        if (vbr_operation_registry_is_live(root_id) || !aggregate.failed) {
+            fprintf(stderr, "P3v2: seal did not fail the never-claimed slot and close\n");
+            return false;
+        }
+        aggregate.report_terminal(true);  // late report must be inert (no double close)
+        // detach-transfer shape: sealed with open tokens stays open until the LAST terminal.
+        test_operation root2(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+                             0, std::numeric_limits<llama_pos>::max(),
+                             vbr_operation_class::ordinary_decode);
+        const vbr_operation_id root2_id = root2.op.release();
+        llama_kv_cache::vbr_composite_outcome open_tokens;
+        open_tokens.operation_id = root2_id;
+        open_tokens.declared     = 2;
+        open_tokens.claim();
+        open_tokens.claim();
+        open_tokens.seal(true);
+        if (!vbr_operation_registry_is_live(root2_id)) {
+            fprintf(stderr, "P3v2: seal closed the root past open participant tokens\n");
+            return false;
+        }
+        open_tokens.report_terminal(true);
+        if (!vbr_operation_registry_is_live(root2_id)) {
+            fprintf(stderr, "P3v2: root closed before every declared slot terminated\n");
+            return false;
+        }
+        open_tokens.report_terminal(true);
+        if (vbr_operation_registry_is_live(root2_id) || open_tokens.failed) {
+            fprintf(stderr, "P3v2: all-committed sealed aggregate did not close committed\n");
+            return false;
+        }
+    }
+
+    // --- v6 rows: P2v2 transactional ubatch manifest --------------------------------------
+    {
+        llama_seq_id   ids[20];
+        llama_seq_id * seq_ptrs[20];
+        int32_t        n_seq_id[20];
+        llama_pos      pos[20];
+        for (int i = 0; i < 20; ++i) {
+            ids[i]      = i;
+            seq_ptrs[i] = &ids[i];
+            n_seq_id[i] = 1;
+            pos[i]      = 100 + i;
+        }
+        llama_ubatch overflow_ub = {};
+        overflow_ub.n_tokens = 20;
+        overflow_ub.pos      = pos;
+        overflow_ub.n_seq_id = n_seq_id;
+        overflow_ub.seq_id   = seq_ptrs;
+        vbr_operation_binding manifest;
+        manifest.kind        = vbr_operation_kind::decode;
+        manifest.child_phase = vbr_operation_phase::mutate;
+        if (llama_kv_cache::vbr_decode_targets_from_ubatch(
+                    manifest, 1, 1, false, VBR_STREAM_ANY, overflow_ub) ||
+                manifest.n_targets != 0) {
+            fprintf(stderr, "P2v2: seq-ceiling overflow did not zero the manifest\n");
+            return false;
+        }
+        // single-seq wrap manifest: ordinary + whole-range wrap + ONE declared seq-wildcard
+        // purge target (v6-fix F1: cross-sequence masked reuse makes both the destroyed
+        // position and the purged owner unbounded by the incoming batch)
+        llama_ubatch one_ub = {};
+        one_ub.n_tokens = 1;
+        one_ub.pos      = pos;
+        one_ub.n_seq_id = n_seq_id;
+        one_ub.seq_id   = seq_ptrs;
+        manifest           = {};
+        manifest.kind        = vbr_operation_kind::decode;
+        manifest.child_phase = vbr_operation_phase::mutate;
+        if (!llama_kv_cache::vbr_decode_targets_from_ubatch(
+                    manifest, 1, 1, true, VBR_STREAM_ANY, one_ub) ||
+                manifest.n_targets != 3 ||
+                manifest.targets[1].operation_class != vbr_operation_class::swa_wrap ||
+                manifest.targets[1].range.p1 != std::numeric_limits<llama_pos>::max() ||
+                manifest.targets[2].operation_class != vbr_operation_class::state_api ||
+                manifest.targets[2].seq_id != -1 ||
+                manifest.targets[2].range.p1 != std::numeric_limits<llama_pos>::max()) {
+            fprintf(stderr, "P2v2: wrap manifest missing the declared wrap/purge claims\n");
+            return false;
+        }
+        // v6-fix F1 end-to-end: the wrap claims authenticate CROSS-SEQUENCE reuse — a
+        // destructive reuse at a prior position far beyond the incoming batch, and the
+        // nested purge of an OLD owner absent from the ubatch, both cover instead of
+        // poisoning.
+        vbr_generation_tracker t10(1, 768, 1);
+        vbr_operation_binding wrap_manifest;
+        wrap_manifest.kind        = vbr_operation_kind::decode;
+        wrap_manifest.child_phase = vbr_operation_phase::mutate;
+        if (!llama_kv_cache::vbr_decode_targets_from_ubatch(
+                    wrap_manifest, t10.pool_identity().hi, t10.pool_identity().lo,
+                    true, VBR_STREAM_ANY, one_ub)) {
+            return false;
+        }
+        vbr_scoped_operation wrap_op(wrap_manifest);
+        test_multi_extent_supplier wrap_supplier;
+        wrap_supplier.handles[1] = t10.extent_store().reserve(
+                vbr_mutation_family::occupied_reuse, vbr_operation_class::swa_wrap, 0, 0,
+                0, std::numeric_limits<llama_pos>::max());
+        {
+            auto reuse = t10.begin_event(
+                    vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+                    vbr_operation_class::swa_wrap, 0,
+                    vbr_generation_stamp_kind::dependency, wrap_op.id(),
+                    &test_multi_extent_cb, &wrap_supplier, true);
+            if (!reuse || !t10.stamp_cell(reuse, 10, ids[0], 5000) ||
+                    wrap_supplier.last != 1 || !reuse.finish()) {
+                fprintf(stderr, "v6-F1: beyond-batch destructive reuse did not authenticate\n");
+                return false;
+            }
+        }
+        {
+            auto purge = t10.begin_event(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, 0,
+                    vbr_generation_stamp_kind::membership, wrap_op.id());
+            if (!purge || !t10.stamp_cell(purge, 11, 7, 5000) || t10.shadow_unavailable() ||
+                    !purge.finish()) {
+                fprintf(stderr, "v6-F1: old-owner cross-seq purge did not authenticate\n");
+                return false;
+            }
+        }
+    }
+
+    // --- v6-fix rows: F6 stream-exact recovery, F7 closed seq domain ----------------------
+    {
+        // F6: a record whose only target names exact stream 1 must NOT authorize stream 0.
+        vbr_operation_binding far = vbr_mutation_binding(
+                vbr_operation_kind::sequence_edit, 2, 0, 64, vbr_operation_class::state_api,
+                tracker.pool_identity().hi, tracker.pool_identity().lo, /*stream=*/1);
+        vbr_scoped_operation far_op(far);
+        const int32_t ridx = vbr_recovery_reserve(far_op.id());
+        if (ridx < 0 ||
+                !vbr_recovery_record_failure(ridx, far_op.id(), vbr_operation_phase::mutate,
+                                             vbr_recovery_failure_site::metadata_mutation, false)) {
+            return false;
+        }
+        {
+            auto capability = vbr_recovery_mint(ridx);
+            if (!capability || capability.target_allowed(0, 2, 0, 64) ||
+                    !capability.target_allowed(1, 2, 0, 64)) {
+                fprintf(stderr, "v6-F6: recovery stream authorization is not target-exact\n");
+                return false;
+            }
+            capability.resolve_completed();
+        }
+        // F7: seq domain is closed at mint — LLAMA_MAX_SEQ refused, LLAMA_MAX_SEQ-1 minted.
+        auto over = vbr_mutation_binding(
+                vbr_operation_kind::sequence_edit, LLAMA_MAX_SEQ, 0, 8,
+                vbr_operation_class::state_api,
+                tracker.pool_identity().hi, tracker.pool_identity().lo);
+        auto edge = vbr_mutation_binding(
+                vbr_operation_kind::sequence_edit, LLAMA_MAX_SEQ - 1, 0, 8,
+                vbr_operation_class::state_api,
+                tracker.pool_identity().hi, tracker.pool_identity().lo);
+        vbr_scoped_operation over_op(over);
+        vbr_scoped_operation edge_op(edge);
+        if (over_op || !edge_op) {
+            fprintf(stderr, "v6-F7: mint seq domain is not closed at LLAMA_MAX_SEQ\n");
+            return false;
+        }
+    }
+
+    // --- v6 rows: P5v2 exact-registrant unit publication ----------------------------------
+    {
+        vbr_generation_tracker t9(1, 64, 1);
+        t9.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
+        test_operation ctrl(vbr_operation_kind::controller_retier, t9.pool_identity(), -1, -1, -1,
+                            vbr_operation_class::controller);
+        if (!t9.publish_unit(0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
+                             vbr_repr_transition::degrade_other,
+                             vbr_mutation_registrant::degrade_next, ctrl.id())) {
+            fprintf(stderr, "P5v2: exact in-manifest registrant publication refused\n");
+            return false;
+        }
+        if (t9.publish_unit(0, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, vbr_repr_domain::full, 0,
+                            vbr_repr_transition::promote,
+                            vbr_mutation_registrant::clear, ctrl.id())) {
+            fprintf(stderr, "P5v2: out-of-manifest registrant publication accepted\n");
+            return false;
+        }
+    }
+
+    printf("A2 extent/index/recovery/citation/tombstone CPU coverage PASS\n");
+    return true;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--a1-cpu") {
         return run_a1_cpu_tests() ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--a2-cpu") {
+        return run_a2_cpu_tests() ? 0 : 1;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL | --a1-cpu\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL | --a1-cpu | --a2-cpu\n", argv[0]);
         return 1;
     }
 
@@ -544,7 +1578,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!run_a1_cpu_tests()) {
+    if (!run_a1_cpu_tests() || !run_a2_cpu_tests()) {
         return 1;
     }
 

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 // Process-local coordination identity. It is deliberately a strong internal type so it cannot
 // accidentally enter a checkpoint/state envelope. The public C freeze API exposes only its
@@ -104,12 +106,108 @@ struct vbr_operation_range {
     llama_pos p1 = -1;
 };
 
+// C2 (v3.2 design, Sol CONCUR): the complete closed authentication tuple, PER TARGET. A
+// multi-sequence ubatch carries one target per touched sequence; sequence ops carry one.
+// pool {0,0} = target valid for any controller (single-cache ops); seq -1 = wildcard sequence
+// (whole-cache edits); range {-1,-1} = whole range. Wildcards are themselves authenticated —
+// an event can only use one if its binding declared it.
+// "Any stream" wildcard — a protocol fact of target authentication, not a per-site literal.
+constexpr uint16_t VBR_STREAM_ANY = 0xFFFF;
+
+struct vbr_operation_target {
+    uint64_t            pool_hi = 0;   // vbr_pool_uuid halves (kept scalar: llama-vbr-generation
+    uint64_t            pool_lo = 0;   // owns the struct; the registry stays self-contained)
+    // v3.2 pin 1: the COMPLETE closed tuple per target — class/registrants/phase are
+    // target-local, not binding-global (the iSWA composite authorizes ordinary_decode on the
+    // base pool and swa_wrap on the SWA pool under ONE operation).
+    vbr_operation_class operation_class = vbr_operation_class::state_api;
+    uint32_t            registrant_mask = 0;
+    vbr_operation_phase child_phase     = vbr_operation_phase::mutate;
+    uint16_t            stream  = 0;
+    llama_seq_id        seq_id  = -1;
+    vbr_operation_range range   = {};
+
+    // The ONE spelling of the pool-wildcard predicate (C2 load-bearing semantics).
+    bool pool_matches(uint64_t hi, uint64_t lo) const {
+        return (pool_hi == 0 && pool_lo == 0) || (pool_hi == hi && pool_lo == lo);
+    }
+    bool stream_matches(uint16_t s) const {
+        return stream == VBR_STREAM_ANY || stream == s;
+    }
+    // The event-constant half of the authentication tuple — the ONE spelling shared by the
+    // begin-time and per-stamp covering searches (they must never diverge).
+    bool matches(uint64_t hi, uint64_t lo, uint16_t s,
+                 vbr_operation_class cls, uint32_t registrant_bit) const {
+        return pool_matches(hi, lo) && stream_matches(s) && operation_class == cls &&
+               (registrant_mask & registrant_bit) != 0 &&
+               child_phase == vbr_operation_phase::mutate;
+    }
+    // P1v2 (v6): per-stamp coverage predicates. Wildcards match only where the manifest
+    // DECLARED them (seq -1 / range {-1,-1}); an unknown position (-1) is covered only by a
+    // whole-range target — whole-cache edits stamp cells whose position is not consulted.
+    bool seq_covers(llama_seq_id seq) const {
+        return seq_id == -1 || (seq >= 0 && seq == seq_id);
+    }
+    bool pos_covers(llama_pos pos) const {
+        if (range.p0 < 0) {
+            return true;  // kind-declared wildcard range
+        }
+        if (pos < 0) {
+            return range.p0 == 0 && range.p1 == std::numeric_limits<llama_pos>::max();
+        }
+        return pos >= range.p0 && pos < range.p1;
+    }
+};
+
 struct vbr_operation_binding {
+    static constexpr uint8_t MAX_TARGETS = 16;
+
     vbr_operation_id    operation_id = {};
     vbr_operation_kind  kind         = vbr_operation_kind::retier_freeze;
-    llama_seq_id        seq_id       = -1;
-    vbr_operation_range range        = {};
-    vbr_operation_phase child_phase  = vbr_operation_phase::root;
+    vbr_operation_phase child_phase  = vbr_operation_phase::root;  // registry-level sanity only
+    uint8_t             n_targets    = 0;
+    std::array<vbr_operation_target, MAX_TARGETS> targets = {};
+
+    // Transitional accessors: single-target ops keep the old shape readable.
+    llama_seq_id        seq_id() const { return n_targets > 0 ? targets[0].seq_id : -1; }
+    vbr_operation_range range()  const { return n_targets > 0 ? targets[0].range : vbr_operation_range{}; }
+
+    // Covering-target search — used by event authentication and quarantine routing so the
+    // matching semantics exist exactly once. Class + registrant + phase are target-local.
+    const vbr_operation_target * find_covering_target(uint64_t pool_hi, uint64_t pool_lo,
+                                                      uint16_t stream,
+                                                      vbr_operation_class operation_class,
+                                                      uint32_t registrant_bit) const {
+        for (uint8_t t = 0; t < n_targets; ++t) {
+            const auto & target = targets[t];
+            if (target.matches(pool_hi, pool_lo, stream, operation_class, registrant_bit)) {
+                return &target;
+            }
+        }
+        return nullptr;
+    }
+
+    // P1v2 (v6): per-stamp covering-target selection — the full authenticated tuple INCLUDING
+    // the stamped (seq, pre-mutation position). The target index is returned so per-target
+    // evidence (lazy extents) binds to the SELECTED record, never a scope-global one.
+    const vbr_operation_target * find_covering_target_at(uint64_t pool_hi, uint64_t pool_lo,
+                                                         uint16_t stream,
+                                                         vbr_operation_class operation_class,
+                                                         uint32_t registrant_bit,
+                                                         llama_seq_id seq, llama_pos pos,
+                                                         uint8_t * index_out = nullptr) const {
+        for (uint8_t t = 0; t < n_targets; ++t) {
+            const auto & target = targets[t];
+            if (target.matches(pool_hi, pool_lo, stream, operation_class, registrant_bit) &&
+                target.seq_covers(seq) && target.pos_covers(pos)) {
+                if (index_out != nullptr) {
+                    *index_out = t;
+                }
+                return &target;
+            }
+        }
+        return nullptr;
+    }
 };
 
 enum class vbr_mutation_registrant : uint8_t {
@@ -310,34 +408,353 @@ constexpr bool vbr_stable_read_registry_is_exhaustive() {
 static_assert(vbr_stable_read_registry_is_exhaustive(),
         "capture, export, and oracle stable-read guards must stay exhaustive");
 
+// A2: extent-entry family for an operation, derived from its authenticated kind/class rather
+// than caller-supplied strings. swa_wrap is the one class whose provenance family is
+// occupied_reuse regardless of kind (§5.5 row 2).
+constexpr vbr_mutation_family vbr_operation_kind_family(vbr_operation_kind  kind,
+                                                        vbr_operation_class operation_class =
+                                                                vbr_operation_class::ordinary_decode) {
+    return operation_class == vbr_operation_class::swa_wrap ? vbr_mutation_family::occupied_reuse
+         : kind == vbr_operation_kind::decode              ? vbr_mutation_family::append
+         : kind == vbr_operation_kind::sequence_edit       ? vbr_mutation_family::trim
+         : kind == vbr_operation_kind::checkpoint_restore  ? vbr_mutation_family::restore
+         : kind == vbr_operation_kind::state_import        ? vbr_mutation_family::import
+         : kind == vbr_operation_kind::controller_retier   ? vbr_mutation_family::degrade
+         : kind == vbr_operation_kind::recovery            ? vbr_mutation_family::recovery
+                                                           : vbr_mutation_family::clear;
+}
+
+// C2: closed registrant masks per operation kind — the manifest declares which registrants an
+// operation may authorize; begin_event checks membership. Derived once here, never per-site.
+constexpr uint32_t vbr_registrant_bit(vbr_mutation_registrant registrant) {
+    return uint32_t(1u) << static_cast<uint8_t>(registrant);
+}
+constexpr uint32_t vbr_operation_kind_registrants(vbr_operation_kind kind) {
+    return kind == vbr_operation_kind::decode
+               ? vbr_registrant_bit(vbr_mutation_registrant::apply_ubatch_append) |
+                 vbr_registrant_bit(vbr_mutation_registrant::apply_ubatch_occupied_reuse) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_rm)  // composite purge (§7.3)
+         : kind == vbr_operation_kind::sequence_edit
+               ? vbr_registrant_bit(vbr_mutation_registrant::seq_rm) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_cp) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_keep) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_add) |
+                 vbr_registrant_bit(vbr_mutation_registrant::seq_div) |
+                 vbr_registrant_bit(vbr_mutation_registrant::clear) |
+                 vbr_registrant_bit(vbr_mutation_registrant::full_reset)
+         : kind == vbr_operation_kind::checkpoint_restore
+               ? vbr_registrant_bit(vbr_mutation_registrant::seq_rm) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_meta) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_data) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_install) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_cleanup) |
+                 vbr_registrant_bit(vbr_mutation_registrant::explicit_restore_adopt)
+         : kind == vbr_operation_kind::state_import
+               ? vbr_registrant_bit(vbr_mutation_registrant::state_read_meta) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_data) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_install) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_cleanup) |
+                 vbr_registrant_bit(vbr_mutation_registrant::whole_import) |
+                 vbr_registrant_bit(vbr_mutation_registrant::clear) |
+                 vbr_registrant_bit(vbr_mutation_registrant::full_reset)
+         : kind == vbr_operation_kind::controller_retier
+               ? vbr_registrant_bit(vbr_mutation_registrant::degrade_next) |
+                 vbr_registrant_bit(vbr_mutation_registrant::promote_next) |
+                 vbr_registrant_bit(vbr_mutation_registrant::execute_shed)
+         : kind == vbr_operation_kind::recovery
+               ? ~uint32_t(0)  // target-subset-restricted by the capability instead
+               : 0;
+}
+
+// P5v2 (v6): raw public-API range sentinels (-1) normalize to canonical [0, max) BEFORE any
+// manifest is built, so the closed mint range rules below see canonical values — the ONE
+// spelling of that clamp (recovery/controller_retier legitimately keep {-1,-1} and never
+// route through it).
+inline void vbr_normalize_edit_range(llama_pos & p0, llama_pos & p1) {
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+}
+
+// P5v2 (v6): closed per-kind range enumeration for mutate-phase targets. Range-bearing kinds
+// require a nonempty canonical p0 < p1. The two special forms are ENUMERATED, never generic:
+//   {-1,-1} wildcard -> recovery (capability-subset-restricted afterwards) and
+//                       controller_retier (unit-level representation ops carry no cell range)
+//   p0 == p1 empty   -> sequence_edit only (the public seq API passes empty no-op ranges
+//                       through; refusing them would latch unavailable on a harmless call)
+constexpr bool vbr_target_range_valid(vbr_operation_kind kind, vbr_operation_range range) {
+    if (range.p0 < 0 || range.p1 < 0) {
+        return range.p0 == -1 && range.p1 == -1 &&
+               (kind == vbr_operation_kind::recovery ||
+                kind == vbr_operation_kind::controller_retier);
+    }
+    if (range.p0 == range.p1) {
+        return kind == vbr_operation_kind::sequence_edit;
+    }
+    return range.p0 < range.p1;
+}
+
+// One construction rule for mutation-shaped bindings (child_phase = mutate is the stated
+// convention, not a per-site choice). Used by the cache scope, wrapper adoption, and tests.
+// The class and registrant mask are authenticated INTO the manifest here (C2).
+constexpr vbr_operation_target vbr_make_target(vbr_operation_kind  kind,
+                                               vbr_operation_class operation_class,
+                                               uint64_t pool_hi, uint64_t pool_lo,
+                                               uint16_t stream, llama_seq_id seq_id,
+                                               llama_pos p0, llama_pos p1) {
+    vbr_operation_target target;
+    target.pool_hi         = pool_hi;
+    target.pool_lo         = pool_lo;
+    target.operation_class = operation_class;
+    target.registrant_mask = vbr_operation_kind_registrants(kind);
+    target.child_phase     = vbr_operation_phase::mutate;
+    target.stream          = stream;
+    target.seq_id          = seq_id;
+    target.range           = { p0, p1 };
+    return target;
+}
+
+// Appends one mutate target for an ARMED pool; an unarmed ({0,0}) pool appends nothing and a
+// full manifest refuses. The ONE spelling of "one exact-pool target per armed child" used by
+// the composite wrappers and the cross-cache shed root.
+inline bool vbr_binding_add_pool_target(vbr_operation_binding & binding,
+                                        vbr_operation_kind  kind,
+                                        vbr_operation_class operation_class,
+                                        uint64_t pool_hi, uint64_t pool_lo,
+                                        uint16_t stream, llama_seq_id seq_id,
+                                        llama_pos p0, llama_pos p1) {
+    if ((pool_hi == 0 && pool_lo == 0) ||
+        binding.n_targets >= vbr_operation_binding::MAX_TARGETS) {
+        return false;
+    }
+    binding.targets[binding.n_targets++] =
+            vbr_make_target(kind, operation_class, pool_hi, pool_lo, stream, seq_id, p0, p1);
+    return true;
+}
+
+constexpr vbr_operation_binding vbr_mutation_binding(vbr_operation_kind  kind,
+                                                     llama_seq_id        seq_id,
+                                                     llama_pos           p0,
+                                                     llama_pos           p1,
+                                                     vbr_operation_class operation_class =
+                                                             vbr_operation_class::state_api,
+                                                     uint64_t pool_hi = 0,
+                                                     uint64_t pool_lo = 0,
+                                                     uint16_t stream  = 0) {
+    vbr_operation_binding binding;
+    binding.kind        = kind;
+    binding.child_phase = vbr_operation_phase::mutate;
+    binding.n_targets   = 1;
+    binding.targets[0]  = vbr_make_target(kind, operation_class, pool_hi, pool_lo,
+                                          stream, seq_id, p0, p1);
+    return binding;
+}
+
 // The sole process-global minting entry point. Composite memories must only forward its result.
 vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding);
 bool vbr_operation_registry_end(vbr_operation_id operation_id);
 bool vbr_operation_registry_is_live(vbr_operation_id operation_id);
+// P4v2 (v6): re-arm capacity probe — true when the bounded live-operation registry has at
+// least one free slot, checked under the registry mutex (boundary-rate only).
+bool vbr_operation_registry_has_capacity();
+
+// A2: the registry retains the immutable binding while the operation is live, so mutation
+// events and extent entries can be validated against the authenticated (registrant-checked)
+// kind/seq/range instead of caller-supplied values. Returns false once the operation ended.
+bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation_binding & out);
+
+// A2 explicit close semantics (design D-A2-4v3). `vbr_operation_registry_end` remains the
+// committed-close alias for the non-mutating legacy callers (freeze scopes).
+enum class vbr_operation_outcome : uint8_t {
+    committed,
+    aborted,
+    failed,
+};
+bool vbr_operation_registry_close(vbr_operation_id operation_id, vbr_operation_outcome outcome);
+
+// ---------------------------------------------------------------------------
+// A2 authenticated recovery (design D-A2-5v3): registry-owned failed-operation records with a
+// monotone state machine and single-use, target-restricted capabilities. Records are RESERVED
+// at operation begin for every fence-spanning/destructive operation — before any potentially
+// observable mutation — so an odd controller serial can never exist without an authenticated
+// resolution path. Ring exhaustion at reserve time makes generation tracking for that
+// operation shadow-unavailable; the legacy mutation proceeds untouched.
+// ---------------------------------------------------------------------------
+
+enum class vbr_recovery_state : uint8_t {
+    free_slot,
+    reserved,             // reserved at op begin; released unused at clean commit
+    recorded,             // operation terminated without commit
+    capability_minted,    // single mint consumed the record's mint right
+    awaiting_ack,         // C4: quarantined — retains targets until the owning tracker acks
+};
+
+enum class vbr_recovery_failure_site : uint8_t {
+    none,
+    metadata_mutation,
+    deferred_byte_copy,
+    publication,
+    exception_unwind,
+};
+
+struct vbr_failed_operation_record {
+    vbr_operation_binding     binding;
+    vbr_operation_phase       phase_reached         = vbr_operation_phase::root;
+    vbr_recovery_failure_site failure_site          = vbr_recovery_failure_site::none;
+    bool                      dest_bytes_observable = false;
+    vbr_recovery_state        state                 = vbr_recovery_state::free_slot;
+    // v4 review F2: the reservation's immutable owner pool — takes/advances match THIS,
+    // never the (possibly composite) manifest, so the base child can never service the SWA
+    // child's failure.
+    uint64_t                  owner_pool_hi         = 0;
+    uint64_t                  owner_pool_lo         = 0;
+    // v3 review B8: in-service marker — a taken record cannot be re-taken, and only the
+    // taking pool's ack (validated below) reclaims it.
+    bool                      taken                 = false;
+    uint64_t                  taken_by_hi           = 0;
+    uint64_t                  taken_by_lo           = 0;
+    uint16_t                  src_stream            = 0;
+    uint16_t                  dst_stream            = 0;
+    vbr_operation_range       src_range             = {};
+    // Source-stability token (design Rev 5 pin 2): the source stream's A1 page generations
+    // over the copied source range, captured at reserve. Bounded (<= pages * 4 B).
+    std::vector<uint32_t>     src_page_gens;
+};
+
+// Reserve/release/record. reserve returns a negative index when the ring is exhausted.
+int32_t vbr_recovery_reserve(vbr_operation_id operation_id,
+                             uint64_t owner_pool_hi = 0, uint64_t owner_pool_lo = 0);
+int32_t vbr_recovery_reserve(const vbr_operation_binding & binding,
+                             uint64_t owner_pool_hi = 0, uint64_t owner_pool_lo = 0);
+bool    vbr_recovery_release_unused(int32_t record_index, vbr_operation_id operation_id);
+bool    vbr_recovery_record_failure(int32_t                   record_index,
+                                    vbr_operation_id          operation_id,
+                                    vbr_operation_phase       phase_reached,
+                                    vbr_recovery_failure_site failure_site,
+                                    bool                      dest_bytes_observable);
+bool    vbr_recovery_set_source_token(int32_t                       record_index,
+                                      vbr_operation_id              operation_id,
+                                      uint16_t                      src_stream,
+                                      uint16_t                      dst_stream,
+                                      vbr_operation_range           src_range,
+                                      const std::vector<uint32_t> & src_page_gens);
+bool    vbr_recovery_get_record(int32_t record_index, vbr_failed_operation_record & out);
+
+// Single-use capability. Only mintable from a `recorded` entry (callers cannot construct one:
+// §1.7 "cannot self-declare"). Destruction without an explicit resolve fail-closes the record
+// to resolved_quarantined and latches a pending-quarantine flag the owner MUST consume by
+// performing the tracker global invalidation (asserted by tests + CI).
+class vbr_recovery_capability {
+  public:
+    ~vbr_recovery_capability();
+
+    vbr_recovery_capability(const vbr_recovery_capability &)             = delete;
+    vbr_recovery_capability & operator=(const vbr_recovery_capability &) = delete;
+    vbr_recovery_capability(vbr_recovery_capability && other) noexcept;
+    vbr_recovery_capability & operator=(vbr_recovery_capability &&) = delete;
+
+    explicit operator bool() const { return record_index_ >= 0; }
+
+    // Target-subset validation: every recovery mutation must fall inside the recorded
+    // (stream, seq, range). Out-of-subset is a hard reject; the record stays unresolved.
+    bool target_allowed(uint16_t stream, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
+    bool resolve_completed();
+    bool resolve_quarantined();
+
+  private:
+    friend vbr_recovery_capability vbr_recovery_mint(int32_t record_index);
+    vbr_recovery_capability() = default;
+
+    int32_t record_index_ = -1;
+};
+
+vbr_recovery_capability vbr_recovery_mint(int32_t record_index);
+
+// C4 (v3.2, Sol CONCUR): tokenized invalidate-then-ack quarantine on the fixed ring. A
+// quarantined record (explicit resolve_quarantined or fail-closed capability destruction)
+// transitions to awaiting_ack RETAINING its manifest targets. The owning tracker's cache takes
+// the pending quarantine for ITS pool at the next decode boundary, performs the target/global
+// invalidation, and acks with the token — only the ack reclaims the slot. Multi-controller
+// failures occupy distinct ring slots; nothing collapses to a process-global bit.
+struct vbr_quarantine_token {
+    int32_t  record_index = -1;
+    uint64_t nonce        = 0;
+
+    explicit operator bool() const { return record_index >= 0 && nonce != 0; }
+};
+
+struct vbr_quarantine_work {
+    vbr_quarantine_token  token;
+    // Retained manifest targets. The current consumer performs a GLOBAL invalidation (a safe
+    // over-approximation of the per-target requirement); target-scoped invalidation can
+    // consume these when a finer path exists.
+    vbr_operation_binding binding;
+};
+
+// Take one pending quarantine whose targets belong to `pool` (or a wildcard-target record).
+// Returns an empty optional-like work item (token false) when none pending for that pool.
+vbr_quarantine_work vbr_recovery_take_quarantine(uint64_t pool_hi, uint64_t pool_lo);
+// v3 review B3: production advancement of `recorded` failures — transitions this pool's
+// recorded slots to awaiting_ack (quarantine) so the take/ack drain resolves them. Returns
+// the number advanced.
+int32_t vbr_recovery_advance_recorded(uint64_t pool_hi, uint64_t pool_lo);
+// v4 review F3: any unresolved recovery work (recorded/awaiting/taken) for this pool?
+bool vbr_recovery_pending_for(uint64_t pool_hi, uint64_t pool_lo);
+// Acknowledge with the token AFTER performing the invalidation; only the pool that took the
+// record may ack (v3 review B8); reclaims the slot.
+bool vbr_recovery_ack_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo);
+// Release an un-serviced take (invalidation could not run): the record becomes takeable again
+// at a later boundary instead of being stuck in-service.
+bool vbr_recovery_untake_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo);
+
+// A2 (review F10/CI): the ONLY generic mint-owning RAII. All operation minting outside the
+// legacy freeze wrapper flows through this type, keeping registry_begin call sites confined to
+// this translation unit. Close is outcome-coded; destruction without close commits.
+class vbr_scoped_operation {
+  public:
+    explicit vbr_scoped_operation(vbr_operation_binding binding);
+    ~vbr_scoped_operation();
+
+    vbr_scoped_operation(const vbr_scoped_operation &)             = delete;
+    vbr_scoped_operation & operator=(const vbr_scoped_operation &) = delete;
+    vbr_scoped_operation(vbr_scoped_operation && other) noexcept;
+    vbr_scoped_operation & operator=(vbr_scoped_operation &&) = delete;
+
+    explicit operator bool() const { return static_cast<bool>(binding_.operation_id); }
+    vbr_operation_id              id() const { return binding_.operation_id; }
+    const vbr_operation_binding & binding() const { return binding_; }
+
+    bool close(vbr_operation_outcome outcome);
+    // Transfer ownership of the open operation (deferred decode lifetime, review F3): the
+    // receiver becomes responsible for the outcome-coded close.
+    vbr_operation_id release();
+
+  private:
+    vbr_operation_binding binding_ = {};
+};
 
 // Internal owner for operations whose call shape permits ordinary C++ lifetime management.
 // The legacy public freeze begin/end ABI is manually paired at its C boundary, while its sole
 // server caller is already protected by server_vbr_retier_freeze_scope.
 class vbr_operation_registry_guard {
 public:
-    explicit vbr_operation_registry_guard(vbr_operation_binding binding);
-    ~vbr_operation_registry_guard();
+    explicit vbr_operation_registry_guard(vbr_operation_binding binding) : op_(binding) {}
 
     vbr_operation_registry_guard(const vbr_operation_registry_guard &) = delete;
     vbr_operation_registry_guard & operator=(const vbr_operation_registry_guard &) = delete;
     vbr_operation_registry_guard(vbr_operation_registry_guard &&) = delete;
     vbr_operation_registry_guard & operator=(vbr_operation_registry_guard &&) = delete;
 
-    bool active() const {
-        return static_cast<bool>(binding_.operation_id);
-    }
+    bool active() const { return static_cast<bool>(op_); }
 
-    const vbr_operation_binding & binding() const {
-        return binding_;
-    }
+    const vbr_operation_binding & binding() const { return op_.binding(); }
 
-    bool finish();
+    bool finish() { return op_.close(vbr_operation_outcome::committed); }
 
 private:
-    vbr_operation_binding binding_;
+    vbr_scoped_operation op_;
 };

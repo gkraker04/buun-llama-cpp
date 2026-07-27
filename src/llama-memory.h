@@ -161,6 +161,15 @@ struct llama_memory_i {
             const char * /*owner*/, vbr_operation_id /*operation_id*/) { return false; }
     virtual void vbr_retier_freeze_end(
             const char * /*owner*/, vbr_operation_id /*operation_id*/) {}
+    // A2: promote deferred (submitted) extent entries at the context's existing synchronize
+    // boundary. Inert for non-VBR memories; composites forward to their attention child.
+    virtual void vbr_commit_submitted() {}
+    // A2 (review F3): resolve in-flight decode operations once the decode outcome is known.
+    virtual void vbr_decode_ops_finish(bool /*ok*/) {}
+    // A2 (review F10b): composite wrappers mint one operation per logical mutation and adopt
+    // it into every armed child so children never mint divergent ids.
+    virtual void vbr_adopt_operation(vbr_operation_id /*operation_id*/) {}
+    virtual void vbr_release_adopted() {}
     virtual llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t /*n_tokens_extra*/) const {
         llama_memory_vbr_preflight_data r = {};
         r.fits = true;

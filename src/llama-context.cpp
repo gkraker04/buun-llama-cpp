@@ -854,6 +854,12 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // A2 (Rev 5.1): the scheduler fence above is the per-family success boundary for the
+    // deferred append/reuse extents — promote submitted -> committed here. No new fences.
+    if (memory) {
+        memory->vbr_commit_submitted();
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -6257,6 +6263,29 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+namespace {
+// C1 (v3 design, Sol CONCUR): decode-scope outcome owner. Constructed before any memory
+// apply; every early return/exception finishes THIS decode's pending operations FAILED by
+// construction. succeed() is called exactly once, at the successful tail. Awaiting-commit
+// records from prior submitted decodes are untouched — their terminal result belongs to the
+// scheduler fence alone (v3 review B1).
+struct vbr_decode_txn {
+    llama_memory_i * mem = nullptr;
+    bool             ok  = false;
+
+    explicit vbr_decode_txn(llama_memory_i * memory) : mem(memory) {
+        // v3 review B1: NO promotion here — submitted evidence commits only at the real
+        // scheduler fence (synchronize). Awaiting records simply keep waiting.
+    }
+    void succeed() { ok = true; }
+    ~vbr_decode_txn() {
+        if (mem != nullptr) {
+            mem->vbr_decode_ops_finish(ok);
+        }
+    }
+};
+}  // namespace
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -6488,6 +6517,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+
+    // C1: decode-scope outcome owner — constructed before ANY memory apply; failure is the
+    // default outcome on every early return below (v3.1 amendment 4).
+    vbr_decode_txn decode_txn(memory.get());
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -6950,6 +6983,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // C1: the decode transaction succeeds exactly here; its destructor delivers
+    // finish(true) -> extents submitted, owners awaiting the synchronize fence.
+    decode_txn.succeed();
 
     if (window_capture &&
         !dflash_window_stage_decode(

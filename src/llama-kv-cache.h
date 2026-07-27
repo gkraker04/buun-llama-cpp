@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <exception>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -424,6 +426,9 @@ private:
     // controller; aliases delegate to their canonical owner and inert caches allocate nothing.
     // No current checkpoint read consults this store until the A2 four-way ratchet lands.
     std::unique_ptr<vbr_generation_tracker> vbr_generation_;
+    // A2 dual-view ownership index: updated in the SAME registrant transactions that stamp the
+    // tracker; capture consumes rank_below for scan-free exact dependency cardinality.
+    std::unique_ptr<vbr_ownership_index>    vbr_ownership_;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
@@ -595,6 +600,210 @@ private:
     const vbr_generation_tracker * vbr_generation_tracker_get() const;
     static bool vbr_generation_cell_has_seq_cb(
             const void * context, uint32_t stream, uint32_t cell, llama_seq_id seq_id);
+    static llama_pos vbr_generation_cell_pos_cb(
+            const void * context, uint32_t stream, uint32_t cell);
+
+    // A2 explicit operation binding (§7.2): every mutation entry point opens ONE scope carrying
+    // its authenticated multi-target manifest. The scope registers the operation and — for
+    // provenance-bearing mutations — reserves the recovery record BEFORE any mutation; damage
+    // extents reserve lazily per SELECTED target at the first destructive stamp (P1v2).
+    // Events minted while the scope is open cite its operation id. Close follows the
+    // per-family commit-boundary table (design Rev 5.1): synchronous families commit at scope
+    // end; deferred families transfer everything to the pending owner via detach_deferred().
+    // A2 (review F3): decode operations stay open past apply_ubatch — closed only when the
+    // decode outcome is known. One entry per in-flight committed ubatch.
+  public:
+    // P3v2 (v6): FIXED parent-declared participant slots with a sealed-registration phase.
+    // The parent declares every armed child before the first apply; each child claims its
+    // slot in its scope constructor (before mutation), and the slot reports terminal EXACTLY
+    // once — setup/decode/submit failure, or synchronize-time delivery. Detach transfers the
+    // still-OPEN token to pending ownership (never terminal). seal() folds the wrapper
+    // result, fails any never-claimed declared slot, and seals registration; only
+    // `sealed && every declared slot terminal` closes the root, failure dominating. No
+    // dynamic remaining++ anywhere — the v5 premature-close class is unrepresentable.
+    // (Public: the iSWA wrapper constructs it; methods live in llama-kv-cache.cpp so the
+    // registry close stays in that trust domain.)
+    struct vbr_composite_outcome {
+        vbr_operation_id operation_id = {};
+        int32_t          declared     = 0;
+        int32_t          claimed      = 0;
+        int32_t          terminal     = 0;
+        bool             sealed       = false;
+        bool             failed       = false;
+        bool             closed       = false;
+
+        void claim();
+        void report_terminal(bool ok);
+        void seal(bool wrapper_ok);
+
+      private:
+        void try_close();
+    };
+
+  private:
+    struct vbr_pending_decode_op {
+        vbr_operation_id  operation_id   = {};
+        // P1v2 (v6): per-target damage extents — submit, commit, fail, and recovery cover
+        // every handle; each cell cited its SELECTED target's extent at stamp time.
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> extents = {};
+        int32_t           recovery_index = -1;
+        // Single-cache ops close directly (owns_close). Composite children instead report
+        // their terminal result into the shared sealed aggregate, which closes the root.
+        bool              owns_close     = true;
+        std::shared_ptr<vbr_composite_outcome> composite;
+    };
+
+    class vbr_mutation_op {
+      public:
+        vbr_mutation_op(llama_kv_cache *    cache,
+                        vbr_operation_kind  kind,
+                        vbr_operation_class operation_class,
+                        llama_seq_id        seq_id,
+                        llama_pos           p0,
+                        llama_pos           p1,
+                        bool                provenance_bearing = false,
+                        uint16_t            extent_stream      = 0);
+        // Multi-target form (decode composites): the caller supplies the full manifest.
+        vbr_mutation_op(llama_kv_cache *              cache,
+                        const vbr_operation_binding & binding,
+                        bool                          provenance_bearing);
+        ~vbr_mutation_op();
+
+        vbr_mutation_op(const vbr_mutation_op &)             = delete;
+        vbr_mutation_op & operator=(const vbr_mutation_op &) = delete;
+        vbr_mutation_op(vbr_mutation_op &&)                  = delete;
+        vbr_mutation_op & operator=(vbr_mutation_op &&)      = delete;
+
+        bool active() const { return static_cast<bool>(operation_id_); }
+        std::optional<vbr_pending_decode_op> detach_deferred();
+        // P1v2 (v6): per-target lazy extent — reserved at the FIRST destructive stamp that
+        // SELECTS manifest target `target_index` (the tracker calls through the trampoline).
+        // Idempotent per target; empty on reservation failure (availability path taken).
+        vbr_extent_handle ensure_extent_for(uint8_t target_index);
+        static vbr_extent_handle extent_trampoline(void * ctx, uint8_t target_index);
+        // P1v2: a refused/unauthorized stamp poisons the whole LOGICAL operation — failure
+        // ownership follows the same root link as extent ownership (v6-fix F2), so a poison
+        // in a joined child fails the root: it reports FAILED (into its aggregate for
+        // composite children, at its close for owned scopes) and its recovery reservation
+        // survives to quarantine through the failed close's autorecord.
+        void poison() {
+            poisoned_ = true;
+            if (extent_owner_ != nullptr && extent_owner_ != this) {
+                extent_owner_->poison();
+            }
+        }
+        // v3.1 amendment 4: explicit success required — destruction without succeed() closes
+        // the operation FAILED (exception unwind and forgotten paths fail by construction).
+        // A poisoned scope can never succeed.
+        void succeed() {
+            if (!poisoned_) {
+                succeeded_ = true;
+            }
+        }
+
+        // For the always-succeed metadata-edit family: ONE opt-in per function. Succeeds at
+        // scope exit UNLESS an exception entered flight — the default-fail pin holds on
+        // unwind while every normal return path stops hand-spelling succeed().
+        class success_on_return {
+          public:
+            explicit success_on_return(vbr_mutation_op & op)
+                : op_(op), exceptions_at_entry_(std::uncaught_exceptions()) {}
+            ~success_on_return() {
+                if (std::uncaught_exceptions() == exceptions_at_entry_) {
+                    op_.succeed();
+                }
+            }
+          private:
+            vbr_mutation_op & op_;
+            int               exceptions_at_entry_;
+        };
+
+      private:
+        void abort_to_shadow_unavailable();
+        void fail_extents();
+        // Owned scopes read their manifest from the RAII (which retains the identical
+        // binding); only adopted scopes hold their own registry-fetched copy.
+        const vbr_operation_binding & scope_manifest() const {
+            return owned_op_ ? owned_op_->binding() : manifest_;
+        }
+
+        friend class llama_kv_cache;
+        llama_kv_cache *      cache_          = nullptr;
+        vbr_mutation_op *     outer_          = nullptr;
+        // The root scope owning the per-target extents this chain stamps against; joined
+        // scopes point at their root so the tracker's extent callback lands there.
+        vbr_mutation_op *     extent_owner_   = nullptr;
+        // Minting scopes own a registry operation; joining scopes (nested/adopted) borrow the
+        // outer/adopted id and own nothing (review F10).
+        std::optional<vbr_scoped_operation> owned_op_;
+        vbr_operation_id      operation_id_   = {};
+        vbr_operation_kind    kind_           = vbr_operation_kind::sequence_edit;
+        // P1v2 (v6): adopted scopes' authenticated manifest copy (owned scopes read the
+        // RAII's retained binding via scope_manifest()); one lazy extent per target.
+        vbr_operation_binding manifest_       = {};
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> extents_ = {};
+        // P3v2: the participant aggregate this adopted child claimed a slot in.
+        std::shared_ptr<vbr_composite_outcome> composite_;
+        int32_t               recovery_index_ = -1;
+        bool                  succeeded_      = false;
+        bool                  poisoned_       = false;
+        bool                  detached_       = false;   // token transferred to pending owner
+        bool                  joined_         = false;   // nested: borrows outer identity fully
+        bool                  adopted_        = false;   // C1: shared id, OWN reservations
+    };
+    friend class vbr_mutation_op;
+    // The innermost open mutation scope; vbr_generation_begin cites it.
+    vbr_mutation_op * vbr_current_mutation_ = nullptr;
+    // A2 (review F10b): an operation adopted from a composite wrapper — child mutation scopes
+    // join it instead of minting, so iSWA/hybrid children share ONE id per logical mutation.
+    vbr_operation_id vbr_adopted_operation_ = {};
+    // P2v2 (v6): the composite root's mint was REFUSED — child scopes open refused (fail
+    // closed to shadow-unavailable) instead of minting independently (A0 one-id in refusal).
+    bool vbr_adopted_refused_ = false;
+    // v4 review F1: the composite aggregate the adopted children report their terminal
+    // results into (set only for deferred/decode composites).
+    std::shared_ptr<vbr_composite_outcome> vbr_adopted_composite_;
+    // A2 (review F3): decode operations stay open past apply_ubatch — closed only when the
+    // decode outcome is known. One entry per in-flight committed ubatch.
+    std::vector<vbr_pending_decode_op> vbr_pending_decode_ops_;
+    // C1: records whose extents are `submitted`, awaiting terminal delivery at the sync fence.
+    // Their registry operations and recovery reservations remain OPEN until then.
+    std::vector<vbr_pending_decode_op> vbr_awaiting_commit_;
+    uint64_t vbr_pending_commit_failures_ = 0;  // sync-boundary commit failures, counted
+
+  public:
+    // Promote submitted extents to committed. Called from the context's existing synchronize
+    // point — never introduces a new fence (Rev 5.1). No-op when nothing is pending.
+    void vbr_commit_submitted();
+    // A2 (review F3): resolve in-flight decode operations at the decode boundary where the
+    // outcome is known. ok=true: extents -> submitted, ops close committed. ok=false: extents
+    // fail, ops close failed (autorecording their reserved recovery slots).
+    void vbr_decode_ops_finish(bool ok);
+    // A2 (review F10b): composite adoption — wrappers mint once and adopt into children.
+    void vbr_adopt_operation(vbr_operation_id operation_id);
+    void vbr_adopt_composite(std::shared_ptr<vbr_composite_outcome> composite);
+    void vbr_adopt_refused();
+    void vbr_release_adopted();
+    // v4 review F4 + P2v2/v6-fix F1: decode manifest bound to the ubatch's actual sequences —
+    // per touched seq an ordinary target over its exact position range, plus (when wrapping
+    // is possible) a whole-range swa_wrap target per seq and ONE declared seq-wildcard
+    // whole-range state_api target authorizing the nested §7.3 prefix purge: cross-sequence
+    // masked reuse makes the destroyed position and the purged old owner unbounded by the
+    // batch, and the owner is chosen by slot selection AFTER an adopted manifest has minted.
+    // TRANSACTIONAL: any target-ceiling overflow zeroes the manifest and returns false — the
+    // registry then refuses the mint (fail-closed shadow-unavailable), never partial.
+    static bool vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
+                                               uint64_t pool_hi, uint64_t pool_lo,
+                                               bool wrap_possible, uint16_t stream,
+                                               const llama_ubatch & ubatch);
+    // Pool identity for manifest construction ({0,0} = unarmed/wildcard).
+    vbr_pool_uuid vbr_pool_id() const {
+        const auto * tracker = vbr_generation_tracker_get();
+        return tracker != nullptr ? tracker->pool_identity() : vbr_pool_uuid{};
+    }
+
+  private:
+
     vbr_generation_event vbr_generation_begin(
             vbr_mutation_registrant registrant,
             vbr_operation_class operation_class,
@@ -602,7 +811,17 @@ private:
             vbr_generation_stamp_kind stamp_kind,
             bool destructive = false,
             bool imported = false);
+    // P1v2 (v6): the ONE spelling of "a refused stamp fails the owning operation" — inert on
+    // an empty (unarmed/latched) event, poisons the scope on refusal. Runtime fail-closed,
+    // never an assert.
+    void vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                   llama_seq_id membership_seq, llama_pos pre_mutation_pos = -1);
+    void vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                   const llama_seq_id * seqs, int32_t n_seqs, llama_pos pre_mutation_pos);
     void vbr_generation_global(vbr_mutation_registrant registrant, vbr_operation_class operation_class);
+    void vbr_ownership_rebuild();  // A2: import/install-boundary index rebuild (sanctioned scan)
+    void vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
+                                       bool add, llama_seq_id exclude_seq = -1);
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();

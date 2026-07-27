@@ -110,7 +110,12 @@ foreach(path IN LISTS serialization_files)
                 vbr_generation_tracker
                 vbr_generation_event
                 vbr_checkpoint_generation_record
-                vbr_unit_generation)
+                vbr_unit_generation
+                vbr_extent_ref
+                vbr_extent_handle
+                vbr_extent_store
+                vbr_recovery_capability
+                vbr_failed_operation_record)
             string(FIND "${text}" "${process_local_symbol}" found)
             if (NOT found EQUAL -1)
                 message(FATAL_ERROR
@@ -121,3 +126,46 @@ foreach(path IN LISTS serialization_files)
 endforeach()
 
 message(STATUS "VBR generation isolation source invariants PASS")
+
+# --- A2 additions ----------------------------------------------------------------------------
+
+# The §5.5 tombstone classifier is evaluator-private: exactly one definition and no callers
+# outside the sole evaluator translation unit.
+file(GLOB_RECURSE a2_scan_files
+    "${SOURCE_ROOT}/src/*.cpp" "${SOURCE_ROOT}/src/*.h"
+    "${SOURCE_ROOT}/common/*.cpp" "${SOURCE_ROOT}/common/*.h"
+    "${SOURCE_ROOT}/tools/server/*.cpp" "${SOURCE_ROOT}/tools/server/*.h")
+foreach(path IN LISTS a2_scan_files)
+    file(READ "${path}" text)
+    string(FIND "${text}" "classify_expected_tombstone" found)
+    if (NOT found EQUAL -1 AND NOT path MATCHES "llama-vbr-generation\.cpp$")
+        message(FATAL_ERROR "tombstone classification escaped the evaluator TU: ${path}")
+    endif()
+    # Committed-extent admission lookups stay inside the evaluator/store/tests trust domain.
+    string(FIND "${text}" "lookup_committed" found)
+    if (NOT found EQUAL -1 AND NOT path MATCHES "llama-vbr-(generation|extent)\.(cpp|h)$")
+        message(FATAL_ERROR "committed-extent admission lookup escaped its trust domain: ${path}")
+    endif()
+    # Recovery capabilities are registry-minted only.
+    string(FIND "${text}" "vbr_recovery_mint" found)
+    if (NOT found EQUAL -1 AND NOT path MATCHES "llama-vbr-operation\.(cpp|h)$|llama-kv-cache\.cpp$")
+        message(FATAL_ERROR "recovery capability minted outside the registry trust domain: ${path}")
+    endif()
+endforeach()
+
+# C4 (v3.2): exactly two awaiting_ack transition sites — the fail-closed capability destructor
+# and explicit resolve_quarantined. Both retain the record + manifest targets; ONLY the
+# tokenized ack (single site) reclaims the slot after the owning tracker's invalidation.
+file(READ "${SOURCE_ROOT}/src/llama-vbr-operation.cpp" op_text)
+string(REGEX MATCHALL "state[ ]*=[ ]*vbr_recovery_state::awaiting_ack" quarantine_sites "${op_text}")
+list(LENGTH quarantine_sites quarantine_count)
+if (NOT quarantine_count EQUAL 3)
+    message(FATAL_ERROR "expected exactly three awaiting_ack transition sites (destructor + resolve + recorded-advancement), found ${quarantine_count}")
+endif()
+string(REGEX MATCHALL "vbr_recovery_ack_quarantine" ack_sites "${op_text}")
+list(LENGTH ack_sites ack_count)
+if (ack_count GREATER 2)  # declaration-adjacent + one definition
+    message(FATAL_ERROR "quarantine ack must have exactly one implementation site, found ${ack_count} mentions")
+endif()
+
+message(STATUS "A2 extent/recovery/classifier isolation invariants PASS")

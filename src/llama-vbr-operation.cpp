@@ -1,9 +1,12 @@
 #include "llama-vbr-operation.h"
 
+#include "llama-cparams.h"
+
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 
 namespace {
 
@@ -13,6 +16,13 @@ constexpr size_t VBR_OPERATION_REGISTRY_CAPACITY = 4096;
 std::atomic<uint64_t> g_vbr_next_operation_id { 1 };
 std::atomic<bool> g_vbr_operation_id_exhausted { false };
 std::array<std::atomic<uint64_t>, VBR_OPERATION_REGISTRY_CAPACITY> g_vbr_live_operations {};
+// A2: authenticated binding retained per live slot.
+// C3 (v3 design, Sol CONCUR): one mutex serializes every binding write/read/reuse and the
+// whole recovery state machine — the registries run per-operation, never per-token, so a lock
+// is the honest concurrency model (lock-free correctness failed review twice). The atomic id
+// slots remain ONLY as the lock-free is_live fast path.
+std::mutex g_vbr_registry_mutex;
+std::array<vbr_operation_binding, VBR_OPERATION_REGISTRY_CAPACITY> g_vbr_live_bindings {};
 
 vbr_operation_id vbr_operation_allocate() {
     if (g_vbr_operation_id_exhausted.load(std::memory_order_acquire)) {
@@ -26,13 +36,15 @@ vbr_operation_id vbr_operation_allocate() {
             return {};
         }
 
-        const uint64_t next =
-            expected == std::numeric_limits<uint64_t>::max() ? 0 : expected + 1;
+        // UINT64_MAX is reserved as the slot-claim sentinel (F5): exhaust one id early rather
+        // than ever handing out a value that could alias a mid-claim slot.
+        if (expected == std::numeric_limits<uint64_t>::max()) {
+            g_vbr_operation_id_exhausted.store(true, std::memory_order_release);
+            return {};
+        }
+        const uint64_t next = expected + 1;
         if (g_vbr_next_operation_id.compare_exchange_weak(
                     expected, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            if (next == 0) {
-                g_vbr_operation_id_exhausted.store(true, std::memory_order_release);
-            }
             return { expected };
         }
     }
@@ -49,11 +61,36 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
     if (binding.operation_id) {
         return {};
     }
+    // v4 review F4: the manifest itself is validated at mint — closed enums per target, a
+    // sane target count, and at least one target for mutate-phase operations.
     if (static_cast<uint8_t>(binding.kind) >=
             static_cast<uint8_t>(vbr_operation_kind::count) ||
         static_cast<uint8_t>(binding.child_phase) >=
-            static_cast<uint8_t>(vbr_operation_phase::count)) {
+            static_cast<uint8_t>(vbr_operation_phase::count) ||
+        binding.n_targets > vbr_operation_binding::MAX_TARGETS ||
+        (binding.child_phase == vbr_operation_phase::mutate && binding.n_targets == 0)) {
         return {};
+    }
+    for (uint8_t t = 0; t < binding.n_targets; ++t) {
+        const auto & target = binding.targets[t];
+        // P5v2 (v6): closed validation domain per target. The registrant mask is a nonzero
+        // subset of the kind's canonical set (equality valid): mask != 0 && no out-of-kind
+        // bit. Targets carry the mutate phase (the stated convention). Mutation targets bind
+        // exact nonzero pools — recovery alone is capability-subset-restricted instead.
+        // Ranges follow the closed per-kind enumeration; seq stays in its declared domain
+        // (-1 = declared wildcard).
+        if (static_cast<uint8_t>(target.operation_class) >=
+                    static_cast<uint8_t>(vbr_operation_class::count) ||
+            target.child_phase != vbr_operation_phase::mutate ||
+            target.registrant_mask == 0 ||
+            (target.registrant_mask & ~vbr_operation_kind_registrants(binding.kind)) != 0 ||
+            (binding.kind != vbr_operation_kind::recovery &&
+             target.pool_hi == 0 && target.pool_lo == 0) ||
+            // v6-fix F7: the CLOSED seq domain — declared wildcard or [0, LLAMA_MAX_SEQ).
+            target.seq_id < -1 || target.seq_id >= LLAMA_MAX_SEQ ||
+            !vbr_target_range_valid(binding.kind, target.range)) {
+            return {};
+        }
     }
 
     const vbr_operation_id operation_id = vbr_operation_allocate();
@@ -61,15 +98,25 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
         return {};
     }
 
+    constexpr uint64_t VBR_SLOT_CLAIM_SENTINEL = std::numeric_limits<uint64_t>::max();
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     const size_t first = vbr_operation_slot(operation_id);
     for (size_t i = 0; i < VBR_OPERATION_REGISTRY_CAPACITY; ++i) {
-        auto & slot = g_vbr_live_operations[(first + i) % VBR_OPERATION_REGISTRY_CAPACITY];
+        const size_t slot_index = (first + i) % VBR_OPERATION_REGISTRY_CAPACITY;
+        auto & slot = g_vbr_live_operations[slot_index];
         uint64_t empty = 0;
-        if (slot.compare_exchange_strong(
-                    empty, operation_id.value, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            binding.operation_id = operation_id;
-            return operation_id;
+        // F5: claim exclusively FIRST (0 -> sentinel); only the claimant writes the binding,
+        // then publishes the real id with release ordering. Readers ignore the sentinel.
+        if (!slot.compare_exchange_strong(
+                    empty, VBR_SLOT_CLAIM_SENTINEL, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            continue;
         }
+        vbr_operation_binding staged = binding;
+        staged.operation_id          = operation_id;
+        g_vbr_live_bindings[slot_index] = staged;
+        slot.store(operation_id.value, std::memory_order_release);
+        binding.operation_id = operation_id;
+        return operation_id;
     }
 
     // The ID is intentionally burned: allocation never reuses an identity even when the bounded
@@ -82,6 +129,7 @@ bool vbr_operation_registry_end(vbr_operation_id operation_id) {
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     const size_t first = vbr_operation_slot(operation_id);
     for (size_t i = 0; i < VBR_OPERATION_REGISTRY_CAPACITY; ++i) {
         auto & slot = g_vbr_live_operations[(first + i) % VBR_OPERATION_REGISTRY_CAPACITY];
@@ -109,26 +157,409 @@ bool vbr_operation_registry_is_live(vbr_operation_id operation_id) {
     return false;
 }
 
-vbr_operation_registry_guard::vbr_operation_registry_guard(vbr_operation_binding binding) :
-        binding_(binding) {
+bool vbr_operation_registry_has_capacity() {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    for (const auto & slot : g_vbr_live_operations) {
+        if (slot.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation_binding & out) {
+    if (!operation_id) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    const size_t first = vbr_operation_slot(operation_id);
+    for (size_t i = 0; i < VBR_OPERATION_REGISTRY_CAPACITY; ++i) {
+        const size_t slot = (first + i) % VBR_OPERATION_REGISTRY_CAPACITY;
+        if (g_vbr_live_operations[slot].load(std::memory_order_acquire) != operation_id.value) {
+            continue;
+        }
+        // Under the registry mutex the copy cannot race an end/reuse (C3).
+        out = g_vbr_live_bindings[slot];
+        return true;
+    }
+    return false;
+}
+
+void vbr_recovery_autorecord_on_close(vbr_operation_id operation_id);
+
+bool vbr_operation_registry_close(vbr_operation_id operation_id, vbr_operation_outcome outcome) {
+    if (outcome != vbr_operation_outcome::committed) {
+        // A reserved-but-unrecorded recovery record for this operation transitions to
+        // `recorded` automatically so a non-committed close can never orphan the reservation
+        // (design D-A2-4v3: no odd serial without an authenticated resolution path).
+        vbr_recovery_autorecord_on_close(operation_id);
+    }
+    return vbr_operation_registry_end(operation_id);
+}
+
+// ---------------------------------------------------------------------------
+// A2 authenticated recovery ring
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int32_t VBR_RECOVERY_RING_CAPACITY = 64;
+
+vbr_failed_operation_record g_vbr_recovery_ring[VBR_RECOVERY_RING_CAPACITY];
+// C4: per-slot ack nonces (token authenticity) — a stale token cannot ack a reused slot.
+uint64_t g_vbr_quarantine_nonce[VBR_RECOVERY_RING_CAPACITY] = {};
+uint64_t g_vbr_quarantine_nonce_next = 1;
+// Lock-free fast path for the per-decode-boundary drain: only nonzero when awaiting_ack
+// records exist (efficiency review — the empty ring is the overwhelmingly common state).
+std::atomic<uint32_t> g_vbr_quarantine_pending { 0 };
+
+vbr_failed_operation_record * recovery_slot(int32_t record_index) {
+    if (record_index < 0 || record_index >= VBR_RECOVERY_RING_CAPACITY) {
+        return nullptr;
+    }
+    return &g_vbr_recovery_ring[record_index];
+}
+
+
+vbr_failed_operation_record * reserved_record(int32_t record_index, vbr_operation_id operation_id) {
+    auto * record = recovery_slot(record_index);
+    return record != nullptr && record->state == vbr_recovery_state::reserved &&
+                   record->binding.operation_id == operation_id
+               ? record
+               : nullptr;
+}
+
+vbr_failed_operation_record * minted_record(int32_t record_index) {
+    auto * record = recovery_slot(record_index);
+    return record != nullptr && record->state == vbr_recovery_state::capability_minted ? record : nullptr;
+}
+
+}  // namespace
+
+void vbr_recovery_autorecord_on_close(vbr_operation_id operation_id) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    for (auto & record : g_vbr_recovery_ring) {
+        if (record.state == vbr_recovery_state::reserved &&
+            record.binding.operation_id == operation_id) {
+            record.state         = vbr_recovery_state::recorded;
+            record.failure_site  = vbr_recovery_failure_site::exception_unwind;
+            record.phase_reached = record.binding.child_phase;
+        }
+    }
+}
+
+static int32_t vbr_recovery_reserve_locked(const vbr_operation_binding & binding,
+                                           uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+    if (!binding.operation_id) {
+        return -1;
+    }
+    for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
+        auto & record = g_vbr_recovery_ring[i];
+        if (record.state == vbr_recovery_state::free_slot) {
+            record               = {};
+            record.binding       = binding;
+            record.owner_pool_hi = owner_pool_hi;
+            record.owner_pool_lo = owner_pool_lo;
+            record.state         = vbr_recovery_state::reserved;
+            return i;
+        }
+    }
+    return -1;  // ring exhausted: caller takes the shadow-unavailable path
+}
+
+int32_t vbr_recovery_reserve(const vbr_operation_binding & binding,
+                             uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    return vbr_recovery_reserve_locked(binding, owner_pool_hi, owner_pool_lo);
+}
+
+int32_t vbr_recovery_reserve(vbr_operation_id operation_id,
+                             uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+    if (!operation_id) {
+        return -1;
+    }
+    // One lock acquisition for lookup + reserve (efficiency review).
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    const size_t first = vbr_operation_slot(operation_id);
+    for (size_t i = 0; i < VBR_OPERATION_REGISTRY_CAPACITY; ++i) {
+        const size_t slot = (first + i) % VBR_OPERATION_REGISTRY_CAPACITY;
+        if (g_vbr_live_operations[slot].load(std::memory_order_acquire) != operation_id.value) {
+            continue;
+        }
+        return vbr_recovery_reserve_locked(g_vbr_live_bindings[slot], owner_pool_hi, owner_pool_lo);
+    }
+    return -1;
+}
+
+bool vbr_recovery_release_unused(int32_t record_index, vbr_operation_id operation_id) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = reserved_record(record_index, operation_id);
+    if (record == nullptr) {
+        return false;
+    }
+    *record = {};
+    return true;
+}
+
+bool vbr_recovery_record_failure(int32_t                   record_index,
+                                 vbr_operation_id          operation_id,
+                                 vbr_operation_phase       phase_reached,
+                                 vbr_recovery_failure_site failure_site,
+                                 bool                      dest_bytes_observable) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = reserved_record(record_index, operation_id);
+    if (record == nullptr) {
+        return false;
+    }
+    record->state                 = vbr_recovery_state::recorded;
+    record->phase_reached         = phase_reached;
+    record->failure_site          = failure_site;
+    record->dest_bytes_observable = dest_bytes_observable;
+    return true;
+}
+
+// Reserved for the cross-stream pending-owner fence (design Rev 5 pin 2) — currently
+// unreachable: armed VBR forces n_stream == 1 and the seq_cp fence asserts.
+bool vbr_recovery_set_source_token(int32_t                       record_index,
+                                   vbr_operation_id              operation_id,
+                                   uint16_t                      src_stream,
+                                   uint16_t                      dst_stream,
+                                   vbr_operation_range           src_range,
+                                   const std::vector<uint32_t> & src_page_gens) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = reserved_record(record_index, operation_id);
+    if (record == nullptr) {
+        return false;
+    }
+    record->src_stream    = src_stream;
+    record->dst_stream    = dst_stream;
+    record->src_range     = src_range;
+    record->src_page_gens = src_page_gens;
+    return true;
+}
+
+bool vbr_recovery_get_record(int32_t record_index, vbr_failed_operation_record & out) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = recovery_slot(record_index);
+    if (record == nullptr || record->state == vbr_recovery_state::free_slot) {
+        return false;
+    }
+    out = *record;
+    return true;
+}
+
+vbr_recovery_capability vbr_recovery_mint(int32_t record_index) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    vbr_recovery_capability capability;
+    auto * record = recovery_slot(record_index);
+    if (record == nullptr || record->state != vbr_recovery_state::recorded) {
+        return capability;  // empty: mint right requires a recorded failure (§1.7)
+    }
+    record->state             = vbr_recovery_state::capability_minted;
+    capability.record_index_  = record_index;
+    return capability;
+}
+
+vbr_recovery_capability::vbr_recovery_capability(vbr_recovery_capability && other) noexcept :
+    record_index_(other.record_index_) {
+    other.record_index_ = -1;
+}
+
+vbr_recovery_capability::~vbr_recovery_capability() {
+    if (record_index_ < 0) {
+        return;
+    }
+    // Fail-closed: destruction without explicit resolution quarantines the record and latches
+    // the pending flag the owner must consume with a global invalidation (design Rev 4 item 6).
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = minted_record(record_index_);
+    if (record != nullptr) {
+        record->state                         = vbr_recovery_state::awaiting_ack;
+        g_vbr_quarantine_nonce[record_index_] = g_vbr_quarantine_nonce_next++;
+        g_vbr_quarantine_pending.fetch_add(1, std::memory_order_release);
+    }
+    record_index_ = -1;
+}
+
+bool vbr_recovery_capability::target_allowed(uint16_t stream, llama_seq_id seq_id,
+                                             llama_pos p0, llama_pos p1) const {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    const auto * record = minted_record(record_index_);
+    if (record == nullptr) {
+        return false;
+    }
+    // C2: validate against the manifest targets — a recovery mutation must fall inside ONE
+    // declared target (wildcards only if the binding declared them). v6-fix F6: the stream is
+    // target-exact through the ONE stream predicate; the src/dst source-token fields never
+    // widen authorization (their default 0 authorized stream 0 against any record). A future
+    // cross-stream recovery must declare explicit source/destination TARGETS instead.
+    for (uint8_t t = 0; t < record->binding.n_targets; ++t) {
+        const auto & target = record->binding.targets[t];
+        const bool stream_ok = target.stream_matches(stream);
+        const bool seq_ok    = target.seq_id < 0 || seq_id == target.seq_id;
+        const bool range_ok  = target.range.p0 < 0 ||
+                               (p0 >= target.range.p0 && p1 <= target.range.p1);
+        if (stream_ok && seq_ok && range_ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool vbr_recovery_capability::resolve_completed() {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = minted_record(record_index_);
+    if (record == nullptr) {
+        return false;
+    }
+    // F6: resolution reclaims the ring slot (records are evidence for recovery, not history).
+    *record       = {};
+    record_index_ = -1;
+    return true;
+}
+
+bool vbr_recovery_capability::resolve_quarantined() {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    auto * record = minted_record(record_index_);
+    if (record == nullptr) {
+        return false;
+    }
+    // C4: retain the record + manifest targets until the owning tracker acks the invalidation.
+    record->state                            = vbr_recovery_state::awaiting_ack;
+    g_vbr_quarantine_nonce[record_index_]    = g_vbr_quarantine_nonce_next++;
+    g_vbr_quarantine_pending.fetch_add(1, std::memory_order_release);
+    record_index_                            = -1;
+    return true;
+}
+
+vbr_quarantine_work vbr_recovery_take_quarantine(uint64_t pool_hi, uint64_t pool_lo) {
+    if (g_vbr_quarantine_pending.load(std::memory_order_acquire) == 0) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
+        auto & record = g_vbr_recovery_ring[i];
+        if (record.state != vbr_recovery_state::awaiting_ack || record.taken) {
+            continue;
+        }
+        // v4 review F2: OWNER-pool match only — never the composite manifest.
+        const bool matches = (record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
+                             (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo);
+        if (!matches) {
+            continue;
+        }
+        record.taken       = true;
+        record.taken_by_hi = pool_hi;
+        record.taken_by_lo = pool_lo;
+        vbr_quarantine_work work;
+        work.token   = { i, g_vbr_quarantine_nonce[i] };
+        work.binding = record.binding;
+        return work;
+    }
+    return {};
+}
+
+bool vbr_recovery_untake_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    if (!token || token.record_index >= VBR_RECOVERY_RING_CAPACITY) {
+        return false;
+    }
+    auto & record = g_vbr_recovery_ring[token.record_index];
+    if (record.state != vbr_recovery_state::awaiting_ack || !record.taken ||
+        record.taken_by_hi != pool_hi || record.taken_by_lo != pool_lo ||
+        g_vbr_quarantine_nonce[token.record_index] != token.nonce) {
+        return false;
+    }
+    record.taken       = false;
+    record.taken_by_hi = 0;
+    record.taken_by_lo = 0;
+    return true;
+}
+
+bool vbr_recovery_pending_for(uint64_t pool_hi, uint64_t pool_lo) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
+        const auto & record = g_vbr_recovery_ring[i];
+        // P4v2 (v6): the FULL cause set — reserved (in-flight operation) and
+        // capability_minted (recovery mid-execution) block re-arm exactly like recorded and
+        // awaiting_ack; every non-free state is unresolved recovery work for its owner pool.
+        if (record.state == vbr_recovery_state::free_slot) {
+            continue;
+        }
+        if ((record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
+            (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t vbr_recovery_advance_recorded(uint64_t pool_hi, uint64_t pool_lo) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    int32_t advanced = 0;
+    for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
+        auto & record = g_vbr_recovery_ring[i];
+        if (record.state != vbr_recovery_state::recorded) {
+            continue;
+        }
+        const bool matches = (record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
+                             (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo);
+        if (!matches) {
+            continue;
+        }
+        record.state             = vbr_recovery_state::awaiting_ack;
+        g_vbr_quarantine_nonce[i] = g_vbr_quarantine_nonce_next++;
+        g_vbr_quarantine_pending.fetch_add(1, std::memory_order_release);
+        ++advanced;
+    }
+    return advanced;
+}
+
+bool vbr_recovery_ack_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo) {
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    if (!token || token.record_index >= VBR_RECOVERY_RING_CAPACITY ||
+        g_vbr_recovery_ring[token.record_index].state != vbr_recovery_state::awaiting_ack ||
+        !g_vbr_recovery_ring[token.record_index].taken ||
+        g_vbr_recovery_ring[token.record_index].taken_by_hi != pool_hi ||
+        g_vbr_recovery_ring[token.record_index].taken_by_lo != pool_lo ||
+        g_vbr_quarantine_nonce[token.record_index] != token.nonce) {
+        return false;
+    }
+    g_vbr_recovery_ring[token.record_index]        = {};
+    g_vbr_quarantine_nonce[token.record_index]     = 0;
+    g_vbr_quarantine_pending.fetch_sub(1, std::memory_order_release);
+    return true;
+}
+
+vbr_scoped_operation::vbr_scoped_operation(vbr_operation_binding binding) : binding_(binding) {
     binding_.operation_id = {};
     vbr_operation_registry_begin(binding_);
 }
 
-vbr_operation_registry_guard::~vbr_operation_registry_guard() {
-    if (active() && !finish()) {
-        std::abort();
+vbr_scoped_operation::vbr_scoped_operation(vbr_scoped_operation && other) noexcept :
+    binding_(other.binding_) {
+    other.binding_.operation_id = {};
+}
+
+vbr_scoped_operation::~vbr_scoped_operation() {
+    // v3.1 amendment 4 applies to the ROOT RAII too (v3 review B5): destruction without an
+    // explicit close is a failure — forgotten paths and unwind can never commit.
+    if (binding_.operation_id) {
+        vbr_operation_registry_close(binding_.operation_id, vbr_operation_outcome::failed);
     }
 }
 
-bool vbr_operation_registry_guard::finish() {
-    if (!active()) {
+bool vbr_scoped_operation::close(vbr_operation_outcome outcome) {
+    if (!binding_.operation_id) {
         return false;
     }
-    const vbr_operation_id operation_id = binding_.operation_id;
-    if (!vbr_operation_registry_end(operation_id)) {
-        return false;
-    }
+    const bool ok         = vbr_operation_registry_close(binding_.operation_id, outcome);
     binding_.operation_id = {};
-    return true;
+    return ok;
+}
+
+vbr_operation_id vbr_scoped_operation::release() {
+    const vbr_operation_id id = binding_.operation_id;
+    binding_.operation_id     = {};
+    return id;
 }

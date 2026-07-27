@@ -149,6 +149,127 @@ vbr_checkpoint_eligibility reject(
     return result;
 }
 
+// --- A2 §5.5 expected-tombstone classification (evaluator-private) ---------------------------
+
+constexpr uint32_t REJECT_INSPECT_CAP = 4096;
+
+struct audit_state {
+    bool     refinement_used       = false;
+    bool     saw_destructive       = false;
+    bool     saw_import            = false;
+    bool     overflowed            = false;
+    bool     cardinality_violated  = false;
+    uint32_t rejecting_cells       = 0;
+};
+
+struct audit_cell {
+    const vbr_generation_tracker * tracker = nullptr;
+    bool           membership_lost = false;
+    bool           doubly_rejected = false;  // F7: dep AND membership — mixed reason
+    bool           in_range        = false;  // C2 stamp-time range proof (committed evidence)
+    uint16_t       provenance      = 0;
+    vbr_extent_ref extent          = {};
+    llama_pos      current_pos     = -1;
+    llama_pos      frontier        = -1;
+    llama_seq_id   dep_seq         = -1;
+};
+
+void fill_audit(vbr_checkpoint_eligibility & result, const audit_state & audit) {
+    result.refinement_used = audit.refinement_used;
+    result.rejecting_cells = audit.rejecting_cells;
+    result.observation_class = audit.saw_import      ? vbr_observation_class::import_refined
+                             : audit.saw_destructive ? vbr_observation_class::destructive
+                             : audit.refinement_used ? vbr_observation_class::boundary_refined
+                                                     : vbr_observation_class::trivial_append;
+}
+
+// §5.5 closed table. A strict reject is an expected tombstone ONLY when every rejecting covered
+// cell carries one uniform allowed (family, class) provenance whose committed extent entry — the
+// same single entry for all cells — satisfies the row's extent predicate. Anything mixed,
+// overwritten, non-committed, or overflowed is `unexplained` (fail-closed disagreement).
+vbr_expected_tombstone_class classify_expected_tombstone(const std::vector<audit_cell> & cells,
+                                                         bool                            overflowed,
+                                                         bool                            cardinality_violated) {
+    if (overflowed || cardinality_violated || cells.empty()) {
+        return vbr_expected_tombstone_class::unexplained;
+    }
+    // F8: one uniform provenance AND one tracker — extent refs are store-local, so cells from
+    // different controllers can never share evidence.
+    const vbr_generation_tracker * tracker    = cells.front().tracker;
+    const uint16_t                 provenance = cells.front().provenance;
+    const vbr_extent_ref           extent_ref = cells.front().extent;
+    if (tracker == nullptr) {
+        return vbr_expected_tombstone_class::unexplained;
+    }
+    for (const auto & rc : cells) {
+        // F7 (§5.5 rule 4): a doubly-rejecting cell is a mixed reason — never expected.
+        if (rc.doubly_rejected || rc.provenance != provenance || rc.tracker != tracker ||
+            rc.extent.index != extent_ref.index || rc.extent.expected_gen != extent_ref.expected_gen) {
+            return vbr_expected_tombstone_class::unexplained;
+        }
+    }
+    const auto family          = static_cast<vbr_mutation_family>(provenance & 0xFF);
+    const auto operation_class = static_cast<vbr_operation_class>((provenance >> 8) & 0xFF);
+
+    // One committed extent entry must back every rejecting cell (equality checked above).
+    const vbr_extent_entry * entry = tracker->extent_store().lookup_committed(extent_ref);
+    if (entry == nullptr || entry->family != family || entry->operation_class != operation_class) {
+        return vbr_expected_tombstone_class::unexplained;
+    }
+
+    if (family == vbr_mutation_family::trim &&
+        operation_class == vbr_operation_class::restore_one_behind_trim) {
+        // Row 1: every lost covered position >= p0 (implied: the cells cite this trim), and
+        // p0 >= checkpoint_frontier - 1.
+        for (const auto & rc : cells) {
+            // C2: the stamp-time range proof replaces assumption — every lost position was
+            // INSIDE the committed trim extent, and the extent starts at/after frontier-1.
+            if (!rc.membership_lost || !rc.in_range || entry->p0 < rc.frontier - 1) {
+                return vbr_expected_tombstone_class::unexplained;
+            }
+        }
+        return vbr_expected_tombstone_class::restore_one_behind;
+    }
+    if (family == vbr_mutation_family::occupied_reuse &&
+        operation_class == vbr_operation_class::swa_wrap) {
+        // Row 2: current occupant is the same dependency sequence at a strictly higher logical
+        // position. Positions written after capture are >= frontier > every covered position,
+        // so the frontier bound is the sound check. Membership persisting IS the same-seq
+        // occupancy (still_has_seq was derivable as !membership_lost — simplification review).
+        for (const auto & rc : cells) {
+            if (rc.membership_lost || rc.current_pos < rc.frontier) {
+                return vbr_expected_tombstone_class::unexplained;
+            }
+        }
+        return vbr_expected_tombstone_class::swa_wrap;
+    }
+    if (family == vbr_mutation_family::trim &&
+        operation_class == vbr_operation_class::explicit_destructive_trim) {
+        // Row 3: every rejecting cell is inside the registry-bound committed [p0,p1). A covered
+        // cell mutated OUTSIDE that range necessarily carries different provenance and already
+        // failed the uniformity check above.
+        for (const auto & rc : cells) {
+            if (!rc.membership_lost || !rc.in_range) {
+                return vbr_expected_tombstone_class::unexplained;
+            }
+        }
+        return vbr_expected_tombstone_class::explicit_destructive_trim;
+    }
+    if (family == vbr_mutation_family::trim &&
+        operation_class == vbr_operation_class::dependency_seq_remove) {
+        // Row 4: the registered removal spans the whole dependency sequence and that sequence
+        // is absent from every covered cell.
+        const bool whole_seq = entry->p0 <= 0 && entry->p1 == std::numeric_limits<llama_pos>::max();
+        for (const auto & rc : cells) {
+            if (!whole_seq || !rc.membership_lost || entry->seq_id != rc.dep_seq) {
+                return vbr_expected_tombstone_class::unexplained;
+            }
+        }
+        return vbr_expected_tombstone_class::dependency_seq_removed;
+    }
+    return vbr_expected_tombstone_class::unexplained;
+}
+
 }  // namespace
 
 vbr_generation_event::~vbr_generation_event() {
@@ -165,9 +286,18 @@ vbr_generation_event::vbr_generation_event(vbr_generation_event && other) noexce
     operation_class(other.operation_class),
     destructive(other.destructive),
     imported(other.imported),
+    operation_id(other.operation_id),
+    manifest(other.manifest),
+    registrant_bit(other.registrant_bit),
+    poisoned(other.poisoned),
+    extent_fn(other.extent_fn),
+    extent_ctx(other.extent_ctx),
     owner_(other.owner_) {
-    other.serial = 0;
-    other.owner_ = nullptr;
+    other.serial       = 0;
+    other.operation_id = {};
+    other.extent_fn    = nullptr;
+    other.extent_ctx   = nullptr;
+    other.owner_       = nullptr;
 }
 
 bool vbr_generation_event::finish() {
@@ -193,7 +323,27 @@ struct vbr_generation_tracker::stream_state {
     std::vector<uint16_t> cell_dependency_provenance;
     std::vector<uint16_t> cell_membership_provenance;
     std::vector<int16_t>  cell_last_membership_seq;
+
+    // A2: durable committed-extent references (design D-A2-4v3). One per stamp kind — a cell
+    // can retain two different events (latest dependency + latest membership).
+    std::vector<vbr_extent_ref> cell_dependency_extent;
+    std::vector<vbr_extent_ref> cell_membership_extent;
+    // C2: stamp-time range-proof bits (position was inside the authenticated target range).
+    std::vector<uint64_t> cell_dependency_in_range;
+    std::vector<uint64_t> cell_membership_in_range;
 };
+
+static void set_range_bit(std::vector<uint64_t> & bits, uint32_t cell, bool value) {
+    if (value) {
+        bits[cell / 64] |= uint64_t(1) << (cell % 64);
+    } else {
+        bits[cell / 64] &= ~(uint64_t(1) << (cell % 64));
+    }
+}
+
+static bool get_range_bit(const std::vector<uint64_t> & bits, uint32_t cell) {
+    return (bits[cell / 64] & (uint64_t(1) << (cell % 64))) != 0;
+}
 
 vbr_generation_tracker::~vbr_generation_tracker() {
     if (active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0) {
@@ -216,6 +366,10 @@ vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cel
         stream.cell_dependency_provenance.resize(n_cells);
         stream.cell_membership_provenance.resize(n_cells);
         stream.cell_last_membership_seq.resize(n_cells, -1);
+        stream.cell_dependency_extent.resize(n_cells);
+        stream.cell_membership_extent.resize(n_cells);
+        stream.cell_dependency_in_range.resize((n_cells + 63) / 64);
+        stream.cell_membership_in_range.resize((n_cells + 63) / 64);
     }
 
     // A process-local construction identity, not a security nonce. A fixed nonzero domain tag
@@ -243,6 +397,7 @@ bool vbr_generation_tracker::stable() const {
     if ((mutation_serial_ & 1u) != 0) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(units_mutex_);
     for (const auto & unit : units_) {
         if ((unit.publish_seq & 1u) != 0) {
             return false;
@@ -263,21 +418,44 @@ vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant
                                                          vbr_operation_class       operation_class,
                                                          uint32_t                  stream,
                                                          vbr_generation_stamp_kind stamp_kind,
+                                                         vbr_operation_id          operation_id,
+                                                         vbr_event_extent_fn       extent_fn,
+                                                         void *                    extent_ctx,
                                                          bool                      destructive,
                                                          bool                      imported) {
+    // One named return object for every path (NRVO): the ~656-byte manifest is copied exactly
+    // once, registry slot -> event, and refused paths return it with serial 0 (falsy).
+    vbr_generation_event result;
     const auto * registration = registration_for(registrant);
     const size_t registrant_index = static_cast<size_t>(registrant);
     const generation_dispatch_effect expected_effect =
             stamp_kind == vbr_generation_stamp_kind::dependency
                     ? generation_dispatch_effect::dependency
                     : generation_dispatch_effect::membership;
-    if (!active() || registration == nullptr || !class_allowed(*registration, operation_class) ||
+    if (!active() || shadow_unavailable_ ||
+        registration == nullptr || !class_allowed(*registration, operation_class) ||
         registrant_index >= VBR_GENERATION_DISPATCH.size() ||
         VBR_GENERATION_DISPATCH[registrant_index] != expected_effect ||
         stream >= streams_.size() || event_serial_ == std::numeric_limits<uint64_t>::max() ||
         active_event_depth_ == MAX_EVENT_DEPTH ||
         (active_event_depth_ == 0 && mutation_serial_ == std::numeric_limits<uint64_t>::max())) {
-        return {};
+        return result;
+    }
+
+    // C2 (v3.2, Sol CONCUR): full manifest authentication. The event must cite a live
+    // operation whose manifest (a) lists this registrant in its closed mask, (b) declares
+    // this exact operation class, (c) is in the mutate phase, and (d) carries a target
+    // covering this tracker's pool and the event's stream.
+    if (!operation_id || !vbr_operation_registry_binding(operation_id, result.manifest)) {
+        return result;
+    }
+    // P1v2 (v6): begin still refuses when NO target could ever cover this
+    // pool/stream/class/registrant; the per-(seq, position) selection happens at EACH STAMP
+    // against the event's manifest copy, so multi-target manifests authenticate
+    // multi-sequence ubatches exactly instead of citing target zero.
+    if (result.manifest.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, stream, operation_class,
+                                             vbr_registrant_bit(registrant)) == nullptr) {
+        return result;
     }
 
     if (active_event_depth_ == 0) {
@@ -286,7 +464,6 @@ vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant
     ++event_serial_;
     active_event_stack_[active_event_depth_] = event_serial_;
     ++active_event_depth_;
-    vbr_generation_event result;
     result.serial          = event_serial_;
     result.stream          = stream;
     result.stamp_kind      = stamp_kind;
@@ -294,6 +471,10 @@ vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant
     result.operation_class = operation_class;
     result.destructive     = destructive;
     result.imported        = imported;
+    result.operation_id    = operation_id;
+    result.registrant_bit  = vbr_registrant_bit(registrant);
+    result.extent_fn       = extent_fn;
+    result.extent_ctx      = extent_ctx;
     result.owner_          = this;
     return result;
 }
@@ -311,18 +492,85 @@ bool vbr_generation_tracker::finish_event(uint64_t serial) {
     return true;
 }
 
-bool vbr_generation_tracker::stamp_cell(const vbr_generation_event & event,
-                                        uint32_t                     cell,
-                                        llama_seq_id                 membership_seq) {
+bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
+                                        uint32_t               cell,
+                                        llama_seq_id           membership_seq,
+                                        llama_pos              pre_mutation_pos) {
+    return stamp_cell(event, cell, &membership_seq, 1, pre_mutation_pos);
+}
+
+bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
+                                        uint32_t               cell,
+                                        const llama_seq_id *   seqs,
+                                        int32_t                n_seqs,
+                                        llama_pos              pre_mutation_pos) {
+    // P1v2 (v6): a poisoned event stays inert — no further metadata moves under it.
+    if (event.poisoned) {
+        return false;
+    }
     bool event_is_live = false;
     for (uint32_t depth = 0; depth < active_event_depth_; ++depth) {
         event_is_live = event_is_live || active_event_stack_[depth] == event.serial;
     }
+    // Wiring-bug refusals (wrong owner, dead event, out-of-bounds): plain false, no poison —
+    // these are not authorization failures against this event's manifest.
+    const bool binds_evidence = event.destructive || event.imported;
     if (!event || event.owner_ != this || !event_is_live ||
-        event.stream >= streams_.size() || cell >= n_cells_ || membership_seq < -1 ||
-        membership_seq > std::numeric_limits<int16_t>::max()) {
+        event.stream >= streams_.size() || cell >= n_cells_ || seqs == nullptr || n_seqs < 1 ||
+        (event.stamp_kind == vbr_generation_stamp_kind::membership && n_seqs != 1)) {
         return false;
     }
+    // Destructive/import evidence binds to exactly ONE selected target; a shared multi-member
+    // cell has no single exact citation, so it goes unavailable instead (v6 P1 rule 3).
+    if (binds_evidence && n_seqs != 1) {
+        event.poisoned = true;
+        set_shadow_unavailable();
+        return false;
+    }
+    // P1v2 (v6): per-stamp covering-target selection over the event's authenticated manifest,
+    // keyed by (pool, stream, class, registrant, seq, pre-mutation position). EVERY member of
+    // a shared cell's sequence set needs a covering target (target-set proof); the first
+    // member's selection supplies the durable evidence binding. NO cover => the stamp
+    // refuses, POISONS the event, and latches shadow-unavailable IMMEDIATELY — metadata may
+    // already have moved under an unauthenticated claim, so no strict accept can be allowed
+    // to form until a sanctioned transition provably follows (P4v2).
+    uint8_t selected_index = 0;
+    bool    all_real_range = true;
+    for (int32_t i = 0; i < n_seqs; ++i) {
+        if (seqs[i] < -1 || seqs[i] > std::numeric_limits<int16_t>::max()) {
+            return false;  // wiring-bug refusal: out-of-domain value, not an auth failure
+        }
+        uint8_t      index    = 0;
+        const auto * covering = event.manifest.find_covering_target_at(
+                pool_uuid_.hi, pool_uuid_.lo, static_cast<uint16_t>(event.stream),
+                event.operation_class, event.registrant_bit, seqs[i], pre_mutation_pos, &index);
+        if (covering == nullptr) {
+            event.poisoned = true;
+            set_shadow_unavailable();
+            return false;
+        }
+        all_real_range = all_real_range && covering->range.p0 >= 0;
+        if (i == 0) {
+            selected_index = index;
+        }
+    }
+    vbr_extent_handle extent = {};
+    if (binds_evidence && event.extent_fn != nullptr) {
+        extent = event.extent_fn(event.extent_ctx, selected_index);
+        if (!extent) {
+            // Per-target reservation failed — the owning scope already took the availability
+            // path; poison so the rest of this event is inert and the operation reports
+            // failed instead of committing partial evidence.
+            event.poisoned = true;
+            set_shadow_unavailable();
+            return false;
+        }
+    }
+    // C2: the range proof is RECORDED (in_range bit) so tombstone rows 1/3 can PROVE
+    // membership from committed evidence. True only when the position is known AND every
+    // member's selected target carries a real (non-wildcard) range containing it.
+    const bool in_authorized_range = pre_mutation_pos >= 0 && all_real_range;
+    const llama_seq_id membership_seq = seqs[0];
 
     auto &         stream = streams_[event.stream];
     const uint32_t page   = cell / VBR_GENERATION_PAGE_CELLS;
@@ -347,11 +595,49 @@ bool vbr_generation_tracker::stamp_cell(const vbr_generation_event & event,
     if (event.stamp_kind == vbr_generation_stamp_kind::dependency) {
         stream.cell_last_dependency_gen[cell]   = generation;
         stream.cell_dependency_provenance[cell] = provenance;
+        extents_.release_ref(stream.cell_dependency_extent[cell]);
+        stream.cell_dependency_extent[cell] = extent ? extents_.add_ref(extent) : vbr_extent_ref{};
+        set_range_bit(stream.cell_dependency_in_range, cell, in_authorized_range);
     } else {
         stream.cell_last_membership_gen[cell]   = generation;
         stream.cell_membership_provenance[cell] = provenance;
         stream.cell_last_membership_seq[cell]   = static_cast<int16_t>(membership_seq);
+        extents_.release_ref(stream.cell_membership_extent[cell]);
+        stream.cell_membership_extent[cell] = extent ? extents_.add_ref(extent) : vbr_extent_ref{};
+        set_range_bit(stream.cell_membership_in_range, cell, in_authorized_range);
     }
+    return true;
+}
+
+vbr_extent_ref vbr_generation_tracker::dependency_extent(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_dependency_extent.at(cell);
+}
+
+vbr_extent_ref vbr_generation_tracker::membership_extent(uint32_t stream, uint32_t cell) const {
+    return streams_.at(stream).cell_membership_extent.at(cell);
+}
+
+bool vbr_generation_tracker::dependency_in_range(uint32_t stream, uint32_t cell) const {
+    return get_range_bit(streams_.at(stream).cell_dependency_in_range, cell);
+}
+
+bool vbr_generation_tracker::membership_in_range(uint32_t stream, uint32_t cell) const {
+    return get_range_bit(streams_.at(stream).cell_membership_in_range, cell);
+}
+
+bool vbr_generation_tracker::global_invalidate_and_reset_extents(vbr_mutation_registrant registrant,
+                                                                 vbr_operation_class     operation_class,
+                                                                 vbr_operation_id        operation_id) {
+    if (!global_transition(registrant, operation_class, operation_id)) {
+        return false;
+    }
+    // Every stored extent reference is obsolete after the global invalidation; drop them so
+    // reset_all() reclaims a coherent slab (design Rev 4 item 3).
+    for (auto & stream : streams_) {
+        std::fill(stream.cell_dependency_extent.begin(), stream.cell_dependency_extent.end(), vbr_extent_ref{});
+        std::fill(stream.cell_membership_extent.begin(), stream.cell_membership_extent.end(), vbr_extent_ref{});
+    }
+    extents_.reset_all();
     return true;
 }
 
@@ -378,15 +664,47 @@ bool vbr_generation_tracker::reset_page_generations_before_wrap() {
         std::fill(stream.cell_dependency_provenance.begin(), stream.cell_dependency_provenance.end(), 0);
         std::fill(stream.cell_membership_provenance.begin(), stream.cell_membership_provenance.end(), 0);
         std::fill(stream.cell_last_membership_seq.begin(), stream.cell_last_membership_seq.end(), -1);
+        // Pre-wrap reset is a global invalidation: every stored extent reference is obsolete.
+        std::fill(stream.cell_dependency_extent.begin(), stream.cell_dependency_extent.end(), vbr_extent_ref{});
+        std::fill(stream.cell_membership_extent.begin(), stream.cell_membership_extent.end(), vbr_extent_ref{});
     }
+    extents_.reset_all();
     if (owns_stability_barrier) {
         ++mutation_serial_;
     }
     return true;
 }
 
+bool vbr_generation_tracker::try_rearm() {
+    if (!shadow_unavailable_) {
+        return true;
+    }
+    if (vbr_recovery_pending_for(pool_uuid_.hi, pool_uuid_.lo) ||
+        !vbr_operation_registry_has_capacity()) {
+        return false;
+    }
+    if (!global_invalidate_and_reset_extents(vbr_mutation_registrant::authenticated_recovery,
+                                             vbr_operation_class::controller)) {
+        return false;
+    }
+    return try_clear_shadow_unavailable();
+}
+
 bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registrant,
-                                               vbr_operation_class     operation_class) {
+                                               vbr_operation_class     operation_class,
+                                               vbr_operation_id        operation_id) {
+    // v3 review B6 / v4 review F5: cited operations validate at manifest depth — the cited
+    // binding must carry a covering target for THIS pool authorizing this registrant + class.
+    // The recovery drain and registry-refusal fallback run OUTSIDE any operation (empty id) —
+    // a NAMED exemption: they are the paths that CREATE availability.
+    if (operation_id) {
+        vbr_operation_binding cited;
+        if (!vbr_operation_registry_binding(operation_id, cited) ||
+            cited.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, 0, operation_class,
+                                       vbr_registrant_bit(registrant)) == nullptr) {
+            return false;
+        }
+    }
     const auto * registration = registration_for(registrant);
     const size_t registrant_index = static_cast<size_t>(registrant);
     if (!active() || registration == nullptr || !class_allowed(*registration, operation_class) ||
@@ -400,10 +718,13 @@ bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registran
     ++mutation_serial_;
     ++global_generation_;
     ++mutation_serial_;
+    // v3 review B7: the unavailable state does NOT auto-clear here — the cause (registry or
+    // slab exhaustion) may persist. try_clear_shadow_unavailable() probes the cause.
     return true;
 }
 
 bool vbr_generation_tracker::initialize_unit(uint32_t unit, int32_t type, vbr_repr_domain domain) {
+    std::lock_guard<std::mutex> lock(units_mutex_);
     if (unit >= units_.size()) {
         return false;
     }
@@ -416,12 +737,26 @@ bool vbr_generation_tracker::initialize_unit(uint32_t unit, int32_t type, vbr_re
     return true;
 }
 
-bool vbr_generation_tracker::publish_unit(uint32_t            unit,
-                                          int32_t             source_type,
-                                          int32_t             target_type,
-                                          vbr_repr_domain     domain,
-                                          uint8_t             promote_hops,
-                                          vbr_repr_transition transition) {
+bool vbr_generation_tracker::publish_unit(uint32_t                unit,
+                                          int32_t                 source_type,
+                                          int32_t                 target_type,
+                                          vbr_repr_domain         domain,
+                                          uint8_t                 promote_hops,
+                                          vbr_repr_transition     transition,
+                                          vbr_mutation_registrant registrant,
+                                          vbr_operation_id        operation_id) {
+    if (operation_id) {
+        vbr_operation_binding cited;
+        // v4-F5 + P5v2 (v6): the citation authenticates at manifest depth with the EXACT
+        // registrant driving this publication — never an OR of plausible ones.
+        if (!vbr_operation_registry_binding(operation_id, cited) ||
+            cited.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, 0,
+                                       vbr_operation_class::controller,
+                                       vbr_registrant_bit(registrant)) == nullptr) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(units_mutex_);
     if (unit >= units_.size() || active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0 ||
         units_[unit].current_type != source_type || (units_[unit].publish_seq & 1u) != 0) {
         return false;
@@ -497,6 +832,7 @@ llama_seq_id vbr_generation_tracker::last_membership_seq(uint32_t stream, uint32
 }
 
 vbr_unit_generation vbr_generation_tracker::unit_generation(uint32_t unit) const {
+    std::lock_guard<std::mutex> lock(units_mutex_);
     return units_.at(unit);
 }
 
@@ -543,7 +879,8 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
                                        checkpoint_child_dependency_mode                      dependency_mode,
                                        const std::vector<vbr_checkpoint_generation_stream> & streams,
                                        vbr_checkpoint_generation_controller &                output) {
-    if (!tracker.active() || !tracker.stable() || dependency_mode != checkpoint_child_dependency_mode::live_guarded) {
+    if (!tracker.active() || tracker.shadow_unavailable() || !tracker.stable() ||
+        dependency_mode != checkpoint_child_dependency_mode::live_guarded) {
         return false;
     }
 
@@ -634,6 +971,9 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
     }
 
     bool any_live_rebased = false;
+    audit_state             audit;
+    std::vector<audit_cell> reject_cells;
+    vbr_checkpoint_eligibility_reason first_reject = vbr_checkpoint_eligibility_reason::none;
     uint32_t previous_child = std::numeric_limits<uint32_t>::max();
     for (size_t ci = 0; ci < checkpoint.controllers.size(); ++ci) {
         const auto & captured = checkpoint.controllers[ci];
@@ -661,6 +1001,9 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
         if (!current.tracker->stable()) {
             return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_unstable);
         }
+        const uint64_t serial_at_read_start = current.tracker->mutation_serial();
+        std::vector<std::pair<uint32_t, uint64_t>> unit_seq_snapshot;
+        unit_seq_snapshot.reserve(captured.units.size());
         if (captured.pool_uuid != current.tracker->pool_identity()) {
             return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::pool_uuid);
         }
@@ -675,6 +1018,7 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
             if ((current_unit.publish_seq & 1u) != 0) {
                 return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::unit_unstable);
             }
+            unit_seq_snapshot.emplace_back(static_cast<uint32_t>(ui), current_unit.publish_seq);
             if (unit_equal(captured.units[ui], current_unit)) {
                 continue;
             }
@@ -705,8 +1049,9 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                 return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::identity_or_frontier);
             }
 
-            uint32_t covered_count = 0;
-            uint32_t previous_page = std::numeric_limits<uint32_t>::max();
+            uint32_t covered_count  = 0;
+            uint32_t lost_in_stream = 0;
+            uint32_t previous_page  = std::numeric_limits<uint32_t>::max();
             for (const auto & page : stored_stream.pages) {
                 if ((previous_page != std::numeric_limits<uint32_t>::max() && page.page_index <= previous_page) ||
                     mask_popcount(page.covered_mask) == 0) {
@@ -720,7 +1065,18 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                 const uint32_t current_page_gen =
                     current.tracker->page_generation(stored_stream.stream_index, page.page_index);
                 const bool     fast_match = current_page_gen == page.captured_page_gen;
-                const uint32_t base       = page.page_index * VBR_GENERATION_PAGE_CELLS;
+                if (!fast_match) {
+                    audit.refinement_used = true;
+                }
+                if (current.tracker->page_destructive_generation(stored_stream.stream_index, page.page_index) >
+                        page.captured_page_gen) {
+                    audit.saw_destructive = true;
+                }
+                if (current.tracker->page_import_generation(stored_stream.stream_index, page.page_index) >
+                        page.captured_page_gen) {
+                    audit.saw_import = true;
+                }
+                const uint32_t base = page.page_index * VBR_GENERATION_PAGE_CELLS;
                 for (uint32_t offset = 0; offset < VBR_GENERATION_PAGE_CELLS; ++offset) {
                     if (!mask_test(page.covered_mask, offset)) {
                         continue;
@@ -730,22 +1086,106 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                         return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::page_out_of_range);
                     }
                     ++covered_count;
-                    if (!fast_match && current.tracker->dependency_generation(stored_stream.stream_index, cell) >
-                                           page.captured_page_gen) {
-                        return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::dependency_changed);
+                    // §5.5 requires inspecting EVERY rejecting covered cell — collect instead of
+                    // early-returning so classification sees the complete reject set.
+                    const bool dep_changed =
+                        !fast_match && current.tracker->dependency_generation(stored_stream.stream_index, cell) >
+                                           page.captured_page_gen;
+                    const bool membership_lost =
+                        !live_stream.cell_has_seq(live_stream.membership_context, stored_stream.stream_index,
+                                                  cell, stored_stream.dependency_seq_id);
+                    if (membership_lost) {
+                        ++lost_in_stream;
                     }
-                    if (!live_stream.cell_has_seq(live_stream.membership_context, stored_stream.stream_index, cell,
-                                                  stored_stream.dependency_seq_id)) {
-                        return reject(live.legacy_eligible,
-                                      vbr_checkpoint_eligibility_reason::dependency_membership_lost);
+                    if (dep_changed || membership_lost) {
+                        if (first_reject == vbr_checkpoint_eligibility_reason::none) {
+                            first_reject = dep_changed ? vbr_checkpoint_eligibility_reason::dependency_changed
+                                                       : vbr_checkpoint_eligibility_reason::dependency_membership_lost;
+                        }
+                        ++audit.rejecting_cells;
+                        if (audit.rejecting_cells > REJECT_INSPECT_CAP) {
+                            audit.overflowed = true;
+                            continue;
+                        }
+                        if (reject_cells.empty()) {
+                            reject_cells.reserve(64);
+                        }
+                        audit_cell rc;
+                        rc.tracker         = current.tracker;
+                        rc.membership_lost = membership_lost;
+                        rc.doubly_rejected = dep_changed && membership_lost;
+                        rc.in_range        = dep_changed
+                                ? current.tracker->dependency_in_range(stored_stream.stream_index, cell)
+                                : current.tracker->membership_in_range(stored_stream.stream_index, cell);
+                        rc.provenance      = dep_changed
+                                ? current.tracker->dependency_provenance(stored_stream.stream_index, cell)
+                                : current.tracker->membership_provenance(stored_stream.stream_index, cell);
+                        rc.extent          = dep_changed
+                                ? current.tracker->dependency_extent(stored_stream.stream_index, cell)
+                                : current.tracker->membership_extent(stored_stream.stream_index, cell);
+                        rc.current_pos     = live_stream.cell_pos != nullptr
+                                ? live_stream.cell_pos(live_stream.membership_context,
+                                                       stored_stream.stream_index, cell)
+                                : -1;
+                        rc.frontier        = stored_stream.computation_frontier;
+                        rc.dep_seq         = stored_stream.dependency_seq_id;
+                        reject_cells.push_back(rc);
                     }
                 }
             }
-            if (covered_count != stored_stream.captured_dependency_count ||
-                live_stream.exact_dependency_count != stored_stream.captured_dependency_count) {
-                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::dependency_cardinality);
+            // F7: cardinality agreement is validated in BOTH outcomes. Clean streams must match
+            // exactly; rejecting streams must reconcile as captured-minus-lost (any expansion or
+            // malformed count forces the whole reject set to unexplained).
+            if (covered_count != stored_stream.captured_dependency_count) {
+                audit.cardinality_violated = true;
+            }
+            const uint32_t expected_live =
+                stored_stream.captured_dependency_count >= lost_in_stream
+                    ? stored_stream.captured_dependency_count - lost_in_stream
+                    : 0;
+            if (live_stream.exact_dependency_count != expected_live ||
+                stored_stream.captured_dependency_count < lost_in_stream) {
+                audit.cardinality_violated = true;
+            }
+            if (first_reject == vbr_checkpoint_eligibility_reason::none && audit.cardinality_violated) {
+                auto result            = reject(live.legacy_eligible,
+                                                vbr_checkpoint_eligibility_reason::dependency_cardinality);
+                result.tombstone_class = vbr_expected_tombstone_class::unexplained;
+                fill_audit(result, audit);
+                return result;
             }
         }
+
+        // F9 (v3.2): per-unit publish_seq must be IDENTICAL after all reads — unit publication
+        // does not move the controller serial, so this is the only proof no unit published
+        // even->odd->even mid-evaluation. Tuple copies themselves are race-free by the units
+        // mutex; this catches the interleaving.
+        for (const auto & [ui, seq_before] : unit_seq_snapshot) {
+            if (current.tracker->unit_generation(ui).publish_seq != seq_before) {
+                auto result = reject(live.legacy_eligible,
+                                     vbr_checkpoint_eligibility_reason::unit_unstable);
+                fill_audit(result, audit);
+                return result;
+            }
+        }
+        // F9: post-read stability recheck — a mutation that raced these reads (even -> odd ->
+        // even) invalidates everything read above. Reject rather than re-read: the caller's
+        // next scan sees a coherent state.
+        if (current.tracker->mutation_serial() != serial_at_read_start ||
+            !current.tracker->stable()) {
+            auto result = reject(live.legacy_eligible,
+                                 vbr_checkpoint_eligibility_reason::controller_unstable);
+            fill_audit(result, audit);
+            return result;
+        }
+    }
+
+    if (first_reject != vbr_checkpoint_eligibility_reason::none) {
+        auto result = reject(live.legacy_eligible, first_reject);
+        result.tombstone_class =
+            classify_expected_tombstone(reject_cells, audit.overflowed, audit.cardinality_violated);
+        fill_audit(result, audit);
+        return result;
     }
 
     vbr_checkpoint_eligibility result;
@@ -755,5 +1195,6 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
     result.category            = any_live_rebased ? vbr_checkpoint_eligibility_category::live_rebased_shadow_accept :
                                                     vbr_checkpoint_eligibility_category::strict_accept;
     result.reason              = vbr_checkpoint_eligibility_reason::none;
+    fill_audit(result, audit);
     return result;
 }

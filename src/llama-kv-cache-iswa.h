@@ -76,6 +76,10 @@ public:
     bool vbr_operation_armed() const override;
     bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
     void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_commit_submitted() override;
+    void vbr_decode_ops_finish(bool ok) override;
+    void vbr_adopt_operation(vbr_operation_id operation_id) override;
+    void vbr_release_adopted() override;
     llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
 
     // summed across both children: each context token holds one row in each cache, so the
@@ -195,7 +199,7 @@ public:
     const llama_kv_cache_context * get_swa()  const;
 
 private:
-    //llama_kv_cache_iswa * kv;
+    llama_kv_cache_iswa * kv = nullptr;  // C1: composite decode-op owner needs the caches
 
     // the index of the next ubatch to process
     size_t i_next = 0;

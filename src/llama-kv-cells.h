@@ -298,6 +298,25 @@ public:
     }
 
     // check if the cell contains seq_id
+    // Iterate the sequences ACTUALLY occupying cell i — O(occupants), not O(LLAMA_MAX_SEQ).
+    // (A2 ownership-index maintenance walks this per touched cell on whole-cache edits.)
+    template <typename F>
+    void seq_for_each(uint32_t i, F && f) const {
+        assert(i < seq.size());
+        const auto & set = seq[i];
+#if defined(__GNUC__)
+        for (size_t s = set._Find_first(); s < set.size(); s = set._Find_next(s)) {
+            f((llama_seq_id) s);
+        }
+#else
+        for (size_t s = 0; s < set.size(); ++s) {
+            if (set.test(s)) {
+                f((llama_seq_id) s);
+            }
+        }
+#endif
+    }
+
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
         assert(seq_id >= 0);
