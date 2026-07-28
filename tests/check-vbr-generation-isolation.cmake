@@ -267,6 +267,30 @@ if (NOT bridge_generation_include EQUAL -1)
     message(FATAL_ERROR "the opaque bridge header imported generation vocabulary")
 endif()
 
+# Commit 3: the opaque bridge surface is a CLOSED seven-operation inventory. This is the
+# source-side census paired with the dorei nm/export check.
+set(c3_bridge_exports
+    llama_vbr_checkpoint_shadow_capture
+    llama_vbr_checkpoint_shadow_free
+    llama_vbr_checkpoint_shadow_equal
+    llama_vbr_checkpoint_shadow_size
+    llama_vbr_checkpoint_shadow_status
+    llama_vbr_checkpoint_shadow_reason_name
+    llama_vbr_checkpoint_shadow_evaluate)
+list(LENGTH c3_bridge_exports c3_bridge_export_count)
+if (NOT c3_bridge_export_count EQUAL 7)
+    message(FATAL_ERROR "checkpoint bridge export inventory must contain exactly seven operations")
+endif()
+file(READ "${SOURCE_ROOT}/src/llama-vbr-checkpoint.cpp" c2_bridge_source)
+foreach(symbol IN LISTS c3_bridge_exports)
+    count_literal("${c2_bridge_header}" "${symbol}" declaration_count)
+    count_literal("${c2_bridge_source}" "${symbol}" definition_count)
+    if (NOT declaration_count EQUAL 1 OR NOT definition_count EQUAL 1)
+        message(FATAL_ERROR
+            "checkpoint bridge export ${symbol} census mismatch: header=${declaration_count} source=${definition_count}")
+    endif()
+endforeach()
+
 # F3 (verify round): the canonical oracle observer region in llama-kv-cache.cpp is scanned for
 # forbidden production-index inputs — the observation builder must stay a direct cell scan.
 file(READ "${SOURCE_ROOT}/src/llama-kv-cache.cpp" c2_kv_source)
@@ -303,7 +327,7 @@ endif()
 # F12/ODR guard: the handle struct definition is mirrored token-identically between the bridge
 # TU and the test-only factory in the named lifecycle test.
 set(c2_handle_definition
-    "struct llama_vbr_checkpoint_shadow {\n    vbr_checkpoint_generation_record record;\n};")
+    "struct llama_vbr_checkpoint_shadow {\n    vbr_checkpoint_generation_record record;\n    std::vector<vbr_checkpoint_oracle_sidecar_entry> oracle_sidecar;\n};")
 foreach(path IN ITEMS
         "${SOURCE_ROOT}/src/llama-vbr-checkpoint.cpp"
         "${SOURCE_ROOT}/tests/test-checkpoint-shadow-lifecycle.cpp")
@@ -312,6 +336,59 @@ foreach(path IN ITEMS
     if (found EQUAL -1)
         message(FATAL_ERROR
             "canonical llama_vbr_checkpoint_shadow definition missing or diverged in ${path}")
+    endif()
+endforeach()
+
+# Oracle evidence is audit-only: the disabled sidecar stays on the opaque handle and must not
+# become part of the immutable admission record or sole evaluator TU.
+file(READ "${SOURCE_ROOT}/src/llama-vbr-generation-types.h" c3_generation_types)
+string(FIND "${c3_generation_types}" "oracle_sidecar" oracle_in_record)
+if (NOT oracle_in_record EQUAL -1)
+    message(FATAL_ERROR "oracle sidecar entered the immutable generation record")
+endif()
+string(FIND "${generation_source}" "vbr_checkpoint_oracle_outcome" oracle_outcome_in_evaluator)
+if (NOT oracle_outcome_in_evaluator EQUAL -1)
+    message(FATAL_ERROR "oracle outcome entered the sole admission evaluator")
+endif()
+
+# Commit 3, single-evaluator consumer rule: the G-only bridge export is called from exactly
+# ONE place outside src — the opaque common wrapper. Server code (and the pure coordinator)
+# must consume the common wrapper, never the bridge or any llama_vbr_checkpoint_* symbol.
+file(READ "${SOURCE_ROOT}/common/common-checkpoint-shadow.cpp" c3_common_shadow_source)
+count_literal("${c3_common_shadow_source}" "llama_vbr_checkpoint_shadow_evaluate(" c3_wrapper_eval_calls)
+if (NOT c3_wrapper_eval_calls EQUAL 1)
+    message(FATAL_ERROR
+        "the common wrapper must call llama_vbr_checkpoint_shadow_evaluate exactly once (found ${c3_wrapper_eval_calls})")
+endif()
+# Recursive fence (verify r1 finding 10): EVERY production TU outside the one allowlisted
+# wrapper — all of tools/ recursively plus every other common/ TU — is barred from naming any
+# bridge symbol. Tests keep their own explicit allowlists above.
+file(GLOB_RECURSE c3_fenced_sources
+    "${SOURCE_ROOT}/tools/*.cpp"
+    "${SOURCE_ROOT}/tools/*.h"
+    "${SOURCE_ROOT}/tools/*.hpp"
+    "${SOURCE_ROOT}/common/*.cpp"
+    "${SOURCE_ROOT}/common/*.h")
+foreach(path IN LISTS c3_fenced_sources)
+    if (path STREQUAL "${SOURCE_ROOT}/common/common-checkpoint-shadow.cpp")
+        continue()
+    endif()
+    file(READ "${path}" c3_fenced_source)
+    string(FIND "${c3_fenced_source}" "llama_vbr_checkpoint" c3_fence_bridge_use)
+    if (NOT c3_fence_bridge_use EQUAL -1)
+        message(FATAL_ERROR "production source ${path} bypassed the opaque common shadow wrapper")
+    endif()
+endforeach()
+
+# Commit 3, coordinator purity: the qualification coordinator is record-free pure common logic.
+foreach(path IN ITEMS
+        "${SOURCE_ROOT}/common/common-checkpoint-coordinator.h"
+        "${SOURCE_ROOT}/common/common-checkpoint-coordinator.cpp")
+    file(READ "${path}" c3_coordinator_source)
+    string(FIND "${c3_coordinator_source}" "llama-vbr-" c3_coordinator_vbr_include)
+    string(FIND "${c3_coordinator_source}" "vbr_checkpoint_generation_record" c3_coordinator_record)
+    if (NOT c3_coordinator_vbr_include EQUAL -1 OR NOT c3_coordinator_record EQUAL -1)
+        message(FATAL_ERROR "coordinator ${path} pierced the opaque bridge layer")
     endif()
 endforeach()
 

@@ -211,7 +211,11 @@ public:
     // reconstruction can catch an index that drifted from the canonical cells.
     bool vbr_generation_oracle_observations(
             llama_seq_id seq_id,
+            llama_pos computation_frontier,
             std::vector<struct vbr_generation_oracle_cell> & output) const;
+    // Producer-authenticated reset-scope source for the checkpoint bridge. True only for the
+    // pool/controller-wide availability latch, never for a transient capture race.
+    bool vbr_generation_shadow_globally_unavailable() const;
 
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
@@ -962,6 +966,14 @@ private:
 
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
+
+    // Canonical sequence-serializer inclusion predicate. The disabled generation oracle
+    // reuses this cell-local rule while retaining its independent full scan (it must never
+    // consume the ownership index or production mask builder).
+    bool state_write_includes_cell(
+            const llama_kv_cells & cells,
+            uint32_t cell,
+            llama_seq_id seq_id) const;
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;

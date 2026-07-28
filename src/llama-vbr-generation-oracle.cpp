@@ -1,6 +1,7 @@
 #include "llama-vbr-generation-oracle.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 
 namespace {
@@ -46,16 +47,19 @@ vbr_generation_oracle_baseline independently_reconstruct(
             result.dependency_cells.back() == cell->physical_cell) {
             result.complete = false;
         }
-        if (cell->byte_count != 0 && cell->bytes == nullptr) {
+        if (cell->dependency_bytes.empty()) {
             result.complete = false;
         }
         result.dependency_cells.push_back(cell->physical_cell);
         result.dependency_byte_hash =
             hash_bytes(result.dependency_byte_hash, &cell->physical_cell, sizeof(cell->physical_cell));
+        const size_t byte_count = cell->dependency_bytes.size();
         result.dependency_byte_hash =
-            hash_bytes(result.dependency_byte_hash, &cell->byte_count, sizeof(cell->byte_count));
-        if (cell->bytes != nullptr && cell->byte_count != 0) {
-            result.dependency_byte_hash = hash_bytes(result.dependency_byte_hash, cell->bytes, cell->byte_count);
+            hash_bytes(result.dependency_byte_hash, &byte_count, sizeof(byte_count));
+        if (!cell->dependency_bytes.empty()) {
+            result.dependency_byte_hash =
+                hash_bytes(result.dependency_byte_hash, cell->dependency_bytes.data(),
+                           cell->dependency_bytes.size());
         }
     }
     return result;
@@ -129,4 +133,18 @@ bool vbr_generation_oracle_audit_due(bool                            destructive
 
 bool vbr_generation_oracle_audit_forced() {
     return env_flag("VBR_GENERATION_FORCE_AUDIT");
+}
+
+void vbr_generation_oracle_inject(vbr_generation_oracle_result & result) {
+    const char * fault = std::getenv("VBR_GENERATION_ORACLE_INJECT");
+    if (fault == nullptr) {
+        return;
+    }
+    if (std::strcmp(fault, "set") == 0) {
+        result.set_equal = false;
+    } else if (std::strcmp(fault, "bytes") == 0) {
+        result.bytes_equal = false;
+    } else if (std::strcmp(fault, "unavailable") == 0) {
+        result.complete = false;
+    }
 }

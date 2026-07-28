@@ -10,19 +10,27 @@
 // directly from llama_kv_cells and the serializer traversal; production ownership indices and
 // cached manifests are forbidden inputs.
 struct vbr_generation_oracle_cell {
-    uint32_t        physical_cell      = 0;
-    llama_pos       position           = -1;
-    bool            has_dependency_seq = false;
-    bool            attention_visible  = false;
-    bool            payload_supplied   = false;
-    const uint8_t * bytes              = nullptr;
-    size_t          byte_count         = 0;
+    uint32_t             physical_cell      = 0;
+    llama_pos            position           = -1;
+    bool                 has_dependency_seq = false;
+    bool                 attention_visible  = false;
+    bool                 payload_supplied   = false;
+    // Canonical serialized dependency bytes for this physical cell. Empty on a dependency is
+    // incomplete, not a valid zero-byte payload.
+    std::vector<uint8_t> dependency_bytes;
 };
 
 struct vbr_generation_oracle_baseline {
     std::vector<uint32_t> dependency_cells;
     uint64_t              dependency_byte_hash = 0;
     bool                  complete             = false;
+};
+
+struct vbr_checkpoint_oracle_sidecar_entry {
+    uint32_t                       child_id    = 0;
+    uint32_t                       stream_index = 0;
+    llama_pos                      computation_frontier = -1;
+    vbr_generation_oracle_baseline baseline;
 };
 
 struct vbr_generation_oracle_result {
@@ -60,3 +68,7 @@ bool vbr_generation_oracle_audit_due(bool                            destructive
 // Env probe for the forced-audit override (VBR_GENERATION_FORCE_AUDIT), probed per call like
 // the oracle gate so tests can toggle it mid-process.
 bool vbr_generation_oracle_audit_forced();
+
+// Test-only fault seam, env VBR_GENERATION_ORACLE_INJECT={set|bytes|unavailable}. Applied after
+// the independent reconstruction so CPU rows can pin each closed per-observation outcome.
+void vbr_generation_oracle_inject(vbr_generation_oracle_result & result);

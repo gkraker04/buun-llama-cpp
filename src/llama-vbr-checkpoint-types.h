@@ -25,7 +25,99 @@ enum class vbr_checkpoint_capture_reason : uint8_t {
     child_capture_failed,
     oracle_mismatch,
     internal_error,
+    controller_unavailable,
+    _count,
 };
+
+// A2 commit-3 reset transport. The producer authenticates the scope; consumers must never
+// infer it from a generic child_capture_failed result.
+enum class vbr_checkpoint_reset_scope : uint8_t {
+    none,
+    capturing_slot,
+    global,
+    _count,
+};
+
+// Record-free mirror of the sole generation evaluator's closed leaf vocabulary. Keep these
+// separate from llama-vbr-generation.h so the opaque bridge cannot expose the process-local
+// checkpoint record or live tracker types to common/server consumers.
+enum class vbr_checkpoint_shadow_category : uint8_t {
+    not_applicable,
+    generation_unknown,
+    strict_accept,
+    live_rebased_shadow_accept,
+    strict_reject,
+    _count,
+};
+
+enum class vbr_checkpoint_shadow_reason : uint8_t {
+    none,
+    capability_not_applicable,
+    record_unknown,
+    record_version,
+    identity_or_frontier,
+    controller_shape,
+    child_order,
+    dependency_mode,
+    controller_inactive,
+    controller_unstable,
+    pool_uuid,
+    global_generation,
+    unit_shape,
+    unit_unstable,
+    unit_generation,
+    live_rebased_transition,
+    stream_shape,
+    stream_order,
+    malformed_page_refs,
+    page_out_of_range,
+    dependency_changed,
+    dependency_membership_lost,
+    dependency_cardinality,
+    _count,
+};
+
+enum class vbr_checkpoint_shadow_tombstone : uint8_t {
+    none,
+    restore_one_behind,
+    swa_wrap,
+    explicit_destructive_trim,
+    dependency_seq_removed,
+    unexplained,
+    _count,
+};
+
+enum class vbr_checkpoint_shadow_observation : uint8_t {
+    trivial_append,
+    boundary_refined,
+    destructive,
+    import_refined,
+    _count,
+};
+
+// One outcome per audited observation. This is deliberately rich enough for the server to
+// increment its set/hash/unavailable counters exactly once without src becoming a second
+// durable counter authority.
+enum class vbr_checkpoint_oracle_outcome : uint8_t {
+    disabled,
+    not_due,
+    pass,
+    set_mismatch,
+    byte_mismatch,
+    set_and_byte_mismatch,
+    unavailable,
+    _count,
+};
+
+// Append detection for every closed enum mirrored by common. Common pins the prior last value
+// numerically; these sentinels make an unmirrored append fail here as well.
+static_assert(static_cast<uint8_t>(vbr_checkpoint_capture_reason::_count) == 8);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_reset_scope::_count) == 3);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_shadow_category::_count) == 5);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_shadow_reason::_count) == 23);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_shadow_tombstone::_count) == 6);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_shadow_observation::_count) == 4);
+static_assert(static_cast<uint8_t>(vbr_checkpoint_oracle_outcome::_count) == 7);
 
 // D-A2-8: server-layer checkpoint identity/frontier fields bound into the record digest.
 // next_position is the EXCLUSIVE computation frontier (dependencies are pos < next_position),

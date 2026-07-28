@@ -1,5 +1,6 @@
 #include "common.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-io.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-vbr-checkpoint.h"
 #include "llama-vbr-checkpoint-compose.inc"
@@ -7,6 +8,7 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <atomic>
 #include <thread>
@@ -146,6 +148,106 @@ struct llama_kv_cache_vbr_epoch_test {
         return kv->vbr_generation_tracker_get();
     }
 
+    struct serializer_count_complete {};
+
+    class serializer_positions_writer : public llama_io_write_i {
+    public:
+        explicit serializer_positions_writer(bool has_ext) : has_ext(has_ext) {}
+
+        void write(const void * src, size_t size) override {
+            if (stage == 0) {
+                if (size == sizeof(uint32_t)) {
+                    std::memcpy(&streams, src, size);
+                }
+                valid = size == sizeof(uint32_t) && streams == 1;
+                stage = 1;
+                return;
+            }
+            if (stage == 1) {
+                if (size == sizeof(uint32_t)) {
+                    std::memcpy(&remaining, src, size);
+                }
+                valid = valid && size == sizeof(uint32_t);
+                positions.reserve(remaining);
+                if (remaining == 0) {
+                    throw serializer_count_complete{};
+                }
+                stage = 2;
+                return;
+            }
+            if (stage == 2) {
+                llama_pos position = -1;
+                if (size == sizeof(position)) {
+                    std::memcpy(&position, src, size);
+                }
+                valid = valid && size == sizeof(position) && position >= 0;
+                positions.push_back(position);
+                stage = 3;
+                return;
+            }
+            if (stage == 3) {
+                uint32_t n_seq = 0;
+                if (size == sizeof(n_seq)) {
+                    std::memcpy(&n_seq, src, size);
+                }
+                valid = valid && size == sizeof(n_seq) && n_seq == 1;
+                stage = has_ext ? 4 : 5;
+                return;
+            }
+            if (stage == 4) {
+                valid = valid && size == sizeof(llama_kv_cell_ext);
+                stage = 5;
+                return;
+            }
+            if (stage == 5) {
+                llama_seq_id seq = -1;
+                if (size == sizeof(seq)) {
+                    std::memcpy(&seq, src, size);
+                }
+                valid = valid && size == sizeof(seq) && seq == 0 && remaining > 0;
+                if (--remaining == 0) {
+                    throw serializer_count_complete{};
+                }
+                stage = 2;
+                return;
+            }
+            valid = false;
+            throw serializer_count_complete{};
+        }
+
+        void write_tensor(ggml_tensor *, size_t, size_t) override {
+            valid = false;
+            throw serializer_count_complete{};
+        }
+
+        size_t n_bytes() override {
+            return 0;
+        }
+
+        const bool             has_ext;
+        uint32_t               streams   = 0;
+        uint32_t               remaining = 0;
+        uint32_t               stage     = 0;
+        bool                   valid     = true;
+        std::vector<llama_pos> positions;
+    };
+
+    static bool serializer_positions(
+            const llama_kv_cache * kv,
+            llama_seq_id seq_id,
+            std::vector<llama_pos> & positions) {
+        serializer_positions_writer writer(kv->hparams.n_pos_per_embd() > 1);
+        try {
+            kv->state_write(writer, seq_id);
+        } catch (const serializer_count_complete &) {
+            positions = std::move(writer.positions);
+            return writer.valid && writer.remaining == 0;
+        } catch (...) {
+            return false;
+        }
+        return false;
+    }
+
     // C2 rows (b)/(c): a REAL provenance-bearing root scope with a deliberately narrow
     // manifest (seq 0, positions [0,2)). Returned open so nested production mutations join
     // it; closing WITHOUT succeed() is the production FAILED close (autorecords recovery).
@@ -277,11 +379,20 @@ static void unset_test_env(const char * name) {
 
 struct a1_membership_fixture {
     std::vector<uint8_t> present;
+    std::vector<llama_pos> positions;
 };
 
 static bool a1_cell_has_seq(const void * context, uint32_t, uint32_t cell, llama_seq_id seq_id) {
     const auto * fixture = static_cast<const a1_membership_fixture *>(context);
     return seq_id == 0 && cell < fixture->present.size() && fixture->present[cell] != 0;
+}
+
+static llama_pos a1_cell_pos(const void * context, uint32_t, uint32_t cell) {
+    const auto * fixture = static_cast<const a1_membership_fixture *>(context);
+    if (cell >= fixture->present.size() || fixture->present[cell] == 0) {
+        return -1;
+    }
+    return cell < fixture->positions.size() ? fixture->positions[cell] : (llama_pos) cell;
 }
 
 static vbr_checkpoint_generation_record a1_make_record(
@@ -310,6 +421,7 @@ static vbr_generation_live_view a1_make_live(
     stream.exact_dependency_count = exact_count;
     stream.membership_context     = &membership;
     stream.cell_has_seq           = a1_cell_has_seq;
+    stream.cell_pos               = a1_cell_pos;
 
     vbr_generation_live_controller_view controller;
     controller.child_id        = 0;
@@ -602,12 +714,10 @@ static bool run_a1_cpu_tests() {
         return false;
     }
 
-    uint8_t bytes_a[] = {1, 2, 3};
-    uint8_t bytes_b[] = {4, 5};
     std::vector<vbr_generation_oracle_cell> canonical = {
-        {10,  10,  true,  true, false, bytes_a, sizeof(bytes_a)},
-        {20,  20,  false, true, false, bytes_a, sizeof(bytes_a)},
-        {300, 300, true,  true, false, bytes_b, sizeof(bytes_b)},
+        {10,  10,  true,  true, false, {1, 2, 3}},
+        {20,  20,  false, true, false, {1, 2, 3}},
+        {300, 300, true,  true, false, {4, 5}},
     };
     unset_test_env("VBR_GENERATION_ORACLE");
     const auto disabled_baseline = vbr_generation_oracle_capture(400, canonical);
@@ -624,13 +734,13 @@ static bool run_a1_cpu_tests() {
         fprintf(stderr, "A1 independent byte oracle rejected its exact baseline\n");
         return false;
     }
-    bytes_a[0] = 9;
+    canonical[0].dependency_bytes[0] = 9;
     audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
     if (!audit.set_equal || audit.bytes_equal) {
         fprintf(stderr, "A1 byte oracle missed a covered-byte mutation\n");
         return false;
     }
-    bytes_a[0] = 1;
+    canonical[0].dependency_bytes[0] = 1;
     auto undercovered = stream;
     undercovered.pages.erase(undercovered.pages.begin());
     audit = vbr_generation_oracle_audit(400, canonical, baseline, undercovered);
@@ -639,12 +749,34 @@ static bool run_a1_cpu_tests() {
         return false;
     }
     auto incomplete = canonical;
-    incomplete[0].bytes = nullptr;
+    incomplete[0].dependency_bytes.clear();
     audit = vbr_generation_oracle_audit(400, incomplete, baseline, stream);
     if (audit.complete || audit.bytes_equal) {
         fprintf(stderr, "A1 byte oracle accepted an incomplete canonical observation\n");
         return false;
     }
+    set_test_env("VBR_GENERATION_ORACLE_INJECT", "set");
+    audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
+    vbr_generation_oracle_inject(audit);
+    if (audit.set_equal || !audit.bytes_equal) {
+        fprintf(stderr, "A1 oracle set-mismatch injection was not isolated\n");
+        return false;
+    }
+    set_test_env("VBR_GENERATION_ORACLE_INJECT", "bytes");
+    audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
+    vbr_generation_oracle_inject(audit);
+    if (!audit.set_equal || audit.bytes_equal) {
+        fprintf(stderr, "A1 oracle byte-mismatch injection was not isolated\n");
+        return false;
+    }
+    set_test_env("VBR_GENERATION_ORACLE_INJECT", "unavailable");
+    audit = vbr_generation_oracle_audit(400, canonical, baseline, stream);
+    vbr_generation_oracle_inject(audit);
+    if (audit.complete) {
+        fprintf(stderr, "A1 oracle unavailable injection remained complete\n");
+        return false;
+    }
+    unset_test_env("VBR_GENERATION_ORACLE_INJECT");
     unset_test_env("VBR_GENERATION_ORACLE");
 
     fprintf(stderr, "A1 generation/evaluator/oracle CPU coverage PASS\n");
@@ -1800,6 +1932,7 @@ static bool run_c2_cpu_tests() {
         live_stream.exact_dependency_count = 2;
         live_stream.membership_context     = &membership;
         live_stream.cell_has_seq           = a1_cell_has_seq;
+        live_stream.cell_pos               = a1_cell_pos;
 
         vbr_generation_live_controller_view live_lg;
         live_lg.child_id        = 0;
@@ -1819,6 +1952,32 @@ static bool run_c2_cpu_tests() {
         fprintf(stderr, "C2 composed two-child record was not strict-accepted (reason %d)\n",
                 (int) result.reason);
         return false;
+    }
+
+    // Pin 6 mixed-child applicability: an unarmed live_guarded child with no covered cells is
+    // a vacuous row in both capture and evaluation, not a demand for a nonexistent tracker.
+    {
+        vbr_checkpoint_child_input unarmed_lg;
+        unarmed_lg.live_guarded = true;
+        vbr_checkpoint_generation_record mixed_record;
+        if (vbr_checkpoint_compose({ armed_lg, unarmed_lg }, frontier, mixed_record) !=
+                vbr_checkpoint_capture_reason::ok) {
+            fprintf(stderr, "C3 mixed-child vacuous live_guarded capture failed\n");
+            return false;
+        }
+        auto mixed_live = live;
+        mixed_live.controllers[1].dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        std::vector<vbr_checkpoint_child_policy> mixed_policy;
+        for (const auto & controller : mixed_record.controllers) {
+            mixed_policy.push_back(
+                    { controller.child_id, controller.dependency_mode, controller.pool_uuid });
+        }
+        mixed_live.identity_policy_order_digest =
+            vbr_checkpoint_identity_digest(frontier, mixed_policy);
+        if (!checkpoint_vbr_eligibility(mixed_record, mixed_live).strict) {
+            fprintf(stderr, "C3 mixed-child vacuous live_guarded evaluation failed\n");
+            return false;
+        }
     }
 
     // payload_complete controllers with nonzero streams reject
@@ -1883,9 +2042,9 @@ static bool run_c2_cpu_tests() {
     // mask that covers the right COUNT of cells but a wrong member
     {
         std::vector<vbr_generation_oracle_cell> canonical = {
-            { 10,  10,  true,  true, false, nullptr, 0 },
-            { 20,  20,  false, true, false, nullptr, 0 },
-            { 300, 300, true,  true, false, nullptr, 0 },
+            { 10,  10,  true,  true, false, { 1 } },
+            { 20,  20,  false, true, false, {} },
+            { 300, 300, true,  true, false, { 2 } },
         };
         set_test_env("VBR_GENERATION_ORACLE", "1");
         const auto baseline = vbr_generation_oracle_capture(400, canonical);
@@ -1972,8 +2131,7 @@ static bool c2_gpu_decode_range(llama_context * ctx, llama_seq_id seq,
     return true;
 }
 
-static bool c2_bridge_capture_ok(llama_memory_t mem, int64_t n_past,
-                                 vbr_checkpoint_capture_reason & reason) {
+static vbr_checkpoint_frontier_fields c2_gpu_frontier(int64_t n_past) {
     static const std::string exec_id    = "c2-gpu-exec";
     static const std::string adapter_id = "c2-gpu-adapter";
     static const std::string media_id   = "c2-gpu-media";
@@ -1987,11 +2145,27 @@ static bool c2_bridge_capture_ok(llama_memory_t mem, int64_t n_past,
     frontier.sequence_epoch = 1;
     frontier.token_count    = n_past;
     frontier.next_position  = (llama_pos) n_past;
+    return frontier;
+}
+
+static llama_vbr_checkpoint_shadow * c2_bridge_capture(
+        llama_memory_t mem, int64_t n_past, vbr_checkpoint_capture_reason & reason,
+        vbr_checkpoint_reset_scope * reset_scope = nullptr) {
+    const auto frontier = c2_gpu_frontier(n_past);
     llama_vbr_checkpoint_capture_result result;
     llama_vbr_checkpoint_shadow_capture(mem, 0, &frontier, &result);
     reason = result.reason;
-    const bool ok = result.handle != nullptr;
-    llama_vbr_checkpoint_shadow_free(result.handle);
+    if (reset_scope != nullptr) {
+        *reset_scope = result.reset_scope;
+    }
+    return result.handle;
+}
+
+static bool c2_bridge_capture_ok(llama_memory_t mem, int64_t n_past,
+                                 vbr_checkpoint_capture_reason & reason) {
+    auto * handle = c2_bridge_capture(mem, n_past, reason);
+    const bool ok = handle != nullptr;
+    llama_vbr_checkpoint_shadow_free(handle);
     return ok;
 }
 
@@ -2051,6 +2225,37 @@ static int c2_gpu_row_d(llama_model * model) {
         fprintf(stderr, "row d: base tracker not stable/armed after 9-ubatch decode\n");
         return 1;
     }
+    // Commit-3 G-only bridge: P and F are deliberately combined outside the bridge. Both
+    // asymmetric rows must invoke the sole evaluator exactly once and produce distinct
+    // P/G versus F/G candidates.
+    vbr_checkpoint_capture_reason eval_capture_reason;
+    auto * eval_handle =
+        c2_bridge_capture(llama_get_memory(ctx.get()), 288, eval_capture_reason);
+    if (eval_handle == nullptr) {
+        fprintf(stderr, "row d: G-only bridge capture failed (%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(eval_capture_reason));
+        return 1;
+    }
+    const auto eval_frontier = c2_gpu_frontier(288);
+    for (const auto [p_eligible, f_eligible] :
+            { std::pair<bool, bool>{ false, true }, { true, false } }) {
+        llama_vbr_checkpoint_shadow_evaluation evaluation;
+        llama_vbr_checkpoint_shadow_evaluate(
+                eval_handle, llama_get_memory(ctx.get()), 0, &eval_frontier, &evaluation);
+        const bool p_g = p_eligible && evaluation.strict;
+        const bool f_g = f_eligible && evaluation.strict;
+        if (evaluation.evaluator_invocations != 1 || !evaluation.strict || p_g == f_g ||
+                p_g != p_eligible || f_g != f_eligible) {
+            fprintf(stderr, "row d: G-only asymmetric P/F bridge row failed "
+                    "(P=%d F=%d calls=%u strict=%d)\n",
+                    (int) p_eligible, (int) f_eligible,
+                    (unsigned) evaluation.evaluator_invocations, (int) evaluation.strict);
+            llama_vbr_checkpoint_shadow_free(eval_handle);
+            return 1;
+        }
+    }
+    llama_vbr_checkpoint_shadow_free(eval_handle);
+
     vbr_checkpoint_capture_reason reason;
     if (!c2_bridge_capture_ok(llama_get_memory(ctx.get()), 288, reason)) {
         fprintf(stderr, "row d: capture unavailable after 9-ubatch decode (reason=%s)\n",
@@ -2110,9 +2315,13 @@ static int c2_gpu_row_b(llama_model * model) {
         return 1;
     }
     vbr_checkpoint_capture_reason reason;
-    if (c2_bridge_capture_ok(mem, 4, reason) ||
-            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+    vbr_checkpoint_reset_scope reset_scope;
+    auto * poisoned = c2_bridge_capture(mem, 4, reason, &reset_scope);
+    if (poisoned != nullptr ||
+            reason != vbr_checkpoint_capture_reason::controller_unavailable ||
+            reset_scope != vbr_checkpoint_reset_scope::global) {
         fprintf(stderr, "row b: poisoned child did not make the composite unavailable\n");
+        llama_vbr_checkpoint_shadow_free(poisoned);
         return 1;
     }
     if (llama_kv_cache_vbr_epoch_test::tracker_mut(base)->try_rearm()) {
@@ -2193,9 +2402,13 @@ static int c2_gpu_row_c(llama_model * model) {
         return 1;
     }
     vbr_checkpoint_capture_reason reason;
-    if (c2_bridge_capture_ok(mem, 6, reason) ||
-            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+    vbr_checkpoint_reset_scope reset_scope;
+    auto * poisoned = c2_bridge_capture(mem, 6, reason, &reset_scope);
+    if (poisoned != nullptr ||
+            reason != vbr_checkpoint_capture_reason::controller_unavailable ||
+            reset_scope != vbr_checkpoint_reset_scope::global) {
         fprintf(stderr, "row c: poisoned root did not make the composite unavailable\n");
+        llama_vbr_checkpoint_shadow_free(poisoned);
         return 1;
     }
     llama_pos pos_cursor = 6;
@@ -2289,9 +2502,13 @@ static int c2_gpu_row_e(llama_model * model) {
     }
     // the failed child blocks the composite until recovery resolves at a real boundary
     vbr_checkpoint_capture_reason reason;
-    if (c2_bridge_capture_ok(mem, 9, reason) ||
-            reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+    vbr_checkpoint_reset_scope reset_scope;
+    auto * failed = c2_bridge_capture(mem, 9, reason, &reset_scope);
+    if (failed != nullptr ||
+            reason != vbr_checkpoint_capture_reason::controller_unavailable ||
+            reset_scope != vbr_checkpoint_reset_scope::global) {
         fprintf(stderr, "row e: failed child did not make the composite unavailable\n");
+        llama_vbr_checkpoint_shadow_free(failed);
         return 1;
     }
     llama_pos pos_cursor = 9;
@@ -2314,12 +2531,9 @@ static int c2_gpu_row_e(llama_model * model) {
 // prechecks that the captured set was actually disturbed — an undisturbed arm fails as
 // uncovered, never passes vacuously.
 //
-// SUBSTRATE NOTE (for the Sol delta review): on REAL same-seq wrap the reused cells keep seq
-// membership but move above the frontier, so the live dependency rank shrinks with lost==0 —
-// the evaluator's F7 captured-minus-lost reconciliation then flags dependency_cardinality and
-// classify_expected_tombstone() force-classifies UNEXPLAINED. §5.5 row 2 (swa_wrap) appears
-// unreachable on real geometry; the CPU row fabricated exact counts and masked this. The arm
-// asserts the reject and accepts either class, printing which one fired for the ruling.
+// Commit-3 adds the exact-cardinality correction and a third, in-domain same-sequence reuse
+// arm. The first two arms retain the prior fail-closed proofs (out-of-domain wrap and
+// cross-sequence reuse); arm 3 is the only row allowed to earn swa_wrap classification.
 static int c2_gpu_row_a(llama_model * model) {
     const int32_t n_swa = llama_model_n_swa(model);
     if (n_swa <= 0 || n_swa > 1728) {
@@ -2457,14 +2671,353 @@ static int c2_gpu_row_a(llama_model * model) {
         }
     }
 
-    fprintf(stderr, "C2 GPU row (a) wrap/cross-seq slot selection PASS\n");
+    // --- arm 3: in-domain SAME-SEQUENCE occupied reuse. Seq 0 first contributes more than
+    // one SWA window but fewer cells than the physical child; seq 1 fills the remaining empty
+    // cells. The next seq-0 token therefore has no free slot and must reuse an expired seq-0
+    // dependency while its new logical position remains inside the ownership-index domain.
+    // This is the real geometry for §5.5 row 2: membership survives, position advances past
+    // the captured frontier, exact live rank shrinks, and only swa_wrap is admissible.
+    {
+        const uint32_t n_ctx = (uint32_t) window * 2 + 640;
+        llama_context_ptr ctx;
+        if (!c2_gpu_context(model, n_ctx, 64, 2, ctx)) {
+            fprintf(stderr, "row a: arm-3 context creation failed\n");
+            return 1;
+        }
+        llama_kv_cache * base = nullptr;
+        llama_kv_cache * swa  = nullptr;
+        if (!c2_gpu_children(llama_get_memory(ctx.get()), base, swa)) {
+            fprintf(stderr, "row a: arm-3 armed iSWA children unavailable\n");
+            return 1;
+        }
+        const uint32_t swa_size = swa->get_size();
+        const llama_pos seq0_fill = window + 64;
+        if (seq0_fill <= window || seq0_fill >= (llama_pos) swa_size ||
+                swa_size - (uint32_t) seq0_fill < 64) {
+            fprintf(stderr, "row a: arm-3 geometry cannot satisfy n_swa < pos < child-size "
+                    "(window=%d fill=%d size=%u)\n",
+                    (int) window, (int) seq0_fill, (unsigned) swa_size);
+            return 1;
+        }
+        if (!c2_gpu_decode_range(ctx.get(), 0, 0, seq0_fill, 64)) {
+            fprintf(stderr, "row a: arm-3 seq-0 fill failed\n");
+            return 1;
+        }
+        const llama_pos seq1_fill = (llama_pos) swa_size - seq0_fill;
+        if (!c2_gpu_decode_range(ctx.get(), 1, 0, seq1_fill, 64)) {
+            fprintf(stderr, "row a: arm-3 seq-1 fill failed\n");
+            return 1;
+        }
+
+        vbr_checkpoint_generation_controller captured;
+        if (!swa->vbr_generation_capture_live_guarded(0, 0, seq0_fill, captured) ||
+                captured.streams.empty()) {
+            fprintf(stderr, "row a: arm-3 SWA capture failed\n");
+            return 1;
+        }
+        vbr_checkpoint_generation_record record;
+        record.status = vbr_checkpoint_generation_status::complete;
+        record.controllers.push_back(captured);
+        if (!c2_gpu_decode_range(ctx.get(), 0, seq0_fill, seq0_fill + 1, 1)) {
+            fprintf(stderr, "row a: arm-3 occupied-reuse decode failed\n");
+            return 1;
+        }
+
+        vbr_generation_live_controller_view view;
+        if (!swa->vbr_generation_live_guarded_view(0, 0, seq0_fill, view) ||
+                view.streams.empty()) {
+            fprintf(stderr, "row a: arm-3 ownership view became unavailable\n");
+            return 1;
+        }
+        const auto & stored_stream = captured.streams[0];
+        const auto & live_stream   = view.streams[0];
+        bool saw_same_seq_higher = false;
+        for (const auto & page : stored_stream.pages) {
+            const uint32_t page_base = page.page_index * VBR_GENERATION_PAGE_CELLS;
+            for (uint32_t off = 0; off < VBR_GENERATION_PAGE_CELLS; ++off) {
+                if ((page.covered_mask[off / 64] & (uint64_t(1) << (off % 64))) == 0) {
+                    continue;
+                }
+                const uint32_t cell = page_base + off;
+                if (live_stream.cell_has_seq(
+                            live_stream.membership_context, live_stream.stream_index, cell, 0) &&
+                        live_stream.cell_pos(
+                            live_stream.membership_context, live_stream.stream_index, cell) >= seq0_fill) {
+                    saw_same_seq_higher = true;
+                }
+            }
+        }
+        if (!saw_same_seq_higher ||
+                live_stream.exact_dependency_count >= stored_stream.captured_dependency_count) {
+            fprintf(stderr, "row a: arm-3 did not prove same-seq higher-position rank shrink\n");
+            return 1;
+        }
+
+        vbr_generation_live_view live;
+        live.legacy_eligible = true;
+        live.controllers.push_back(view);
+        const auto result = checkpoint_vbr_eligibility(record, live);
+        if (result.category != vbr_checkpoint_eligibility_category::strict_reject ||
+                result.tombstone_class != vbr_expected_tombstone_class::swa_wrap) {
+            fprintf(stderr, "row a: arm-3 classified reason=%d tombstone=%d, expected only swa_wrap\n",
+                    (int) result.reason, (int) result.tombstone_class);
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "C2 GPU row (a) three-arm wrap/cross-seq/in-domain-swa PASS\n");
+    return 0;
+}
+
+static void c3_oracle_cover_cell(
+        vbr_checkpoint_generation_stream & stream,
+        uint32_t cell) {
+    const uint32_t page_index = cell / VBR_GENERATION_PAGE_CELLS;
+    auto it = std::lower_bound(
+            stream.pages.begin(), stream.pages.end(), page_index,
+            [](const vbr_generation_page_ref & page, uint32_t index) {
+                return page.page_index < index;
+            });
+    if (it == stream.pages.end() || it->page_index != page_index) {
+        vbr_generation_page_ref page;
+        page.page_index = page_index;
+        it = stream.pages.insert(it, page);
+    }
+    const uint32_t offset = cell % VBR_GENERATION_PAGE_CELLS;
+    it->covered_mask[offset / 64] |= uint64_t(1) << (offset % 64);
+}
+
+// Commit-3 finding-7 row: use a full-size SWA child so old, serializer-masked cells remain
+// physically occupied beside visible cells for the SAME sequence. The canonical observer's
+// independently scanned logical-position set must equal the real sequence serializer's set.
+// Deliberately adding one masked physical cell to the production covered mask must then be
+// caught as set_mismatch.
+static int c3_gpu_oracle_serializer_visibility_row(llama_model * model) {
+    const int32_t n_swa = llama_model_n_swa(model);
+    if (n_swa <= 0 || n_swa > 1728) {
+        fprintf(stderr, "C3 oracle visibility row: SKIP — model window %d outside fixture range\n",
+                n_swa);
+        return 0;
+    }
+
+    const llama_pos frontier = (llama_pos) n_swa + 32;
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, (uint32_t) frontier + 64, 64, 1, ctx, /*swa_full=*/true)) {
+        fprintf(stderr, "C3 oracle visibility row: context creation failed\n");
+        return 1;
+    }
+    llama_kv_cache * base = nullptr;
+    llama_kv_cache * swa  = nullptr;
+    if (!c2_gpu_children(llama_get_memory(ctx.get()), base, swa)) {
+        fprintf(stderr, "C3 oracle visibility row: armed iSWA children unavailable\n");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, frontier, 64)) {
+        fprintf(stderr, "C3 oracle visibility row: seed decode failed\n");
+        return 1;
+    }
+
+    std::vector<vbr_generation_oracle_cell> observations;
+    if (!swa->vbr_generation_oracle_observations(0, frontier, observations)) {
+        fprintf(stderr, "C3 oracle visibility row: canonical observation unavailable\n");
+        return 1;
+    }
+
+    vbr_checkpoint_generation_stream production;
+    production.stream_index         = 0;
+    production.dependency_seq_id    = 0;
+    production.computation_frontier = frontier;
+    uint32_t visible_count   = 0;
+    uint32_t masked_count    = 0;
+    uint32_t one_masked_cell = UINT32_MAX;
+    for (const auto & cell : observations) {
+        if (!cell.has_dependency_seq || cell.position < 0 || cell.position >= frontier) {
+            continue;
+        }
+        if (!cell.attention_visible) {
+            ++masked_count;
+            one_masked_cell = cell.physical_cell;
+            continue;
+        }
+        ++visible_count;
+        ++production.captured_dependency_count;
+        c3_oracle_cover_cell(production, cell.physical_cell);
+    }
+
+    std::vector<llama_pos> visible_positions;
+    visible_positions.reserve(visible_count);
+    for (const auto & cell : observations) {
+        if (cell.has_dependency_seq && cell.attention_visible &&
+                cell.position >= 0 && cell.position < frontier) {
+            visible_positions.push_back(cell.position);
+        }
+    }
+    std::vector<llama_pos> serializer_positions;
+    if (visible_count == 0 || masked_count == 0 || one_masked_cell == UINT32_MAX ||
+            !llama_kv_cache_vbr_epoch_test::serializer_positions(
+                    swa, 0, serializer_positions) ||
+            serializer_positions != visible_positions) {
+        fprintf(stderr,
+                "C3 oracle visibility row: fixture/serializer mismatch "
+                "(visible=%u masked=%u serialized=%zu)\n",
+                visible_count, masked_count, serializer_positions.size());
+        return 1;
+    }
+    const uint32_t serializer_count = (uint32_t) serializer_positions.size();
+
+    set_test_env("VBR_GENERATION_ORACLE", "1");
+    const auto baseline = vbr_generation_oracle_capture(frontier, observations);
+    auto audit = vbr_generation_oracle_audit(frontier, observations, baseline, production);
+    if (!audit.complete || !audit.set_equal || !audit.bytes_equal ||
+            audit.independent_count != serializer_count) {
+        fprintf(stderr,
+                "C3 oracle visibility row: independent set did not match serializer "
+                "(complete=%d set=%d bytes=%d independent=%u serialized=%u)\n",
+                (int) audit.complete, (int) audit.set_equal, (int) audit.bytes_equal,
+                audit.independent_count, serializer_count);
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+
+    c3_oracle_cover_cell(production, one_masked_cell);
+    ++production.captured_dependency_count;
+    audit = vbr_generation_oracle_audit(frontier, observations, baseline, production);
+    if (!audit.complete || audit.set_equal ||
+            audit.independent_count != serializer_count) {
+        fprintf(stderr,
+                "C3 oracle visibility row: masked-cell production inclusion escaped "
+                "set mismatch (complete=%d set=%d independent=%u)\n",
+                (int) audit.complete, (int) audit.set_equal, audit.independent_count);
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+
+    // Payload-complete children are outside the live-dependency set even when their attention
+    // cells are visible. This copy exercises the observer vocabulary directly; the production
+    // bridge enforces the same exclusion structurally by never invoking the observer for
+    // payload_complete children.
+    auto payload_complete = observations;
+    for (auto & cell : payload_complete) {
+        cell.payload_supplied = true;
+    }
+    const auto payload_baseline =
+            vbr_generation_oracle_capture(frontier, payload_complete);
+    unset_test_env("VBR_GENERATION_ORACLE");
+    if (!payload_baseline.complete || !payload_baseline.dependency_cells.empty()) {
+        fprintf(stderr, "C3 oracle visibility row: payload-complete cells became live dependencies\n");
+        return 1;
+    }
+
+    fprintf(stderr, "C3 oracle serializer-visibility/set-mismatch row PASS\n");
+    return 0;
+}
+
+// Commit-3 §6.2 bridge row: capture two real dependency cells with the disabled-only byte
+// sidecar enabled, append within the same page so strict evaluation refines, then audit the
+// independently observed set+bytes. The fault seam pins each closed outcome, and a handle
+// captured before enable proves late enable is unavailable rather than baseline fabrication.
+static int c3_gpu_oracle_bridge_row(llama_model * model) {
+    llama_context_ptr ctx;
+    if (!c2_gpu_context(model, 128, 32, 1, ctx)) {
+        fprintf(stderr, "C3 oracle row: context creation failed\n");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 0, 2, 2)) {
+        fprintf(stderr, "C3 oracle row: seed decode failed\n");
+        return 1;
+    }
+    auto mem = llama_get_memory(ctx.get());
+    vbr_checkpoint_capture_reason reason;
+
+    unset_test_env("VBR_GENERATION_ORACLE");
+    auto * no_sidecar = c2_bridge_capture(mem, 2, reason);
+    if (no_sidecar == nullptr) {
+        fprintf(stderr, "C3 oracle row: sidecar-less capture failed\n");
+        return 1;
+    }
+
+    set_test_env("VBR_GENERATION_ORACLE", "1");
+    auto * audited = c2_bridge_capture(mem, 2, reason);
+    if (audited == nullptr) {
+        fprintf(stderr, "C3 oracle row: audited capture failed (%s)\n",
+                llama_vbr_checkpoint_shadow_reason_name(reason));
+        llama_vbr_checkpoint_shadow_free(no_sidecar);
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+    if (!c2_gpu_decode_range(ctx.get(), 0, 2, 3, 1)) {
+        fprintf(stderr, "C3 oracle row: append refinement decode failed\n");
+        llama_vbr_checkpoint_shadow_free(no_sidecar);
+        llama_vbr_checkpoint_shadow_free(audited);
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+
+    set_test_env("VBR_GENERATION_FORCE_AUDIT", "1");
+    const auto frontier = c2_gpu_frontier(2);
+    auto evaluate = [&](llama_vbr_checkpoint_shadow * handle) {
+        llama_vbr_checkpoint_shadow_evaluation evaluation;
+        llama_vbr_checkpoint_shadow_evaluate(handle, mem, 0, &frontier, &evaluation);
+        return evaluation;
+    };
+    auto evaluation = evaluate(audited);
+    if (evaluation.evaluator_invocations != 1 || !evaluation.strict ||
+            !evaluation.refinement_used ||
+            evaluation.oracle_outcome != vbr_checkpoint_oracle_outcome::pass) {
+        fprintf(stderr, "C3 oracle row: real set+byte audit did not pass "
+                "(calls=%u strict=%d refine=%d outcome=%d)\n",
+                (unsigned) evaluation.evaluator_invocations, (int) evaluation.strict,
+                (int) evaluation.refinement_used, (int) evaluation.oracle_outcome);
+        llama_vbr_checkpoint_shadow_free(no_sidecar);
+        llama_vbr_checkpoint_shadow_free(audited);
+        unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+    for (const auto & fault : {
+            std::pair<const char *, vbr_checkpoint_oracle_outcome>{
+                "set", vbr_checkpoint_oracle_outcome::set_mismatch },
+            { "bytes", vbr_checkpoint_oracle_outcome::byte_mismatch },
+            { "unavailable", vbr_checkpoint_oracle_outcome::unavailable },
+         }) {
+        set_test_env("VBR_GENERATION_ORACLE_INJECT", fault.first);
+        evaluation = evaluate(audited);
+        if (evaluation.oracle_outcome != fault.second) {
+            fprintf(stderr, "C3 oracle row: injected %s produced outcome %d\n",
+                    fault.first, (int) evaluation.oracle_outcome);
+            llama_vbr_checkpoint_shadow_free(no_sidecar);
+            llama_vbr_checkpoint_shadow_free(audited);
+            unset_test_env("VBR_GENERATION_ORACLE_INJECT");
+            unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+            unset_test_env("VBR_GENERATION_ORACLE");
+            return 1;
+        }
+    }
+    unset_test_env("VBR_GENERATION_ORACLE_INJECT");
+    evaluation = evaluate(no_sidecar);
+    if (evaluation.evaluator_invocations != 1 || !evaluation.strict ||
+            evaluation.oracle_outcome != vbr_checkpoint_oracle_outcome::unavailable) {
+        fprintf(stderr, "C3 oracle row: late enable fabricated a baseline\n");
+        llama_vbr_checkpoint_shadow_free(no_sidecar);
+        llama_vbr_checkpoint_shadow_free(audited);
+        unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+        unset_test_env("VBR_GENERATION_ORACLE");
+        return 1;
+    }
+    llama_vbr_checkpoint_shadow_free(no_sidecar);
+    llama_vbr_checkpoint_shadow_free(audited);
+    unset_test_env("VBR_GENERATION_FORCE_AUDIT");
+    unset_test_env("VBR_GENERATION_ORACLE");
+    fprintf(stderr, "C3 oracle sidecar/real-byte/audit bridge row PASS\n");
     return 0;
 }
 
 static int run_c2_gpu_rows(llama_model * model) {
     if (c2_gpu_row_d(model) != 0 || c2_gpu_row_b(model) != 0 ||
             c2_gpu_row_c(model) != 0 || c2_gpu_row_e(model) != 0 ||
-            c2_gpu_row_a(model) != 0) {
+            c2_gpu_row_a(model) != 0 ||
+            c3_gpu_oracle_serializer_visibility_row(model) != 0 ||
+            c3_gpu_oracle_bridge_row(model) != 0) {
         return 1;
     }
     fprintf(stderr, "C2 GPU fixture rows (a)-(e) PASS\n");

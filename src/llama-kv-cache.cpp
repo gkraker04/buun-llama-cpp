@@ -3894,7 +3894,8 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     }
 
     const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+    if (tracker == nullptr || tracker->shadow_unavailable() ||
+            seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
             computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
         return false;
     }
@@ -3953,13 +3954,30 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
 // the production ownership index is a forbidden input here (the CI scan re-checks exactly this
 // region) — and must hold the same stable-read contract as ordinary capture: controller stable
 // before the scan and unchanged after it, else the observation is unavailable.
+bool llama_kv_cache::state_write_includes_cell(
+        const llama_kv_cells & cells,
+        uint32_t cell,
+        llama_seq_id seq_id) const {
+    if (cells.is_empty(cell) || (seq_id != -1 && !cells.seq_has(cell, seq_id))) {
+        return false;
+    }
+    if (seq_id == -1) {
+        return true;
+    }
+    return !llama_hparams::is_masked_swa(
+            n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
+}
+
 bool llama_kv_cache::vbr_generation_oracle_observations(
         llama_seq_id seq_id,
+        llama_pos computation_frontier,
         std::vector<vbr_generation_oracle_cell> & output) const {
     if (other != nullptr) {
-        return other->vbr_generation_oracle_observations(seq_id, output);
+        return other->vbr_generation_oracle_observations(
+                seq_id, computation_frontier, output);
     }
-    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || computation_frontier < 0 ||
+            static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
         return false;
     }
     const uint32_t stream = seq_to_stream[seq_id];
@@ -3967,11 +3985,32 @@ bool llama_kv_cache::vbr_generation_oracle_observations(
         return false;
     }
     const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || !tracker->stable()) {
+    if (tracker == nullptr || tracker->shadow_unavailable() || !tracker->stable()) {
         return false;
     }
     const uint64_t serial_at_scan_start = tracker->mutation_serial();
+    std::vector<uint64_t> unit_seq_at_scan_start;
+    unit_seq_at_scan_start.reserve(tracker->unit_count());
+    for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
+        const uint64_t seq = tracker->unit_generation(unit).publish_seq;
+        if ((seq & 1u) != 0) {
+            return false;
+        }
+        unit_seq_at_scan_start.push_back(seq);
+    }
+
     const auto & cells = v_cells[stream];
+    auto append_bytes = [](std::vector<uint8_t> & dst, const void * src, size_t size) {
+        const auto * first = static_cast<const uint8_t *>(src);
+        dst.insert(dst.end(), first, first + size);
+    };
+    auto append_tensor = [&](std::vector<uint8_t> & dst, const ggml_tensor * tensor,
+                             size_t offset, size_t size) {
+        const size_t old_size = dst.size();
+        dst.resize(old_size + size);
+        ggml_backend_tensor_get(tensor, dst.data() + old_size, offset, size);
+    };
+
     output.clear();
     output.reserve(cells.size());
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -3980,16 +4019,85 @@ bool llama_kv_cache::vbr_generation_oracle_observations(
         const bool empty = cells.is_empty(i);
         cell.position           = empty ? -1 : cells.pos_get(i);
         cell.has_dependency_seq = !empty && cells.seq_has(i, seq_id);
-        cell.attention_visible  = !empty;
+        // This is the exact sequence-serializer predicate, including SWA masking. The
+        // observer still discovers membership by a direct cell scan and never imports the
+        // ownership index or production covered-mask builder. Payload-complete children are
+        // excluded by collect_children(): only live_guarded children invoke this observer.
+        cell.attention_visible  = state_write_includes_cell(cells, i, seq_id);
+        if (cell.has_dependency_seq && cell.attention_visible && cell.position >= 0 &&
+                cell.position < computation_frontier) {
+            // Canonical byte order deliberately mirrors state_write_data for one physical
+            // cell: envelope, all K rows, then all V rows/elements. This reads the actual
+            // current-tier dependency bytes; no ownership index, generation mask, or cached
+            // manifest participates.
+            const uint32_t trans   = v_trans ? 1u : 0u;
+            const uint32_t n_layer = static_cast<uint32_t>(layers.size());
+            append_bytes(cell.dependency_bytes, &trans, sizeof(trans));
+            append_bytes(cell.dependency_bytes, &n_layer, sizeof(n_layer));
+            for (const auto & layer : layers) {
+                auto * k = layer.k_stream[stream];
+                const int32_t  type = static_cast<int32_t>(k->type);
+                const uint64_t row_size =
+                    ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
+                append_bytes(cell.dependency_bytes, &type, sizeof(type));
+                append_bytes(cell.dependency_bytes, &row_size, sizeof(row_size));
+                append_tensor(cell.dependency_bytes, k, size_t(i) * row_size, row_size);
+            }
+            if (!v_trans) {
+                for (const auto & layer : layers) {
+                    auto * v = layer.v_stream[stream];
+                    if (v == nullptr) {
+                        continue;
+                    }
+                    const int32_t  type = static_cast<int32_t>(v->type);
+                    const uint64_t row_size =
+                        ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
+                    append_bytes(cell.dependency_bytes, &type, sizeof(type));
+                    append_bytes(cell.dependency_bytes, &row_size, sizeof(row_size));
+                    append_tensor(cell.dependency_bytes, v, size_t(i) * row_size, row_size);
+                }
+            } else {
+                const uint32_t kv_size = cells.size();
+                for (const auto & layer : layers) {
+                    auto * v = layer.v_stream[stream];
+                    if (v == nullptr) {
+                        continue;
+                    }
+                    const int32_t  type   = static_cast<int32_t>(v->type);
+                    const uint32_t elsize = ggml_type_size(v->type);
+                    const uint32_t n_embd = hparams.n_embd_v_gqa(layer.il);
+                    append_bytes(cell.dependency_bytes, &type, sizeof(type));
+                    append_bytes(cell.dependency_bytes, &elsize, sizeof(elsize));
+                    append_bytes(cell.dependency_bytes, &n_embd, sizeof(n_embd));
+                    for (uint32_t j = 0; j < n_embd; ++j) {
+                        const size_t offset = (size_t(i) + size_t(j) * kv_size) * elsize;
+                        append_tensor(cell.dependency_bytes, v, offset, elsize);
+                    }
+                }
+            }
+        }
         output.push_back(cell);
     }
-    if (tracker->mutation_serial() != serial_at_scan_start || !tracker->stable()) {
+    bool units_stable = unit_seq_at_scan_start.size() == tracker->unit_count();
+    for (uint32_t unit = 0; units_stable && unit < tracker->unit_count(); ++unit) {
+        units_stable = tracker->unit_generation(unit).publish_seq == unit_seq_at_scan_start[unit];
+    }
+    if (!units_stable || tracker->shadow_unavailable() ||
+            tracker->mutation_serial() != serial_at_scan_start || !tracker->stable()) {
         output.clear();
         return false;
     }
     return true;
 }
 // VBR_GENERATION_ORACLE_OBSERVER_REGION_END
+
+bool llama_kv_cache::vbr_generation_shadow_globally_unavailable() const {
+    if (other != nullptr) {
+        return other->vbr_generation_shadow_globally_unavailable();
+    }
+    const auto * tracker = vbr_generation_tracker_get();
+    return tracker != nullptr && tracker->shadow_unavailable();
+}
 
 bool llama_kv_cache::vbr_generation_live_guarded_view(
         uint32_t child_id,
@@ -4002,7 +4110,8 @@ bool llama_kv_cache::vbr_generation_live_guarded_view(
     }
 
     const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+    if (tracker == nullptr || tracker->shadow_unavailable() ||
+            seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
             computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
         return false;
     }
@@ -7100,19 +7209,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         uint32_t cell_range_begin = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            bool add_cell = true;
-
-            add_cell = add_cell && !cells.is_empty(i);
-            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
-
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
-
-            if (add_cell) {
+            if (state_write_includes_cell(cells, i, seq_id)) {
                 ++cell_count;
                 if (cell_range_begin == cells.size()) {
                     cell_range_begin = i;

@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "common-checkpoint-shadow.h"
+#include "common-checkpoint-coordinator.h"
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
@@ -255,11 +256,70 @@ static inline bool prompt_save_durable(prompt_save_result r) {
     return r == prompt_save_result::published || r == prompt_save_result::already_durable;
 }
 
+// Commit-3 server-wide shadow qualification state (§8.3–8.5). Owned by server_context; slots
+// hold a const view for /slots emission only. Nothing here feeds shipped selection or either
+// live authority bit — pre-flip evidence only (the first G flip is A3), and the pending flip
+// below is stored state that no selector reads.
+struct server_shadow_global_state {
+    enum class applicability_state : uint8_t { unknown, applicable, not_applicable };
+    applicability_state applicability = applicability_state::unknown;
+
+    // §9.1–9.3 lifecycle counters (commit-2 vocabulary, unchanged semantics)
+    struct {
+        uint64_t capture_ok                              = 0;
+        uint64_t capture_failed                          = 0;
+        uint64_t qualification_reset                     = 0;
+        uint64_t distinct_but_legacy_dedup               = 0;
+        uint64_t duplicate_but_legacy_keep               = 0;
+        uint64_t refresh_ok                              = 0;
+        uint64_t refresh_refused                         = 0;
+        uint64_t refresh_nondeterministic_byte_mismatch  = 0;
+        uint64_t midlist_stale_no_refresh                = 0;
+    } counters;
+
+    // §8.5 versioned server-wide evidence; per-slot WS-4 evidence lives on server_slot
+    uint64_t authority_generation    = 0;
+    bool     pending_generation_flip = false;  // provably unable to change authority in A2
+    common_shadow_relation_evidence ws7_p;
+    common_shadow_relation_evidence ws7_f;
+    common_shadow_qualification_minima minima;  // production defaults: 1024 / 64 / 16
+
+    // top-level fault/availability observability (survives evidence resets)
+    uint64_t expected_unknown_total        = 0;
+    uint64_t shadow_unavailable_total      = 0;
+    uint64_t unexplained_disagreement_total = 0;
+    uint64_t coordinator_exceptions_total  = 0;
+
+    // class-keyed availability accounting (indexed by the closed tombstone enum)
+    std::array<uint64_t, 6> expected_tombstones = {};  // by common_checkpoint_shadow_tombstone
+    std::array<uint64_t, 6> lost_restores       = {};  // shipped restore whose G evaluation tombstoned
+    // §10.2 / verify r1 finding 8: replay-cost EVENTS caused by each strict tombstone class —
+    // the shipped-authority G axis paused on that tombstone this scan (event count, not tokens)
+    std::array<uint64_t, 6> extra_replay_events = {};
+
+    struct {
+        uint64_t set_pass    = 0;
+        uint64_t set_fail    = 0;
+        uint64_t hash_pass   = 0;
+        uint64_t hash_fail   = 0;
+        uint64_t unavailable = 0;
+    } oracle;
+
+    std::string last_outcome;
+    std::string last_reason;
+};
+
 struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+
+    // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
+    // (for /slots emission only)
+    common_shadow_relation_evidence shadow_ws4_l;
+    common_shadow_relation_evidence shadow_ws4_g;
+    const server_shadow_global_state * shadow_global = nullptr;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -606,6 +666,15 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // §8.5 / verify r1 finding 4: slot reuse clears that slot's WS-4 qualification
+        // evidence — a recycled slot must never inherit the prior request's streak/classes
+        {
+            const uint64_t gen =
+                shadow_global != nullptr ? shadow_global->authority_generation : 0;
+            shadow_ws4_l.reset(gen);
+            shadow_ws4_g.reset(gen);
+        }
     }
 
     void init_sampler() const {
@@ -1005,6 +1074,72 @@ struct server_slot {
             }},
         };
 
+        // Commit-3 §8.3–8.5 qualification surface (read-only diagnostics; the
+        // computation_frontier_ratchet.read_path above remains the ONLY reported live L-axis
+        // authority — no G read path exists in A2). Emitted only once the applicability latch
+        // proves an armed run, so unarmed servers keep a byte-identical /slots response.
+        if (shadow_global != nullptr &&
+            shadow_global->applicability ==
+                server_shadow_global_state::applicability_state::applicable) {
+            const auto relation_json = [](const common_shadow_relation_evidence & ev) {
+                return json {
+                    { "agreement_streak",     ev.agreement_streak },
+                    { "agreements_total",     ev.agreements_total },
+                    { "disagreements_total",  ev.disagreements_total },
+                    { "class_counts", json {
+                        { "trivial_append",   ev.class_counts[size_t(common_checkpoint_shadow_observation::trivial_append)] },
+                        { "boundary_refined", ev.class_counts[size_t(common_checkpoint_shadow_observation::boundary_refined)] },
+                        { "destructive",      ev.class_counts[size_t(common_checkpoint_shadow_observation::destructive)] },
+                        { "import_refined",   ev.class_counts[size_t(common_checkpoint_shadow_observation::import_refined)] },
+                    } },
+                    { "boundary_refinements", ev.boundary_refinements },
+                    { "qualified",            ev.qualified },
+                };
+            };
+            const auto tombstone_json = [](const std::array<uint64_t, 6> & counts) {
+                json out = json::object();
+                for (size_t i = 0; i < counts.size(); ++i) {
+                    if (counts[i] > 0) {
+                        out[common_checkpoint_shadow_tombstone_name(
+                            common_checkpoint_shadow_tombstone(i))] = counts[i];
+                    }
+                }
+                return out;
+            };
+            res["vbr_generation_shadow"] = json {
+                { "applicability",            "applicable" },
+                { "authority_generation",     shadow_global->authority_generation },
+                { "evidence_version",         COMMON_SHADOW_EVIDENCE_VERSION },
+                { "qualification_state",      shadow_global->pending_generation_flip
+                                                  ? "qualified_pending" : "accumulating" },
+                { "pending_generation_flip",  shadow_global->pending_generation_flip },
+                { "last_outcome",             shadow_global->last_outcome },
+                { "last_reason",              shadow_global->last_reason },
+                { "relations", json {
+                    { "ws4_l", relation_json(shadow_ws4_l) },
+                    { "ws4_g", relation_json(shadow_ws4_g) },
+                    { "ws7_p", relation_json(shadow_global->ws7_p) },
+                    { "ws7_f", relation_json(shadow_global->ws7_f) },
+                } },
+                { "qualification_resets_total",     shadow_global->counters.qualification_reset },
+                { "expected_unknown_total",         shadow_global->expected_unknown_total },
+                { "shadow_unavailable_total",       shadow_global->shadow_unavailable_total },
+                { "unexplained_disagreement_total", shadow_global->unexplained_disagreement_total },
+                { "coordinator_exceptions_total",   shadow_global->coordinator_exceptions_total },
+                { "expected_tombstones",            tombstone_json(shadow_global->expected_tombstones) },
+                { "lost_restores",                  tombstone_json(shadow_global->lost_restores) },
+                { "extra_replay",                   tombstone_json(shadow_global->extra_replay_events) },
+                { "oracle", json {
+                    { "set_pass",    shadow_global->oracle.set_pass },
+                    { "set_fail",    shadow_global->oracle.set_fail },
+                    { "hash_pass",   shadow_global->oracle.hash_pass },
+                    { "hash_fail",   shadow_global->oracle.hash_fail },
+                    { "unavailable", shadow_global->oracle.unavailable },
+                } },
+                { "midlist_stale_no_refresh_total", shadow_global->counters.midlist_stale_no_refresh },
+            };
+        }
+
         // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
         if (ctx_tgt != nullptr) {
             const double kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
@@ -1360,27 +1495,70 @@ private:
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
-    // §9.1–9.3 shadow lifecycle observability. Commit-2 scope: counters + SHADOW_LIFECYCLE log
-    // lines only; the /slots surface and the qualification consumer arrive with the commit-3
-    // coordinator (qualification_reset is COUNTED here, CONSUMED there [Q2]).
-    struct {
-        uint64_t capture_ok                              = 0;
-        uint64_t capture_failed                          = 0;
-        uint64_t qualification_reset                     = 0;
-        uint64_t distinct_but_legacy_dedup               = 0;
-        uint64_t duplicate_but_legacy_keep               = 0;
-        uint64_t refresh_ok                              = 0;
-        uint64_t refresh_refused                         = 0;
-        uint64_t refresh_nondeterministic_byte_mismatch  = 0;
-        uint64_t midlist_stale_no_refresh                = 0;
-    } shadow_counters;
+    // §9.1–9.3 + §8.3–8.5 shadow lifecycle/qualification state (commit 3): counters, the
+    // F5 applicability latch, versioned WS-7 evidence, and the /slots surface source.
+    server_shadow_global_state shadow_state;
 
-    // F5 (verify round): shadow applicability latched from capture OUTCOMES — `applicable`
-    // after any armed-path result (ok or an armed failure), `not_applicable` after an unarmed
-    // result. Restore-selection accounting keys on this, never on a particular record's
-    // completeness; truly unarmed runs stay at zero lifecycle lines.
-    enum class shadow_applicability_state : uint8_t { unknown, applicable, not_applicable };
-    shadow_applicability_state shadow_applicability = shadow_applicability_state::unknown;
+    // Q2 consumer (accepted ruling, worklog:6763-6769): producer-delivered, reason-coded reset
+    // with an authenticated closed scope. An ordinary capture failure resets server-wide WS-7
+    // evidence plus ONLY the capturing slot's WS-4 evidence; an authenticated global
+    // availability failure clears every slot. Never inferred from a generic reason, never
+    // touches the shipped WS-4 authority bit.
+    // Verify r1 finding 5: the pending flip is a joint certification, never a last-scanning-
+    // slot bit — server-wide WS-7 plus EVERY applicable slot's WS-4 evidence. The applicable-
+    // slot rule: a slot is applicable once it has any WS-4 observation (agreement or
+    // disagreement); slots that never scanned do not veto, but at least one applicable slot
+    // must exist.
+    void shadow_recompute_pending_flip() {
+        bool pending        = shadow_state.ws7_p.qualified && shadow_state.ws7_f.qualified;
+        bool any_applicable = false;
+        for (const auto & s : slots) {
+            const bool observed =
+                s.shadow_ws4_l.agreements_total + s.shadow_ws4_l.disagreements_total +
+                s.shadow_ws4_g.agreements_total + s.shadow_ws4_g.disagreements_total > 0;
+            if (!observed) {
+                continue;
+            }
+            any_applicable = true;
+            pending = pending && s.shadow_ws4_l.qualified && s.shadow_ws4_g.qualified;
+        }
+        shadow_state.pending_generation_flip = pending && any_applicable;
+    }
+
+    void shadow_apply_qualification_reset(
+            server_slot *                   capturing,
+            common_checkpoint_reset_scope   scope,
+            common_checkpoint_shadow_reason reason) {
+        const uint64_t gen = shadow_state.authority_generation;
+        switch (scope) {
+            case common_checkpoint_reset_scope::none:
+                return;
+            case common_checkpoint_reset_scope::capturing_slot:
+                shadow_state.ws7_p.reset(gen);
+                shadow_state.ws7_f.reset(gen);
+                if (capturing != nullptr) {
+                    capturing->shadow_ws4_l.reset(gen);
+                    capturing->shadow_ws4_g.reset(gen);
+                }
+                break;
+            case common_checkpoint_reset_scope::global:
+                shadow_state.ws7_p.reset(gen);
+                shadow_state.ws7_f.reset(gen);
+                for (auto & s : slots) {
+                    s.shadow_ws4_l.reset(gen);
+                    s.shadow_ws4_g.reset(gen);
+                }
+                break;
+        }
+        // verify r1 finding 9: the reset consumer owns the Q2 counter — every delivered
+        // non-none reset increments exactly once, whatever the producer site
+        shadow_state.counters.qualification_reset++;
+        shadow_recompute_pending_flip();
+        SRV_WRN("SHADOW_LIFECYCLE event=qualification_reset scope=%s reason=%s total=%" PRIu64 "\n",
+                common_checkpoint_reset_scope_name(scope),
+                common_checkpoint_shadow_reason_name(reason),
+                shadow_state.counters.qualification_reset);
+    }
 
     // §9.1 shadow capture with owned failure accounting. Never throws and never touches legacy
     // checkpoint state; failure leaves the shadow null (generation unknown by representation).
@@ -1390,32 +1568,41 @@ private:
             common_prompt_checkpoint &          ckpt,
             const common_computation_frontier & frontier) {
         auto reason = common_checkpoint_shadow_reason::internal_error;
+        auto scope  = common_checkpoint_reset_scope::capturing_slot;
         try {
-            reason = common_checkpoint_shadow_capture(ckpt, ctx_tgt, slot.id, frontier);
+            reason = common_checkpoint_shadow_capture_scoped(ckpt, ctx_tgt, slot.id, frontier, scope);
         } catch (...) {
             reason = common_checkpoint_shadow_reason::internal_error;
+            scope  = common_checkpoint_reset_scope::capturing_slot;
         }
+        // F5: applicability latched from capture OUTCOMES — `applicable` after any armed-path
+        // result, `not_applicable` after an unarmed result; truly unarmed runs stay silent.
         switch (reason) {
             case common_checkpoint_shadow_reason::not_applicable:
-                shadow_applicability = shadow_applicability_state::not_applicable;
+                shadow_state.applicability = server_shadow_global_state::applicability_state::not_applicable;
                 break;
             case common_checkpoint_shadow_reason::ok:
             case common_checkpoint_shadow_reason::unarmed_live_covered:
             case common_checkpoint_shadow_reason::child_capture_failed:
             case common_checkpoint_shadow_reason::oracle_mismatch:
-                shadow_applicability = shadow_applicability_state::applicable;
+            case common_checkpoint_shadow_reason::controller_unavailable:
+                shadow_state.applicability = server_shadow_global_state::applicability_state::applicable;
                 break;
             default:
                 break;  // invalid_arguments/internal_error prove nothing about armed-ness
         }
         if (reason != common_checkpoint_shadow_reason::ok &&
             reason != common_checkpoint_shadow_reason::not_applicable) {
-            shadow_counters.capture_failed++;
-            shadow_counters.qualification_reset++;  // Q2: counted here, consumed by commit 3
+            shadow_state.counters.capture_failed++;
+            if (reason == common_checkpoint_shadow_reason::controller_unavailable) {
+                shadow_state.shadow_unavailable_total++;
+            }
             SLT_WRN(slot,
-                    "SHADOW_LIFECYCLE event=capture_failed reason=%s total_failed=%" PRIu64 "\n",
+                    "SHADOW_LIFECYCLE event=capture_failed reason=%s scope=%s total_failed=%" PRIu64 "\n",
                     common_checkpoint_shadow_reason_name(reason),
-                    shadow_counters.capture_failed);
+                    common_checkpoint_reset_scope_name(scope),
+                    shadow_state.counters.capture_failed);
+            shadow_apply_qualification_reset(&slot, scope, reason);
         }
         return reason;
     }
@@ -1486,31 +1673,31 @@ private:
                 }
                 if (post_reason == common_checkpoint_shadow_reason::ok) {
                     common_checkpoint_shadow_adopt(last, post_proof);
-                    shadow_counters.refresh_ok++;
+                    shadow_state.counters.refresh_ok++;
                     SLT_INF(slot, "SHADOW_LIFECYCLE event=refresh_ok total=%" PRIu64 "\n",
-                            shadow_counters.refresh_ok);
+                            shadow_state.counters.refresh_ok);
                 } else {
-                    shadow_counters.refresh_refused++;
+                    shadow_state.counters.refresh_refused++;
                     SLT_WRN(slot,
                             "SHADOW_LIFECYCLE event=refresh_refused "
                             "reason=post_proof_capture_unavailable total=%" PRIu64 "\n",
-                            shadow_counters.refresh_refused);
+                            shadow_state.counters.refresh_refused);
                 }
             } else if (verdict == common_checkpoint_refresh_verdict::refused_byte_mismatch) {
-                shadow_counters.refresh_nondeterministic_byte_mismatch++;
+                shadow_state.counters.refresh_nondeterministic_byte_mismatch++;
                 SLT_WRN(slot,
                         "SHADOW_LIFECYCLE event=refresh_refused "
                         "reason=shadow_refresh_nondeterministic_byte_mismatch total=%" PRIu64 "\n",
-                        shadow_counters.refresh_nondeterministic_byte_mismatch);
+                        shadow_state.counters.refresh_nondeterministic_byte_mismatch);
             } else {
-                shadow_counters.refresh_refused++;
+                shadow_state.counters.refresh_refused++;
                 SLT_WRN(slot,
                         "SHADOW_LIFECYCLE event=refresh_refused "
                         "reason=cannot_reproduce total=%" PRIu64 "\n",
-                        shadow_counters.refresh_refused);
+                        shadow_state.counters.refresh_refused);
             }
         } catch (...) {
-            shadow_counters.refresh_refused++;
+            shadow_state.counters.refresh_refused++;
             SLT_WRN(slot, "%s", "SHADOW_LIFECYCLE event=refresh_refused reason=internal_error\n");
         }
     }
@@ -2555,6 +2742,7 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
+            slot.shadow_global = &shadow_state;
             slot.ctx_dft = ctx_dft.get();
             slot.n_ctx   = n_ctx_slot;
             slot.frontier_ratchet_min_agreements =
@@ -2591,6 +2779,10 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // verify r2 finding 1: release-time reset() just cleared this slot's WS-4
+                // evidence (it runs before this callback) — the joint pending flip must be
+                // recomputed or a released sole-applicable slot leaves it stale-true
+                shadow_recompute_pending_flip();
             };
 
             slot.reset();
@@ -5523,22 +5715,315 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
                                     bool vbr_preflight_rejected = false;
 
-                                    // §9.3 mid-list availability accounting [F8]: refresh exists
-                                    // only at the back-adoption site, so a selected mid-list
-                                    // checkpoint with a MISSING record is counted (subreason
-                                    // midlist_record_absent) — staleness is never inferred from
-                                    // record inequality; evaluator-proven staleness lands with
-                                    // the commit-3 selection evaluator. Gated on the capture-
-                                    // outcome applicability latch so unarmed runs stay at zero
-                                    // shadow lines without inferring from any one record.
+                                    // ---- commit-3 pre-flip qualification coordinator (§8.3–8.5).
+                                    // Shadow-only: the shipped selection above is final before this
+                                    // block runs, and a coordinator exception is isolated to a scoped
+                                    // evidence reset — it never changes the selector decision. Gated
+                                    // on the capture-outcome applicability latch so unarmed runs do
+                                    // zero generation work (settled-regime inertness, Pin 12).
+                                    // Memoized bridge evaluations (reverse-list index -> evaluation)
+                                    // keep the sole evaluator at ONE invocation per checkpoint per
+                                    // scan, shared with the mid-list consumer below.
+                                    std::vector<std::pair<bool, common_checkpoint_shadow_evaluation>>
+                                        scan_evals;
+                                    const bool shadow_scan_applicable =
+                                        shadow_state.applicability ==
+                                        server_shadow_global_state::applicability_state::applicable;
+                                    const auto scan_eval_at = [&](size_t i)
+                                            -> const common_checkpoint_shadow_evaluation & {
+                                        auto & slot_pair = scan_evals[i];
+                                        if (!slot_pair.first) {
+                                            slot_pair.first = true;
+                                            const auto & cur = *std::next(
+                                                slot.prompt.checkpoints.rbegin(), (int64_t) i);
+                                            slot_pair.second = common_checkpoint_shadow_evaluate(
+                                                cur, ctx_tgt, slot.id, cur.computation_frontier);
+                                        }
+                                        return slot_pair.second;
+                                    };
+                                    if (shadow_scan_applicable) {
+                                        try {
+                                            const bool recurrent =
+                                                llama_model_is_recurrent(model_tgt) ||
+                                                llama_model_is_hybrid(model_tgt);
+                                            scan_evals.assign(slot.prompt.checkpoints.size(), {});
+                                            // One immutable snapshot of the reverse list. The
+                                            // positional predicates and legacy validity mirror the
+                                            // shipped selectors above WITHOUT logging; the drift
+                                            // check below catches any divergence as a coordinator
+                                            // exception rather than trusting the replica.
+                                            std::vector<common_shadow_candidate_row> rows;
+                                            rows.reserve(slot.prompt.checkpoints.size());
+                                            for (auto rit = slot.prompt.checkpoints.rbegin();
+                                                 rit != slot.prompt.checkpoints.rend(); ++rit) {
+                                                const auto & cur = *rit;
+                                                common_shadow_candidate_row row;
+                                                const bool nonempty = !cur.empty();
+                                                if (recurrent) {
+                                                    row.p_pos = nonempty && cur.pos_max < pos_next;
+                                                    row.l_valid = nonempty &&
+                                                        cur.representation_epoch ==
+                                                            vbr_now.representation_epoch &&
+                                                        cur.representation_epoch_swa ==
+                                                            vbr_now.representation_epoch_swa;
+                                                } else {
+                                                    row.p_pos = nonempty && cur.pos_max <= pos_next &&
+                                                        (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                                                    row.l_valid = nonempty;
+                                                }
+                                                bool f_pos = nonempty &&
+                                                    checkpoint_frontier_is_current(
+                                                        slot, cur, frontier_adapter_identity);
+                                                if (f_pos && slot.frontier_ratchet_flipped &&
+                                                    server_fault("frontier_disagree_after_flip")) {
+                                                    f_pos = false;
+                                                }
+                                                if (f_pos) {
+                                                    f_pos = recurrent
+                                                        ? cur.computation_frontier.next_position <= pos_next
+                                                        : cur.computation_frontier.next_position - 1 <= pos_next &&
+                                                          (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                                                }
+                                                row.f_pos      = f_pos;
+                                                row.has_record = common_checkpoint_shadow_complete(cur);
+                                                rows.push_back(row);
+                                            }
+
+                                            auto candidates = common_shadow_compute_candidates(
+                                                rows, [&](size_t i) { return scan_eval_at(i); });
+                                            // verify r1 finding 3: the shipped WS-4 ratchet only
+                                            // counts eligible frontier observations; transport
+                                            // that side condition instead of inferring it from an
+                                            // absent candidate
+                                            if (!frontier_eligible) {
+                                                candidates.f_l.observed  = false;
+                                                candidates.f_l.candidate = -1;
+                                            }
+
+                                            if (candidates.p_l.candidate != legacy_choice ||
+                                                candidates.f_l.candidate != frontier_choice) {
+                                                // replica drifted from the shipped selectors: a
+                                                // coordinator-integrity failure — authenticated
+                                                // GLOBAL reset (verify r1 finding 9), shipped
+                                                // decision untouched
+                                                shadow_state.coordinator_exceptions_total++;
+                                                shadow_apply_qualification_reset(
+                                                    &slot, common_checkpoint_reset_scope::global,
+                                                    common_checkpoint_shadow_reason::internal_error);
+                                                SLT_WRN(slot,
+                                                        "SHADOW_LIFECYCLE event=coordinator_exception "
+                                                        "subreason=selector_replica_drift "
+                                                        "p_l=%" PRId64 "/%" PRId64 " f_l=%" PRId64 "/%" PRId64 "\n",
+                                                        candidates.p_l.candidate, legacy_choice,
+                                                        candidates.f_l.candidate, frontier_choice);
+                                            } else {
+                                                // verify r1 finding 6: relation-LOCAL observation
+                                                // classes — each relation is credited only with
+                                                // the evaluation that establishes its agreement
+                                                const auto obs_of_row = [&](int64_t row_idx)
+                                                        -> common_shadow_relation_observation {
+                                                    if (row_idx < 0 ||
+                                                        size_t(row_idx) >= scan_evals.size() ||
+                                                        !scan_evals[size_t(row_idx)].first ||
+                                                        !scan_evals[size_t(row_idx)].second.evaluated) {
+                                                        return {};
+                                                    }
+                                                    const auto & e = scan_evals[size_t(row_idx)].second;
+                                                    return { e.observation_class,
+                                                             e.refinement_used &&
+                                                                 e.observation_class ==
+                                                                     common_checkpoint_shadow_observation::boundary_refined };
+                                                };
+                                                std::array<common_shadow_relation_observation, 4> rel_obs;
+                                                rel_obs[2] = obs_of_row(candidates.p_g.verdict_row);  // ws7_p <- P/G
+                                                rel_obs[3] = obs_of_row(candidates.f_g.verdict_row);  // ws7_f <- F/G
+                                                if (candidates.p_g.candidate >= 0 &&
+                                                    candidates.p_g.candidate == candidates.f_g.candidate) {
+                                                    // ws4_g: the shared agreed row's evaluation
+                                                    rel_obs[1] = obs_of_row(candidates.p_g.candidate);
+                                                }
+                                                if (candidates.p_l.candidate >= 0 &&
+                                                    candidates.p_l.candidate == candidates.f_l.candidate) {
+                                                    // ws4_l (conservative): the agreed L row's
+                                                    // evaluation when one happened this scan,
+                                                    // else trivial_append = no class credit
+                                                    rel_obs[0] = obs_of_row(candidates.p_l.candidate);
+                                                }
+                                                // fault/availability accounting from the axis verdicts
+                                                for (const auto * axis : { &candidates.p_g, &candidates.f_g }) {
+                                                    switch (axis->verdict) {
+                                                        case common_shadow_g_verdict::unexplained:
+                                                            shadow_state.unexplained_disagreement_total++;
+                                                            break;
+                                                        case common_shadow_g_verdict::expected_unknown:
+                                                            if (axis->paused) {
+                                                                shadow_state.expected_unknown_total++;
+                                                            }
+                                                            break;
+                                                        case common_shadow_g_verdict::expected_tombstone: {
+                                                            const auto & pair =
+                                                                scan_evals[size_t(axis->verdict_row)];
+                                                            shadow_state.expected_tombstones[size_t(
+                                                                pair.second.tombstone_class)]++;
+                                                            break;
+                                                        }
+                                                        default:
+                                                            break;
+                                                    }
+                                                }
+                                                // closed oracle outcome accounting (server owns the
+                                                // durable counters; src supplies outcomes only [A6])
+                                                for (size_t i = 0; i < scan_evals.size(); ++i) {
+                                                    if (!scan_evals[i].first || !scan_evals[i].second.evaluated) {
+                                                        continue;
+                                                    }
+                                                    switch (scan_evals[i].second.oracle_outcome) {
+                                                        case common_checkpoint_oracle_outcome::pass:
+                                                            shadow_state.oracle.set_pass++;
+                                                            shadow_state.oracle.hash_pass++;
+                                                            break;
+                                                        case common_checkpoint_oracle_outcome::set_mismatch:
+                                                            shadow_state.oracle.set_fail++;
+                                                            break;
+                                                        case common_checkpoint_oracle_outcome::byte_mismatch:
+                                                            shadow_state.oracle.hash_fail++;
+                                                            break;
+                                                        case common_checkpoint_oracle_outcome::set_and_byte_mismatch:
+                                                            shadow_state.oracle.set_fail++;
+                                                            shadow_state.oracle.hash_fail++;
+                                                            break;
+                                                        case common_checkpoint_oracle_outcome::unavailable:
+                                                            shadow_state.oracle.unavailable++;
+                                                            break;
+                                                        default:
+                                                            break;
+                                                    }
+                                                }
+                                                // §8.3 lost-restore accounting: the shipped restore
+                                                // proceeds on L authority while its own G evaluation
+                                                // tombstoned
+                                                const int64_t shipped_choice =
+                                                    use_frontier ? frontier_choice : legacy_choice;
+                                                if (shipped_choice >= 0 &&
+                                                    size_t(shipped_choice) < scan_evals.size() &&
+                                                    scan_evals[size_t(shipped_choice)].first) {
+                                                    const auto & sel = scan_evals[size_t(shipped_choice)].second;
+                                                    // verify r2 finding 2: only the four NAMED
+                                                    // §5.5 classes count — the closed classifier
+                                                    // is the one authority on what a tombstone is
+                                                    if (sel.evaluated &&
+                                                        common_shadow_classify_evaluation(sel) ==
+                                                            common_shadow_g_verdict::expected_tombstone) {
+                                                        shadow_state.lost_restores[size_t(sel.tombstone_class)]++;
+                                                    }
+                                                }
+                                                // §10.2 extra-replay events (verify r1 finding 8):
+                                                // the G axis corresponding to the SHIPPED P/F
+                                                // authority paused on a strict tombstone — the
+                                                // restore G would have lost, keyed by tombstone
+                                                // class (event count, not tokens)
+                                                const auto & shipped_axis =
+                                                    use_frontier ? candidates.f_g : candidates.p_g;
+                                                if (shipped_axis.verdict ==
+                                                        common_shadow_g_verdict::expected_tombstone &&
+                                                    shipped_axis.verdict_row >= 0) {
+                                                    const auto & pair =
+                                                        scan_evals[size_t(shipped_axis.verdict_row)];
+                                                    shadow_state.extra_replay_events[size_t(
+                                                        pair.second.tombstone_class)]++;
+                                                }
+
+                                                std::array<common_shadow_relation_evidence *, 4> evidence = {
+                                                    &slot.shadow_ws4_l, &slot.shadow_ws4_g,
+                                                    &shadow_state.ws7_p, &shadow_state.ws7_f,
+                                                };
+                                                const auto scan_outcome = common_shadow_apply_scan(
+                                                    evidence, candidates, rel_obs,
+                                                    shadow_state.authority_generation,
+                                                    shadow_state.minima);
+                                                shadow_recompute_pending_flip();
+                                                shadow_state.last_outcome =
+                                                    common_shadow_g_verdict_name(candidates.f_g.verdict);
+                                                shadow_state.last_reason =
+                                                    candidates.f_g.verdict_row >= 0 &&
+                                                            scan_evals[size_t(candidates.f_g.verdict_row)].first
+                                                        ? common_checkpoint_shadow_eval_reason_name(
+                                                              scan_evals[size_t(candidates.f_g.verdict_row)]
+                                                                  .second.reason)
+                                                        : "none";
+                                                SLT_INF(slot,
+                                                        "SHADOW_LIFECYCLE event=qualification_scan "
+                                                        "ws4_l=%s ws4_g=%s ws7_p=%s ws7_f=%s "
+                                                        "g_evals=%u qualified_pending=%d\n",
+                                                        common_shadow_disposition_name(scan_outcome.disposition[0]),
+                                                        common_shadow_disposition_name(scan_outcome.disposition[1]),
+                                                        common_shadow_disposition_name(scan_outcome.disposition[2]),
+                                                        common_shadow_disposition_name(scan_outcome.disposition[3]),
+                                                        candidates.g_evaluations,
+                                                        shadow_state.pending_generation_flip ? 1 : 0);
+                                            }
+                                        } catch (const std::exception & e) {
+                                            // Pin 8: coordinator exception isolation — scoped reset,
+                                            // shipped selector decision unchanged.
+                                            shadow_state.coordinator_exceptions_total++;
+                                            shadow_apply_qualification_reset(
+                                                &slot, common_checkpoint_reset_scope::global,
+                                                common_checkpoint_shadow_reason::internal_error);
+                                            SLT_WRN(slot,
+                                                    "SHADOW_LIFECYCLE event=coordinator_exception "
+                                                    "subreason=scan_exception error=%s\n",
+                                                    e.what());
+                                        }
+                                    }
+
+                                    // §9.3 mid-list availability accounting [F8] + commit-3
+                                    // evaluator-proven staleness: refresh exists only at the
+                                    // back-adoption site, so a selected mid-list checkpoint is
+                                    // accounted here. A MISSING record keeps the commit-2 fallback
+                                    // (subreason midlist_record_absent); a PRESENT record uses the
+                                    // closed evaluator result — staleness is proven, never inferred
+                                    // from record inequality. Shares the scan memo above so the sole
+                                    // evaluator still runs at most once per checkpoint.
                                     if (!do_reset && it != slot.prompt.checkpoints.rbegin() &&
-                                        shadow_applicability == shadow_applicability_state::applicable &&
-                                        !common_checkpoint_shadow_complete(*it)) {
-                                        shadow_counters.midlist_stale_no_refresh++;
-                                        SLT_INF(slot,
-                                                "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
-                                                "subreason=midlist_record_absent total=%" PRIu64 "\n",
-                                                shadow_counters.midlist_stale_no_refresh);
+                                        shadow_scan_applicable) {
+                                        if (!common_checkpoint_shadow_complete(*it)) {
+                                            shadow_state.counters.midlist_stale_no_refresh++;
+                                            SLT_INF(slot,
+                                                    "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
+                                                    "subreason=midlist_record_absent total=%" PRIu64 "\n",
+                                                    shadow_state.counters.midlist_stale_no_refresh);
+                                        } else {
+                                            const auto midlist_index = (size_t) std::distance(
+                                                slot.prompt.checkpoints.rbegin(), it);
+                                            common_checkpoint_shadow_evaluation evaluation;
+                                            try {
+                                                if (scan_evals.size() == slot.prompt.checkpoints.size()) {
+                                                    evaluation = scan_eval_at(midlist_index);
+                                                }
+                                            } catch (...) {
+                                                evaluation = {};
+                                            }
+                                            if (!evaluation.evaluated) {
+                                                shadow_state.counters.midlist_stale_no_refresh++;
+                                                SLT_INF(slot,
+                                                        "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
+                                                        "subreason=midlist_not_evaluable reason=%s "
+                                                        "total=%" PRIu64 "\n",
+                                                        common_checkpoint_shadow_eval_reason_name(evaluation.reason),
+                                                        shadow_state.counters.midlist_stale_no_refresh);
+                                            } else if (evaluation.category ==
+                                                       common_checkpoint_shadow_category::strict_reject) {
+                                                shadow_state.counters.midlist_stale_no_refresh++;
+                                                SLT_INF(slot,
+                                                        "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
+                                                        "subreason=midlist_evaluator_stale reason=%s "
+                                                        "tombstone=%s total=%" PRIu64 "\n",
+                                                        common_checkpoint_shadow_eval_reason_name(evaluation.reason),
+                                                        common_checkpoint_shadow_tombstone_name(evaluation.tombstone_class),
+                                                        shadow_state.counters.midlist_stale_no_refresh);
+                                            }
+                                            // strict accept / live_rebased: proven fresh, no counter
+                                        }
                                     }
 
                                     if (!do_reset) {
@@ -6178,10 +6663,10 @@ private:
                                     !common_checkpoint_shadow_equal(fresh, last)) {
                                     // fresh is complete; retained is absent/unknown or unequal
                                     // (records agreeing is the serialization-free fast path)
-                                    shadow_counters.distinct_but_legacy_dedup++;
+                                    shadow_state.counters.distinct_but_legacy_dedup++;
                                     SLT_INF(slot,
                                             "SHADOW_LIFECYCLE event=shadow_distinct_but_legacy_dedup total=%" PRIu64 "\n",
-                                            shadow_counters.distinct_but_legacy_dedup);
+                                            shadow_state.counters.distinct_but_legacy_dedup);
                                     shadow_try_refresh(slot, last, ckpt_frontier);
                                 }
                             }
@@ -6251,20 +6736,20 @@ private:
                         auto & next = staged.back();
                         if (shadow_try_capture(slot, next, ckpt_frontier) ==
                                 common_checkpoint_shadow_reason::ok) {
-                            shadow_counters.capture_ok++;
+                            shadow_state.counters.capture_ok++;
                             SLT_INF(slot,
                                     "SHADOW_LIFECYCLE event=capture_ok n_tokens=%" PRId64
                                     " total_ok=%" PRIu64 "\n",
-                                    ckpt_n_tokens, shadow_counters.capture_ok);
+                                    ckpt_n_tokens, shadow_state.counters.capture_ok);
                             // §9.2: legacy decided to KEEP a new checkpoint whose record a
                             // complete retained back() proves equal (dedup condition was
                             // false). Metadata compare only; no legacy decision changes.
                             if (!slot.prompt.checkpoints.empty() &&
                                 common_checkpoint_shadow_equal(next, slot.prompt.checkpoints.back())) {
-                                shadow_counters.duplicate_but_legacy_keep++;
+                                shadow_state.counters.duplicate_but_legacy_keep++;
                                 SLT_INF(slot,
                                         "SHADOW_LIFECYCLE event=shadow_duplicate_but_legacy_keep total=%" PRIu64 "\n",
-                                        shadow_counters.duplicate_but_legacy_keep);
+                                        shadow_state.counters.duplicate_but_legacy_keep);
                             }
                         }
                     }

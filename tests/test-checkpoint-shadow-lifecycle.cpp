@@ -1,11 +1,13 @@
 #include "common.h"
 #include "common-checkpoint-shadow.h"
+#include "common-checkpoint-coordinator.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-vbr-checkpoint.h"
 #include "llama-vbr-checkpoint-compose.inc"
 #include "llama-vbr-generation.h"
+#include "llama-vbr-generation-oracle.h"
 #include "llama-vbr-generation-types.h"
 #include "llama-vbr-operation.h"
 
@@ -23,13 +25,14 @@
 // src/llama-vbr-checkpoint.cpp token-identically; CI compares the two definitions.
 struct llama_vbr_checkpoint_shadow {
     vbr_checkpoint_generation_record record;
+    std::vector<vbr_checkpoint_oracle_sidecar_entry> oracle_sidecar;
 };
 
 // Test seam into the one common holder bridge TU (defined in common-checkpoint-shadow.cpp).
 void common_checkpoint_shadow_attach(common_prompt_checkpoint & ckpt, llama_vbr_checkpoint_shadow * handle);
 
 static llama_vbr_checkpoint_shadow * make_handle(vbr_checkpoint_generation_record record) {
-    return new llama_vbr_checkpoint_shadow{ std::move(record) };
+    return new llama_vbr_checkpoint_shadow{ std::move(record), {} };
 }
 
 static vbr_checkpoint_generation_record make_complete_record() {
@@ -306,12 +309,357 @@ static bool run_refresh_proof_tests() {
     return true;
 }
 
+// ---- commit-3 §8.3–8.5 coordinator rows (pure common logic; no bridge, no model) ----
+
+static common_checkpoint_shadow_evaluation coord_eval(
+        common_checkpoint_shadow_category  category,
+        common_checkpoint_shadow_tombstone tombstone = common_checkpoint_shadow_tombstone::none,
+        common_checkpoint_oracle_outcome   oracle    = common_checkpoint_oracle_outcome::disabled) {
+    common_checkpoint_shadow_evaluation e;
+    e.evaluated       = true;
+    e.category        = category;
+    e.strict          = category == common_checkpoint_shadow_category::strict_accept;
+    e.tombstone_class = tombstone;
+    e.oracle_outcome  = oracle;
+    return e;
+}
+
+static bool run_coordinator_candidate_tests() {
+    using row = common_shadow_candidate_row;
+
+    // asymmetric matrix: newest row (0) satisfies only F, row 1 satisfies only P; row 0 has a
+    // strict record, row 1 has a strict record too — all four candidates land distinctly and
+    // the sole evaluator runs at most once per row
+    {
+        std::vector<row> rows = {
+            { /*p_pos=*/false, /*f_pos=*/true,  /*l_valid=*/true, /*has_record=*/true },
+            { /*p_pos=*/true,  /*f_pos=*/false, /*l_valid=*/true, /*has_record=*/true },
+        };
+        std::vector<int> calls(rows.size(), 0);
+        const auto candidates = common_shadow_compute_candidates(rows, [&](size_t i) {
+            calls[i]++;
+            return coord_eval(common_checkpoint_shadow_category::strict_accept);
+        });
+        if (candidates.p_l.candidate != 1 || candidates.f_l.candidate != 0 ||
+                candidates.p_g.candidate != 1 || candidates.f_g.candidate != 0 ||
+                candidates.g_evaluations != 2 || calls[0] != 1 || calls[1] != 1) {
+            fprintf(stderr, "coordinator: asymmetric four-candidate matrix failed\n");
+            return false;
+        }
+    }
+
+    // expected tombstone at the FIRST eligible row pauses the axis — it never falls through to
+    // the older strict row (that would mint a fake agreement)
+    {
+        std::vector<row> rows = {
+            { true, true, true, true },   // tombstoned
+            { true, true, true, true },   // strict, must NOT be reached
+        };
+        std::vector<int> calls(rows.size(), 0);
+        const auto candidates = common_shadow_compute_candidates(rows, [&](size_t i) {
+            calls[i]++;
+            return i == 0 ? coord_eval(common_checkpoint_shadow_category::strict_reject,
+                                       common_checkpoint_shadow_tombstone::swa_wrap)
+                          : coord_eval(common_checkpoint_shadow_category::strict_accept);
+        });
+        if (!candidates.p_g.paused || !candidates.f_g.paused ||
+                candidates.p_g.candidate != -1 || calls[1] != 0 ||
+                candidates.p_g.verdict != common_shadow_g_verdict::expected_tombstone) {
+            fprintf(stderr, "coordinator: tombstone did not pause without fall-through\n");
+            return false;
+        }
+    }
+
+    // a missing record at the first eligible row pauses as expected_unknown WITHOUT invoking
+    // the evaluator at all
+    {
+        std::vector<row> rows = { { true, true, true, /*has_record=*/false } };
+        const auto candidates = common_shadow_compute_candidates(rows, [&](size_t) {
+            fprintf(stderr, "coordinator: evaluator invoked for a record-less row\n");
+            return coord_eval(common_checkpoint_shadow_category::strict_accept);
+        });
+        if (!candidates.p_g.paused || candidates.g_evaluations != 0 ||
+                candidates.p_g.verdict != common_shadow_g_verdict::expected_unknown) {
+            fprintf(stderr, "coordinator: record-less row was not an unknown pause\n");
+            return false;
+        }
+    }
+
+    // classification mapping (verify r1 findings 1+2): the closed category+reason+tombstone
+    // table — only the four named §5.5 classes are expected tombstones; strict rejects with
+    // tombstone none (identity, generation drift...) are unexplained; pinned transient reasons
+    // are expected-unknown; ALL FOUR oracle non-pass outcomes incl. unavailable are failures
+    {
+        auto identity_reject = coord_eval(common_checkpoint_shadow_category::strict_reject);
+        identity_reject.reason = common_checkpoint_shadow_eval_reason::identity_or_frontier;
+        auto unstable_reject = coord_eval(common_checkpoint_shadow_category::strict_reject);
+        unstable_reject.reason = common_checkpoint_shadow_eval_reason::controller_unstable;
+        const common_checkpoint_shadow_tombstone expected_classes[4] = {
+            common_checkpoint_shadow_tombstone::restore_one_behind,
+            common_checkpoint_shadow_tombstone::swa_wrap,
+            common_checkpoint_shadow_tombstone::explicit_destructive_trim,
+            common_checkpoint_shadow_tombstone::dependency_seq_removed,
+        };
+        for (const auto cls : expected_classes) {
+            if (common_shadow_classify_evaluation(coord_eval(
+                        common_checkpoint_shadow_category::strict_reject, cls)) !=
+                    common_shadow_g_verdict::expected_tombstone) {
+                fprintf(stderr, "coordinator: named tombstone class was not an expected pause\n");
+                return false;
+            }
+        }
+        if (common_shadow_classify_evaluation(identity_reject) !=
+                common_shadow_g_verdict::unexplained ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::strict_reject)) !=
+                common_shadow_g_verdict::unexplained ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::strict_reject,
+                    common_checkpoint_shadow_tombstone::unexplained)) !=
+                common_shadow_g_verdict::unexplained ||
+            common_shadow_classify_evaluation(unstable_reject) !=
+                common_shadow_g_verdict::expected_unknown ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::live_rebased_shadow_accept)) !=
+                common_shadow_g_verdict::live_rebased ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::generation_unknown)) !=
+                common_shadow_g_verdict::expected_unknown ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::strict_accept,
+                    common_checkpoint_shadow_tombstone::none,
+                    common_checkpoint_oracle_outcome::byte_mismatch)) !=
+                common_shadow_g_verdict::oracle_failure ||
+            common_shadow_classify_evaluation(coord_eval(
+                    common_checkpoint_shadow_category::strict_accept,
+                    common_checkpoint_shadow_tombstone::none,
+                    common_checkpoint_oracle_outcome::unavailable)) !=
+                common_shadow_g_verdict::oracle_failure ||
+            common_shadow_classify_evaluation(common_checkpoint_shadow_evaluation{}) !=
+                common_shadow_g_verdict::expected_unknown) {
+            fprintf(stderr, "coordinator: evaluation classification mapping diverged\n");
+            return false;
+        }
+    }
+
+    // verify r1 finding 3: a scan with nothing positionally eligible makes no observation —
+    // no axis observes, so no relation can mint a vacuous agreement
+    {
+        std::vector<row> rows = { { false, false, true, true } };
+        const auto candidates = common_shadow_compute_candidates(rows, [&](size_t) {
+            fprintf(stderr, "coordinator: evaluator invoked with nothing eligible\n");
+            return coord_eval(common_checkpoint_shadow_category::strict_accept);
+        });
+        if (candidates.p_l.observed || candidates.f_g.observed || candidates.g_evaluations != 0) {
+            fprintf(stderr, "coordinator: ineligible scan claimed an observation\n");
+            return false;
+        }
+        common_shadow_relation_evidence e0, e1, e2, e3;
+        std::array<common_shadow_relation_evidence *, 4> evidence = { &e0, &e1, &e2, &e3 };
+        const std::array<common_shadow_relation_observation, 4> no_obs = {};
+        const auto outcome = common_shadow_apply_scan(
+            evidence, candidates, no_obs, 0, common_shadow_qualification_minima{ 1, 0, 0 });
+        for (const auto d : outcome.disposition) {
+            if (d != common_shadow_disposition::pause) {
+                fprintf(stderr, "coordinator: empty scan advanced a relation\n");
+                return false;
+            }
+        }
+        if (e0.agreement_streak != 0 || e3.agreements_total != 0 || outcome.all_qualified) {
+            fprintf(stderr, "coordinator: empty scan accumulated vacuous evidence\n");
+            return false;
+        }
+    }
+
+    fprintf(stderr, "coordinator candidate rows PASS\n");
+    return true;
+}
+
+static bool run_coordinator_evidence_tests() {
+    // production defaults are the §8.4 minima
+    {
+        const common_shadow_qualification_minima defaults;
+        if (defaults.consecutive_agreements != 1024 || defaults.per_class_observations != 64 ||
+                defaults.boundary_refinements != 16) {
+            fprintf(stderr, "coordinator: production minima diverged from §8.4\n");
+            return false;
+        }
+    }
+
+    const common_shadow_qualification_minima tiny{ /*consecutive=*/3, /*per_class=*/1, /*boundary=*/1 };
+    common_shadow_relation_evidence ws4_l, ws4_g, ws7_p, ws7_f;
+    std::array<common_shadow_relation_evidence *, 4> evidence = { &ws4_l, &ws4_g, &ws7_p, &ws7_f };
+
+    const auto agreeing_candidates = [] {
+        common_shadow_candidates c;
+        c.p_l.candidate = c.f_l.candidate = c.p_g.candidate = c.f_g.candidate = 0;
+        c.p_l.observed = c.f_l.observed = c.p_g.observed = c.f_g.observed = true;
+        c.p_g.verdict = c.f_g.verdict = common_shadow_g_verdict::strict;
+        return c;
+    };
+    const auto uniform_obs = [](common_checkpoint_shadow_observation cls, bool boundary) {
+        std::array<common_shadow_relation_observation, 4> obs;
+        obs.fill({ cls, boundary });
+        return obs;
+    };
+
+    // three agreeing scans across the three applicable nontrivial classes reach the tiny
+    // minima on all four relations
+    {
+        const common_checkpoint_shadow_observation classes[3] = {
+            common_checkpoint_shadow_observation::boundary_refined,
+            common_checkpoint_shadow_observation::destructive,
+            common_checkpoint_shadow_observation::import_refined,
+        };
+        common_shadow_scan_outcome outcome;
+        for (int i = 0; i < 3; ++i) {
+            outcome = common_shadow_apply_scan(
+                evidence, agreeing_candidates(),
+                uniform_obs(classes[i],
+                            classes[i] == common_checkpoint_shadow_observation::boundary_refined),
+                /*authority_generation=*/0, tiny);
+        }
+        if (!outcome.all_qualified || !ws4_l.qualified || ws7_f.agreement_streak != 3 ||
+                ws4_g.boundary_refinements != 1) {
+            fprintf(stderr, "coordinator: agreeing ladder did not reach tiny minima\n");
+            return false;
+        }
+    }
+
+    // verify r1 finding 6: relation-local classes — a destructive P observation and an
+    // import-refined F observation credit their own relations, never each other's
+    {
+        common_shadow_relation_evidence a0, a1, a2, a3;
+        std::array<common_shadow_relation_evidence *, 4> asym = { &a0, &a1, &a2, &a3 };
+        std::array<common_shadow_relation_observation, 4> obs = {};
+        obs[2] = { common_checkpoint_shadow_observation::destructive, false };      // ws7_p <- P/G
+        obs[3] = { common_checkpoint_shadow_observation::import_refined, false };   // ws7_f <- F/G
+        common_shadow_apply_scan(asym, agreeing_candidates(), obs, 0, tiny);
+        const auto destructive = size_t(common_checkpoint_shadow_observation::destructive);
+        const auto import_ref  = size_t(common_checkpoint_shadow_observation::import_refined);
+        if (a2.class_counts[destructive] != 1 || a2.class_counts[import_ref] != 0 ||
+                a3.class_counts[import_ref] != 1 || a3.class_counts[destructive] != 0 ||
+                a0.class_counts[destructive] != 0) {
+            fprintf(stderr, "coordinator: observation class leaked across relations\n");
+            return false;
+        }
+    }
+
+    // a paused scan is an availability non-event: nothing advances, nothing resets
+    {
+        auto paused        = agreeing_candidates();
+        paused.f_g.paused  = true;
+        paused.f_g.candidate = -1;
+        paused.f_g.verdict = common_shadow_g_verdict::expected_tombstone;
+        const auto outcome = common_shadow_apply_scan(
+            evidence, paused,
+            uniform_obs(common_checkpoint_shadow_observation::trivial_append, false), 0, tiny);
+        // relations touching F/G pause; WS-4/L and WS-7/P still advance
+        if (outcome.disposition[1] != common_shadow_disposition::pause ||
+                outcome.disposition[3] != common_shadow_disposition::pause ||
+                outcome.disposition[0] != common_shadow_disposition::advance ||
+                ws4_g.agreement_streak != 3 || ws7_f.agreement_streak != 3 ||
+                ws4_l.agreement_streak != 4) {
+            fprintf(stderr, "coordinator: pause was not an availability non-event\n");
+            return false;
+        }
+    }
+
+    // an unexplained axis resets the relations that touch it and disqualifies them
+    {
+        auto failed        = agreeing_candidates();
+        failed.p_g.failed  = true;
+        failed.p_g.candidate = -1;
+        failed.p_g.verdict = common_shadow_g_verdict::unexplained;
+        const auto outcome = common_shadow_apply_scan(
+            evidence, failed,
+            uniform_obs(common_checkpoint_shadow_observation::trivial_append, false), 0, tiny);
+        if (outcome.disposition[1] != common_shadow_disposition::reset ||
+                outcome.disposition[2] != common_shadow_disposition::reset ||
+                ws4_g.agreement_streak != 0 || ws4_g.qualified || ws7_p.agreements_total != 0 ||
+                ws4_l.agreement_streak != 5) {
+            fprintf(stderr, "coordinator: unexplained axis did not reset its relations\n");
+            return false;
+        }
+    }
+
+    // verify r1 finding 1: an oracle-unavailable axis is a failure exactly like a mismatch —
+    // relations touching it reset and cannot remain qualified
+    {
+        common_shadow_relation_evidence q0, q1, q2, q3;
+        std::array<common_shadow_relation_evidence *, 4> qual = { &q0, &q1, &q2, &q3 };
+        for (int i = 0; i < 3; ++i) {
+            common_shadow_apply_scan(
+                qual, agreeing_candidates(),
+                uniform_obs(common_checkpoint_shadow_observation::boundary_refined, true), 0,
+                common_shadow_qualification_minima{ 3, 0, 1 });
+        }
+        if (!q1.qualified) {
+            fprintf(stderr, "coordinator: oracle row setup failed to qualify\n");
+            return false;
+        }
+        auto unavailable = agreeing_candidates();
+        unavailable.f_g.failed    = true;
+        unavailable.f_g.candidate = -1;
+        unavailable.f_g.verdict   = common_shadow_g_verdict::oracle_failure;
+        const auto outcome = common_shadow_apply_scan(
+            qual, unavailable,
+            uniform_obs(common_checkpoint_shadow_observation::trivial_append, false), 0,
+            common_shadow_qualification_minima{ 3, 0, 1 });
+        if (outcome.disposition[1] != common_shadow_disposition::reset ||
+                outcome.disposition[3] != common_shadow_disposition::reset ||
+                q1.qualified || q3.qualified || q1.agreement_streak != 0 ||
+                outcome.all_qualified) {
+            fprintf(stderr, "coordinator: oracle unavailability did not reset/disqualify\n");
+            return false;
+        }
+    }
+
+    // ordinary disagreement: streak resets, totals persist, no evidence clearing
+    {
+        auto disagreeing = agreeing_candidates();
+        disagreeing.f_l.candidate = 1;
+        const auto outcome = common_shadow_apply_scan(
+            evidence, disagreeing,
+            uniform_obs(common_checkpoint_shadow_observation::trivial_append, false), 0, tiny);
+        if (outcome.disposition[0] != common_shadow_disposition::disagree ||
+                ws4_l.agreement_streak != 0 || ws4_l.agreements_total != 5 ||
+                ws4_l.disagreements_total != 1 || ws4_l.qualified) {
+            fprintf(stderr, "coordinator: ordinary disagreement accounting diverged\n");
+            return false;
+        }
+    }
+
+    // Q5.1 version clearing: stale evidence_version or authority_generation lazily clears
+    // before the next observation — discarded, never upgraded
+    {
+        common_shadow_relation_evidence stale;
+        stale.agreements_total = 7;
+        stale.evidence_version = COMMON_SHADOW_EVIDENCE_VERSION + 1;
+        if (!stale.ensure_current(0) || stale.agreements_total != 0 ||
+                stale.evidence_version != COMMON_SHADOW_EVIDENCE_VERSION) {
+            fprintf(stderr, "coordinator: stale evidence_version did not clear\n");
+            return false;
+        }
+        stale.agreements_total = 9;
+        if (!stale.ensure_current(2) || stale.agreements_total != 0 ||
+                stale.authority_generation != 2 || stale.ensure_current(2)) {
+            fprintf(stderr, "coordinator: authority_generation mismatch did not clear\n");
+            return false;
+        }
+    }
+
+    fprintf(stderr, "coordinator evidence rows PASS\n");
+    return true;
+}
+
 static bool run_bridge_boundary_tests() {
     // null memory / null frontier fail closed with a closed reason, never a crash
     llama_vbr_checkpoint_capture_result result;
     llama_vbr_checkpoint_shadow_capture(nullptr, 0, nullptr, &result);
     if (result.handle != nullptr ||
-            result.reason != vbr_checkpoint_capture_reason::invalid_arguments) {
+            result.reason != vbr_checkpoint_capture_reason::invalid_arguments ||
+            result.reset_scope != vbr_checkpoint_reset_scope::capturing_slot) {
         fprintf(stderr, "null capture arguments were not refused\n");
         return false;
     }
@@ -326,6 +674,16 @@ static bool run_bridge_boundary_tests() {
     }
     llama_vbr_checkpoint_shadow_free(nullptr);
 
+    llama_vbr_checkpoint_shadow_evaluation evaluation;
+    llama_vbr_checkpoint_shadow_evaluate(nullptr, nullptr, 0, nullptr, &evaluation);
+    if (evaluation.evaluator_invocations != 0 ||
+            evaluation.category != vbr_checkpoint_shadow_category::generation_unknown ||
+            evaluation.reason != vbr_checkpoint_shadow_reason::record_unknown) {
+        fprintf(stderr, "null G-only evaluation was not closed generation-unknown\n");
+        return false;
+    }
+    llama_vbr_checkpoint_shadow_evaluate(nullptr, nullptr, 0, nullptr, nullptr);
+
     for (const auto reason : {
                  vbr_checkpoint_capture_reason::ok,
                  vbr_checkpoint_capture_reason::not_applicable,
@@ -334,6 +692,7 @@ static bool run_bridge_boundary_tests() {
                  vbr_checkpoint_capture_reason::child_capture_failed,
                  vbr_checkpoint_capture_reason::oracle_mismatch,
                  vbr_checkpoint_capture_reason::internal_error,
+                 vbr_checkpoint_capture_reason::controller_unavailable,
          }) {
         const char * name = llama_vbr_checkpoint_shadow_reason_name(reason);
         if (name == nullptr || strlen(name) == 0) {
@@ -392,11 +751,15 @@ static vbr_checkpoint_frontier_fields gpu_frontier(int64_t n_past) {
 }
 
 static llama_vbr_checkpoint_shadow * gpu_capture(llama_memory_t mem, int64_t n_past,
-                                                 vbr_checkpoint_capture_reason & reason) {
+                                                 vbr_checkpoint_capture_reason & reason,
+                                                 vbr_checkpoint_reset_scope * reset_scope = nullptr) {
     const auto frontier = gpu_frontier(n_past);
     llama_vbr_checkpoint_capture_result result;
     llama_vbr_checkpoint_shadow_capture(mem, 0, &frontier, &result);
     reason = result.reason;
+    if (reset_scope != nullptr) {
+        *reset_scope = result.reset_scope;
+    }
     return result.handle;
 }
 
@@ -552,9 +915,12 @@ static int run_gpu_fixture_rows(const char * model_path) {
                 fprintf(stderr, "row g: could not open a mid-mutation event\n");
                 return 1;
             }
-            llama_vbr_checkpoint_shadow * refused = gpu_capture(mem, n_past, reason);
+            vbr_checkpoint_reset_scope reset_scope;
+            llama_vbr_checkpoint_shadow * refused =
+                gpu_capture(mem, n_past, reason, &reset_scope);
             if (refused != nullptr ||
-                    reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+                    reason != vbr_checkpoint_capture_reason::child_capture_failed ||
+                    reset_scope != vbr_checkpoint_reset_scope::capturing_slot) {
                 fprintf(stderr, "row g: capture was not refused mid-mutation (reason=%s)\n",
                         llama_vbr_checkpoint_shadow_reason_name(reason));
                 llama_vbr_checkpoint_shadow_free(refused);
@@ -566,8 +932,11 @@ static int run_gpu_fixture_rows(const char * model_path) {
             }
         }
         tracker->set_shadow_unavailable();
-        llama_vbr_checkpoint_shadow * latched = gpu_capture(mem, n_past, reason);
-        if (latched != nullptr || reason != vbr_checkpoint_capture_reason::child_capture_failed) {
+        vbr_checkpoint_reset_scope reset_scope;
+        llama_vbr_checkpoint_shadow * latched = gpu_capture(mem, n_past, reason, &reset_scope);
+        if (latched != nullptr ||
+                reason != vbr_checkpoint_capture_reason::controller_unavailable ||
+                reset_scope != vbr_checkpoint_reset_scope::global) {
             fprintf(stderr, "row g: capture was not refused while shadow-unavailable (reason=%s)\n",
                     llama_vbr_checkpoint_shadow_reason_name(reason));
             llama_vbr_checkpoint_shadow_free(latched);
@@ -586,6 +955,7 @@ static int run_gpu_fixture_rows(const char * model_path) {
 
 int main(int argc, char ** argv) {
     if (!run_holder_tests() || !run_equality_tests() || !run_refresh_proof_tests() ||
+            !run_coordinator_candidate_tests() || !run_coordinator_evidence_tests() ||
             !run_bridge_boundary_tests()) {
         return 1;
     }

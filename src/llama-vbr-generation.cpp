@@ -999,6 +999,17 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
             }
             continue;
         }
+        // Mixed-child applicability: an unarmed live_guarded child with no covered cells is a
+        // vacuous row (capture §11.1 row 16's complement). It carries no tracker/pool/units or
+        // streams; requiring an active controller here would make a valid mixed composite
+        // permanently not-applicable at evaluation.
+        if (captured.streams.empty() && captured.units.empty() &&
+                !vbr_pool_uuid_is_set(captured.pool_uuid)) {
+            if (!current.streams.empty() || current.tracker != nullptr) {
+                return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_shape);
+            }
+            continue;
+        }
         if (current.tracker == nullptr || !current.tracker->active()) {
             return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_inactive,
                           vbr_checkpoint_eligibility_category::not_applicable);
@@ -1046,7 +1057,7 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                 return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_order);
             }
             if (stored_stream.dependency_seq_id < 0 || stored_stream.computation_frontier < 0 ||
-                live_stream.cell_has_seq == nullptr) {
+                live_stream.cell_has_seq == nullptr || live_stream.cell_pos == nullptr) {
                 return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::stream_shape);
             }
             if (stored_stream.dependency_seq_id != live_stream.dependency_seq_id ||
@@ -1099,10 +1110,23 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                     const bool membership_lost =
                         !live_stream.cell_has_seq(live_stream.membership_context, stored_stream.stream_index,
                                                   cell, stored_stream.dependency_seq_id);
-                    if (membership_lost) {
+                    const llama_pos current_pos = live_stream.cell_pos != nullptr
+                            ? live_stream.cell_pos(live_stream.membership_context,
+                                                   stored_stream.stream_index, cell)
+                            : -1;
+                    // Rev-9 §5.4 exact dependency cardinality is set membership, not merely
+                    // sequence membership. A covered dependency leaves the live dependency
+                    // set when its sequence disappears OR its current logical position is no
+                    // longer in [0, frontier). Keep membership_lost separate: §5.5's swa_wrap
+                    // row deliberately requires membership to survive while occupied reuse
+                    // moves the same-sequence cell to a higher position.
+                    const bool dependency_lost =
+                        membership_lost || current_pos < 0 ||
+                        current_pos >= stored_stream.computation_frontier;
+                    if (dependency_lost) {
                         ++lost_in_stream;
                     }
-                    if (dep_changed || membership_lost) {
+                    if (dep_changed || dependency_lost) {
                         if (first_reject == vbr_checkpoint_eligibility_reason::none) {
                             first_reject = dep_changed ? vbr_checkpoint_eligibility_reason::dependency_changed
                                                        : vbr_checkpoint_eligibility_reason::dependency_membership_lost;
@@ -1128,10 +1152,7 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
                         rc.extent          = dep_changed
                                 ? current.tracker->dependency_extent(stored_stream.stream_index, cell)
                                 : current.tracker->membership_extent(stored_stream.stream_index, cell);
-                        rc.current_pos     = live_stream.cell_pos != nullptr
-                                ? live_stream.cell_pos(live_stream.membership_context,
-                                                       stored_stream.stream_index, cell)
-                                : -1;
+                        rc.current_pos     = current_pos;
                         rc.frontier        = stored_stream.computation_frontier;
                         rc.dep_seq         = stored_stream.dependency_seq_id;
                         reject_cells.push_back(rc);

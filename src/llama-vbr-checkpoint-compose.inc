@@ -1,7 +1,7 @@
 // Single-source, INTERNAL-LINKAGE implementation of the D-A2-8 composite assembly core.
 // Included (inside an anonymous namespace) by the production bridge TU
 // src/llama-vbr-checkpoint.cpp and by the two named test files — and by nothing else.
-// This keeps libllama's dynamic-export surface at exactly the six bridge handle operations
+// This keeps libllama's dynamic-export surface at the closed bridge operation inventory
 // (F4/F12, verify round) while the tests exercise a token-identical copy without relinking
 // the production bridge TU.
 

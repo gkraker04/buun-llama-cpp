@@ -19,6 +19,23 @@ struct llama_vbr_checkpoint_capture_result {
     // null == no shadow (generation unknown by representation); reason says why
     struct llama_vbr_checkpoint_shadow * handle = nullptr;
     vbr_checkpoint_capture_reason        reason = vbr_checkpoint_capture_reason::internal_error;
+    vbr_checkpoint_reset_scope           reset_scope = vbr_checkpoint_reset_scope::capturing_slot;
+};
+
+struct llama_vbr_checkpoint_shadow_evaluation {
+    bool                              strict              = false;
+    bool                              live_rebased_shadow = false;
+    vbr_checkpoint_shadow_category    category = vbr_checkpoint_shadow_category::generation_unknown;
+    vbr_checkpoint_shadow_reason      reason   = vbr_checkpoint_shadow_reason::record_unknown;
+    vbr_checkpoint_shadow_observation observation_class =
+            vbr_checkpoint_shadow_observation::trivial_append;
+    vbr_checkpoint_shadow_tombstone tombstone_class = vbr_checkpoint_shadow_tombstone::none;
+    bool                            refinement_used = false;
+    uint32_t                        rejecting_cells = 0;
+    vbr_checkpoint_oracle_outcome   oracle_outcome = vbr_checkpoint_oracle_outcome::disabled;
+    // Test/diagnostic proof that the bridge used the sole evaluator exactly once. Valid handle
+    // evaluations report one; precondition failures report zero.
+    uint8_t evaluator_invocations = 0;
 };
 
 // §9.1 composite capture over the memory tree for one checkpoint sequence. A live handle is
@@ -45,3 +62,12 @@ LLAMA_API vbr_checkpoint_generation_status llama_vbr_checkpoint_shadow_status(
         const struct llama_vbr_checkpoint_shadow * shadow) noexcept;
 
 LLAMA_API const char * llama_vbr_checkpoint_shadow_reason_name(vbr_checkpoint_capture_reason reason) noexcept;
+
+// Commit-3 G-only evaluation bridge. P/F predicates are intentionally absent: the server
+// combines its separately computed P and F axes with this ONE G evaluation.
+LLAMA_API void llama_vbr_checkpoint_shadow_evaluate(
+        const struct llama_vbr_checkpoint_shadow * shadow,
+        llama_memory_t                              mem,
+        llama_seq_id                                seq_id,
+        const vbr_checkpoint_frontier_fields *      frontier,
+        llama_vbr_checkpoint_shadow_evaluation *    result) noexcept;
