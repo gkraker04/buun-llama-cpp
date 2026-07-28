@@ -11,7 +11,7 @@
 // dorei 2026-07-28 campaign (36 cold records over 64-2048 tokens, 6 composed host->ckpt
 // restores over 20-50 MiB payloads; replay intercept ~13.3 ms absorbed by the fit)
 static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
-    "qwen35-2b-q4-k---medium/nvidia-geforce-rtx-3090-ngl99/b512", 1,
+    "qwen35-2b-q4-k---medium/nvidia-geforce-rtx-3090-ngl99/b512/kf16-vf16", 1,
     75.688, 0.000010, 7184.4,
 };
 
@@ -30,8 +30,10 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
 }
 
 std::string common_cache_plan_calib_profile(const std::string & model_stem,
-                                            const std::string & hw_desc, int n_batch) {
-    std::string prof = model_stem + "/" + hw_desc + "/b" + std::to_string(n_batch);
+                                            const std::string & hw_desc, int n_batch,
+                                            const std::string & kv_desc) {
+    std::string prof = model_stem + "/" + hw_desc + "/b" + std::to_string(n_batch)
+                     + "/" + kv_desc;
     for (char & ch : prof) {
         ch = ch >= 'A' && ch <= 'Z' ? char(ch - 'A' + 'a') : ch;
         if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '/' || ch == '.')) {

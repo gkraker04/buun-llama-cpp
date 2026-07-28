@@ -61,12 +61,16 @@ static void test_profile_refusal() {
 // the ONE producer-side profile-composition rule: lowercase, [a-z0-9/.] kept, rest '-'
 // (a drifted spelling fails silently — estimators legally refuse forever)
 static void test_profile_composition() {
-    CHECK(common_cache_plan_calib_profile("Qwen3.5-2B-Q4_K_M", "NVIDIA GeForce RTX 3090", 512) ==
-          "qwen3.5-2b-q4-k-m/nvidia-geforce-rtx-3090/b512");
-    CHECK(common_cache_plan_calib_profile("m", "cpu", 1) == "m/cpu/b1");
-    // model-desc + multi-GPU topology shapes survive the squash
-    CHECK(common_cache_plan_calib_profile("qwen3 1.7B Q4_K - Medium", "2x NVIDIA RTX 3090 sm1", 2048) ==
-          "qwen3-1.7b-q4-k---medium/2x-nvidia-rtx-3090-sm1/b2048");
+    CHECK(common_cache_plan_calib_profile("Qwen3.5-2B-Q4_K_M", "NVIDIA GeForce RTX 3090", 512,
+                                          "kf16-vf16") ==
+          "qwen3.5-2b-q4-k-m/nvidia-geforce-rtx-3090/b512/kf16-vf16");
+    CHECK(common_cache_plan_calib_profile("m", "cpu", 1, "kf16-vf16") == "m/cpu/b1/kf16-vf16");
+    // model-desc + multi-GPU topology shapes survive the squash; KV regime never aliases
+    CHECK(common_cache_plan_calib_profile("qwen3 1.7B Q4_K - Medium", "2x NVIDIA RTX 3090 sm1", 2048,
+                                          "kvbr-vf16") ==
+          "qwen3-1.7b-q4-k---medium/2x-nvidia-rtx-3090-sm1/b2048/kvbr-vf16");
+    CHECK(common_cache_plan_calib_profile("m", "cpu", 1, "kf16-vf16") !=
+          common_cache_plan_calib_profile("m", "cpu", 1, "kvbr-vf16"));
 }
 
 // verify-r4/r5: the placement key is pure and positional — reversed heterogeneous device

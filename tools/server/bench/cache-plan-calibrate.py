@@ -100,8 +100,11 @@ def main():
                     continue
                 if any(c.get("provider") == "host_cache_entry" for c in comps):
                     restored.append((sum(c["payload_bytes"] for c in comps), nre, ttft))
-            elif plan.get("provider") == "host_cache_entry" and \
+            elif plan.get("provider") in ("host_cache_entry", "live_context_checkpoint") and \
                     isinstance(plan.get("payload_bytes"), int):
+                # bare host restores AND bare checkpoint restores both exercise the same
+                # state-install path — under dynamic VBR (host cache disabled) checkpoint
+                # restores are the ONLY restore-fit source
                 restored.append((plan["payload_bytes"], nre, ttft))
 
     # one fit = one profile: mixing hardware/model regimes in a single log would fit

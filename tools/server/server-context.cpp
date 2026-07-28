@@ -3227,7 +3227,9 @@ private:
                                                int(params_base.split_mode),
                                                params_base.main_gpu,
                                                params_base.tensor_split),
-                    params_base.n_batch);
+                    params_base.n_batch,
+                    std::string("k") + ggml_type_name(params_base.cache_type_k) +
+                    "-v" + ggml_type_name(params_base.cache_type_v));
             }
             SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
                     cache_plan_obs->calibration_profile.c_str());

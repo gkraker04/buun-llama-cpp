@@ -32,9 +32,12 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
 // THE profile-composition rule (single producer-side spelling, tested): lowercases and
 // squashes everything outside [a-z0-9/.] to '-'. The server composes records with this;
 // fitted table entries must key on exactly this output — a drifted spelling fails silently
-// (estimators legally refuse forever), so no consumer hand-rolls it.
+// (estimators legally refuse forever), so no consumer hand-rolls it. kv_desc names the KV
+// cache regime ("k<ctk>-v<ctv>"): replay/restore costs differ across KV codecs (VBR,
+// turbo encode paths), so an f16 run and a vbr run must never share coefficients.
 std::string common_cache_plan_calib_profile(const std::string & model_stem,
-                                            const std::string & hw_desc, int n_batch);
+                                            const std::string & hw_desc, int n_batch,
+                                            const std::string & kv_desc);
 
 // THE placement-key (hardware class) construction, pure and tested: POSITIONAL device
 // order (main_gpu / tensor_split index into it — reversed heterogeneous orders must
