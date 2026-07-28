@@ -3170,15 +3170,49 @@ private:
         // strictly zero observer work (B-a).
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+            const auto observer_domain = llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::not_applicable);
+            const auto host_domain = llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::pageable_host);
+
+            // C schema-v2 completeness manifest is owned by configuration, not by either
+            // producer. The host producer is required iff the host cache exists; the
+            // observer-init producer is always required while --cache-debug is on.
+            llama_cache_acct_completeness_requirement required[2];
+            size_t n_required = 0;
+            required[n_required++] = {
+                observer_domain, llama_cache_acct_producer::observer_init,
+            };
+            if (prompt_cache) {
+                required[n_required++] = {
+                    host_domain, llama_cache_acct_producer::host_cache,
+                };
+            }
+            (void) cache_plan_obs->ledger.configure_required_producers(required, n_required);
+
             if (prompt_cache) {
                 prompt_cache->acct = &cache_plan_obs->ledger;
+                // Empty-cache gauges are real observations. Certification follows them,
+                // rather than merely proving that wiring code ran.
+                for (const auto cat : {
+                        llama_cache_acct_category::full_snapshot_payload,
+                        llama_cache_acct_category::checkpoint_state_payload,
+                        llama_cache_acct_category::typed_accelerator_payload }) {
+                    cache_plan_obs->ledger.gauge_set(
+                        cat, host_domain,
+                        llama_cache_acct_measure::logical_payload, 0);
+                }
+                (void) cache_plan_obs->ledger.certify_complete(
+                    host_domain, llama_cache_acct_producer::host_cache);
             }
             // the parked rolling-window tape's zero is OBSERVED, not implied: an explicit
             // measured-zero gauge, distinct from every unknown cell
             cache_plan_obs->ledger.gauge_set(
                     llama_cache_acct_category::rolling_window_tape,
-                    llama_cache_acct_residency::not_applicable,
+                    observer_domain,
                     llama_cache_acct_measure::logical_payload, 0);
+            (void) cache_plan_obs->ledger.certify_complete(
+                observer_domain, llama_cache_acct_producer::observer_init);
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -3199,12 +3233,16 @@ private:
                 // into this order, so the key lists devices in sequence — a reversed
                 // heterogeneous pair must never alias the same placement
                 std::vector<std::string> gpu_descs;
+                std::vector<std::string> gpu_identities;
                 if (!params_base.devices.empty()) {
                     // the explicit --device list is nullptr-TERMINATED (parse_device_list);
                     // "none" is a single nullptr -> empty -> "cpu"
                     for (auto * dev : params_base.devices) {
                         if (dev) {
                             gpu_descs.push_back(ggml_backend_dev_description(dev));
+                            gpu_identities.push_back(
+                                std::string(ggml_backend_dev_name(dev)) + "\n" +
+                                ggml_backend_dev_description(dev));
                         }
                     }
                 } else {
@@ -3212,6 +3250,9 @@ private:
                         auto * dev = ggml_backend_dev_get(i);
                         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                             gpu_descs.push_back(ggml_backend_dev_description(dev));
+                            gpu_identities.push_back(
+                                std::string(ggml_backend_dev_name(dev)) + "\n" +
+                                ggml_backend_dev_description(dev));
                         }
                     }
                 }
@@ -3221,6 +3262,28 @@ private:
                 const int ngl_eff = params_base.n_gpu_layers >= 0
                     ? params_base.n_gpu_layers
                     : llama_model_n_layer(model_tgt) + 1;
+                if (ngl_eff > 0 && !gpu_identities.empty()) {
+                    llama_cache_acct_shard_topology topology;
+                    if (llama_cache_acct_build_shard_topology(
+                            gpu_identities,
+                            int16_t(params_base.split_mode),
+                            params_base.main_gpu,
+                            params_base.tensor_split,
+                            topology)) {
+                        for (size_t i = 0; i < gpu_identities.size(); ++i) {
+                            llama_cache_acct_resource_domain domain;
+                            if (!cache_plan_obs->ledger.make_device_domain(
+                                    topology,
+                                    llama_cache_acct_device_ordinal{ uint16_t(i) },
+                                    domain)) {
+                                cache_plan_obs->shadow_unavailable++;
+                                break;
+                            }
+                        }
+                    } else {
+                        cache_plan_obs->shadow_unavailable++;
+                    }
+                }
                 cache_plan_obs->calibration_profile = common_cache_plan_calib_profile(
                     desc,
                     common_cache_plan_calib_hw(gpu_descs, ngl_eff,

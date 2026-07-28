@@ -3,9 +3,14 @@
 #include "common-cache-plan.h"
 
 #include <functional>
+#include <string>
 #include <vector>
 
 struct common_params;
+
+// One lowercase formatter for every SHA-256 identity emitted by cache-plan surfaces.
+std::string common_cache_plan_sha256_hex_digest(
+        const std::array<uint8_t, 32> & digest);
 
 // common-cache-plan-estimate.h — B shadow-planner estimators (§7.5), schema v2.
 //

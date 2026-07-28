@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-// llama-cache-accounting.h — P2 C0 accounting contract, schema version 1.
+// llama-cache-accounting.h — P2 C accounting contract, schema version 2.
 //
 // Policy-free, library-neutral accounting types shared by the server observer (B0), the D
 // lease/lifecycle work, and the F artifact-transaction work. This header is the SOLE byte
@@ -24,7 +26,9 @@
 // (reservation precedes mutation; publication waits on accounting) — that flip is an F
 // decision, not made here.
 
-constexpr uint32_t LLAMA_CACHE_ACCT_SCHEMA_VERSION = 1;
+constexpr uint32_t LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2;
+constexpr uint32_t LLAMA_CACHE_ACCT_TOPOLOGY_VERSION        = 1;
+constexpr uint32_t LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR = 1000000;
 
 // Mutually-exclusive semantic LEAF categories. host_cache / snapshot_blob are DERIVED
 // provider/artifact groupings over these leaves, never additive leaves themselves: a
@@ -66,7 +70,143 @@ enum class llama_cache_acct_residency : uint8_t {
     _count,
 };
 
-// Four measures per (category, residency) cell. An observation that cannot be made stays a
+// Resource domains are closed accounting identities, not presentation labels. Device rows
+// are qualified by one stable ordinal in one versioned, ordered shard-topology descriptor.
+// Non-device rows carry an EXPLICIT not_applicable tag; they never fabricate ordinal zero
+// or an empty topology that a v1 reader could mistake for a device.
+enum class llama_cache_acct_domain_kind : uint8_t {
+    not_applicable = 0,
+    device_topology,
+    _count,
+};
+
+struct llama_cache_acct_device_ordinal {
+    uint16_t v = UINT16_MAX;
+    explicit operator bool() const { return v != UINT16_MAX; }
+};
+
+struct llama_cache_acct_topology_id {
+    uint32_t v = 0;
+    explicit operator bool() const { return v != 0; }
+};
+
+struct llama_cache_acct_device_digest_tag;
+struct llama_cache_acct_topology_digest_tag;
+
+// A tag is part of the digest's TYPE, not merely its field name. The byte array is private
+// so `topology_digest.bytes = device_digest.bytes` cannot bypass that distinction.
+template <typename Tag>
+class llama_cache_acct_digest {
+public:
+    llama_cache_acct_digest() = default;
+
+    static llama_cache_acct_digest from_sha256(std::array<uint8_t, 32> bytes) {
+        llama_cache_acct_digest out;
+        out.bytes_ = std::move(bytes);
+        return out;
+    }
+
+    const std::array<uint8_t, 32> & bytes() const { return bytes_; }
+
+    friend bool operator==(const llama_cache_acct_digest & a,
+                           const llama_cache_acct_digest & b) {
+        return a.bytes_ == b.bytes_;
+    }
+    friend bool operator!=(const llama_cache_acct_digest & a,
+                           const llama_cache_acct_digest & b) {
+        return !(a == b);
+    }
+
+private:
+    std::array<uint8_t, 32> bytes_ = {};
+};
+
+using llama_cache_acct_device_digest =
+    llama_cache_acct_digest<llama_cache_acct_device_digest_tag>;
+using llama_cache_acct_topology_digest =
+    llama_cache_acct_digest<llama_cache_acct_topology_digest_tag>;
+
+inline bool operator==(llama_cache_acct_device_ordinal a, llama_cache_acct_device_ordinal b) {
+    return a.v == b.v;
+}
+inline bool operator!=(llama_cache_acct_device_ordinal a, llama_cache_acct_device_ordinal b) {
+    return !(a == b);
+}
+inline bool operator==(llama_cache_acct_topology_id a, llama_cache_acct_topology_id b) {
+    return a.v == b.v;
+}
+inline bool operator!=(llama_cache_acct_topology_id a, llama_cache_acct_topology_id b) {
+    return !(a == b);
+}
+
+struct llama_cache_acct_shard_topology {
+    uint32_t version      = 0;
+    uint16_t device_count = 0;
+    int16_t  split_mode   = 0;
+    llama_cache_acct_device_ordinal main_device;
+    // The vectors have EXACTLY device_count entries. Their length is bounded by the
+    // runtime's llama_max_devices(), not a second private constant in this contract.
+    std::vector<llama_cache_acct_device_digest> device_identities;
+    std::vector<uint32_t> shard_weights;
+    llama_cache_acct_topology_digest digest;
+};
+
+// The ONE topology-construction door. It hashes the ordered device descriptions, normalizes
+// explicit weights to exact millionths, and computes the canonical descriptor digest.
+// Absent/all-zero weights are valid only for a one-device topology; multi-device auto-split
+// must supply its resolved weights rather than fabricate equal placement.
+bool llama_cache_acct_build_shard_topology(
+        const std::vector<std::string> & ordered_device_identities,
+        int16_t split_mode,
+        int32_t main_device,
+        const float * shard_weights,
+        llama_cache_acct_shard_topology & out) noexcept;
+
+inline bool operator==(const llama_cache_acct_shard_topology & a,
+                       const llama_cache_acct_shard_topology & b) {
+    return a.version           == b.version &&
+           a.device_count      == b.device_count &&
+           a.split_mode        == b.split_mode &&
+           a.main_device       == b.main_device &&
+           a.device_identities == b.device_identities &&
+           a.shard_weights     == b.shard_weights &&
+           a.digest            == b.digest;
+}
+inline bool operator!=(const llama_cache_acct_shard_topology & a,
+                       const llama_cache_acct_shard_topology & b) {
+    return !(a == b);
+}
+
+struct llama_cache_acct_resource_domain {
+    llama_cache_acct_residency residency = llama_cache_acct_residency::not_applicable;
+    llama_cache_acct_domain_kind kind = llama_cache_acct_domain_kind::not_applicable;
+    llama_cache_acct_device_ordinal device_ordinal;
+    // Ledger-local, immutable, non-reused citation into snapshot.topologies. Zero is valid
+    // only for non-device domains.
+    llama_cache_acct_topology_id topology;
+
+    static llama_cache_acct_resource_domain non_device(llama_cache_acct_residency residency);
+};
+
+inline bool operator==(const llama_cache_acct_resource_domain & a,
+                       const llama_cache_acct_resource_domain & b) {
+    return a.residency      == b.residency &&
+           a.kind           == b.kind &&
+           a.device_ordinal == b.device_ordinal &&
+           a.topology       == b.topology;
+}
+inline bool operator!=(const llama_cache_acct_resource_domain & a,
+                       const llama_cache_acct_resource_domain & b) {
+    return !(a == b);
+}
+static_assert(sizeof(llama_cache_acct_resource_domain) <= 12,
+              "resource domains must remain interned keys, not inline topology descriptors");
+
+// Structural validation only. A ledger additionally verifies that topology is an interned
+// registry key and that the ordinal is in that descriptor's range.
+bool llama_cache_acct_resource_domain_valid(const llama_cache_acct_resource_domain & domain);
+
+// Four measures per (category, resource-domain) cell. An observation that cannot be made stays a
 // typed unknown/unavailable — zero always means a measured zero. `transient_peak` is the
 // high-water mark of CONCURRENTLY staged bytes for the cell, not the largest single stage.
 enum class llama_cache_acct_measure : uint8_t {
@@ -81,6 +221,19 @@ enum class llama_cache_acct_known : uint8_t {
     known = 0,
     unknown,        // not yet observed / producer absent
     unavailable,    // observation attempted and failed (fault, overflow)
+    _count,
+};
+
+// Closed producer identity for completeness certification. The configuration owner declares
+// the required (domain, producer) manifest; producers may only transition a declared row.
+// An absent producer therefore cannot make itself optional by omission.
+enum class llama_cache_acct_producer : uint8_t {
+    observer_init = 0,
+    host_cache,
+    // Reserved in the refrozen v2 vocabulary for the immediately-following D-S producers;
+    // they are not required until their configuration paths are wired.
+    live_memory,
+    retention_sidecar,
     _count,
 };
 
@@ -141,8 +294,8 @@ enum class llama_cache_acct_attr_kind : uint8_t {
     _count,
 };
 
-// Identity discipline (C/F freeze requirement 3): five DISTINCT identities that must never
-// be interchanged. The operation and allocation ids are process-local accounting identities;
+// Identity discipline (C/F freeze requirement 3): every DISTINCT identity must never be
+// interchanged. The operation and allocation ids are process-local accounting identities;
 // the artifact identity, content digest, and eligibility lineage identity are opaque
 // contract fields carried and retained by the transaction (F populates and validates them).
 // Distinct wrapper types make interchange a compile error (matrix asserted below). The
@@ -178,27 +331,58 @@ template <> struct std::hash<llama_cache_acct_alloc_id> {
     size_t operator()(const llama_cache_acct_alloc_id & id) const { return std::hash<uint64_t>{}(id.v); }
 };
 
-// The non-interchange proof, in the header so every consumer TU enforces it: no pair among
-// the five identities (or a raw integer) converts either way. Aggregate `{n}` init stays
-// legal — mints construct ids on purpose; only IMPLICIT interchange is banned.
+// The non-interchange proof, in the header so every consumer TU enforces it. Aggregate
+// `{n}` init stays legal — mints construct ids on purpose; only IMPLICIT interchange is
+// banned.
 template <typename A, typename B>
 constexpr bool llama_cache_acct_ids_distinct =
     !std::is_convertible_v<A, B> && !std::is_convertible_v<B, A>;
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_alloc_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_artifact_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_content_digest>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_lineage_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          uint64_t>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_artifact_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_content_digest>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_lineage_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       uint64_t>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    llama_cache_acct_content_digest>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    llama_cache_acct_lineage_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    uint64_t>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_content_digest, llama_cache_acct_lineage_id>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_content_digest, uint64_t>);
-static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_lineage_id,     uint64_t>);
+
+template <typename A, typename... Rest>
+constexpr bool llama_cache_acct_distinct_from_all =
+    (llama_cache_acct_ids_distinct<A, Rest> && ...);
+
+template <typename... Ts>
+struct llama_cache_acct_all_ids_distinct;
+
+template <>
+struct llama_cache_acct_all_ids_distinct<> : std::true_type {};
+
+template <typename A, typename... Rest>
+struct llama_cache_acct_all_ids_distinct<A, Rest...>
+    : std::bool_constant<llama_cache_acct_distinct_from_all<A, Rest...> &&
+                         llama_cache_acct_all_ids_distinct<Rest...>::value> {};
+
+// Full compile-negative matrix: every strong identity is distinct from every other strong
+// identity, and each is separately non-convertible to all three raw integer widths.
+static_assert(llama_cache_acct_all_ids_distinct<
+        llama_cache_acct_op_id,
+        llama_cache_acct_alloc_id,
+        llama_cache_acct_artifact_id,
+        llama_cache_acct_content_digest,
+        llama_cache_acct_lineage_id,
+        llama_cache_acct_device_ordinal,
+        llama_cache_acct_topology_id,
+        llama_cache_acct_device_digest,
+        llama_cache_acct_topology_digest>::value);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_op_id,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_alloc_id,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_artifact_id,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_content_digest,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_lineage_id,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_device_ordinal,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_topology_id,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_device_digest,
+        uint16_t, uint32_t, uint64_t>);
+static_assert(llama_cache_acct_distinct_from_all<llama_cache_acct_topology_digest,
+        uint16_t, uint32_t, uint64_t>);
 
 struct llama_cache_acct_attribution {
     llama_cache_acct_attr_kind   kind    = llama_cache_acct_attr_kind::server;
@@ -221,10 +405,81 @@ struct llama_cache_acct_cell {
     std::array<llama_cache_acct_value, size_t(llama_cache_acct_measure::_count)> measures;
 };
 
+struct llama_cache_acct_cell_row {
+    llama_cache_acct_category        category = llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    // Snapshot-boundary join of every required producer for this domain. Measures are
+    // projected unavailable unless this is known.
+    llama_cache_acct_known           certification = llama_cache_acct_known::unknown;
+    llama_cache_acct_cell            cell;
+
+private:
+    // Canonical ledger-local concurrent staging state for this exact aggregate row. It is
+    // deliberately not a public snapshot measure; only transient_peak is observable.
+    uint64_t staged = 0;
+    friend struct llama_cache_acct_ledger;
+};
+
+struct llama_cache_acct_topology_row {
+    llama_cache_acct_topology_id    id;
+    llama_cache_acct_shard_topology topology;
+};
+
+struct llama_cache_acct_completeness_requirement {
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_producer        producer = llama_cache_acct_producer::observer_init;
+};
+
+struct llama_cache_acct_completeness_row {
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_producer        producer = llama_cache_acct_producer::observer_init;
+    llama_cache_acct_known           state    = llama_cache_acct_known::unknown;
+};
+
 // Normalized attributed row: one per live committed physical allocation. Server aggregates
 // live in `cells`; slot/artifact attribution is read from these rows (an explicit normalized
 // form — no private per-consumer counters).
 struct llama_cache_acct_allocation_row {
+    llama_cache_acct_alloc_id      alloc;
+    llama_cache_acct_attribution   attribution;
+    llama_cache_acct_category      category  = llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_known         certification = llama_cache_acct_known::unknown;
+    uint64_t                       logical_bytes  = 0;
+    uint64_t                       resident_bytes = 0;
+    uint32_t                       committed_refs = 0;
+    llama_cache_acct_artifact_id    artifact_identity;
+    llama_cache_acct_content_digest content_digest;
+    llama_cache_acct_lineage_id     lineage_identity;
+};
+
+struct llama_cache_acct_snapshot {
+    uint32_t               schema_version = LLAMA_CACHE_ACCT_SCHEMA_VERSION;
+    uint64_t               serial         = 0;    // bumped on EVERY observable change, faults included
+    // Authoritative schema-v2 aggregates and certification. Completeness is NEVER a
+    // server-wide scalar: each required (resource-domain, producer) pair has its own row.
+    llama_cache_acct_known completeness_manifest = llama_cache_acct_known::unknown;
+    // Topologies are interned once per ledger and emitted once per record. Every device
+    // domain in cells/completeness/allocations cites one row by id.
+    std::vector<llama_cache_acct_topology_row>     topologies;
+    std::vector<llama_cache_acct_cell_row>         cells;
+    std::vector<llama_cache_acct_completeness_row> completeness;
+    std::vector<llama_cache_acct_allocation_row> allocations;
+    // in-flight transaction count (reserved + staged + committed-unreleased): zero after a
+    // producer's entries are fully destroyed — a leaked op is an accounting bug
+    uint64_t live_ops = 0;
+    // monotone fault counters
+    uint64_t faults_invalid_transition = 0;
+    uint64_t faults_overflow           = 0;
+    uint64_t faults_unknown_id         = 0;
+    uint64_t faults_allocation         = 0;   // internal ledger allocation failure (non-throwing contract)
+};
+
+// Explicit compatibility projection for schema-v1 readers. Device-topology rows cannot be
+// represented and therefore make the projection fail closed (`false`, completeness
+// unavailable). Callers must opt into this adapter; schema-v2 never silently flattens a
+// device ordinal into the old residency-only cells.
+struct llama_cache_acct_allocation_row_v1 {
     llama_cache_acct_alloc_id      alloc;
     llama_cache_acct_attribution   attribution;
     llama_cache_acct_category      category  = llama_cache_acct_category::container_overhead;
@@ -237,43 +492,53 @@ struct llama_cache_acct_allocation_row {
     llama_cache_acct_lineage_id     lineage_identity;
 };
 
-struct llama_cache_acct_snapshot {
-    uint32_t               schema_version = LLAMA_CACHE_ACCT_SCHEMA_VERSION;
-    uint64_t               serial         = 0;    // bumped on EVERY observable change, faults included
-    llama_cache_acct_known completeness   = llama_cache_acct_known::unknown;
+struct llama_cache_acct_snapshot_v1 {
+    uint32_t schema_version = 1;
+    uint64_t serial = 0;
+    llama_cache_acct_known completeness = llama_cache_acct_known::unknown;
     std::array<std::array<llama_cache_acct_cell,
                           size_t(llama_cache_acct_residency::_count)>,
                size_t(llama_cache_acct_category::_count)> cells;
-    std::vector<llama_cache_acct_allocation_row> allocations;
-    // in-flight transaction count (reserved + staged + committed-unreleased): zero after a
-    // producer's entries are fully destroyed — a leaked op is an accounting bug
+    std::vector<llama_cache_acct_allocation_row_v1> allocations;
     uint64_t live_ops = 0;
-    // monotone fault counters
     uint64_t faults_invalid_transition = 0;
     uint64_t faults_overflow           = 0;
     uint64_t faults_unknown_id         = 0;
-    uint64_t faults_allocation         = 0;   // internal ledger allocation failure (non-throwing contract)
+    uint64_t faults_allocation         = 0;
 };
+
+bool llama_cache_acct_snapshot_to_v1(
+        const llama_cache_acct_snapshot & source,
+        llama_cache_acct_snapshot_v1 & destination) noexcept;
 
 // Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
 // (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
 // LAST reference releases; per-reference metadata is reported by the referrer under its own
 // leaf (artifact_reference_metadata), outside this refcount. Allocation ids must come from
-// new_alloc() (zero and unminted ids are faults) and an allocation's (category, residency,
-// resident-size) tuple is immutable — a mismatched citation is a fault, never a silent
-// merge. NON-THROWING: no method throws; internal failure latches faults_allocation.
+// new_alloc() (zero and unminted ids are faults) and an allocation's (category,
+// resource-domain, resident-size) tuple is immutable — a domain/topology mismatch is a
+// fault, never a silent merge. NON-THROWING: no method throws; internal failure latches
+// faults_allocation.
 struct llama_cache_acct_ledger {
     llama_cache_acct_ledger();
 
     // Mint a fresh physical-allocation id (one owner for the whole accounting id space).
     llama_cache_acct_alloc_id new_alloc();
 
+    // Canonical topology registration. The descriptor must come from
+    // llama_cache_acct_build_shard_topology(); duplicate descriptors reuse the existing
+    // immutable id. The returned domain is ledger-local and safe to place in citations.
+    bool make_device_domain(
+            const llama_cache_acct_shard_topology & topology,
+            llama_cache_acct_device_ordinal ordinal,
+            llama_cache_acct_resource_domain & out);
+
     // Observational reservation: records the expected resident bytes under `reserved`,
     // returns the op id (zero id on internal failure). Never blocks or admits anything.
     llama_cache_acct_op_id reserve(
             llama_cache_acct_category      category,
-            llama_cache_acct_residency     residency,
+            const llama_cache_acct_resource_domain & domain,
             llama_cache_acct_attribution   attribution,
             uint64_t                       expected_logical,
             uint64_t                       expected_resident);
@@ -282,7 +547,8 @@ struct llama_cache_acct_ledger {
     // Validates the allocation tuple against any existing citation. Updates the concurrent
     // staged high-water mark. The three opaque identities are retained on the transaction
     // (F populates them; empty is valid in P2). False on any fault.
-    bool stage(llama_cache_acct_op_id op, llama_cache_acct_alloc_id alloc, uint64_t resident_bytes,
+    bool stage(llama_cache_acct_op_id op, llama_cache_acct_alloc_id alloc,
+               uint64_t resident_bytes,
                llama_cache_acct_artifact_id    artifact = {},
                llama_cache_acct_content_digest digest   = {},
                llama_cache_acct_lineage_id     lineage  = {});
@@ -302,26 +568,42 @@ struct llama_cache_acct_ledger {
     // Direct gauge reporting for non-transactional producers (live state, metadata gauges).
     // Checked: overflow latches the cell unavailable and counts a fault.
     void gauge_set(llama_cache_acct_category category,
-                   llama_cache_acct_residency residency,
+                   const llama_cache_acct_resource_domain & domain,
                    llama_cache_acct_measure measure,
                    uint64_t value);
 
     // A producer whose own observation failed (e.g. checked-sum overflow) latches the cell
     // unavailable instead of reporting a fabricated value.
     void mark_unavailable(llama_cache_acct_category category,
-                          llama_cache_acct_residency residency,
+                          const llama_cache_acct_resource_domain & domain,
                           llama_cache_acct_measure measure);
+
+    // Replace the REQUIRED completeness manifest atomically. This is configuration-owned:
+    // producer code cannot add/remove its own requirement. Duplicate or malformed entries
+    // fault and leave the previous manifest unchanged.
+    bool configure_required_producers(
+            const llama_cache_acct_completeness_requirement * requirements,
+            size_t n_requirements);
+
+    // Producer transitions for a manifest row. Known and unavailable are monotone for one
+    // schema lifetime; an undeclared pair is an invalid-transition fault.
+    bool certify_complete(
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_producer producer);
+    void mark_producer_unavailable(
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_producer producer);
 
     // Coherent copy of the observable state under one serial (gauges + normalized
     // allocation rows + fault counters). On internal copy failure the returned snapshot has
-    // completeness == unavailable and no rows.
+    // every completeness row unavailable and no aggregate/allocation rows.
     llama_cache_acct_snapshot snapshot();
 
 private:
     struct txn {
         llama_cache_acct_txn_state   state = llama_cache_acct_txn_state::reserved;
         llama_cache_acct_category    category  = llama_cache_acct_category::container_overhead;
-        llama_cache_acct_residency   residency = llama_cache_acct_residency::not_applicable;
+        llama_cache_acct_resource_domain domain;
         llama_cache_acct_attribution attribution;
         llama_cache_acct_alloc_id    alloc;
         uint64_t                     reserved_bytes = 0; // charged at reserve, unwound by commit/abort
@@ -345,7 +627,7 @@ private:
         // immutable citation tuple, fixed by the first stage — ALL fields compared on every
         // shared citation (identity fields included)
         llama_cache_acct_category    category  = llama_cache_acct_category::container_overhead;
-        llama_cache_acct_residency   residency = llama_cache_acct_residency::not_applicable;
+        llama_cache_acct_resource_domain domain;
         uint64_t                     resident_bytes = 0;
         uint64_t                     charged_logical = 0; // set by the first commit
         llama_cache_acct_attribution attribution;         // first committer's
@@ -354,18 +636,37 @@ private:
         llama_cache_acct_lineage_id     lineage;
     };
 
+    // Unlocked helpers (callers hold the mutex). Aggregate rows are pre-created atomically
+    // with the required-producer manifest, so the gauge and failure paths never allocate.
+    llama_cache_acct_cell_row * find_cell(
+            llama_cache_acct_category c,
+            const llama_cache_acct_resource_domain & domain);
+    llama_cache_acct_completeness_row * find_completeness(
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_producer producer);
     // unlocked internal latch (callers hold the mutex)
-    void cell_latch_unavailable(llama_cache_acct_category c, llama_cache_acct_residency r,
+    void cell_latch_unavailable(llama_cache_acct_category c,
+                                const llama_cache_acct_resource_domain & domain,
                                 llama_cache_acct_measure m);
     // checked-add/sub on a cell measure; latches unavailable + fault on overflow/underflow
-    void cell_add(llama_cache_acct_category c, llama_cache_acct_residency r,
+    void cell_add(llama_cache_acct_category c, const llama_cache_acct_resource_domain & domain,
                   llama_cache_acct_measure m, uint64_t v);
-    void cell_sub(llama_cache_acct_category c, llama_cache_acct_residency r,
+    void cell_sub(llama_cache_acct_category c, const llama_cache_acct_resource_domain & domain,
                   llama_cache_acct_measure m, uint64_t v);
-    // concurrent-staged tracking: staged_now +=/-= v, peak = max(peak, staged_now)
-    void staged_add(llama_cache_acct_category c, llama_cache_acct_residency r, uint64_t v);
-    void staged_sub(llama_cache_acct_category c, llama_cache_acct_residency r, uint64_t v);
+    // concurrent-staged tracking: row.staged +=/-= v, peak = max(peak, row.staged)
+    void staged_add(llama_cache_acct_category c, const llama_cache_acct_resource_domain & domain,
+                    uint64_t v);
+    void staged_sub(llama_cache_acct_category c, const llama_cache_acct_resource_domain & domain,
+                    uint64_t v);
     void bump_serial();
+    const llama_cache_acct_shard_topology * find_topology(
+            llama_cache_acct_topology_id id) const;
+    bool domain_registered(const llama_cache_acct_resource_domain & domain) const;
+    bool domain_manifested(const llama_cache_acct_resource_domain & domain) const;
+    bool domain_use_valid(llama_cache_acct_category category,
+                          const llama_cache_acct_resource_domain & domain) const;
+    llama_cache_acct_known domain_certification(
+            const llama_cache_acct_resource_domain & domain) const;
     // retirement accounts for BOTH claim kinds: an allocation that ever committed retires
     // only when its last committed AND last staged reference are gone (a staged op holds a
     // valid claim that may still commit)
@@ -373,8 +674,6 @@ private:
 
     mutable std::mutex mtx;
     llama_cache_acct_snapshot state;    // durable gauges + serial + faults live here (rows built on demand)
-    std::array<std::array<uint64_t, size_t(llama_cache_acct_residency::_count)>,
-               size_t(llama_cache_acct_category::_count)> staged_now = {};
     llama_cache_acct_op_id    next_op       = {1};
     llama_cache_acct_alloc_id next_alloc_id = {1};
     std::unordered_map<llama_cache_acct_op_id, txn>            ops;

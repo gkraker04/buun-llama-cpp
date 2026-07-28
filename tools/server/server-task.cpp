@@ -1752,6 +1752,8 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
     if (!acct) {
         return;
     }
+    const auto domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
 
     // checked sums: an overflowing observation latches the leaf unavailable instead of
     // charging a fabricated value (the shipped path is untouched either way)
@@ -1775,26 +1777,29 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
         for (const auto cat : { llama_cache_acct_category::full_snapshot_payload,
                                 llama_cache_acct_category::checkpoint_state_payload,
                                 llama_cache_acct_category::typed_accelerator_payload }) {
-            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+            acct->mark_unavailable(cat, domain,
                                    llama_cache_acct_measure::logical_payload);
         }
+        acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
         return;
     }
 
     // every transition result is checked: a failed stage/commit aborts the op (fail-closed,
     // idempotent — abort on an erased op only faults), latches the leaf unavailable, and
     // publishes NO op id, so the entry's later release cannot compound the fault
-    const auto charge = [this](llama_cache_acct_category cat, uint64_t bytes) -> llama_cache_acct_op_id {
-        const auto op = acct->reserve(cat, llama_cache_acct_residency::pageable_host, {}, bytes, bytes);
+    const auto charge = [this, &domain](llama_cache_acct_category cat, uint64_t bytes) -> llama_cache_acct_op_id {
+        const auto op = acct->reserve(cat, domain, {}, bytes, bytes);
         if (!op) {
-            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+            acct->mark_unavailable(cat, domain,
                                    llama_cache_acct_measure::logical_payload);
+            acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
             return {};
         }
         if (!acct->stage(op, acct->new_alloc(), bytes) || !acct->commit(op, bytes)) {
             acct->abort(op);
-            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+            acct->mark_unavailable(cat, domain,
                                    llama_cache_acct_measure::logical_payload);
+            acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
             return {};
         }
         return op;

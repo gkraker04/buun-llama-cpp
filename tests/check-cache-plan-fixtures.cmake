@@ -1,4 +1,4 @@
-# B-6 golden-fixture gate [P2]: the replay tool must parse the checked-in v1+v2 CACHE_PLAN
+# B-6 golden-fixture gate [P2]: the replay tool must parse checked-in v1/v2/v3 CACHE_PLAN
 # samples exactly and reproduce the pinned report values. A schema drift that breaks either
 # the emitted record shape or the tool's reading of it fails here, not in the field.
 #
@@ -23,12 +23,12 @@ if (NOT rc EQUAL 0)
     message(FATAL_ERROR "cache-plan-replay.py failed on the golden fixture (rc=${rc})")
 endif()
 
-# pinned values: 4 records (1x v1 + 3x v2), two agreements (incl. the composed
+# pinned values: 5 records (1x v1 + 3x v2 + 1x v3), two agreements (incl. the composed
 # host→checkpoint chain as the complete shipped-plan ordinal) + one exact disagreement
 foreach(expect
-        "\"records\": 4"
+        "\"records\": 5"
         "\"shadow_evaluated\": 3"
-        "\"shadow_unavailable\": 1"
+        "\"shadow_unavailable\": 2"
         "\"agreement_rate\": 0.666"
         "\"disagreements\": 1"
         "\"predicted_saving_us\": 49600"

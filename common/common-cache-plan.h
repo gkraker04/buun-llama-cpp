@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string>
 
-// common-cache-plan.h — P2 B0/B shadow decision record, schema version 2.
+// common-cache-plan.h — P2 B0/B shadow decision record, schema version 3.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -30,7 +30,16 @@
 // B chooser fills them. Candidate observation transport is noexcept by construction: fixed
 // capacity in the record, append-or-mark-overflowed, no allocation in selector hooks.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 2;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 3;
+
+// Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
+// under the current record version until this table and the record version move together.
+constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
+    return record_schema == 3 ? 2 :
+           (record_schema == 1 || record_schema == 2 ? 1 : 0);
+}
+static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
+              LLAMA_CACHE_ACCT_SCHEMA_VERSION);
 
 // Bounded inventory capacity (fixed-in-record option of the A2 transport contract). Sized
 // for worst realistic scan breadth (parallel slots + host-cache entries + checkpoint
@@ -515,6 +524,8 @@ const char * common_cache_plan_planner_status_name(common_cache_plan_planner_sta
 
 const char * common_cache_acct_category_name(llama_cache_acct_category c);
 const char * common_cache_acct_residency_name(llama_cache_acct_residency r);
+const char * common_cache_acct_domain_kind_name(llama_cache_acct_domain_kind k);
+const char * common_cache_acct_producer_name(llama_cache_acct_producer p);
 const char * common_cache_acct_measure_name(llama_cache_acct_measure m);
 const char * common_cache_acct_known_name(llama_cache_acct_known k);
 const char * common_cache_acct_unit_name(llama_cache_acct_unit u);

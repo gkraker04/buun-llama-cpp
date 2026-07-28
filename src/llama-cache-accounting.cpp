@@ -1,25 +1,313 @@
 #include "llama-cache-accounting.h"
+#include "llama-sha256.h"
+#include "llama.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <numeric>
 
-// Shadow accounting ledger (C0). Every entry point is fault-tolerant AND non-throwing by
-// contract: an invalid transition, unknown id, tuple mismatch, overflow, or internal
-// allocation failure increments a fault counter and returns failure — it never throws and
-// never influences the shipped mutation it observes. bump_serial() runs on every observable
-// change, fault counters included, so the serial is a usable coherence epoch.
+// Shadow accounting ledger (C schema v2). Every entry point is fault-tolerant and
+// observational: an invalid transition, tuple mismatch, overflow, or allocation failure
+// increments a counter and cannot influence the shipped mutation it observes.
 
-llama_cache_acct_ledger::llama_cache_acct_ledger() {
-    for (auto & row : state.cells) {
-        for (auto & cell : row) {
-            for (auto & m : cell.measures) {
-                m = { 0, llama_cache_acct_known::unknown };
+static bool acct_digest_nonzero(const std::array<uint8_t, 32> & bytes) {
+    return std::any_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v != 0; });
+}
+
+template <typename Digest>
+static Digest acct_sha256(const void * data, size_t size) {
+    llama_sha256_writer writer;
+    writer.string(data, size);
+    return Digest::from_sha256(writer.finish());
+}
+
+static llama_cache_acct_topology_digest acct_compute_topology_digest(
+        const llama_cache_acct_shard_topology & topology) {
+    llama_sha256_writer writer;
+    static constexpr char domain_separator[] = "llama-cache-acct/shard-topology";
+    writer.string(domain_separator, sizeof(domain_separator) - 1);
+    writer.u32(topology.version);
+    writer.u32(topology.device_count);
+    writer.u32(uint32_t(topology.split_mode));
+    writer.u32(topology.main_device.v);
+    const size_t n = std::min(topology.device_identities.size(),
+                              topology.shard_weights.size());
+    writer.u64(n);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & identity = topology.device_identities[i].bytes();
+        writer.string(identity.data(), identity.size());
+        writer.u32(topology.shard_weights[i]);
+    }
+    return llama_cache_acct_topology_digest::from_sha256(writer.finish());
+}
+
+bool llama_cache_acct_build_shard_topology(
+        const std::vector<std::string> & ordered_device_identities,
+        int16_t split_mode,
+        int32_t main_device,
+        const float * shard_weights,
+        llama_cache_acct_shard_topology & out) noexcept {
+    out = {};
+    const size_t n = ordered_device_identities.size();
+    if (n == 0 || n > llama_max_devices() ||
+        split_mode < 0 || split_mode > 3 ||
+        main_device < 0 || size_t(main_device) >= n) {
+        return false;
+    }
+    try {
+        llama_cache_acct_shard_topology built;
+        built.version      = LLAMA_CACHE_ACCT_TOPOLOGY_VERSION;
+        built.device_count = uint16_t(n);
+        built.split_mode   = split_mode;
+        built.main_device  = { uint16_t(main_device) };
+        built.device_identities.reserve(n);
+        built.shard_weights.resize(n);
+
+        for (const auto & identity : ordered_device_identities) {
+            if (identity.empty()) {
+                return false;
+            }
+            built.device_identities.push_back(
+                acct_sha256<llama_cache_acct_device_digest>(identity.data(), identity.size()));
+        }
+
+        std::vector<double> weights(n, 0.0);
+        if (shard_weights) {
+            for (size_t i = 0; i < n; ++i) {
+                const double w = shard_weights[i];
+                if (!std::isfinite(w) || w < 0.0) {
+                    return false;
+                }
+                weights[i] = w;
+            }
+        }
+        double sum = std::accumulate(weights.begin(), weights.end(), 0.0);
+        if (n == 1 && !(sum > 0.0)) {
+            weights[0] = 1.0;
+            sum = 1.0;
+        }
+        if (!(sum > 0.0) || !std::isfinite(sum)) {
+            return false;
+        }
+
+        struct remainder {
+            size_t index;
+            double fraction;
+        };
+        std::vector<remainder> remainders;
+        remainders.reserve(n);
+        uint64_t assigned = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double exact =
+                weights[i] * double(LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR) / sum;
+            const uint32_t base = uint32_t(std::floor(exact));
+            built.shard_weights[i] = base;
+            assigned += base;
+            remainders.push_back({ i, exact - double(base) });
+        }
+        std::stable_sort(remainders.begin(), remainders.end(),
+            [](const remainder & a, const remainder & b) {
+                if (a.fraction != b.fraction) {
+                    return a.fraction > b.fraction;
+                }
+                return a.index < b.index;
+            });
+        if (assigned > LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR) {
+            return false;
+        }
+        for (uint32_t i = uint32_t(assigned);
+             i < LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR; ++i) {
+            built.shard_weights[remainders[
+                (i - uint32_t(assigned)) % remainders.size()].index]++;
+        }
+        built.digest = acct_compute_topology_digest(built);
+        if (!acct_digest_nonzero(built.digest.bytes())) {
+            return false;
+        }
+        out = std::move(built);
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+llama_cache_acct_resource_domain llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency residency) {
+    llama_cache_acct_resource_domain out;
+    out.residency = residency;
+    out.kind      = llama_cache_acct_domain_kind::not_applicable;
+    return out;
+}
+
+bool llama_cache_acct_resource_domain_valid(const llama_cache_acct_resource_domain & domain) {
+    if (domain.residency >= llama_cache_acct_residency::_count ||
+        domain.kind      >= llama_cache_acct_domain_kind::_count) {
+        return false;
+    }
+
+    if (domain.kind == llama_cache_acct_domain_kind::not_applicable) {
+        return domain.residency != llama_cache_acct_residency::device &&
+               !domain.device_ordinal &&
+               !domain.topology;
+    }
+
+    return domain.residency == llama_cache_acct_residency::device &&
+           bool(domain.device_ordinal) && bool(domain.topology);
+}
+
+static bool acct_topology_valid(const llama_cache_acct_shard_topology & topology) {
+    if (topology.version != LLAMA_CACHE_ACCT_TOPOLOGY_VERSION ||
+        topology.device_count == 0 ||
+        topology.device_count > llama_max_devices() ||
+        topology.device_identities.size() != topology.device_count ||
+        topology.shard_weights.size() != topology.device_count ||
+        topology.split_mode < 0 || topology.split_mode > 3 ||
+        !topology.main_device ||
+        topology.main_device.v >= topology.device_count ||
+        !acct_digest_nonzero(topology.digest.bytes()) ||
+        topology.digest != acct_compute_topology_digest(topology)) {
+        return false;
+    }
+    uint64_t weight_sum = 0;
+    for (size_t i = 0; i < topology.device_count; ++i) {
+        if (!acct_digest_nonzero(topology.device_identities[i].bytes())) {
+            return false;
+        }
+        weight_sum += topology.shard_weights[i];
+    }
+    return weight_sum == LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR;
+}
+
+static const llama_cache_acct_shard_topology * acct_snapshot_topology(
+        const llama_cache_acct_snapshot & snapshot,
+        llama_cache_acct_topology_id id) {
+    for (const auto & row : snapshot.topologies) {
+        if (row.id == id) {
+            return &row.topology;
+        }
+    }
+    return nullptr;
+}
+
+static bool acct_snapshot_domain_valid(
+        const llama_cache_acct_snapshot & snapshot,
+        const llama_cache_acct_resource_domain & domain) {
+    if (!llama_cache_acct_resource_domain_valid(domain)) {
+        return false;
+    }
+    if (domain.kind == llama_cache_acct_domain_kind::not_applicable) {
+        return true;
+    }
+    const auto * topology = acct_snapshot_topology(snapshot, domain.topology);
+    return topology && acct_topology_valid(*topology) &&
+           domain.device_ordinal.v < topology->device_count;
+}
+
+bool llama_cache_acct_snapshot_to_v1(
+        const llama_cache_acct_snapshot & source,
+        llama_cache_acct_snapshot_v1 & destination) noexcept {
+    destination = {};
+    destination.serial                    = source.serial;
+    destination.live_ops                  = source.live_ops;
+    destination.faults_invalid_transition = source.faults_invalid_transition;
+    destination.faults_overflow           = source.faults_overflow;
+    destination.faults_unknown_id         = source.faults_unknown_id;
+    destination.faults_allocation         = source.faults_allocation;
+    for (auto & categories : destination.cells) {
+        for (auto & cell : categories) {
+            for (auto & measure : cell.measures) {
+                measure = { 0, llama_cache_acct_known::unknown };
             }
         }
     }
-    // The ledger reports exactly what producers report into it; completeness stays unknown
-    // until the C aggregator can certify coverage.
-    state.completeness = llama_cache_acct_known::unknown;
+
+    const auto reject = [&destination]() {
+        destination.completeness = llama_cache_acct_known::unavailable;
+        return false;
+    };
+    const auto v1_domain = [&source](const llama_cache_acct_resource_domain & domain) {
+        return acct_snapshot_domain_valid(source, domain) &&
+               domain.kind == llama_cache_acct_domain_kind::not_applicable;
+    };
+    if (source.schema_version != LLAMA_CACHE_ACCT_SCHEMA_VERSION ||
+        source.completeness_manifest >= llama_cache_acct_known::_count) {
+        return reject();
+    }
+    for (size_t i = 0; i < source.cells.size(); ++i) {
+        const auto & row = source.cells[i];
+        if (row.category >= llama_cache_acct_category::_count ||
+            !v1_domain(row.domain) ||
+            row.certification != llama_cache_acct_known::known) {
+            return reject();
+        }
+        for (const auto & value : row.cell.measures) {
+            if (value.state >= llama_cache_acct_known::_count) {
+                return reject();
+            }
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (source.cells[j].category == row.category &&
+                source.cells[j].domain == row.domain) {
+                return reject();
+            }
+        }
+        destination.cells[size_t(row.category)][size_t(row.domain.residency)] = row.cell;
+    }
+    try {
+        destination.allocations.reserve(source.allocations.size());
+        for (const auto & row : source.allocations) {
+            if (row.category >= llama_cache_acct_category::_count ||
+                row.attribution.kind >= llama_cache_acct_attr_kind::_count ||
+                !v1_domain(row.domain) ||
+                row.certification != llama_cache_acct_known::known) {
+                destination.allocations.clear();
+                return reject();
+            }
+            destination.allocations.push_back({
+                row.alloc,
+                row.attribution,
+                row.category,
+                row.domain.residency,
+                row.logical_bytes,
+                row.resident_bytes,
+                row.committed_refs,
+                row.artifact_identity,
+                row.content_digest,
+                row.lineage_identity,
+            });
+        }
+    } catch (...) {
+        destination.allocations.clear();
+        return reject();
+    }
+
+    destination.completeness = source.completeness_manifest;
+    for (size_t i = 0; i < source.completeness.size(); ++i) {
+        const auto & row = source.completeness[i];
+        if (row.producer >= llama_cache_acct_producer::_count ||
+            row.state    >= llama_cache_acct_known::_count ||
+            !v1_domain(row.domain)) {
+            return reject();
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (source.completeness[j].domain == row.domain &&
+                source.completeness[j].producer == row.producer) {
+                return reject();
+            }
+        }
+        if (row.state == llama_cache_acct_known::unavailable) {
+            destination.completeness = llama_cache_acct_known::unavailable;
+        } else if (row.state == llama_cache_acct_known::unknown &&
+                   destination.completeness == llama_cache_acct_known::known) {
+            destination.completeness = llama_cache_acct_known::unknown;
+        }
+    }
+    return true;
 }
+
+llama_cache_acct_ledger::llama_cache_acct_ledger() = default;
 
 void llama_cache_acct_ledger::bump_serial() {
     if (state.serial == std::numeric_limits<uint64_t>::max()) {
@@ -29,76 +317,225 @@ void llama_cache_acct_ledger::bump_serial() {
     state.serial++;
 }
 
-void llama_cache_acct_ledger::cell_add(llama_cache_acct_category c, llama_cache_acct_residency r,
-                                       llama_cache_acct_measure m, uint64_t v) {
-    auto & cell = state.cells[size_t(c)][size_t(r)].measures[size_t(m)];
-    if (cell.state == llama_cache_acct_known::unavailable) {
-        return; // latched by a prior overflow; only a schema reset clears it
+const llama_cache_acct_shard_topology * llama_cache_acct_ledger::find_topology(
+        llama_cache_acct_topology_id id) const {
+    for (const auto & row : state.topologies) {
+        if (row.id == id) {
+            return &row.topology;
+        }
     }
-    if (cell.value > std::numeric_limits<uint64_t>::max() - v) {
-        cell.state = llama_cache_acct_known::unavailable;
+    return nullptr;
+}
+
+bool llama_cache_acct_ledger::domain_registered(
+        const llama_cache_acct_resource_domain & domain) const {
+    if (!llama_cache_acct_resource_domain_valid(domain)) {
+        return false;
+    }
+    if (domain.kind == llama_cache_acct_domain_kind::not_applicable) {
+        return true;
+    }
+    const auto * topology = find_topology(domain.topology);
+    return topology && domain.device_ordinal.v < topology->device_count;
+}
+
+bool llama_cache_acct_ledger::domain_manifested(
+        const llama_cache_acct_resource_domain & domain) const {
+    return std::any_of(state.completeness.begin(), state.completeness.end(),
+        [&](const auto & row) { return row.domain == domain; });
+}
+
+bool llama_cache_acct_ledger::domain_use_valid(
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain) const {
+    return category < llama_cache_acct_category::_count &&
+           domain_registered(domain) && domain_manifested(domain);
+}
+
+llama_cache_acct_known llama_cache_acct_ledger::domain_certification(
+        const llama_cache_acct_resource_domain & domain) const {
+    if (state.completeness_manifest != llama_cache_acct_known::known) {
+        return llama_cache_acct_known::unavailable;
+    }
+    bool found = false;
+    for (const auto & row : state.completeness) {
+        if (row.domain != domain) {
+            continue;
+        }
+        found = true;
+        if (row.state != llama_cache_acct_known::known) {
+            return llama_cache_acct_known::unavailable;
+        }
+    }
+    return found ? llama_cache_acct_known::known
+                 : llama_cache_acct_known::unavailable;
+}
+
+llama_cache_acct_cell_row * llama_cache_acct_ledger::find_cell(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain) {
+    for (auto & row : state.cells) {
+        if (row.category == c && row.domain == domain) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+llama_cache_acct_completeness_row * llama_cache_acct_ledger::find_completeness(
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_producer producer) {
+    for (auto & row : state.completeness) {
+        if (row.domain == domain && row.producer == producer) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+void llama_cache_acct_ledger::cell_add(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure m,
+        uint64_t v) {
+    auto * row = find_cell(c, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
+        return;
+    }
+    auto & value = row->cell.measures[size_t(m)];
+    if (value.state == llama_cache_acct_known::unavailable) {
+        return;
+    }
+    if (value.value > std::numeric_limits<uint64_t>::max() - v) {
+        value.state = llama_cache_acct_known::unavailable;
         state.faults_overflow++;
         return;
     }
-    cell.value += v;
-    cell.state  = llama_cache_acct_known::known;
+    value.value += v;
+    value.state  = llama_cache_acct_known::known;
 }
 
-void llama_cache_acct_ledger::cell_sub(llama_cache_acct_category c, llama_cache_acct_residency r,
-                                       llama_cache_acct_measure m, uint64_t v) {
-    auto & cell = state.cells[size_t(c)][size_t(r)].measures[size_t(m)];
-    if (cell.state == llama_cache_acct_known::unavailable) {
+void llama_cache_acct_ledger::cell_sub(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure m,
+        uint64_t v) {
+    auto * row = find_cell(c, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
         return;
     }
-    if (cell.value < v) {
-        // an underflow is an accounting bug, not a shipped-path condition: latch, count
-        cell.state = llama_cache_acct_known::unavailable;
+    auto & value = row->cell.measures[size_t(m)];
+    if (value.state == llama_cache_acct_known::unavailable) {
+        return;
+    }
+    if (value.value < v) {
+        value.state = llama_cache_acct_known::unavailable;
         state.faults_overflow++;
         return;
     }
-    cell.value -= v;
-    cell.state  = llama_cache_acct_known::known;
+    value.value -= v;
+    value.state  = llama_cache_acct_known::known;
 }
 
-void llama_cache_acct_ledger::cell_latch_unavailable(llama_cache_acct_category c,
-                                                     llama_cache_acct_residency r,
-                                                     llama_cache_acct_measure m) {
-    state.cells[size_t(c)][size_t(r)].measures[size_t(m)].state =
-        llama_cache_acct_known::unavailable;
+void llama_cache_acct_ledger::cell_latch_unavailable(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure m) {
+    auto * row = find_cell(c, domain);
+    if (row) {
+        row->cell.measures[size_t(m)].state = llama_cache_acct_known::unavailable;
+    } else {
+        state.faults_invalid_transition++;
+    }
 }
 
-void llama_cache_acct_ledger::staged_add(llama_cache_acct_category c, llama_cache_acct_residency r,
-                                         uint64_t v) {
-    auto & now = staged_now[size_t(c)][size_t(r)];
-    if (now > std::numeric_limits<uint64_t>::max() - v) {
-        state.faults_overflow++;
-        cell_latch_unavailable(c, r, llama_cache_acct_measure::transient_peak);
+void llama_cache_acct_ledger::staged_add(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain,
+        uint64_t v) {
+    auto * row = find_cell(c, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
         return;
     }
-    now += v;
-    // the peak is the high-water mark of CONCURRENTLY staged bytes
-    auto & peak = state.cells[size_t(c)][size_t(r)].measures[size_t(llama_cache_acct_measure::transient_peak)];
-    if (peak.state != llama_cache_acct_known::unavailable && now > peak.value) {
-        peak.value = now;
+    if (row->staged > std::numeric_limits<uint64_t>::max() - v) {
+        state.faults_overflow++;
+        row->cell.measures[size_t(llama_cache_acct_measure::transient_peak)].state =
+            llama_cache_acct_known::unavailable;
+        return;
+    }
+    row->staged += v;
+    auto & peak = row->cell.measures[size_t(llama_cache_acct_measure::transient_peak)];
+    if (peak.state != llama_cache_acct_known::unavailable && row->staged > peak.value) {
+        peak.value = row->staged;
         peak.state = llama_cache_acct_known::known;
     }
 }
 
-void llama_cache_acct_ledger::staged_sub(llama_cache_acct_category c, llama_cache_acct_residency r,
-                                         uint64_t v) {
-    auto & now = staged_now[size_t(c)][size_t(r)];
-    if (now < v) {
-        state.faults_overflow++;
-        cell_latch_unavailable(c, r, llama_cache_acct_measure::transient_peak);
+void llama_cache_acct_ledger::staged_sub(
+        llama_cache_acct_category c,
+        const llama_cache_acct_resource_domain & domain,
+        uint64_t v) {
+    auto * row = find_cell(c, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
         return;
     }
-    now -= v;
+    if (row->staged < v) {
+        state.faults_overflow++;
+        cell_latch_unavailable(c, domain, llama_cache_acct_measure::transient_peak);
+        return;
+    }
+    row->staged -= v;
 }
 
 void llama_cache_acct_ledger::maybe_retire(alloc_entry & entry) {
     if (entry.ever_committed && entry.staged_refs == 0 && entry.committed_refs == 0) {
-        // the id is DEAD: the tombstone survives so it can never name a new allocation
         entry.retired = true;
+    }
+}
+
+bool llama_cache_acct_ledger::make_device_domain(
+        const llama_cache_acct_shard_topology & topology,
+        llama_cache_acct_device_ordinal ordinal,
+        llama_cache_acct_resource_domain & out) {
+    std::lock_guard<std::mutex> lock(mtx);
+    out = {};
+    if (!acct_topology_valid(topology) ||
+        !ordinal || ordinal.v >= topology.device_count) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return false;
+    }
+    try {
+        llama_cache_acct_topology_id id;
+        for (const auto & row : state.topologies) {
+            if (row.topology == topology) {
+                id = row.id;
+                break;
+            }
+        }
+        if (!id) {
+            if (state.topologies.size() >= std::numeric_limits<uint32_t>::max()) {
+                state.faults_overflow++;
+                bump_serial();
+                return false;
+            }
+            id = { uint32_t(state.topologies.size() + 1) };
+            state.topologies.push_back({ id, topology });
+            bump_serial();
+        }
+        out.residency      = llama_cache_acct_residency::device;
+        out.kind           = llama_cache_acct_domain_kind::device_topology;
+        out.device_ordinal = ordinal;
+        out.topology       = id;
+        return true;
+    } catch (...) {
+        state.faults_allocation++;
+        bump_serial();
+        return false;
     }
 }
 
@@ -110,8 +547,6 @@ llama_cache_acct_alloc_id llama_cache_acct_ledger::new_alloc() {
         return {};
     }
     try {
-        // the registry entry IS the mint: identity exists before any citation, and it
-        // survives retirement as a tombstone (no id resurrection)
         const llama_cache_acct_alloc_id id = next_alloc_id;
         allocs.emplace(id, alloc_entry{});
         next_alloc_id.v++;
@@ -124,15 +559,18 @@ llama_cache_acct_alloc_id llama_cache_acct_ledger::new_alloc() {
 }
 
 llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
-        llama_cache_acct_category      category,
-        llama_cache_acct_residency     residency,
-        llama_cache_acct_attribution   attribution,
-        uint64_t                       expected_logical,
-        uint64_t                       expected_resident) {
-    (void) expected_logical; // expectation is observational; only commit charges logical
-
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_attribution attribution,
+        uint64_t expected_logical,
+        uint64_t expected_resident) {
+    (void) expected_logical;
     std::lock_guard<std::mutex> lock(mtx);
-
+    if (!domain_use_valid(category, domain)) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return {};
+    }
     if (next_op.v == std::numeric_limits<uint64_t>::max()) {
         state.faults_overflow++;
         bump_serial();
@@ -140,18 +578,24 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
     }
 
     try {
-        const llama_cache_acct_op_id op = next_op;
-        next_op.v++;
+        // Aggregate/staging trackers were created atomically with the manifest.
+        if (!find_cell(category, domain)) {
+            state.faults_invalid_transition++;
+            bump_serial();
+            return {};
+        }
 
+        const llama_cache_acct_op_id op = next_op;
         txn t;
         t.state          = llama_cache_acct_txn_state::reserved;
         t.category       = category;
-        t.residency      = residency;
+        t.domain         = domain;
         t.attribution    = attribution;
         t.reserved_bytes = expected_resident;
         ops.emplace(op, t);
+        next_op.v++;
 
-        cell_add(category, residency, llama_cache_acct_measure::reserved, expected_resident);
+        cell_add(category, domain, llama_cache_acct_measure::reserved, expected_resident);
         bump_serial();
         return op;
     } catch (...) {
@@ -161,13 +605,14 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
     }
 }
 
-bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_alloc_id alloc,
-                                    uint64_t resident_bytes,
-                                    llama_cache_acct_artifact_id    artifact,
-                                    llama_cache_acct_content_digest digest,
-                                    llama_cache_acct_lineage_id     lineage) {
+bool llama_cache_acct_ledger::stage(
+        llama_cache_acct_op_id op,
+        llama_cache_acct_alloc_id alloc,
+        uint64_t resident_bytes,
+        llama_cache_acct_artifact_id artifact,
+        llama_cache_acct_content_digest digest,
+        llama_cache_acct_lineage_id lineage) {
     std::lock_guard<std::mutex> lock(mtx);
-
     auto it = ops.find(op);
     if (it == ops.end()) {
         state.faults_unknown_id++;
@@ -179,14 +624,13 @@ bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_
         bump_serial();
         return false;
     }
-    // allocation ids must come from new_alloc(): the registry entry is the mint proof
+    const auto & domain = it->second.domain;
     auto ait = allocs.find(alloc);
     if (!alloc || ait == allocs.end()) {
         state.faults_unknown_id++;
         bump_serial();
         return false;
     }
-    // a retired id names a DEAD physical allocation: citing it again is resurrection
     if (ait->second.retired) {
         state.faults_invalid_transition++;
         bump_serial();
@@ -194,31 +638,31 @@ bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_
     }
 
     if (ait->second.tuple_set) {
-        // the citation tuple is immutable — identity fields included: a mismatched
-        // re-citation is a fault, never a silent merge (false charge-once would undercount)
-        if (ait->second.category != it->second.category ||
-            ait->second.residency != it->second.residency ||
+        if (ait->second.category       != it->second.category ||
+            ait->second.domain         != domain ||
             ait->second.resident_bytes != resident_bytes ||
-            ait->second.artifact != artifact ||
-            ait->second.digest   != digest ||
-            ait->second.lineage  != lineage) {
+            ait->second.artifact       != artifact ||
+            ait->second.digest         != digest ||
+            ait->second.lineage        != lineage) {
             state.faults_invalid_transition++;
             bump_serial();
             return false;
         }
-    } else {
-        ait->second.tuple_set      = true;
-        ait->second.category       = it->second.category;
-        ait->second.residency      = it->second.residency;
-        ait->second.resident_bytes = resident_bytes;
-        ait->second.artifact       = artifact;
-        ait->second.digest         = digest;
-        ait->second.lineage        = lineage;
     }
     if (ait->second.staged_refs == std::numeric_limits<uint32_t>::max()) {
         state.faults_overflow++;
         bump_serial();
         return false;
+    }
+
+    if (!ait->second.tuple_set) {
+        ait->second.tuple_set      = true;
+        ait->second.category       = it->second.category;
+        ait->second.domain         = domain;
+        ait->second.resident_bytes = resident_bytes;
+        ait->second.artifact       = artifact;
+        ait->second.digest         = digest;
+        ait->second.lineage        = lineage;
     }
     ait->second.staged_refs++;
 
@@ -228,15 +672,13 @@ bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_
     it->second.artifact       = artifact;
     it->second.digest         = digest;
     it->second.lineage        = lineage;
-
-    staged_add(it->second.category, it->second.residency, resident_bytes);
+    staged_add(it->second.category, it->second.domain, resident_bytes);
     bump_serial();
     return true;
 }
 
 bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical_bytes) {
     std::lock_guard<std::mutex> lock(mtx);
-
     auto it = ops.find(op);
     if (it == ops.end()) {
         state.faults_unknown_id++;
@@ -248,7 +690,6 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
         bump_serial();
         return false;
     }
-
     auto ait = allocs.find(it->second.alloc);
     if (ait == allocs.end()) {
         state.faults_unknown_id++;
@@ -257,16 +698,8 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
     }
 
     auto & entry = ait->second;
-    // defensive: a retired allocation accepts no commit (unreachable while retirement
-    // accounts for staged claims, but fail loudly if that invariant ever breaks)
-    if (entry.retired) {
-        state.faults_invalid_transition++;
-        bump_serial();
-        return false;
-    }
-    if (entry.committed_refs > 0 && entry.charged_logical != logical_bytes) {
-        // a shared immutable allocation has ONE logical size; a mismatched later commit is
-        // a fault and does not join the refcount
+    if (entry.retired ||
+        (entry.committed_refs > 0 && entry.charged_logical != logical_bytes)) {
         state.faults_invalid_transition++;
         bump_serial();
         return false;
@@ -278,24 +711,21 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
     }
 
     it->second.state = llama_cache_acct_txn_state::committed;
-
-    // the staged and reserved observations both resolve at the publication boundary
-    staged_sub(it->second.category, it->second.residency, it->second.resident_bytes);
+    staged_sub(it->second.category, it->second.domain, it->second.resident_bytes);
     if (entry.staged_refs > 0) {
         entry.staged_refs--;
     }
-    cell_sub(it->second.category, it->second.residency,
+    cell_sub(it->second.category, it->second.domain,
              llama_cache_acct_measure::reserved, it->second.reserved_bytes);
 
     entry.committed_refs++;
     entry.ever_committed = true;
     if (entry.committed_refs == 1) {
-        // charge-once: the first committed reference charges the allocation's durable bytes
         entry.charged_logical = logical_bytes;
         entry.attribution     = it->second.attribution;
-        cell_add(entry.category, entry.residency,
-                 llama_cache_acct_measure::logical_payload,    entry.charged_logical);
-        cell_add(entry.category, entry.residency,
+        cell_add(entry.category, entry.domain,
+                 llama_cache_acct_measure::logical_payload, entry.charged_logical);
+        cell_add(entry.category, entry.domain,
                  llama_cache_acct_measure::resident_allocated, entry.resident_bytes);
     }
     bump_serial();
@@ -304,7 +734,6 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
 
 bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
     std::lock_guard<std::mutex> lock(mtx);
-
     auto it = ops.find(op);
     if (it == ops.end()) {
         state.faults_unknown_id++;
@@ -318,14 +747,10 @@ bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
         return false;
     }
 
-    // zero durable delta: the reservation unwinds by the RESERVED amount, the concurrent
-    // staged tracking by the ACTUAL amount; the transient peak stays observed. The op is
-    // erased — an aborted transaction holds nothing. The allocation entry persists (mint
-    // registry), keeping its tuple immutable for any other citation.
-    cell_sub(it->second.category, it->second.residency,
+    cell_sub(it->second.category, it->second.domain,
              llama_cache_acct_measure::reserved, it->second.reserved_bytes);
     if (it->second.state == llama_cache_acct_txn_state::staged) {
-        staged_sub(it->second.category, it->second.residency, it->second.resident_bytes);
+        staged_sub(it->second.category, it->second.domain, it->second.resident_bytes);
         auto ait = allocs.find(it->second.alloc);
         if (ait != allocs.end() && ait->second.staged_refs > 0) {
             ait->second.staged_refs--;
@@ -339,7 +764,6 @@ bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
 
 bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
     std::lock_guard<std::mutex> lock(mtx);
-
     auto it = ops.find(op);
     if (it == ops.end()) {
         state.faults_unknown_id++;
@@ -351,7 +775,6 @@ bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
         bump_serial();
         return false;
     }
-
     auto ait = allocs.find(it->second.alloc);
     if (ait == allocs.end() || ait->second.committed_refs == 0) {
         state.faults_unknown_id++;
@@ -361,57 +784,199 @@ bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
 
     ait->second.committed_refs--;
     if (ait->second.committed_refs == 0) {
-        cell_sub(ait->second.category, ait->second.residency,
-                 llama_cache_acct_measure::logical_payload,    ait->second.charged_logical);
-        cell_sub(ait->second.category, ait->second.residency,
+        cell_sub(ait->second.category, ait->second.domain,
+                 llama_cache_acct_measure::logical_payload, ait->second.charged_logical);
+        cell_sub(ait->second.category, ait->second.domain,
                  llama_cache_acct_measure::resident_allocated, ait->second.resident_bytes);
     }
-    // a staged claim may still commit: retirement waits for BOTH claim kinds to drain
     maybe_retire(ait->second);
     ops.erase(it);
     bump_serial();
     return true;
 }
 
-void llama_cache_acct_ledger::gauge_set(llama_cache_acct_category category,
-                                        llama_cache_acct_residency residency,
-                                        llama_cache_acct_measure measure,
-                                        uint64_t value) {
+void llama_cache_acct_ledger::gauge_set(
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure measure,
+        uint64_t value) {
     std::lock_guard<std::mutex> lock(mtx);
-
-    auto & cell = state.cells[size_t(category)][size_t(residency)].measures[size_t(measure)];
-    if (cell.state == llama_cache_acct_known::unavailable) {
+    if (measure >= llama_cache_acct_measure::_count ||
+        !domain_use_valid(category, domain)) {
+        state.faults_invalid_transition++;
+        bump_serial();
         return;
     }
-    cell.value = value;
-    cell.state = llama_cache_acct_known::known;
+    auto * row = find_cell(category, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return;
+    }
+    auto & cell = row->cell.measures[size_t(measure)];
+    if (cell.state != llama_cache_acct_known::unavailable) {
+        cell.value = value;
+        cell.state = llama_cache_acct_known::known;
+        bump_serial();
+    }
+}
+
+void llama_cache_acct_ledger::mark_unavailable(
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure measure) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (measure >= llama_cache_acct_measure::_count ||
+        !domain_use_valid(category, domain)) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return;
+    }
+    cell_latch_unavailable(category, domain, measure);
     bump_serial();
 }
 
-void llama_cache_acct_ledger::mark_unavailable(llama_cache_acct_category category,
-                                               llama_cache_acct_residency residency,
-                                               llama_cache_acct_measure measure) {
+bool llama_cache_acct_ledger::configure_required_producers(
+        const llama_cache_acct_completeness_requirement * requirements,
+        size_t n_requirements) {
     std::lock_guard<std::mutex> lock(mtx);
-    cell_latch_unavailable(category, residency, measure);
-    bump_serial();
+    if ((n_requirements > 0 && !requirements) ||
+        !ops.empty() || !state.cells.empty() || !state.completeness.empty()) {
+        state.faults_invalid_transition++;
+        if (state.completeness_manifest == llama_cache_acct_known::unknown) {
+            state.completeness_manifest = llama_cache_acct_known::unavailable;
+        }
+        bump_serial();
+        return false;
+    }
+    try {
+        std::vector<llama_cache_acct_completeness_row> next;
+        std::vector<llama_cache_acct_resource_domain> domains;
+        std::vector<llama_cache_acct_cell_row> cells;
+        next.reserve(n_requirements);
+        domains.reserve(n_requirements);
+        for (size_t i = 0; i < n_requirements; ++i) {
+            const auto & req = requirements[i];
+            if (req.producer >= llama_cache_acct_producer::_count ||
+                !domain_registered(req.domain)) {
+                state.faults_invalid_transition++;
+                state.completeness_manifest = llama_cache_acct_known::unavailable;
+                bump_serial();
+                return false;
+            }
+            const bool duplicate = std::any_of(next.begin(), next.end(), [&](const auto & row) {
+                return row.domain == req.domain && row.producer == req.producer;
+            });
+            if (duplicate) {
+                state.faults_invalid_transition++;
+                state.completeness_manifest = llama_cache_acct_known::unavailable;
+                bump_serial();
+                return false;
+            }
+            next.push_back({ req.domain, req.producer, llama_cache_acct_known::unknown });
+            if (std::find(domains.begin(), domains.end(), req.domain) == domains.end()) {
+                domains.push_back(req.domain);
+            }
+        }
+        cells.reserve(domains.size() * size_t(llama_cache_acct_category::_count));
+        for (const auto & domain : domains) {
+            for (size_t c = 0; c < size_t(llama_cache_acct_category::_count); ++c) {
+                llama_cache_acct_cell_row row;
+                row.category = llama_cache_acct_category(c);
+                row.domain   = domain;
+                cells.push_back(std::move(row));
+            }
+        }
+        state.completeness.swap(next);
+        state.cells.swap(cells);
+        state.completeness_manifest = llama_cache_acct_known::known;
+        bump_serial();
+        return true;
+    } catch (...) {
+        state.faults_allocation++;
+        state.completeness_manifest = llama_cache_acct_known::unavailable;
+        bump_serial();
+        return false;
+    }
+}
+
+bool llama_cache_acct_ledger::certify_complete(
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_producer producer) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto * row = find_completeness(domain, producer);
+    if (!row) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return false;
+    }
+    if (row->state == llama_cache_acct_known::unavailable) {
+        return false;
+    }
+    if (row->state == llama_cache_acct_known::unknown) {
+        row->state = llama_cache_acct_known::known;
+        bump_serial();
+    }
+    return true;
+}
+
+void llama_cache_acct_ledger::mark_producer_unavailable(
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_producer producer) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto * row = find_completeness(domain, producer);
+    if (!row) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return;
+    }
+    if (row->state != llama_cache_acct_known::unavailable) {
+        row->state = llama_cache_acct_known::unavailable;
+        bump_serial();
+    }
 }
 
 llama_cache_acct_snapshot llama_cache_acct_ledger::snapshot() {
     std::lock_guard<std::mutex> lock(mtx);
-
-    llama_cache_acct_snapshot out = state;
-    out.live_ops = (uint64_t) ops.size();
+    llama_cache_acct_snapshot out;
     try {
+        out = state;
+        out.live_ops = (uint64_t) ops.size();
+        std::vector<std::pair<llama_cache_acct_resource_domain, llama_cache_acct_known>>
+            domain_certifications;
+        domain_certifications.reserve(state.completeness.size());
+        const auto certification_for =
+            [this, &domain_certifications](const llama_cache_acct_resource_domain & domain) {
+                for (const auto & cached : domain_certifications) {
+                    if (cached.first == domain) {
+                        return cached.second;
+                    }
+                }
+                const auto certification = domain_certification(domain);
+                domain_certifications.emplace_back(domain, certification);
+                return certification;
+            };
+        for (auto & row : out.cells) {
+            row.certification = certification_for(row.domain);
+            if (row.certification != llama_cache_acct_known::known) {
+                for (auto & measure : row.cell.measures) {
+                    if (measure.state != llama_cache_acct_known::unknown) {
+                        measure = { 0, llama_cache_acct_known::unavailable };
+                    }
+                }
+            }
+        }
         out.allocations.reserve(allocs.size());
         for (const auto & [alloc, entry] : allocs) {
             if (entry.committed_refs == 0) {
-                continue; // staged-only and retired allocations are not durable rows
+                continue;
             }
             llama_cache_acct_allocation_row row;
             row.alloc             = alloc;
             row.attribution       = entry.attribution;
             row.category          = entry.category;
-            row.residency         = entry.residency;
+            row.domain            = entry.domain;
+            row.certification     = certification_for(entry.domain);
             row.logical_bytes     = entry.charged_logical;
             row.resident_bytes    = entry.resident_bytes;
             row.committed_refs    = entry.committed_refs;
@@ -420,13 +985,22 @@ llama_cache_acct_snapshot llama_cache_acct_ledger::snapshot() {
             row.lineage_identity  = entry.lineage;
             out.allocations.push_back(row);
         }
+        return out;
     } catch (...) {
         state.faults_allocation++;
         bump_serial();
-        out.allocations.clear();
-        out.completeness = llama_cache_acct_known::unavailable;
-        out.faults_allocation = state.faults_allocation;
-        out.serial            = state.serial;
+
+        llama_cache_acct_snapshot failed;
+        failed.serial                    = state.serial;
+        failed.completeness_manifest     = llama_cache_acct_known::unavailable;
+        failed.live_ops                  = (uint64_t) ops.size();
+        failed.faults_invalid_transition = state.faults_invalid_transition;
+        failed.faults_overflow           = state.faults_overflow;
+        failed.faults_unknown_id         = state.faults_unknown_id;
+        failed.faults_allocation         = state.faults_allocation;
+        // The failure object intentionally carries no partially-copied rows. Its manifest
+        // state is the complete fail-closed signal; retrying allocation inside an allocation
+        // failure handler would make the non-throwing contract recursive.
+        return failed;
     }
-    return out;
 }

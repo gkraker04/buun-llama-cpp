@@ -41,6 +41,8 @@ foreach(def
         "enum class common_cache_plan_planner_status : uint8_t"
         "enum class llama_cache_acct_category : uint8_t"
         "enum class llama_cache_acct_residency : uint8_t"
+        "enum class llama_cache_acct_domain_kind : uint8_t"
+        "enum class llama_cache_acct_producer : uint8_t"
         "enum class llama_cache_acct_measure : uint8_t"
         "enum class llama_cache_acct_known : uint8_t"
         "enum class llama_cache_acct_unit : uint8_t"
@@ -51,6 +53,74 @@ foreach(def
         message(FATAL_ERROR "expected exactly one definition of '${def}', found ${def_count}")
     endif()
 endforeach()
+foreach(alias
+        "using llama_cache_acct_device_digest ="
+        "using llama_cache_acct_topology_digest =")
+    count_literal("${all_source}" "${alias}" alias_count)
+    if (NOT alias_count EQUAL 1)
+        message(FATAL_ERROR "expected exactly one tagged digest alias '${alias}', found ${alias_count}")
+    endif()
+endforeach()
+
+# --- C schema-v2 resource identity and explicit v1 adapter are one-definition contracts ---
+foreach(def
+        "struct llama_cache_acct_resource_domain"
+        "struct llama_cache_acct_shard_topology"
+        "struct llama_cache_acct_topology_row"
+        "struct llama_cache_acct_completeness_row"
+        "struct llama_cache_acct_snapshot_v1")
+    count_literal("${all_source}" "${def}" def_count)
+    if (NOT def_count EQUAL 1)
+        message(FATAL_ERROR "expected exactly one definition of '${def}', found ${def_count}")
+    endif()
+endforeach()
+file(READ "${SOURCE_ROOT}/src/llama-cache-accounting.h" acct_v2_header)
+file(READ "${SOURCE_ROOT}/src/llama-cache-accounting.cpp" acct_v2_source)
+count_literal("${acct_v2_header}" "bool llama_cache_acct_snapshot_to_v1(" v1_adapter_decls)
+count_literal("${acct_v2_source}" "bool llama_cache_acct_snapshot_to_v1(" v1_adapter_defs)
+if (NOT v1_adapter_decls EQUAL 1 OR NOT v1_adapter_defs EQUAL 1)
+    message(FATAL_ERROR
+        "expected one declaration + one definition of explicit C-v1 adapter, found "
+        "${v1_adapter_decls}/${v1_adapter_defs}")
+endif()
+count_literal("${acct_v2_header}" "bool llama_cache_acct_build_shard_topology(" topology_builder_decls)
+count_literal("${acct_v2_source}" "bool llama_cache_acct_build_shard_topology(" topology_builder_defs)
+if (NOT topology_builder_decls EQUAL 1 OR NOT topology_builder_defs EQUAL 1)
+    message(FATAL_ERROR
+        "canonical topology builder drifted (header/source definitions "
+        "${topology_builder_decls}/${topology_builder_defs})")
+endif()
+count_literal("${acct_v2_source}" "llama_sha256_writer" topology_writer_uses)
+if (NOT topology_writer_uses EQUAL 2)
+    message(FATAL_ERROR
+        "accounting identity digests must use the canonical writer (found "
+        "${topology_writer_uses} uses)")
+endif()
+foreach(retired_shape "llama_sha256 hash" "staged_now" "find_staged")
+    string(FIND "${acct_v2_source}" "${retired_shape}" retired_found)
+    string(FIND "${acct_v2_header}" "${retired_shape}" retired_header_found)
+    if (NOT retired_found EQUAL -1 OR NOT retired_header_found EQUAL -1)
+        message(FATAL_ERROR
+            "retired accounting identity/staging shape returned: '${retired_shape}'")
+    endif()
+endforeach()
+
+# Record schema 3 embeds accounting schema 2. The compile-time table is the authority; these
+# source pins ensure the JSON schema could not move while either side's version stayed put.
+foreach(schema_pin
+        "constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 3"
+        "common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION)"
+        "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2")
+    count_literal("${all_source}" "${schema_pin}" schema_pin_count)
+    if (NOT schema_pin_count EQUAL 1)
+        message(FATAL_ERROR "record/accounting schema coupling drifted: '${schema_pin}'")
+    endif()
+endforeach()
+file(READ "${SOURCE_ROOT}/tools/server/bench/cache_plan_common.py" cache_plan_reader)
+string(FIND "${cache_plan_reader}" "SUPPORTED_SCHEMAS = (1, 2, 3)" schema_reader_pin)
+if (schema_reader_pin EQUAL -1)
+    message(FATAL_ERROR "cache-plan reader does not explicitly accept v1/v2/v3")
+endif()
 
 # --- name spellings are SINGULAR: every reason name is extracted mechanically from the
 # X-macro list (its one authoritative spelling) and any second quoted occurrence anywhere in
@@ -73,6 +143,61 @@ foreach(entry IN LISTS reason_entries)
         message(FATAL_ERROR "name-table replica: \"${name}\" spelled ${name_count} times")
     endif()
 endforeach()
+
+# Operation/allocation ids are process-local ledger handles. They may live in the in-memory
+# server cache owner, but must not enter a public/state envelope or the JSON bridge. Glob the
+# whole serialization/API surface: a renamed/new file must enter the scan automatically.
+file(GLOB_RECURSE acct_serialization_files LIST_DIRECTORIES false
+    "${SOURCE_ROOT}/include/*"
+    "${SOURCE_ROOT}/common/*.h" "${SOURCE_ROOT}/common/*.cpp"
+    "${SOURCE_ROOT}/src/llama-io*"
+    "${SOURCE_ROOT}/tools/server/server-common*")
+foreach(path IN LISTS acct_serialization_files)
+    file(READ "${path}" text)
+    foreach(process_local_symbol IN ITEMS
+            llama_cache_acct_op_id
+            llama_cache_acct_alloc_id)
+        string(FIND "${text}" "${process_local_symbol}" found)
+        if (NOT found EQUAL -1)
+            message(FATAL_ERROR
+                "process-local accounting id reached serialization/API surface: "
+                "${path} (${process_local_symbol})")
+        endif()
+    endforeach()
+endforeach()
+
+# C/F freeze requirement 9: the ledger snapshot is the sole aggregate byte-cell shape.
+# Production consumers may carry the snapshot, but cannot grow a parallel container of its
+# cell/allocation rows. This is reader-agnostic and globbed; the negative control proves the
+# scanner, rather than a hand-listed current file.
+function(acct_find_private_aggregates corpus output)
+    string(REGEX MATCHALL
+        "(array|vector|unordered_map)[ \t]*<[^;\\n]*(llama_cache_acct_cell|llama_cache_acct_cell_row|llama_cache_acct_allocation_row)"
+        private_hits "${corpus}")
+    set(${output} "${private_hits}" PARENT_SCOPE)
+endfunction()
+set(acct_consumer_source "")
+foreach(path IN LISTS contract_files)
+    if (path STREQUAL "${SOURCE_ROOT}/src/llama-cache-accounting.h" OR
+        path STREQUAL "${SOURCE_ROOT}/src/llama-cache-accounting.cpp" OR
+        path MATCHES "/tests/")
+        continue()
+    endif()
+    file(READ "${path}" text)
+    string(APPEND acct_consumer_source "${text}\n")
+endforeach()
+acct_find_private_aggregates("${acct_consumer_source}" private_acct_aggregates)
+if (private_acct_aggregates)
+    message(FATAL_ERROR
+        "C/F freeze requirement 9: private accounting aggregate container found: "
+        "${private_acct_aggregates}")
+endif()
+set(acct_private_negative
+    "${acct_consumer_source}\nstd::vector<llama_cache_acct_cell_row> private_cache_bytes;")
+acct_find_private_aggregates("${acct_private_negative}" private_acct_negative_hits)
+if (NOT private_acct_negative_hits)
+    message(FATAL_ERROR "C/F freeze requirement 9 negative control did not trip")
+endif()
 
 # non-reason closed names keep the representative replica ban
 foreach(name "\"valid_not_chosen_cost\"" "\"restore_failed_fell_back_cold\"" "\"rolling_window_tape\"")

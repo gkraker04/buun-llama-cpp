@@ -1,4 +1,4 @@
-// B0/B decision-record contract tests (schema v2): band monotonicity (compile-time),
+// B0/B decision-record contract tests (schema v3): band monotonicity (compile-time),
 // multi-failure first-reason precedence including out-of-order arrival, valid-loser
 // disposition, per-entry inventory merge/overflow/completeness semantics, selection
 // mapping, planner-output clearing, unknown-vs-zero on measured fields, and exhaustive
@@ -175,7 +175,7 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 2);
+    CHECK(rec.schema_version == 3);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -228,7 +228,7 @@ static void test_name_tables() {
     }
     // and the closed inventory really is closed: exactly today's four providers
     CHECK(uint8_t(common_cache_plan_provider::_count) == 4);
-    // schema v2 member census + sentinel (compile-time pinned; echoed here as a wire check)
+    // schema-v3 record retains the v2 reason census + sentinel (compile-time pinned)
     CHECK(COMMON_CACHE_PLAN_REASON_MEMBER_COUNT == 30);
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
 }
@@ -271,8 +271,31 @@ static void test_json_serialization() {
     host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
     host->predicted_total_us = llama_cache_acct_value::measured(50000);
 
+    // Record schema-v3 / accounting-v2 bridge: interned topology table plus per-domain
+    // producer completeness, with explicit not_applicable rather than fabricated zeroes.
+    llama_cache_acct_ledger ledger;
+    const auto domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::not_applicable);
+    llama_cache_acct_shard_topology topology;
+    CHECK(llama_cache_acct_build_shard_topology(
+        std::vector<std::string>{ "record-test-device" }, 1, 0, nullptr, topology));
+    llama_cache_acct_resource_domain device_domain;
+    CHECK(ledger.make_device_domain(topology, { 0 }, device_domain));
+    const llama_cache_acct_completeness_requirement requirements[] = {
+        { domain, llama_cache_acct_producer::observer_init },
+        { device_domain, llama_cache_acct_producer::host_cache },
+    };
+    CHECK(ledger.configure_required_producers(requirements, 2));
+    ledger.gauge_set(llama_cache_acct_category::rolling_window_tape, domain,
+                     llama_cache_acct_measure::logical_payload, 0);
+    ledger.gauge_set(llama_cache_acct_category::live_attention_state, device_domain,
+                     llama_cache_acct_measure::resident_allocated, 1234);
+    CHECK(ledger.certify_complete(domain, llama_cache_acct_producer::observer_init));
+    CHECK(ledger.certify_complete(device_domain, llama_cache_acct_producer::host_cache));
+    rec.acct = ledger.snapshot();
+
     const auto j = common_cache_plan_record_json(rec);
-    CHECK(j["schema_version"] == 2);
+    CHECK(j["schema_version"] == 3);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
@@ -289,6 +312,25 @@ static void test_json_serialization() {
     CHECK(j["inventory_states"]["host_cache_entry"] == "complete");
     CHECK(j["delivered_chain"] == nlohmann::ordered_json::array(
         {"host_cache_entry", "live_context_checkpoint"}));
+    CHECK(j["accounting"]["schema_version"] == 2);
+    CHECK(j["accounting"]["completeness_manifest"] == "known");
+    CHECK(j["accounting"]["cells"][0]["domain"]["kind"] == "not_applicable");
+    CHECK(j["accounting"]["cells"][0]["domain"]["device_ordinal"] == "not_applicable");
+    CHECK(j["accounting"]["cells"][0]["certification"] == "known");
+    CHECK(j["accounting"]["cells"][0]["value"] == 0);
+    CHECK(j["accounting"]["cells"][1]["domain"]["device_ordinal"] == 0);
+    CHECK(j["accounting"]["cells"][1]["domain"]["topology_id"] == 1);
+    CHECK(j["accounting"]["topologies"].size() == 1);
+    CHECK(j["accounting"]["topologies"][0]["version"] == 1);
+    CHECK(j["accounting"]["topologies"][0]["digest"] ==
+          "ee2a4284677b3fc301fd80997cb041cf85a5c82d59e060a7832831dffbe5414d");
+    CHECK(j["accounting"]["topologies"][0]["device_identities"] ==
+          nlohmann::ordered_json::array(
+              {"43b772486999664b169f739107dca459818ffff40d1d3833ac9c8da18a4e5d5a"}));
+    CHECK(j["accounting"]["cells"][1]["value"] == 1234);
+    CHECK(j["accounting"]["completeness"][0]["producer"] == "observer_init");
+    CHECK(j["accounting"]["completeness"][0]["state"] == "known");
+    CHECK(j["accounting"]["completeness"][1]["domain"]["kind"] == "device_topology");
 }
 
 // finalize-shaped chain composition (verify-r4): the ONE tested implementation the server

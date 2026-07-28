@@ -49,7 +49,7 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
     return nullptr;
 }
 
-static std::string cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
+std::string common_cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out;
     out.reserve(digest.size()*2);
@@ -63,7 +63,7 @@ static std::string cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & 
 static std::string cache_plan_sha256_hex(const std::string & bytes) {
     llama_sha256 hash;
     hash.update(bytes.data(), bytes.size());
-    return cache_plan_sha256_hex_digest(hash.finish());
+    return common_cache_plan_sha256_hex_digest(hash.finish());
 }
 
 bool common_cache_plan_sha256_file_identity(const std::string & path, std::string & identity) {
@@ -83,7 +83,7 @@ bool common_cache_plan_sha256_file_identity(const std::string & path, std::strin
     if (file.bad()) {
         return false;
     }
-    identity = "sha256-" + cache_plan_sha256_hex_digest(hash.finish());
+    identity = "sha256-" + common_cache_plan_sha256_hex_digest(hash.finish());
     return true;
 }
 

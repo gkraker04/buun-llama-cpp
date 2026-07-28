@@ -129,6 +129,26 @@ const char * common_cache_acct_residency_name(llama_cache_acct_residency r) {
     return "invalid";
 }
 
+const char * common_cache_acct_domain_kind_name(llama_cache_acct_domain_kind k) {
+    switch (k) {
+        case llama_cache_acct_domain_kind::not_applicable: return "not_applicable";
+        case llama_cache_acct_domain_kind::device_topology: return "device_topology";
+        case llama_cache_acct_domain_kind::_count:          break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_acct_producer_name(llama_cache_acct_producer p) {
+    switch (p) {
+        case llama_cache_acct_producer::observer_init: return "observer_init";
+        case llama_cache_acct_producer::host_cache:    return "host_cache";
+        case llama_cache_acct_producer::live_memory:   return "live_memory";
+        case llama_cache_acct_producer::retention_sidecar: return "retention_sidecar";
+        case llama_cache_acct_producer::_count:        break;
+    }
+    return "invalid";
+}
+
 const char * common_cache_acct_measure_name(llama_cache_acct_measure m) {
     switch (m) {
         case llama_cache_acct_measure::logical_payload:    return "logical_payload";
@@ -230,6 +250,21 @@ static json cache_plan_value_json(const llama_cache_acct_value & v) {
         return json(v.value);
     }
     return json(common_cache_acct_known_name(v.state));
+}
+
+static json cache_acct_domain_json(const llama_cache_acct_resource_domain & domain) {
+    json out = {
+        { "residency", common_cache_acct_residency_name(domain.residency) },
+        { "kind",      common_cache_acct_domain_kind_name(domain.kind) },
+    };
+    if (domain.kind == llama_cache_acct_domain_kind::not_applicable) {
+        out["device_ordinal"] = "not_applicable";
+        out["topology_id"] = "not_applicable";
+        return out;
+    }
+    out["device_ordinal"] = domain.device_ordinal.v;
+    out["topology_id"] = domain.topology.v;
+    return out;
 }
 
 // phase-bit spellings (single source; CI scans ban replicas like the other name tables)
@@ -425,26 +460,58 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         // touched cells only (state != unknown) — a known ZERO is an observation and is
         // emitted; an unknown cell is silence, never a zero
         json cells = json::array();
-        for (size_t c = 0; c < size_t(llama_cache_acct_category::_count); c++) {
-            for (size_t r = 0; r < size_t(llama_cache_acct_residency::_count); r++) {
-                for (size_t m = 0; m < size_t(llama_cache_acct_measure::_count); m++) {
-                    const auto & cell = rec.acct.cells[c][r].measures[m];
-                    if (cell.state == llama_cache_acct_known::unknown) {
-                        continue;
-                    }
-                    cells.push_back(json {
-                        { "category",  common_cache_acct_category_name(llama_cache_acct_category(c)) },
-                        { "residency", common_cache_acct_residency_name(llama_cache_acct_residency(r)) },
-                        { "measure",   common_cache_acct_measure_name(llama_cache_acct_measure(m)) },
-                        { "value",     cache_plan_value_json(cell) },
-                    });
+        for (const auto & row : rec.acct.cells) {
+            for (size_t m = 0; m < size_t(llama_cache_acct_measure::_count); m++) {
+                const auto & cell = row.cell.measures[m];
+                if (cell.state == llama_cache_acct_known::unknown) {
+                    continue;
                 }
+                cells.push_back(json {
+                    { "category", common_cache_acct_category_name(row.category) },
+                    { "domain",   cache_acct_domain_json(row.domain) },
+                    { "certification", common_cache_acct_known_name(row.certification) },
+                    { "measure",  common_cache_acct_measure_name(llama_cache_acct_measure(m)) },
+                    { "value",    cache_plan_value_json(cell) },
+                });
             }
+        }
+
+        json topologies = json::array();
+        for (const auto & row : rec.acct.topologies) {
+            json devices = json::array();
+            for (const auto & identity : row.topology.device_identities) {
+                devices.push_back(common_cache_plan_sha256_hex_digest(identity.bytes()));
+            }
+            topologies.push_back(json {
+                { "id",                  row.id.v },
+                { "version",             row.topology.version },
+                { "digest",              common_cache_plan_sha256_hex_digest(
+                                                row.topology.digest.bytes()) },
+                { "split_mode",          row.topology.split_mode },
+                { "main_device_ordinal", row.topology.main_device.v },
+                { "device_identities",   std::move(devices) },
+                { "shard_weights",       row.topology.shard_weights },
+                { "weight_denominator",  LLAMA_CACHE_ACCT_SHARD_WEIGHT_DENOMINATOR },
+            });
+        }
+
+        // Configuration-owned required manifest, reported row-for-row. There is
+        // intentionally no server-wide completeness scalar in accounting schema v2.
+        json completeness = json::array();
+        for (const auto & row : rec.acct.completeness) {
+            completeness.push_back(json {
+                { "domain",   cache_acct_domain_json(row.domain) },
+                { "producer", common_cache_acct_producer_name(row.producer) },
+                { "state",    common_cache_acct_known_name(row.state) },
+            });
         }
         out["accounting"] = json {
             { "schema_version", rec.acct.schema_version },
             { "serial",         rec.acct.serial },
-            { "completeness",   common_cache_acct_known_name(rec.acct.completeness) },
+            { "completeness_manifest",
+                common_cache_acct_known_name(rec.acct.completeness_manifest) },
+            { "completeness",   std::move(completeness) },
+            { "topologies",     std::move(topologies) },
             { "live_ops",       rec.acct.live_ops },
             { "cells",          std::move(cells) },
             { "faults", json {
