@@ -4243,6 +4243,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
+        {"--cache-debug"},
+        string_format("emit one shadow cache-plan decision record per request as a JSON log line and expose the last record in /slots (default: %s)", params.cache_debug ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_debug = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {

@@ -792,6 +792,9 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    // B0 shadow cache-plan observer: strictly zero observer work when disabled
+    bool cache_debug = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
 

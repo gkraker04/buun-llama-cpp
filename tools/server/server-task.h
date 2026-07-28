@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
 #include "llama.h"
 
 #include <string>
@@ -638,6 +639,12 @@ struct server_prompt_cache_state {
     // only served from an entry whose key matches the requesting slot's current adapter config
     std::string adapter_config_key;
 
+    // C0 shadow accounting op ids, one per charged leaf category (0 = not charged): opened at
+    // the publish boundary, released when the entry leaves `states` [P2]
+    uint64_t acct_op_snapshot = 0;
+    uint64_t acct_op_ckpt     = 0;
+    uint64_t acct_op_accel    = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -680,9 +687,32 @@ struct server_prompt_cache {
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
     void publish(std::list<server_prompt_cache_state> entry);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key);
+    // `obs` is the B0 shadow observer row for the host_cache_entry candidate (nullptr = observer
+    // off). It only receives values this selection already computes — never a re-scan [B-a].
+    // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
+    // candidate loop is the pre-B0 loop with zero observer branches.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs = nullptr);
+
+    template <bool Observed>
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs);
 
     void update();
+
+    // C0 shadow ledger (nullptr = off). publish() records the publication boundary as
+    // reserve→stage→commit per charged leaf; every path that removes an entry from `states`
+    // releases its ops — including whole-cache destruction/replacement (model reload), or the
+    // surviving ledger would carry phantom host-cache bytes. Observational only — never
+    // blocks, orders, or interrupts the shipped mutation [C-a]; the ledger is non-throwing
+    // and outlives this cache by member order in server_context_impl.
+    llama_cache_acct_ledger * acct = nullptr;
+
+    ~server_prompt_cache() {
+        clear_accounting();
+    }
+
+    void clear_accounting();
+    void acct_charge_entry(server_prompt_cache_state & st);
+    void acct_release_entry(server_prompt_cache_state & st);
 };
 
 // used exclusively by router mode

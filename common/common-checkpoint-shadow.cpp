@@ -306,6 +306,17 @@ common_checkpoint_shadow_evaluation common_checkpoint_shadow_evaluate(
     return out;
 }
 
+const char * common_checkpoint_shadow_category_name(common_checkpoint_shadow_category category) {
+    switch (category) {
+        case common_checkpoint_shadow_category::not_applicable:             return "not_applicable";
+        case common_checkpoint_shadow_category::generation_unknown:         return "generation_unknown";
+        case common_checkpoint_shadow_category::strict_accept:              return "strict_accept";
+        case common_checkpoint_shadow_category::live_rebased_shadow_accept: return "live_rebased_shadow_accept";
+        case common_checkpoint_shadow_category::strict_reject:              return "strict_reject";
+    }
+    return "invalid";
+}
+
 const char * common_checkpoint_shadow_eval_reason_name(common_checkpoint_shadow_eval_reason reason) {
     switch (reason) {
         case common_checkpoint_shadow_eval_reason::none:                       return "none";

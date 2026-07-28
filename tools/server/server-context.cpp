@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "common-cache-plan.h"
 #include "common-checkpoint-shadow.h"
 #include "common-checkpoint-coordinator.h"
 #include "fit.h"
@@ -309,6 +310,19 @@ struct server_shadow_global_state {
     std::string last_reason;
 };
 
+// B0 shadow cache-plan observer state [P2 §7.7]. Enabled iff params_base.cache_debug (the
+// one flag; no mirror): records are allocated, populated, and serialized only under it, and
+// the C0 ledger is wired to the prompt cache only then. Observer faults are caught outside
+// the shipped decision path and become shadow_unavailable — never a changed live choice.
+// Both counters are surfaced on every emitted record ("observer" object).
+struct server_cache_plan_observer {
+    uint64_t records_finalized  = 0;
+    uint64_t shadow_unavailable = 0;
+
+    // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
+    llama_cache_acct_ledger ledger;
+};
+
 struct server_slot {
     int id;
 
@@ -320,6 +334,12 @@ struct server_slot {
     common_shadow_relation_evidence shadow_ws4_l;
     common_shadow_relation_evidence shadow_ws4_g;
     const server_shadow_global_state * shadow_global = nullptr;
+
+    // B0 shadow cache-plan record [P2]: in-flight (allocated per request only when the
+    // observer is enabled — absence IS the disabled state) + this slot's last finalized
+    // record, serialized once at finalize and reused verbatim by /slots
+    std::unique_ptr<common_cache_plan_record> cache_plan;
+    json cache_plan_json;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -449,7 +469,7 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_candidate * obs = nullptr) {
         // A host snapshot replaces the live frontier wholesale. Any rolling
         // tape rooted in the displaced frontier is no longer a valid lineage.
         if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
@@ -457,7 +477,7 @@ struct server_slot {
             return false;
         }
         dflash_window_identity.clear();
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, adapter_config_key);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, adapter_config_key, obs);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -837,6 +857,11 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
+            // B0: a request that ends before its record finalized (error, cancel) resolves
+            // the in-flight record here, exactly once, by deliberate drop — an incomplete
+            // request has no truthful outcome to emit
+            cache_plan.reset();
+
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
@@ -1180,6 +1205,11 @@ struct server_slot {
             if (!cache_status.empty()) {
                 res["cache_status"] = cache_status; // [obs] why the last prompt (partially) reprocessed
             }
+            // B0 shadow decision record [P2 §7.7]: last finalized record for this slot,
+            // built once at finalize. Only ever non-null under --cache-debug.
+            if (!cache_plan_json.is_null()) {
+                res["cache_plan"] = cache_plan_json;
+            }
             if (dflash_window_restore_generation > 0) {
                 const char * restore_codec =
                     dflash_window_restore_codec == LLAMA_DFLASH_WINDOW_CODEC_F16
@@ -1498,6 +1528,121 @@ private:
     // §9.1–9.3 + §8.3–8.5 shadow lifecycle/qualification state (commit 3): counters, the
     // F5 applicability latch, versioned WS-7 evidence, and the /slots surface source.
     server_shadow_global_state shadow_state;
+
+    // B0 shadow cache-plan observer + C0 ledger [P2]. Constructed ONLY under
+    // params_base.cache_debug (B-a literal: no observer object, no 456-cell ledger init, no
+    // hook work of any kind on the disabled path — absence IS the disabled state). Declared
+    // before prompt_cache so the ledger outlives the cache's accounting-release destructor.
+    std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
+
+    // B0 finalize [P2 §7.7]: exactly one final record per request, emitted only after the
+    // actual restore/cold path AND all fallible trims/fallbacks and the prompt replay have
+    // settled — the call sites ride the SAME timing points that feed metrics.on_prompt_eval
+    // (no second clock). ttft_known=false for embedding/rerank: their prompt completes but
+    // there is no first generated token, so TTFT stays typed unavailable. Every observer
+    // fault is caught here, outside the shipped decision path.
+    void cache_plan_finalize(server_slot & slot, bool ttft_known = true) {
+        if (!slot.cache_plan) {
+            return;
+        }
+        try {
+            auto & rec = *slot.cache_plan;
+
+            // once-only: outcome != unknown IS the finalized state; a second finalization
+            // attempt on the same record is an observer fault, never a second emission
+            if (rec.outcome != common_cache_plan_outcome::unknown) {
+                if (cache_plan_obs) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
+                slot.cache_plan.reset();
+                return;
+            }
+
+            rec.n_prompt_tokens   = llama_cache_acct_value::measured((uint64_t) slot.task->n_tokens());
+            rec.n_reused_tokens   = llama_cache_acct_value::measured((uint64_t) slot.n_prompt_tokens_cache);
+            rec.n_replayed_tokens = llama_cache_acct_value::measured((uint64_t) slot.n_prompt_tokens_processed);
+            if (ttft_known) {
+                // measured actual (t_prompt_processing is ms) — never an estimate slot
+                rec.ttft_us = llama_cache_acct_value::measured((uint64_t) (slot.t_prompt_processing * 1000.0));
+            }
+
+            // live-slot evidence comes from the FINAL post-trim state, not the selection
+            // heuristics: realized prefix reuse IS live-slot delivery (with the default zero
+            // similarity threshold an LRU pick can still reuse its own prefix), and a
+            // stage-1 heuristic reject is superseded by that fact. PROVENANCE guard (F2): a
+            // host restore replaces the slot state wholesale, so a positive final reuse
+            // count after host delivery is the HOST's prefix — never attributed to the
+            // original live slot.
+            if (slot.n_prompt_tokens_cache > 0 &&
+                !rec.candidates[size_t(common_cache_plan_provider::host_cache_entry)].delivered) {
+                auto & live = rec.row(common_cache_plan_provider::live_slot);
+                live.disposition = common_cache_plan_disposition::accepted;
+                live.delivered   = true;
+                live.reason      = COMMON_CACHE_PLAN_REASON_NONE;
+                live.lcp_tokens  = llama_cache_acct_value::measured((uint64_t) slot.n_prompt_tokens_cache);
+            }
+
+            // cold replay is the always-valid floor: it always has a row, and it delivered
+            // exactly when nothing else did
+            {
+                auto & cold = rec.row(common_cache_plan_provider::cold_replay);
+                cold.disposition = common_cache_plan_disposition::accepted;
+            }
+
+            // chosen = the TERMINAL delivered provider (delivery is data recorded at each
+            // site; the causal chain is emitted separately, so composition is not lost)
+            const common_cache_plan_provider terminal_order[] = {
+                common_cache_plan_provider::live_context_checkpoint,
+                common_cache_plan_provider::host_cache_entry,
+                common_cache_plan_provider::live_slot,
+            };
+            const common_cache_plan_candidate * delivered_row = nullptr;
+            for (const auto prov : terminal_order) {
+                const auto & c = rec.candidates[size_t(prov)];
+                if (c.present && c.delivered) {
+                    delivered_row = &c;
+                    rec.chosen    = prov;
+                    break;
+                }
+            }
+
+            if (delivered_row) {
+                rec.outcome = common_cache_plan_outcome::restored;
+            } else if (rec.restore_attempt_failed) {
+                rec.outcome = common_cache_plan_outcome::restore_failed_fell_back_cold;
+                rec.chosen  = common_cache_plan_provider::cold_replay;
+            } else {
+                rec.outcome = common_cache_plan_outcome::cold;
+                rec.chosen  = common_cache_plan_provider::cold_replay;
+            }
+            if (rec.chosen == common_cache_plan_provider::cold_replay) {
+                rec.candidates[size_t(common_cache_plan_provider::cold_replay)].delivered = true;
+            }
+
+            if (cache_plan_obs) {
+                rec.acct = cache_plan_obs->ledger.snapshot();
+            }
+
+            json out = common_cache_plan_record_json(rec);
+            if (cache_plan_obs) {
+                cache_plan_obs->records_finalized++;
+                out["observer"] = json {
+                    { "records_finalized",  cache_plan_obs->records_finalized },
+                    { "shadow_unavailable", cache_plan_obs->shadow_unavailable },
+                };
+            }
+
+            SRV_INF("CACHE_PLAN %s\n", out.dump().c_str());
+
+            slot.cache_plan_json = std::move(out); // built once; /slots reuses it verbatim
+            slot.cache_plan.reset();
+        } catch (...) {
+            if (cache_plan_obs) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+            slot.cache_plan.reset();
+        }
+    }
 
     // Q2 consumer (accepted ruling, worklog:6763-6769): producer-delivered, reason-coded reset
     // with an authenticated closed scope. An ordinary capture failure resets server-wide WS-7
@@ -2969,6 +3114,23 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // B0/C0 shadow observer [P2]: constructed only under params_base.cache_debug — the
+        // observer object, the C0 ledger, and both surfaces exist iff the flag is set. Off =
+        // strictly zero observer work (B-a).
+        if (params_base.cache_debug) {
+            cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+            if (prompt_cache) {
+                prompt_cache->acct = &cache_plan_obs->ledger;
+            }
+            // the parked rolling-window tape's zero is OBSERVED, not implied: an explicit
+            // measured-zero gauge, distinct from every unknown cell
+            cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::rolling_window_tape,
+                    llama_cache_acct_residency::not_applicable,
+                    llama_cache_acct_measure::logical_payload, 0);
+            SRV_INF("%s", "cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan)\n");
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -3181,11 +3343,38 @@ private:
         // how close the rejected candidates came)
         float sim_best_any = 0;
 
+        // B0: begin the multi-stage record BEFORE any selection-side mutation [B-a]. The
+        // selection scan below is read-only; the record exists only under --cache-debug, and
+        // every row write from here on is noexcept (fixed-array record), so the shipped path
+        // cannot throw through the observer. An allocation fault is swallowed and counted.
+        std::unique_ptr<common_cache_plan_record> plan_rec;
+        if (cache_plan_obs) {
+            try {
+                plan_rec = std::make_unique<common_cache_plan_record>();
+                plan_rec->id_task = task.id;
+                // opaque identity evidence from already-computed keys (never raw values);
+                // identities the server has not computed stay typed unknown
+                plan_rec->identity.model_digest = llama_cache_acct_value::measured(
+                    std::hash<std::string>{}(model_name));
+                plan_rec->identity.execution_digest = llama_cache_acct_value::measured(
+                    std::hash<std::string>{}(frontier_execution_identity));
+            } catch (...) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+        }
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                if (plan_rec) {
+                    plan_rec->selection = common_cache_plan_selection::by_id;
+                    // forced selection carries no reuse verdict, but the provider WAS
+                    // observed — the row exists with disposition unavailable; finalize
+                    // upgrades it from realized prefix reuse
+                    plan_rec->row(common_cache_plan_provider::live_slot);
+                }
             }
         }
 
@@ -3229,12 +3418,24 @@ private:
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             sim_best, slot_prompt_similarity, f_keep);
+                    if (plan_rec) {
+                        plan_rec->selection = common_cache_plan_selection::similarity;
+                        auto & row = plan_rec->row(common_cache_plan_provider::live_slot);
+                        row.disposition = common_cache_plan_disposition::accepted;
+                        row.sim         = sim_best; row.sim_known    = true;
+                        row.f_keep      = f_keep;   row.f_keep_known = true;
+                    }
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+            }
+
+            if (plan_rec) {
+                plan_rec->sim_best_any       = sim_best_any;
+                plan_rec->sim_best_any_known = true;
             }
         }
 
@@ -3271,6 +3472,13 @@ private:
                 SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
                         lcp_best, (double) lcp_best / task.tokens.size(), slot_prompt_similarity);
 
+                if (plan_rec) {
+                    plan_rec->selection = common_cache_plan_selection::route_home;
+                    auto & row = plan_rec->row(common_cache_plan_provider::live_slot);
+                    row.disposition = common_cache_plan_disposition::accepted;
+                    row.lcp_tokens  = llama_cache_acct_value::measured(lcp_best);
+                }
+
                 update_cache = true;
             }
         }
@@ -3302,11 +3510,27 @@ private:
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
                         t_last, sim_best_any);
 
+                if (plan_rec) {
+                    plan_rec->selection = common_cache_plan_selection::lru;
+                    // the shipped path found no reusable live-slot prefix: an empty fleet
+                    // has no provider; otherwise coverage was below the threshold
+                    plan_rec->row(common_cache_plan_provider::live_slot).note_reject(
+                        sim_best_any > 0.0f
+                            ? COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT
+                            : COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
+                }
+
                 update_cache = true;
             }
         }
 
         if (ret) {
+            // B0: the record follows the chosen slot; stages 2-3 and finalize find it there
+            if (plan_rec) {
+                plan_rec->id_slot = ret->id;
+                ret->cache_plan   = std::move(plan_rec);
+            }
+
             recurrent_shrink_for_prefill("before prompt cache save/load");
 
             // note: prompt_save() itself is a no-op when the slot's context is empty
@@ -3336,10 +3560,27 @@ private:
                 // clears this slot for the adapter change, so a restore here would consume a cache
                 // entry only to have it immediately wiped. (Cross-identity reuse -- moving a request
                 // onto a differently-bound LRU slot -- needs identity-aware selection, deferred.)
+                if (ret->cache_plan) {
+                    // adapter identity: the shipped path computes this key for the lookup
+                    ret->cache_plan->identity.adapter_config_digest = llama_cache_acct_value::measured(
+                        std::hash<std::string>{}(lora_config_identity(incoming_loras)));
+                }
                 if (are_lora_equal(incoming_loras, ret->lora)) {
-                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras))) {
+                    // B0 stage-2: the host-cache observer row rides the shipped lookup [B-a]
+                    common_cache_plan_candidate * obs = ret->cache_plan
+                        ? &ret->cache_plan->row(common_cache_plan_provider::host_cache_entry)
+                        : nullptr;
+                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras), obs)) {
+                        if (ret->cache_plan) {
+                            ret->cache_plan->restore_attempt_failed = true;
+                        }
                         ret->prompt_clear();
                     }
+                } else if (ret->cache_plan) {
+                    // shipped path skips the lookup entirely for the adapter change [finding 1]:
+                    // the host-cache candidate is rejected on adapter identity
+                    ret->cache_plan->row(common_cache_plan_provider::host_cache_entry)
+                        .note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
                 }
 
                 prompt_cache->update();
@@ -5632,6 +5873,10 @@ private:
                                     // from next_position rather than pos_max.
                                     std::string frontier_adapter_identity;
                                     bool frontier_eligible = false;
+                                    // per-selector [I9] rejection count: after a WS-4 flip
+                                    // the authoritative scan is this one, and its epoch
+                                    // rejections are NOT the legacy scan's
+                                    int n_ckpt_rejected_vbr_frontier = 0;
                                     auto it_frontier =
                                         slot.prompt.checkpoints.rend();
                                     bool frontier_shadow_available = true;
@@ -5660,6 +5905,7 @@ private:
                                                             vbr_now.representation_epoch ||
                                                         cur.representation_epoch_swa !=
                                                             vbr_now.representation_epoch_swa) {
+                                                        n_ckpt_rejected_vbr_frontier++;
                                                         return false;
                                                     }
                                                     return cur.computation_frontier.next_position <=
@@ -5908,6 +6154,15 @@ private:
                                                     size_t(shipped_choice) < scan_evals.size() &&
                                                     scan_evals[size_t(shipped_choice)].first) {
                                                     const auto & sel = scan_evals[size_t(shipped_choice)].second;
+                                                    // B0: transport the memoized A-track
+                                                    // evaluation of the SHIPPED choice into
+                                                    // the checkpoint row (one authority; the
+                                                    // evaluator ran in this scan, not for us)
+                                                    if (slot.cache_plan && sel.evaluated) {
+                                                        slot.cache_plan->row(
+                                                            common_cache_plan_provider::live_context_checkpoint)
+                                                            .gen_eval = sel;
+                                                    }
                                                     // verify r2 finding 2: only the four NAMED
                                                     // §5.5 classes count — the closed classifier
                                                     // is the one authority on what a tombstone is
@@ -6073,6 +6328,13 @@ private:
                                                             "VBR preflight was active but scoped freeze acquisition failed\n");
                                                     vbr_restore_freeze.reset();
                                                     do_reset = true;
+                                                    // B0: an attempted restore failed on
+                                                    // infrastructure, not eligibility
+                                                    if (slot.cache_plan) {
+                                                        slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
+                                                            .note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+                                                        slot.cache_plan->restore_attempt_failed = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -6085,6 +6347,11 @@ private:
                                         if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
                                             SLT_ERR(slot, "%s", "cannot discard rolling window before checkpoint restore\n");
                                             do_reset = true;
+                                            if (slot.cache_plan) {
+                                                slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
+                                                    .note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                slot.cache_plan->restore_attempt_failed = true;
+                                            }
                                         }
                                         slot.dflash_window_identity.clear();
                                         const size_t checkpoint_size = it->data_tgt.size();
@@ -6097,6 +6364,11 @@ private:
                                         if (!do_reset && n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                             do_reset = true;
+                                            if (slot.cache_plan) {
+                                                slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
+                                                    .note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                slot.cache_plan->restore_attempt_failed = true;
+                                            }
                                         } else if (!do_reset) {
                                             // restore the draft-side state, if any (draft-model checkpoints)
                                             it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -6136,6 +6408,11 @@ private:
 
                                             if (!checkpoint_aux_ok) {
                                                 do_reset = true;
+                                                if (slot.cache_plan) {
+                                                    slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
+                                                        .note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                    slot.cache_plan->restore_attempt_failed = true;
+                                                }
                                             } else {
                                                 checkpoint_tgt_recurrent_installed =
                                                     llama_model_is_hybrid(model_tgt);
@@ -6156,6 +6433,31 @@ private:
 
                                                 SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                                 slot.cache_status = "restored context checkpoint";
+                                                // B0 stage-3 [B-a]: transport the shipped
+                                                // restore's own values into the observer row.
+                                                // This site IS the delivery point — recorded
+                                                // as data, never inferred.
+                                                if (slot.cache_plan) {
+                                                    auto & row = slot.cache_plan->row(
+                                                        common_cache_plan_provider::live_context_checkpoint);
+                                                    row.disposition = common_cache_plan_disposition::accepted;
+                                                    row.delivered   = true;
+                                                    row.lcp_tokens =
+                                                        llama_cache_acct_value::measured((uint64_t) it->pos_max);
+                                                    row.payload_bytes =
+                                                        llama_cache_acct_value::measured((uint64_t) checkpoint_size);
+                                                    // rows the AUTHORITATIVE shipped scan
+                                                    // actually visited (frontier after a
+                                                    // WS-4 flip, else legacy) + that same
+                                                    // selector's epoch rejections
+                                                    row.siblings_scanned = (uint32_t)
+                                                        (it == slot.prompt.checkpoints.rend()
+                                                            ? slot.prompt.checkpoints.size()
+                                                            : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                                    row.siblings_rejected_epoch = (uint32_t)
+                                                        (use_frontier ? n_ckpt_rejected_vbr_frontier
+                                                                      : n_ckpt_rejected_vbr);
+                                                }
                                             }
                                         }
                                     }
@@ -6174,6 +6476,42 @@ private:
                                             : n_ckpt_rejected_vbr > 0
                                                 ? "full reprocess: checkpoint(s) rejected -- VBR representation changed [I9]"
                                                 : "full reprocess: no reusable context checkpoint";
+                                        // B0 stage-3: the same shipped classification, as a
+                                        // closed reason on the checkpoint candidate row. A
+                                        // concrete restore-failure reason recorded at its
+                                        // failure site takes precedence — the generic
+                                        // eligibility classification applies only to a row
+                                        // with no reason yet.
+                                        if (slot.cache_plan) {
+                                            auto & row = slot.cache_plan->row(
+                                                common_cache_plan_provider::live_context_checkpoint);
+                                            const int  n_rejected_sel = use_frontier
+                                                ? n_ckpt_rejected_vbr_frontier
+                                                : n_ckpt_rejected_vbr;
+                                            row.siblings_scanned = (uint32_t)
+                                                (it == slot.prompt.checkpoints.rend()
+                                                    ? slot.prompt.checkpoints.size()
+                                                    : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                            row.siblings_rejected_epoch = (uint32_t) n_rejected_sel;
+                                            if (row.reason == COMMON_CACHE_PLAN_REASON_NONE) {
+                                                if (vbr_preflight_rejected) {
+                                                    // restoring would demand a retier under the frozen
+                                                    // footprint: a representation-tier fit failure
+                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_TIER_UNSUPPORTED);
+                                                } else if (n_rejected_sel > 0) {
+                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
+                                                } else if (slot.prompt.checkpoints.empty()) {
+                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
+                                                } else {
+                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                                                }
+                                            }
+                                            // F1: this do_reset discards EVERYTHING already
+                                            // installed for the request (pos_next/n_past go
+                                            // to zero) — revoke historical deliveries; cold
+                                            // fallback dominates them
+                                            slot.cache_plan->revoke_deliveries();
+                                        }
                                         pos_next = 0;
                                         n_past = 0;
                                         n_past_keep = 0;
@@ -6236,6 +6574,12 @@ private:
                                 }
                                 if (n_past == 0) {
                                     slot.dflash_window_identity.clear();
+                                    // B0/F1: the full reset physically discarded whatever any
+                                    // provider installed — a policy reset, not a failed
+                                    // attempt, but delivery is revoked either way
+                                    if (slot.cache_plan) {
+                                        slot.cache_plan->revoke_deliveries();
+                                    }
                                 }
                             }
                         }
@@ -6283,6 +6627,9 @@ private:
                     const int64_t t_now = ggml_time_us();
                     slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
                     slot.print_timings_pp();
+                    // (B0 finalize deliberately does NOT happen here: replay tokens and the
+                    // fallible post-restore trim are still ahead — the record finalizes at
+                    // the metrics.on_prompt_eval timing points)
 
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
@@ -6340,6 +6687,22 @@ private:
                         slot.prompt.tokens.keep_first(0);
                         slot.n_prompt_tokens_cache = 0;
                         slot.n_prompt_tokens_processed = 0;
+
+                        // B0/F1: the suffix trim of the restore transaction was rejected and
+                        // everything installed was cleared — the delivered rows failed to
+                        // realize their frontier. Record the precise reason on each, revoke
+                        // delivery, and mark the attempt failed: cold fallback dominates.
+                        if (slot.cache_plan) {
+                            for (const auto prov : { common_cache_plan_provider::host_cache_entry,
+                                                     common_cache_plan_provider::live_context_checkpoint }) {
+                                auto & c = slot.cache_plan->candidates[size_t(prov)];
+                                if (c.present && c.delivered) {
+                                    c.note_reject(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID);
+                                }
+                            }
+                            slot.cache_plan->revoke_deliveries();
+                            slot.cache_plan->restore_attempt_failed = true;
+                        }
                     }
 
                     // Retiering resumes only after the coordinated restore+trim transaction.
@@ -7081,6 +7444,8 @@ private:
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
+                    // B0: no first generated token exists — TTFT stays typed unavailable
+                    cache_plan_finalize(slot, /*ttft_known=*/false);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -7088,6 +7453,7 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    cache_plan_finalize(slot, /*ttft_known=*/false);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -7143,6 +7509,7 @@ private:
                     slot.t_start_generation = ggml_time_us();
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                     metrics.on_prompt_eval(slot);
+                    cache_plan_finalize(slot); // B0: same timing point as the metrics clock
 
                     slot.i_batch = -1;
                     return;
@@ -7208,6 +7575,7 @@ private:
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(slot);
+                cache_plan_finalize(slot); // B0: replay + every trim/fallback settled, TTFT real
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;

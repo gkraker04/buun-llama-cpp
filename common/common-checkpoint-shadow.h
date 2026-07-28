@@ -130,6 +130,7 @@ common_checkpoint_shadow_evaluation common_checkpoint_shadow_evaluate(
         llama_seq_id                        seq_id,
         const common_computation_frontier & frontier);
 
+const char * common_checkpoint_shadow_category_name(common_checkpoint_shadow_category category);
 const char * common_checkpoint_shadow_eval_reason_name(common_checkpoint_shadow_eval_reason reason);
 const char * common_checkpoint_shadow_tombstone_name(common_checkpoint_shadow_tombstone tombstone);
 const char * common_checkpoint_shadow_observation_name(common_checkpoint_shadow_observation observation);

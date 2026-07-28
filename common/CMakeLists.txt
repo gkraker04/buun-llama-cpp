@@ -65,6 +65,8 @@ add_library(${TARGET}
     chat-peg-parser.h
     chat.cpp
     chat.h
+    common-cache-plan.cpp
+    common-cache-plan.h
     common-checkpoint-coordinator.cpp
     common-checkpoint-coordinator.h
     common-checkpoint-shadow.cpp

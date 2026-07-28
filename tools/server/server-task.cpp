@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <limits>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1739,6 +1741,94 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     return staged;
 }
 
+// C0 shadow producer [P2]: one accounting transaction per charged leaf category of a published
+// entry, at the publication boundary (the splice into `states`), released when the entry leaves
+// `states` on any path. Aggregate entry size is a provider grouping and is NEVER charged — the
+// leaves below are mutually exclusive so their sum cannot double-count. The fill-failure abort
+// mapping (stage() → abort) lands with F's real artifact transaction. The ledger is
+// non-throwing by contract, so no accounting failure can escape into the shipped cache path;
+// the `acct_unavailable` fault seam proves that invariance in the gate.
+void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
+    if (!acct) {
+        return;
+    }
+
+    // checked sums: an overflowing observation latches the leaf unavailable instead of
+    // charging a fabricated value (the shipped path is untouched either way)
+    uint64_t ckpt_bytes  = 0;
+    uint64_t accel_bytes = 0;
+    bool     sums_ok     = true;
+    const auto add_checked = [&sums_ok](uint64_t & acc, size_t v) {
+        if (acc > std::numeric_limits<uint64_t>::max() - (uint64_t) v) {
+            sums_ok = false;
+            return;
+        }
+        acc += (uint64_t) v;
+    };
+    for (const auto & ckpt : st.prompt.checkpoints) {
+        add_checked(ckpt_bytes, ckpt.data_tgt.size());
+        add_checked(ckpt_bytes, ckpt.data_dft.size());
+        add_checked(accel_bytes, ckpt.accel.size());
+    }
+
+    if (!sums_ok || server_fault("acct_unavailable")) { // [P2 gate] shipped-path invariance seam
+        for (const auto cat : { llama_cache_acct_category::full_snapshot_payload,
+                                llama_cache_acct_category::checkpoint_state_payload,
+                                llama_cache_acct_category::typed_accelerator_payload }) {
+            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+                                   llama_cache_acct_measure::logical_payload);
+        }
+        return;
+    }
+
+    // every transition result is checked: a failed stage/commit aborts the op (fail-closed,
+    // idempotent — abort on an erased op only faults), latches the leaf unavailable, and
+    // publishes NO op id, so the entry's later release cannot compound the fault
+    const auto charge = [this](llama_cache_acct_category cat, uint64_t bytes) -> uint64_t {
+        const auto op = acct->reserve(cat, llama_cache_acct_residency::pageable_host, {}, bytes, bytes);
+        if (op == 0) {
+            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+                                   llama_cache_acct_measure::logical_payload);
+            return 0;
+        }
+        if (!acct->stage(op, acct->new_alloc(), bytes) || !acct->commit(op, bytes)) {
+            acct->abort(op);
+            acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
+                                   llama_cache_acct_measure::logical_payload);
+            return 0;
+        }
+        return op;
+    };
+
+    st.acct_op_snapshot = charge(llama_cache_acct_category::full_snapshot_payload,     st.data.size());
+    st.acct_op_ckpt     = charge(llama_cache_acct_category::checkpoint_state_payload,  ckpt_bytes);
+    st.acct_op_accel    = charge(llama_cache_acct_category::typed_accelerator_payload, accel_bytes);
+}
+
+void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
+    if (!acct) {
+        return;
+    }
+    for (uint64_t * op : { &st.acct_op_snapshot, &st.acct_op_ckpt, &st.acct_op_accel }) {
+        if (*op != 0) {
+            acct->release(*op);
+            *op = 0;
+        }
+    }
+}
+
+// Release symmetry for whole-cache destruction/replacement (model reload swaps the cache
+// object while the observer ledger survives): every charged entry releases before the
+// container dies, or the next snapshot would carry phantom host-cache bytes.
+void server_prompt_cache::clear_accounting() {
+    if (!acct) {
+        return;
+    }
+    for (auto & st : states) {
+        acct_release_entry(st);
+    }
+}
+
 void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
     if (entry.empty()) {
         return;
@@ -1753,11 +1843,18 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
     states.splice(states.end(), entry);
     const auto self = std::prev(states.end());
 
+    if (acct) {
+        acct_charge_entry(*self);
+    }
+
     for (auto it = states.begin(); it != states.end();) {
         if (it != self && it->adapter_config_key == self->adapter_config_key) {
             const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
             if (len == (int) it->prompt.tokens.size()) {
                 SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+                if (acct) {
+                    acct_release_entry(*it);
+                }
                 it = states.erase(it);
                 continue;
             }
@@ -1772,7 +1869,14 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
     update();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key) {
+// The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer
+// off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
+// every `if constexpr (Observed)` block vanishes from the <false> instantiation.
+template <bool Observed>
+bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs) {
+    if constexpr (!Observed) {
+        (void) obs;
+    }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1781,6 +1885,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
+
+    // observer tallies [B-a]: these exist only in the observed instantiation, and only carry
+    // values this selection computes anyway
+    [[maybe_unused]] uint32_t obs_adapter_match = 0;
+    [[maybe_unused]] int      obs_lcp_sel       = 0;
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1799,6 +1908,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
+        if constexpr (Observed) {
+            obs_adapter_match++;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1814,6 +1927,28 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             sim_best    = sim_cur;
 
             it_best = it;
+            if constexpr (Observed) {
+                obs_lcp_sel = lcp_cur; // the winner's exact LCP, from the shipped computation
+            }
+        }
+    }
+
+    if constexpr (Observed) {
+        obs->siblings_scanned = (uint32_t) states.size();
+        if (it_best != states.end()) {
+            obs->disposition = common_cache_plan_disposition::accepted;
+            obs->sim        = sim_best;    obs->sim_known    = true;
+            obs->f_keep     = f_keep_best; obs->f_keep_known = true;
+            obs->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
+            obs->payload_bytes = llama_cache_acct_value::measured(it_best->size());
+        } else if (states.empty()) {
+            obs->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
+        } else if (obs_adapter_match == 0) {
+            // entries exist but none share the requesting adapter identity [I6]
+            obs->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
+        } else {
+            // identity-compatible entries exist but none beats the slot's own prefix coverage
+            obs->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
         }
     }
 
@@ -1837,6 +1972,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // [P0 gate]
         if (n_tgt != size_tgt) {
             SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
+            if constexpr (Observed) {
+                // the accepted row was ELIGIBILITY; the attempted restore failed short —
+                // note_reject demotes the disposition and records the structural reason
+                obs->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+            }
             return false;
         }
     }
@@ -1846,15 +1986,35 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, it_best->data.drft.data(), size_dft, id_slot, 0);
         if (n_dft != size_dft) {
             SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);
+            if constexpr (Observed) {
+                obs->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+            }
             return false;
         }
     }
 
-    // both sides restored: now it is safe to consume the entry
+    // both sides restored: now it is safe to consume the entry (its bytes become live-slot
+    // state, so its host-cache accounting charge is released here)
+    if constexpr (Observed) {
+        obs->delivered = true; // recorded at the delivery point, never inferred [B0]
+    }
+    if (acct) {
+        acct_release_entry(*it_best);
+    }
     prompt = std::move(it_best->prompt);
     states.erase(it_best);
 
     return true;
+}
+
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_candidate *);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_candidate *);
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs) {
+    // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
+    return obs != nullptr
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, obs)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr);
 }
 
 void server_prompt_cache::update() {
@@ -1862,6 +2022,9 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (acct) {
+                acct_release_entry(states.front());
+            }
             states.pop_front();
         }
     }
@@ -1877,6 +2040,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (acct) {
+                acct_release_entry(states.front());
+            }
             states.pop_front();
         }
     }

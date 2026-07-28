@@ -2,14 +2,7 @@ if (NOT DEFINED SOURCE_ROOT)
     message(FATAL_ERROR "SOURCE_ROOT is required")
 endif()
 
-function(count_literal text needle output)
-    string(LENGTH "${text}" before)
-    string(REPLACE "${needle}" "" stripped "${text}")
-    string(LENGTH "${stripped}" after)
-    string(LENGTH "${needle}" needle_length)
-    math(EXPR count "(${before} - ${after}) / ${needle_length}")
-    set(${output} "${count}" PARENT_SCOPE)
-endfunction()
+include("${CMAKE_CURRENT_LIST_DIR}/contract-scan-utils.cmake")
 
 file(GLOB_RECURSE implementation_sources
     "${SOURCE_ROOT}/src/*.cpp"

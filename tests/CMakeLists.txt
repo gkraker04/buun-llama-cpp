@@ -159,6 +159,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-checkpoint-shadow-lifecycle.cpp)
     target_include_directories(test-checkpoint-shadow-lifecycle PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-cache-accounting.cpp)
+    target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-cache-plan-record.cpp)
+    target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build(test-dflash-tape-vs-plane.cpp)
     target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -279,6 +285,13 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-generation-isolation.cmake
+)
+
+add_test(
+    NAME test-cache-plan-contract-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-contract.cmake
 )
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
