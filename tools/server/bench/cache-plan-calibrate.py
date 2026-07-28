@@ -44,8 +44,60 @@ def least_squares(xs, ys):
     return a, my - a * mx
 
 
+def fit_restore(xs, ys):
+    """Restore/workspace fit with the unidentifiable-slope rule: when payloads are
+    (near-)constant the slope is forced to exactly zero and workspace becomes the mean
+    residual. Returns (slope, workspace, flat_branch_taken)."""
+    a, b = least_squares(xs, ys)
+    if max(xs) - min(xs) < 0.01 * max(xs):
+        return 0.0, sum(ys) / len(ys), True
+    return a, b, False
+
+
+def self_test():
+    fails = 0
+    def check(cond, what):
+        nonlocal fails
+        if not cond:
+            print(f"FAIL: {what}", file=sys.stderr)
+            fails += 1
+
+    # exact-constant payloads (the 27B hybrid case): slope 0, workspace = mean
+    xs = [156894364] * 5
+    ys = [100.0, 110.0, 90.0, 105.0, 95.0]
+    a, b, flat = fit_restore(xs, ys)
+    check(flat and a == 0.0 and abs(b - 100.0) < 1e-9, "exact-constant -> 0 / mean")
+
+    # near-constant with a garbage POSITIVE raw slope (old bug kept it + a negative intercept)
+    xs = [1000000, 1001000, 1002000, 1003000, 1004000]
+    ys = [500.0, 100.0, 900.0, 200.0, 800.0]
+    raw_a, raw_b = least_squares(xs, ys)
+    a, b, flat = fit_restore(xs, ys)
+    check(raw_a > 0 and raw_b < 0, "near-constant raw fit is the pathological case")
+    check(flat and a == 0.0 and abs(b - 500.0) < 1e-9, "near-constant+ -> 0 / mean")
+
+    # near-constant with a garbage NEGATIVE raw slope
+    ys = [800.0, 200.0, 900.0, 100.0, 500.0]
+    raw_a, _ = least_squares(xs, ys)
+    a, b, flat = fit_restore(xs, ys)
+    check(raw_a < 0, "negative-slope cell is negative before the branch")
+    check(flat and a == 0.0 and abs(b - 500.0) < 1e-9, "near-constant- -> 0 / mean")
+
+    # genuinely identifiable slope: the branch must NOT fire
+    xs = [1_000_000, 10_000_000, 50_000_000, 100_000_000]
+    ys = [1100.0, 10100.0, 50100.0, 100100.0]   # ~1e-3 us/byte + 100 us
+    a, b, flat = fit_restore(xs, ys)
+    check(not flat and abs(a - 0.001) < 1e-6 and abs(b - 100.0) < 1.0,
+          "identifiable slope preserved")
+
+    print("all cache-plan-calibrate self-tests passed" if not fails else f"{fails} failure(s)")
+    return 1 if fails else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="cache-plan calibration sweep + fit")
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
     ap.add_argument("--server", default="http://localhost:8080")
     ap.add_argument("--log", required=True, help="the server's log file (--cache-debug on)")
     ap.add_argument("--lengths", default="64,128,256,512,1024",
@@ -131,15 +183,11 @@ def main():
     if len(restored) >= 4:
         xs = [r[0] for r in restored]
         ys = [r[2] - r[1] * replay_us_per_token for r in restored]  # ttft minus replay share
-        restore_us_per_byte, workspace_setup_us = least_squares(xs, ys)
-        if max(xs) - min(xs) < 0.01 * max(xs):
+        restore_us_per_byte, workspace_setup_us, flat = fit_restore(xs, ys)
+        if flat:
             # payloads (near-)constant — common on hybrid models whose checkpoint blob is
-            # dominated by the fixed-size recurrent state: the slope is UNIDENTIFIABLE, so
-            # force it to exactly zero and recompute the intercept as the mean residual.
-            # (Keeping a fitted slope here — of either sign — and its paired intercept would
-            # extrapolate wildly off the observed payload point.)
-            restore_us_per_byte = 0.0
-            workspace_setup_us  = sum(ys) / len(ys)
+            # dominated by the fixed-size recurrent state: the slope is UNIDENTIFIABLE (see
+            # fit_restore + --self-test)
             print(f"# note: restored payloads are (near-)constant ({min(xs)}..{max(xs)} B); "
                   "slope forced to 0, workspace = mean residual")
         print(f"# restored records: {len(restored)}, restore fit: {restore_us_per_byte:.6f} us/byte, "

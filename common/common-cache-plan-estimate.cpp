@@ -25,7 +25,7 @@ static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
 // 5 checkpoint restores — hybrid payloads constant at 156.9 MiB, restore cost FLAT
 // ~158 ms carried by workspace; crossover vs replay ~= 183 tokens.
 static const common_cache_plan_calib CALIB_DOREI_QWEN36_27B_VBR_3090 = {
-    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr-vbr-dynamic-auto-auto-auto-8.125-0.25", 1,
+    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr-vbr-dynamic-dynamic-runtime-controller--1.25-1.25-0-8.125-0.25", 1,
     861.510, 0.0, 158069.2,
 };
 
@@ -58,27 +58,30 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
     return prof;
 }
 
-std::string common_cache_plan_calib_kv(bool vbr_armed, bool vbr_k, bool vbr_v,
-                                       const std::string & type_k, const std::string & type_v,
-                                       const std::string & vbr_budget,
-                                       const std::string & vbr_min_bits,
-                                       const std::string & vbr_vram_budget,
-                                       const std::string & vbr_policy,
-                                       float reclaim_floor_bpv, float reset_keep_frac) {
-    const std::string k = (vbr_armed && vbr_k) ? "vbr" : type_k;
-    const std::string v = (vbr_armed && vbr_v) ? "vbr" : type_v;
-    std::string kv = "k" + k + "-v" + v;
-    if (!vbr_armed) {
+std::string common_cache_plan_calib_kv(const common_cache_plan_vbr_regime & vbr,
+                                       const std::string & type_k, const std::string & type_v) {
+    const std::string k = (vbr.armed && vbr.side_k) ? "vbr" : type_k;
+    const std::string v = (vbr.armed && vbr.side_v) ? "vbr" : type_v;
+    const std::string kv = "k" + k + "-v" + v;
+    if (!vbr.armed) {
         return kv;
     }
-    // regime signature: every knob that moves the ladder's cost. Rendered compactly and
-    // stably; the profile sanitizer squashes the rest.
-    // separators stay inside the sanitizer's squash class so the rendered key is legible
-    // ("...-vbr-dynamic-auto-auto-auto-8.125-0.25") rather than pseudo-path segmented
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.4g %.4g", (double) reclaim_floor_bpv, (double) reset_keep_frac);
-    return kv + " vbr " + vbr_budget + " " + vbr_min_bits + " " + vbr_vram_budget + " " +
-           vbr_policy + " " + buf;
+    if (vbr.unrepresented_override) {
+        return ""; // effective regime unknown -> no profile -> planner refuses
+    }
+    // every dimension that moves the ladder's cost, in RESOLVED form; separators stay in
+    // the profile sanitizer's squash class so the key renders legibly
+    char nums[128];
+    snprintf(nums, sizeof(nums), "%.4g %.4g %llu %.4g %.4g",
+             vbr.capacity_bits, vbr.selected_bpv,
+             (unsigned long long) vbr.vram_budget_bytes,
+             (double) vbr.reclaim_floor_bpv, (double) vbr.reset_keep_frac);
+    std::string out = kv + " vbr " + vbr.budget_mode + " " + vbr.family + " " + vbr.policy +
+                      " " + vbr.schedule + " " + nums;
+    if (!vbr.overrides.empty()) {
+        out += " ovr " + vbr.overrides;
+    }
+    return out;
 }
 
 std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_descs,

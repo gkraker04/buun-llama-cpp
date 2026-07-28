@@ -73,6 +73,52 @@ static void test_profile_composition() {
           common_cache_plan_calib_profile("m", "cpu", 1, "kvbr-vf16"));
 }
 
+// D-pins r2 finding 2: EVERY effective VBR dimension must move the key, requested-string
+// equality must not alias differing resolved regimes, and an unrepresentable override must
+// yield no profile at all
+static void test_vbr_regime_key() {
+    common_cache_plan_vbr_regime base;
+    base.armed = true; base.side_k = base.side_v = true;
+    base.budget_mode = "dynamic"; base.family = "dyn"; base.policy = "p1";
+    base.schedule = "sched-a"; base.capacity_bits = 4.5; base.selected_bpv = 4.2;
+    base.vram_budget_bytes = 0; base.reclaim_floor_bpv = 8.125f; base.reset_keep_frac = 0.25f;
+    const std::string ref = common_cache_plan_calib_kv(base, "f16", "f16");
+    CHECK(ref.rfind("kvbr-vvbr", 0) == 0);
+
+    // each resolved dimension changes the key
+    const auto differs = [&](auto mutate) {
+        common_cache_plan_vbr_regime v = base;
+        mutate(v);
+        return common_cache_plan_calib_kv(v, "f16", "f16") != ref;
+    };
+    CHECK(differs([](auto & v) { v.budget_mode = "fixed"; }));
+    CHECK(differs([](auto & v) { v.family = "static"; }));
+    CHECK(differs([](auto & v) { v.policy = "p2"; }));            // same request, resolved differently
+    CHECK(differs([](auto & v) { v.schedule = "sched-b"; }));
+    CHECK(differs([](auto & v) { v.capacity_bits = 3.0; }));
+    CHECK(differs([](auto & v) { v.selected_bpv = 2.25; }));
+    CHECK(differs([](auto & v) { v.vram_budget_bytes = 1ull << 30; })); // env budget override
+    CHECK(differs([](auto & v) { v.reclaim_floor_bpv = 16.0f; }));
+    CHECK(differs([](auto & v) { v.reset_keep_frac = 0.0f; }));
+    CHECK(differs([](auto & v) { v.overrides = "VBR_BUDGET_MIB=4096"; }));
+    CHECK(differs([](auto & v) { v.side_v = false; }));           // mixed/pinned side
+
+    // identical resolved state is stable
+    CHECK(common_cache_plan_calib_kv(base, "f16", "f16") == ref);
+    // unrepresentable override -> NO profile (refuse), never an aliased match
+    common_cache_plan_vbr_regime unk = base;
+    unk.unrepresented_override = true;
+    CHECK(common_cache_plan_calib_kv(unk, "f16", "f16").empty());
+    // VBR armed via knobs only (no alias) still keys as a vbr regime, not plain f16
+    common_cache_plan_vbr_regime knobs = base;
+    knobs.side_k = knobs.side_v = false;
+    const std::string knob_key = common_cache_plan_calib_kv(knobs, "f16", "f16");
+    CHECK(knob_key != "kf16-vf16" && knob_key.find(" vbr ") != std::string::npos);
+    // non-armed run keys on types alone
+    common_cache_plan_vbr_regime off;
+    CHECK(common_cache_plan_calib_kv(off, "f16", "q8_0") == "kf16-vq8_0");
+}
+
 // verify-r4/r5: the placement key is pure and positional — reversed heterogeneous device
 // orders produce DISTINCT keys, equivalent inputs are stable, empty/ngl==0 maps to cpu
 static void test_placement_key() {
@@ -394,6 +440,7 @@ int main() {
     test_profile_refusal();
     test_profile_composition();
     test_placement_key();
+    test_vbr_regime_key();
     test_calibration_validation();
     test_basic_estimation();
     test_controlled_disagreement();

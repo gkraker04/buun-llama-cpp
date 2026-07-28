@@ -52,4 +52,13 @@ if (neg_rc EQUAL 0)
     message(FATAL_ERROR "unknown-schema fixture was ACCEPTED (rc 0) — schema gate is open")
 endif()
 
+# calibration fit arithmetic (D-pins r2 finding 6): the unidentifiable-slope branch
+execute_process(
+    COMMAND "${PYTHON3}" "${SOURCE_ROOT}/tools/server/bench/cache-plan-calibrate.py" --self-test
+    OUTPUT_QUIET ERROR_VARIABLE selftest_err RESULT_VARIABLE selftest_rc
+)
+if (NOT selftest_rc EQUAL 0)
+    message(FATAL_ERROR "cache-plan-calibrate self-test failed:\n${selftest_err}")
+endif()
+
 message(STATUS "cache-plan golden-fixture gate passed")

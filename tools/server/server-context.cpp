@@ -3236,14 +3236,37 @@ private:
                     // which would otherwise key as plain f16. Sides name the regime; the
                     // regime signature disambiguates configurations within it.
                     // [D pins r1 finding: post-CLEAN follow-up 1]
-                    common_cache_plan_calib_kv(
-                        params_base.vbr_enabled(),
-                        params_base.vbr_cache_type_k, params_base.vbr_cache_type_v,
-                        ggml_type_name(params_base.cache_type_k),
-                        ggml_type_name(params_base.cache_type_v),
-                        params_base.vbr_budget, params_base.vbr_min_bits,
-                        params_base.vbr_vram_budget, params_base.vbr_policy,
-                        params_base.vbr_reclaim_floor_bpv, params_base.vbr_reset_keep_frac));
+                    [&] {
+                        // EFFECTIVE regime, not the requested CLI strings (D-pins r2
+                        // finding 2): resolved family/policy/schedule/capacity/BPV, the
+                        // resolved byte budget, and the documented developer env overrides
+                        // that move the controller AFTER CLI resolution. An override we
+                        // cannot represent yields an empty profile -> planner refuses.
+                        common_cache_plan_vbr_regime vbr;
+                        vbr.armed  = params_base.vbr_enabled();
+                        vbr.side_k = params_base.vbr_cache_type_k;
+                        vbr.side_v = params_base.vbr_cache_type_v;
+                        vbr.budget_mode       = params_base.vbr_budget;
+                        vbr.family            = params_base.vbr_selected_family;
+                        vbr.policy            = params_base.vbr_selected_policy;
+                        vbr.schedule          = params_base.vbr_selected_schedule;
+                        vbr.capacity_bits     = params_base.vbr_capacity_bits;
+                        vbr.selected_bpv      = params_base.vbr_selected_bpv;
+                        vbr.vram_budget_bytes = params_base.vbr_vram_budget_bytes;
+                        vbr.reclaim_floor_bpv = params_base.vbr_reclaim_floor_bpv;
+                        vbr.reset_keep_frac   = params_base.vbr_reset_keep_frac;
+                        for (const char * name : { "VBR_BUDGET_MIB", "VBR_MIN_BITS",
+                                                   "VBR_POLICY_LADDER", "VBR_FREEZE" }) {
+                            if (const char * val = std::getenv(name)) {
+                                vbr.overrides += (vbr.overrides.empty() ? "" : " ");
+                                vbr.overrides += std::string(name) + "=" + val;
+                            }
+                        }
+                        return common_cache_plan_calib_kv(
+                            vbr,
+                            ggml_type_name(params_base.cache_type_k),
+                            ggml_type_name(params_base.cache_type_v));
+                    }());
             }
             SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
                     cache_plan_obs->calibration_profile.c_str());

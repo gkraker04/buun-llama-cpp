@@ -39,19 +39,37 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
                                             const std::string & hw_desc, int n_batch,
                                             const std::string & kv_desc);
 
-// THE KV-regime segment, pure and tested: names the cache regime AND — when VBR is armed
-// — the ladder configuration that determines its cost (budget mode, aggregate floor, VRAM
-// budget, policy id, server reclaim/reset policy). VBR arms from the --vbr-* knobs even
-// without the `-ct vbr` alias, so `vbr_armed` comes from the canonical predicate, never
-// from the cache types alone; two VBR runs with different budgets/floors/policies MUST NOT
-// share fitted coefficients. Non-VBR runs key on the ggml type names only.
-std::string common_cache_plan_calib_kv(bool vbr_armed, bool vbr_k, bool vbr_v,
-                                       const std::string & type_k, const std::string & type_v,
-                                       const std::string & vbr_budget,
-                                       const std::string & vbr_min_bits,
-                                       const std::string & vbr_vram_budget,
-                                       const std::string & vbr_policy,
-                                       float reclaim_floor_bpv, float reset_keep_frac);
+// EFFECTIVE VBR regime identity (D-pins r2 finding 2): requested CLI strings are NOT the
+// regime — `auto` resolves to a selected family/policy/schedule, the aggregate floor
+// resolves to a capacity, and documented developer env overrides (VBR_BUDGET_MIB,
+// VBR_MIN_BITS, VBR_POLICY_LADDER) can move the controller's budget AFTER CLI resolution.
+// Two runs whose requested strings match but whose resolved regimes differ must NOT share
+// fitted coefficients. Every field below is an effective/resolved value; `overrides` carries
+// the raw override tokens so an overridden run keys distinctly (empty when none are set).
+// `unrepresented_override` means the effective state could not be established — the caller
+// then has NO profile (refuse) rather than a possibly-aliased one.
+struct common_cache_plan_vbr_regime {
+    bool        armed = false;
+    bool        side_k = false;      // K took the vbr alias
+    bool        side_v = false;
+    std::string budget_mode;         // resolved budget mode (dynamic/fixed tier)
+    std::string family;              // vbr_selected_family
+    std::string policy;              // vbr_selected_policy
+    std::string schedule;            // vbr_selected_schedule (path/name identity)
+    double      capacity_bits = 0.0; // resolved aggregate floor (bits/value)
+    double      selected_bpv  = 0.0; // measured BPV of the selected rung
+    uint64_t    vram_budget_bytes = 0; // resolved explicit budget, 0 == auto
+    float       reclaim_floor_bpv = 0.0f;
+    float       reset_keep_frac   = 0.0f;
+    std::string overrides;           // raw env-override tokens, empty when none
+    bool        unrepresented_override = false;
+};
+
+// THE KV-regime segment, pure and tested. Non-VBR runs key on the ggml type names only.
+// Returns an EMPTY string when the regime is armed but unrepresentable — the profile is
+// then empty and the planner refuses (no_profile), never a possibly-aliased match.
+std::string common_cache_plan_calib_kv(const common_cache_plan_vbr_regime & vbr,
+                                       const std::string & type_k, const std::string & type_v);
 
 // THE placement-key (hardware class) construction, pure and tested: POSITIONAL device
 // order (main_gpu / tensor_split index into it — reversed heterogeneous orders must
