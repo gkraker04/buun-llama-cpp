@@ -31,19 +31,23 @@ static llama_cache_acct_value cell(const llama_cache_acct_snapshot & s,
     return s.cells[size_t(c)][size_t(r)].measures[size_t(m)];
 }
 
+// Compile-negative coverage (C/F freeze requirement 3): the full pairwise non-interchange
+// matrix over the five identities + raw integers lives in the HEADER (llama_cache_acct_
+// ids_distinct static_asserts), so every consumer TU enforces it — nothing to repeat here.
+
 // happy path: reserve -> stage -> commit -> release round-trips durable gauges to zero
 static void test_lifecycle() {
     llama_cache_acct_ledger ledger;
 
     const auto op = ledger.reserve(CAT, RES, {}, 100, 128);
-    CHECK(op != 0);
+    CHECK(bool(op));
     auto s = ledger.snapshot();
     CHECK(cell(s, CAT, RES, llama_cache_acct_measure::reserved).value == 128);
     CHECK(cell(s, CAT, RES, llama_cache_acct_measure::logical_payload).state ==
           llama_cache_acct_known::unknown); // unknown until a commit, never a fabricated zero
 
     const auto alloc = ledger.new_alloc();
-    CHECK(alloc != 0);
+    CHECK(bool(alloc));
     CHECK(ledger.stage(op, alloc, 128));
     CHECK(ledger.commit(op, 100));
     s = ledger.snapshot();
@@ -116,8 +120,8 @@ static void test_invalid_transitions() {
     const auto op = ledger.reserve(CAT, RES, {}, 10, 10);
     CHECK(!ledger.commit(op, 10));               // commit before stage
     CHECK(!ledger.release(op));                  // release before commit
-    CHECK(!ledger.stage(op, 0, 10));             // zero alloc id (unknown_id)
-    CHECK(!ledger.stage(op, alloc + 999, 10));   // unminted alloc id (unknown_id)
+    CHECK(!ledger.stage(op, llama_cache_acct_alloc_id{}, 10));            // zero alloc id (unknown_id)
+    CHECK(!ledger.stage(op, llama_cache_acct_alloc_id{alloc.v + 999}, 10)); // unminted alloc id (unknown_id)
     CHECK(ledger.stage(op, alloc, 10));
     CHECK(!ledger.stage(op, alloc, 10));         // double stage
     CHECK(ledger.commit(op, 10));
@@ -126,7 +130,7 @@ static void test_invalid_transitions() {
     CHECK(ledger.release(op));
     CHECK(!ledger.release(op));                  // double release (op erased -> unknown id)
 
-    CHECK(!ledger.stage(999, alloc, 1));         // unknown op
+    CHECK(!ledger.stage(llama_cache_acct_op_id{999}, alloc, 1)); // unknown op
 
     const auto s = ledger.snapshot();
     // early-commit, early-release, double-stage, double-commit, abort-after-commit
@@ -351,7 +355,7 @@ static void test_serial_on_fault() {
     llama_cache_acct_ledger ledger;
 
     const auto s0 = ledger.snapshot();
-    CHECK(!ledger.release(424242)); // unknown op -> fault
+    CHECK(!ledger.release(llama_cache_acct_op_id{424242})); // unknown op -> fault
     const auto s1 = ledger.snapshot();
     CHECK(s1.faults_unknown_id == s0.faults_unknown_id + 1);
     CHECK(s1.serial > s0.serial);

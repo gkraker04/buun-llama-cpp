@@ -2,7 +2,9 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -143,13 +145,60 @@ enum class llama_cache_acct_attr_kind : uint8_t {
 // be interchanged. The operation and allocation ids are process-local accounting identities;
 // the artifact identity, content digest, and eligibility lineage identity are opaque
 // contract fields carried and retained by the transaction (F populates and validates them).
-// Distinct wrapper types make interchange a compile error.
-using llama_cache_acct_op_id    = uint64_t;
-using llama_cache_acct_alloc_id = uint64_t;
-
+// Distinct wrapper types make interchange a compile error (matrix asserted below). The
+// zero id is the "none" sentinel (vbr_operation_id idiom): `explicit operator bool` tests
+// it; only op/alloc ids get std::hash — they alone key the ledger maps.
+struct llama_cache_acct_op_id {
+    uint64_t v = 0;
+    explicit operator bool() const { return v != 0; }
+};
+struct llama_cache_acct_alloc_id {
+    uint64_t v = 0;
+    explicit operator bool() const { return v != 0; }
+};
 struct llama_cache_acct_artifact_id    { uint64_t v = 0; };
 struct llama_cache_acct_content_digest { uint64_t v = 0; };
 struct llama_cache_acct_lineage_id     { uint64_t v = 0; };
+
+inline bool operator==(llama_cache_acct_op_id          a, llama_cache_acct_op_id          b) { return a.v == b.v; }
+inline bool operator==(llama_cache_acct_alloc_id       a, llama_cache_acct_alloc_id       b) { return a.v == b.v; }
+inline bool operator==(llama_cache_acct_artifact_id    a, llama_cache_acct_artifact_id    b) { return a.v == b.v; }
+inline bool operator==(llama_cache_acct_content_digest a, llama_cache_acct_content_digest b) { return a.v == b.v; }
+inline bool operator==(llama_cache_acct_lineage_id     a, llama_cache_acct_lineage_id     b) { return a.v == b.v; }
+inline bool operator!=(llama_cache_acct_op_id          a, llama_cache_acct_op_id          b) { return !(a == b); }
+inline bool operator!=(llama_cache_acct_alloc_id       a, llama_cache_acct_alloc_id       b) { return !(a == b); }
+inline bool operator!=(llama_cache_acct_artifact_id    a, llama_cache_acct_artifact_id    b) { return !(a == b); }
+inline bool operator!=(llama_cache_acct_content_digest a, llama_cache_acct_content_digest b) { return !(a == b); }
+inline bool operator!=(llama_cache_acct_lineage_id     a, llama_cache_acct_lineage_id     b) { return !(a == b); }
+
+template <> struct std::hash<llama_cache_acct_op_id> {
+    size_t operator()(const llama_cache_acct_op_id & id) const { return std::hash<uint64_t>{}(id.v); }
+};
+template <> struct std::hash<llama_cache_acct_alloc_id> {
+    size_t operator()(const llama_cache_acct_alloc_id & id) const { return std::hash<uint64_t>{}(id.v); }
+};
+
+// The non-interchange proof, in the header so every consumer TU enforces it: no pair among
+// the five identities (or a raw integer) converts either way. Aggregate `{n}` init stays
+// legal — mints construct ids on purpose; only IMPLICIT interchange is banned.
+template <typename A, typename B>
+constexpr bool llama_cache_acct_ids_distinct =
+    !std::is_convertible_v<A, B> && !std::is_convertible_v<B, A>;
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_alloc_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_artifact_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_content_digest>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          llama_cache_acct_lineage_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_op_id,          uint64_t>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_artifact_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_content_digest>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       llama_cache_acct_lineage_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_alloc_id,       uint64_t>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    llama_cache_acct_content_digest>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    llama_cache_acct_lineage_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_artifact_id,    uint64_t>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_content_digest, llama_cache_acct_lineage_id>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_content_digest, uint64_t>);
+static_assert(llama_cache_acct_ids_distinct<llama_cache_acct_lineage_id,     uint64_t>);
 
 struct llama_cache_acct_attribution {
     llama_cache_acct_attr_kind   kind    = llama_cache_acct_attr_kind::server;
@@ -176,7 +225,7 @@ struct llama_cache_acct_cell {
 // live in `cells`; slot/artifact attribution is read from these rows (an explicit normalized
 // form — no private per-consumer counters).
 struct llama_cache_acct_allocation_row {
-    llama_cache_acct_alloc_id      alloc = 0;
+    llama_cache_acct_alloc_id      alloc;
     llama_cache_acct_attribution   attribution;
     llama_cache_acct_category      category  = llama_cache_acct_category::container_overhead;
     llama_cache_acct_residency     residency = llama_cache_acct_residency::not_applicable;
@@ -221,7 +270,7 @@ struct llama_cache_acct_ledger {
     llama_cache_acct_alloc_id new_alloc();
 
     // Observational reservation: records the expected resident bytes under `reserved`,
-    // returns the op id (0 on internal failure). Never blocks or admits anything.
+    // returns the op id (zero id on internal failure). Never blocks or admits anything.
     llama_cache_acct_op_id reserve(
             llama_cache_acct_category      category,
             llama_cache_acct_residency     residency,
@@ -274,7 +323,7 @@ private:
         llama_cache_acct_category    category  = llama_cache_acct_category::container_overhead;
         llama_cache_acct_residency   residency = llama_cache_acct_residency::not_applicable;
         llama_cache_acct_attribution attribution;
-        llama_cache_acct_alloc_id    alloc = 0;
+        llama_cache_acct_alloc_id    alloc;
         uint64_t                     reserved_bytes = 0; // charged at reserve, unwound by commit/abort
         uint64_t                     resident_bytes = 0; // actual, set at stage
         llama_cache_acct_artifact_id    artifact;
@@ -326,8 +375,8 @@ private:
     llama_cache_acct_snapshot state;    // durable gauges + serial + faults live here (rows built on demand)
     std::array<std::array<uint64_t, size_t(llama_cache_acct_residency::_count)>,
                size_t(llama_cache_acct_category::_count)> staged_now = {};
-    llama_cache_acct_op_id    next_op       = 1;
-    llama_cache_acct_alloc_id next_alloc_id = 1;
+    llama_cache_acct_op_id    next_op       = {1};
+    llama_cache_acct_alloc_id next_alloc_id = {1};
     std::unordered_map<llama_cache_acct_op_id, txn>            ops;
     std::unordered_map<llama_cache_acct_alloc_id, alloc_entry> allocs;
 };

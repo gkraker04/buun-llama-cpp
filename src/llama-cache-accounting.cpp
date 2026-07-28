@@ -104,22 +104,22 @@ void llama_cache_acct_ledger::maybe_retire(alloc_entry & entry) {
 
 llama_cache_acct_alloc_id llama_cache_acct_ledger::new_alloc() {
     std::lock_guard<std::mutex> lock(mtx);
-    if (next_alloc_id == std::numeric_limits<uint64_t>::max()) {
+    if (next_alloc_id.v == std::numeric_limits<uint64_t>::max()) {
         state.faults_overflow++;
         bump_serial();
-        return 0;
+        return {};
     }
     try {
         // the registry entry IS the mint: identity exists before any citation, and it
         // survives retirement as a tombstone (no id resurrection)
         const llama_cache_acct_alloc_id id = next_alloc_id;
         allocs.emplace(id, alloc_entry{});
-        next_alloc_id++;
+        next_alloc_id.v++;
         return id;
     } catch (...) {
         state.faults_allocation++;
         bump_serial();
-        return 0;
+        return {};
     }
 }
 
@@ -133,14 +133,15 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
 
     std::lock_guard<std::mutex> lock(mtx);
 
-    if (next_op == std::numeric_limits<uint64_t>::max()) {
+    if (next_op.v == std::numeric_limits<uint64_t>::max()) {
         state.faults_overflow++;
         bump_serial();
-        return 0;
+        return {};
     }
 
     try {
-        const llama_cache_acct_op_id op = next_op++;
+        const llama_cache_acct_op_id op = next_op;
+        next_op.v++;
 
         txn t;
         t.state          = llama_cache_acct_txn_state::reserved;
@@ -156,7 +157,7 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
     } catch (...) {
         state.faults_allocation++;
         bump_serial();
-        return 0;
+        return {};
     }
 }
 
@@ -180,7 +181,7 @@ bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_
     }
     // allocation ids must come from new_alloc(): the registry entry is the mint proof
     auto ait = allocs.find(alloc);
-    if (alloc == 0 || ait == allocs.end()) {
+    if (!alloc || ait == allocs.end()) {
         state.faults_unknown_id++;
         bump_serial();
         return false;
@@ -198,9 +199,9 @@ bool llama_cache_acct_ledger::stage(llama_cache_acct_op_id op, llama_cache_acct_
         if (ait->second.category != it->second.category ||
             ait->second.residency != it->second.residency ||
             ait->second.resident_bytes != resident_bytes ||
-            ait->second.artifact.v != artifact.v ||
-            ait->second.digest.v   != digest.v ||
-            ait->second.lineage.v  != lineage.v) {
+            ait->second.artifact != artifact ||
+            ait->second.digest   != digest ||
+            ait->second.lineage  != lineage) {
             state.faults_invalid_transition++;
             bump_serial();
             return false;

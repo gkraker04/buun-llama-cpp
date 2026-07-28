@@ -639,11 +639,11 @@ struct server_prompt_cache_state {
     // only served from an entry whose key matches the requesting slot's current adapter config
     std::string adapter_config_key;
 
-    // C0 shadow accounting op ids, one per charged leaf category (0 = not charged): opened at
+    // C0 shadow accounting op ids, one per charged leaf category (zero id = not charged):
     // the publish boundary, released when the entry leaves `states` [P2]
-    uint64_t acct_op_snapshot = 0;
-    uint64_t acct_op_ckpt     = 0;
-    uint64_t acct_op_accel    = 0;
+    llama_cache_acct_op_id acct_op_snapshot;
+    llama_cache_acct_op_id acct_op_ckpt;
+    llama_cache_acct_op_id acct_op_accel;
 
     size_t size() const {
         size_t res = data.size();

@@ -1784,18 +1784,18 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
     // every transition result is checked: a failed stage/commit aborts the op (fail-closed,
     // idempotent — abort on an erased op only faults), latches the leaf unavailable, and
     // publishes NO op id, so the entry's later release cannot compound the fault
-    const auto charge = [this](llama_cache_acct_category cat, uint64_t bytes) -> uint64_t {
+    const auto charge = [this](llama_cache_acct_category cat, uint64_t bytes) -> llama_cache_acct_op_id {
         const auto op = acct->reserve(cat, llama_cache_acct_residency::pageable_host, {}, bytes, bytes);
-        if (op == 0) {
+        if (!op) {
             acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
                                    llama_cache_acct_measure::logical_payload);
-            return 0;
+            return {};
         }
         if (!acct->stage(op, acct->new_alloc(), bytes) || !acct->commit(op, bytes)) {
             acct->abort(op);
             acct->mark_unavailable(cat, llama_cache_acct_residency::pageable_host,
                                    llama_cache_acct_measure::logical_payload);
-            return 0;
+            return {};
         }
         return op;
     };
@@ -1809,10 +1809,10 @@ void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
     if (!acct) {
         return;
     }
-    for (uint64_t * op : { &st.acct_op_snapshot, &st.acct_op_ckpt, &st.acct_op_accel }) {
-        if (*op != 0) {
+    for (llama_cache_acct_op_id * op : { &st.acct_op_snapshot, &st.acct_op_ckpt, &st.acct_op_accel }) {
+        if (*op) {
             acct->release(*op);
-            *op = 0;
+            *op = {};
         }
     }
 }
