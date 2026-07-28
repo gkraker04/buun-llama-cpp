@@ -3471,6 +3471,24 @@ private:
                     std::hash<std::string>{}(model_name));
                 plan_rec->identity.execution_digest = llama_cache_acct_value::measured(
                     std::hash<std::string>{}(frontier_execution_identity));
+                // prefix-family fingerprint: FNV-1a over the prompt's first 64 token ids —
+                // an EXACT family key for offline clustering (three agent variants = three
+                // digests), where cross-slot LCP evidence is only an inference from
+                // whatever slots happened to hold. Opaque + content-minimizing like every
+                // identity digest; token count folded in so a short prompt that happens to
+                // prefix-match a long one still keys separately.
+                {
+                    uint64_t h = 1469598103934665603ull;
+                    const auto fold = [&h](uint64_t v) {
+                        h = (h ^ v) * 1099511628211ull;
+                    };
+                    const size_t n = std::min<size_t>(task.tokens.size(), 64);
+                    for (size_t i = 0; i < n; i++) {
+                        fold((uint64_t)(uint32_t) task.tokens[i]);
+                    }
+                    fold((uint64_t) n);
+                    plan_rec->identity.prefix_token_digest = llama_cache_acct_value::measured(h);
+                }
             } catch (...) {
                 cache_plan_obs->shadow_unavailable++;
             }

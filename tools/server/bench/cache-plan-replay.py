@@ -114,6 +114,29 @@ def main():
             if pt is not None and ttft is not None:
                 residuals.append(pt - ttft)
 
+    families = {}
+    for rec in records:
+        fam = rec.get("identity", {}).get("prefix_tokens")
+        if not isinstance(fam, int):
+            continue
+        f = families.setdefault(fam, {"n": 0, "outcomes": Counter(), "reused": 0, "replayed": 0,
+                                      "ttft_us": 0, "ttft_n": 0})
+        f["n"] += 1
+        f["outcomes"][rec["outcome"]] += 1
+        for k, key in (("reused", "n_reused_tokens"), ("replayed", "n_replayed_tokens")):
+            v = rec.get(key)
+            if isinstance(v, int):
+                f[k] += v
+        t = rec.get("ttft_us")
+        if isinstance(t, (int, float)):
+            f["ttft_us"] += t
+            f["ttft_n"] += 1
+    family_rows = sorted((
+        {"family": f"{fam:016x}", "requests": f["n"], "outcomes": dict(f["outcomes"]),
+         "reused_tokens": f["reused"], "replayed_tokens": f["replayed"],
+         "mean_ttft_us": (f["ttft_us"] / f["ttft_n"]) if f["ttft_n"] else None}
+        for fam, f in families.items()), key=lambda r: -r["requests"])
+
     evaluated = agreements + len(disagreements)
     report = {
         "records":            n,
@@ -128,6 +151,7 @@ def main():
         "agreement_rate":     (agreements / evaluated) if evaluated else None,
         "disagreements":      len(disagreements),
         "disagreement_items": disagreements[: args.max_disagreements],
+        "prefix_families":    family_rows,
         "residual_us": {
             "n":    len(residuals),
             "mean": (sum(residuals) / len(residuals)) if residuals else None,
@@ -152,6 +176,11 @@ def main():
                   f"saving_us={d['predicted_saving_us']}")
         r = report["residual_us"]
         print(f"residual_us: n={r['n']} mean={r['mean']} min={r['min']} max={r['max']}")
+        print(f"prefix_families={len(family_rows)}")
+        for f in family_rows[:8]:
+            print(f"  family={f['family']} n={f['requests']} outcomes={f['outcomes']} "
+                  f"reused={f['reused_tokens']} replayed={f['replayed_tokens']} "
+                  f"mean_ttft_ms={(f['mean_ttft_us'] or 0)/1000:.0f}")
 
     return 0 if n > 0 else 1
 
