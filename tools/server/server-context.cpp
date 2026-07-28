@@ -3255,12 +3255,31 @@ private:
                         vbr.vram_budget_bytes = params_base.vbr_vram_budget_bytes;
                         vbr.reclaim_floor_bpv = params_base.vbr_reclaim_floor_bpv;
                         vbr.reset_keep_frac   = params_base.vbr_reset_keep_frac;
-                        for (const char * name : { "VBR_BUDGET_MIB", "VBR_MIN_BITS",
-                                                   "VBR_POLICY_LADDER", "VBR_FREEZE",
-                                                   "VBR_VMM", "VBR_MODE" }) {
-                            if (const char * val = std::getenv(name)) {
-                                vbr.overrides += (vbr.overrides.empty() ? "" : " ");
-                                vbr.overrides += std::string(name) + "=" + val;
+                        // closed census (r4): every cost-affecting VBR_* override that is
+                        // SET becomes part of the identity; CI proves the census covers
+                        // every getenv("VBR_*") in the tree
+#define COMMON_CACHE_PLAN_VBR_ENV_FOLD(NAME, AFFECTS)                                  \
+                        if (AFFECTS) {                                                 \
+                            if (const char * val = std::getenv(NAME)) {                 \
+                                vbr.overrides += (vbr.overrides.empty() ? "" : " ");    \
+                                vbr.overrides += std::string(NAME) + "=" + val;         \
+                            }                                                           \
+                        }
+                        COMMON_CACHE_PLAN_VBR_ENV_LIST(COMMON_CACHE_PLAN_VBR_ENV_FOLD)
+#undef COMMON_CACHE_PLAN_VBR_ENV_FOLD
+                        // schedule CONTENT identity, not its path: digest the file when one
+                        // is named; a named-but-unreadable schedule is unrepresentable
+                        if (!params_base.vbr_selected_schedule.empty()) {
+                            std::ifstream sf(params_base.vbr_selected_schedule, std::ios::binary);
+                            if (sf) {
+                                uint64_t h = 1469598103934665603ull;
+                                char c;
+                                while (sf.get(c)) { h = (h ^ (uint8_t) c) * 1099511628211ull; }
+                                char hb[32];
+                                snprintf(hb, sizeof(hb), "sched%016llx", (unsigned long long) h);
+                                vbr.schedule = hb;
+                            } else {
+                                vbr.unrepresented_override = true;
                             }
                         }
                         return common_cache_plan_calib_kv(

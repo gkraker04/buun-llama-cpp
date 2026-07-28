@@ -99,4 +99,35 @@ endforeach()
 # (once-only finalization is a RUNTIME invariant: cache_plan_finalize early-returns and
 # fault-counts on an already-finalized record — outcome != unknown is the finalized state)
 
+# VBR env census completeness (D-pins r4): every getenv("VBR_*") in the tree must appear
+# in COMMON_CACHE_PLAN_VBR_ENV_LIST, so an override can never silently escape the
+# calibration regime identity.
+file(READ "${SOURCE_ROOT}/common/common-cache-plan-estimate.h" census_src)
+set(vbr_env_names "")
+foreach(dir src common tools ggml/src)
+    file(GLOB_RECURSE dir_files "${SOURCE_ROOT}/${dir}/*.c" "${SOURCE_ROOT}/${dir}/*.cpp"
+                                "${SOURCE_ROOT}/${dir}/*.cu" "${SOURCE_ROOT}/${dir}/*.h"
+                                "${SOURCE_ROOT}/${dir}/*.cuh")
+    foreach(f ${dir_files})
+        file(READ "${f}" body)
+        string(REGEX MATCHALL "getenv\\(\"VBR_[A-Z_0-9]+\"" hits "${body}")
+        foreach(hit ${hits})
+            string(REGEX REPLACE "^getenv\\(\"" "" name "${hit}")
+            string(REGEX REPLACE "\"$" "" name "${name}")
+            list(APPEND vbr_env_names "${name}")
+        endforeach()
+    endforeach()
+endforeach()
+list(REMOVE_DUPLICATES vbr_env_names)
+foreach(name ${vbr_env_names})
+    string(FIND "${census_src}" "X(\"${name}\"" found)
+    if (found EQUAL -1)
+        message(FATAL_ERROR "VBR env override ${name} is used in the tree but missing from "
+                            "COMMON_CACHE_PLAN_VBR_ENV_LIST — the calibration regime identity "
+                            "would not see it")
+    endif()
+endforeach()
+list(LENGTH vbr_env_names n_vbr_env)
+message(STATUS "vbr env census covers ${n_vbr_env} overrides")
+
 message(STATUS "cache-plan/accounting contract scans passed")

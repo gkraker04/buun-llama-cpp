@@ -78,8 +78,10 @@ std::string common_cache_plan_calib_kv(const common_cache_plan_vbr_regime & vbr,
     }
     // every dimension that moves the ladder's cost, in RESOLVED form; separators stay in
     // the profile sanitizer's squash class so the key renders legibly
-    char nums[128];
-    snprintf(nums, sizeof(nums), "%.4g %.4g %llu %.4g %.4g",
+    // EXACT numeric encoding (r4): %.17g round-trips a double bit-for-bit, so two
+    // distinct resolved values can never render to the same token
+    char nums[256];
+    snprintf(nums, sizeof(nums), "%.17g %.17g %llu %.17g %.17g",
              vbr.capacity_bits, vbr.selected_bpv,
              (unsigned long long) vbr.vram_budget_bytes,
              (double) vbr.reclaim_floor_bpv, (double) vbr.reset_keep_frac);
