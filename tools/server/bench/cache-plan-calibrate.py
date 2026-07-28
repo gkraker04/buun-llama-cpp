@@ -132,10 +132,19 @@ def main():
         xs = [r[0] for r in restored]
         ys = [r[2] - r[1] * replay_us_per_token for r in restored]  # ttft minus replay share
         restore_us_per_byte, workspace_setup_us = least_squares(xs, ys)
+        if max(xs) - min(xs) < 0.01 * max(xs):
+            # payloads (near-)constant — common on hybrid models whose checkpoint blob is
+            # dominated by the fixed-size recurrent state: the slope is unidentifiable and
+            # the honest model is a FLAT restore cost carried entirely by workspace
+            restore_us_per_byte = max(restore_us_per_byte, 0.0)
+            print(f"# note: restored payloads are (near-)constant ({min(xs)}..{max(xs)} B); "
+                  "restore cost fitted as flat workspace")
         print(f"# restored records: {len(restored)}, restore fit: {restore_us_per_byte:.6f} us/byte, "
               f"workspace {workspace_setup_us:.0f} us")
-        if not (restore_us_per_byte > 0 and math.isfinite(restore_us_per_byte)
-                and math.isfinite(workspace_setup_us)):
+        # the estimator contract accepts nonnegative finite coefficients; refuse only
+        # negative/non-finite (a genuinely flat restore cost is valid data)
+        if not (restore_us_per_byte >= 0 and math.isfinite(restore_us_per_byte)
+                and workspace_setup_us >= 0 and math.isfinite(workspace_setup_us)):
             print(f"error: invalid restore fit ({restore_us_per_byte}, {workspace_setup_us}); "
                   "refusing to emit an entry", file=sys.stderr)
             return 2

@@ -3228,8 +3228,14 @@ private:
                                                params_base.main_gpu,
                                                params_base.tensor_split),
                     params_base.n_batch,
-                    std::string("k") + ggml_type_name(params_base.cache_type_k) +
-                    "-v" + ggml_type_name(params_base.cache_type_v));
+                    // a vbr side is a RUNTIME regime, not a ggml type — cache_type_k/v
+                    // still hold the f16 entry tier, so naming the type would alias a
+                    // vbr run with a true-f16 run (the exact collision this segment
+                    // exists to prevent)
+                    std::string("k") + (params_base.vbr_cache_type_k
+                        ? "vbr" : ggml_type_name(params_base.cache_type_k)) +
+                    "-v" + (params_base.vbr_cache_type_v
+                        ? "vbr" : ggml_type_name(params_base.cache_type_v)));
             }
             SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
                     cache_plan_obs->calibration_profile.c_str());
