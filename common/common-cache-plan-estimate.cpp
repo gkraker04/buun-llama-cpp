@@ -15,12 +15,14 @@ static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
     75.688, 0.000010, 7184.4,
 };
 
-// dorei 2026-07-28 campaign, buun's 27B-VBR serving config (32 cold records over
-// 64-2048 tokens; 8 checkpoint restores — hybrid payloads constant at 156.9 MiB, so the
-// restore cost is a FLAT ~197 ms carried by workspace; crossover vs replay ~= 201 tokens)
+// dorei 2026-07-28 campaign, buun's 27B-VBR serving config under PINNED -ngl 99 (the
+// auto-fit placement varied per launch — ngl64 measured 979 us/tok, all-GPU measures
+// 861.5: the profile key distinguishing placements is load-bearing). 23 cold records,
+// 5 checkpoint restores — hybrid payloads constant at 156.9 MiB, restore cost FLAT
+// ~158 ms carried by workspace; crossover vs replay ~= 183 tokens.
 static const common_cache_plan_calib CALIB_DOREI_QWEN36_27B_VBR_3090 = {
-    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl64/b2048/kvbr-vvbr", 1,
-    978.741, 0.0, 196840.6,
+    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr", 1,
+    861.510, 0.0, 158069.2,
 };
 
 static const common_cache_plan_calib * const calib_table[] = {
