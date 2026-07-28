@@ -3256,7 +3256,8 @@ private:
                         vbr.reclaim_floor_bpv = params_base.vbr_reclaim_floor_bpv;
                         vbr.reset_keep_frac   = params_base.vbr_reset_keep_frac;
                         for (const char * name : { "VBR_BUDGET_MIB", "VBR_MIN_BITS",
-                                                   "VBR_POLICY_LADDER", "VBR_FREEZE" }) {
+                                                   "VBR_POLICY_LADDER", "VBR_FREEZE",
+                                                   "VBR_VMM", "VBR_MODE" }) {
                             if (const char * val = std::getenv(name)) {
                                 vbr.overrides += (vbr.overrides.empty() ? "" : " ");
                                 vbr.overrides += std::string(name) + "=" + val;

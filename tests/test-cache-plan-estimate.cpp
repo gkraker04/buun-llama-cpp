@@ -117,6 +117,14 @@ static void test_vbr_regime_key() {
     // non-armed run keys on types alone
     common_cache_plan_vbr_regime off;
     CHECK(common_cache_plan_calib_kv(off, "f16", "q8_0") == "kf16-vq8_0");
+
+    // END-TO-END refusal (r3 finding 3): an empty segment must yield NO profile, not a
+    // composed "model/hw/bN/" key that merely fails to match
+    CHECK(common_cache_plan_calib_profile("m", "gpu", 512,
+              common_cache_plan_calib_kv(unk, "f16", "f16")).empty());
+    CHECK(common_cache_plan_calib_profile("m", "", 512, "kf16-vf16").empty());
+    CHECK(common_cache_plan_calib_profile("", "gpu", 512, "kf16-vf16").empty());
+    CHECK(!common_cache_plan_calib_profile("m", "gpu", 512, "kf16-vf16").empty());
 }
 
 // verify-r4/r5: the placement key is pure and positional — reversed heterogeneous device

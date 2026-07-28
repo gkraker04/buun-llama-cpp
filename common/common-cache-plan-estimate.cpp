@@ -47,6 +47,13 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
 std::string common_cache_plan_calib_profile(const std::string & model_stem,
                                             const std::string & hw_desc, int n_batch,
                                             const std::string & kv_desc) {
+    // REFUSAL PROPAGATES (D-pins r3 finding 3): an empty segment means its regime could not
+    // be established, so there is NO profile — composing "model/hw/bN/" would hand back a
+    // nonempty key that merely fails to match, losing the no_profile distinction and
+    // risking a collision with a genuinely-empty segment.
+    if (model_stem.empty() || hw_desc.empty() || kv_desc.empty()) {
+        return "";
+    }
     std::string prof = model_stem + "/" + hw_desc + "/b" + std::to_string(n_batch)
                      + "/" + kv_desc;
     for (char & ch : prof) {
