@@ -2,7 +2,10 @@
 
 #include "common-cache-plan.h"
 
+#include <functional>
 #include <vector>
+
+struct common_params;
 
 // common-cache-plan-estimate.h — B shadow-planner estimators (§7.5), schema v2.
 //
@@ -45,36 +48,58 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
 // VBR_MIN_BITS, VBR_POLICY_LADDER) can move the controller's budget AFTER CLI resolution.
 // Two runs whose requested strings match but whose resolved regimes differ must NOT share
 // fitted coefficients. Every field below is an effective/resolved value; `overrides` carries
-// the raw override tokens so an overridden run keys distinctly (empty when none are set).
+// canonical override tokens so an overridden run keys distinctly (empty when none are set).
 // `unrepresented_override` means the effective state could not be established — the caller
 // then has NO profile (refuse) rather than a possibly-aliased one.
-// CLOSED CENSUS of VBR developer env overrides (D-pins r4): every getenv("VBR_*") in the
-// tree must appear here — CI scans and fails on an omission, so the census cannot silently
-// go stale. `affects_cost` = 0 only for pure logging; everything that can move tiers,
-// budgets, schedules, headroom, or transcode behavior is cost-affecting and, when set,
-// becomes part of the regime identity (an unlisted or unreadable one ⇒ refuse).
-#define COMMON_CACHE_PLAN_VBR_ENV_LIST(X)      \
-    X("VBR_BUDGET_MIB",              1)        \
-    X("VBR_DEGRADE_ORDER",           1)        \
-    X("VBR_FORCE_GENERIC",           1)        \
-    X("VBR_GENERATION_ORACLE_INJECT",1)        \
-    X("VBR_GROWTH_HEADROOM_MIB",     1)        \
-    X("VBR_LAYER_SCHEDULE",          1)        \
-    X("VBR_MIN_BITS",                1)        \
-    X("VBR_MODE",                    1)        \
-    X("VBR_PROMOTE",                 1)        \
-    X("VBR_SCHEDULE_CTX",            1)        \
-    X("VBR_STASH_CAPTURE_ONLY",      1)        \
-    X("VBR_STASH_ROWS",              1)        \
-    X("VBR_TRACE",                   0)        \
-    X("VBR_TRANSCODE_FIDELITY",      1)        \
-    X("VBR_TRANSCODE_NOTILE",        1)        \
-    X("VBR_TRANSCODE_TEST",          1)        \
-    X("VBR_TRANSCODE_TEST_N",        1)        \
-    X("VBR_VMM",                     1)        \
-    X("VBR_VRAM_HEADROOM_MIB",       1)        \
-    X("VBR_FREEZE",                  1)        \
-    X("VBR_POLICY_LADDER",           1)
+enum class common_cache_plan_vbr_value_grammar : uint8_t {
+    scalar,
+    path,
+    dir_or_file,
+    inline_or_path,
+};
+
+// CLOSED CENSUS of every quoted VBR_* name in src/common/tools/ggml (D-pins r6).
+// The CI scan is reader-agnostic: wrapper reads, direct reads, programmatic producers,
+// diagnostics, and scripts all have to be classified here. `affects_cost` controls
+// whether a set value joins calibration identity. The closed grammar tag determines how
+// identity is formed; file forms use SHA-256 content, never paths, and unreadable content
+// makes the regime unrepresentable.
+// Names that only publish resolved telemetry or label logs are deliberately non-costing.
+#define COMMON_CACHE_PLAN_VBR_ENV_LIST(X)                              \
+    X("VBR_BUDGET",                    0, scalar)                      \
+    X("VBR_BUDGET_MIB",                1, scalar)                      \
+    X("VBR_CAPACITY_BITS",             0, scalar)                      \
+    X("VBR_DEGRADE_ORDER",             1, path)                        \
+    X("VBR_FORCE_GENERIC",             1, scalar)                      \
+    X("VBR_FREEZE",                    1, scalar)                      \
+    X("VBR_GENERATION_FORCE_AUDIT",    1, scalar)                      \
+    X("VBR_GENERATION_ORACLE",         1, scalar)                      \
+    X("VBR_GENERATION_ORACLE_INJECT",  1, scalar)                      \
+    X("VBR_GROWTH_HEADROOM_MIB",       1, scalar)                      \
+    X("VBR_LAYER_SCHEDULE",            1, inline_or_path)              \
+    X("VBR_LAYER_SCHEDULE_FROM_POLICY",0, scalar)                      \
+    X("VBR_LAYER_STRICT",              1, scalar)                      \
+    X("VBR_MIN_BITS",                  1, scalar)                      \
+    X("VBR_MODE",                      1, scalar)                      \
+    X("VBR_POLICY_LADDER",             1, dir_or_file)                 \
+    X("VBR_PROMOTE",                   1, scalar)                      \
+    X("VBR_RETIER_PREFLIGHT",          0, scalar)                      \
+    X("VBR_SCHEDULE_CTX",              1, scalar)                      \
+    X("VBR_SELECTED_BPV",              0, scalar)                      \
+    X("VBR_SELECTED_FAMILY",           0, scalar)                      \
+    X("VBR_SELECTED_KLD",              0, scalar)                      \
+    X("VBR_SELECTED_POLICY",           0, scalar)                      \
+    X("VBR_SELECTED_SCHEDULE",         0, path)                        \
+    X("VBR_STASH_CAPTURE_ONLY",        1, scalar)                      \
+    X("VBR_STASH_ROWS",                1, scalar)                      \
+    X("VBR_TRACE",                     0, scalar)                      \
+    X("VBR_TRANSCODE_FIDELITY",        1, scalar)                      \
+    X("VBR_TRANSCODE_NOTILE",          1, scalar)                      \
+    X("VBR_TRANSCODE_TEST",            1, scalar)                      \
+    X("VBR_TRANSCODE_TEST_N",          1, scalar)                      \
+    X("VBR_VMM",                       1, scalar)                      \
+    X("VBR_VRAM_BUDGET",               0, scalar)                      \
+    X("VBR_VRAM_HEADROOM_MIB",         1, scalar)
 
 struct common_cache_plan_vbr_regime {
     bool        armed = false;
@@ -83,14 +108,14 @@ struct common_cache_plan_vbr_regime {
     std::string budget_mode;         // resolved budget mode (dynamic/fixed tier)
     std::string family;              // vbr_selected_family
     std::string policy;              // vbr_selected_policy
-    std::string schedule;            // schedule CONTENT identity (digest of the file when
-                                     // one is named — a path string aliases across edits)
+    std::string schedule;            // compatibility key segment; schedule content is
+                                     // represented once by the VBR_LAYER_SCHEDULE token
     double      capacity_bits = 0.0; // resolved aggregate floor (bits/value)
     double      selected_bpv  = 0.0; // measured BPV of the selected rung
     uint64_t    vram_budget_bytes = 0; // resolved explicit budget, 0 == auto
     float       reclaim_floor_bpv = 0.0f;
     float       reset_keep_frac   = 0.0f;
-    std::string overrides;           // raw env-override tokens, empty when none
+    std::string overrides;           // canonical env-override tokens, empty when none
     bool        unrepresented_override = false;
 };
 
@@ -99,6 +124,28 @@ struct common_cache_plan_vbr_regime {
 // then empty and the planner refuses (no_profile), never a possibly-aliased match.
 std::string common_cache_plan_calib_kv(const common_cache_plan_vbr_regime & vbr,
                                        const std::string & type_k, const std::string & type_v);
+
+// Calibration-identity-only content hashing. For a cost-affecting census value, returns
+// NAME=value for scalar values and NAME=sha256-<lower-hex> for file-valued values. The
+// VBR_LAYER_SCHEDULE grammar accepts inline schedules, @file, or a bare file path;
+// VBR_POLICY_LADDER accepts a JSON file or a directory containing policy_ladder.json.
+// false means a required file could not be read and the calibration profile must refuse.
+bool common_cache_plan_vbr_override_identity(const std::string & name,
+                                             const std::string & value,
+                                             common_cache_plan_vbr_value_grammar grammar,
+                                             std::string & identity);
+
+// Calibration-identity file digest. This does not change B0 record identity digests or
+// sampled-prefix telemetry.
+bool common_cache_plan_sha256_file_identity(const std::string & path, std::string & identity);
+
+using common_cache_plan_getenv_fn = std::function<const char *(const char *)>;
+
+// THE production regime assembly path, separated from server control flow so override
+// ordering, refusal accumulation, and fail-closed profile composition are tested directly.
+common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
+        const common_params & params,
+        const common_cache_plan_getenv_fn & getenv_fn);
 
 // THE placement-key (hardware class) construction, pure and tested: POSITIONAL device
 // order (main_gpu / tensor_split index into it — reversed heterogeneous orders must

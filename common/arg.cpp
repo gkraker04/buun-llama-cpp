@@ -642,7 +642,7 @@ static bool common_vbr_is_dir(const std::string & path) {
 #endif
 }
 
-static std::string common_vbr_resolve_policy_file(const std::string & raw_policy_path) {
+std::string common_vbr_resolve_policy_file(const std::string & raw_policy_path) {
     std::string policy_file = raw_policy_path;
     if (common_vbr_is_dir(policy_file)) {
         policy_file = common_vbr_join_path(policy_file, "policy_ladder.json");

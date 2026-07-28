@@ -99,35 +99,63 @@ endforeach()
 # (once-only finalization is a RUNTIME invariant: cache_plan_finalize early-returns and
 # fault-counts on an already-finalized record — outcome != unknown is the finalized state)
 
-# VBR env census completeness (D-pins r4): every getenv("VBR_*") in the tree must appear
-# in COMMON_CACHE_PLAN_VBR_ENV_LIST, so an override can never silently escape the
-# calibration regime identity.
-file(READ "${SOURCE_ROOT}/common/common-cache-plan-estimate.h" census_src)
+# VBR name census completeness (D-pins r6): scan quoted VBR_* literals independently of
+# the reader spelling. This catches direct getenv, wrapper reads, programmatic producers,
+# diagnostics, and scripts; every one must be classified in COMMON_CACHE_PLAN_VBR_ENV_LIST.
+# The registry header is deliberately excluded from observations so it cannot prove its own
+# coverage.
+set(vbr_census_path "${SOURCE_ROOT}/common/common-cache-plan-estimate.h")
+file(READ "${vbr_census_path}" census_src)
+function(vbr_find_uncensused names_var output)
+    set(missing "")
+    foreach(name IN LISTS ${names_var})
+        string(FIND "${census_src}" "X(\"${name}\"" found)
+        if (found EQUAL -1)
+            list(APPEND missing "${name}")
+        endif()
+    endforeach()
+    set(${output} "${missing}" PARENT_SCOPE)
+endfunction()
+
+# ONE spelling of the extraction pattern: the negative control below must exercise the
+# SAME regex as production, or it can keep passing against a retired pattern.
+set(vbr_name_re "\"VBR_[A-Z_0-9]+\"")
 set(vbr_env_names "")
 foreach(dir src common tools ggml/src)
-    file(GLOB_RECURSE dir_files "${SOURCE_ROOT}/${dir}/*.c" "${SOURCE_ROOT}/${dir}/*.cpp"
-                                "${SOURCE_ROOT}/${dir}/*.cu" "${SOURCE_ROOT}/${dir}/*.h"
-                                "${SOURCE_ROOT}/${dir}/*.cuh")
+    file(GLOB_RECURSE dir_files LIST_DIRECTORIES false
+         "${SOURCE_ROOT}/${dir}/*.c"   "${SOURCE_ROOT}/${dir}/*.cpp"
+         "${SOURCE_ROOT}/${dir}/*.cu"  "${SOURCE_ROOT}/${dir}/*.cuh"
+         "${SOURCE_ROOT}/${dir}/*.h"   "${SOURCE_ROOT}/${dir}/*.hpp"
+         "${SOURCE_ROOT}/${dir}/*.inc" "${SOURCE_ROOT}/${dir}/*.py"
+         "${SOURCE_ROOT}/${dir}/*.sh"  "${SOURCE_ROOT}/${dir}/*.cmake")
     foreach(f ${dir_files})
+        if ("${f}" STREQUAL "${vbr_census_path}")
+            continue()
+        endif()
         file(READ "${f}" body)
-        string(REGEX MATCHALL "getenv\\(\"VBR_[A-Z_0-9]+\"" hits "${body}")
+        string(REGEX MATCHALL "${vbr_name_re}" hits "${body}")
         foreach(hit ${hits})
-            string(REGEX REPLACE "^getenv\\(\"" "" name "${hit}")
+            string(REGEX REPLACE "^\"" "" name "${hit}")
             string(REGEX REPLACE "\"$" "" name "${name}")
             list(APPEND vbr_env_names "${name}")
         endforeach()
     endforeach()
 endforeach()
 list(REMOVE_DUPLICATES vbr_env_names)
-foreach(name ${vbr_env_names})
-    string(FIND "${census_src}" "X(\"${name}\"" found)
-    if (found EQUAL -1)
-        message(FATAL_ERROR "VBR env override ${name} is used in the tree but missing from "
-                            "COMMON_CACHE_PLAN_VBR_ENV_LIST — the calibration regime identity "
-                            "would not see it")
-    endif()
-endforeach()
+vbr_find_uncensused(vbr_env_names uncensused_vbr)
+if (uncensused_vbr)
+    message(FATAL_ERROR "VBR names used in the tree but missing from "
+                        "COMMON_CACHE_PLAN_VBR_ENV_LIST: ${uncensused_vbr}")
+endif()
 list(LENGTH vbr_env_names n_vbr_env)
-message(STATUS "vbr env census covers ${n_vbr_env} overrides")
+message(STATUS "vbr literal census covers ${n_vbr_env} classified names")
+
+# Negative control for the exact historical hole: VBR_LAYER_STRICT is read through the real
+# turbo_vbr_env_enabled wrapper (and set programmatically), so it must occur in the REAL scan
+# output. A regression to getenv("VBR_*") extraction loses it and fails here.
+list(FIND vbr_env_names "VBR_LAYER_STRICT" wrapper_name_index)
+if (wrapper_name_index EQUAL -1)
+    message(FATAL_ERROR "VBR reader-agnostic census missed real wrapper-only VBR_LAYER_STRICT")
+endif()
 
 message(STATUS "cache-plan/accounting contract scans passed")

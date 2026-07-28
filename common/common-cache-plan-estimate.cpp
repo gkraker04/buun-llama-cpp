@@ -1,8 +1,13 @@
 #include "common-cache-plan-estimate.h"
+#include "arg.h"
+#include "common.h"
+#include "llama-sha256.h"
+#include "llama-vbr-config.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <tuple>
 
 // Fitted calibration table. Filled ONLY by the dorei microbench sweep + offline fit
@@ -42,6 +47,124 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
         }
     }
     return nullptr;
+}
+
+static std::string cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(digest.size()*2);
+    for (uint8_t byte : digest) {
+        out.push_back(hex[byte >> 4]);
+        out.push_back(hex[byte & 0x0f]);
+    }
+    return out;
+}
+
+static std::string cache_plan_sha256_hex(const std::string & bytes) {
+    llama_sha256 hash;
+    hash.update(bytes.data(), bytes.size());
+    return cache_plan_sha256_hex_digest(hash.finish());
+}
+
+bool common_cache_plan_sha256_file_identity(const std::string & path, std::string & identity) {
+    identity.clear();
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    // chunked: llama_sha256::update is incremental, so a mistyped override naming a
+    // multi-GB model file costs O(1) memory instead of materializing the whole file
+    llama_sha256 hash;
+    char buf[64 * 1024];
+    while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
+        hash.update(buf, (size_t) file.gcount());
+    }
+    if (file.bad()) {
+        return false;
+    }
+    identity = "sha256-" + cache_plan_sha256_hex_digest(hash.finish());
+    return true;
+}
+
+bool common_cache_plan_vbr_override_identity(const std::string & name,
+                                             const std::string & value,
+                                             common_cache_plan_vbr_value_grammar grammar,
+                                             std::string & identity) {
+    identity.clear();
+
+    std::string content_identity;
+    switch (grammar) {
+        case common_cache_plan_vbr_value_grammar::scalar:
+            identity = name + "=" + value;
+            return true;
+        case common_cache_plan_vbr_value_grammar::path:
+            if (!common_cache_plan_sha256_file_identity(value, content_identity)) {
+                return false;
+            }
+            break;
+        case common_cache_plan_vbr_value_grammar::dir_or_file:
+            if (!common_cache_plan_sha256_file_identity(
+                    common_vbr_resolve_policy_file(value), content_identity)) {
+                return false;
+            }
+            break;
+        case common_cache_plan_vbr_value_grammar::inline_or_path: {
+            std::string content;
+            std::string source;
+            if (!llama_vbr_resolve_layer_schedule(value.c_str(), content, source)) {
+                return false;
+            }
+            content_identity = "sha256-" + cache_plan_sha256_hex(content);
+            break;
+        }
+        default:
+            return false;
+    }
+
+    identity = name + "=" + content_identity;
+    return true;
+}
+
+common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
+        const common_params & params,
+        const common_cache_plan_getenv_fn & getenv_fn) {
+    common_cache_plan_vbr_regime vbr;
+    vbr.armed  = params.vbr_enabled();
+    vbr.side_k = params.vbr_cache_type_k;
+    vbr.side_v = params.vbr_cache_type_v;
+    vbr.budget_mode       = params.vbr_budget;
+    vbr.family            = params.vbr_selected_family;
+    vbr.policy            = params.vbr_selected_policy;
+    // Schedule content is represented once by the VBR_LAYER_SCHEDULE census row. Keep
+    // this compatibility segment empty so the checked-in default-regime key is stable.
+    vbr.capacity_bits     = params.vbr_capacity_bits;
+    vbr.selected_bpv      = params.vbr_selected_bpv;
+    vbr.vram_budget_bytes = params.vbr_vram_budget_bytes;
+    vbr.reclaim_floor_bpv = params.vbr_reclaim_floor_bpv;
+    vbr.reset_keep_frac   = params.vbr_reset_keep_frac;
+
+    // Nothing below can affect common_cache_plan_calib_kv's unarmed early return.
+    if (!vbr.armed) {
+        return vbr;
+    }
+
+#define COMMON_CACHE_PLAN_VBR_ENV_FOLD(NAME, AFFECTS, GRAMMAR)                         \
+    if (AFFECTS) {                                                                     \
+        if (const char * val = getenv_fn(NAME)) {                                      \
+            std::string token;                                                         \
+            if (!common_cache_plan_vbr_override_identity(                              \
+                    NAME, val, common_cache_plan_vbr_value_grammar::GRAMMAR, token)) { \
+                vbr.unrepresented_override = true;                                     \
+            } else {                                                                   \
+                vbr.overrides += (vbr.overrides.empty() ? "" : " ") + token;          \
+            }                                                                          \
+        }                                                                              \
+    }
+    COMMON_CACHE_PLAN_VBR_ENV_LIST(COMMON_CACHE_PLAN_VBR_ENV_FOLD)
+#undef COMMON_CACHE_PLAN_VBR_ENV_FOLD
+
+    return vbr;
 }
 
 std::string common_cache_plan_calib_profile(const std::string & model_stem,

@@ -3237,51 +3237,8 @@ private:
                     // regime signature disambiguates configurations within it.
                     // [D pins r1 finding: post-CLEAN follow-up 1]
                     [&] {
-                        // EFFECTIVE regime, not the requested CLI strings (D-pins r2
-                        // finding 2): resolved family/policy/schedule/capacity/BPV, the
-                        // resolved byte budget, and the documented developer env overrides
-                        // that move the controller AFTER CLI resolution. An override we
-                        // cannot represent yields an empty profile -> planner refuses.
-                        common_cache_plan_vbr_regime vbr;
-                        vbr.armed  = params_base.vbr_enabled();
-                        vbr.side_k = params_base.vbr_cache_type_k;
-                        vbr.side_v = params_base.vbr_cache_type_v;
-                        vbr.budget_mode       = params_base.vbr_budget;
-                        vbr.family            = params_base.vbr_selected_family;
-                        vbr.policy            = params_base.vbr_selected_policy;
-                        vbr.schedule          = params_base.vbr_selected_schedule;
-                        vbr.capacity_bits     = params_base.vbr_capacity_bits;
-                        vbr.selected_bpv      = params_base.vbr_selected_bpv;
-                        vbr.vram_budget_bytes = params_base.vbr_vram_budget_bytes;
-                        vbr.reclaim_floor_bpv = params_base.vbr_reclaim_floor_bpv;
-                        vbr.reset_keep_frac   = params_base.vbr_reset_keep_frac;
-                        // closed census (r4): every cost-affecting VBR_* override that is
-                        // SET becomes part of the identity; CI proves the census covers
-                        // every getenv("VBR_*") in the tree
-#define COMMON_CACHE_PLAN_VBR_ENV_FOLD(NAME, AFFECTS)                                  \
-                        if (AFFECTS) {                                                 \
-                            if (const char * val = std::getenv(NAME)) {                 \
-                                vbr.overrides += (vbr.overrides.empty() ? "" : " ");    \
-                                vbr.overrides += std::string(NAME) + "=" + val;         \
-                            }                                                           \
-                        }
-                        COMMON_CACHE_PLAN_VBR_ENV_LIST(COMMON_CACHE_PLAN_VBR_ENV_FOLD)
-#undef COMMON_CACHE_PLAN_VBR_ENV_FOLD
-                        // schedule CONTENT identity, not its path: digest the file when one
-                        // is named; a named-but-unreadable schedule is unrepresentable
-                        if (!params_base.vbr_selected_schedule.empty()) {
-                            std::ifstream sf(params_base.vbr_selected_schedule, std::ios::binary);
-                            if (sf) {
-                                uint64_t h = 1469598103934665603ull;
-                                char c;
-                                while (sf.get(c)) { h = (h ^ (uint8_t) c) * 1099511628211ull; }
-                                char hb[32];
-                                snprintf(hb, sizeof(hb), "sched%016llx", (unsigned long long) h);
-                                vbr.schedule = hb;
-                            } else {
-                                vbr.unrepresented_override = true;
-                            }
-                        }
+                        const auto vbr = common_cache_plan_vbr_regime_from_params(
+                            params_base, [](const char * name) { return std::getenv(name); });
                         return common_cache_plan_calib_kv(
                             vbr,
                             ggml_type_name(params_base.cache_type_k),

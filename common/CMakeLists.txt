@@ -137,9 +137,14 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
 # common-checkpoint-shadow.cpp is the ONE common TU allowed to reach the internal VBR
 # checkpoint bridge header — the include path is granted to that single source file, so the
 # compiler (not just the CI symbol scans in tests/check-vbr-generation-isolation.cmake)
-# enforces that no other common TU reaches libllama internals.
-set_source_files_properties(common-checkpoint-shadow.cpp PROPERTIES
-    INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
+# enforces that no OTHER common TU reaches libllama internals.
+# (the second grant is common-cache-plan-estimate.cpp: calibration identity hashes file
+# CONTENT with the internal SHA-256 primitive and — deliberately — resolves schedule paths
+# through the SAME runtime resolver the VBR reader uses (llama-vbr-config.h), so identity
+# can never drift from behavior. That makes this TU depend on libllama at link time, which
+# libcommon already does. These TWO TUs and no others.)
+set_source_files_properties(common-checkpoint-shadow.cpp common-cache-plan-estimate.cpp
+    PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

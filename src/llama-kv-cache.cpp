@@ -1,6 +1,7 @@
 #include "llama-kv-cache.h"
 
 #include "llama-vbr-generation-oracle.h"
+#include "llama-vbr-config.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -275,10 +276,14 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
     return ss.str();
 }
 
-static std::string turbo_vbr_read_schedule_env(const char * env, std::string & src) {
-    src = "inline";
+bool llama_vbr_resolve_layer_schedule(
+        const char * env,
+        std::string & schedule,
+        std::string & source) {
+    schedule.clear();
+    source = "inline";
     if (!env || !env[0]) {
-        return {};
+        return true;
     }
 
     std::string value = turbo_vbr_trim(env);
@@ -293,15 +298,18 @@ static std::string turbo_vbr_read_schedule_env(const char * env, std::string & s
         std::ifstream f(path);
         if (!f) {
             LLAMA_LOG_WARN("llama_kv_cache: could not open VBR_LAYER_SCHEDULE file %s\n", path.c_str());
-            return {};
+            source = path;
+            return false;
         }
         std::ostringstream ss;
         ss << f.rdbuf();
-        src = path;
-        return ss.str();
+        schedule = ss.str();
+        source = path;
+        return true;
     }
 
-    return value;
+    schedule = std::move(value);
+    return true;
 }
 
 static bool turbo_vbr_layer_strict_enabled(void) {
@@ -342,7 +350,8 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
 
     const char * env = turbo_vbr_getenv("VBR_LAYER_SCHEDULE");
     std::string src;
-    std::string schedule = turbo_vbr_read_schedule_env(env, src);
+    std::string schedule;
+    llama_vbr_resolve_layer_schedule(env, schedule, src);
     if (schedule.empty()) {
         if (env && env[0] && turbo_vbr_layer_strict_enabled()) {
             throw std::runtime_error("VBR_LAYER_SCHEDULE is empty or could not be read while VBR_LAYER_STRICT=1 is set");

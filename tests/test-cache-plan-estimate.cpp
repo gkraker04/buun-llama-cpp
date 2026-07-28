@@ -9,10 +9,15 @@
 // feasibility (component-only rows never win), and composed-chain estimation.
 
 #include "common-cache-plan-estimate.h"
+#include "common.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
 
 static int failures = 0;
 
@@ -125,6 +130,173 @@ static void test_vbr_regime_key() {
     CHECK(common_cache_plan_calib_profile("m", "", 512, "kf16-vf16").empty());
     CHECK(common_cache_plan_calib_profile("", "gpu", 512, "kf16-vf16").empty());
     CHECK(!common_cache_plan_calib_profile("m", "gpu", 512, "kf16-vf16").empty());
+
+    // Checked-in dorei 27B entry: reconstruct the measured default through the production
+    // assembly helper, not a hand-built common_cache_plan_vbr_regime.
+    common_params dorei_params;
+    dorei_params.vbr_cache_type_k = dorei_params.vbr_cache_type_v = true;
+    dorei_params.vbr_budget = "dynamic";
+    dorei_params.vbr_selected_family = "dynamic";
+    dorei_params.vbr_selected_policy = "runtime-controller";
+    dorei_params.vbr_capacity_bits = 1.25;
+    dorei_params.vbr_selected_bpv = 1.25;
+    dorei_params.vbr_reclaim_floor_bpv = 8.125f;
+    dorei_params.vbr_reset_keep_frac = 0.25f;
+    const auto dorei = common_cache_plan_vbr_regime_from_params(
+        dorei_params, [](const char *) -> const char * { return nullptr; });
+    const std::string dorei_profile = common_cache_plan_calib_profile(
+        "qwen35-27b-q6-k", "nvidia-geforce-rtx-3090-ngl99", 2048,
+        common_cache_plan_calib_kv(dorei, "f16", "f16"));
+    CHECK(dorei_profile ==
+          "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/"
+          "kvbr-vvbr-vbr-dynamic-dynamic-runtime-controller--1.25-1.25-0-8.125-0.25");
+    CHECK(common_cache_plan_calib_find(dorei_profile) != nullptr);
+}
+
+static void write_test_file(const std::filesystem::path & path, const std::string & bytes) {
+    std::ofstream out(path, std::ios::binary);
+    CHECK(bool(out));
+    out.write(bytes.data(), bytes.size());
+    CHECK(bool(out));
+}
+
+// D-pins r6 C-2/C-3: file-valued overrides key on SHA-256 content. Moving identical
+// content cannot move identity; editing a file in place must; unreadable content refuses.
+static void test_vbr_file_override_identity() {
+    using grammar = common_cache_plan_vbr_value_grammar;
+
+    const auto unique = std::to_string(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("llama-cache-plan-vbr-" + unique);
+    const auto dir_a = root / "a";
+    const auto dir_b = root / "b";
+    std::filesystem::create_directories(dir_a);
+    std::filesystem::create_directories(dir_b);
+
+    const std::string schedule = "il0k=t8;il0v=f16";
+    const auto file_a = dir_a / "schedule.txt";
+    const auto file_b = dir_b / "renamed.txt";
+    write_test_file(file_a, schedule);
+    write_test_file(file_b, schedule);
+
+    std::string a;
+    std::string b;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_LAYER_SCHEDULE", "@" + file_a.string(), grammar::inline_or_path, a));
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_LAYER_SCHEDULE", file_b.string(), grammar::inline_or_path, b));
+    CHECK(a == b); // same bytes, different path and path grammar
+
+    std::string inline_id;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_LAYER_SCHEDULE", schedule, grammar::inline_or_path, inline_id));
+    CHECK(inline_id == a); // inline and file forms share the content identity
+    std::string spaced_id;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_LAYER_SCHEDULE", "  @" + file_b.string() + "  ",
+        grammar::inline_or_path, spaced_id));
+    CHECK(spaced_id == b); // authoritative runtime trim prevents file-vs-inline aliasing
+
+    write_test_file(file_a, schedule + "il1k=t4\n");
+    std::string changed;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_LAYER_SCHEDULE", "@" + file_a.string(), grammar::inline_or_path, changed));
+    CHECK(changed != a); // same path, changed bytes
+
+    const auto order_a = dir_a / "degrade-order.txt";
+    const auto order_b = dir_b / "degrade-order.txt";
+    write_test_file(order_a, "il0k:t8\n");
+    write_test_file(order_b, "il0k:t8\n");
+    std::string order_id_a;
+    std::string order_id_b;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_DEGRADE_ORDER", order_a.string(), grammar::path, order_id_a));
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_DEGRADE_ORDER", order_b.string(), grammar::path, order_id_b));
+    CHECK(order_id_a == order_id_b);
+    write_test_file(order_a, "il0k:t4\n");
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_DEGRADE_ORDER", order_a.string(), grammar::path, changed));
+    CHECK(changed != order_id_a);
+
+    std::string missing = "must-clear";
+    CHECK(!common_cache_plan_vbr_override_identity(
+        "VBR_DEGRADE_ORDER", (root / "missing.txt").string(), grammar::path, missing));
+    CHECK(missing.empty());
+
+    // Policy directories resolve to policy_ladder.json and use the same content rule.
+    const auto policy_dir = root / "policy";
+    std::filesystem::create_directories(policy_dir);
+    write_test_file(policy_dir / "policy_ladder.json", "{\"version\":1}\n");
+    std::string policy_dir_id;
+    std::string policy_file_id;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_POLICY_LADDER", policy_dir.string(), grammar::dir_or_file, policy_dir_id));
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_POLICY_LADDER", (policy_dir / "policy_ladder.json").string(),
+        grammar::dir_or_file,
+        policy_file_id));
+    CHECK(policy_dir_id == policy_file_id);
+
+    // Pin the primitive and rendering, not only relative equality.
+    const auto sha_file = root / "sha-vector.txt";
+    write_test_file(sha_file, "abc");
+    std::string sha_id;
+    CHECK(common_cache_plan_sha256_file_identity(sha_file.string(), sha_id));
+    CHECK(sha_id ==
+          "sha256-ba7816bf8f01cfea414140de5dae2223"
+          "b00361a396177a9cb410ff61f20015ad");
+
+    // Scalar census values remain literal and are not fed through the digest domain.
+    std::string scalar;
+    CHECK(common_cache_plan_vbr_override_identity(
+        "VBR_BUDGET_MIB", "4096", grammar::scalar, scalar));
+    CHECK(scalar == "VBR_BUDGET_MIB=4096");
+
+    // Exercise the production assembly helper: unarmed means zero environment work;
+    // successful tokens have census order; a later unreadable file latches refusal without
+    // erasing either earlier or later successfully represented tokens.
+    common_params params;
+    int getenv_calls = 0;
+    const auto no_env = [&](const char *) -> const char * {
+        getenv_calls++;
+        return nullptr;
+    };
+    const auto unarmed = common_cache_plan_vbr_regime_from_params(params, no_env);
+    CHECK(!unarmed.armed);
+    CHECK(getenv_calls == 0);
+
+    params.vbr_cache_type_k = params.vbr_cache_type_v = true;
+    std::map<std::string, std::string> env = {
+        {"VBR_BUDGET_MIB", "4096"},
+        {"VBR_DEGRADE_ORDER", (root / "missing.txt").string()},
+        {"VBR_MODE", "1"},
+    };
+    const auto getenv_map = [&](const char * name) -> const char * {
+        const auto it = env.find(name);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    const auto refused = common_cache_plan_vbr_regime_from_params(params, getenv_map);
+    CHECK(refused.unrepresented_override);
+    CHECK(refused.overrides == "VBR_BUDGET_MIB=4096 VBR_MODE=1");
+    CHECK(common_cache_plan_calib_profile(
+        "m", "gpu", 1, common_cache_plan_calib_kv(refused, "f16", "f16")).empty());
+
+    // Policy selection sets both params.vbr_selected_schedule and VBR_LAYER_SCHEDULE.
+    // Assembly represents the schedule exactly once through the cost-affecting census row;
+    // VBR_SELECTED_SCHEDULE remains typed as a path but is non-costing telemetry.
+    params.vbr_selected_schedule = file_b.string();
+    env = {{"VBR_LAYER_SCHEDULE", "  @" + file_b.string() + "  "}};
+    const auto selected = common_cache_plan_vbr_regime_from_params(params, getenv_map);
+    CHECK(!selected.unrepresented_override);
+    CHECK(selected.schedule.empty());
+    CHECK(selected.overrides == b);
+    const size_t first_hash = selected.overrides.find("sha256-");
+    CHECK(first_hash != std::string::npos);
+    CHECK(selected.overrides.find("sha256-", first_hash + 1) == std::string::npos);
+
+    std::filesystem::remove_all(root);
 }
 
 // verify-r4/r5: the placement key is pure and positional — reversed heterogeneous device
@@ -449,6 +621,7 @@ int main() {
     test_profile_composition();
     test_placement_key();
     test_vbr_regime_key();
+    test_vbr_file_override_identity();
     test_calibration_validation();
     test_basic_estimation();
     test_controlled_disagreement();

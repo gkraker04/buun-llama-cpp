@@ -113,6 +113,10 @@ namespace common_arg_utils {
     bool is_autoy(const std::string & value);
 }
 
+// Authoritative --vbr-policy/VBR_POLICY_LADDER file resolver. A value may name the
+// JSON file directly or a directory containing policy_ladder.json.
+std::string common_vbr_resolve_policy_file(const std::string & raw_policy_path);
+
 struct common_params_context {
     enum llama_example ex = LLAMA_EXAMPLE_COMMON;
     common_params & params;
