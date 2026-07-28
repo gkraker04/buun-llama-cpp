@@ -114,6 +114,9 @@ def main():
             if pt is not None and ttft is not None:
                 residuals.append(pt - ttft)
 
+    # SAMPLED-PREFIX clusters (see the server-side comment): a 64-token-window FNV hash,
+    # so distinct workloads sharing a long leading boilerplate merge and collisions are
+    # possible. Good enough to separate workload variants offline; never an identity.
     families = {}
     for rec in records:
         fam = rec.get("identity", {}).get("prefix_tokens")

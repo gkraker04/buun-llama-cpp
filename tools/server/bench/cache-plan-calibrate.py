@@ -134,11 +134,14 @@ def main():
         restore_us_per_byte, workspace_setup_us = least_squares(xs, ys)
         if max(xs) - min(xs) < 0.01 * max(xs):
             # payloads (near-)constant — common on hybrid models whose checkpoint blob is
-            # dominated by the fixed-size recurrent state: the slope is unidentifiable and
-            # the honest model is a FLAT restore cost carried entirely by workspace
-            restore_us_per_byte = max(restore_us_per_byte, 0.0)
+            # dominated by the fixed-size recurrent state: the slope is UNIDENTIFIABLE, so
+            # force it to exactly zero and recompute the intercept as the mean residual.
+            # (Keeping a fitted slope here — of either sign — and its paired intercept would
+            # extrapolate wildly off the observed payload point.)
+            restore_us_per_byte = 0.0
+            workspace_setup_us  = sum(ys) / len(ys)
             print(f"# note: restored payloads are (near-)constant ({min(xs)}..{max(xs)} B); "
-                  "restore cost fitted as flat workspace")
+                  "slope forced to 0, workspace = mean residual")
         print(f"# restored records: {len(restored)}, restore fit: {restore_us_per_byte:.6f} us/byte, "
               f"workspace {workspace_setup_us:.0f} us")
         # the estimator contract accepts nonnegative finite coefficients; refuse only

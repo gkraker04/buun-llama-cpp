@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <tuple>
 
 // Fitted calibration table. Filled ONLY by the dorei microbench sweep + offline fit
@@ -15,13 +16,16 @@ static const common_cache_plan_calib CALIB_DOREI_QWEN35_2B_3090_B512 = {
     75.688, 0.000010, 7184.4,
 };
 
-// dorei 2026-07-28 campaign, buun's 27B-VBR serving config under PINNED -ngl 99 (the
+// dorei 2026-07-28 campaign, buun's 27B-VBR serving config under PINNED -ngl 99 and the
+// DEFAULT VBR ladder regime (dynamic budget / auto floor / auto vram / auto policy /
+// reclaim 8.125 / reset-keep 0.25 — the key names it; a different ladder config is a
+// different regime and must be re-fitted). (the
 // auto-fit placement varied per launch — ngl64 measured 979 us/tok, all-GPU measures
 // 861.5: the profile key distinguishing placements is load-bearing). 23 cold records,
 // 5 checkpoint restores — hybrid payloads constant at 156.9 MiB, restore cost FLAT
 // ~158 ms carried by workspace; crossover vs replay ~= 183 tokens.
 static const common_cache_plan_calib CALIB_DOREI_QWEN36_27B_VBR_3090 = {
-    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr", 1,
+    "qwen35-27b-q6-k/nvidia-geforce-rtx-3090-ngl99/b2048/kvbr-vvbr-vbr-dynamic-auto-auto-auto-8.125-0.25", 1,
     861.510, 0.0, 158069.2,
 };
 
@@ -52,6 +56,29 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
         }
     }
     return prof;
+}
+
+std::string common_cache_plan_calib_kv(bool vbr_armed, bool vbr_k, bool vbr_v,
+                                       const std::string & type_k, const std::string & type_v,
+                                       const std::string & vbr_budget,
+                                       const std::string & vbr_min_bits,
+                                       const std::string & vbr_vram_budget,
+                                       const std::string & vbr_policy,
+                                       float reclaim_floor_bpv, float reset_keep_frac) {
+    const std::string k = (vbr_armed && vbr_k) ? "vbr" : type_k;
+    const std::string v = (vbr_armed && vbr_v) ? "vbr" : type_v;
+    std::string kv = "k" + k + "-v" + v;
+    if (!vbr_armed) {
+        return kv;
+    }
+    // regime signature: every knob that moves the ladder's cost. Rendered compactly and
+    // stably; the profile sanitizer squashes the rest.
+    // separators stay inside the sanitizer's squash class so the rendered key is legible
+    // ("...-vbr-dynamic-auto-auto-auto-8.125-0.25") rather than pseudo-path segmented
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.4g %.4g", (double) reclaim_floor_bpv, (double) reset_keep_frac);
+    return kv + " vbr " + vbr_budget + " " + vbr_min_bits + " " + vbr_vram_budget + " " +
+           vbr_policy + " " + buf;
 }
 
 std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_descs,

@@ -39,6 +39,20 @@ std::string common_cache_plan_calib_profile(const std::string & model_stem,
                                             const std::string & hw_desc, int n_batch,
                                             const std::string & kv_desc);
 
+// THE KV-regime segment, pure and tested: names the cache regime AND — when VBR is armed
+// — the ladder configuration that determines its cost (budget mode, aggregate floor, VRAM
+// budget, policy id, server reclaim/reset policy). VBR arms from the --vbr-* knobs even
+// without the `-ct vbr` alias, so `vbr_armed` comes from the canonical predicate, never
+// from the cache types alone; two VBR runs with different budgets/floors/policies MUST NOT
+// share fitted coefficients. Non-VBR runs key on the ggml type names only.
+std::string common_cache_plan_calib_kv(bool vbr_armed, bool vbr_k, bool vbr_v,
+                                       const std::string & type_k, const std::string & type_v,
+                                       const std::string & vbr_budget,
+                                       const std::string & vbr_min_bits,
+                                       const std::string & vbr_vram_budget,
+                                       const std::string & vbr_policy,
+                                       float reclaim_floor_bpv, float reset_keep_frac);
+
 // THE placement-key (hardware class) construction, pure and tested: POSITIONAL device
 // order (main_gpu / tensor_split index into it — reversed heterogeneous orders must
 // produce distinct keys), effective ngl (0 or no devices → "cpu"), and for multi-GPU the

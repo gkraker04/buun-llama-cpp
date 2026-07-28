@@ -3228,14 +3228,22 @@ private:
                                                params_base.main_gpu,
                                                params_base.tensor_split),
                     params_base.n_batch,
-                    // a vbr side is a RUNTIME regime, not a ggml type — cache_type_k/v
-                    // still hold the f16 entry tier, so naming the type would alias a
-                    // vbr run with a true-f16 run (the exact collision this segment
-                    // exists to prevent)
-                    std::string("k") + (params_base.vbr_cache_type_k
-                        ? "vbr" : ggml_type_name(params_base.cache_type_k)) +
-                    "-v" + (params_base.vbr_cache_type_v
-                        ? "vbr" : ggml_type_name(params_base.cache_type_v)));
+                    // a vbr side is a RUNTIME REGIME, not a ggml type (cache_type_k/v still
+                    // hold the f16 entry tier), and the regime's COST depends on the whole
+                    // ladder configuration — budget mode, aggregate floor, VRAM budget,
+                    // policy — not just which sides took the alias. VBR can also arm from
+                    // those knobs with no `-ct vbr` at all (common_params::vbr_enabled),
+                    // which would otherwise key as plain f16. Sides name the regime; the
+                    // regime signature disambiguates configurations within it.
+                    // [D pins r1 finding: post-CLEAN follow-up 1]
+                    common_cache_plan_calib_kv(
+                        params_base.vbr_enabled(),
+                        params_base.vbr_cache_type_k, params_base.vbr_cache_type_v,
+                        ggml_type_name(params_base.cache_type_k),
+                        ggml_type_name(params_base.cache_type_v),
+                        params_base.vbr_budget, params_base.vbr_min_bits,
+                        params_base.vbr_vram_budget, params_base.vbr_policy,
+                        params_base.vbr_reclaim_floor_bpv, params_base.vbr_reset_keep_frac));
             }
             SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
                     cache_plan_obs->calibration_profile.c_str());
@@ -3471,12 +3479,12 @@ private:
                     std::hash<std::string>{}(model_name));
                 plan_rec->identity.execution_digest = llama_cache_acct_value::measured(
                     std::hash<std::string>{}(frontier_execution_identity));
-                // prefix-family fingerprint: FNV-1a over the prompt's first 64 token ids —
-                // an EXACT family key for offline clustering (three agent variants = three
-                // digests), where cross-slot LCP evidence is only an inference from
-                // whatever slots happened to hold. Opaque + content-minimizing like every
-                // identity digest; token count folded in so a short prompt that happens to
-                // prefix-match a long one still keys separately.
+                // SAMPLED-PREFIX TELEMETRY (not an identity): FNV-1a over at most the
+                // prompt's first 64 token ids + that sampled count. Useful for OFFLINE
+                // clustering of workload variants; it is NOT an exact family key and must
+                // never drive a shipped decision — prompts sharing 64 leading tokens merge
+                // deliberately, the folded count saturates at the window, and FNV collides.
+                // Opaque + content-minimizing like every identity digest.
                 {
                     uint64_t h = 1469598103934665603ull;
                     const auto fold = [&h](uint64_t v) {
