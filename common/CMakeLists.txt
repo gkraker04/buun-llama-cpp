@@ -67,6 +67,8 @@ add_library(${TARGET}
     chat.h
     common-cache-plan.cpp
     common-cache-plan.h
+    common-cache-plan-estimate.cpp
+    common-cache-plan-estimate.h
     common-checkpoint-coordinator.cpp
     common-checkpoint-coordinator.h
     common-checkpoint-shadow.cpp

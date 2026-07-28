@@ -1,9 +1,12 @@
-// B0 decision-record contract tests: band monotonicity (compile-time), multi-failure
-// first-reason precedence including out-of-order arrival, valid-loser disposition, upsert
-// identity, unknown-vs-zero on measured fields, and exhaustive name tables (every member of
-// every closed enum must produce a non-"invalid" name).
+// B0/B decision-record contract tests (schema v2): band monotonicity (compile-time),
+// multi-failure first-reason precedence including out-of-order arrival, valid-loser
+// disposition, per-entry inventory merge/overflow/completeness semantics, selection
+// mapping, planner-output clearing, unknown-vs-zero on measured fields, and exhaustive
+// name tables (every member of every closed enum must produce a non-"invalid" name).
 
 #include "common-cache-plan.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,38 +53,154 @@ static void test_valid_loser() {
     CHECK(d.disposition == common_cache_plan_disposition::rejected_invalid);
 }
 
-// one row per provider across stages; none observed means typed-unknown fields, never zeros
-static void test_record_stages() {
+// per-entry inventory: cross-phase merge on (provider, source), never duplicate rows for
+// one physical candidate; phases accumulate; selection maps to a row (r3/r4 A1)
+static void test_inventory_merge() {
     common_cache_plan_record rec;
-    // outcome `unknown` IS the typed not-finalized state
+    CHECK(rec.n_inventory == 0);
+    for (size_t p = 0; p < size_t(common_cache_plan_provider::_count); p++) {
+        CHECK(rec.inventory_states[p] == common_cache_plan_inventory_state::unobserved);
+        CHECK(rec.selected[p] == -1);
+        CHECK(rec.selected_row(common_cache_plan_provider(p)) == nullptr);
+    }
+
+    // slot 3 visited by similarity, then again by LRU: ONE row, both phase bits
+    auto * a = rec.find_or_add(common_cache_plan_provider::live_slot, 3,
+                               COMMON_CACHE_PLAN_PHASE_SIMILARITY);
+    CHECK(a != nullptr);
+    a->sim = 0.4; a->sim_known = true;
+    auto * b = rec.find_or_add(common_cache_plan_provider::live_slot, 3,
+                               COMMON_CACHE_PLAN_PHASE_LRU);
+    CHECK(b == a);
+    CHECK(rec.n_inventory == 1);
+    CHECK(a->phases_seen == (COMMON_CACHE_PLAN_PHASE_SIMILARITY | COMMON_CACHE_PLAN_PHASE_LRU));
+    CHECK(a->sim_known); // phase 2 added its scalars without erasing phase 1's
+
+    // same source id under a DIFFERENT provider is a different physical candidate
+    auto * h = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 3,
+                               COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+    CHECK(h != nullptr && h != a);
+    CHECK(rec.n_inventory == 2);
+
+    // first observation flips unobserved -> complete
+    CHECK(rec.inventory_states[size_t(common_cache_plan_provider::live_slot)] ==
+          common_cache_plan_inventory_state::complete);
+
+    // selection round-trips through the ordinal mapping
+    rec.select(common_cache_plan_provider::live_slot, a);
+    CHECK(rec.selected_row(common_cache_plan_provider::live_slot) == a);
+    rec.select(common_cache_plan_provider::live_slot, nullptr);
+    CHECK(rec.selected_row(common_cache_plan_provider::live_slot) == nullptr);
+
+    // rows carry typed-unknown measured fields until a shipped loop fills them
+    CHECK(h->lcp_tokens.state == llama_cache_acct_known::unknown);
+    CHECK(h->t_last_used_us.state == llama_cache_acct_known::unknown);
+    CHECK(!h->delivered && !h->gen_eval.evaluated);
+}
+
+// capacity exhaustion: overflow latches, append stops, shipped-side calls keep succeeding
+// as no-ops (nullptr), and the latched state never downgrades (A2/A3 overflow gate)
+static void test_inventory_overflow() {
+    common_cache_plan_record rec;
+    for (size_t i = 0; i < COMMON_CACHE_PLAN_MAX_CANDIDATES; i++) {
+        CHECK(rec.find_or_add(common_cache_plan_provider::host_cache_entry, (int32_t) i,
+                              COMMON_CACHE_PLAN_PHASE_HOST_SCAN) != nullptr);
+    }
+    CHECK(rec.n_inventory == COMMON_CACHE_PLAN_MAX_CANDIDATES);
+    CHECK(rec.find_or_add(common_cache_plan_provider::live_slot, 0,
+                          COMMON_CACHE_PLAN_PHASE_LRU) == nullptr);
+    CHECK(rec.inventory_states[size_t(common_cache_plan_provider::live_slot)] ==
+          common_cache_plan_inventory_state::overflowed);
+    // overflow never downgrades
+    rec.note_inventory_complete(common_cache_plan_provider::live_slot);
+    rec.note_inventory_truncated(common_cache_plan_provider::live_slot);
+    CHECK(rec.inventory_states[size_t(common_cache_plan_provider::live_slot)] ==
+          common_cache_plan_inventory_state::overflowed);
+    // an EXISTING row is still found after capacity is exhausted (merge, not append)
+    CHECK(rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
+                          COMMON_CACHE_PLAN_PHASE_HOST_SCAN) != nullptr);
+    // a dropped derived plan latches the record-level flag WITHOUT touching any
+    // provider's inventory state (verify-r1 finding 4)
+    const auto host_state_before =
+        rec.inventory_states[size_t(common_cache_plan_provider::host_cache_entry)];
+    CHECK(rec.add_chain(common_cache_plan_provider::host_cache_entry, 0, 1) == nullptr);
+    CHECK(rec.derived_plans_incomplete);
+    CHECK(rec.inventory_states[size_t(common_cache_plan_provider::host_cache_entry)] ==
+          host_state_before);
+}
+
+// truncation marks a shipped short-circuit; complete never overwrites it (r3 A1 reading 2)
+static void test_inventory_truncation() {
+    common_cache_plan_record rec;
+    rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
+                    COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+    rec.note_inventory_truncated(common_cache_plan_provider::live_context_checkpoint);
+    rec.note_inventory_complete(common_cache_plan_provider::live_context_checkpoint);
+    CHECK(rec.inventory_states[size_t(common_cache_plan_provider::live_context_checkpoint)] ==
+          common_cache_plan_inventory_state::truncated_by_shipped_short_circuit);
+}
+
+// revocation clears every non-cold delivery; planner-fault clearing wipes planner outputs
+// only, leaving the B0 evidence intact (A2)
+static void test_revoke_and_planner_clear() {
+    common_cache_plan_record rec;
+    auto * s = rec.find_or_add(common_cache_plan_provider::live_slot, 0, COMMON_CACHE_PLAN_PHASE_LRU);
+    auto * k = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
+                               COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+    auto * cold = rec.find_or_add(common_cache_plan_provider::cold_replay, -1, uint8_t(0));
+    s->delivered = k->delivered = cold->delivered = true;
+    rec.revoke_deliveries();
+    CHECK(!s->delivered && !k->delivered);
+    CHECK(cold->delivered); // cold is a final-state fact, never revoked
+
+    // simulated planner outputs
+    k->predicted_total_us = llama_cache_acct_value::measured(42);
+    k->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimated_us =
+        llama_cache_acct_value::measured(41);
+    rec.shadow_choice  = 1;
+    rec.shadow_tie_set[0] = 1; rec.n_shadow_ties = 1;
+    k->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED); // B0 evidence
+
+    rec.clear_planner_outputs();
+    CHECK(rec.shadow_choice == -1 && rec.n_shadow_ties == 0);
+    CHECK(k->predicted_total_us.state == llama_cache_acct_known::unknown);
+    CHECK(k->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimated_us.state ==
+          llama_cache_acct_known::unknown);
+    // the B0 evidence survives the planner fault
+    CHECK(k->reason == COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
+    CHECK(rec.n_inventory == 3);
+}
+
+// record-level typed-unknown discipline + per-candidate cost-term defaults: five DISTINCT
+// kinds with canonical raw units — a default array would collapse to five "restore" slots
+static void test_record_defaults() {
+    common_cache_plan_record rec;
+    CHECK(rec.schema_version == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
-    for (const auto & term : rec.cost_terms) {
+    CHECK(rec.calibration_profile.empty()); // typed-unknown on the wire
+    CHECK(rec.shadow_choice == -1 && rec.n_shadow_ties == 0);
+    CHECK(rec.shipped_plan_candidate == -1);
+    CHECK(!rec.derived_plans_incomplete);
+    CHECK(rec.planner_status == common_cache_plan_planner_status::not_attempted);
+
+    common_cache_plan_candidate c;
+    bool seen[size_t(llama_cache_acct_cost_kind::_count)] = {};
+    for (const auto & term : c.cost_terms) {
+        CHECK(!seen[size_t(term.kind)]);
+        seen[size_t(term.kind)] = true;
+        CHECK(term.raw_unit == llama_cache_acct_cost_kind_unit(term.kind));
+        CHECK(term.raw.state == llama_cache_acct_known::unknown);
         CHECK(term.estimated_us.state == llama_cache_acct_known::unknown);
     }
-    // no provider observed yet — absence is not a vacuous verdict
-    for (const auto & c : rec.candidates) {
-        CHECK(!c.present);
-        CHECK(!c.delivered);
-        CHECK(!c.gen_eval.evaluated);
-    }
-
-    auto & slot_row = rec.row(common_cache_plan_provider::live_slot);
-    slot_row.sim = 0.75; slot_row.sim_known = true;
-    slot_row.disposition = common_cache_plan_disposition::accepted;
-    CHECK(slot_row.present);
-
-    // row() is idempotent identity, noexcept by construction (fixed array)
-    auto & again = rec.row(common_cache_plan_provider::live_slot);
-    CHECK(&again == &slot_row);
-
-    auto & ckpt_row = rec.row(common_cache_plan_provider::live_context_checkpoint);
-    ckpt_row.note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
-    CHECK(ckpt_row.present);
-    CHECK(!rec.candidates[size_t(common_cache_plan_provider::host_cache_entry)].present);
-    // a rejection is never a delivery
-    CHECK(!ckpt_row.delivered);
+    CHECK(c.cost_terms[size_t(llama_cache_acct_cost_kind::replay)].raw_unit ==
+          llama_cache_acct_unit::tokens);
+    CHECK(c.predicted_total_us.state == llama_cache_acct_known::unknown);
+    CHECK(c.component_ids[0] == -1 && c.component_ids[1] == -1);
+    // identity evidence starts typed-unknown across the board — never fabricated digests
+    CHECK(rec.identity.model_digest.state == llama_cache_acct_known::unknown);
+    CHECK(rec.identity.prefix_token_digest.state == llama_cache_acct_known::unknown);
 }
 
 // exhaustive name tables: every member names itself, no member is "invalid"
@@ -101,38 +220,164 @@ static void test_name_tables() {
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_selection::_count); i++) {
         CHECK(strcmp(common_cache_plan_selection_name(common_cache_plan_selection(i)), "invalid") != 0);
     }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_inventory_state::_count); i++) {
+        CHECK(strcmp(common_cache_plan_inventory_state_name(common_cache_plan_inventory_state(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_planner_status::_count); i++) {
+        CHECK(strcmp(common_cache_plan_planner_status_name(common_cache_plan_planner_status(i)), "invalid") != 0);
+    }
     // and the closed inventory really is closed: exactly today's four providers
     CHECK(uint8_t(common_cache_plan_provider::_count) == 4);
-    // schema v1 member census + sentinel (compile-time pinned; echoed here as a wire check)
+    // schema v2 member census + sentinel (compile-time pinned; echoed here as a wire check)
     CHECK(COMMON_CACHE_PLAN_REASON_MEMBER_COUNT == 30);
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
 }
 
-// the cost array carries five DISTINCT kinds with their canonical raw units — a default
-// array would collapse to five "restore"/bytes slots (Sol verify-r1 finding 9)
-static void test_cost_term_defaults() {
+// verify-r1 finding 9: couple the golden schema to the ACTUAL C++ serializer — a
+// representative composed-delivery record through common_cache_plan_record_json, with
+// structural assertions on every load-bearing v2 key
+static void test_json_serialization() {
     common_cache_plan_record rec;
-    bool seen[size_t(llama_cache_acct_cost_kind::_count)] = {};
-    for (const auto & term : rec.cost_terms) {
-        CHECK(!seen[size_t(term.kind)]);
-        seen[size_t(term.kind)] = true;
-        CHECK(term.raw_unit == llama_cache_acct_cost_kind_unit(term.kind));
-        CHECK(term.raw.state == llama_cache_acct_known::unknown);
-        CHECK(term.estimated_us.state == llama_cache_acct_known::unknown);
+    rec.id_task = 42; rec.id_slot = 1;
+    rec.calibration_profile = "test-model/test-gpu/b512";
+    rec.selection = common_cache_plan_selection::similarity;
+    rec.n_prompt_tokens = llama_cache_acct_value::measured(1000);
+
+    auto * host = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
+                                  COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+    host->accept();
+    host->delivered     = true;
+    host->lcp_tokens    = llama_cache_acct_value::measured(500);
+    host->payload_bytes = llama_cache_acct_value::measured(1000);
+    auto * ckpt = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
+                                  COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+    ckpt->accept();
+    ckpt->delivered      = true;
+    ckpt->component_only = true;
+    rec.select(common_cache_plan_provider::host_cache_entry, host);
+    rec.select(common_cache_plan_provider::live_context_checkpoint, ckpt);
+    auto * chain = rec.add_chain(common_cache_plan_provider::host_cache_entry, 0, 1);
+    chain->disposition = common_cache_plan_disposition::accepted;
+    chain->delivered   = true;
+    rec.shipped_plan_candidate = 2;
+    rec.chosen  = common_cache_plan_provider::live_context_checkpoint;
+    rec.outcome = common_cache_plan_outcome::restored;
+    rec.planner_status = common_cache_plan_planner_status::profile_unfitted;
+    // a filled term must appear on the wire; unfilled kinds must be absent
+    host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].raw =
+        llama_cache_acct_value::measured(500);
+    host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimated_us =
+        llama_cache_acct_value::measured(50000);
+    host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
+    host->predicted_total_us = llama_cache_acct_value::measured(50000);
+
+    const auto j = common_cache_plan_record_json(rec);
+    CHECK(j["schema_version"] == 2);
+    CHECK(j["candidates"].size() == 3);
+    CHECK(j["candidates"][0]["id"] == 0);
+    CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
+    CHECK(j["candidates"][0]["cost_terms"].contains("replay"));
+    CHECK(!j["candidates"][0]["cost_terms"].contains("transfer")); // absence = unavailable
+    CHECK(j["candidates"][1]["component_only"] == true);
+    CHECK(j["candidates"][2]["is_chain"] == true);
+    CHECK(j["candidates"][2]["components"] == nlohmann::ordered_json::array({0, 1}));
+    CHECK(j["chosen"] == "live_context_checkpoint");
+    CHECK(j["chosen_candidate"] == 1);
+    CHECK(j["shipped_plan_candidate"] == 2); // the chain, not the terminal provider row
+    CHECK(j["planner_status"] == "profile_unfitted");
+    CHECK(j["shadow"] == "unavailable"); // string sentinel per the acct-value convention
+    CHECK(j["inventory_states"]["host_cache_entry"] == "complete");
+    CHECK(j["delivered_chain"] == nlohmann::ordered_json::array(
+        {"host_cache_entry", "live_context_checkpoint"}));
+}
+
+// finalize-shaped chain composition (verify-r4): the ONE tested implementation the server
+// calls — simple delivery, composed delivery with sibling cost-loser chains, and the
+// exact-capacity shape where the delivered pair's chain cannot be recorded
+static void test_compose_chains() {
+    { // simple (non-composed) delivery: shipped plan = the chosen provider's selected row
+        common_cache_plan_record rec;
+        auto * live = rec.find_or_add(common_cache_plan_provider::live_slot, 0,
+                                      COMMON_CACHE_PLAN_PHASE_SIMILARITY);
+        live->accept(); live->delivered = true;
+        rec.select(common_cache_plan_provider::live_slot, live);
+        rec.chosen = common_cache_plan_provider::live_slot;
+        common_cache_plan_compose_chains(rec);
+        CHECK(rec.shipped_plan_candidate == 0);
+        CHECK(rec.n_inventory == 1); // no chains fabricated
     }
-    CHECK(rec.cost_terms[size_t(llama_cache_acct_cost_kind::replay)].raw_unit ==
-          llama_cache_acct_unit::tokens);
-    // identity evidence starts typed-unknown across the board — never fabricated digests
-    CHECK(rec.identity.model_digest.state == llama_cache_acct_known::unknown);
-    CHECK(rec.identity.prefix_token_digest.state == llama_cache_acct_known::unknown);
+    { // composed delivery: every sibling component-only, valid ones chained, shipped = chain
+        common_cache_plan_record rec;
+        auto * host = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
+                                      COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+        host->accept(); host->delivered = true;
+        auto * sel = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
+                                     COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+        sel->accept(); sel->delivered = true;
+        auto * sib = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 1,
+                                     COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+        sib->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL); // valid loser
+        auto * bad = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 2,
+                                     COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+        bad->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED); // invalid
+        rec.select(common_cache_plan_provider::host_cache_entry, host);
+        rec.select(common_cache_plan_provider::live_context_checkpoint, sel);
+        rec.chosen = common_cache_plan_provider::live_context_checkpoint;
+        common_cache_plan_compose_chains(rec);
+        CHECK(sel->component_only && sib->component_only && bad->component_only);
+        CHECK(rec.n_inventory == 6); // 4 rows + shipped chain + sibling chain (invalid: none)
+        CHECK(rec.shipped_plan_candidate >= 4);
+        const auto & shipped = rec.inventory[size_t(rec.shipped_plan_candidate)];
+        CHECK(shipped.is_chain() && shipped.delivered);
+        CHECK(shipped.disposition == common_cache_plan_disposition::accepted);
+        // the sibling's chain is a cost loser, never delivered
+        bool found_sib_chain = false;
+        for (uint32_t i = 4; i < rec.n_inventory; i++) {
+            const auto & c = rec.inventory[i];
+            if ((int32_t) i != rec.shipped_plan_candidate) {
+                found_sib_chain = true;
+                CHECK(c.is_chain() && !c.delivered);
+                CHECK(c.disposition == common_cache_plan_disposition::valid_not_chosen_cost);
+            }
+        }
+        CHECK(found_sib_chain);
+        CHECK(!rec.derived_plans_incomplete);
+    }
+    { // exact capacity: the delivered pair's chain cannot be recorded — shipped plan is
+      // -1 (the bare dependent checkpoint never stands in) and the planner will refuse
+        common_cache_plan_record rec;
+        auto * host = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
+                                      COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+        host->accept(); host->delivered = true;
+        auto * sel = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
+                                     COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+        sel->accept(); sel->delivered = true;
+        for (int32_t i = 1; rec.n_inventory < COMMON_CACHE_PLAN_MAX_CANDIDATES; i++) {
+            rec.find_or_add(common_cache_plan_provider::live_slot, i,
+                            COMMON_CACHE_PLAN_PHASE_LRU)
+                ->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+        }
+        rec.select(common_cache_plan_provider::host_cache_entry, host);
+        rec.select(common_cache_plan_provider::live_context_checkpoint, sel);
+        rec.chosen = common_cache_plan_provider::live_context_checkpoint;
+        common_cache_plan_compose_chains(rec);
+        CHECK(rec.derived_plans_incomplete);
+        CHECK(rec.shipped_plan_candidate == -1);
+        CHECK(sel->component_only); // the dependency fact is still recorded
+    }
 }
 
 int main() {
     test_precedence();
     test_valid_loser();
-    test_record_stages();
+    test_inventory_merge();
+    test_inventory_overflow();
+    test_inventory_truncation();
+    test_revoke_and_planner_clear();
+    test_record_defaults();
     test_name_tables();
-    test_cost_term_defaults();
+    test_json_serialization();
+    test_compose_chains();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

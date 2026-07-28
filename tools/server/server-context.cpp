@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "common-cache-plan.h"
+#include "common-cache-plan-estimate.h"
 #include "common-checkpoint-shadow.h"
 #include "common-checkpoint-coordinator.h"
 #include "fit.h"
@@ -34,6 +35,7 @@
 #include <random>
 #include <filesystem>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <fstream>
 
@@ -318,6 +320,14 @@ struct server_shadow_global_state {
 struct server_cache_plan_observer {
     uint64_t records_finalized  = 0;
     uint64_t shadow_unavailable = 0;
+    // planner-attempt accounting (verify-r1 finding 8): refusals counted exactly once,
+    // distinct from observer faults; the per-record closed status carries the WHY
+    uint64_t planner_ok      = 0;
+    uint64_t planner_refused = 0;
+
+    // B-2 stable calibration-profile id ("{model class}/{hardware class}/b{batch}"),
+    // composed once at observer init; copied onto every record. Empty = unprofiled.
+    std::string calibration_profile;
 
     // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
@@ -469,7 +479,7 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_candidate * obs = nullptr) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr) {
         // A host snapshot replaces the live frontier wholesale. Any rolling
         // tape rooted in the displaced frontier is no longer a valid lineage.
         if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
@@ -1573,20 +1583,23 @@ private:
             // host restore replaces the slot state wholesale, so a positive final reuse
             // count after host delivery is the HOST's prefix — never attributed to the
             // original live slot.
-            if (slot.n_prompt_tokens_cache > 0 &&
-                !rec.candidates[size_t(common_cache_plan_provider::host_cache_entry)].delivered) {
-                auto & live = rec.row(common_cache_plan_provider::live_slot);
-                live.disposition = common_cache_plan_disposition::accepted;
-                live.delivered   = true;
-                live.reason      = COMMON_CACHE_PLAN_REASON_NONE;
-                live.lcp_tokens  = llama_cache_acct_value::measured((uint64_t) slot.n_prompt_tokens_cache);
+            {
+                const auto * host = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+                auto *       live = rec.selected_row(common_cache_plan_provider::live_slot);
+                if (slot.n_prompt_tokens_cache > 0 && !(host && host->delivered) && live) {
+                    live->disposition = common_cache_plan_disposition::accepted;
+                    live->delivered   = true;
+                    live->reason      = COMMON_CACHE_PLAN_REASON_NONE;
+                    live->lcp_tokens  = llama_cache_acct_value::measured((uint64_t) slot.n_prompt_tokens_cache);
+                }
             }
 
             // cold replay is the always-valid floor: it always has a row, and it delivered
             // exactly when nothing else did
-            {
-                auto & cold = rec.row(common_cache_plan_provider::cold_replay);
-                cold.disposition = common_cache_plan_disposition::accepted;
+            if (auto * cold = rec.find_or_add(common_cache_plan_provider::cold_replay, COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0))) {
+                cold->disposition = common_cache_plan_disposition::accepted;
+                rec.select(common_cache_plan_provider::cold_replay, cold);
+                rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
             }
 
             // chosen = the TERMINAL delivered provider (delivery is data recorded at each
@@ -1598,9 +1611,9 @@ private:
             };
             const common_cache_plan_candidate * delivered_row = nullptr;
             for (const auto prov : terminal_order) {
-                const auto & c = rec.candidates[size_t(prov)];
-                if (c.present && c.delivered) {
-                    delivered_row = &c;
+                const auto * c = rec.selected_row(prov);
+                if (c && c->delivered) {
+                    delivered_row = c;
                     rec.chosen    = prov;
                     break;
                 }
@@ -1616,11 +1629,47 @@ private:
                 rec.chosen  = common_cache_plan_provider::cold_replay;
             }
             if (rec.chosen == common_cache_plan_provider::cold_replay) {
-                rec.candidates[size_t(common_cache_plan_provider::cold_replay)].delivered = true;
+                if (auto * cold = rec.selected_row(common_cache_plan_provider::cold_replay)) {
+                    cold->delivered = true;
+                }
             }
+
+            // composed plan as a first-class candidate (verify-r1 finding 1): a
+            // multi-provider delivery (host snapshot + checkpoint continuation) gets ONE
+            // chain row — DELIVERED, since it is what actually ran — and the chain IS the
+            // complete shipped plan. The bare checkpoint row becomes component-only: its
+            // state was reachable only through the delivered host entry, so it can never
+            // enter the root optimum as a standalone plan.
+            common_cache_plan_compose_chains(rec);
 
             if (cache_plan_obs) {
                 rec.acct = cache_plan_obs->ledger.snapshot();
+            }
+
+            // ---- planner boundary [A2]: estimation, tie-set construction, and shadow
+            // choice run HERE, inside their own boundary — failure clears planner outputs
+            // only; B0 finalization and emission continue unconditionally. Every attempt
+            // outcome is a closed status on the record, and refusals move the observer
+            // counter exactly once (verify-r1 finding 8).
+            try {
+                if (rec.calibration_profile.empty()) {
+                    rec.planner_status = common_cache_plan_planner_status::no_profile;
+                } else if (const auto * calib = common_cache_plan_calib_find(rec.calibration_profile)) {
+                    // refusal is all-or-nothing inside the estimator (its postcondition)
+                    rec.planner_status = common_cache_plan_estimate_and_choose(rec, *calib);
+                } else {
+                    rec.planner_status = common_cache_plan_planner_status::profile_unfitted;
+                }
+            } catch (...) {
+                rec.clear_planner_outputs();
+                rec.planner_status = common_cache_plan_planner_status::internal_fault;
+            }
+            if (cache_plan_obs) {
+                if (rec.planner_status == common_cache_plan_planner_status::ok) {
+                    cache_plan_obs->planner_ok++;
+                } else {
+                    cache_plan_obs->planner_refused++;
+                }
             }
 
             json out = common_cache_plan_record_json(rec);
@@ -1629,6 +1678,8 @@ private:
                 out["observer"] = json {
                     { "records_finalized",  cache_plan_obs->records_finalized },
                     { "shadow_unavailable", cache_plan_obs->shadow_unavailable },
+                    { "planner_ok",         cache_plan_obs->planner_ok },
+                    { "planner_refused",    cache_plan_obs->planner_refused },
                 };
             }
 
@@ -3128,7 +3179,58 @@ private:
                     llama_cache_acct_category::rolling_window_tape,
                     llama_cache_acct_residency::not_applicable,
                     llama_cache_acct_measure::logical_payload, 0);
-            SRV_INF("%s", "cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan)\n");
+            // B-2: compose the stable calibration-profile id ONCE. The model class comes
+            // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
+            // never a filesystem label — renaming a different file to the same basename
+            // must not select fitted coefficients (verify-r1 finding 5). The hardware
+            // class covers the COMPLETE GPU topology (per-description counts + split
+            // mode), not just the first device. Composition/sanitize rule lives beside
+            // the calib struct (single tested spelling).
+            {
+                char desc[256] = {0};
+                llama_model_desc(model_tgt, desc, sizeof(desc));
+
+                // EFFECTIVE placement, not system inventory (verify-r2 finding 2): the
+                // devices actually offloaded to (--device wins over the system list),
+                // plus every knob that changes where work runs — ngl, and for multi-GPU
+                // the split mode / main gpu / tensor split. CPU vs full-offload on the
+                // same host must never share a key.
+                // POSITIONAL device order (verify-r4): main_gpu and tensor_split index
+                // into this order, so the key lists devices in sequence — a reversed
+                // heterogeneous pair must never alias the same placement
+                std::vector<std::string> gpu_descs;
+                if (!params_base.devices.empty()) {
+                    // the explicit --device list is nullptr-TERMINATED (parse_device_list);
+                    // "none" is a single nullptr -> empty -> "cpu"
+                    for (auto * dev : params_base.devices) {
+                        if (dev) {
+                            gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        }
+                    }
+                } else {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        auto * dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        }
+                    }
+                }
+                // effective placement: auto-fit wrote the resolved count back into
+                // params; a remaining negative sentinel means the loader's
+                // negative-is-all default — key on the model's actual layer count
+                const int ngl_eff = params_base.n_gpu_layers >= 0
+                    ? params_base.n_gpu_layers
+                    : llama_model_n_layer(model_tgt) + 1;
+                cache_plan_obs->calibration_profile = common_cache_plan_calib_profile(
+                    desc,
+                    common_cache_plan_calib_hw(gpu_descs, ngl_eff,
+                                               int(params_base.split_mode),
+                                               params_base.main_gpu,
+                                               params_base.tensor_split),
+                    params_base.n_batch);
+            }
+            SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
+                    cache_plan_obs->calibration_profile.c_str());
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -3352,6 +3454,9 @@ private:
             try {
                 plan_rec = std::make_unique<common_cache_plan_record>();
                 plan_rec->id_task = task.id;
+                // B-2: the profile is composed once at init and copied here (inside the
+                // creation try — never from a selector hook)
+                plan_rec->calibration_profile = cache_plan_obs->calibration_profile;
                 // opaque identity evidence from already-computed keys (never raw values);
                 // identities the server has not computed stay typed unknown
                 plan_rec->identity.model_digest = llama_cache_acct_value::measured(
@@ -3363,6 +3468,14 @@ private:
             }
         }
 
+        // one observer row per slot a loop classifies (merge key = slot id across all
+        // loops); nullptr when the observer is off or the inventory overflowed [A2]
+        const auto slot_row = [&](const server_slot & slot, uint8_t phase) {
+            return plan_rec
+                ? plan_rec->find_or_add(common_cache_plan_provider::live_slot, slot.id, phase)
+                : (common_cache_plan_candidate *) nullptr;
+        };
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -3370,47 +3483,83 @@ private:
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::by_id;
-                    // forced selection carries no reuse verdict, but the provider WAS
-                    // observed — the row exists with disposition unavailable; finalize
-                    // upgrades it from realized prefix reuse
-                    plan_rec->row(common_cache_plan_provider::live_slot);
+                    // forced selection carries no reuse verdict, but the slot WAS observed —
+                    // its row exists with disposition unavailable; finalize upgrades the
+                    // selected row from realized prefix reuse
+                    slot_row(*ret, COMMON_CACHE_PLAN_PHASE_BY_ID);
                 }
             }
         }
 
-        // find the slot that has at least n% prompt similarity
+        // find the slot that has at least n% prompt similarity.
+        // Observer transport [A2, noexcept]: one row per slot this loop classifies (merge key
+        // = slot id across all three loops); every evaluated survivor starts as a cost loser
+        // and the shipped winner is promoted after the scan. A nullptr row (inventory
+        // overflow) is skipped — the shipped scan never changes.
         if (slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
-            for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
-                    continue;
+            // shipped logic written ONCE; the unobserved instantiation compiles every
+            // observer block away — literal zero work with --cache-debug off [A2/F7]
+            const auto similarity_scan = [&](auto obs_c) {
+                constexpr bool Obs = decltype(obs_c)::value;
+                for (server_slot & slot : slots) {
+                    if (task.id_slot != -1 && slot.id != task.id_slot) {
+                        continue; // id filter, not a classification: no row
+                    }
+
+                    [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+                    if constexpr (Obs) {
+                        row = slot_row(slot, COMMON_CACHE_PLAN_PHASE_SIMILARITY);
+                    }
+
+                    // skip the slot if it is not available
+                    if (slot.is_processing()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY); }
+                        }
+                        continue;
+                    }
+
+                    const auto & tokens = slot.prompt.tokens;
+
+                    // skip the slot if it does not contains cached tokens
+                    if (tokens.empty()) {
+                        if constexpr (Obs) {
+                            // truly stateless slot [B-8]: unavailable, never coverage
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE); }
+                        }
+                        continue;
+                    }
+
+                    // fraction of the Longest Common Prefix length with respect to the input prompt length
+                    const size_t lcp_cur = tokens.get_common_prefix(task.tokens);
+                    const float  sim_cur = float(lcp_cur) / task.tokens.size();
+
+                    sim_best_any = std::max(sim_best_any, sim_cur);
+
+                    if constexpr (Obs) {
+                        if (row) {
+                            row->sim        = sim_cur; row->sim_known = true;
+                            row->lcp_tokens = llama_cache_acct_value::measured((uint64_t) lcp_cur);
+                            // B-8 applies to the LCP itself, not the shipped selection threshold
+                            // (verify-r1 finding 2): ANY nonzero overlap is a valid replay plan —
+                            // a below-threshold slot is a cost loser, not a coverage reject
+                            row->note_reject(lcp_cur > 0
+                                ? COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL
+                                : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                        }
+                    }
+
+                    // select the current slot if the criteria match
+                    if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
+                        sim_best = sim_cur;
+
+                        ret = &slot;
+                    }
                 }
-
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    continue;
-                }
-
-                const auto & tokens = slot.prompt.tokens;
-
-                // skip the slot if it does not contains cached tokens
-                if (tokens.empty()) {
-                    continue;
-                }
-
-                // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
-
-                sim_best_any = std::max(sim_best_any, sim_cur);
-
-                // select the current slot if the criteria match
-                if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
-                    sim_best = sim_cur;
-
-                    ret = &slot;
-                }
-            }
+            };
+            plan_rec ? similarity_scan(std::true_type{}) : similarity_scan(std::false_type{});
 
             if (ret != nullptr) {
                 const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
@@ -3420,10 +3569,11 @@ private:
                             sim_best, slot_prompt_similarity, f_keep);
                     if (plan_rec) {
                         plan_rec->selection = common_cache_plan_selection::similarity;
-                        auto & row = plan_rec->row(common_cache_plan_provider::live_slot);
-                        row.disposition = common_cache_plan_disposition::accepted;
-                        row.sim         = sim_best; row.sim_known    = true;
-                        row.f_keep      = f_keep;   row.f_keep_known = true;
+                        if (auto * row = slot_row(*ret, COMMON_CACHE_PLAN_PHASE_SIMILARITY)) {
+                            row->accept();
+                            row->sim    = sim_best; row->sim_known    = true;
+                            row->f_keep = f_keep;   row->f_keep_known = true;
+                        }
                     }
                 }
 
@@ -3449,24 +3599,49 @@ private:
         if (ret == nullptr && server_vbr_dynamic_active(params_base)) {
             size_t lcp_best = 0;
 
-            for (server_slot & slot : slots) {
-                if (slot.is_processing()) {
-                    continue;
+            const auto route_home_scan = [&](auto obs_c) {
+                constexpr bool Obs = decltype(obs_c)::value;
+                for (server_slot & slot : slots) {
+                    [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+                    if constexpr (Obs) {
+                        row = slot_row(slot, COMMON_CACHE_PLAN_PHASE_ROUTE_HOME);
+                    }
+
+                    if (slot.is_processing()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY); }
+                        }
+                        continue;
+                    }
+
+                    const auto & tokens = slot.prompt.tokens;
+
+                    if (tokens.empty()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE); }
+                        }
+                        continue;
+                    }
+
+                    const size_t lcp = tokens.get_common_prefix(task.tokens);
+                    if constexpr (Obs) {
+                        if (row) {
+                            row->lcp_tokens = llama_cache_acct_value::measured(lcp);
+                            // zero overlap WITH state is a coverage rejection [B-8]; any nonzero LCP
+                            // is a valid route-home candidate that loses unless promoted below
+                            row->note_reject(lcp > 0
+                                ? COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL
+                                : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                        }
+                    }
+                    if (lcp > lcp_best) {
+                        lcp_best = lcp;
+
+                        ret = &slot;
+                    }
                 }
-
-                const auto & tokens = slot.prompt.tokens;
-
-                if (tokens.empty()) {
-                    continue;
-                }
-
-                const size_t lcp = tokens.get_common_prefix(task.tokens);
-                if (lcp > lcp_best) {
-                    lcp_best = lcp;
-
-                    ret = &slot;
-                }
-            }
+            };
+            plan_rec ? route_home_scan(std::true_type{}) : route_home_scan(std::false_type{});
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
@@ -3474,9 +3649,10 @@ private:
 
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::route_home;
-                    auto & row = plan_rec->row(common_cache_plan_provider::live_slot);
-                    row.disposition = common_cache_plan_disposition::accepted;
-                    row.lcp_tokens  = llama_cache_acct_value::measured(lcp_best);
+                    if (auto * row = slot_row(*ret, COMMON_CACHE_PLAN_PHASE_ROUTE_HOME)) {
+                        row->accept();
+                        row->lcp_tokens = llama_cache_acct_value::measured(lcp_best);
+                    }
                 }
 
                 update_cache = true;
@@ -3488,23 +3664,46 @@ private:
         if (ret == nullptr) {
             int64_t t_last = -1;
 
-            for (server_slot & slot : slots) {
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    continue;
-                }
+            const auto lru_scan = [&](auto obs_c) {
+                constexpr bool Obs = decltype(obs_c)::value;
+                for (server_slot & slot : slots) {
+                    [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+                    if constexpr (Obs) {
+                        row = slot_row(slot, COMMON_CACHE_PLAN_PHASE_LRU);
+                    }
 
-                // strongly prefer spec-capable slots: pick a spec slot over a non-spec
-                // slot regardless of LRU, then use LRU within the same capability tier
-                const bool curr_spec = ret && ret->can_speculate();
-                const bool slot_spec = slot.can_speculate();
-                if (!ret ||
-                    (slot_spec && !curr_spec) ||
-                    (slot_spec == curr_spec && slot.t_last_used < t_last)) {
-                    t_last = slot.t_last_used;
-                    ret = &slot;
+                    // skip the slot if it is not available
+                    if (slot.is_processing()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY); }
+                        }
+                        continue;
+                    }
+
+                    if constexpr (Obs) {
+                        if (row) {
+                            // scalars THIS loop computes; reuse verdicts (if any) came from the
+                            // reuse-evaluating loops via the merged row
+                            row->t_last_used_us = llama_cache_acct_value::measured(
+                                (uint64_t) std::max<int64_t>(slot.t_last_used, 0));
+                            row->spec_capable       = slot.can_speculate();
+                            row->spec_capable_known = true;
+                        }
+                    }
+
+                    // strongly prefer spec-capable slots: pick a spec slot over a non-spec
+                    // slot regardless of LRU, then use LRU within the same capability tier
+                    const bool curr_spec = ret && ret->can_speculate();
+                    const bool slot_spec = slot.can_speculate();
+                    if (!ret ||
+                        (slot_spec && !curr_spec) ||
+                        (slot_spec == curr_spec && slot.t_last_used < t_last)) {
+                        t_last = slot.t_last_used;
+                        ret = &slot;
+                    }
                 }
-            }
+            };
+            plan_rec ? lru_scan(std::true_type{}) : lru_scan(std::false_type{});
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
@@ -3512,12 +3711,6 @@ private:
 
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::lru;
-                    // the shipped path found no reusable live-slot prefix: an empty fleet
-                    // has no provider; otherwise coverage was below the threshold
-                    plan_rec->row(common_cache_plan_provider::live_slot).note_reject(
-                        sim_best_any > 0.0f
-                            ? COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT
-                            : COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
                 }
 
                 update_cache = true;
@@ -3528,7 +3721,14 @@ private:
             // B0: the record follows the chosen slot; stages 2-3 and finalize find it there
             if (plan_rec) {
                 plan_rec->id_slot = ret->id;
-                ret->cache_plan   = std::move(plan_rec);
+                // the slot the request landed on is the shipped live-slot selection; the
+                // whole fleet was visited without short-circuit, so the live-slot inventory
+                // is complete over the declared domain
+                plan_rec->select(common_cache_plan_provider::live_slot,
+                                 plan_rec->find_or_add(common_cache_plan_provider::live_slot,
+                                                       ret->id, uint8_t(0)));
+                plan_rec->note_inventory_complete(common_cache_plan_provider::live_slot);
+                ret->cache_plan = std::move(plan_rec);
             }
 
             recurrent_shrink_for_prefill("before prompt cache save/load");
@@ -3566,11 +3766,9 @@ private:
                         std::hash<std::string>{}(lora_config_identity(incoming_loras)));
                 }
                 if (are_lora_equal(incoming_loras, ret->lora)) {
-                    // B0 stage-2: the host-cache observer row rides the shipped lookup [B-a]
-                    common_cache_plan_candidate * obs = ret->cache_plan
-                        ? &ret->cache_plan->row(common_cache_plan_provider::host_cache_entry)
-                        : nullptr;
-                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras), obs)) {
+                    // B0 stage-2: per-entry host rows ride the shipped lookup [B-a/A2]
+                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras),
+                                          ret->cache_plan.get())) {
                         if (ret->cache_plan) {
                             ret->cache_plan->restore_attempt_failed = true;
                         }
@@ -3578,9 +3776,15 @@ private:
                     }
                 } else if (ret->cache_plan) {
                     // shipped path skips the lookup entirely for the adapter change [finding 1]:
-                    // the host-cache candidate is rejected on adapter identity
-                    ret->cache_plan->row(common_cache_plan_provider::host_cache_entry)
-                        .note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
+                    // no entries were scanned (empty declared domain) — the classified fact is
+                    // provider-level, carried by one aggregate row (source -1)
+                    auto * row = ret->cache_plan->find_or_add(
+                        common_cache_plan_provider::host_cache_entry,
+                        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0));
+                    if (row) {
+                        row->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
+                    }
+                    ret->cache_plan->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
                 }
 
                 prompt_cache->update();
@@ -5825,18 +6029,55 @@ private:
                                     // representation, to explain a resulting cold reprocess in /slots
                                     int n_ckpt_rejected_vbr = 0;
 
+                                    // B/A2 candidate transport: which scan is authoritative
+                                    // (legacy vs frontier) is decided AFTER both run, so each
+                                    // lambda notes its visits into a fixed stack buffer
+                                    // (classification + scalars the scan itself touched —
+                                    // noexcept, no allocation); once the ratchet picks the
+                                    // authoritative scan, ONLY that buffer becomes candidate
+                                    // rows. The declared domain stays the shipped-visited set.
+                                    struct ckpt_obs_visit {
+                                        common_cache_plan_reason cls;
+                                        int32_t  pos_max;
+                                        uint64_t bytes;
+                                    };
+                                    struct ckpt_obs_buf {
+                                        // deliberately NO default member initializers: the
+                                        // disabled path pays a stack reservation and nothing
+                                        // else (verify-r2 finding 3); fields are initialized
+                                        // only under the observer flag below
+                                        std::array<ckpt_obs_visit, COMMON_CACHE_PLAN_MAX_CANDIDATES> v;
+                                        uint32_t n;
+                                        bool     overflow;
+                                        // cls NONE = eligible (the short-circuiting selection)
+                                        void note(common_cache_plan_reason cls, int32_t pos_max, uint64_t bytes) noexcept {
+                                            if (n >= v.size()) { overflow = true; return; }
+                                            v[n++] = { cls, pos_max, bytes };
+                                        }
+                                    };
+                                    ckpt_obs_buf obs_legacy_buf, obs_frontier_buf;
+                                    const bool ckpt_obs_on = slot.cache_plan != nullptr;
+                                    if (ckpt_obs_on) {
+                                        obs_legacy_buf.n   = 0; obs_legacy_buf.overflow   = false;
+                                        obs_frontier_buf.n = 0; obs_frontier_buf.overflow = false;
+                                    }
+
                                     // Legacy selection remains authoritative while the
                                     // computation-frontier path runs in shadow [WS-4].
-                                    const auto it_legacy = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
+                                    // shipped predicate written ONCE; observer notes vanish
+                                    // from the unobserved instantiation [A2/F7]
+                                    const auto make_legacy_pred = [&](auto obs_c) {
+                                        return [&, obs_c](const auto & cur) {
+                                            constexpr bool Obs = decltype(obs_c)::value;
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // A capture is durable only after its target payload is
                                             // complete. Old/foreign half-filled entries must never
                                             // reach the mutating restore path.
+                                            [[maybe_unused]] uint64_t obs_bytes = 0;
+                                            if constexpr (Obs) { obs_bytes = (uint64_t) cur.size_without_shadow(); }
                                             if (cur.empty()) {
+                                                if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY, cur.pos_max, obs_bytes); }
                                                 return false;
                                             }
                                             // for hybrid/recurrent models (DeltaNet, Mamba), pos_min always equals
@@ -5855,17 +6096,30 @@ private:
                                                 if (cur.representation_epoch     != vbr_now.representation_epoch ||
                                                     cur.representation_epoch_swa != vbr_now.representation_epoch_swa) {
                                                     n_ckpt_rejected_vbr++;
+                                                    if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED, cur.pos_max, obs_bytes); }
                                                     return false;
                                                 }
-                                                return cur.pos_max < pos_next;
+                                                const bool ok = cur.pos_max < pos_next;
+                                                if constexpr (Obs) { obs_legacy_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                return ok;
                                             }
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
+                                                if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
+                                            const bool ok = cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            if constexpr (Obs) { obs_legacy_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                            return ok;
+                                        };
+                                    };
+                                    const auto it_legacy = ckpt_obs_on
+                                        ? std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                       slot.prompt.checkpoints.rend(),
+                                                       make_legacy_pred(std::true_type{}))
+                                        : std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                       slot.prompt.checkpoints.rend(),
+                                                       make_legacy_pred(std::false_type{}));
 
                                     // Shadow the same choice from the dual-written logical
                                     // frontier. pos_min remains the physical attention-coverage
@@ -5883,19 +6137,26 @@ private:
                                     try {
                                         frontier_adapter_identity =
                                             lora_config_identity(slot.lora);
-                                        it_frontier = std::find_if(
-                                            slot.prompt.checkpoints.rbegin(),
-                                            slot.prompt.checkpoints.rend(),
-                                            [&](const auto & cur) {
+                                        const auto make_frontier_pred = [&](auto obs_c) {
+                                            return [&, obs_c](const auto & cur) {
+                                                constexpr bool Obs = decltype(obs_c)::value;
+                                                [[maybe_unused]] uint64_t obs_bytes = 0;
+                                                if constexpr (Obs) { obs_bytes = (uint64_t) cur.size_without_shadow(); }
                                                 if (slot.frontier_ratchet_flipped &&
                                                     server_fault(
                                                         "frontier_disagree_after_flip")) {
+                                                    if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID, cur.pos_max, obs_bytes); }
                                                     return false;
                                                 }
                                                 if (cur.empty() ||
                                                     !checkpoint_frontier_is_current(
                                                         slot, cur,
                                                         frontier_adapter_identity)) {
+                                                    if constexpr (Obs) {
+                                                        obs_frontier_buf.note(cur.empty()
+                                                            ? COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY
+                                                            : COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID, cur.pos_max, obs_bytes);
+                                                    }
                                                     return false;
                                                 }
                                                 frontier_eligible = true;
@@ -5906,19 +6167,32 @@ private:
                                                         cur.representation_epoch_swa !=
                                                             vbr_now.representation_epoch_swa) {
                                                         n_ckpt_rejected_vbr_frontier++;
+                                                        if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED, cur.pos_max, obs_bytes); }
                                                         return false;
                                                     }
-                                                    return cur.computation_frontier.next_position <=
+                                                    const bool ok = cur.computation_frontier.next_position <=
                                                            pos_next;
+                                                    if constexpr (Obs) { obs_frontier_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                    return ok;
                                                 }
                                                 if (cur.computation_frontier.next_position - 1 >
                                                     pos_next) {
+                                                    if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
                                                     return false;
                                                 }
-                                                return cur.pos_min < pos_min_thold ||
+                                                const bool ok = cur.pos_min < pos_min_thold ||
                                                        cur.pos_min == 0;
-                                            }
-                                        );
+                                                if constexpr (Obs) { obs_frontier_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                return ok;
+                                            };
+                                        };
+                                        it_frontier = ckpt_obs_on
+                                            ? std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                           slot.prompt.checkpoints.rend(),
+                                                           make_frontier_pred(std::true_type{}))
+                                            : std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                           slot.prompt.checkpoints.rend(),
+                                                           make_frontier_pred(std::false_type{}));
                                     } catch (const std::exception & e) {
                                         // Shadow bookkeeping must never make the
                                         // authoritative legacy selector less available.
@@ -5960,6 +6234,43 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
                                     bool vbr_preflight_rejected = false;
+
+                                    // B candidate transport [A2, noexcept]: the AUTHORITATIVE
+                                    // scan's visit buffer becomes checkpoint candidate rows
+                                    // (ordinal = reverse-scan position). The short-circuit
+                                    // leaves later siblings outside the declared domain —
+                                    // recorded as truncation, never extrapolated (r3 A1).
+                                    if (slot.cache_plan) {
+                                        auto & rec = *slot.cache_plan;
+                                        const auto & buf = use_frontier ? obs_frontier_buf : obs_legacy_buf;
+                                        for (uint32_t i = 0; i < buf.n; i++) {
+                                            auto * row = rec.find_or_add(
+                                                common_cache_plan_provider::live_context_checkpoint,
+                                                (int32_t) i, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+                                            if (!row) {
+                                                break; // record inventory overflowed (state latched)
+                                            }
+                                            row->lcp_tokens    = llama_cache_acct_value::measured(
+                                                (uint64_t) std::max<int32_t>(buf.v[i].pos_max, 0));
+                                            row->payload_bytes = llama_cache_acct_value::measured(buf.v[i].bytes);
+                                            if (buf.v[i].cls == COMMON_CACHE_PLAN_REASON_NONE) {
+                                                // the scan's first eligible entry = the shipped selection;
+                                                // restore failures below demote it via note_reject
+                                                row->accept();
+                                                rec.select(common_cache_plan_provider::live_context_checkpoint, row);
+                                            } else {
+                                                row->note_reject(buf.v[i].cls);
+                                            }
+                                        }
+                                        if (buf.overflow) {
+                                            rec.inventory_states[size_t(common_cache_plan_provider::live_context_checkpoint)] =
+                                                common_cache_plan_inventory_state::overflowed;
+                                        } else if (!do_reset && buf.n < slot.prompt.checkpoints.size()) {
+                                            rec.note_inventory_truncated(common_cache_plan_provider::live_context_checkpoint);
+                                        } else {
+                                            rec.note_inventory_complete(common_cache_plan_provider::live_context_checkpoint);
+                                        }
+                                    }
 
                                     // ---- commit-3 pre-flip qualification coordinator (§8.3–8.5).
                                     // Shadow-only: the shipped selection above is final before this
@@ -6159,9 +6470,12 @@ private:
                                                     // the checkpoint row (one authority; the
                                                     // evaluator ran in this scan, not for us)
                                                     if (slot.cache_plan && sel.evaluated) {
-                                                        slot.cache_plan->row(
-                                                            common_cache_plan_provider::live_context_checkpoint)
-                                                            .gen_eval = sel;
+                                                        if (auto * row = slot.cache_plan->find_or_add(
+                                                                common_cache_plan_provider::live_context_checkpoint,
+                                                                (int32_t) shipped_choice,
+                                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN)) {
+                                                            row->gen_eval = sel;
+                                                        }
                                                     }
                                                     // verify r2 finding 2: only the four NAMED
                                                     // §5.5 classes count — the closed classifier
@@ -6331,8 +6645,10 @@ private:
                                                     // B0: an attempted restore failed on
                                                     // infrastructure, not eligibility
                                                     if (slot.cache_plan) {
-                                                        slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
-                                                            .note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+                                                        if (auto * sel_row = slot.cache_plan->selected_row(
+                                                                common_cache_plan_provider::live_context_checkpoint)) {
+                                                            sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+                                                        }
                                                         slot.cache_plan->restore_attempt_failed = true;
                                                     }
                                                 }
@@ -6348,8 +6664,10 @@ private:
                                             SLT_ERR(slot, "%s", "cannot discard rolling window before checkpoint restore\n");
                                             do_reset = true;
                                             if (slot.cache_plan) {
-                                                slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
-                                                    .note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                if (auto * sel_row = slot.cache_plan->selected_row(
+                                                        common_cache_plan_provider::live_context_checkpoint)) {
+                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                }
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         }
@@ -6365,8 +6683,10 @@ private:
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                             do_reset = true;
                                             if (slot.cache_plan) {
-                                                slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
-                                                    .note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                if (auto * sel_row = slot.cache_plan->selected_row(
+                                                        common_cache_plan_provider::live_context_checkpoint)) {
+                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                }
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         } else if (!do_reset) {
@@ -6409,8 +6729,10 @@ private:
                                             if (!checkpoint_aux_ok) {
                                                 do_reset = true;
                                                 if (slot.cache_plan) {
-                                                    slot.cache_plan->row(common_cache_plan_provider::live_context_checkpoint)
-                                                        .note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                    if (auto * sel_row = slot.cache_plan->selected_row(
+                                                            common_cache_plan_provider::live_context_checkpoint)) {
+                                                        sel_row->note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                    }
                                                     slot.cache_plan->restore_attempt_failed = true;
                                                 }
                                             } else {
@@ -6438,25 +6760,28 @@ private:
                                                 // This site IS the delivery point — recorded
                                                 // as data, never inferred.
                                                 if (slot.cache_plan) {
-                                                    auto & row = slot.cache_plan->row(
-                                                        common_cache_plan_provider::live_context_checkpoint);
-                                                    row.disposition = common_cache_plan_disposition::accepted;
-                                                    row.delivered   = true;
-                                                    row.lcp_tokens =
-                                                        llama_cache_acct_value::measured((uint64_t) it->pos_max);
-                                                    row.payload_bytes =
-                                                        llama_cache_acct_value::measured((uint64_t) checkpoint_size);
-                                                    // rows the AUTHORITATIVE shipped scan
-                                                    // actually visited (frontier after a
-                                                    // WS-4 flip, else legacy) + that same
-                                                    // selector's epoch rejections
-                                                    row.siblings_scanned = (uint32_t)
-                                                        (it == slot.prompt.checkpoints.rend()
-                                                            ? slot.prompt.checkpoints.size()
-                                                            : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
-                                                    row.siblings_rejected_epoch = (uint32_t)
-                                                        (use_frontier ? n_ckpt_rejected_vbr_frontier
-                                                                      : n_ckpt_rejected_vbr);
+                                                    if (auto * sel_row = slot.cache_plan->selected_row(
+                                                            common_cache_plan_provider::live_context_checkpoint)) {
+                                                        sel_row->delivered = true;
+                                                        // logical restored token count, not the physical
+                                                        // pos_max position; bytes = every applied component
+                                                        // (target+draft+accelerators) [verify-r1 finding 3]
+                                                        sel_row->lcp_tokens =
+                                                            llama_cache_acct_value::measured((uint64_t) std::max(n_past, 0));
+                                                        sel_row->payload_bytes =
+                                                            llama_cache_acct_value::measured((uint64_t) it->size_without_shadow());
+                                                        // rows the AUTHORITATIVE shipped scan
+                                                        // actually visited (frontier after a
+                                                        // WS-4 flip, else legacy) + that same
+                                                        // selector's epoch rejections
+                                                        sel_row->siblings_scanned = (uint32_t)
+                                                            (it == slot.prompt.checkpoints.rend()
+                                                                ? slot.prompt.checkpoints.size()
+                                                                : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                                        sel_row->siblings_rejected_epoch = (uint32_t)
+                                                            (use_frontier ? n_ckpt_rejected_vbr_frontier
+                                                                          : n_ckpt_rejected_vbr);
+                                                    }
                                                 }
                                             }
                                         }
@@ -6483,27 +6808,39 @@ private:
                                         // eligibility classification applies only to a row
                                         // with no reason yet.
                                         if (slot.cache_plan) {
-                                            auto & row = slot.cache_plan->row(
-                                                common_cache_plan_provider::live_context_checkpoint);
-                                            const int  n_rejected_sel = use_frontier
+                                            const int n_rejected_sel = use_frontier
                                                 ? n_ckpt_rejected_vbr_frontier
                                                 : n_ckpt_rejected_vbr;
-                                            row.siblings_scanned = (uint32_t)
-                                                (it == slot.prompt.checkpoints.rend()
-                                                    ? slot.prompt.checkpoints.size()
-                                                    : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
-                                            row.siblings_rejected_epoch = (uint32_t) n_rejected_sel;
-                                            if (row.reason == COMMON_CACHE_PLAN_REASON_NONE) {
-                                                if (vbr_preflight_rejected) {
-                                                    // restoring would demand a retier under the frozen
-                                                    // footprint: a representation-tier fit failure
-                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_TIER_UNSUPPORTED);
-                                                } else if (n_rejected_sel > 0) {
-                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
-                                                } else if (slot.prompt.checkpoints.empty()) {
-                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
-                                                } else {
-                                                    row.note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                                            // the selected row carries a concrete restore-failure
+                                            // reason from its failure site; when the scan selected
+                                            // NOTHING, the provider-level classification rides one
+                                            // aggregate row (source -1). Per-sibling verdicts are
+                                            // already in the inventory from the scan transport.
+                                            auto * row = slot.cache_plan->selected_row(
+                                                common_cache_plan_provider::live_context_checkpoint);
+                                            if (!row) {
+                                                row = slot.cache_plan->find_or_add(
+                                                    common_cache_plan_provider::live_context_checkpoint,
+                                                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+                                            }
+                                            if (row) {
+                                                row->siblings_scanned = (uint32_t)
+                                                    (it == slot.prompt.checkpoints.rend()
+                                                        ? slot.prompt.checkpoints.size()
+                                                        : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                                row->siblings_rejected_epoch = (uint32_t) n_rejected_sel;
+                                                if (row->reason == COMMON_CACHE_PLAN_REASON_NONE) {
+                                                    if (vbr_preflight_rejected) {
+                                                        // restoring would demand a retier under the frozen
+                                                        // footprint: a representation-tier fit failure
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_TIER_UNSUPPORTED);
+                                                    } else if (n_rejected_sel > 0) {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
+                                                    } else if (slot.prompt.checkpoints.empty()) {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
+                                                    } else {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                                                    }
                                                 }
                                             }
                                             // F1: this do_reset discards EVERYTHING already
@@ -6695,9 +7032,10 @@ private:
                         if (slot.cache_plan) {
                             for (const auto prov : { common_cache_plan_provider::host_cache_entry,
                                                      common_cache_plan_provider::live_context_checkpoint }) {
-                                auto & c = slot.cache_plan->candidates[size_t(prov)];
-                                if (c.present && c.delivered) {
-                                    c.note_reject(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID);
+                                if (auto * c = slot.cache_plan->selected_row(prov)) {
+                                    if (c->delivered) {
+                                        c->note_reject(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID);
+                                    }
                                 }
                             }
                             slot.cache_plan->revoke_deliveries();

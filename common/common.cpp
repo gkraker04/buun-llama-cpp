@@ -1228,6 +1228,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        // surface the RESOLVED placement: auto-fit decided the real offload count in
+        // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
+        // effective value, never the unresolved -1 sentinel
+        params.n_gpu_layers = mparams.n_gpu_layers;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

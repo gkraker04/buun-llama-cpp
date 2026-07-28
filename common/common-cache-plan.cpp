@@ -1,4 +1,5 @@
 #include "common-cache-plan.h"
+#include "common-cache-plan-estimate.h" // tie-floor constants echoed into shadow JSON
 
 #include <nlohmann/json.hpp>
 
@@ -59,6 +60,32 @@ const char * common_cache_plan_selection_name(common_cache_plan_selection s) {
         case common_cache_plan_selection::route_home: return "route_home";
         case common_cache_plan_selection::lru:        return "lru";
         case common_cache_plan_selection::_count:     break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_inventory_state_name(common_cache_plan_inventory_state s) {
+    switch (s) {
+        case common_cache_plan_inventory_state::unobserved: return "unobserved";
+        case common_cache_plan_inventory_state::complete:   return "complete";
+        case common_cache_plan_inventory_state::truncated_by_shipped_short_circuit:
+            return "truncated_by_shipped_short_circuit";
+        case common_cache_plan_inventory_state::overflowed: return "overflowed";
+        case common_cache_plan_inventory_state::_count:     break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_planner_status_name(common_cache_plan_planner_status st) {
+    switch (st) {
+        case common_cache_plan_planner_status::not_attempted:       return "not_attempted";
+        case common_cache_plan_planner_status::ok:                  return "ok";
+        case common_cache_plan_planner_status::no_profile:          return "no_profile";
+        case common_cache_plan_planner_status::profile_unfitted:    return "profile_unfitted";
+        case common_cache_plan_planner_status::invalid_calibration: return "invalid_calibration";
+        case common_cache_plan_planner_status::incomplete_evidence: return "incomplete_evidence";
+        case common_cache_plan_planner_status::internal_fault:      return "internal_fault";
+        case common_cache_plan_planner_status::_count:              break;
     }
     return "invalid";
 }
@@ -145,6 +172,59 @@ const char * common_cache_acct_cost_kind_name(llama_cache_acct_cost_kind k) {
     return "invalid";
 }
 
+void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
+    rec.shipped_plan_candidate = rec.selected[size_t(rec.chosen)];
+
+    auto * host = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+    if (!host || !host->delivered) {
+        return;
+    }
+    // the checkpoint list the scan visited ARRIVED WITH the delivered host entry (the
+    // restore replaces the slot's prompt wholesale), so EVERY checkpoint sibling is
+    // host-dependent (verify-r2 finding 1): each valid sibling's true complete plan is
+    // host→sibling. The delivered pair's chain is the shipped plan; every other valid
+    // sibling gets a cost-loser chain so the planner compares real alternatives.
+    const int32_t host_ord =
+        rec.selected[size_t(common_cache_plan_provider::host_cache_entry)];
+    const int32_t sel_ckpt =
+        rec.selected[size_t(common_cache_plan_provider::live_context_checkpoint)];
+    const uint32_t n_before = rec.n_inventory; // chains appended below are not siblings
+    bool shipped_chain_recorded = false;
+    for (uint32_t i = 0; i < n_before; i++) {
+        auto & sib = rec.inventory[i];
+        if (sib.provider != common_cache_plan_provider::live_context_checkpoint) {
+            continue;
+        }
+        sib.component_only = true;
+        const bool valid =
+            sib.disposition == common_cache_plan_disposition::accepted ||
+            sib.disposition == common_cache_plan_disposition::valid_not_chosen_cost;
+        if (!valid) {
+            continue;
+        }
+        auto * chain = rec.add_chain(common_cache_plan_provider::host_cache_entry,
+                                     host_ord, (int32_t) i);
+        if (!chain) {
+            break; // derived_plans_incomplete latched; planner will refuse
+        }
+        if ((int32_t) i == sel_ckpt && sib.delivered) {
+            chain->disposition = common_cache_plan_disposition::accepted;
+            chain->delivered   = true;
+            rec.shipped_plan_candidate = int32_t(chain - rec.inventory.data());
+            shipped_chain_recorded = true;
+        } else {
+            chain->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL);
+        }
+    }
+    // a composed delivery whose chain could not be recorded has NO honest shipped-plan
+    // ordinal — the bare dependent checkpoint must not stand in for it (verify-r3
+    // finding 2)
+    if (sel_ckpt >= 0 && rec.inventory[size_t(sel_ckpt)].delivered &&
+        !shipped_chain_recorded) {
+        rec.shipped_plan_candidate = -1;
+    }
+}
+
 static json cache_plan_value_json(const llama_cache_acct_value & v) {
     if (v.state == llama_cache_acct_known::known) {
         return json(v.value);
@@ -152,28 +232,65 @@ static json cache_plan_value_json(const llama_cache_acct_value & v) {
     return json(common_cache_acct_known_name(v.state));
 }
 
+// phase-bit spellings (single source; CI scans ban replicas like the other name tables)
+static json cache_plan_phases_json(uint8_t phases_seen) {
+    static constexpr struct { uint8_t bit; const char * name; } bits[] = {
+        { COMMON_CACHE_PLAN_PHASE_BY_ID,      "by_id_route"  },
+        { COMMON_CACHE_PLAN_PHASE_SIMILARITY, "similarity_scan" },
+        { COMMON_CACHE_PLAN_PHASE_ROUTE_HOME, "route_home_scan" },
+        { COMMON_CACHE_PLAN_PHASE_LRU,        "lru_scan"     },
+        { COMMON_CACHE_PLAN_PHASE_HOST_SCAN,  "host_scan"    },
+        { COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,  "ckpt_scan"    },
+        { COMMON_CACHE_PLAN_PHASE_CHAIN,      "chain"        },
+    };
+    json out = json::array();
+    for (const auto & b : bits) {
+        if (phases_seen & b.bit) {
+            out.push_back(b.name);
+        }
+    }
+    return out;
+}
+
 json common_cache_plan_record_json(const common_cache_plan_record & rec) {
     const bool finalized = rec.outcome != common_cache_plan_outcome::unknown;
 
     json cands = json::array();
-    for (size_t p = 0; p < size_t(common_cache_plan_provider::_count); p++) {
-        const auto & c = rec.candidates[p];
-        if (!c.present) {
-            continue; // an unobserved provider has no row — absence is not a verdict
-        }
+    for (uint32_t i = 0; i < rec.n_inventory; i++) {
+        const auto & c = rec.inventory[i];
         json jc = {
-            { "provider",      common_cache_plan_provider_name(common_cache_plan_provider(p)) },
+            { "id",            i },
+            { "provider",      common_cache_plan_provider_name(c.provider) },
+            { "phases",        cache_plan_phases_json(c.phases_seen) },
             { "disposition",   common_cache_plan_disposition_name(c.disposition) },
             { "reason",        common_cache_plan_reason_name(c.reason) },
             { "delivered",     c.delivered },
             { "lcp_tokens",    cache_plan_value_json(c.lcp_tokens) },
             { "payload_bytes", cache_plan_value_json(c.payload_bytes) },
         };
-        if (c.sim_known)    { jc["sim"]    = c.sim; }
-        if (c.f_keep_known) { jc["f_keep"] = c.f_keep; }
+        if (c.source_id >= 0)  { jc["source_id"] = c.source_id; }
+        if (c.component_only)  { jc["component_only"] = true; }
+        if (c.sim_known)       { jc["sim"]       = c.sim; }
+        if (c.f_keep_known)    { jc["f_keep"]    = c.f_keep; }
+        if (c.spec_capable_known) { jc["spec_capable"] = c.spec_capable; }
+        if (c.t_last_used_us.state == llama_cache_acct_known::known) {
+            jc["t_last_used_us"] = cache_plan_value_json(c.t_last_used_us);
+        }
         if (c.siblings_scanned > 0) {
             jc["siblings_scanned"]        = c.siblings_scanned;
             jc["siblings_rejected_epoch"] = c.siblings_rejected_epoch;
+        }
+        if (c.is_chain()) {
+            // explicit marker: a chain row's `provider` names its BASE provider, so
+            // provider histograms must not count it as a plain entry
+            jc["is_chain"] = true;
+            json comps = json::array();
+            for (const int32_t comp : c.component_ids) {
+                if (comp >= 0) {
+                    comps.push_back(comp);
+                }
+            }
+            jc["components"] = std::move(comps);
         }
         if (c.gen_eval.evaluated) {
             jc["generation_eval"] = json {
@@ -183,32 +300,60 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
                 { "refinement", c.gen_eval.refinement_used },
             };
         }
+        // per-candidate economics only once an estimator produced them — absence on the wire
+        // IS the typed-unavailable state; emitting five unavailable slots per row would bloat
+        // every pre-planner record
+        bool any_estimated = c.predicted_total_us.state == llama_cache_acct_known::known;
+        for (const auto & term : c.cost_terms) {
+            any_estimated = any_estimated || term.estimated_us.state == llama_cache_acct_known::known
+                                          || term.raw.state          == llama_cache_acct_known::known;
+        }
+        if (any_estimated) {
+            json terms = json::object();
+            for (const auto & term : c.cost_terms) {
+                // wire discipline: absence IS the typed-unavailable state, per term — the
+                // D-owned kinds (transfer/eviction) would otherwise add two dead objects
+                // to every estimated row (kind->unit is fixed schema, nothing is lost)
+                if (term.raw.state          != llama_cache_acct_known::known &&
+                    term.estimated_us.state != llama_cache_acct_known::known) {
+                    continue;
+                }
+                json jt = {
+                    { "raw",          cache_plan_value_json(term.raw) },
+                    { "unit",         common_cache_acct_unit_name(term.raw_unit) },
+                    { "estimated_us", cache_plan_value_json(term.estimated_us) },
+                };
+                // the estimator version is metadata OF an estimate: emitting it while the
+                // estimate is unavailable would fabricate evidence
+                if (term.estimated_us.state == llama_cache_acct_known::known) {
+                    jt["estimator_version"] = term.estimator_version;
+                }
+                terms[common_cache_acct_cost_kind_name(term.kind)] = std::move(jt);
+            }
+            jc["cost_terms"]         = std::move(terms);
+            jc["predicted_total_us"] = cache_plan_value_json(c.predicted_total_us);
+        }
         cands.push_back(std::move(jc));
     }
 
-    json terms = json::object();
-    for (const auto & term : rec.cost_terms) {
-        json jt = {
-            { "raw",          cache_plan_value_json(term.raw) },
-            { "unit",         common_cache_acct_unit_name(term.raw_unit) }, // schema metadata, valid while unavailable
-            { "estimated_us", cache_plan_value_json(term.estimated_us) },
-        };
-        // the estimator version is metadata OF an estimate: emitting it while the estimate
-        // is unavailable would fabricate evidence
-        if (term.estimated_us.state == llama_cache_acct_known::known) {
-            jt["estimator_version"] = term.estimator_version;
+    // per-provider observed-inventory completeness over the declared (shipped-visited) domain
+    json inv_states = json::object();
+    for (size_t p = 0; p < size_t(common_cache_plan_provider::_count); p++) {
+        const auto st = rec.inventory_states[p];
+        if (st != common_cache_plan_inventory_state::unobserved) {
+            inv_states[common_cache_plan_provider_name(common_cache_plan_provider(p))] =
+                common_cache_plan_inventory_state_name(st);
         }
-        terms[common_cache_acct_cost_kind_name(term.kind)] = std::move(jt);
     }
 
-    // causal delivery chain: which providers actually applied state, in shipped order
-    // (live slot prefix → host snapshot → context checkpoint). `chosen` is the terminal one.
+    // causal delivery chain: the selected candidates that actually applied state, in shipped
+    // order (live slot prefix → host snapshot → context checkpoint). `chosen` is terminal.
     json chain = json::array();
     for (const auto prov : { common_cache_plan_provider::live_slot,
                              common_cache_plan_provider::host_cache_entry,
                              common_cache_plan_provider::live_context_checkpoint }) {
-        const auto & c = rec.candidates[size_t(prov)];
-        if (c.present && c.delivered) {
+        const int32_t sel = rec.selected[size_t(prov)];
+        if (sel >= 0 && uint32_t(sel) < rec.n_inventory && rec.inventory[size_t(sel)].delivered) {
             chain.push_back(common_cache_plan_provider_name(prov));
         }
     }
@@ -227,6 +372,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             { "prefix_tokens",      cache_plan_value_json(rec.identity.prefix_token_digest) },
         } },
         { "candidates",        std::move(cands) },
+        { "inventory_states",  std::move(inv_states) },
         { "delivered_chain",   std::move(chain) },
         { "seq_cp_capability", true }, // copy_state_to's primitive exists on every build
         { "chosen",            finalized ? common_cache_plan_provider_name(rec.chosen) : "unknown" },
@@ -235,8 +381,42 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         { "n_reused_tokens",   cache_plan_value_json(rec.n_reused_tokens) },
         { "n_replayed_tokens", cache_plan_value_json(rec.n_replayed_tokens) },
         { "ttft_us",           cache_plan_value_json(rec.ttft_us) },
-        { "cost_terms",        std::move(terms) },
     };
+    if (!rec.calibration_profile.empty()) {
+        out["calibration_profile"] = rec.calibration_profile;
+    }
+    if (finalized) {
+        const int32_t sel = rec.selected[size_t(rec.chosen)];
+        if (sel >= 0) {
+            out["chosen_candidate"] = sel;
+        }
+        // the COMPLETE shipped plan (chain ordinal on composed deliveries) — offline
+        // agreement runs against THIS, never the terminal provider's bare row
+        if (rec.shipped_plan_candidate >= 0) {
+            out["shipped_plan_candidate"] = rec.shipped_plan_candidate;
+        }
+        out["planner_status"] = common_cache_plan_planner_status_name(rec.planner_status);
+    }
+    // shadow-planner result: an object when computed, the typed unavailable name otherwise
+    // (string-sentinel follows the acct-value wire convention used record-wide). The tie
+    // floors are chooser SEMANTICS: without them on the wire, logs spanning builds with
+    // different floors would merge into one silently-mixed agreement rate.
+    if (rec.shadow_choice >= 0) {
+        json ties = json::array();
+        for (uint32_t i = 0; i < rec.n_shadow_ties; i++) {
+            ties.push_back(rec.shadow_tie_set[i]);
+        }
+        out["shadow"] = json {
+            { "choice",  rec.shadow_choice },
+            { "tie_set", std::move(ties) },
+            { "tie_floor", json {
+                { "rel",    COMMON_CACHE_PLAN_TIE_REL_FLOOR },
+                { "abs_us", COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US },
+            } },
+        };
+    } else {
+        out["shadow"] = common_cache_acct_known_name(llama_cache_acct_known::unavailable);
+    }
     if (rec.sim_best_any_known) {
         out["sim_best_any"] = rec.sim_best_any;
     }

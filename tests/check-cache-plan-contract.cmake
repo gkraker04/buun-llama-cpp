@@ -37,6 +37,8 @@ foreach(def
         "enum class common_cache_plan_provider : uint8_t"
         "enum class common_cache_plan_outcome : uint8_t"
         "enum class common_cache_plan_selection : uint8_t"
+        "enum class common_cache_plan_inventory_state : uint8_t"
+        "enum class common_cache_plan_planner_status : uint8_t"
         "enum class llama_cache_acct_category : uint8_t"
         "enum class llama_cache_acct_residency : uint8_t"
         "enum class llama_cache_acct_measure : uint8_t"

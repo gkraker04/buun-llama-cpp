@@ -1873,9 +1873,9 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
 // off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs) {
+bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec) {
     if constexpr (!Observed) {
-        (void) obs;
+        (void) rec;
     }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1888,16 +1888,32 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     // observer tallies [B-a]: these exist only in the observed instantiation, and only carry
     // values this selection computes anyway
-    [[maybe_unused]] uint32_t obs_adapter_match = 0;
-    [[maybe_unused]] int      obs_lcp_sel       = 0;
+    [[maybe_unused]] int32_t obs_idx      = -1;
+    [[maybe_unused]] int32_t obs_idx_best = -1;
+    [[maybe_unused]] int     obs_lcp_sel  = 0;
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // find the most similar cached prompt, that would also preserve the most context.
+    // Observer transport [A2, noexcept]: ONE row per visited entry, keyed by the entry's
+    // scan ordinal; every evaluated survivor starts as a cost loser (cost_not_minimal) and
+    // the shipped winner is promoted to accepted after the scan. find_or_add returning
+    // nullptr = inventory overflow — the provider's state latches and rows stop, the
+    // shipped scan is untouched.
     for (auto it = states.begin(); it != states.end(); ++it) {
+        [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+        if constexpr (Observed) {
+            obs_idx++;
+            row = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
+                                   obs_idx, COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+        }
+
         // never select a structurally-empty entry [I7/I10]: a size-0 main would "restore" as a
         // false success (0 == 0) and leave the slot on empty state, then continue as if a prefix
         // were present -> pos_min == -1 with n_past > 0 abort. The transactional save/load here
         // never produces an empty-main entry, but guard the selector so a stray one is inert.
         if (it->data.main.empty()) {
+            if constexpr (Observed) {
+                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY); }
+            }
             continue;
         }
 
@@ -1905,11 +1921,10 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         // would hand adapter A's KV to a base/adapter-B request. Live-slot rebinds are caught at
         // launch, but a host-cache entry is restored here during prefill, after that check.
         if (it->adapter_config_key != adapter_config_key) {
+            if constexpr (Observed) {
+                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH); }
+            }
             continue;
-        }
-
-        if constexpr (Observed) {
-            obs_adapter_match++;
         }
 
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
@@ -1917,9 +1932,29 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
+        if constexpr (Observed) {
+            if (row) {
+                // metadata the shipped loop computed (plus O(1) payload sizes per B-a's
+                // metadata-level allowance)
+                row->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) lcp_cur);
+                row->payload_bytes = llama_cache_acct_value::measured(
+                    (uint64_t) it->data.main.size() + (uint64_t) it->data.drft.size());
+                row->sim    = sim_cur;    row->sim_known    = true;
+                row->f_keep = f_keep_cur; row->f_keep_known = true;
+            }
+        }
+
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
+            if constexpr (Observed) {
+                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
+            }
             continue;
+        }
+
+        if constexpr (Observed) {
+            // valid candidate; not-chosen by the shipped heuristic unless promoted below
+            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL); }
         }
 
         if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
@@ -1928,27 +1963,27 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
             it_best = it;
             if constexpr (Observed) {
-                obs_lcp_sel = lcp_cur; // the winner's exact LCP, from the shipped computation
+                obs_idx_best = obs_idx;
+                obs_lcp_sel  = lcp_cur; // the winner's exact LCP, from the shipped computation
             }
         }
     }
 
     if constexpr (Observed) {
-        obs->siblings_scanned = (uint32_t) states.size();
-        if (it_best != states.end()) {
-            obs->disposition = common_cache_plan_disposition::accepted;
-            obs->sim        = sim_best;    obs->sim_known    = true;
-            obs->f_keep     = f_keep_best; obs->f_keep_known = true;
-            obs->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
-            obs->payload_bytes = llama_cache_acct_value::measured(it_best->size());
-        } else if (states.empty()) {
-            obs->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
-        } else if (obs_adapter_match == 0) {
-            // entries exist but none share the requesting adapter identity [I6]
-            obs->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
-        } else {
-            // identity-compatible entries exist but none beats the slot's own prefix coverage
-            obs->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+        // the scan visits every entry (no short-circuit): the declared domain is complete
+        // even when it is empty
+        rec->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+        if (it_best != states.end() && obs_idx_best >= 0) {
+            auto * win = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
+                                          obs_idx_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+            if (win) {
+                win->accept(); // shipped winner: promote over the scan-time cost-loser default
+                win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);
+                // bytes the restore actually installs (main+draft state) — NOT entry
+                // size(), which also sums every retained checkpoint (verify-r1 finding 3)
+                win->payload_bytes = llama_cache_acct_value::measured((uint64_t) it_best->data.size());
+                rec->select(common_cache_plan_provider::host_cache_entry, win);
+            }
         }
     }
 
@@ -1975,7 +2010,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             if constexpr (Observed) {
                 // the accepted row was ELIGIBILITY; the attempted restore failed short —
                 // note_reject demotes the disposition and records the structural reason
-                obs->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
+                    sel->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                }
             }
             return false;
         }
@@ -1987,7 +2024,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         if (n_dft != size_dft) {
             SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);
             if constexpr (Observed) {
-                obs->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
+                    sel->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                }
             }
             return false;
         }
@@ -1996,7 +2035,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // both sides restored: now it is safe to consume the entry (its bytes become live-slot
     // state, so its host-cache accounting charge is released here)
     if constexpr (Observed) {
-        obs->delivered = true; // recorded at the delivery point, never inferred [B0]
+        if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
+            sel->delivered = true; // recorded at the delivery point, never inferred [B0]
+        }
     }
     if (acct) {
         acct_release_entry(*it_best);
@@ -2007,13 +2048,13 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_candidate *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_candidate *);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec) {
     // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
-    return obs != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, obs)
+    return rec != nullptr
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec)
         : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr);
 }
 

@@ -691,10 +691,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_candidate * obs);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec);
 
     void update();
 
