@@ -3,6 +3,7 @@
 #include "common.h"
 #include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
 #include "llama.h"
+#include "server-cache-lifecycle.h"
 
 #include <string>
 #include <unordered_set>
@@ -663,6 +664,7 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt_cache_state> states;
+    using iterator = std::list<server_prompt_cache_state>::iterator;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -698,6 +700,10 @@ struct server_prompt_cache {
 
     void update();
 
+    iterator destroy_entry(
+            iterator it,
+            server_cache_destruction_reason reason);
+
     // C0 shadow ledger (nullptr = off). publish() records the publication boundary as
     // reserve→stage→commit per charged leaf; every path that removes an entry from `states`
     // releases its ops — including whole-cache destruction/replacement (model reload), or the
@@ -705,6 +711,7 @@ struct server_prompt_cache {
     // blocks, orders, or interrupts the shipped mutation [C-a]; the ledger is non-throwing
     // and outlives this cache by member order in server_context_impl.
     llama_cache_acct_ledger * acct = nullptr;
+    server_cache_destruction_observer * destruction_obs = nullptr;
 
     ~server_prompt_cache() {
         clear_accounting();

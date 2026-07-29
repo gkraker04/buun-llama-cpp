@@ -511,6 +511,18 @@ bool llama_cache_acct_snapshot_to_v1(
         const llama_cache_acct_snapshot & source,
         llama_cache_acct_snapshot_v1 & destination) noexcept;
 
+// Non-mutating, last-reference-aware release preview used by D's shadow destruction seam.
+// Values are exact deltas the ledger's current release(op) would apply. A shared allocation
+// therefore reports measured zero until its last committed reference. False means the op
+// cannot be previewed as a live committed reference; no ledger state or fault counter changes.
+struct llama_cache_acct_release_preview {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_value logical_payload;
+    llama_cache_acct_value resident_allocated;
+};
+
 // Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
 // (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
@@ -564,6 +576,10 @@ struct llama_cache_acct_ledger {
     // Drop the op's reference; discharges durable bytes when the allocation loses its last
     // reference. Exactly-once per reference — a second release is a fault.
     bool release(llama_cache_acct_op_id op);
+
+    bool preview_release(
+            llama_cache_acct_op_id op,
+            llama_cache_acct_release_preview & out) const noexcept;
 
     // Direct gauge reporting for non-transactional producers (live state, metadata gauges).
     // Checked: overflow latches the cell unavailable and counts a fault.
@@ -635,6 +651,25 @@ private:
         llama_cache_acct_content_digest digest;
         llama_cache_acct_lineage_id     lineage;
     };
+
+    enum class release_resolution_status : uint8_t {
+        ok = 0,
+        unknown_op,
+        invalid_state,
+        unknown_allocation,
+    };
+
+    struct release_resolution {
+        const txn * operation = nullptr;
+        const alloc_entry * allocation = nullptr;
+    };
+
+    // Unlocked common policy for release() and preview_release(): resolve one live committed
+    // reference and its allocation. The mutating caller applies fault/serial effects; preview
+    // remains a neutral query.
+    release_resolution_status resolve_release_locked(
+            llama_cache_acct_op_id op,
+            release_resolution & out) const noexcept;
 
     // Unlocked helpers (callers hold the mutex). Aggregate rows are pre-created atomically
     // with the required-producer manifest, so the gauge and failure paths never allocate.

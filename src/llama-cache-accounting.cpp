@@ -762,36 +762,75 @@ bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
     return true;
 }
 
-bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
-    std::lock_guard<std::mutex> lock(mtx);
-    auto it = ops.find(op);
+llama_cache_acct_ledger::release_resolution_status
+llama_cache_acct_ledger::resolve_release_locked(
+        llama_cache_acct_op_id op,
+        release_resolution & out) const noexcept {
+    out = {};
+    const auto it = ops.find(op);
     if (it == ops.end()) {
-        state.faults_unknown_id++;
-        bump_serial();
-        return false;
+        return release_resolution_status::unknown_op;
     }
     if (it->second.state != llama_cache_acct_txn_state::committed) {
-        state.faults_invalid_transition++;
-        bump_serial();
-        return false;
+        return release_resolution_status::invalid_state;
     }
-    auto ait = allocs.find(it->second.alloc);
+    const auto ait = allocs.find(it->second.alloc);
     if (ait == allocs.end() || ait->second.committed_refs == 0) {
-        state.faults_unknown_id++;
+        return release_resolution_status::unknown_allocation;
+    }
+    out.operation  = &it->second;
+    out.allocation = &ait->second;
+    return release_resolution_status::ok;
+}
+
+bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
+    std::lock_guard<std::mutex> lock(mtx);
+    release_resolution resolved;
+    const auto status = resolve_release_locked(op, resolved);
+    if (status != release_resolution_status::ok) {
+        if (status == release_resolution_status::invalid_state) {
+            state.faults_invalid_transition++;
+        } else {
+            state.faults_unknown_id++;
+        }
         bump_serial();
         return false;
     }
 
-    ait->second.committed_refs--;
-    if (ait->second.committed_refs == 0) {
-        cell_sub(ait->second.category, ait->second.domain,
-                 llama_cache_acct_measure::logical_payload, ait->second.charged_logical);
-        cell_sub(ait->second.category, ait->second.domain,
-                 llama_cache_acct_measure::resident_allocated, ait->second.resident_bytes);
+    // resolve_release_locked validated this id under the same lock; the mutable lookup only
+    // obtains the entry for applying the already-resolved release.
+    auto & entry = allocs.find(resolved.operation->alloc)->second;
+    entry.committed_refs--;
+    if (entry.committed_refs == 0) {
+        cell_sub(entry.category, entry.domain,
+                 llama_cache_acct_measure::logical_payload, entry.charged_logical);
+        cell_sub(entry.category, entry.domain,
+                 llama_cache_acct_measure::resident_allocated, entry.resident_bytes);
     }
-    maybe_retire(ait->second);
-    ops.erase(it);
+    maybe_retire(entry);
+    ops.erase(op);
     bump_serial();
+    return true;
+}
+
+bool llama_cache_acct_ledger::preview_release(
+        llama_cache_acct_op_id op,
+        llama_cache_acct_release_preview & out) const noexcept {
+    std::lock_guard<std::mutex> lock(mtx);
+    release_resolution resolved;
+    if (resolve_release_locked(op, resolved) !=
+            release_resolution_status::ok) {
+        return false;
+    }
+
+    out = {};
+    out.category = resolved.allocation->category;
+    out.domain   = resolved.allocation->domain;
+    const bool last = resolved.allocation->committed_refs == 1;
+    out.logical_payload = llama_cache_acct_value::measured(
+        last ? resolved.allocation->charged_logical : 0);
+    out.resident_allocated = llama_cache_acct_value::measured(
+        last ? resolved.allocation->resident_bytes : 0);
     return true;
 }
 

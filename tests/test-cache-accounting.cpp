@@ -257,6 +257,50 @@ static void test_charge_once() {
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 0);
 }
 
+// D-S4: release preview is observational and last-reference-aware. Shared references
+// advertise measured zero until the final reference; previewing changes neither serial nor
+// fault counters, and the final release applies exactly the advertised delta.
+static void test_release_preview() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const auto alloc = ledger.new_alloc();
+    const auto op0 = ledger.reserve(CAT, DOM, {}, 100, 128);
+    const auto op1 = ledger.reserve(CAT, DOM, {}, 100, 128);
+    CHECK(ledger.stage(op0, alloc, 128));
+    CHECK(ledger.stage(op1, alloc, 128));
+    CHECK(ledger.commit(op0, 100));
+    CHECK(ledger.commit(op1, 100));
+
+    const auto before = ledger.snapshot();
+    llama_cache_acct_release_preview preview;
+    CHECK(ledger.preview_release(op0, preview));
+    CHECK(preview.category == CAT);
+    CHECK(preview.domain == DOM);
+    CHECK(preview.logical_payload.state == llama_cache_acct_known::known);
+    CHECK(preview.logical_payload.value == 0);
+    CHECK(preview.resident_allocated.state == llama_cache_acct_known::known);
+    CHECK(preview.resident_allocated.value == 0);
+    const auto after_preview = ledger.snapshot();
+    CHECK(after_preview.serial == before.serial);
+    CHECK(after_preview.faults_invalid_transition == before.faults_invalid_transition);
+    CHECK(after_preview.faults_unknown_id == before.faults_unknown_id);
+
+    CHECK(ledger.release(op0));
+    CHECK(ledger.preview_release(op1, preview));
+    CHECK(preview.logical_payload.value == 100);
+    CHECK(preview.resident_allocated.value == 128);
+    CHECK(ledger.release(op1));
+
+    const auto after = ledger.snapshot();
+    CHECK(cell(after, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 0);
+    CHECK(cell(after, CAT, DOM, llama_cache_acct_measure::resident_allocated).value == 0);
+
+    const auto faults_before = after.faults_unknown_id;
+    CHECK(!ledger.preview_release(op1, preview));
+    CHECK(ledger.snapshot().faults_unknown_id == faults_before);
+}
+
 // Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical
 // allocation (tombstone survives the last release), and the complete citation tuple —
 // identity fields included — is immutable on every shared citation
@@ -587,6 +631,7 @@ int main() {
     test_live_ops_zero();
     test_abort_retains_peak();
     test_charge_once();
+    test_release_preview();
     test_attribution_rows();
     test_overflow_latch();
     test_serial_on_fault();

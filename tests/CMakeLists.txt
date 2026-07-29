@@ -297,6 +297,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-contract.cmake
 )
 
+add_test(
+    NAME test-cache-destruction-inventory-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-destruction-inventory.cmake
+)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

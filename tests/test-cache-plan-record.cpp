@@ -5,6 +5,7 @@
 // name tables (every member of every closed enum must produce a non-"invalid" name).
 
 #include "common-cache-plan.h"
+#include "../tools/server/server-cache-lifecycle.h"
 
 #include <nlohmann/json.hpp>
 
@@ -415,6 +416,76 @@ static void test_compose_chains() {
     }
 }
 
+static void test_destruction_observer() {
+    static_assert(
+        size_t(server_cache_destruction_class::_count) == 6,
+        "D-S4 inventory is closed at six logical classes");
+
+    server_cache_destruction_observer observer;
+    server_cache_destruction_request request;
+    request.cls = server_cache_destruction_class::host_artifact_drop;
+    request.reason = server_cache_destruction_reason::host_capacity;
+    request.add_target(server_cache_destruction_target_kind::host_artifact, -1);
+
+    server_cache_destruction_yield value;
+    value.category = llama_cache_acct_category::full_snapshot_payload;
+    value.measure = llama_cache_acct_measure::resident_allocated;
+    value.domain_known = true;
+    value.domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    value.value = llama_cache_acct_value::measured(4096);
+    request.add_yield(value);
+
+    const auto first_admission =
+        server_cache_retention_admit(&observer, request);
+    CHECK(first_admission.issued);
+    CHECK(first_admission.observer_recorded);
+    CHECK(first_admission.sequence == 1);
+    CHECK(first_admission.covers(
+        server_cache_destruction_class::host_artifact_drop,
+        server_cache_destruction_reason::host_capacity));
+    CHECK(observer.n_events == 1);
+    CHECK(observer.totals[size_t(
+        server_cache_destruction_class::host_artifact_drop)] == 1);
+    CHECK(observer.events[0].verdict ==
+          server_cache_destruction_verdict::admit_unleased);
+    CHECK(observer.events[0].execution ==
+          server_cache_destruction_execution::pass_through);
+    CHECK(observer.events[0].request.n_targets == 1);
+    CHECK(observer.events[0].request.n_yields == 1);
+    CHECK(observer.events[0].request.yields[0].value.value == 4096);
+
+    // Detail is bounded, while totals and sequence remain monotone.
+    for (size_t i = 1; i < SERVER_CACHE_DESTRUCTION_EVENT_RING + 3; ++i) {
+        CHECK(server_cache_retention_admit(&observer, request).issued);
+    }
+    CHECK(observer.n_events == SERVER_CACHE_DESTRUCTION_EVENT_RING + 3);
+    CHECK(observer.totals[size_t(
+        server_cache_destruction_class::host_artifact_drop)] ==
+          SERVER_CACHE_DESTRUCTION_EVENT_RING + 3);
+    const auto & newest = observer.events[size_t(
+        (observer.n_events - 1) % observer.events.size())];
+    CHECK(newest.sequence == observer.n_events);
+
+    // Manifest overflow is observable but cannot block D-S4 execution.
+    server_cache_destruction_request oversized;
+    oversized.cls = server_cache_destruction_class::slot_drop;
+    for (size_t i = 0; i <= SERVER_CACHE_DESTRUCTION_MAX_TARGETS; ++i) {
+        oversized.add_target(
+            server_cache_destruction_target_kind::live_target, int32_t(i));
+    }
+    CHECK(oversized.overflowed);
+    const auto overflows_before = observer.overflows;
+    CHECK(server_cache_retention_admit(&observer, oversized).issued);
+    CHECK(observer.overflows == overflows_before + 1);
+
+    // Disabled observer is the zero-work/pass-through branch.
+    const auto unobserved = server_cache_retention_admit(nullptr, request);
+    CHECK(unobserved.issued);
+    CHECK(!unobserved.observer_recorded);
+    CHECK(unobserved.sequence == 0);
+}
+
 int main() {
     test_precedence();
     test_valid_loser();
@@ -426,6 +497,7 @@ int main() {
     test_name_tables();
     test_json_serialization();
     test_compose_chains();
+    test_destruction_observer();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

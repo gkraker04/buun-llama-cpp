@@ -1822,15 +1822,81 @@ void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
     }
 }
 
+static void server_prompt_cache_observe_drop(
+        server_prompt_cache & cache,
+        const server_prompt_cache_state & state,
+        server_cache_destruction_reason reason) noexcept {
+    if (!cache.destruction_obs) {
+        return;
+    }
+
+    server_cache_destruction_request request;
+    request.cls    = server_cache_destruction_class::host_artifact_drop;
+    request.reason = reason;
+    request.add_target(server_cache_destruction_target_kind::host_artifact, -1);
+
+    const llama_cache_acct_op_id ops[] = {
+        state.acct_op_snapshot,
+        state.acct_op_ckpt,
+        state.acct_op_accel,
+    };
+    const llama_cache_acct_category categories[] = {
+        llama_cache_acct_category::full_snapshot_payload,
+        llama_cache_acct_category::checkpoint_state_payload,
+        llama_cache_acct_category::typed_accelerator_payload,
+    };
+    for (size_t i = 0; i < std::size(ops); ++i) {
+        llama_cache_acct_release_preview preview;
+        const bool known = cache.acct && ops[i] &&
+            cache.acct->preview_release(ops[i], preview);
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated }) {
+            server_cache_destruction_yield value;
+            value.category = known ? preview.category : categories[i];
+            value.measure  = measure;
+            value.domain_known = known;
+            if (known) {
+                value.domain = preview.domain;
+                value.value = measure == llama_cache_acct_measure::logical_payload
+                    ? preview.logical_payload
+                    : preview.resident_allocated;
+            }
+            request.add_yield(value);
+        }
+    }
+    (void) server_cache_retention_admit(cache.destruction_obs, request);
+}
+
+static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it) {
+    if (cache.acct) {
+        cache.acct_release_entry(*it);
+    }
+    return cache.states.erase(it);
+}
+
+server_prompt_cache::iterator server_prompt_cache::destroy_entry(
+        iterator it,
+        server_cache_destruction_reason reason) {
+    server_prompt_cache_observe_drop(*this, *it, reason);
+    return server_prompt_cache_destroy_entry_impl(*this, it);
+}
+
 // Release symmetry for whole-cache destruction/replacement (model reload swaps the cache
 // object while the observer ledger survives): every charged entry releases before the
 // container dies, or the next snapshot would carry phantom host-cache bytes.
 void server_prompt_cache::clear_accounting() {
-    if (!acct) {
+    if (!acct && !destruction_obs) {
         return;
     }
     for (auto & st : states) {
-        acct_release_entry(st);
+        server_prompt_cache_observe_drop(
+            *this, st, server_cache_destruction_reason::host_shutdown);
+        if (acct) {
+            acct_release_entry(st);
+        }
     }
 }
 
@@ -1857,10 +1923,8 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
             const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
             if (len == (int) it->prompt.tokens.size()) {
                 SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-                if (acct) {
-                    acct_release_entry(*it);
-                }
-                it = states.erase(it);
+                it = destroy_entry(
+                    it, server_cache_destruction_reason::host_dedup);
                 continue;
             }
         }
@@ -2044,11 +2108,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             sel->delivered = true; // recorded at the delivery point, never inferred [B0]
         }
     }
-    if (acct) {
-        acct_release_entry(*it_best);
-    }
     prompt = std::move(it_best->prompt);
-    states.erase(it_best);
+    destroy_entry(
+        it_best, server_cache_destruction_reason::host_consumed_restore);
 
     return true;
 }
@@ -2068,10 +2130,8 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            if (acct) {
-                acct_release_entry(states.front());
-            }
-            states.pop_front();
+            destroy_entry(
+                states.begin(), server_cache_destruction_reason::host_capacity);
         }
     }
 
@@ -2086,10 +2146,8 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            if (acct) {
-                acct_release_entry(states.front());
-            }
-            states.pop_front();
+            destroy_entry(
+                states.begin(), server_cache_destruction_reason::host_token_limit);
         }
     }
 

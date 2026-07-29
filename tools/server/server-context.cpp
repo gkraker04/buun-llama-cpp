@@ -337,17 +337,65 @@ struct server_cache_plan_observer {
 
     // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
+    server_cache_destruction_observer destruction;
 
     // D-S1: immutable bridge from the load-time ordered placement topology to the
     // ledger-local device-domain keys interned before the one-shot producer manifest.
     std::vector<device_binding> live_device_domains;
 };
 
+// D-S4 keeps retention policy at the server's logical-operation boundary. These functions
+// are the closed physical seams allowed to invoke the low-level destructive primitives.
+// Callers must first admit their logical manifest, or be an explicitly transient operation.
+static bool server_cache_live_range_drop_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        bool attention_only = false) {
+    return attention_only
+        ? llama_memory_seq_rm_attn(mem, seq_id, p0, p1)
+        : llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
+static void server_cache_live_range_drop_impl(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    common_context_seq_rm(ctx, seq_id, p0, p1);
+}
+
+static bool server_cache_mandatory_recovery_reset_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
+static void server_cache_mandatory_recovery_reset_impl(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    common_context_seq_rm(ctx, seq_id, p0, p1);
+}
+
+static bool server_cache_transient_seq_rm_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
 struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    server_cache_destruction_observer * destruction_obs = nullptr;
 
     // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
     // (for /slots emission only)
@@ -505,7 +553,7 @@ struct server_slot {
         return res;
     }
 
-    void prompt_clear() {
+    void server_cache_slot_drop_impl() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
@@ -522,6 +570,165 @@ struct server_slot {
         }
 
         prompt.clear();
+    }
+
+    server_cache_destruction_admission observe_full_slot(
+            server_cache_destruction_class cls,
+            server_cache_destruction_reason reason) const {
+        GGML_ASSERT(
+            cls == server_cache_destruction_class::slot_drop ||
+            cls == server_cache_destruction_class::mandatory_recovery_reset);
+        server_cache_destruction_admission admission;
+        admission.cls    = cls;
+        admission.reason = reason;
+        admission.issued = true;
+        if (!destruction_obs) {
+            return admission;
+        }
+        server_cache_destruction_request request;
+        request.cls    = cls;
+        request.reason = reason;
+        for (const auto kind : {
+                server_cache_destruction_target_kind::live_target,
+                server_cache_destruction_target_kind::token_ledger,
+                server_cache_destruction_target_kind::checkpoint_ring,
+                server_cache_destruction_target_kind::rolling_window,
+                server_cache_destruction_target_kind::typed_accelerator }) {
+            request.add_target(kind, id);
+        }
+        if (ctx_dft) {
+            request.add_target(
+                server_cache_destruction_target_kind::live_draft, id);
+        }
+        for (const auto category : {
+                llama_cache_acct_category::live_attention_state,
+                llama_cache_acct_category::live_recurrent_state,
+                llama_cache_acct_category::checkpoint_state_payload,
+                llama_cache_acct_category::typed_accelerator_payload,
+                llama_cache_acct_category::rolling_window_tape }) {
+            request.add_yield(category);
+        }
+        return server_cache_retention_admit(destruction_obs, request);
+    }
+
+    void prompt_clear(
+            server_cache_destruction_reason reason =
+                server_cache_destruction_reason::slot_rebind) {
+        (void) observe_full_slot(
+            server_cache_destruction_class::slot_drop, reason);
+        server_cache_slot_drop_impl();
+    }
+
+    server_cache_destruction_admission observe_live_range_drop(
+            server_cache_destruction_reason reason,
+            bool include_checkpoints = false) const {
+        server_cache_destruction_admission admission;
+        admission.cls    = server_cache_destruction_class::live_range_drop;
+        admission.reason = reason;
+        admission.issued = true;
+        if (!destruction_obs) {
+            return admission;
+        }
+        server_cache_destruction_request request;
+        request.cls    = server_cache_destruction_class::live_range_drop;
+        request.reason = reason;
+        request.add_target(
+            server_cache_destruction_target_kind::live_target, id);
+        if (ctx_dft) {
+            request.add_target(
+                server_cache_destruction_target_kind::live_draft, id);
+        }
+        request.add_target(
+            server_cache_destruction_target_kind::token_ledger, id);
+        if (include_checkpoints) {
+            request.add_target(
+                server_cache_destruction_target_kind::checkpoint_ring, id);
+        }
+        for (const auto category : {
+                llama_cache_acct_category::live_attention_state,
+                llama_cache_acct_category::live_recurrent_state }) {
+            request.add_yield(category);
+        }
+        return server_cache_retention_admit(destruction_obs, request);
+    }
+
+    server_cache_destruction_admission observe_mandatory_recovery_reset(
+            server_cache_destruction_reason reason) const {
+        return observe_full_slot(
+            server_cache_destruction_class::mandatory_recovery_reset,
+            reason);
+    }
+
+    // Slot-file restore has already installed target bytes when this cleanup runs. It clears
+    // only the displaced prompt metadata and draft state; the target must remain intact.
+    void server_cache_mandatory_recovery_reset_impl(bool clear_draft) {
+        prompt.clear();
+        if (clear_draft && ctx_dft) {
+            ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
+        }
+    }
+
+    void mandatory_recovery_reset(server_cache_destruction_reason reason) {
+        observe_mandatory_recovery_reset(reason);
+        server_cache_slot_drop_impl();
+    }
+
+    void server_cache_live_range_drop_impl(llama_tokens && retained_tokens) {
+        prompt.clear();
+        prompt.tokens.insert(retained_tokens);
+    }
+
+    using checkpoint_iterator = std::list<common_prompt_checkpoint>::iterator;
+
+    checkpoint_iterator server_cache_checkpoint_drop_impl(
+            checkpoint_iterator first,
+            checkpoint_iterator last) {
+        return prompt.checkpoints.erase(first, last);
+    }
+
+    checkpoint_iterator checkpoint_drop(
+            checkpoint_iterator first,
+            checkpoint_iterator last,
+            server_cache_destruction_reason reason) {
+        if (destruction_obs && first != last) {
+            server_cache_destruction_request request;
+            request.cls    = server_cache_destruction_class::checkpoint_drop;
+            request.reason = reason;
+            request.add_target(
+                server_cache_destruction_target_kind::checkpoint_ring, id);
+            request.add_yield(
+                llama_cache_acct_category::checkpoint_state_payload);
+            (void) server_cache_retention_admit(destruction_obs, request);
+        }
+        return server_cache_checkpoint_drop_impl(first, last);
+    }
+
+    void server_cache_token_ledger_truncate_impl(size_t n_tokens) {
+        prompt.tokens.keep_first(n_tokens);
+    }
+
+    void server_cache_transient_token_truncate_impl(size_t n_tokens) {
+        prompt.tokens.keep_first(n_tokens);
+    }
+
+    // No standalone caller exists yet: current physical token truncations are children of
+    // live_range_drop or mandatory_recovery_reset. Keep this closed admission seam ready for
+    // the first independent retained-ledger truncation rather than weakening the 1:1 inventory.
+    void token_ledger_truncate(
+            size_t n_tokens,
+            server_cache_destruction_reason reason) {
+        if (destruction_obs && n_tokens < prompt.tokens.size()) {
+            server_cache_destruction_request request;
+            request.cls    =
+                server_cache_destruction_class::token_ledger_truncate;
+            request.reason = reason;
+            request.add_target(
+                server_cache_destruction_target_kind::token_ledger, id);
+            request.add_yield(
+                llama_cache_acct_category::artifact_descriptor_metadata);
+            (void) server_cache_retention_admit(destruction_obs, request);
+        }
+        server_cache_token_ledger_truncate_impl(n_tokens);
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -889,7 +1096,8 @@ struct server_slot {
 
             // clean up speculative backup sequence to avoid orphaned KV cells
             if (has_draft_backup && seq_id_backup >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
+                server_cache_transient_seq_rm_impl(
+                    llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
             }
 
             // do not keep context of the child slots - the parent's context is enough
@@ -921,7 +1129,9 @@ struct server_slot {
                                 "release: erasing dead generation checkpoint "
                                 "(n_tokens=%" PRId64 ", prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
                                 it->n_tokens, prompt_end, retained_end);
-                        it = prompt.checkpoints.erase(it);
+                        it = checkpoint_drop(
+                            it, std::next(it),
+                            server_cache_destruction_reason::checkpoint_invalidated);
                         n_erased++;
                     } else {
                         ++it;
@@ -1273,13 +1483,15 @@ struct server_slot {
     bool copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        common_context_seq_rm(ctx_tgt, other.id, -1, -1);
+        other.observe_live_range_drop(
+            server_cache_destruction_reason::child_release, true);
+        ::server_cache_live_range_drop_impl(ctx_tgt, other.id, -1, -1);
         if (!llama_memory_try_seq_cp(llama_get_memory(ctx_tgt), id, other.id, -1, -1)) {
             return false;
         }
 
         if (ctx_dft) {
-            common_context_seq_rm(ctx_dft, other.id, -1, -1);
+            ::server_cache_live_range_drop_impl(ctx_dft, other.id, -1, -1);
             if (!llama_memory_try_seq_cp(llama_get_memory(ctx_dft), id, other.id, -1, -1)) {
                 return false;
             }
@@ -2336,8 +2548,7 @@ private:
                 continue;
             }
             SLT_WRN(s, "vbr reclaim (%s): clearing %d cached tokens\n", reason, (int) s.prompt.n_tokens());
-            s.prompt_clear(); // #25649 dropped the fork's bool allow_processing param (now no-arg)
-            s.prompt.checkpoints.clear(); // host-RAM recurrent blobs would linger until slot reuse
+            s.prompt_clear(server_cache_destruction_reason::idle_reclaim);
             cleared++;
         }
         return cleared;
@@ -2375,7 +2586,10 @@ private:
     // obstacle to recovery that benefits every stream), and if the pool then holds nothing
     // but this slot's cells, drop n_past to 0 — the full re-prefill re-enters at the entry
     // tier, so turn-N cache quality equals turn-1. Returns the (possibly zeroed) n_past.
-    int vbr_reset_on_low_lcp(server_slot & slot, int n_past) {
+    int vbr_reset_on_low_lcp(
+            server_slot & slot,
+            int n_past,
+            server_cache_destruction_admission & admission) {
         if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reset_keep_frac <= 0.0f) {
             return n_past;
         }
@@ -2398,7 +2612,14 @@ private:
         SLT_WRN(slot, "vbr reset: cursor %d and only %d/%d prompt tokens reusable (< %.2f) — dropping the prefix; "
                 "the full re-prefill re-enters at the entry tier\n",
                 st.cursor, n_past, n_prompt, (double) params_base.vbr_reset_keep_frac);
-        slot.prompt.checkpoints.clear(); // all invalidated by the full clear
+        admission = slot.observe_live_range_drop(
+            server_cache_destruction_reason::low_lcp_reset, true);
+        if (admission.execution !=
+                server_cache_destruction_execution::pass_through) {
+            return n_past;
+        }
+        (void) slot.server_cache_checkpoint_drop_impl(
+            slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end());
         return 0;
     }
 
@@ -2426,7 +2647,7 @@ private:
         auto * mem = llama_get_memory(ctx_tgt);
         for (const server_slot & slot : slots) {
             const llama_seq_id seq_backup = slot.id + n_parallel_user;
-            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+            server_cache_transient_seq_rm_impl(mem, seq_backup, -1, -1);
         }
 
         if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
@@ -3306,6 +3527,12 @@ private:
         // strictly zero observer work (B-a).
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+            for (auto & slot : slots) {
+                slot.destruction_obs = &cache_plan_obs->destruction;
+            }
+            if (prompt_cache) {
+                prompt_cache->destruction_obs = &cache_plan_obs->destruction;
+            }
             const auto observer_domain = llama_cache_acct_resource_domain::non_device(
                 llama_cache_acct_residency::not_applicable);
             const auto host_domain = llama_cache_acct_resource_domain::non_device(
@@ -4023,7 +4250,8 @@ private:
                         if (ret->cache_plan) {
                             ret->cache_plan->restore_attempt_failed = true;
                         }
-                        ret->prompt_clear();
+                        ret->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
                     }
                 } else if (ret->cache_plan) {
                     // shipped path skips the lookup entirely for the adapter change [finding 1]:
@@ -5191,7 +5419,8 @@ private:
                         // a partial/failed load may have written some target cells; prompt_clear()
                         // (seq_rm) resets the target AND draft sequences, not just the bookkeeping
                         // that the struct-level prompt.clear() would [R7/N7]
-                        slot->prompt_clear();
+                        slot->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -5205,15 +5434,10 @@ private:
                                 slot->prompt.checkpoints.size(),
                                 slot->prompt.sequence_epoch);
                     }
-                    slot->prompt.clear();
+                    slot->observe_mandatory_recovery_reset(
+                        server_cache_destruction_reason::slot_rebind);
+                    slot->server_cache_mandatory_recovery_reset_impl(ctx_dft != nullptr);
                     slot->prompt.tokens.insert(tokens);
-
-                    // the slot file carries only the target state; reset the draft/speculative side
-                    // so it rebuilds from the restored prompt on the next decode instead of
-                    // continuing the previous conversation's stale draft KV [R7/N7]
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot->id, -1, -1);
-                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -5572,11 +5796,15 @@ private:
                     throw std::runtime_error(
                         "cannot discard rolling window before context shift");
                 }
-                common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
+                slot.observe_live_range_drop(
+                    server_cache_destruction_reason::context_shift, true);
+                ::server_cache_live_range_drop_impl(
+                    ctx_tgt, slot.id, n_keep, n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 if (ctx_dft) {
-                    common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
+                    ::server_cache_live_range_drop_impl(
+                        ctx_dft.get(), slot.id, n_keep, n_keep + n_discard);
                     common_context_seq_add(ctx_dft.get(), slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
                 }
 
@@ -5592,8 +5820,8 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
-                    slot.prompt.clear();
-                    slot.prompt.tokens.insert(new_tokens);
+                    slot.server_cache_live_range_drop_impl(
+                        llama_tokens(std::move(new_tokens)));
                 }
 
                 slot.truncated = true;
@@ -5699,7 +5927,8 @@ private:
                     SLT_ERR(slot, "%s\n", "exact tape replay synchronization failed; resetting slot");
                     send_error(slot, "Compute error completing exact tape replay");
                     slot.release();
-                    slot.prompt_clear();
+                    slot.mandatory_recovery_reset(
+                        server_cache_destruction_reason::restore_failure);
                     slot.has_draft_backup = false;
                     slot.seq_id_backup = -1;
                     return;
@@ -5758,7 +5987,8 @@ private:
                             }
                             const llama_seq_id seq_backup = slot.id + n_parallel_user;
                             auto * mem = llama_get_memory(ctx_tgt);
-                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            server_cache_transient_seq_rm_impl(
+                                mem, seq_backup, -1, -1);
                             // Arm the rollback backup only if the copy actually succeeded [I13/N4].
                             // A recurrent-pool exhaustion previously left the backup empty while
                             // has_draft_backup stayed true, so a later partial accept "restored" the
@@ -6014,19 +6244,26 @@ private:
                                             // checkpoint over spliced cells would restore silently
                                             // wrong state. Invalidate before the first mutation.
                                             // [WS-7 review F7]
+                                            slot.observe_live_range_drop(
+                                                server_cache_destruction_reason::live_prefix_replace,
+                                                true);
                                             if (!slot.prompt.checkpoints.empty()) {
                                                 SLT_WRN(slot, "cache-reuse splice invalidates %zu context checkpoint(s)\n",
                                                         slot.prompt.checkpoints.size());
-                                                slot.prompt.checkpoints.clear();
+                                                (void) slot.server_cache_checkpoint_drop_impl(
+                                                    slot.prompt.checkpoints.begin(),
+                                                    slot.prompt.checkpoints.end());
                                             }
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            common_context_seq_rm (ctx_tgt, slot.id, head_p, head_c);
+                                            ::server_cache_live_range_drop_impl(
+                                                ctx_tgt, slot.id, head_p, head_c);
                                             common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
 
                                             if (ctx_dft) {
-                                                common_context_seq_rm (ctx_dft.get(), slot.id, head_p, head_c);
+                                                ::server_cache_live_range_drop_impl(
+                                                    ctx_dft.get(), slot.id, head_p, head_c);
                                                 common_context_seq_add(ctx_dft.get(), slot.id, head_c, head_c + n_match, kv_shift);
                                             }
 
@@ -6174,7 +6411,8 @@ private:
                                                     info.frontier_pos,
                                                     target_pos,
                                                     info.frontier_pos - target_pos);
-                                                slot.prompt_clear();
+                                                slot.mandatory_recovery_reset(
+                                                    server_cache_destruction_reason::restore_failure);
                                                 n_past = 0;
                                                 n_past_common = 0;
                                                 n_past_keep = 0;
@@ -6218,7 +6456,8 @@ private:
                                     // and full-reprocess. Loud ERR so a real desync is never silently masked.
                                     SLT_ERR(slot, "token-ledger/KV desync (n_past = %d, pos_min = -1, tokens = %d, seq_id = %d) -- failing closed: clearing slot and reprocessing from scratch\n",
                                             n_past, (int) slot.prompt.tokens.size(), slot.id);
-                                    slot.prompt_clear();
+                                    slot.mandatory_recovery_reset(
+                                        server_cache_destruction_reason::restore_failure);
                                     n_past            = 0;
                                     n_past_common     = 0;
                                     n_past_keep       = 0;
@@ -7138,7 +7377,9 @@ private:
                                                 ", n_swa = %d, prompt_pos_end = %d, common_pos_end = %d, size = %.3f MiB)\n",
                                                 cur.pos_min, cur.pos_max, cur.n_tokens, n_swa,
                                                 prompt_pos_end, common_pos_end, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        it = slot.checkpoint_drop(
+                                            it, std::next(it),
+                                            server_cache_destruction_reason::checkpoint_invalidated);
                                     } else {
                                         ++it;
                                     }
@@ -7149,9 +7390,12 @@ private:
                         // dynamic VBR: trade a token-trivial reusable prefix for the lossless
                         // full reset (n_past -> 0 makes the seq_rm below a full clear; the
                         // cache empties and the next prepare restores every entry tier)
+                        server_cache_destruction_admission
+                            vbr_low_lcp_admission;
                         {
                             const int n_past_before_vbr_reset = n_past;
-                            n_past = vbr_reset_on_low_lcp(slot, n_past);
+                            n_past = vbr_reset_on_low_lcp(
+                                slot, n_past, vbr_low_lcp_admission);
                             if (n_past < n_past_before_vbr_reset) {
                                 // A VBR reset physically cleared state; do not let true-LCP token
                                 // retention claim the cleared prefix.
@@ -7185,7 +7429,21 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
-                        slot.prompt.tokens.keep_first(std::max(n_past_keep, (size_t) n_past));
+                        const size_t n_tokens_keep =
+                            std::max(n_past_keep, (size_t) n_past);
+                        if (vbr_low_lcp_admission.covers(
+                                server_cache_destruction_class::live_range_drop,
+                                server_cache_destruction_reason::low_lcp_reset) &&
+                            vbr_low_lcp_admission.execution ==
+                                server_cache_destruction_execution::pass_through) {
+                            // The joined low-LCP manifest was admitted before its checkpoint
+                            // invalidation; carry that same authority to this later phase.
+                            slot.server_cache_token_ledger_truncate_impl(n_tokens_keep);
+                        } else {
+                            slot.observe_live_range_drop(
+                                server_cache_destruction_reason::live_prefix_replace);
+                            slot.server_cache_token_ledger_truncate_impl(n_tokens_keep);
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -7246,15 +7504,13 @@ private:
                                 trim_tgt_attn_only ? 1u : 0u,
                                 trim_dft_attn_only ? 1u : 0u);
                     }
-                    bool trim_ok = trim_tgt_attn_only
-                        ? llama_memory_seq_rm_attn(llama_get_memory(ctx_tgt), slot.id, p0, -1)
-                        : llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1);
+                    bool trim_ok = ::server_cache_live_range_drop_impl(
+                        llama_get_memory(ctx_tgt), slot.id, p0, -1,
+                        trim_tgt_attn_only);
                     if (trim_ok && ctx_dft) {
-                        trim_ok = trim_dft_attn_only
-                            ? llama_memory_seq_rm_attn(
-                                llama_get_memory(ctx_dft.get()), slot.id, p0, -1)
-                            : llama_memory_seq_rm(
-                                llama_get_memory(ctx_dft.get()), slot.id, p0, -1);
+                        trim_ok = ::server_cache_live_range_drop_impl(
+                            llama_get_memory(ctx_dft.get()), slot.id, p0, -1,
+                            trim_dft_attn_only);
                     }
 
                     if (!trim_ok) {
@@ -7267,12 +7523,16 @@ private:
                             SLT_ERR(slot, "%s", "cannot discard rolling window after trim rejection\n");
                         }
                         slot.dflash_window_identity.clear();
-                        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                        slot.observe_mandatory_recovery_reset(
+                            server_cache_destruction_reason::trim_rejection);
+                        ::server_cache_mandatory_recovery_reset_impl(
+                            ctx_tgt, slot.id, -1, -1);
                         if (ctx_dft) {
-                            common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+                            ::server_cache_mandatory_recovery_reset_impl(
+                                ctx_dft.get(), slot.id, -1, -1);
                         }
 
-                        slot.prompt.tokens.keep_first(0);
+                        slot.server_cache_token_ledger_truncate_impl(0);
                         slot.n_prompt_tokens_cache = 0;
                         slot.n_prompt_tokens_processed = 0;
 
@@ -7719,7 +7979,9 @@ private:
                                     SLT_TRC(slot,
                                             "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
                                             it->pos_min, it->pos_max, it->n_tokens);
-                                    it = slot.prompt.checkpoints.erase(it);
+                                    it = slot.checkpoint_drop(
+                                        it, std::next(it),
+                                        server_cache_destruction_reason::checkpoint_thin);
                                     continue;
                                 }
                                 last = it->n_tokens;
@@ -7736,7 +7998,10 @@ private:
                                     ", size = %.3f MiB)\n",
                                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data_tgt.size() / 1024 / 1024);
 
-                            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+                            (void) slot.checkpoint_drop(
+                                slot.prompt.checkpoints.begin(),
+                                std::next(slot.prompt.checkpoints.begin()),
+                                server_cache_destruction_reason::checkpoint_capacity);
                         }
 
                         slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), staged);
@@ -7858,7 +8123,8 @@ private:
 
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
+                            slot.mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
                         }
                     }
 
@@ -7899,7 +8165,8 @@ private:
                                 "Compute error publishing rolling DFlash tape",
                                 ERROR_TYPE_SERVER);
                             slot.release();
-                            slot.prompt_clear();
+                            slot.mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
                         }
                     }
                     throw std::runtime_error(
@@ -7922,7 +8189,8 @@ private:
                             "Failed to establish rolling DFlash tape boundary",
                             ERROR_TYPE_SERVER);
                         slot.release();
-                        slot.prompt_clear();
+                        slot.mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
                         throw std::runtime_error(
                             "rolling DFlash tape boundary creation failed");
                     }
@@ -7972,7 +8240,8 @@ private:
                         SLT_ERR(*child, "%s\n", "failed to copy parent state to child (recurrent pool full)");
                         send_error(*child, "Failed to clone parent state to child slot");
                         child->release();
-                        child->prompt_clear();
+                        child->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
                         continue;
                     }
                     child->state = SLOT_STATE_DONE_PROMPT;
@@ -8025,7 +8294,8 @@ private:
                         "Failed to establish rolling DFlash tape boundary",
                         ERROR_TYPE_SERVER);
                     slot.release();
-                    slot.prompt_clear();
+                    slot.mandatory_recovery_reset(
+                        server_cache_destruction_reason::restore_failure);
                     slot.i_batch = -1;
                     return;
                 }
@@ -8244,7 +8514,8 @@ private:
                     "Compute error committing rolling DFlash tape",
                     ERROR_TYPE_SERVER);
                 slot.release();
-                slot.prompt_clear();
+                slot.mandatory_recovery_reset(
+                    server_cache_destruction_reason::restore_failure);
                 slot.has_draft_backup = false;
                 slot.seq_id_backup = -1;
                 continue;
@@ -8304,7 +8575,8 @@ private:
             }
 
             // add accepted tokens to the prompt
-            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            slot.server_cache_transient_token_truncate_impl(
+                slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
 
             if (slot.has_draft_backup) {
@@ -8337,12 +8609,15 @@ private:
                     auto * mem = llama_get_memory(ctx_tgt);
 
                     if (all_accepted) {
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
+                        server_cache_transient_seq_rm_impl(
+                            mem, seq_backup, -1, -1);
+                        server_cache_transient_seq_rm_impl(
+                            mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                     } else {
                         const int n_past_before = slot.n_tokens_before_draft;
 
-                        llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
+                        server_cache_transient_seq_rm_impl(
+                            mem, slot.id, n_past_before, -1);
                         if (!llama_memory_try_seq_cp(mem, seq_backup, slot.id, -1, -1)) {
                             // could not restore the backup into the slot (recurrent pool exhausted):
                             // the slot is left at n_past_before with the accepted tokens unresolved.
@@ -8350,11 +8625,13 @@ private:
                             SLT_ERR(slot, "%s\n", "failed to restore speculative backup; resetting slot");
                             send_error(slot, "Compute error restoring speculative backup");
                             slot.release();
-                            slot.prompt_clear();
+                            slot.mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
                             slot.has_draft_backup = false;
                             slot.seq_id_backup = -1;
                         } else {
-                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                            server_cache_transient_seq_rm_impl(
+                                mem, seq_backup, -1, -1);
 
                             const int n_reeval = slot.prompt.n_tokens() - n_past_before;
                             if (n_reeval > 0) {
@@ -8373,7 +8650,8 @@ private:
                                     SLT_ERR(slot, "failed to re-decode accepted tokens after partial accept (ret = %d)\n", ret_reeval);
                                     send_error(slot, "Compute error re-decoding accepted tokens");
                                     slot.release();
-                                    slot.prompt_clear();
+                                    slot.mandatory_recovery_reset(
+                                        server_cache_destruction_reason::restore_failure);
                                 }
                             }
                         }
@@ -8383,7 +8661,9 @@ private:
                 slot.has_draft_backup = false;
                 slot.seq_id_backup = -1;
             } else {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
+                server_cache_transient_seq_rm_impl(
+                    llama_get_memory(ctx_tgt), slot.id,
+                    slot.prompt.tokens.pos_next(), -1);
             }
 
             common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t)(ids.size() - 1));
@@ -8628,7 +8908,8 @@ private:
                     }
                 }
 
-                llama_memory_seq_rm(mem, slot.id, committed, committed + draft_len);
+                server_cache_transient_seq_rm_impl(
+                    mem, slot.id, committed, committed + draft_len);
 
                 // VERIFY: causal — single pass with draft tokens
                 llama_set_causal_attn(ctx_tgt, true);
@@ -8704,7 +8985,9 @@ private:
                 }
 
                 if (n_accept < draft_len) {
-                    llama_memory_seq_rm(mem, slot.id, committed + n_accept, committed + draft_len);
+                    server_cache_transient_seq_rm_impl(
+                        mem, slot.id, committed + n_accept,
+                        committed + draft_len);
                 }
 
                 // BONUS: decode one token — produces new prev_logits for next cycle
