@@ -16,6 +16,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
+#include "../../src/llama-cache-budget.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -339,10 +340,14 @@ struct server_cache_plan_observer {
     llama_cache_acct_ledger ledger;
     server_retention_sidecar_store retention;
     server_cache_destruction_observer destruction;
+    llama_cache_budget_coordinator budget;
 
     // D-S1: immutable bridge from the load-time ordered placement topology to the
     // ledger-local device-domain keys interned before the one-shot producer manifest.
     std::vector<device_binding> live_device_domains;
+    // D-S2: fixed-at-reserve-time compute rows. Point-in-time physical capacity is
+    // deliberately sampled later, immediately before each CACHE_BUDGET emission.
+    std::vector<llama_cache_budget_device_input> budget_devices;
 };
 
 // D-S4 keeps retention policy at the server's logical-operation boundary. These functions
@@ -1921,12 +1926,10 @@ private:
                     llama_cache_acct_category::recurrent_rollback_planes, domain,
                     llama_cache_acct_measure::resident_allocated,
                     total.recurrent_rollback);
-                if (dflash_window_server_enabled()) {
-                    cache_plan_obs->ledger.gauge_set(
-                        llama_cache_acct_category::rolling_window_tape, domain,
-                        llama_cache_acct_measure::resident_allocated,
-                        total.rolling_window_tape);
-                }
+                cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::rolling_window_tape, domain,
+                    llama_cache_acct_measure::resident_allocated,
+                    total.rolling_window_tape);
                 if (certify) {
                     (void) cache_plan_obs->ledger.certify_complete(
                         domain, llama_cache_acct_producer::live_memory);
@@ -1940,6 +1943,275 @@ private:
                     binding.domain, llama_cache_acct_producer::live_memory);
             }
             return false;
+        }
+    }
+
+    // D-S2 reserve-time capture. This is called once, and only while --cache-debug
+    // owns the observer. The scheduler's reserved compute allocation is CONFIGURED
+    // headroom; it is not an empirical peak and is never relabeled measured here.
+    bool cache_plan_configure_budget() noexcept {
+        if (!cache_plan_obs) {
+            return true;
+        }
+        try {
+            cache_plan_obs->budget_devices.clear();
+            cache_plan_obs->budget_devices.reserve(
+                cache_plan_obs->live_device_domains.size());
+            for (const auto & binding : cache_plan_obs->live_device_domains) {
+                llama_cache_budget_device_input input;
+                input.backend_device = binding.device;
+                input.domain = binding.domain;
+                input.phys_state = llama_cache_budget_capacity_state::unavailable;
+                input.compute_state = llama_cache_budget_capacity_state::known;
+                input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
+                input.reserve_provenance =
+                    llama_cache_budget_reserve_provenance::configured;
+                cache_plan_obs->budget_devices.push_back(input);
+            }
+
+            bool complete = true;
+            const auto add_checked = [&complete](uint64_t & dst, size_t value) {
+                if (uint64_t(value) >
+                    std::numeric_limits<uint64_t>::max() - dst) {
+                    complete = false;
+                    return;
+                }
+                dst += uint64_t(value);
+            };
+
+            const llama_context * contexts[] = {
+                ctx_tgt,
+                ctx_dft.get(),
+                ctx_dft_shared.get(),
+            };
+            for (size_t i_ctx = 0; i_ctx < std::size(contexts); ++i_ctx) {
+                const llama_context * ctx = contexts[i_ctx];
+                if (!ctx ||
+                    std::find(contexts, contexts + i_ctx, ctx) !=
+                        contexts + i_ctx) {
+                    continue;
+                }
+                for (const auto & [raw_buft, row] :
+                        llama_get_memory_breakdown(ctx)) {
+                    if (row.compute == 0 || !raw_buft ||
+                        ggml_backend_buft_is_host(raw_buft)) {
+                        continue;
+                    }
+                    ggml_backend_buffer_type_t buft = raw_buft;
+                    if (ggml_backend_buft_is_meta(buft)) {
+                        if (ggml_backend_meta_buft_n_bufts(buft) != 1) {
+                            complete = false;
+                            continue;
+                        }
+                        buft = ggml_backend_meta_buft_simple_buft(buft, 0);
+                    }
+                    const ggml_backend_dev_t device =
+                        ggml_backend_buft_get_device(buft);
+                    auto it = std::find_if(
+                        cache_plan_obs->budget_devices.begin(),
+                        cache_plan_obs->budget_devices.end(),
+                        [device](const auto & input) {
+                            return input.backend_device == device;
+                        });
+                    if (it == cache_plan_obs->budget_devices.end()) {
+                        complete = false;
+                        continue;
+                    }
+                    add_checked(it->current_compute_allocated, row.compute);
+                }
+            }
+
+            for (auto & input : cache_plan_obs->budget_devices) {
+                input.configured_compute_reserve =
+                    input.current_compute_allocated;
+                if (!complete) {
+                    input.compute_state =
+                        llama_cache_budget_capacity_state::unavailable;
+                }
+            }
+            return complete;
+        } catch (...) {
+            cache_plan_obs->budget_devices.clear();
+            return false;
+        }
+    }
+
+    // D-S2 point-in-time shadow surface. Capacity sampling and all coordinator
+    // arithmetic occur only under --cache-debug, immediately before emission.
+    void cache_plan_emit_budget(
+            const llama_cache_acct_snapshot & snapshot) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            llama_cache_budget_config config;
+            config.devices = cache_plan_obs->budget_devices;
+            for (auto & input : config.devices) {
+                size_t free = 0;
+                size_t total = 0;
+                auto * device = reinterpret_cast<ggml_backend_dev_t>(
+                    const_cast<void *>(input.backend_device));
+                ggml_backend_dev_memory(
+                    device, &free, &total);
+                input.physical_free  = uint64_t(free);
+                input.physical_total = uint64_t(total);
+                input.phys_state =
+                    total > 0 && free <= total
+                        ? llama_cache_budget_capacity_state::known
+                        : llama_cache_budget_capacity_state::unavailable;
+            }
+
+            config.host.pinned_cap = 0;
+            config.host.pinned_state =
+                llama_cache_budget_capacity_state::known;
+            config.host.total_state =
+                llama_cache_budget_capacity_state::unbounded;
+            if (params_base.cache_ram_mib > 0) {
+                const uint64_t mib = uint64_t(params_base.cache_ram_mib);
+                if (mib <= std::numeric_limits<uint64_t>::max() /
+                        (1024ULL * 1024ULL)) {
+                    config.host.pageable_cap = mib * 1024ULL * 1024ULL;
+                    config.host.pageable_state =
+                        llama_cache_budget_capacity_state::known;
+                } else {
+                    config.host.pageable_state =
+                        llama_cache_budget_capacity_state::unavailable;
+                }
+            } else if (params_base.cache_ram_mib == 0) {
+                config.host.pageable_cap = 0;
+                config.host.pageable_state =
+                    llama_cache_budget_capacity_state::known;
+            } else if (params_base.cache_ram_mib == -1) {
+                config.host.pageable_state =
+                    llama_cache_budget_capacity_state::unbounded;
+            } else {
+                config.host.pageable_state =
+                    llama_cache_budget_capacity_state::unavailable;
+            }
+            config.global_cap_state =
+                llama_cache_budget_capacity_state::unbounded;
+
+            llama_cache_budget_plan baseline;
+            baseline.accounting_serial = snapshot.serial;
+            if (!cache_plan_obs->budget.reset(snapshot, config)) {
+                cache_plan_obs->shadow_unavailable++;
+                return;
+            }
+            const auto result = cache_plan_obs->budget.fits(baseline);
+
+            const auto compute_json = [](
+                    const llama_cache_budget_device_input & input,
+                    uint64_t value) {
+                const llama_cache_acct_value typed =
+                    input.compute_state ==
+                        llama_cache_budget_capacity_state::known
+                        ? llama_cache_acct_value::measured(value)
+                        : llama_cache_acct_value {
+                            0, llama_cache_acct_known::unavailable,
+                        };
+                return common_cache_plan_value_json(typed);
+            };
+            for (const auto & group : result.groups) {
+                if (group.resource.kind !=
+                    llama_cache_budget_resource_kind::physical_device) {
+                    continue;
+                }
+                const auto input_it = std::find_if(
+                    config.devices.begin(), config.devices.end(),
+                    [&](const auto & input) {
+                        return input.backend_device ==
+                            group.resource.backend_device;
+                    });
+                if (input_it == config.devices.end()) {
+                    cache_plan_obs->shadow_unavailable++;
+                    continue;
+                }
+
+                std::string topology_digest;
+                const auto topo_it = std::find_if(
+                    snapshot.topologies.begin(), snapshot.topologies.end(),
+                    [&](const auto & row) {
+                        return row.id == input_it->domain.topology;
+                    });
+                if (topo_it != snapshot.topologies.end()) {
+                    topology_digest = common_cache_plan_sha256_hex_digest(
+                        topo_it->topology.digest.bytes());
+                }
+
+                const char * reason = "none";
+                if (group.state ==
+                    llama_cache_budget_fit_state::unavailable) {
+                    reason = group.ceiling_state ==
+                            llama_cache_budget_capacity_state::unavailable
+                        ? "capacity_unavailable"
+                        : "accounting_unavailable";
+                } else if (group.state ==
+                           llama_cache_budget_fit_state::exceeds) {
+                    reason = "budget_exceeded";
+                }
+
+                const json line = {
+                    { "accounting_serial", result.accounting_serial },
+                    { "domain", {
+                        { "residency", common_cache_acct_residency_name(
+                            input_it->domain.residency) },
+                        { "device_ordinal",
+                            input_it->domain.device_ordinal.v },
+                        { "topology_id", input_it->domain.topology.v },
+                        { "topology_digest", topology_digest.empty()
+                            ? json("unavailable")
+                            : json(topology_digest) },
+                    } },
+                    { "device", {
+                        { "name", ggml_backend_dev_name(
+                            reinterpret_cast<ggml_backend_dev_t>(
+                                const_cast<void *>(
+                                    input_it->backend_device))) },
+                        { "physical_total", input_it->physical_total },
+                        { "physical_free", input_it->physical_free },
+                        { "physical_state",
+                            llama_cache_budget_capacity_state_name(
+                                input_it->phys_state) },
+                    } },
+                    { "current_cache_resident",
+                        common_cache_plan_value_json(
+                            group.current_resident) },
+                    { "current_compute_allocated",
+                        compute_json(
+                            *input_it, input_it->current_compute_allocated) },
+                    { "configured_compute_reserve",
+                        compute_json(
+                            *input_it, input_it->configured_compute_reserve) },
+                    { "reserve_provenance",
+                        llama_cache_budget_reserve_provenance_name(
+                            input_it->reserve_provenance) },
+                    { "derived_cache_ceiling",
+                        group.ceiling_state ==
+                            llama_cache_budget_capacity_state::known
+                            ? common_cache_plan_value_json(group.ceiling)
+                            : json(llama_cache_budget_capacity_state_name(
+                                group.ceiling_state)) },
+                    { "fit", {
+                        { "state", llama_cache_budget_fit_state_name(
+                            group.state) },
+                        { "reason", reason },
+                        { "before",
+                            common_cache_plan_value_json(group.before) },
+                        { "after",
+                            common_cache_plan_value_json(group.after) },
+                        { "headroom_after",
+                            group.headroom_state ==
+                                llama_cache_budget_capacity_state::known
+                                ? common_cache_plan_value_json(
+                                    group.headroom_after)
+                                : json(llama_cache_budget_capacity_state_name(
+                                    group.headroom_state)) },
+                    } },
+                };
+                SRV_INF("CACHE_BUDGET %s\n", line.dump().c_str());
+            }
+        } catch (...) {
+            cache_plan_obs->shadow_unavailable++;
         }
     }
 
@@ -2045,6 +2317,7 @@ private:
                     cache_plan_obs->shadow_unavailable++;
                 }
                 rec.acct = cache_plan_obs->ledger.snapshot();
+                cache_plan_emit_budget(rec.acct);
             }
 
             // ---- planner boundary [A2]: estimation, tie-set construction, and shadow
@@ -3689,7 +3962,8 @@ private:
                 &cache_plan_obs->ledger, host_domain);
             for (const auto measure : {
                     llama_cache_acct_measure::logical_payload,
-                    llama_cache_acct_measure::resident_allocated }) {
+                    llama_cache_acct_measure::resident_allocated,
+                    llama_cache_acct_measure::reserved }) {
                 cache_plan_obs->ledger.gauge_set(
                     llama_cache_acct_category::artifact_descriptor_metadata,
                     host_domain,
@@ -3699,18 +3973,25 @@ private:
             (void) cache_plan_obs->ledger.certify_complete(
                 host_domain, llama_cache_acct_producer::retention_sidecar);
 
+            // Host-cache absence is itself an observed zero. Initialize all three
+            // transactional leaves before an optional cache attaches; later C
+            // transactions update these same resident/reserved cells.
+            for (const auto cat : {
+                    llama_cache_acct_category::full_snapshot_payload,
+                    llama_cache_acct_category::checkpoint_state_payload,
+                    llama_cache_acct_category::typed_accelerator_payload }) {
+                for (const auto measure : {
+                        llama_cache_acct_measure::logical_payload,
+                        llama_cache_acct_measure::resident_allocated,
+                        llama_cache_acct_measure::reserved }) {
+                    cache_plan_obs->ledger.gauge_set(
+                        cat, host_domain, measure, 0);
+                }
+            }
             if (prompt_cache) {
                 prompt_cache->acct = &cache_plan_obs->ledger;
                 // Empty-cache gauges are real observations. Certification follows them,
                 // rather than merely proving that wiring code ran.
-                for (const auto cat : {
-                        llama_cache_acct_category::full_snapshot_payload,
-                        llama_cache_acct_category::checkpoint_state_payload,
-                        llama_cache_acct_category::typed_accelerator_payload }) {
-                    cache_plan_obs->ledger.gauge_set(
-                        cat, host_domain,
-                        llama_cache_acct_measure::logical_payload, 0);
-                }
                 (void) cache_plan_obs->ledger.certify_complete(
                     host_domain, llama_cache_acct_producer::host_cache);
             }
@@ -3727,6 +4008,9 @@ private:
             // attribution leaves every affected domain unavailable; a measured zero is
             // valid (e.g. no recurrent layers on an attention-only target).
             if (!cache_plan_observe_live_memory(true)) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+            if (!cache_plan_configure_budget()) {
                 cache_plan_obs->shadow_unavailable++;
             }
 

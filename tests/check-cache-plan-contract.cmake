@@ -220,6 +220,30 @@ endif()
 # the tree is a shadow replica. "none" is excluded — it is a legitimate name in other closed
 # vocabularies (e.g. the A2 tombstone table). ---
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" plan_header)
+file(READ "${SOURCE_ROOT}/common/common-cache-plan.cpp" plan_source)
+count_literal("${plan_header}"
+    "nlohmann::ordered_json common_cache_plan_value_json(" value_json_decls)
+count_literal("${plan_source}"
+    "json common_cache_plan_value_json(" value_json_defs)
+if (NOT value_json_decls EQUAL 1 OR NOT value_json_defs EQUAL 1)
+    message(FATAL_ERROR
+        "canonical accounting-value JSON helper drifted "
+        "(decls=${value_json_decls}, defs=${value_json_defs})")
+endif()
+string(FIND "${plan_source}" "static json cache_plan_value_json(" old_value_json)
+if (NOT old_value_json EQUAL -1)
+    message(FATAL_ERROR
+        "private accounting-value JSON replica returned")
+endif()
+set(value_json_negative
+    "${plan_header}\nnlohmann::ordered_json common_cache_plan_value_json();")
+count_literal("${value_json_negative}"
+    "nlohmann::ordered_json common_cache_plan_value_json(" value_json_negative_count)
+if (value_json_negative_count EQUAL 1)
+    message(FATAL_ERROR
+        "accounting-value JSON one-definition negative control did not trip")
+endif()
+
 string(REGEX MATCHALL "X\\([A-Z_0-9]+, +\"[a-z_0-9]+\"" reason_entries "${plan_header}")
 list(LENGTH reason_entries reason_entry_count)
 if (reason_entry_count LESS 30)

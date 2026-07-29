@@ -162,6 +162,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-accounting.cpp)
     target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-cache-budget.cpp)
+    target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-cache-plan-record.cpp)
     target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -309,6 +312,13 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-destruction-inventory.cmake
+)
+
+add_test(
+    NAME test-cache-budget-classification-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-budget-classification.cmake
 )
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

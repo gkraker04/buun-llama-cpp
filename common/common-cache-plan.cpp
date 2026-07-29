@@ -245,7 +245,7 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
     }
 }
 
-static json cache_plan_value_json(const llama_cache_acct_value & v) {
+json common_cache_plan_value_json(const llama_cache_acct_value & v) {
     if (v.state == llama_cache_acct_known::known) {
         return json(v.value);
     }
@@ -300,8 +300,8 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             { "disposition",   common_cache_plan_disposition_name(c.disposition) },
             { "reason",        common_cache_plan_reason_name(c.reason) },
             { "delivered",     c.delivered },
-            { "lcp_tokens",    cache_plan_value_json(c.lcp_tokens) },
-            { "payload_bytes", cache_plan_value_json(c.payload_bytes) },
+            { "lcp_tokens",    common_cache_plan_value_json(c.lcp_tokens) },
+            { "payload_bytes", common_cache_plan_value_json(c.payload_bytes) },
         };
         if (c.source_id >= 0)  { jc["source_id"] = c.source_id; }
         if (c.component_only)  { jc["component_only"] = true; }
@@ -309,7 +309,8 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         if (c.f_keep_known)    { jc["f_keep"]    = c.f_keep; }
         if (c.spec_capable_known) { jc["spec_capable"] = c.spec_capable; }
         if (c.t_last_used_us.state == llama_cache_acct_known::known) {
-            jc["t_last_used_us"] = cache_plan_value_json(c.t_last_used_us);
+            jc["t_last_used_us"] =
+                common_cache_plan_value_json(c.t_last_used_us);
         }
         if (c.siblings_scanned > 0) {
             jc["siblings_scanned"]        = c.siblings_scanned;
@@ -354,9 +355,9 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
                     continue;
                 }
                 json jt = {
-                    { "raw",          cache_plan_value_json(term.raw) },
+                    { "raw",          common_cache_plan_value_json(term.raw) },
                     { "unit",         common_cache_acct_unit_name(term.raw_unit) },
-                    { "estimated_us", cache_plan_value_json(term.estimated_us) },
+                    { "estimated_us", common_cache_plan_value_json(term.estimated_us) },
                 };
                 // the estimator version is metadata OF an estimate: emitting it while the
                 // estimate is unavailable would fabricate evidence
@@ -366,7 +367,8 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
                 terms[common_cache_acct_cost_kind_name(term.kind)] = std::move(jt);
             }
             jc["cost_terms"]         = std::move(terms);
-            jc["predicted_total_us"] = cache_plan_value_json(c.predicted_total_us);
+            jc["predicted_total_us"] =
+                common_cache_plan_value_json(c.predicted_total_us);
         }
         cands.push_back(std::move(jc));
     }
@@ -399,12 +401,12 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         { "id_slot",           rec.id_slot },
         { "selection",         common_cache_plan_selection_name(rec.selection) },
         { "identity", json {
-            { "model",              cache_plan_value_json(rec.identity.model_digest) },
-            { "execution",          cache_plan_value_json(rec.identity.execution_digest) },
-            { "adapter_config",     cache_plan_value_json(rec.identity.adapter_config_digest) },
-            { "media_content",      cache_plan_value_json(rec.identity.media_content_digest) },
-            { "tokenizer_template", cache_plan_value_json(rec.identity.tokenizer_template_digest) },
-            { "prefix_tokens",      cache_plan_value_json(rec.identity.prefix_token_digest) },
+            { "model",              common_cache_plan_value_json(rec.identity.model_digest) },
+            { "execution",          common_cache_plan_value_json(rec.identity.execution_digest) },
+            { "adapter_config",     common_cache_plan_value_json(rec.identity.adapter_config_digest) },
+            { "media_content",      common_cache_plan_value_json(rec.identity.media_content_digest) },
+            { "tokenizer_template", common_cache_plan_value_json(rec.identity.tokenizer_template_digest) },
+            { "prefix_tokens",      common_cache_plan_value_json(rec.identity.prefix_token_digest) },
         } },
         { "candidates",        std::move(cands) },
         { "inventory_states",  std::move(inv_states) },
@@ -412,10 +414,10 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         { "seq_cp_capability", true }, // copy_state_to's primitive exists on every build
         { "chosen",            finalized ? common_cache_plan_provider_name(rec.chosen) : "unknown" },
         { "outcome",           common_cache_plan_outcome_name(rec.outcome) },
-        { "n_prompt_tokens",   cache_plan_value_json(rec.n_prompt_tokens) },
-        { "n_reused_tokens",   cache_plan_value_json(rec.n_reused_tokens) },
-        { "n_replayed_tokens", cache_plan_value_json(rec.n_replayed_tokens) },
-        { "ttft_us",           cache_plan_value_json(rec.ttft_us) },
+        { "n_prompt_tokens",   common_cache_plan_value_json(rec.n_prompt_tokens) },
+        { "n_reused_tokens",   common_cache_plan_value_json(rec.n_reused_tokens) },
+        { "n_replayed_tokens", common_cache_plan_value_json(rec.n_replayed_tokens) },
+        { "ttft_us",           common_cache_plan_value_json(rec.ttft_us) },
     };
     if (!rec.calibration_profile.empty()) {
         out["calibration_profile"] = rec.calibration_profile;
@@ -471,7 +473,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
                     { "domain",   cache_acct_domain_json(row.domain) },
                     { "certification", common_cache_acct_known_name(row.certification) },
                     { "measure",  common_cache_acct_measure_name(llama_cache_acct_measure(m)) },
-                    { "value",    cache_plan_value_json(cell) },
+                    { "value",    common_cache_plan_value_json(cell) },
                 });
             }
         }

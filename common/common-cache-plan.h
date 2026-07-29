@@ -531,6 +531,11 @@ const char * common_cache_acct_known_name(llama_cache_acct_known k);
 const char * common_cache_acct_unit_name(llama_cache_acct_unit u);
 const char * common_cache_acct_cost_kind_name(llama_cache_acct_cost_kind k);
 
+// One typed-known-value JSON shape shared by CACHE_PLAN and process-local
+// observer siblings such as CACHE_BUDGET.
+nlohmann::ordered_json common_cache_plan_value_json(
+        const llama_cache_acct_value & value);
+
 // One JSON shape for both B0 surfaces (the --cache-debug log line and /slots.cache_plan).
 // Identities stay opaque by construction: no prompt bytes, no raw adapter/media identities —
 // only closed-enum names, counts, and sizes. Only present rows and non-unknown accounting
