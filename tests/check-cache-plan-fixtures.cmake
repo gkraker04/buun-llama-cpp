@@ -1,4 +1,4 @@
-# B-6 golden-fixture gate [P2]: the replay tool must parse checked-in v1/v2/v3 CACHE_PLAN
+# B-6/D-S7 golden-fixture gate [P2]: the replay tool must parse checked-in v1/v2/v3/v4 CACHE_PLAN
 # samples exactly and reproduce the pinned report values. A schema drift that breaks either
 # the emitted record shape or the tool's reading of it fails here, not in the field.
 #
@@ -23,12 +23,12 @@ if (NOT rc EQUAL 0)
     message(FATAL_ERROR "cache-plan-replay.py failed on the golden fixture (rc=${rc})")
 endif()
 
-# pinned values: 5 records (1x v1 + 3x v2 + 1x v3), two agreements (incl. the composed
+# pinned values: 7 records (1x v1 + 3x v2 + 1x v3 + 2x v4), two agreements (incl. the composed
 # host→checkpoint chain as the complete shipped-plan ordinal) + one exact disagreement
 foreach(expect
-        "\"records\": 5"
+        "\"records\": 7"
         "\"shadow_evaluated\": 3"
-        "\"shadow_unavailable\": 2"
+        "\"shadow_unavailable\": 4"
         "\"agreement_rate\": 0.666"
         "\"disagreements\": 1"
         "\"predicted_saving_us\": 49600"
@@ -40,6 +40,16 @@ foreach(expect
         message(FATAL_ERROR "golden-fixture report missing pinned value: ${expect}\n${report}")
     endif()
 endforeach()
+
+# Schema-4 compatibility: the production reader accepts both yield shapes, while
+# the exact frozen v1/v2/v3 supported set rejects the same fixture fail-closed.
+execute_process(
+    COMMAND "${PYTHON3}" "${SOURCE_ROOT}/tests/check-cache-plan-schema-compat.py"
+    OUTPUT_QUIET ERROR_VARIABLE compat_err RESULT_VARIABLE compat_rc
+)
+if (NOT compat_rc EQUAL 0)
+    message(FATAL_ERROR "cache-plan schema compatibility check failed:\n${compat_err}")
+endif()
 
 # fail-closed negative: an unsupported schema_version must ERROR, never count as a record
 execute_process(

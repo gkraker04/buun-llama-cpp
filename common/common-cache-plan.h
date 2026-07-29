@@ -8,8 +8,9 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
-// common-cache-plan.h — P2 B0/B shadow decision record, schema version 3.
+// common-cache-plan.h — P2 B0/B/D-S shadow decision record, schema version 4.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -29,13 +30,16 @@
 // to each row; shadow choice / tie set are planner outputs, typed-unavailable until the
 // B chooser fills them. Candidate observation transport is noexcept by construction: fixed
 // capacity in the record, append-or-mark-overflowed, no allocation in selector hooks.
+// v3 embeds accounting schema v2. v4 adds the D-S shadow yield projection: selected
+// artifacts and exact union-level projected domain values, plus an explicitly
+// not_observed actual-yield slot reserved for later D-A authority.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 3;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 4;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
-    return record_schema == 3 ? 2 :
+    return (record_schema == 3 || record_schema == 4) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -231,6 +235,64 @@ enum class common_cache_plan_planner_status : uint8_t {
     _count,
 };
 
+// D-S7 schema-v4 yield projection. The selected artifact rows and projected domain
+// values describe the shadow planner's selected UNION. They are never measured yield:
+// D-S does not execute an eviction, so the actual side stays explicitly not_observed
+// until D-A supplies an authoritative post-mutation measurement.
+enum class common_cache_plan_yield_status : uint8_t {
+    fits = 0,
+    insufficient_yield,
+    unsupported_required,
+    unavailable,
+    _count,
+};
+
+enum class common_cache_plan_yield_plan_state : uint8_t {
+    not_required = 0,
+    planned,
+    unavailable,
+    _count,
+};
+
+enum class common_cache_plan_yield_actual_state : uint8_t {
+    not_observed = 0,
+    measured,
+    unavailable,
+    _count,
+};
+
+struct common_cache_plan_yield_domain {
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_value current_resident_bytes;
+    llama_cache_acct_value fit_before_bytes;
+    llama_cache_acct_value projected_release_bytes;
+    llama_cache_acct_value projected_reserve_bytes;
+    llama_cache_acct_value projected_after_bytes;
+};
+
+struct common_cache_plan_actual_yield_domain {
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_value before_bytes;
+    llama_cache_acct_value released_bytes;
+    llama_cache_acct_value after_bytes;
+};
+
+struct common_cache_plan_yield_record {
+    common_cache_plan_yield_status status =
+        common_cache_plan_yield_status::unavailable;
+    common_cache_plan_yield_plan_state plan_state =
+        common_cache_plan_yield_plan_state::unavailable;
+    common_cache_plan_yield_actual_state actual_state =
+        common_cache_plan_yield_actual_state::not_observed;
+    uint32_t yield_policy_version = 0;
+    uint64_t accounting_serial = 0;
+    std::vector<llama_cache_acct_artifact_id> selected_attention;
+    std::vector<llama_cache_acct_artifact_id> selected_recurrent;
+    std::vector<llama_cache_acct_artifact_id> unsupported;
+    std::vector<common_cache_plan_yield_domain> projected_domains;
+    std::vector<common_cache_plan_actual_yield_domain> actual_domains;
+};
+
 // Opaque identity evidence (§7.7 redaction: digests of already-computed keys/strings, never
 // raw values). An identity the server has not computed stays typed unknown — never a
 // fabricated digest.
@@ -334,8 +396,8 @@ struct common_cache_plan_candidate {
 // (slot routing → host-cache load → context-checkpoint selection); candidate rows
 // accumulate at each stage and the record is finalized exactly once (outcome flips off
 // `unknown`), after the actual restore/cold path and measured TTFT are known. Fields no
-// shipped computation produced remain typed unknown/unavailable — budget deltas and
-// would-evict lists are D work and stay unavailable in B.
+// shipped computation produced remain typed unknown/unavailable. D-S yield data is
+// populated later at finalize inside its own observer-only boundary.
 //
 // A2 transport contract (pins v4, verbatim contract): this base record exists independently
 // of planner outputs; the inventory is FIXED-CAPACITY in the record, so every selector hook
@@ -400,6 +462,9 @@ struct common_cache_plan_record {
     int32_t  shadow_choice = -1;                       // inventory ordinal; -1 = unavailable
     std::array<int32_t, COMMON_CACHE_PLAN_MAX_CANDIDATES> shadow_tie_set = {};   // valid [0, n_shadow_ties)
     uint32_t n_shadow_ties = 0;
+
+    // D-S yield is a separate observer projection, not a B chooser output.
+    common_cache_plan_yield_record yield;
 
     // C0 accounting snapshot; meaningful once outcome != unknown
     llama_cache_acct_snapshot acct;
@@ -521,6 +586,9 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec);
 
 const char * common_cache_plan_inventory_state_name(common_cache_plan_inventory_state s);
 const char * common_cache_plan_planner_status_name(common_cache_plan_planner_status s);
+const char * common_cache_plan_yield_status_name(common_cache_plan_yield_status s);
+const char * common_cache_plan_yield_plan_state_name(common_cache_plan_yield_plan_state s);
+const char * common_cache_plan_yield_actual_state_name(common_cache_plan_yield_actual_state s);
 
 const char * common_cache_acct_category_name(llama_cache_acct_category c);
 const char * common_cache_acct_residency_name(llama_cache_acct_residency r);

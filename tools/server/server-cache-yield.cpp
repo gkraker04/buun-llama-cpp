@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <tuple>
+#include <utility>
 
 namespace {
 
@@ -112,6 +113,7 @@ server_cache_yield_result server_cache_yield_plan(
         result.selected = {};
         result.plan.clear();
         result.unsupported.clear();
+        result.projected_fit = {};
     };
     if (policy_version != SERVER_CACHE_YIELD_POLICY_VERSION ||
         candidates.size() > SERVER_CACHE_YIELD_MAX_CANDIDATES ||
@@ -197,6 +199,9 @@ server_cache_yield_result server_cache_yield_plan(
             return result;
         }
         if (fit.state == llama_cache_budget_fit_state::fits) {
+            // The winning fit and selected-union evidence are serial-bound to
+            // the same accounting snapshot; D-S7 projects these rows verbatim.
+            result.projected_fit = std::move(fit);
             result.status = server_cache_yield_status::fits;
             return result;
         }
@@ -232,6 +237,7 @@ server_cache_yield_result server_cache_yield_plan(
                     candidate->artifact_id);
                 result.plan = budget_plan.entries;
                 if (fit.state == llama_cache_budget_fit_state::fits) {
+                    result.projected_fit = std::move(fit);
                     result.status = server_cache_yield_status::fits;
                     return result;
                 }
@@ -259,6 +265,7 @@ server_cache_yield_result server_cache_yield_plan(
         result.selected = {};
         result.plan.clear();
         result.unsupported.clear();
+        result.projected_fit = {};
         return result;
     }
 }

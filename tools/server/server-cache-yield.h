@@ -42,6 +42,10 @@ struct server_cache_yield_result {
                size_t(common_retention_pool::_count)> selected;
     std::vector<llama_cache_budget_plan_entry> plan;
     std::vector<llama_cache_acct_artifact_id> unsupported;
+    // Winning D-S2 fit projection. Its domain rows are the canonical source of
+    // resident/before/released/reserved/after at accounting_serial; D-S7 lowers
+    // them to accounting-only wire types.
+    llama_cache_budget_result projected_fit;
 };
 
 using server_cache_yield_preview_callback = std::function<bool(

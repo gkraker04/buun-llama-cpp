@@ -324,6 +324,13 @@ add_test(
 )
 
 add_test(
+    NAME test-cache-plan-fixtures-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-fixtures.cmake
+)
+
+add_test(
     NAME test-cache-destruction-inventory-source
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}

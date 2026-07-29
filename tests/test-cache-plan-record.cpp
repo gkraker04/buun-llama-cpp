@@ -1,4 +1,4 @@
-// B0/B decision-record contract tests (schema v3): band monotonicity (compile-time),
+// B0/B/D-S decision-record contract tests (schema v4): band monotonicity (compile-time),
 // multi-failure first-reason precedence including out-of-order arrival, valid-loser
 // disposition, per-entry inventory merge/overflow/completeness semantics, selection
 // mapping, planner-output clearing, unknown-vs-zero on measured fields, and exhaustive
@@ -160,6 +160,9 @@ static void test_revoke_and_planner_clear() {
         llama_cache_acct_value::measured(41);
     rec.shadow_choice  = 1;
     rec.shadow_tie_set[0] = 1; rec.n_shadow_ties = 1;
+    rec.yield.status = common_cache_plan_yield_status::fits;
+    rec.yield.plan_state = common_cache_plan_yield_plan_state::not_required;
+    rec.yield.accounting_serial = 17;
     k->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED); // B0 evidence
 
     rec.clear_planner_outputs();
@@ -170,13 +173,17 @@ static void test_revoke_and_planner_clear() {
     // the B0 evidence survives the planner fault
     CHECK(k->reason == COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
     CHECK(rec.n_inventory == 3);
+    CHECK(rec.yield.status == common_cache_plan_yield_status::fits);
+    CHECK(rec.yield.plan_state ==
+          common_cache_plan_yield_plan_state::not_required);
+    CHECK(rec.yield.accounting_serial == 17);
 }
 
 // record-level typed-unknown discipline + per-candidate cost-term defaults: five DISTINCT
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 3);
+    CHECK(rec.schema_version == 4);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -185,6 +192,12 @@ static void test_record_defaults() {
     CHECK(rec.shipped_plan_candidate == -1);
     CHECK(!rec.derived_plans_incomplete);
     CHECK(rec.planner_status == common_cache_plan_planner_status::not_attempted);
+    CHECK(rec.yield.status == common_cache_plan_yield_status::unavailable);
+    CHECK(rec.yield.plan_state ==
+          common_cache_plan_yield_plan_state::unavailable);
+    CHECK(rec.yield.actual_state ==
+          common_cache_plan_yield_actual_state::not_observed);
+    CHECK(rec.yield.actual_domains.empty());
 
     common_cache_plan_candidate c;
     bool seen[size_t(llama_cache_acct_cost_kind::_count)] = {};
@@ -227,9 +240,21 @@ static void test_name_tables() {
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_planner_status::_count); i++) {
         CHECK(strcmp(common_cache_plan_planner_status_name(common_cache_plan_planner_status(i)), "invalid") != 0);
     }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_yield_status::_count); i++) {
+        CHECK(strcmp(common_cache_plan_yield_status_name(
+                         common_cache_plan_yield_status(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_yield_plan_state::_count); i++) {
+        CHECK(strcmp(common_cache_plan_yield_plan_state_name(
+                         common_cache_plan_yield_plan_state(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_yield_actual_state::_count); i++) {
+        CHECK(strcmp(common_cache_plan_yield_actual_state_name(
+                         common_cache_plan_yield_actual_state(i)), "invalid") != 0);
+    }
     // and the closed inventory really is closed: exactly today's four providers
     CHECK(uint8_t(common_cache_plan_provider::_count) == 4);
-    // schema-v3 record retains the v2 reason census + sentinel (compile-time pinned)
+    // schema-v4 record retains the v2 reason census + sentinel (compile-time pinned)
     CHECK(COMMON_CACHE_PLAN_REASON_MEMBER_COUNT == 30);
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
 }
@@ -272,7 +297,7 @@ static void test_json_serialization() {
     host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
     host->predicted_total_us = llama_cache_acct_value::measured(50000);
 
-    // Record schema-v3 / accounting-v2 bridge: interned topology table plus per-domain
+    // Record schema-v4 / accounting-v2 bridge: interned topology table plus per-domain
     // producer completeness, with explicit not_applicable rather than fabricated zeroes.
     llama_cache_acct_ledger ledger;
     const auto domain = llama_cache_acct_resource_domain::non_device(
@@ -298,9 +323,26 @@ static void test_json_serialization() {
     CHECK(ledger.certify_complete(domain, llama_cache_acct_producer::observer_init));
     CHECK(ledger.certify_complete(device_domain, llama_cache_acct_producer::live_memory));
     rec.acct = ledger.snapshot();
+    rec.yield.status = common_cache_plan_yield_status::fits;
+    rec.yield.plan_state = common_cache_plan_yield_plan_state::planned;
+    rec.yield.actual_state =
+        common_cache_plan_yield_actual_state::not_observed;
+    rec.yield.yield_policy_version = 1;
+    rec.yield.accounting_serial = rec.acct.serial;
+    rec.yield.selected_attention.push_back({ 11 });
+    rec.yield.selected_recurrent.push_back({ 12 });
+    rec.yield.unsupported.push_back({ 13 });
+    rec.yield.projected_domains.push_back({
+        device_domain,
+        llama_cache_acct_value::measured(1890),
+        llama_cache_acct_value::measured(1922),
+        llama_cache_acct_value::measured(128),
+        llama_cache_acct_value::measured(0),
+        llama_cache_acct_value::measured(1794),
+    });
 
     const auto j = common_cache_plan_record_json(rec);
-    CHECK(j["schema_version"] == 3);
+    CHECK(j["schema_version"] == 4);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
@@ -338,6 +380,43 @@ static void test_json_serialization() {
     CHECK(j["accounting"]["completeness"][1]["domain"]["kind"] == "device_topology");
     CHECK(j["accounting"]["completeness"][1]["producer"] == "live_memory");
     CHECK(j["accounting"]["completeness"][1]["state"] == "known");
+    CHECK(j["yield"]["status"] == "fits");
+    CHECK(j["yield"]["plan_state"] == "planned");
+    CHECK(j["yield"]["actual_state"] == "not_observed");
+    CHECK(j["yield"]["yield_policy_version"] == 1);
+    CHECK(j["yield"]["accounting_serial"] == rec.acct.serial);
+    CHECK(j["yield"]["selected"]["attention"] ==
+          nlohmann::ordered_json::array({11}));
+    CHECK(j["yield"]["selected"]["recurrent"] ==
+          nlohmann::ordered_json::array({12}));
+    CHECK(j["yield"]["unsupported"] ==
+          nlohmann::ordered_json::array({13}));
+    CHECK(j["yield"]["projected_domains"].size() == 1);
+    CHECK(j["yield"]["projected_domains"][0]["fit_before"] == 1922);
+    CHECK(j["yield"]["projected_domains"][0]["projected_release"] == 128);
+    CHECK(j["yield"]["projected_domains"][0]["projected_after"] == 1794);
+    CHECK(j["yield"]["actual_domains"].empty());
+}
+
+static void test_yield_not_required_serialization() {
+    common_cache_plan_record rec;
+    rec.outcome = common_cache_plan_outcome::cold;
+    rec.yield.status = common_cache_plan_yield_status::fits;
+    rec.yield.plan_state =
+        common_cache_plan_yield_plan_state::not_required;
+    rec.yield.actual_state =
+        common_cache_plan_yield_actual_state::not_observed;
+    rec.yield.yield_policy_version = 1;
+    rec.yield.accounting_serial = 23;
+
+    const auto j = common_cache_plan_record_json(rec);
+    CHECK(j["yield"]["status"] == "fits");
+    CHECK(j["yield"]["plan_state"] == "not_required");
+    CHECK(j["yield"]["actual_state"] == "not_observed");
+    CHECK(j["yield"]["selected"]["attention"].empty());
+    CHECK(j["yield"]["selected"]["recurrent"].empty());
+    CHECK(j["yield"]["projected_domains"].empty());
+    CHECK(j["yield"]["actual_domains"].empty());
 }
 
 // finalize-shaped chain composition (verify-r4): the ONE tested implementation the server
@@ -496,6 +575,7 @@ int main() {
     test_record_defaults();
     test_name_tables();
     test_json_serialization();
+    test_yield_not_required_serialization();
     test_compose_chains();
     test_destruction_observer();
 

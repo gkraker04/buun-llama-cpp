@@ -10,14 +10,14 @@ import urllib.request
 _LINE_RE = re.compile(r"CACHE_PLAN (\{.*\})")
 
 # fail-closed schema set: an unknown version is an ERROR, never a silently-counted record
-SUPPORTED_SCHEMAS = (1, 2, 3)
+SUPPORTED_SCHEMAS = (1, 2, 3, 4)
 
 
 class UnsupportedSchemaError(ValueError):
     pass
 
 
-def iter_cache_plan_records(paths):
+def iter_cache_plan_records(paths, supported_schemas=SUPPORTED_SCHEMAS):
     """Yield CACHE_PLAN records from server logs (grepping the log-line marker) or raw
     JSONL record dumps. Malformed/non-record lines are skipped; a RECORD with an
     unsupported schema_version raises UnsupportedSchemaError (fail closed)."""
@@ -36,7 +36,7 @@ def iter_cache_plan_records(paths):
                 except json.JSONDecodeError:
                     continue
                 if isinstance(rec, dict) and "schema_version" in rec and "outcome" in rec:
-                    if rec["schema_version"] not in SUPPORTED_SCHEMAS:
+                    if rec["schema_version"] not in supported_schemas:
                         raise UnsupportedSchemaError(
                             f"unsupported CACHE_PLAN schema_version {rec['schema_version']} in {path}")
                     yield rec

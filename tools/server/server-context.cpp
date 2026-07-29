@@ -2484,6 +2484,106 @@ private:
         }
     }
 
+    // D-S7 schema-v4 lowering boundary. Budget types remain server/process-local;
+    // only accounting domains and typed values cross into the common wire record.
+    // Build off-record and move once so an allocation/mapping fault cannot expose a
+    // partial projection or suppress the independently-finalized B0 record.
+    void cache_plan_project_yield(
+            common_cache_plan_record & rec,
+            const server_cache_yield_result & result) noexcept {
+        try {
+            common_cache_plan_yield_record projected;
+            if (result.accounting_serial != rec.acct.serial) {
+                throw std::runtime_error(
+                    "cache-yield record/accounting serial mismatch");
+            }
+            switch (result.status) {
+                case server_cache_yield_status::fits:
+                    projected.status = common_cache_plan_yield_status::fits;
+                    break;
+                case server_cache_yield_status::insufficient_yield:
+                    projected.status =
+                        common_cache_plan_yield_status::insufficient_yield;
+                    break;
+                case server_cache_yield_status::unsupported_required:
+                    projected.status =
+                        common_cache_plan_yield_status::unsupported_required;
+                    break;
+                case server_cache_yield_status::unavailable:
+                    projected.status = common_cache_plan_yield_status::unavailable;
+                    break;
+                case server_cache_yield_status::_count:
+                    throw std::runtime_error("invalid cache-yield status");
+            }
+
+            projected.yield_policy_version = result.yield_policy_version;
+            projected.accounting_serial = result.accounting_serial;
+            projected.selected_attention =
+                result.selected[size_t(common_retention_pool::attention)];
+            projected.selected_recurrent =
+                result.selected[size_t(common_retention_pool::recurrent)];
+            projected.unsupported = result.unsupported;
+
+            const bool selected_any =
+                !projected.selected_attention.empty() ||
+                !projected.selected_recurrent.empty();
+            if (result.status == server_cache_yield_status::fits) {
+                if (result.projected_fit.accounting_serial !=
+                        result.accounting_serial ||
+                    result.projected_fit.state !=
+                        llama_cache_budget_fit_state::fits) {
+                    throw std::runtime_error(
+                        "cache-yield projection serial/state mismatch");
+                }
+                projected.plan_state = selected_any
+                    ? common_cache_plan_yield_plan_state::planned
+                    : common_cache_plan_yield_plan_state::not_required;
+                // Baseline-fit rows remain in the server pre-image as serial-bound
+                // evidence, but no-eviction wire records carry no projected action.
+                if (selected_any) {
+                    if (result.plan.empty() ||
+                        result.projected_fit.domains.empty()) {
+                        throw std::runtime_error(
+                            "cache-yield planned projection is empty");
+                    }
+                    projected.projected_domains.reserve(
+                        result.projected_fit.domains.size());
+                    for (const auto & row : result.projected_fit.domains) {
+                        if (row.resource.kind !=
+                                llama_cache_budget_resource_kind::
+                                    accounting_domain) {
+                            throw std::runtime_error(
+                                "non-domain cache-yield projection row");
+                        }
+                        projected.projected_domains.push_back({
+                            row.resource.domain,
+                            row.current_resident,
+                            row.before,
+                            row.released,
+                            row.reserved,
+                            row.after,
+                        });
+                    }
+                }
+            } else {
+                projected.plan_state =
+                    common_cache_plan_yield_plan_state::unavailable;
+            }
+
+            // D-S never executes an eviction. D-A may fill this already-versioned
+            // slot only after it has authoritative post-mutation measurements.
+            projected.actual_state =
+                common_cache_plan_yield_actual_state::not_observed;
+            projected.actual_domains.clear();
+            rec.yield = std::move(projected);
+        } catch (...) {
+            rec.yield = {};
+            if (cache_plan_obs) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+        }
+    }
+
     // B0 finalize [P2 §7.7]: exactly one final record per request, emitted only after the
     // actual restore/cold path AND all fallible trims/fallbacks and the prompt replay have
     // settled — the call sites ride the SAME timing points that feed metrics.on_prompt_eval
@@ -2591,6 +2691,7 @@ private:
                 cache_plan_emit_budget(rec.acct);
                 cache_plan_run_yield(
                     rec.acct, std::move(retention_candidates));
+                cache_plan_project_yield(rec, cache_plan_obs->last_yield);
                 cache_plan_emit_yield(cache_plan_obs->last_yield);
             }
 

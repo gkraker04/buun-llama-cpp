@@ -90,6 +90,37 @@ const char * common_cache_plan_planner_status_name(common_cache_plan_planner_sta
     return "invalid";
 }
 
+const char * common_cache_plan_yield_status_name(common_cache_plan_yield_status st) {
+    switch (st) {
+        case common_cache_plan_yield_status::fits:                 return "fits";
+        case common_cache_plan_yield_status::insufficient_yield:   return "insufficient_yield";
+        case common_cache_plan_yield_status::unsupported_required: return "unsupported_required";
+        case common_cache_plan_yield_status::unavailable:          return "unavailable";
+        case common_cache_plan_yield_status::_count:                break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_yield_plan_state_name(common_cache_plan_yield_plan_state st) {
+    switch (st) {
+        case common_cache_plan_yield_plan_state::not_required: return "not_required";
+        case common_cache_plan_yield_plan_state::planned:      return "planned";
+        case common_cache_plan_yield_plan_state::unavailable:  return "unavailable";
+        case common_cache_plan_yield_plan_state::_count:        break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_yield_actual_state_name(common_cache_plan_yield_actual_state st) {
+    switch (st) {
+        case common_cache_plan_yield_actual_state::not_observed: return "not_observed";
+        case common_cache_plan_yield_actual_state::measured:     return "measured";
+        case common_cache_plan_yield_actual_state::unavailable:  return "unavailable";
+        case common_cache_plan_yield_actual_state::_count:        break;
+    }
+    return "invalid";
+}
+
 const char * common_cache_acct_category_name(llama_cache_acct_category c) {
     switch (c) {
         case llama_cache_acct_category::live_attention_state:                 return "live_attention_state";
@@ -267,6 +298,66 @@ static json cache_acct_domain_json(const llama_cache_acct_resource_domain & doma
     return out;
 }
 
+static json cache_plan_yield_json(const common_cache_plan_yield_record & yield) {
+    json selected_attention = json::array();
+    for (const auto artifact : yield.selected_attention) {
+        selected_attention.push_back(artifact.v);
+    }
+    json selected_recurrent = json::array();
+    for (const auto artifact : yield.selected_recurrent) {
+        selected_recurrent.push_back(artifact.v);
+    }
+    json unsupported = json::array();
+    for (const auto artifact : yield.unsupported) {
+        unsupported.push_back(artifact.v);
+    }
+
+    json projected_domains = json::array();
+    for (const auto & row : yield.projected_domains) {
+        projected_domains.push_back(json {
+            { "domain",            cache_acct_domain_json(row.domain) },
+            { "current_resident",  common_cache_plan_value_json(
+                                           row.current_resident_bytes) },
+            { "fit_before",        common_cache_plan_value_json(
+                                           row.fit_before_bytes) },
+            { "projected_release", common_cache_plan_value_json(
+                                           row.projected_release_bytes) },
+            { "projected_reserve", common_cache_plan_value_json(
+                                           row.projected_reserve_bytes) },
+            { "projected_after",   common_cache_plan_value_json(
+                                           row.projected_after_bytes) },
+        });
+    }
+
+    json actual_domains = json::array();
+    for (const auto & row : yield.actual_domains) {
+        actual_domains.push_back(json {
+            { "domain",   cache_acct_domain_json(row.domain) },
+            { "before",   common_cache_plan_value_json(row.before_bytes) },
+            { "released", common_cache_plan_value_json(row.released_bytes) },
+            { "after",    common_cache_plan_value_json(row.after_bytes) },
+        });
+    }
+
+    return json {
+        { "status",               common_cache_plan_yield_status_name(
+                                        yield.status) },
+        { "plan_state",           common_cache_plan_yield_plan_state_name(
+                                        yield.plan_state) },
+        { "actual_state",         common_cache_plan_yield_actual_state_name(
+                                        yield.actual_state) },
+        { "yield_policy_version", yield.yield_policy_version },
+        { "accounting_serial",    yield.accounting_serial },
+        { "selected", json {
+            { "attention", std::move(selected_attention) },
+            { "recurrent", std::move(selected_recurrent) },
+        } },
+        { "unsupported",       std::move(unsupported) },
+        { "projected_domains", std::move(projected_domains) },
+        { "actual_domains",    std::move(actual_domains) },
+    };
+}
+
 // phase-bit spellings (single source; CI scans ban replicas like the other name tables)
 static json cache_plan_phases_json(uint8_t phases_seen) {
     static constexpr struct { uint8_t bit; const char * name; } bits[] = {
@@ -433,6 +524,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             out["shipped_plan_candidate"] = rec.shipped_plan_candidate;
         }
         out["planner_status"] = common_cache_plan_planner_status_name(rec.planner_status);
+        out["yield"] = cache_plan_yield_json(rec.yield);
     }
     // shadow-planner result: an object when computed, the typed unavailable name otherwise
     // (string-sentinel follows the acct-value wire convention used record-wide). The tie

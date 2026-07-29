@@ -91,6 +91,19 @@ struct fixture {
             out.state = released >= fit_after_release
                 ? llama_cache_budget_fit_state::fits
                 : llama_cache_budget_fit_state::exceeds;
+            llama_cache_budget_row row;
+            row.resource.kind =
+                llama_cache_budget_resource_kind::accounting_domain;
+            row.resource.domain = HOST;
+            row.current_resident =
+                llama_cache_acct_value::measured(total_before);
+            row.before = llama_cache_acct_value::measured(total_before);
+            row.released = llama_cache_acct_value::measured(released);
+            row.reserved = llama_cache_acct_value::measured(0);
+            row.after =
+                llama_cache_acct_value::measured(total_before - released);
+            row.state = out.state;
+            out.domains.push_back(row);
             return out;
         };
     }
@@ -218,6 +231,10 @@ static void test_policy_v1_mixed_pools() {
     CHECK(result.selected[1][0].v == 3);
     CHECK(result.plan.size() == 1);
     CHECK(result.plan[0].release_bytes == 30);
+    CHECK(result.projected_fit.accounting_serial == f.serial);
+    CHECK(result.projected_fit.state == llama_cache_budget_fit_state::fits);
+    CHECK(result.projected_fit.domains.size() == 1);
+    CHECK(result.projected_fit.domains[0].released.value == 30);
 }
 
 static void configure_ledger(llama_cache_acct_ledger & ledger) {
@@ -434,6 +451,10 @@ static void test_empty_stale_and_capacity() {
         {}, f.serial, f.preview(), f.fits());
     CHECK(result.status == server_cache_yield_status::fits);
     CHECK(result.plan.empty());
+    CHECK(result.projected_fit.accounting_serial == f.serial);
+    CHECK(result.projected_fit.state == llama_cache_budget_fit_state::fits);
+    CHECK(result.projected_fit.domains.size() == 1);
+    CHECK(result.projected_fit.domains[0].released.value == 0);
 
     f.fit_after_release = 1;
     f.stale = true;
@@ -469,6 +490,8 @@ static void test_exception_isolation() {
         f.serial, throwing_preview, f.fits());
     CHECK(result.status == server_cache_yield_status::unavailable);
     CHECK(result.plan.empty());
+    CHECK(result.projected_fit.state ==
+          llama_cache_budget_fit_state::unavailable);
 
     size_t preview_calls = 0;
     const server_cache_yield_preview_callback drifts_at_prefix =
