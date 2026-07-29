@@ -55,6 +55,26 @@ struct server_retention_instance_key_hash {
     size_t operator()(const server_retention_instance_key & key) const noexcept;
 };
 
+enum class server_retention_candidate_availability : uint8_t {
+    available = 0,
+    in_flight_mutation,
+    backing_missing_or_stale,
+    _count,
+};
+
+struct server_retention_candidate {
+    llama_cache_acct_artifact_id artifact_id;
+    server_retention_instance_key instance_key;
+    common_retention_artifact_record record;
+    // D-S3's descriptor charge is provenance only. It is excluded from the D-S2
+    // budget and must never be credited as eviction yield.
+    llama_cache_acct_op_id provenance_op;
+    // Filled by D-S6's server assembler from the validated backing object.
+    std::vector<llama_cache_acct_op_id> release_ops;
+    server_retention_candidate_availability avail =
+        server_retention_candidate_availability::backing_missing_or_stale;
+};
+
 void server_cache_acct_mark_shadow_unavailable(
         llama_cache_acct_ledger & ledger,
         llama_cache_acct_category category,
@@ -105,6 +125,7 @@ public:
     void retire_slot(int32_t owner_slot) noexcept;
     llama_cache_acct_artifact_id artifact_id(
         const server_retention_instance_key & key) const noexcept;
+    std::vector<server_retention_candidate> candidate_snapshot() const noexcept;
 
     common_retention_sidecar_snapshot snapshot() const noexcept;
     bool import_snapshot(const common_retention_sidecar_snapshot & snapshot) noexcept;

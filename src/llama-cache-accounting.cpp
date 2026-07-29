@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 // Shadow accounting ledger (C schema v2). Every entry point is fault-tolerant and
 // observational: an invalid transition, tuple mismatch, overflow, or allocation failure
@@ -832,6 +833,90 @@ bool llama_cache_acct_ledger::preview_release(
     out.resident_allocated = llama_cache_acct_value::measured(
         last ? resolved.allocation->resident_bytes : 0);
     return true;
+}
+
+bool llama_cache_acct_ledger::preview_release_set(
+        const std::vector<llama_cache_acct_op_id> & selected,
+        uint64_t expected_serial,
+        llama_cache_acct_release_set_preview & out) const noexcept {
+    out = {};
+    std::lock_guard<std::mutex> lock(mtx);
+    if (state.serial != expected_serial) {
+        return false;
+    }
+    try {
+        std::unordered_map<llama_cache_acct_alloc_id, uint32_t> selected_refs;
+        selected_refs.reserve(selected.size());
+        std::unordered_set<llama_cache_acct_op_id> unique_ops;
+        unique_ops.reserve(selected.size());
+
+        for (const auto op : selected) {
+            if (!op || !unique_ops.insert(op).second) {
+                return false;
+            }
+            release_resolution resolved;
+            if (resolve_release_locked(op, resolved) !=
+                    release_resolution_status::ok) {
+                return false;
+            }
+            auto & count = selected_refs[resolved.operation->alloc];
+            if (count == std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            count++;
+        }
+
+        llama_cache_acct_release_set_preview next;
+        next.accounting_serial = expected_serial;
+        next.rows.reserve(selected_refs.size());
+        for (const auto & [alloc, count] : selected_refs) {
+            const auto it = allocs.find(alloc);
+            if (it == allocs.end() || count > it->second.committed_refs) {
+                return false;
+            }
+            if (count != it->second.committed_refs) {
+                continue;
+            }
+            auto row = std::find_if(
+                next.rows.begin(), next.rows.end(),
+                [&](const auto & candidate) {
+                    return candidate.domain == it->second.domain;
+                });
+            if (row == next.rows.end()) {
+                next.rows.push_back({ it->second.domain, 0, 0 });
+                row = std::prev(next.rows.end());
+            }
+            if (it->second.charged_logical >
+                    std::numeric_limits<uint64_t>::max() -
+                        row->logical_payload ||
+                it->second.resident_bytes >
+                    std::numeric_limits<uint64_t>::max() -
+                        row->resident_allocated) {
+                return false;
+            }
+            row->logical_payload += it->second.charged_logical;
+            row->resident_allocated += it->second.resident_bytes;
+        }
+        std::sort(next.rows.begin(), next.rows.end(),
+            [](const auto & a, const auto & b) {
+                if (a.domain.residency != b.domain.residency) {
+                    return a.domain.residency < b.domain.residency;
+                }
+                if (a.domain.kind != b.domain.kind) {
+                    return a.domain.kind < b.domain.kind;
+                }
+                if (a.domain.topology != b.domain.topology) {
+                    return a.domain.topology.v < b.domain.topology.v;
+                }
+                return a.domain.device_ordinal.v <
+                       b.domain.device_ordinal.v;
+            });
+        out = std::move(next);
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
 }
 
 void llama_cache_acct_ledger::gauge_set(

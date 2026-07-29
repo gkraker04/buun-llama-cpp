@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-cache-yield.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -344,6 +345,7 @@ struct server_cache_plan_observer {
     server_retention_sidecar_store retention;
     server_cache_destruction_observer destruction;
     llama_cache_budget_coordinator budget;
+    server_cache_yield_result last_yield;
 
     // D-S1: immutable bridge from the load-time ordered placement topology to the
     // ledger-local device-domain keys interned before the one-shot producer manifest.
@@ -2247,6 +2249,241 @@ private:
         }
     }
 
+    void cache_plan_run_yield(
+            const llama_cache_acct_snapshot & snapshot,
+            std::vector<server_retention_candidate> catalog) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            std::vector<server_cache_yield_candidate> candidates;
+            const auto resolve = [&](const server_retention_candidate & source,
+                                     server_cache_yield_candidate & candidate,
+                                     server_cache_lease_identity & identity,
+                                     bool & identity_known) {
+                switch (source.instance_key.kind) {
+                    case common_retention_artifact_kind::host_entry: {
+                        if (prompt_cache &&
+                            source.instance_key.owner_slot == -1 &&
+                            source.instance_key.instance != 0) {
+                            const auto backing = std::find_if(
+                                prompt_cache->states.begin(),
+                                prompt_cache->states.end(),
+                                [&](const auto & entry) {
+                                    return server_retention_instance_key::
+                                               for_host_entry(&entry).instance ==
+                                           source.instance_key.instance;
+                                });
+                            if (backing == prompt_cache->states.end()) {
+                                candidate.availability =
+                                    server_retention_candidate_availability::
+                                        backing_missing_or_stale;
+                                break;
+                            }
+                            const auto coverage =
+                                source.record.stamp.coverage_tokens;
+                            identity_known =
+                                coverage <= uint64_t(INT64_MAX) &&
+                                server_cache_lease_build_identity(
+                                    frontier_execution_identity,
+                                    backing->adapter_config_key,
+                                    backing->prompt.tokens,
+                                    int64_t(coverage),
+                                    identity);
+                            for (const auto op : {
+                                    backing->acct_op_snapshot,
+                                    backing->acct_op_ckpt,
+                                    backing->acct_op_accel }) {
+                                if (op) {
+                                    candidate.release_ops.push_back(op);
+                                }
+                            }
+                            if (candidate.release_ops.empty()) {
+                                candidate.availability =
+                                    server_retention_candidate_availability::
+                                        backing_missing_or_stale;
+                            }
+                        } else {
+                            candidate.availability =
+                                server_retention_candidate_availability::
+                                    backing_missing_or_stale;
+                        }
+                        break;
+                    }
+                    case common_retention_artifact_kind::live_slot: {
+                        const auto slot_it = std::find_if(
+                            slots.begin(), slots.end(),
+                            [&](const auto & candidate_slot) {
+                                return candidate_slot.id ==
+                                    source.instance_key.owner_slot &&
+                                    server_retention_instance_key::for_slot(
+                                        candidate_slot.id).instance ==
+                                        source.instance_key.instance;
+                            });
+                        if (slot_it != slots.end()) {
+                            const auto coverage =
+                                source.record.stamp.coverage_tokens;
+                            identity_known =
+                                coverage <= uint64_t(INT64_MAX) &&
+                                server_cache_lease_build_identity(
+                                    frontier_execution_identity,
+                                    lora_config_identity(slot_it->lora),
+                                    slot_it->prompt.tokens,
+                                    int64_t(coverage),
+                                    identity);
+                            candidate.availability = slot_it->is_processing()
+                                ? server_retention_candidate_availability::
+                                      in_flight_mutation
+                                : server_retention_candidate_availability::
+                                      backing_missing_or_stale;
+                        } else {
+                            candidate.availability =
+                                server_retention_candidate_availability::
+                                    backing_missing_or_stale;
+                        }
+                        candidate.has_unsupported_host_spill = true;
+                        break;
+                    }
+                    case common_retention_artifact_kind::checkpoint: {
+                        // Checkpoint payloads are currently embedded in either the
+                        // live aggregate or a host-entry allocation. Neither gives a
+                        // checkpoint an exact independently releasable op set.
+                        candidate.availability =
+                            server_retention_candidate_availability::
+                                backing_missing_or_stale;
+                        candidate.has_unsupported_host_spill = true;
+                        if (source.instance_key.instance == 0) {
+                            break;
+                        }
+
+                        for (const auto & owner : slots) {
+                            if (source.instance_key.owner_slot != owner.id) {
+                                continue;
+                            }
+                            const auto checkpoint = std::find_if(
+                                owner.prompt.checkpoints.begin(),
+                                owner.prompt.checkpoints.end(),
+                                [&](const auto & item) {
+                                    return server_retention_instance_key::
+                                               for_checkpoint(
+                                                   owner.id, &item).instance ==
+                                           source.instance_key.instance;
+                                });
+                            if (checkpoint !=
+                                owner.prompt.checkpoints.end()) {
+                                identity_known =
+                                    server_cache_lease_build_identity(
+                                        frontier_execution_identity,
+                                        lora_config_identity(owner.lora),
+                                        owner.prompt.tokens,
+                                        checkpoint->n_tokens,
+                                        identity);
+                                if (owner.is_processing()) {
+                                    candidate.availability =
+                                        server_retention_candidate_availability::
+                                            in_flight_mutation;
+                                }
+                                break;
+                            }
+                        }
+                        if (!identity_known &&
+                            source.instance_key.owner_slot == -1 &&
+                            prompt_cache) {
+                            for (const auto & owner : prompt_cache->states) {
+                                const auto checkpoint = std::find_if(
+                                    owner.prompt.checkpoints.begin(),
+                                    owner.prompt.checkpoints.end(),
+                                    [&](const auto & item) {
+                                        return server_retention_instance_key::
+                                                   for_checkpoint(
+                                                       -1, &item).instance ==
+                                               source.instance_key.instance;
+                                    });
+                                if (checkpoint !=
+                                    owner.prompt.checkpoints.end()) {
+                                    identity_known =
+                                        server_cache_lease_build_identity(
+                                            frontier_execution_identity,
+                                            owner.adapter_config_key,
+                                            owner.prompt.tokens,
+                                            checkpoint->n_tokens,
+                                            identity);
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case common_retention_artifact_kind::_count:
+                        candidate.availability =
+                            server_retention_candidate_availability::
+                                backing_missing_or_stale;
+                        break;
+                }
+            };
+            if (!server_cache_yield_assemble(
+                    catalog, cache_plan_obs->leases, resolve, candidates)) {
+                cache_plan_obs->last_yield = {};
+                cache_plan_obs->last_yield.accounting_serial =
+                    snapshot.serial;
+                return;
+            }
+
+            const auto preview = [&](const auto & ops,
+                                     uint64_t expected_serial,
+                                     auto & out) {
+                return cache_plan_obs->ledger.preview_release_set(
+                    ops, expected_serial, out);
+            };
+            const auto fit = [&](const llama_cache_budget_plan & plan) {
+                // The empty baseline has no prefix preview, so probe the live
+                // ledger here to preserve Lock A4's atomic-capture serial guard.
+                llama_cache_acct_release_set_preview serial_probe;
+                if (!cache_plan_obs->ledger.preview_release_set(
+                        {}, snapshot.serial, serial_probe)) {
+                    llama_cache_budget_result unavailable;
+                    unavailable.accounting_serial = snapshot.serial;
+                    return unavailable;
+                }
+                return cache_plan_obs->budget.fits(plan);
+            };
+            cache_plan_obs->last_yield = server_cache_yield_plan(
+                candidates, snapshot.serial, preview, fit);
+        } catch (...) {
+            cache_plan_obs->last_yield = {};
+            cache_plan_obs->last_yield.accounting_serial =
+                snapshot.serial;
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
+
+    // D-S6 observer-only surface. D-S7 owns the later schema-4 projection;
+    // this line deliberately does not enter the cache-plan wire record.
+    void cache_plan_emit_yield(
+            const server_cache_yield_result & result) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            const json line = {
+                { "status", server_cache_yield_status_name(result.status) },
+                { "yield_policy_version", result.yield_policy_version },
+                { "accounting_serial", result.accounting_serial },
+                { "n_selected_attention",
+                    result.selected[size_t(
+                        common_retention_pool::attention)].size() },
+                { "n_selected_recurrent",
+                    result.selected[size_t(
+                        common_retention_pool::recurrent)].size() },
+                { "n_plan_entries", result.plan.size() },
+                { "n_unsupported", result.unsupported.size() },
+            };
+            SRV_INF("CACHE_YIELD %s\n", line.dump().c_str());
+        } catch (...) {
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
+
     // B0 finalize [P2 §7.7]: exactly one final record per request, emitted only after the
     // actual restore/cold path AND all fallible trims/fallbacks and the prompt replay have
     // settled — the call sites ride the SAME timing points that feed metrics.on_prompt_eval
@@ -2349,7 +2586,12 @@ private:
                     cache_plan_obs->shadow_unavailable++;
                 }
                 rec.acct = cache_plan_obs->ledger.snapshot();
+                auto retention_candidates =
+                    cache_plan_obs->retention.candidate_snapshot();
                 cache_plan_emit_budget(rec.acct);
+                cache_plan_run_yield(
+                    rec.acct, std::move(retention_candidates));
+                cache_plan_emit_yield(cache_plan_obs->last_yield);
             }
 
             // ---- planner boundary [A2]: estimation, tie-set construction, and shadow

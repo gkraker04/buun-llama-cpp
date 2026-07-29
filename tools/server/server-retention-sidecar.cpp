@@ -327,6 +327,46 @@ llama_cache_acct_artifact_id server_retention_sidecar_store::artifact_id(
     return it == associations.end() ? llama_cache_acct_artifact_id{} : it->second;
 }
 
+std::vector<server_retention_candidate>
+server_retention_sidecar_store::candidate_snapshot() const noexcept {
+    try {
+        std::vector<server_retention_candidate> out;
+        out.reserve(associations.size());
+        for (const auto & [key, artifact] : associations) {
+            server_retention_candidate candidate;
+            candidate.artifact_id = artifact;
+            candidate.instance_key = key;
+            const auto item = catalog.find(artifact.v);
+            if (item != catalog.end()) {
+                candidate.record = item->second.record;
+                candidate.provenance_op = item->second.accounting_op;
+                candidate.avail =
+                    server_retention_candidate_availability::available;
+            }
+            out.push_back(std::move(candidate));
+        }
+        std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+            if (a.record.stamp.pool != b.record.stamp.pool) {
+                return a.record.stamp.pool < b.record.stamp.pool;
+            }
+            if (a.record.stamp.stable_id != b.record.stamp.stable_id) {
+                return a.record.stamp.stable_id < b.record.stamp.stable_id;
+            }
+            return a.artifact_id.v < b.artifact_id.v;
+        });
+        return out;
+    } catch (...) {
+        server_retention_candidate failed;
+        failed.avail =
+            server_retention_candidate_availability::backing_missing_or_stale;
+        try {
+            return { std::move(failed) };
+        } catch (...) {
+            return {};
+        }
+    }
+}
+
 common_retention_sidecar_snapshot
 server_retention_sidecar_store::snapshot() const noexcept {
     try {

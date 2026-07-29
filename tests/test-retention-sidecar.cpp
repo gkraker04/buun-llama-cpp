@@ -278,6 +278,19 @@ static void test_observer_store_accounting() {
         exported.data(), exported.size(), decoded));
     CHECK(decoded.artifacts.size() == 2);
 
+    const auto candidates = store.candidate_snapshot();
+    CHECK(candidates.size() == 2);
+    for (const auto & candidate : candidates) {
+        CHECK(candidate.artifact_id.v != 0);
+        CHECK(candidate.record.valid());
+        CHECK(candidate.provenance_op);
+        CHECK(candidate.release_ops.empty()); // server assembler owns payload join
+        CHECK(candidate.avail ==
+              server_retention_candidate_availability::available);
+        CHECK(store.artifact_id(candidate.instance_key) ==
+              candidate.artifact_id);
+    }
+
     store.retire(rebound);
     store.retire(live);
     CHECK(leases.evaluate(live_artifact, lease_identity).cls ==

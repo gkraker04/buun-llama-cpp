@@ -301,6 +301,46 @@ static void test_release_preview() {
     CHECK(ledger.snapshot().faults_unknown_id == faults_before);
 }
 
+// D-S6 SEAM B: a set preview applies last-reference accounting over the entire
+// selected union. Neither individual reference frees a shared allocation, while
+// selecting both does. The query is serial-bound and remains observational.
+static void test_release_set_preview() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const auto alloc = ledger.new_alloc();
+    const auto op0 = ledger.reserve(CAT, DOM, {}, 100, 128);
+    const auto op1 = ledger.reserve(CAT, DOM, {}, 100, 128);
+    CHECK(ledger.stage(op0, alloc, 128));
+    CHECK(ledger.stage(op1, alloc, 128));
+    CHECK(ledger.commit(op0, 100));
+    CHECK(ledger.commit(op1, 100));
+
+    const auto before = ledger.snapshot();
+    llama_cache_acct_release_set_preview preview;
+    CHECK(ledger.preview_release_set({ op0 }, before.serial, preview));
+    CHECK(preview.accounting_serial == before.serial);
+    CHECK(preview.rows.empty());
+    CHECK(ledger.preview_release_set({ op1 }, before.serial, preview));
+    CHECK(preview.rows.empty());
+
+    CHECK(ledger.preview_release_set({ op0, op1 }, before.serial, preview));
+    CHECK(preview.rows.size() == 1);
+    CHECK(preview.rows[0].domain == DOM);
+    CHECK(preview.rows[0].logical_payload == 100);
+    CHECK(preview.rows[0].resident_allocated == 128);
+    CHECK(ledger.snapshot().serial == before.serial);
+
+    CHECK(!ledger.preview_release_set(
+        { op0, op0 }, before.serial, preview));
+    CHECK(!ledger.preview_release_set(
+        { op0, op1 }, before.serial + 1, preview));
+    CHECK(ledger.snapshot().serial == before.serial);
+
+    CHECK(ledger.release(op0));
+    CHECK(ledger.release(op1));
+}
+
 // Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical
 // allocation (tombstone survives the last release), and the complete citation tuple —
 // identity fields included — is immutable on every shared citation
@@ -632,6 +672,7 @@ int main() {
     test_abort_retains_peak();
     test_charge_once();
     test_release_preview();
+    test_release_set_preview();
     test_attribution_rows();
     test_overflow_latch();
     test_serial_on_fault();

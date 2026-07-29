@@ -609,6 +609,52 @@ server_cache_lease_evaluation server_cache_lease_table::evaluate(
     return result;
 }
 
+server_cache_lease_evaluation server_cache_lease_table::inspect(
+        llama_cache_acct_artifact_id artifact,
+        const server_cache_lease_identity & expected_identity) const noexcept {
+    server_cache_lease_evaluation result;
+    if (!available || artifact.v == 0 || !expected_identity.valid()) {
+        return result;
+    }
+    if (std::any_of(
+            identity_unavailable.begin(), identity_unavailable.end(),
+            [&](const auto & value) {
+                return value.artifact == artifact;
+            })) {
+        return result;
+    }
+
+    // Observe expiry without driving the lifecycle state machine. A later
+    // lifecycle point records and removes the same expired entries.
+    const uint64_t now = clock->now_ns();
+    result.state = server_cache_lease_eval_state::known;
+    for (const auto & lease : leases) {
+        if (lease.subject.artifact != artifact ||
+            lease.expires_at_ns <= now) {
+            continue;
+        }
+        const auto identity = std::find_if(
+            identities.begin(), identities.end(),
+            [&](const auto & value) {
+                return value.id == lease.identity_id;
+            });
+        if (identity == identities.end() ||
+            identity->value != expected_identity) {
+            result.state = server_cache_lease_eval_state::unavailable;
+            result.cls = server_cache_lease_class::none;
+            result.eligibility = server_cache_lease_eligibility::eligible;
+            return result;
+        }
+        if (lease.cls > result.cls) {
+            result.cls = lease.cls;
+        }
+    }
+    if (result.cls == server_cache_lease_class::hard) {
+        result.eligibility = server_cache_lease_eligibility::hard_blocked;
+    }
+    return result;
+}
+
 bool server_cache_lease_table::admit_checkpoint_ring(
         const server_cache_destruction_target & target,
         bool & saw_soft,

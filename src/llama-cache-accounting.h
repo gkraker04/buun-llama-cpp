@@ -523,6 +523,21 @@ struct llama_cache_acct_release_preview {
     llama_cache_acct_value resident_allocated;
 };
 
+// Exact, non-mutating preview of releasing a SET of operation references together. Rows
+// are aggregated by resource domain because D-S2 prices one release entry per domain.
+// Unlike summing llama_cache_acct_release_preview values, this preserves last-reference
+// semantics when several selected operations jointly own one shared allocation.
+struct llama_cache_acct_release_set_row {
+    llama_cache_acct_resource_domain domain;
+    uint64_t logical_payload   = 0;
+    uint64_t resident_allocated = 0;
+};
+
+struct llama_cache_acct_release_set_preview {
+    uint64_t accounting_serial = 0;
+    std::vector<llama_cache_acct_release_set_row> rows;
+};
+
 // Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
 // (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
@@ -580,6 +595,10 @@ struct llama_cache_acct_ledger {
     bool preview_release(
             llama_cache_acct_op_id op,
             llama_cache_acct_release_preview & out) const noexcept;
+    bool preview_release_set(
+            const std::vector<llama_cache_acct_op_id> & ops,
+            uint64_t expected_serial,
+            llama_cache_acct_release_set_preview & out) const noexcept;
 
     // Direct gauge reporting for non-transactional producers (live state, metadata gauges).
     // Checked: overflow latches the cell unavailable and counts a fault.

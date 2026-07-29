@@ -172,6 +172,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
 
+    llama_build_and_test(
+        test-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-yield PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
     llama_build_and_test(test-cache-plan-record.cpp)
     target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

@@ -243,6 +243,12 @@ public:
     server_cache_lease_evaluation evaluate(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity) noexcept;
+    // Read-only planner seam: samples the current clock to ignore logically
+    // expired leases, but never interns, expires, invalidates, records, or
+    // changes table counters.
+    server_cache_lease_evaluation inspect(
+        llama_cache_acct_artifact_id artifact,
+        const server_cache_lease_identity & expected_identity) const noexcept;
     server_cache_destruction_verdict admit(
         const server_cache_destruction_request & request) noexcept;
 

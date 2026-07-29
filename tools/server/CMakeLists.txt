@@ -11,6 +11,8 @@ add_library(${TARGET} STATIC
     server-task.h
     server-cache-lease.cpp
     server-cache-lease.h
+    server-cache-yield.cpp
+    server-cache-yield.h
     server-retention-sidecar.cpp
     server-retention-sidecar.h
     server-queue.cpp

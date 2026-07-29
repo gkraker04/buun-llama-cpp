@@ -57,7 +57,9 @@ foreach(def
         "enum class server_cache_lease_eval_state : uint8_t"
         "enum class server_cache_lease_eligibility : uint8_t"
         "enum class server_cache_lease_fallback_state : uint8_t"
-        "enum class server_cache_lease_event_kind : uint8_t")
+        "enum class server_cache_lease_event_kind : uint8_t"
+        "enum class server_retention_candidate_availability : uint8_t"
+        "enum class server_cache_yield_status : uint8_t")
     count_literal("${all_source}" "${def}" def_count)
     if (NOT def_count EQUAL 1)
         message(FATAL_ERROR "expected exactly one definition of '${def}', found ${def_count}")
@@ -130,25 +132,30 @@ foreach(struct_name server_prompt server_prompt_cache_state)
         "${retention_server_header}" "${struct_name}" retention_struct_body)
     string(FIND "${retention_struct_body}" "common_retention_" retention_member)
     string(FIND "${retention_struct_body}" "server_cache_lease_" lease_member)
-    if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1)
+    string(FIND "${retention_struct_body}" "server_cache_yield_" yield_member)
+    if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1 OR
+        NOT yield_member EQUAL -1)
         message(FATAL_ERROR
-            "D-S3/D-S5 containment violation: ${struct_name} embeds retention/lease metadata")
+            "D-S3/D-S5/D-S6 containment violation: ${struct_name} embeds shadow metadata")
     endif()
 endforeach()
 retention_extract_struct(
     "${retention_common_header}" "common_prompt_checkpoint" retention_struct_body)
 string(FIND "${retention_struct_body}" "common_retention_" retention_member)
 string(FIND "${retention_struct_body}" "server_cache_lease_" lease_member)
-if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1)
+string(FIND "${retention_struct_body}" "server_cache_yield_" yield_member)
+if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1 OR
+    NOT yield_member EQUAL -1)
     message(FATAL_ERROR
-        "D-S3/D-S5 containment violation: common_prompt_checkpoint embeds retention/lease metadata")
+        "D-S3/D-S5/D-S6 containment violation: common_prompt_checkpoint embeds shadow metadata")
 endif()
 retention_extract_struct(
     "${cache_plan_wire_header}" "common_cache_plan_record" lease_wire_body)
 string(FIND "${lease_wire_body}" "server_cache_lease_" lease_wire_member)
-if (NOT lease_wire_member EQUAL -1)
+string(FIND "${lease_wire_body}" "server_cache_yield_" yield_wire_member)
+if (NOT lease_wire_member EQUAL -1 OR NOT yield_wire_member EQUAL -1)
     message(FATAL_ERROR
-        "D-S5 containment violation: common_cache_plan_record embeds lease state")
+        "D-S5/D-S6 containment violation: common_cache_plan_record embeds shadow state")
 endif()
 
 string(REPLACE
@@ -183,6 +190,17 @@ retention_extract_struct(
 string(FIND "${lease_wire_negative_body}" "server_cache_lease_" lease_wire_negative_hit)
 if (lease_wire_negative_hit EQUAL -1)
     message(FATAL_ERROR "D-S5 wire-purity negative control did not trip")
+endif()
+string(REPLACE
+    "struct common_cache_plan_record {"
+    "struct common_cache_plan_record {\\n    server_cache_yield_result forbidden_yield;"
+    yield_wire_negative
+    "${cache_plan_wire_header}")
+retention_extract_struct(
+    "${yield_wire_negative}" "common_cache_plan_record" yield_wire_negative_body)
+string(FIND "${yield_wire_negative_body}" "server_cache_yield_" yield_wire_negative_hit)
+if (yield_wire_negative_hit EQUAL -1)
+    message(FATAL_ERROR "D-S6 wire-purity negative control did not trip")
 endif()
 
 # D-S5 identity is an observer-only mirror of WS-4's canonical three opaque
