@@ -31,6 +31,7 @@
 #include <cinttypes>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <random>
 #include <filesystem>
@@ -318,6 +319,11 @@ struct server_shadow_global_state {
 // the shipped decision path and become shadow_unavailable — never a changed live choice.
 // Both counters are surfaced on every emitted record ("observer" object).
 struct server_cache_plan_observer {
+    struct device_binding {
+        ggml_backend_dev_t               device = nullptr;
+        llama_cache_acct_resource_domain domain;
+    };
+
     uint64_t records_finalized  = 0;
     uint64_t shadow_unavailable = 0;
     // planner-attempt accounting (verify-r1 finding 8): refusals counted exactly once,
@@ -331,6 +337,10 @@ struct server_cache_plan_observer {
 
     // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
+
+    // D-S1: immutable bridge from the load-time ordered placement topology to the
+    // ledger-local device-domain keys interned before the one-shot producer manifest.
+    std::vector<device_binding> live_device_domains;
 };
 
 struct server_slot {
@@ -1545,6 +1555,129 @@ private:
     // before prompt_cache so the ledger outlives the cache's accounting-release destructor.
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
 
+    // D-S1 live producer. This is observer-only and is called only while --cache-debug owns
+    // cache_plan_obs. It measures every distinct live target/draft context's resident cache
+    // allocations from the library's canonical breakdown, then updates the manifested device
+    // cells. A multi-device meta row cannot be assigned without per-shard bytes and therefore
+    // fails closed rather than applying topology weights to a physical measurement.
+    bool cache_plan_observe_live_memory(bool certify) noexcept {
+        if (!cache_plan_obs || cache_plan_obs->live_device_domains.empty()) {
+            return true;
+        }
+
+        try {
+            using live_row = llama_live_memory_breakdown_data;
+            std::vector<live_row> totals(cache_plan_obs->live_device_domains.size());
+            bool complete = true;
+
+            const auto add_checked = [&complete](size_t & dst, size_t value) {
+                if (value > std::numeric_limits<size_t>::max() - dst) {
+                    complete = false;
+                    return;
+                }
+                dst += value;
+            };
+
+            const llama_context * contexts[] = {
+                ctx_tgt,
+                ctx_dft.get(),
+                ctx_dft_shared.get(),
+            };
+            for (size_t i_ctx = 0; i_ctx < std::size(contexts); ++i_ctx) {
+                const llama_context * ctx = contexts[i_ctx];
+                if (!ctx || std::find(contexts, contexts + i_ctx, ctx) != contexts + i_ctx) {
+                    continue;
+                }
+                const auto breakdown = llama_get_live_memory_breakdown(ctx);
+                for (const auto & [raw_buft, row] : breakdown) {
+                    if (!raw_buft || ggml_backend_buft_is_host(raw_buft)) {
+                        continue;
+                    }
+
+                    ggml_backend_buffer_type_t buft = raw_buft;
+                    if (ggml_backend_buft_is_meta(buft)) {
+                        if (ggml_backend_meta_buft_n_bufts(buft) != 1) {
+                            complete = false;
+                            continue;
+                        }
+                        buft = ggml_backend_meta_buft_simple_buft(buft, 0);
+                    }
+
+                    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+                    const auto it = std::find_if(
+                        cache_plan_obs->live_device_domains.begin(),
+                        cache_plan_obs->live_device_domains.end(),
+                        [device](const auto & binding) {
+                            return binding.device == device;
+                        });
+                    if (it == cache_plan_obs->live_device_domains.end()) {
+                        complete = false;
+                        continue;
+                    }
+
+                    auto & total = totals[size_t(
+                        it - cache_plan_obs->live_device_domains.begin())];
+                    add_checked(total.attention,           row.attention);
+                    add_checked(total.recurrent,           row.recurrent);
+                    add_checked(total.recurrent_rollback,  row.recurrent_rollback);
+                    add_checked(total.rolling_window_tape, row.rolling_window_tape);
+                }
+            }
+
+            // complete is fixed after accumulation; when unavailable, every domain is marked
+            // the same way, so the fail path is hoisted out of the per-domain gauge loop.
+            if (!complete) {
+                for (const auto & binding : cache_plan_obs->live_device_domains) {
+                    for (const auto category : {
+                            llama_cache_acct_category::live_attention_state,
+                            llama_cache_acct_category::live_recurrent_state,
+                            llama_cache_acct_category::recurrent_rollback_planes,
+                            llama_cache_acct_category::rolling_window_tape }) {
+                        cache_plan_obs->ledger.mark_unavailable(
+                            category, binding.domain,
+                            llama_cache_acct_measure::resident_allocated);
+                    }
+                    cache_plan_obs->ledger.mark_producer_unavailable(
+                        binding.domain, llama_cache_acct_producer::live_memory);
+                }
+                return false;
+            }
+
+            for (size_t i = 0; i < totals.size(); ++i) {
+                const auto & domain = cache_plan_obs->live_device_domains[i].domain;
+                const auto & total  = totals[i];
+                cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::live_attention_state, domain,
+                    llama_cache_acct_measure::resident_allocated, total.attention);
+                cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::live_recurrent_state, domain,
+                    llama_cache_acct_measure::resident_allocated, total.recurrent);
+                cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::recurrent_rollback_planes, domain,
+                    llama_cache_acct_measure::resident_allocated,
+                    total.recurrent_rollback);
+                if (dflash_window_server_enabled()) {
+                    cache_plan_obs->ledger.gauge_set(
+                        llama_cache_acct_category::rolling_window_tape, domain,
+                        llama_cache_acct_measure::resident_allocated,
+                        total.rolling_window_tape);
+                }
+                if (certify) {
+                    (void) cache_plan_obs->ledger.certify_complete(
+                        domain, llama_cache_acct_producer::live_memory);
+                }
+            }
+
+            return complete;
+        } catch (...) {
+            for (const auto & binding : cache_plan_obs->live_device_domains) {
+                cache_plan_obs->ledger.mark_producer_unavailable(
+                    binding.domain, llama_cache_acct_producer::live_memory);
+            }
+            return false;
+        }
+    }
+
     // B0 finalize [P2 §7.7]: exactly one final record per request, emitted only after the
     // actual restore/cold path AND all fallible trims/fallbacks and the prompt replay have
     // settled — the call sites ride the SAME timing points that feed metrics.on_prompt_eval
@@ -1643,6 +1776,9 @@ private:
             common_cache_plan_compose_chains(rec);
 
             if (cache_plan_obs) {
+                if (!cache_plan_observe_live_memory(false)) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
                 rec.acct = cache_plan_obs->ledger.snapshot();
             }
 
@@ -3175,20 +3311,90 @@ private:
             const auto host_domain = llama_cache_acct_resource_domain::non_device(
                 llama_cache_acct_residency::pageable_host);
 
-            // C schema-v2 completeness manifest is owned by configuration, not by either
-            // producer. The host producer is required iff the host cache exists; the
-            // observer-init producer is always required while --cache-debug is on.
-            llama_cache_acct_completeness_requirement required[2];
-            size_t n_required = 0;
-            required[n_required++] = {
-                observer_domain, llama_cache_acct_producer::observer_init,
-            };
-            if (prompt_cache) {
-                required[n_required++] = {
-                    host_domain, llama_cache_acct_producer::host_cache,
-                };
+            // D-S1 manifest ordering: resolve the same effective placement used by the
+            // calibration profile, build/intern every usable device domain, and retain its
+            // runtime device binding BEFORE the one-shot producer manifest is configured.
+            // Multi-device auto placement has no resolved weights here; the canonical
+            // topology builder refuses it rather than fabricating equal shares.
+            std::vector<ggml_backend_dev_t> gpu_devices;
+            std::vector<std::string> gpu_descs;
+            std::vector<std::string> gpu_identities;
+            if (!params_base.devices.empty()) {
+                // the explicit --device list is nullptr-TERMINATED (parse_device_list);
+                // "none" is a single nullptr -> empty -> "cpu"
+                for (auto * dev : params_base.devices) {
+                    if (dev) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    auto * dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
             }
-            (void) cache_plan_obs->ledger.configure_required_producers(required, n_required);
+            // Auto-fit writes the resolved layer count back into params. A remaining
+            // negative sentinel means the loader's negative-is-all default.
+            const int ngl_eff = params_base.n_gpu_layers >= 0
+                ? params_base.n_gpu_layers
+                : llama_model_n_layer(model_tgt) + 1;
+            if (ngl_eff > 0 && !gpu_identities.empty()) {
+                llama_cache_acct_shard_topology topology;
+                if (llama_cache_acct_build_shard_topology(
+                        gpu_identities,
+                        int16_t(params_base.split_mode),
+                        params_base.main_gpu,
+                        params_base.tensor_split,
+                        topology)) {
+                    for (size_t i = 0; i < gpu_identities.size(); ++i) {
+                        llama_cache_acct_resource_domain domain;
+                        if (!cache_plan_obs->ledger.make_device_domain(
+                                topology,
+                                llama_cache_acct_device_ordinal{ uint16_t(i) },
+                                domain)) {
+                            cache_plan_obs->shadow_unavailable++;
+                            cache_plan_obs->live_device_domains.clear();
+                            break;
+                        }
+                        cache_plan_obs->live_device_domains.push_back({
+                            gpu_devices[i], domain,
+                        });
+                    }
+                } else {
+                    cache_plan_obs->shadow_unavailable++;
+                }
+            }
+
+            // C schema-v2 completeness manifest is owned by configuration, not by either
+            // producer. Device/live-memory rows are part of this SAME one-shot call; no
+            // producer is allowed to append its own domain after cells exist.
+            std::vector<llama_cache_acct_completeness_requirement> required;
+            required.reserve(2 + cache_plan_obs->live_device_domains.size());
+            required.push_back({
+                observer_domain, llama_cache_acct_producer::observer_init,
+            });
+            if (prompt_cache) {
+                required.push_back({
+                    host_domain, llama_cache_acct_producer::host_cache,
+                });
+            }
+            for (const auto & binding : cache_plan_obs->live_device_domains) {
+                required.push_back({
+                    binding.domain, llama_cache_acct_producer::live_memory,
+                });
+            }
+            (void) cache_plan_obs->ledger.configure_required_producers(
+                required.data(), required.size());
 
             if (prompt_cache) {
                 prompt_cache->acct = &cache_plan_obs->ledger;
@@ -3213,6 +3419,14 @@ private:
                     llama_cache_acct_measure::logical_payload, 0);
             (void) cache_plan_obs->ledger.certify_complete(
                 observer_domain, llama_cache_acct_producer::observer_init);
+
+            // Observe real resident allocations before certifying live_memory. A failed
+            // attribution leaves every affected domain unavailable; a measured zero is
+            // valid (e.g. no recurrent layers on an attention-only target).
+            if (!cache_plan_observe_live_memory(true)) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -3224,66 +3438,6 @@ private:
                 char desc[256] = {0};
                 llama_model_desc(model_tgt, desc, sizeof(desc));
 
-                // EFFECTIVE placement, not system inventory (verify-r2 finding 2): the
-                // devices actually offloaded to (--device wins over the system list),
-                // plus every knob that changes where work runs — ngl, and for multi-GPU
-                // the split mode / main gpu / tensor split. CPU vs full-offload on the
-                // same host must never share a key.
-                // POSITIONAL device order (verify-r4): main_gpu and tensor_split index
-                // into this order, so the key lists devices in sequence — a reversed
-                // heterogeneous pair must never alias the same placement
-                std::vector<std::string> gpu_descs;
-                std::vector<std::string> gpu_identities;
-                if (!params_base.devices.empty()) {
-                    // the explicit --device list is nullptr-TERMINATED (parse_device_list);
-                    // "none" is a single nullptr -> empty -> "cpu"
-                    for (auto * dev : params_base.devices) {
-                        if (dev) {
-                            gpu_descs.push_back(ggml_backend_dev_description(dev));
-                            gpu_identities.push_back(
-                                std::string(ggml_backend_dev_name(dev)) + "\n" +
-                                ggml_backend_dev_description(dev));
-                        }
-                    }
-                } else {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        auto * dev = ggml_backend_dev_get(i);
-                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                            gpu_descs.push_back(ggml_backend_dev_description(dev));
-                            gpu_identities.push_back(
-                                std::string(ggml_backend_dev_name(dev)) + "\n" +
-                                ggml_backend_dev_description(dev));
-                        }
-                    }
-                }
-                // effective placement: auto-fit wrote the resolved count back into
-                // params; a remaining negative sentinel means the loader's
-                // negative-is-all default — key on the model's actual layer count
-                const int ngl_eff = params_base.n_gpu_layers >= 0
-                    ? params_base.n_gpu_layers
-                    : llama_model_n_layer(model_tgt) + 1;
-                if (ngl_eff > 0 && !gpu_identities.empty()) {
-                    llama_cache_acct_shard_topology topology;
-                    if (llama_cache_acct_build_shard_topology(
-                            gpu_identities,
-                            int16_t(params_base.split_mode),
-                            params_base.main_gpu,
-                            params_base.tensor_split,
-                            topology)) {
-                        for (size_t i = 0; i < gpu_identities.size(); ++i) {
-                            llama_cache_acct_resource_domain domain;
-                            if (!cache_plan_obs->ledger.make_device_domain(
-                                    topology,
-                                    llama_cache_acct_device_ordinal{ uint16_t(i) },
-                                    domain)) {
-                                cache_plan_obs->shadow_unavailable++;
-                                break;
-                            }
-                        }
-                    } else {
-                        cache_plan_obs->shadow_unavailable++;
-                    }
-                }
                 cache_plan_obs->calibration_profile = common_cache_plan_calib_profile(
                     desc,
                     common_cache_plan_calib_hw(gpu_descs, ngl_eff,

@@ -224,6 +224,36 @@ endforeach()
 # (once-only finalization is a RUNTIME invariant: cache_plan_finalize early-returns and
 # fault-counts on an already-finalized record — outcome != unknown is the finalized state)
 
+# D-S1: device domains must be interned before the ONE production completeness-manifest
+# configuration. A second configure call cannot work after cells exist, and a gauge on a
+# domain omitted from the first call fails closed. Keep this ordering mechanically pinned.
+file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" server_context_source)
+function(cache_plan_live_manifest_shape source output)
+    count_literal("${source}" "configure_required_producers(" configure_count)
+    string(FIND "${source}" "make_device_domain(" domain_pos)
+    string(FIND "${source}" "configure_required_producers(" configure_pos)
+    string(FIND "${source}"
+        "binding.domain, llama_cache_acct_producer::live_memory" live_requirement_pos)
+    set(ok TRUE)
+    if (NOT configure_count EQUAL 1 OR domain_pos EQUAL -1 OR configure_pos EQUAL -1 OR
+        live_requirement_pos EQUAL -1 OR NOT domain_pos LESS configure_pos OR
+        NOT live_requirement_pos LESS configure_pos)
+        set(ok FALSE)
+    endif()
+    set(${output} "${ok}" PARENT_SCOPE)
+endfunction()
+cache_plan_live_manifest_shape("${server_context_source}" live_manifest_ok)
+if (NOT live_manifest_ok)
+    message(FATAL_ERROR
+        "D-S1 live-memory domains/requirements must precede the single producer manifest")
+endif()
+set(live_manifest_negative
+    "configure_required_producers(required, n); make_device_domain(topology, ordinal, domain); binding.domain, llama_cache_acct_producer::live_memory")
+cache_plan_live_manifest_shape("${live_manifest_negative}" live_manifest_negative_ok)
+if (live_manifest_negative_ok)
+    message(FATAL_ERROR "D-S1 manifest-order negative control did not trip")
+endif()
+
 # VBR name census completeness (D-pins r6): scan quoted VBR_* literals independently of
 # the reader spelling. This catches direct getenv, wrapper reads, programmatic producers,
 # diagnostics, and scripts; every one must be classified in COMMON_CACHE_PLAN_VBR_ENV_LIST.

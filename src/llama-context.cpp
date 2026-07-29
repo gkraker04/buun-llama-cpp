@@ -8382,6 +8382,90 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
+    llama_live_memory_breakdown ret;
+
+    if (memory) {
+        const uint64_t n_planes = uint64_t(cparams.n_rs_seq) + 1;
+
+        const auto add_attention = [&ret](
+                const std::map<ggml_backend_buffer_type_t, size_t> & breakdown) {
+            for (const auto & [buft, size] : breakdown) {
+                ret[buft].attention += size;
+            }
+        };
+
+        const auto add_recurrent = [&ret, n_planes](
+                const std::map<ggml_backend_buffer_type_t, size_t> & breakdown) {
+            for (const auto & [buft, recurrent_total] : breakdown) {
+                auto & row = ret[buft];
+                // The recurrent tensors allocate one equal-width row plane for live state
+                // plus n_rs_seq rollback planes. Assign any backend alignment remainder to
+                // rollback so the two leaves sum to the measured resident allocation.
+                const size_t live = recurrent_total / n_planes;
+                row.recurrent          += live;
+                row.recurrent_rollback += recurrent_total - live;
+            }
+        };
+
+        // Walk each physical allocation once. Hybrid memory's aggregate breakdown is the sum
+        // of these same two children, while its fixed breakdown walks the recurrent child a
+        // second time. Reading the children directly preserves that exact partition without
+        // the duplicate walk or subtraction-based classification.
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            add_attention(hybrid->get_mem_attn()->memory_breakdown());
+            add_recurrent(hybrid->get_mem_recr()->memory_breakdown());
+        } else if (auto * hybrid_iswa =
+                       dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+            add_attention(hybrid_iswa->get_mem_attn()->memory_breakdown());
+            add_recurrent(hybrid_iswa->get_mem_recr()->memory_breakdown());
+        } else if (auto * recurrent =
+                       dynamic_cast<llama_memory_recurrent *>(memory.get())) {
+            add_recurrent(recurrent->memory_breakdown());
+        } else {
+            add_attention(memory->memory_breakdown());
+            if (!memory->memory_breakdown_fixed().empty()) {
+                throw std::runtime_error(
+                    "unclassified fixed context allocation in live memory breakdown");
+            }
+        }
+    }
+
+    if (dflash_capture) {
+        const auto add_buffer = [&ret](ggml_backend_buffer_t buf) {
+            if (!buf) {
+                return;
+            }
+            if (ggml_backend_buffer_is_meta(buf)) {
+                const size_t n = ggml_backend_meta_buffer_n_bufs(buf);
+                for (size_t i = 0; i < n; ++i) {
+                    ggml_backend_buffer_t child =
+                        ggml_backend_meta_buffer_simple_buffer(buf, i);
+                    if (child) {
+                        ret[ggml_backend_buffer_get_type(child)].rolling_window_tape +=
+                            ggml_backend_buffer_get_size(child);
+                    }
+                }
+                return;
+            }
+            ret[ggml_backend_buffer_get_type(buf)].rolling_window_tape +=
+                ggml_backend_buffer_get_size(buf);
+        };
+
+        for (const auto & window : dflash_capture->windows) {
+            if (!window || !window->enabled) {
+                continue;
+            }
+            add_buffer(window->buf);
+            add_buffer(window->scratch);
+            add_buffer(window->advance_scratch);
+            add_buffer(window->codec_scratch);
+        }
+    }
+
+    return ret;
+}
+
 //
 // training
 //
@@ -9851,6 +9935,11 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx) {
+    return ctx ? ctx->live_memory_breakdown() : llama_live_memory_breakdown{};
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

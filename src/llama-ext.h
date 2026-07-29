@@ -94,6 +94,25 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Resident cache-state allocation for one context, split into mutually-exclusive physical
+// leaves: attention KV, live recurrent state, recurrent rollback planes, and speculative
+// rolling-window tape. Keys are backend buffer types (one row per allocation). Recurrent
+// buffers physically contain (1 + n_rs_seq) equal state planes; their allocation bytes are
+// partitioned between the live plane and rollback planes without changing the measured total.
+// The rolling-window field excludes the fixed speculative tape.
+struct llama_live_memory_breakdown_data {
+    size_t attention             = 0;
+    size_t recurrent             = 0;
+    size_t recurrent_rollback    = 0;
+    size_t rolling_window_tape   = 0;
+};
+
+using llama_live_memory_breakdown =
+    std::map<ggml_backend_buffer_type_t, llama_live_memory_breakdown_data>;
+
+LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx);
+
 // Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
 // from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
 // bits/value would cross floor_bpv (<= 0 = bottom-tier default; pass 1e30 for the un-walked

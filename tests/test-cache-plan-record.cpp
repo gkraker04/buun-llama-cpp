@@ -283,15 +283,19 @@ static void test_json_serialization() {
     CHECK(ledger.make_device_domain(topology, { 0 }, device_domain));
     const llama_cache_acct_completeness_requirement requirements[] = {
         { domain, llama_cache_acct_producer::observer_init },
-        { device_domain, llama_cache_acct_producer::host_cache },
+        { device_domain, llama_cache_acct_producer::live_memory },
     };
     CHECK(ledger.configure_required_producers(requirements, 2));
     ledger.gauge_set(llama_cache_acct_category::rolling_window_tape, domain,
                      llama_cache_acct_measure::logical_payload, 0);
     ledger.gauge_set(llama_cache_acct_category::live_attention_state, device_domain,
                      llama_cache_acct_measure::resident_allocated, 1234);
+    ledger.gauge_set(llama_cache_acct_category::live_recurrent_state, device_domain,
+                     llama_cache_acct_measure::resident_allocated, 567);
+    ledger.gauge_set(llama_cache_acct_category::recurrent_rollback_planes, device_domain,
+                     llama_cache_acct_measure::resident_allocated, 89);
     CHECK(ledger.certify_complete(domain, llama_cache_acct_producer::observer_init));
-    CHECK(ledger.certify_complete(device_domain, llama_cache_acct_producer::host_cache));
+    CHECK(ledger.certify_complete(device_domain, llama_cache_acct_producer::live_memory));
     rec.acct = ledger.snapshot();
 
     const auto j = common_cache_plan_record_json(rec);
@@ -331,6 +335,8 @@ static void test_json_serialization() {
     CHECK(j["accounting"]["completeness"][0]["producer"] == "observer_init");
     CHECK(j["accounting"]["completeness"][0]["state"] == "known");
     CHECK(j["accounting"]["completeness"][1]["domain"]["kind"] == "device_topology");
+    CHECK(j["accounting"]["completeness"][1]["producer"] == "live_memory");
+    CHECK(j["accounting"]["completeness"][1]["state"] == "known");
 }
 
 // finalize-shaped chain composition (verify-r4): the ONE tested implementation the server
