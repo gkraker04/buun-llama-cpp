@@ -337,6 +337,7 @@ struct server_cache_plan_observer {
 
     // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
+    server_retention_sidecar_store retention;
     server_cache_destruction_observer destruction;
 
     // D-S1: immutable bridge from the load-time ordered placement topology to the
@@ -396,6 +397,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
+    server_retention_sidecar_store * retention_obs = nullptr;
+    common_retention_pool retention_pool = common_retention_pool::attention;
 
     // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
     // (for /slots emission only)
@@ -528,7 +531,7 @@ struct server_slot {
                 }
             }
 
-            prompt_cache.publish(std::move(staged));
+            prompt_cache.publish(std::move(staged), &prompt, id);
 
             return prompt_save_result::published;
         } catch (const std::bad_alloc &) {
@@ -555,6 +558,9 @@ struct server_slot {
 
     void server_cache_slot_drop_impl() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+        if (retention_obs) {
+            retention_obs->retire_slot(id);
+        }
 
         if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
             // The server integration currently rejects --parallel > 1, so a
@@ -594,7 +600,16 @@ struct server_slot {
                 server_cache_destruction_target_kind::checkpoint_ring,
                 server_cache_destruction_target_kind::rolling_window,
                 server_cache_destruction_target_kind::typed_accelerator }) {
-            request.add_target(kind, id);
+            if (kind == server_cache_destruction_target_kind::live_target &&
+                retention_obs) {
+                request.add_target(
+                    kind,
+                    id,
+                    retention_obs->artifact_id(
+                        server_retention_instance_key::for_slot(id)));
+            } else {
+                request.add_target(kind, id);
+            }
         }
         if (ctx_dft) {
             request.add_target(
@@ -633,7 +648,11 @@ struct server_slot {
         request.cls    = server_cache_destruction_class::live_range_drop;
         request.reason = reason;
         request.add_target(
-            server_cache_destruction_target_kind::live_target, id);
+            server_cache_destruction_target_kind::live_target,
+            id,
+            retention_obs ? retention_obs->artifact_id(
+                server_retention_instance_key::for_slot(id))
+                : llama_cache_acct_artifact_id{});
         if (ctx_dft) {
             request.add_target(
                 server_cache_destruction_target_kind::live_draft, id);
@@ -662,6 +681,9 @@ struct server_slot {
     // Slot-file restore has already installed target bytes when this cleanup runs. It clears
     // only the displaced prompt metadata and draft state; the target must remain intact.
     void server_cache_mandatory_recovery_reset_impl(bool clear_draft) {
+        if (retention_obs) {
+            retention_obs->retire_slot(id);
+        }
         prompt.clear();
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
@@ -674,6 +696,9 @@ struct server_slot {
     }
 
     void server_cache_live_range_drop_impl(llama_tokens && retained_tokens) {
+        if (retention_obs) {
+            retention_obs->retire_slot(id);
+        }
         prompt.clear();
         prompt.tokens.insert(retained_tokens);
     }
@@ -683,6 +708,13 @@ struct server_slot {
     checkpoint_iterator server_cache_checkpoint_drop_impl(
             checkpoint_iterator first,
             checkpoint_iterator last) {
+        if (retention_obs) {
+            for (auto it = first; it != last; ++it) {
+                retention_obs->retire(
+                    server_retention_instance_key::for_checkpoint(
+                        id, &*it));
+            }
+        }
         return prompt.checkpoints.erase(first, last);
     }
 
@@ -695,7 +727,12 @@ struct server_slot {
             request.cls    = server_cache_destruction_class::checkpoint_drop;
             request.reason = reason;
             request.add_target(
-                server_cache_destruction_target_kind::checkpoint_ring, id);
+                server_cache_destruction_target_kind::checkpoint_ring,
+                id,
+                retention_obs ? retention_obs->artifact_id(
+                    server_retention_instance_key::for_checkpoint(
+                        id, &*first))
+                    : llama_cache_acct_artifact_id{});
             request.add_yield(
                 llama_cache_acct_category::checkpoint_state_payload);
             (void) server_cache_retention_admit(destruction_obs, request);
@@ -1143,6 +1180,22 @@ struct server_slot {
                             "release: erased %d dead generation checkpoint(s) "
                             "(prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
                             n_erased, prompt_end, retained_end);
+                }
+            }
+
+            if (retention_obs) {
+                if (!task->is_child() && prompt.n_tokens() > 0) {
+                    (void) retention_obs->publish(
+                        server_retention_instance_key::for_slot(id),
+                        retention_pool,
+                        task->params.message_spans,
+                        !task->params.message_spans.spans.empty(),
+                        uint64_t(prompt.n_tokens()),
+                        uint64_t(prompt.n_tokens()),
+                        prompt.n_tokens() >= 0);
+                } else {
+                    retention_obs->retire(
+                        server_retention_instance_key::for_slot(id));
                 }
             }
 
@@ -3529,9 +3582,16 @@ private:
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
             for (auto & slot : slots) {
                 slot.destruction_obs = &cache_plan_obs->destruction;
+                slot.retention_obs = &cache_plan_obs->retention;
+                slot.retention_pool =
+                    (llama_model_is_recurrent(model_tgt) ||
+                     llama_model_is_hybrid(model_tgt))
+                        ? common_retention_pool::recurrent
+                        : common_retention_pool::attention;
             }
             if (prompt_cache) {
                 prompt_cache->destruction_obs = &cache_plan_obs->destruction;
+                prompt_cache->retention_obs = &cache_plan_obs->retention;
             }
             const auto observer_domain = llama_cache_acct_resource_domain::non_device(
                 llama_cache_acct_residency::not_applicable);
@@ -3606,7 +3666,7 @@ private:
             // producer. Device/live-memory rows are part of this SAME one-shot call; no
             // producer is allowed to append its own domain after cells exist.
             std::vector<llama_cache_acct_completeness_requirement> required;
-            required.reserve(2 + cache_plan_obs->live_device_domains.size());
+            required.reserve(3 + cache_plan_obs->live_device_domains.size());
             required.push_back({
                 observer_domain, llama_cache_acct_producer::observer_init,
             });
@@ -3615,6 +3675,9 @@ private:
                     host_domain, llama_cache_acct_producer::host_cache,
                 });
             }
+            required.push_back({
+                host_domain, llama_cache_acct_producer::retention_sidecar,
+            });
             for (const auto & binding : cache_plan_obs->live_device_domains) {
                 required.push_back({
                     binding.domain, llama_cache_acct_producer::live_memory,
@@ -3622,6 +3685,19 @@ private:
             }
             (void) cache_plan_obs->ledger.configure_required_producers(
                 required.data(), required.size());
+            cache_plan_obs->retention.configure(
+                &cache_plan_obs->ledger, host_domain);
+            for (const auto measure : {
+                    llama_cache_acct_measure::logical_payload,
+                    llama_cache_acct_measure::resident_allocated }) {
+                cache_plan_obs->ledger.gauge_set(
+                    llama_cache_acct_category::artifact_descriptor_metadata,
+                    host_domain,
+                    measure,
+                    0);
+            }
+            (void) cache_plan_obs->ledger.certify_complete(
+                host_domain, llama_cache_acct_producer::retention_sidecar);
 
             if (prompt_cache) {
                 prompt_cache->acct = &cache_plan_obs->ledger;
@@ -4577,6 +4653,10 @@ private:
             task.tokens = server_tokens(toks, task.tokens.has_mtmd);
         }
 
+        if (slot.retention_obs) {
+            slot.retention_obs->retire(
+                server_retention_instance_key::for_slot(slot.id));
+        }
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -5438,6 +5518,17 @@ private:
                         server_cache_destruction_reason::slot_rebind);
                     slot->server_cache_mandatory_recovery_reset_impl(ctx_dft != nullptr);
                     slot->prompt.tokens.insert(tokens);
+                    if (slot->retention_obs) {
+                        const common_chat_msg_spans unavailable_spans;
+                        (void) slot->retention_obs->publish(
+                            server_retention_instance_key::for_slot(slot->id),
+                            slot->retention_pool,
+                            unavailable_spans,
+                            false,
+                            uint64_t(slot->prompt.n_tokens()),
+                            uint64_t(slot->prompt.n_tokens()),
+                            true);
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -8006,6 +8097,22 @@ private:
 
                         slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), staged);
                         const auto & cur = slot.prompt.checkpoints.back();
+                        if (slot.retention_obs) {
+                            const bool frontier_valid =
+                                cur.computation_frontier.valid() &&
+                                cur.computation_frontier.token_count == cur.n_tokens &&
+                                cur.n_tokens >= 0 &&
+                                cur.n_tokens <= slot.task->n_tokens();
+                            (void) slot.retention_obs->publish(
+                                server_retention_instance_key::for_checkpoint(
+                                    slot.id, &cur),
+                                slot.retention_pool,
+                                slot.task->params.message_spans,
+                                !slot.task->params.message_spans.spans.empty(),
+                                uint64_t(slot.task->n_tokens()),
+                                cur.n_tokens >= 0 ? uint64_t(cur.n_tokens) : 0,
+                                frontier_valid);
+                        }
 
                         SLT_WRN(slot,
                                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64

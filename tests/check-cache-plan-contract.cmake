@@ -47,12 +47,105 @@ foreach(def
         "enum class llama_cache_acct_known : uint8_t"
         "enum class llama_cache_acct_unit : uint8_t"
         "enum class llama_cache_acct_cost_kind : uint8_t"
-        "enum class llama_cache_acct_txn_state : uint8_t")
+        "enum class llama_cache_acct_txn_state : uint8_t"
+        "enum class common_retention_source_state : uint8_t"
+        "enum class common_retention_pool : uint8_t"
+        "enum class common_retention_artifact_kind : uint8_t"
+        "enum class common_retention_score_state : uint8_t")
     count_literal("${all_source}" "${def}" def_count)
     if (NOT def_count EQUAL 1)
         message(FATAL_ERROR "expected exactly one definition of '${def}', found ${def_count}")
     endif()
 endforeach()
+
+# D-S3 has an independent fail-closed binary envelope. It is not the cache-plan wire
+# schema and must remain singular/versioned rather than acquiring a server-side mirror.
+foreach(sidecar_pin
+        "constexpr uint32_t COMMON_RETENTION_SIDECAR_VERSION = 1"
+        "constexpr uint32_t COMMON_RETENTION_TURN_TABLE_VERSION = 1"
+        "constexpr uint32_t SIDECAR_MAGIC = 0x44533352")
+    count_literal("${all_source}" "${sidecar_pin}" sidecar_pin_count)
+    if (NOT sidecar_pin_count EQUAL 1)
+        message(FATAL_ERROR
+            "D-S3 retention-sidecar format authority drifted: '${sidecar_pin}'")
+    endif()
+endforeach()
+set(sidecar_pin_negative
+    "${all_source}\nconstexpr uint32_t COMMON_RETENTION_SIDECAR_VERSION = 1;")
+count_literal("${sidecar_pin_negative}"
+    "constexpr uint32_t COMMON_RETENTION_SIDECAR_VERSION = 1"
+    sidecar_negative_count)
+if (sidecar_negative_count EQUAL 1)
+    message(FATAL_ERROR "D-S3 one-definition negative control did not trip")
+endif()
+
+# D-S3 containment: durable turn vectors and score records belong only to the
+# observer-owned catalog. The three shipped artifact structs must remain free of
+# common_retention_* members so cloning, sizing, and pressure decisions cannot
+# accidentally absorb shadow metadata.
+function(retention_extract_struct source struct_name output)
+    string(REPLACE ";" "\\;" escaped_source "${source}")
+    string(REPLACE "\n" ";" lines "${escaped_source}")
+    set(active FALSE)
+    set(found FALSE)
+    set(depth 0)
+    set(body "")
+    foreach(raw_line IN LISTS lines)
+        if (NOT active AND
+            raw_line MATCHES "(^|[^a-zA-Z0-9_])struct[ \t]+${struct_name}[ \t]*\\{")
+            set(active TRUE)
+            set(found TRUE)
+        endif()
+        if (active)
+            string(APPEND body "${raw_line}\n")
+            string(REGEX MATCHALL "\\{" opens "${raw_line}")
+            string(REGEX MATCHALL "\\}" closes "${raw_line}")
+            list(LENGTH opens n_open)
+            list(LENGTH closes n_close)
+            math(EXPR depth "${depth} + ${n_open} - ${n_close}")
+            if (depth LESS_EQUAL 0)
+                set(active FALSE)
+                break()
+            endif()
+        endif()
+    endforeach()
+    if (NOT found)
+        message(FATAL_ERROR "D-S3 containment scan could not find struct ${struct_name}")
+    endif()
+    set(${output} "${body}" PARENT_SCOPE)
+endfunction()
+
+file(READ "${SOURCE_ROOT}/tools/server/server-task.h" retention_server_header)
+file(READ "${SOURCE_ROOT}/common/common.h" retention_common_header)
+foreach(struct_name server_prompt server_prompt_cache_state)
+    retention_extract_struct(
+        "${retention_server_header}" "${struct_name}" retention_struct_body)
+    string(FIND "${retention_struct_body}" "common_retention_" retention_member)
+    if (NOT retention_member EQUAL -1)
+        message(FATAL_ERROR
+            "D-S3 containment violation: ${struct_name} embeds retention metadata")
+    endif()
+endforeach()
+retention_extract_struct(
+    "${retention_common_header}" "common_prompt_checkpoint" retention_struct_body)
+string(FIND "${retention_struct_body}" "common_retention_" retention_member)
+if (NOT retention_member EQUAL -1)
+    message(FATAL_ERROR
+        "D-S3 containment violation: common_prompt_checkpoint embeds retention metadata")
+endif()
+
+string(REPLACE
+    "struct server_prompt {"
+    "struct server_prompt {\\n    common_retention_stamp forbidden_inline;"
+    retention_struct_negative
+    "${retention_server_header}")
+retention_extract_struct(
+    "${retention_struct_negative}" "server_prompt" retention_negative_body)
+string(FIND "${retention_negative_body}" "common_retention_" retention_negative_hit)
+if (retention_negative_hit EQUAL -1)
+    message(FATAL_ERROR "D-S3 struct-purity negative control did not trip")
+endif()
+
 foreach(alias
         "using llama_cache_acct_device_digest ="
         "using llama_cache_acct_topology_digest =")

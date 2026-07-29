@@ -5,6 +5,18 @@
 #include <cstdint>
 #include <cstring>
 
+inline void llama_store_le_u32(uint8_t (&data)[4], uint32_t value) {
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        data[i] = uint8_t(value >> (8*i));
+    }
+}
+
+inline void llama_store_le_u64(uint8_t (&data)[8], uint64_t value) {
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        data[i] = uint8_t(value >> (8*i));
+    }
+}
+
 // Compact SHA-256 for internal identity digests (adapter identities, VBR checkpoint
 // identity/policy/order digests). Callers version their own serialization domains.
 class llama_sha256 {
@@ -144,17 +156,13 @@ public:
 
     void u32(uint32_t value) {
         uint8_t data[4];
-        for (size_t i = 0; i < sizeof(data); ++i) {
-            data[i] = uint8_t(value >> (8*i));
-        }
+        llama_store_le_u32(data, value);
         bytes(data, sizeof(data));
     }
 
     void u64(uint64_t value) {
         uint8_t data[8];
-        for (size_t i = 0; i < sizeof(data); ++i) {
-            data[i] = uint8_t(value >> (8*i));
-        }
+        llama_store_le_u64(data, value);
         bytes(data, sizeof(data));
     }
 

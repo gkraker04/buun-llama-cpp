@@ -4,6 +4,7 @@
 #include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
 #include "llama.h"
 #include "server-cache-lifecycle.h"
+#include "server-retention-sidecar.h"
 
 #include <string>
 #include <unordered_set>
@@ -687,7 +688,10 @@ struct server_prompt_cache {
     // allocation, no throw). A failed fill drops the staged node — never a poisoned/half-filled
     // published entry, never an eviction that bought nothing.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
-    void publish(std::list<server_prompt_cache_state> entry);
+    void publish(
+            std::list<server_prompt_cache_state> entry,
+            const server_prompt * source_prompt = nullptr,
+            int32_t source_slot = -1);
 
     // `obs` is the B0 shadow observer row for the host_cache_entry candidate (nullptr = observer
     // off). It only receives values this selection already computes — never a re-scan [B-a].
@@ -712,6 +716,7 @@ struct server_prompt_cache {
     // and outlives this cache by member order in server_context_impl.
     llama_cache_acct_ledger * acct = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
+    server_retention_sidecar_store * retention_obs = nullptr;
 
     ~server_prompt_cache() {
         clear_accounting();

@@ -114,6 +114,18 @@ struct server_cache_destruction_request {
         target.slot_id = slot_id;
     }
 
+    void add_target(
+            server_cache_destruction_target_kind kind,
+            int32_t slot_id,
+            llama_cache_acct_artifact_id artifact) noexcept {
+        add_target(kind, slot_id);
+        if (n_targets > 0 && !overflowed) {
+            auto & target = targets[n_targets - 1];
+            target.artifact = artifact;
+            target.artifact_known = artifact.v != 0;
+        }
+    }
+
     void add_yield(const server_cache_destruction_yield & value) noexcept {
         if (n_yields >= yields.size()) {
             overflowed = true;

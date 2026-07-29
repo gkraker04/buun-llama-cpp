@@ -1777,37 +1777,24 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
         for (const auto cat : { llama_cache_acct_category::full_snapshot_payload,
                                 llama_cache_acct_category::checkpoint_state_payload,
                                 llama_cache_acct_category::typed_accelerator_payload }) {
-            acct->mark_unavailable(cat, domain,
-                                   llama_cache_acct_measure::logical_payload);
+            server_cache_acct_mark_shadow_unavailable(
+                *acct, cat, domain, llama_cache_acct_producer::host_cache);
         }
-        acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
         return;
     }
 
-    // every transition result is checked: a failed stage/commit aborts the op (fail-closed,
-    // idempotent — abort on an erased op only faults), latches the leaf unavailable, and
-    // publishes NO op id, so the entry's later release cannot compound the fault
-    const auto charge = [this, &domain](llama_cache_acct_category cat, uint64_t bytes) -> llama_cache_acct_op_id {
-        const auto op = acct->reserve(cat, domain, {}, bytes, bytes);
-        if (!op) {
-            acct->mark_unavailable(cat, domain,
-                                   llama_cache_acct_measure::logical_payload);
-            acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
-            return {};
-        }
-        if (!acct->stage(op, acct->new_alloc(), bytes) || !acct->commit(op, bytes)) {
-            acct->abort(op);
-            acct->mark_unavailable(cat, domain,
-                                   llama_cache_acct_measure::logical_payload);
-            acct->mark_producer_unavailable(domain, llama_cache_acct_producer::host_cache);
-            return {};
-        }
-        return op;
-    };
-
-    st.acct_op_snapshot = charge(llama_cache_acct_category::full_snapshot_payload,     st.data.size());
-    st.acct_op_ckpt     = charge(llama_cache_acct_category::checkpoint_state_payload,  ckpt_bytes);
-    st.acct_op_accel    = charge(llama_cache_acct_category::typed_accelerator_payload, accel_bytes);
+    st.acct_op_snapshot = server_cache_acct_charge_shadow(
+        *acct, llama_cache_acct_category::full_snapshot_payload, domain,
+        llama_cache_acct_producer::host_cache, {},
+        st.data.size(), st.data.size());
+    st.acct_op_ckpt = server_cache_acct_charge_shadow(
+        *acct, llama_cache_acct_category::checkpoint_state_payload, domain,
+        llama_cache_acct_producer::host_cache, {},
+        ckpt_bytes, ckpt_bytes);
+    st.acct_op_accel = server_cache_acct_charge_shadow(
+        *acct, llama_cache_acct_category::typed_accelerator_payload, domain,
+        llama_cache_acct_producer::host_cache, {},
+        accel_bytes, accel_bytes);
 }
 
 void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
@@ -1833,7 +1820,12 @@ static void server_prompt_cache_observe_drop(
     server_cache_destruction_request request;
     request.cls    = server_cache_destruction_class::host_artifact_drop;
     request.reason = reason;
-    request.add_target(server_cache_destruction_target_kind::host_artifact, -1);
+    request.add_target(
+        server_cache_destruction_target_kind::host_artifact,
+        -1,
+        cache.retention_obs ? cache.retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&state))
+            : llama_cache_acct_artifact_id{});
 
     const llama_cache_acct_op_id ops[] = {
         state.acct_op_snapshot,
@@ -1871,6 +1863,15 @@ static void server_prompt_cache_observe_drop(
 static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
         server_prompt_cache & cache,
         server_prompt_cache::iterator it) {
+    if (cache.retention_obs) {
+        cache.retention_obs->retire(
+            server_retention_instance_key::for_host_entry(&*it));
+        for (auto & checkpoint : it->prompt.checkpoints) {
+            cache.retention_obs->retire(
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint));
+        }
+    }
     if (cache.acct) {
         cache.acct_release_entry(*it);
     }
@@ -1888,7 +1889,7 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
 // object while the observer ledger survives): every charged entry releases before the
 // container dies, or the next snapshot would carry phantom host-cache bytes.
 void server_prompt_cache::clear_accounting() {
-    if (!acct && !destruction_obs) {
+    if (!acct && !destruction_obs && !retention_obs) {
         return;
     }
     for (auto & st : states) {
@@ -1897,10 +1898,22 @@ void server_prompt_cache::clear_accounting() {
         if (acct) {
             acct_release_entry(st);
         }
+        if (retention_obs) {
+            retention_obs->retire(
+                server_retention_instance_key::for_host_entry(&st));
+            for (auto & checkpoint : st.prompt.checkpoints) {
+                retention_obs->retire(
+                    server_retention_instance_key::for_checkpoint(
+                        -1, &checkpoint));
+            }
+        }
     }
 }
 
-void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
+void server_prompt_cache::publish(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot) {
     if (entry.empty()) {
         return;
     }
@@ -1916,6 +1929,22 @@ void server_prompt_cache::publish(std::list<server_prompt_cache_state> entry) {
 
     if (acct) {
         acct_charge_entry(*self);
+    }
+    if (retention_obs && source_prompt && source_slot >= 0) {
+        (void) retention_obs->clone(
+            server_retention_instance_key::for_slot(source_slot),
+            server_retention_instance_key::for_host_entry(&*self));
+        auto source_checkpoint = source_prompt->checkpoints.begin();
+        auto host_checkpoint = self->prompt.checkpoints.begin();
+        for (; source_checkpoint != source_prompt->checkpoints.end() &&
+               host_checkpoint != self->prompt.checkpoints.end();
+               ++source_checkpoint, ++host_checkpoint) {
+            (void) retention_obs->clone(
+                server_retention_instance_key::for_checkpoint(
+                    source_slot, &*source_checkpoint),
+                server_retention_instance_key::for_checkpoint(
+                    -1, &*host_checkpoint));
+        }
     }
 
     for (auto it = states.begin(); it != states.end();) {
@@ -2106,6 +2135,18 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     if constexpr (Observed) {
         if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
             sel->delivered = true; // recorded at the delivery point, never inferred [B0]
+        }
+    }
+    if (retention_obs) {
+        (void) retention_obs->clone(
+            server_retention_instance_key::for_host_entry(&*it_best),
+            server_retention_instance_key::for_slot(id_slot));
+        for (auto & checkpoint : it_best->prompt.checkpoints) {
+            (void) retention_obs->rebind(
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint),
+                server_retention_instance_key::for_checkpoint(
+                    id_slot, &checkpoint));
         }
     }
     prompt = std::move(it_best->prompt);
