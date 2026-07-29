@@ -44,6 +44,24 @@ static server_cache_yield_candidate candidate(
     return out;
 }
 
+// Rebuild yield candidates from a decoded sidecar snapshot (op == stable_id, the
+// way the fixtures mint them) so encode->decode->replay reproduction can be checked.
+static std::vector<server_cache_yield_candidate> resume_candidates(
+        const common_retention_sidecar_snapshot & snapshot) {
+    std::vector<server_cache_yield_candidate> out;
+    for (const auto & record : snapshot.artifacts) {
+        auto value = candidate(
+            record.stamp.stable_id,
+            record.stamp.stable_id,
+            record.stamp.pool,
+            record.stamp.stable_id,
+            record.stamp.recency_ordinal);
+        value.record = record;
+        out.push_back(std::move(value));
+    }
+    return out;
+}
+
 struct fixture {
     uint64_t serial = 17;
     uint64_t fit_after_release = 0;
@@ -348,21 +366,143 @@ static void test_value_record_order_reproduction() {
     CHECK(common_retention_sidecar_decode(
         bytes.data(), bytes.size(), decoded));
 
-    std::vector<server_cache_yield_candidate> resumed;
-    for (const auto & record : decoded.artifacts) {
-        auto value = candidate(
-            record.stamp.stable_id,
-            record.stamp.stable_id,
-            record.stamp.pool,
-            record.stamp.stable_id,
-            record.stamp.recency_ordinal);
-        value.record = record;
-        resumed.push_back(std::move(value));
-    }
+    const auto resumed = resume_candidates(decoded);
     const auto replayed = server_cache_yield_plan(
         resumed, f.serial, f.preview(), f.fits());
     CHECK(replayed.status == server_cache_yield_status::fits);
     CHECK(replayed.selected[0] == original.selected[0]);
+}
+
+// D-S GATE — cross-pool determinism. Pins the invariants the shadow yield planner
+// must hold before D-A can trust its evidence:
+//   (1) attention selection is independent of recurrent presence (attention is
+//       walked first from an empty union) and reflects the intra-pool sort, not
+//       input order;
+//   (2) recurrent selection legitimately DEPENDS on the accumulated attention
+//       yield — it is the shortest recurrent prefix that fits after it;
+//   (3) a recurrent candidate whose ops are already covered by the attention
+//       union is zero-marginal and skipped (shared-op dedup).
+static void test_cross_pool_independence() {
+    auto make = [](uint64_t fit_after) {
+        fixture f;
+        f.fit_after_release = fit_after;
+        f.bytes = { {1, 10}, {2, 10}, {3, 10}, {4, 10}, {5, 10} };
+        return f;
+    };
+
+    // (1) attention alone is insufficient at fit=25 (a1+a2 = 20 < 25); its selected
+    // prefix + order are identical whether recurrent is absent or present+permuted.
+    fixture f = make(25);
+    const auto att_only = server_cache_yield_plan(
+        {
+            candidate(2, 2, common_retention_pool::attention, 2, 2),
+            candidate(1, 1, common_retention_pool::attention, 1, 1),
+        },
+        f.serial, f.preview(), f.fits());
+    CHECK(att_only.status == server_cache_yield_status::insufficient_yield);
+    CHECK(att_only.selected[0].size() == 2);
+    CHECK(att_only.selected[0][0].v == 1);   // sorted by recency, not input order
+    CHECK(att_only.selected[0][1].v == 2);
+    CHECK(att_only.selected[1].empty());
+
+    const auto with_rec = server_cache_yield_plan(
+        {
+            candidate(4, 4, common_retention_pool::recurrent, 4, 4),
+            candidate(2, 2, common_retention_pool::attention, 2, 2),
+            candidate(3, 3, common_retention_pool::recurrent, 3, 3),
+            candidate(1, 1, common_retention_pool::attention, 1, 1),
+        },
+        f.serial, f.preview(), f.fits());
+    CHECK(with_rec.status == server_cache_yield_status::fits);
+    CHECK(with_rec.selected[0] == att_only.selected[0]);   // byte-identical prefix
+    // (2) recurrent = shortest prefix that fits after attention (20): r3 -> 30 >= 25
+    CHECK(with_rec.selected[1].size() == 1);
+    CHECK(with_rec.selected[1][0].v == 3);
+
+    // (2, cont.) recurrent selection legitimately shifts when the attention yield
+    // shrinks: with only a1 (10) the recurrent walk needs r3 AND r4 to reach 25.
+    // (Same immutable fit=25 fixture as above; the planner only reads it.)
+    const auto thin = server_cache_yield_plan(
+        {
+            candidate(1, 1, common_retention_pool::attention, 1, 1),
+            candidate(4, 4, common_retention_pool::recurrent, 4, 4),
+            candidate(3, 3, common_retention_pool::recurrent, 3, 3),
+        },
+        f.serial, f.preview(), f.fits());
+    CHECK(thin.status == server_cache_yield_status::fits);
+    CHECK(thin.selected[0].size() == 1);
+    CHECK(thin.selected[0][0].v == 1);
+    CHECK(thin.selected[1].size() == 2);   // now needs both — depends on attention
+    CHECK(thin.selected[1][0].v == 3);
+    CHECK(thin.selected[1][1].v == 4);
+
+    // (2, A/B) recurrent INTERNAL order is independent of attention presence: with
+    // attention absent, {r4,r3} sorts to the same [r3,r4] the thin arm selected.
+    const auto rec_only = server_cache_yield_plan(
+        {
+            candidate(4, 4, common_retention_pool::recurrent, 4, 4),
+            candidate(3, 3, common_retention_pool::recurrent, 3, 3),
+        },
+        f.serial, f.preview(), f.fits());
+    CHECK(rec_only.status == server_cache_yield_status::insufficient_yield);
+    CHECK(rec_only.selected[0].empty());
+    CHECK(rec_only.selected[1].size() == 2);
+    CHECK(rec_only.selected[1][0].v == 3);
+    CHECK(rec_only.selected[1][1].v == 4);
+    CHECK(rec_only.selected[1] == thin.selected[1]);
+
+    // (3) shared-op dedup: recurrent rs cites op 1, already freed by attention a1
+    // -> zero-marginal -> skipped; rn (op 5) is the selected recurrent yield.
+    fixture h = make(15);
+    const auto dedup = server_cache_yield_plan(
+        {
+            candidate(1, 1, common_retention_pool::attention, 1, 1),
+            candidate(90, 1, common_retention_pool::recurrent, 90, 1),
+            candidate(91, 5, common_retention_pool::recurrent, 91, 2),
+        },
+        h.serial, h.preview(), h.fits());
+    CHECK(dedup.status == server_cache_yield_status::fits);
+    CHECK(dedup.selected[0].size() == 1);
+    CHECK(dedup.selected[0][0].v == 1);
+    CHECK(dedup.selected[1].size() == 1);
+    CHECK(dedup.selected[1][0].v == 91);   // rs(90) skipped as zero-marginal
+}
+
+// D-S GATE — suspend/resume reproduction across BOTH pools (prior coverage was
+// attention-only). Encode the retention sidecar, decode it, rebuild candidates in
+// decoded order, and require the per-pool selection to reproduce byte-for-byte.
+static void test_resume_both_pools() {
+    fixture f;
+    f.fit_after_release = 25;
+    f.bytes = { {1, 10}, {2, 10}, {3, 10}, {4, 10} };
+    auto a1 = candidate(1, 1, common_retention_pool::attention, 1, 1);
+    auto a2 = candidate(2, 2, common_retention_pool::attention, 2, 2);
+    auto r3 = candidate(3, 3, common_retention_pool::recurrent, 3, 3);
+    auto r4 = candidate(4, 4, common_retention_pool::recurrent, 4, 4);
+    const auto original = server_cache_yield_plan(
+        { r4, a2, r3, a1 }, f.serial, f.preview(), f.fits());
+    CHECK(original.status == server_cache_yield_status::fits);
+    CHECK(original.selected[0].size() == 2);
+    CHECK(original.selected[1].size() == 1);
+
+    common_retention_sidecar_snapshot snapshot;
+    snapshot.recency_high_water[0] = 2;
+    snapshot.recency_high_water[1] = 4;
+    snapshot.stable_high_water[0] = 2;
+    snapshot.stable_high_water[1] = 4;
+    snapshot.artifacts = { r4.record, a2.record, r3.record, a1.record };
+    std::vector<uint8_t> bytes;
+    CHECK(common_retention_sidecar_encode(snapshot, bytes));
+    common_retention_sidecar_snapshot decoded;
+    CHECK(common_retention_sidecar_decode(
+        bytes.data(), bytes.size(), decoded));
+
+    const auto resumed = resume_candidates(decoded);
+    const auto replayed = server_cache_yield_plan(
+        resumed, f.serial, f.preview(), f.fits());
+    CHECK(replayed.status == server_cache_yield_status::fits);
+    CHECK(replayed.selected[0] == original.selected[0]);
+    CHECK(replayed.selected[1] == original.selected[1]);
 }
 
 static void test_filters_and_terminals() {
@@ -521,6 +661,8 @@ int main() {
     test_zero_marginal_candidate_skipped();
     test_live_soft_order_and_serialized_bit();
     test_value_record_order_reproduction();
+    test_cross_pool_independence();
+    test_resume_both_pools();
     test_filters_and_terminals();
     test_closed_filter_matrix();
     test_empty_stale_and_capacity();
