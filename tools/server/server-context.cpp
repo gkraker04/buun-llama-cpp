@@ -338,6 +338,9 @@ struct server_cache_plan_observer {
 
     // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
+    // Declaration order is lifetime order: retention's destructor releases lease memberships
+    // and accounting ops, so both authorities must outlive it.
+    server_cache_lease_table leases;
     server_retention_sidecar_store retention;
     server_cache_destruction_observer destruction;
     llama_cache_budget_coordinator budget;
@@ -403,6 +406,8 @@ struct server_slot {
     llama_context * ctx_dft = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
+    server_cache_lease_table * lease_obs = nullptr;
+    const std::string * lease_execution_identity = nullptr;
     common_retention_pool retention_pool = common_retention_pool::attention;
 
     // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
@@ -1190,7 +1195,7 @@ struct server_slot {
 
             if (retention_obs) {
                 if (!task->is_child() && prompt.n_tokens() > 0) {
-                    (void) retention_obs->publish(
+                    const bool published = retention_obs->publish(
                         server_retention_instance_key::for_slot(id),
                         retention_pool,
                         task->params.message_spans,
@@ -1198,6 +1203,33 @@ struct server_slot {
                         uint64_t(prompt.n_tokens()),
                         uint64_t(prompt.n_tokens()),
                         prompt.n_tokens() >= 0);
+                    if (published && lease_obs) {
+                        server_cache_lease_identity identity;
+                        const auto artifact = retention_obs->artifact_id(
+                            server_retention_instance_key::for_slot(id));
+                        const auto scope = lease_obs->new_context_scope();
+                        const server_cache_lease_subject subject {
+                            artifact,
+                            common_retention_artifact_kind::live_slot,
+                            id,
+                        };
+                        if (lease_execution_identity &&
+                            server_cache_lease_build_identity(
+                                *lease_execution_identity,
+                                lora_config_identity(lora),
+                                prompt.tokens,
+                                prompt.n_tokens(),
+                                identity) &&
+                            subject.valid() && scope.v != 0) {
+                            (void) lease_obs->grant_soft(
+                                subject,
+                                server_cache_lease_scope::from(scope),
+                                identity,
+                                server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+                        } else if (subject.valid()) {
+                            lease_obs->artifact_identity_unavailable(subject);
+                        }
+                    }
                 } else {
                     retention_obs->retire(
                         server_retention_instance_key::for_slot(id));
@@ -3853,9 +3885,14 @@ private:
         // strictly zero observer work (B-a).
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+            cache_plan_obs->destruction.lease_context = &cache_plan_obs->leases;
+            cache_plan_obs->destruction.lease_evaluator =
+                server_cache_lease_evaluate_request;
             for (auto & slot : slots) {
                 slot.destruction_obs = &cache_plan_obs->destruction;
                 slot.retention_obs = &cache_plan_obs->retention;
+                slot.lease_obs = &cache_plan_obs->leases;
+                slot.lease_execution_identity = &frontier_execution_identity;
                 slot.retention_pool =
                     (llama_model_is_recurrent(model_tgt) ||
                      llama_model_is_hybrid(model_tgt))
@@ -3865,6 +3902,9 @@ private:
             if (prompt_cache) {
                 prompt_cache->destruction_obs = &cache_plan_obs->destruction;
                 prompt_cache->retention_obs = &cache_plan_obs->retention;
+                prompt_cache->lease_obs = &cache_plan_obs->leases;
+                prompt_cache->lease_execution_identity =
+                    &frontier_execution_identity;
             }
             const auto observer_domain = llama_cache_acct_resource_domain::non_device(
                 llama_cache_acct_residency::not_applicable);
@@ -3959,7 +3999,7 @@ private:
             (void) cache_plan_obs->ledger.configure_required_producers(
                 required.data(), required.size());
             cache_plan_obs->retention.configure(
-                &cache_plan_obs->ledger, host_domain);
+                &cache_plan_obs->ledger, host_domain, &cache_plan_obs->leases);
             for (const auto measure : {
                     llama_cache_acct_measure::logical_payload,
                     llama_cache_acct_measure::resident_allocated,

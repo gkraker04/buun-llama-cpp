@@ -59,6 +59,10 @@ enum class server_cache_destruction_target_kind : uint8_t {
 
 enum class server_cache_destruction_verdict : uint8_t {
     admit_unleased = 0,
+    admit_soft_leased,
+    would_refuse_hard_leased,
+    admit_mandatory_recovery,
+    unavailable,
     _count,
 };
 
@@ -141,6 +145,10 @@ struct server_cache_destruction_request {
     }
 };
 
+using server_cache_lease_evaluator = server_cache_destruction_verdict (*)(
+        void * context,
+        const server_cache_destruction_request & request) noexcept;
+
 // A logical operation keeps this small token across split physical phases. D-S4 and D-S5
 // execute pass-through; D-A can later change execution authority without re-cutting joined
 // operations such as low-LCP reset.
@@ -182,8 +190,12 @@ struct server_cache_destruction_observer {
     std::array<uint64_t, size_t(server_cache_destruction_class::_count)> totals = {};
     uint64_t n_events   = 0;
     uint64_t overflows  = 0;
+    void * lease_context = nullptr;
+    server_cache_lease_evaluator lease_evaluator = nullptr;
 
-    uint64_t observe(const server_cache_destruction_request & request) noexcept {
+    uint64_t observe(
+            const server_cache_destruction_request & request,
+            server_cache_destruction_verdict verdict) noexcept {
         const size_t cls = size_t(request.cls);
         if (cls >= totals.size()) {
             overflows++;
@@ -192,7 +204,7 @@ struct server_cache_destruction_observer {
         server_cache_destruction_event & event =
             events[size_t(n_events % events.size())];
         event.request   = request;
-        event.verdict   = server_cache_destruction_verdict::admit_unleased;
+        event.verdict   = verdict;
         event.execution = server_cache_destruction_execution::pass_through;
         event.sequence  = n_events + 1;
         totals[cls]++;
@@ -204,8 +216,8 @@ struct server_cache_destruction_observer {
     }
 };
 
-// The ONE retention-admission API. D-S4 has no lease state, so the simulated verdict is
-// admit_unleased and execution is always pass-through. D-S5 replaces only the simulation;
+// The ONE retention-admission API. D-S5 supplies a type-erased evaluator
+// only when the cache-debug observer exists. Execution remains pass-through;
 // D-A is the later authority flip.
 inline server_cache_destruction_admission server_cache_retention_admit(
         server_cache_destruction_observer * observer,
@@ -215,7 +227,11 @@ inline server_cache_destruction_admission server_cache_retention_admit(
     admission.reason = request.reason;
     admission.issued = true;
     if (observer) {
-        admission.sequence = observer->observe(request);
+        if (observer->lease_evaluator) {
+            admission.verdict = observer->lease_evaluator(
+                observer->lease_context, request);
+        }
+        admission.sequence = observer->observe(request, admission.verdict);
         admission.observer_recorded = admission.sequence != 0;
     }
     return admission;

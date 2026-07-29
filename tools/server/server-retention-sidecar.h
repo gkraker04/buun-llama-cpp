@@ -7,6 +7,7 @@
 
 struct common_prompt_checkpoint;
 struct server_prompt_cache_state;
+class server_cache_lease_table;
 
 struct server_retention_instance_key {
     common_retention_artifact_kind kind =
@@ -81,7 +82,8 @@ public:
 
     void configure(
         llama_cache_acct_ledger * ledger,
-        const llama_cache_acct_resource_domain & domain) noexcept;
+        const llama_cache_acct_resource_domain & domain,
+        server_cache_lease_table * leases = nullptr) noexcept;
     bool publish(
         const server_retention_instance_key & key,
         common_retention_pool pool,
@@ -132,6 +134,7 @@ private:
         common_retention_pool pool, uint64_t stable_id) noexcept;
 
     llama_cache_acct_ledger * ledger = nullptr;
+    server_cache_lease_table * leases = nullptr;
     llama_cache_acct_resource_domain domain;
     common_retention_allocator allocator;
     association_map associations;

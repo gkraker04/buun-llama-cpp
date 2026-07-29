@@ -51,7 +51,13 @@ foreach(def
         "enum class common_retention_source_state : uint8_t"
         "enum class common_retention_pool : uint8_t"
         "enum class common_retention_artifact_kind : uint8_t"
-        "enum class common_retention_score_state : uint8_t")
+        "enum class common_retention_score_state : uint8_t"
+        "enum class server_cache_lease_scope_kind : uint8_t"
+        "enum class server_cache_lease_class : uint8_t"
+        "enum class server_cache_lease_eval_state : uint8_t"
+        "enum class server_cache_lease_eligibility : uint8_t"
+        "enum class server_cache_lease_fallback_state : uint8_t"
+        "enum class server_cache_lease_event_kind : uint8_t")
     count_literal("${all_source}" "${def}" def_count)
     if (NOT def_count EQUAL 1)
         message(FATAL_ERROR "expected exactly one definition of '${def}', found ${def_count}")
@@ -117,21 +123,32 @@ endfunction()
 
 file(READ "${SOURCE_ROOT}/tools/server/server-task.h" retention_server_header)
 file(READ "${SOURCE_ROOT}/common/common.h" retention_common_header)
+file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" cache_plan_wire_header)
+file(READ "${SOURCE_ROOT}/tools/server/server-cache-lease.h" lease_header)
 foreach(struct_name server_prompt server_prompt_cache_state)
     retention_extract_struct(
         "${retention_server_header}" "${struct_name}" retention_struct_body)
     string(FIND "${retention_struct_body}" "common_retention_" retention_member)
-    if (NOT retention_member EQUAL -1)
+    string(FIND "${retention_struct_body}" "server_cache_lease_" lease_member)
+    if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1)
         message(FATAL_ERROR
-            "D-S3 containment violation: ${struct_name} embeds retention metadata")
+            "D-S3/D-S5 containment violation: ${struct_name} embeds retention/lease metadata")
     endif()
 endforeach()
 retention_extract_struct(
     "${retention_common_header}" "common_prompt_checkpoint" retention_struct_body)
 string(FIND "${retention_struct_body}" "common_retention_" retention_member)
-if (NOT retention_member EQUAL -1)
+string(FIND "${retention_struct_body}" "server_cache_lease_" lease_member)
+if (NOT retention_member EQUAL -1 OR NOT lease_member EQUAL -1)
     message(FATAL_ERROR
-        "D-S3 containment violation: common_prompt_checkpoint embeds retention metadata")
+        "D-S3/D-S5 containment violation: common_prompt_checkpoint embeds retention/lease metadata")
+endif()
+retention_extract_struct(
+    "${cache_plan_wire_header}" "common_cache_plan_record" lease_wire_body)
+string(FIND "${lease_wire_body}" "server_cache_lease_" lease_wire_member)
+if (NOT lease_wire_member EQUAL -1)
+    message(FATAL_ERROR
+        "D-S5 containment violation: common_cache_plan_record embeds lease state")
 endif()
 
 string(REPLACE
@@ -144,6 +161,55 @@ retention_extract_struct(
 string(FIND "${retention_negative_body}" "common_retention_" retention_negative_hit)
 if (retention_negative_hit EQUAL -1)
     message(FATAL_ERROR "D-S3 struct-purity negative control did not trip")
+endif()
+string(REPLACE
+    "struct server_prompt_cache_state {"
+    "struct server_prompt_cache_state {\\n    server_cache_lease_id forbidden_lease;"
+    lease_struct_negative
+    "${retention_server_header}")
+retention_extract_struct(
+    "${lease_struct_negative}" "server_prompt_cache_state" lease_negative_body)
+string(FIND "${lease_negative_body}" "server_cache_lease_" lease_negative_hit)
+if (lease_negative_hit EQUAL -1)
+    message(FATAL_ERROR "D-S5 struct-purity negative control did not trip")
+endif()
+string(REPLACE
+    "struct common_cache_plan_record {"
+    "struct common_cache_plan_record {\\n    server_cache_lease_id forbidden_lease;"
+    lease_wire_negative
+    "${cache_plan_wire_header}")
+retention_extract_struct(
+    "${lease_wire_negative}" "common_cache_plan_record" lease_wire_negative_body)
+string(FIND "${lease_wire_negative_body}" "server_cache_lease_" lease_wire_negative_hit)
+if (lease_wire_negative_hit EQUAL -1)
+    message(FATAL_ERROR "D-S5 wire-purity negative control did not trip")
+endif()
+
+# D-S5 identity is an observer-only mirror of WS-4's canonical three opaque
+# computation-frontier keys. Keep the lease library independent of common.h,
+# but fail source CI if either side silently changes shape.
+retention_extract_struct(
+    "${retention_common_header}" "common_computation_frontier" frontier_identity_body)
+retention_extract_struct(
+    "${lease_header}" "server_cache_lease_identity" lease_identity_body)
+foreach(field
+        execution_identity
+        adapter_config_identity
+        media_content_identity)
+    foreach(body frontier_identity_body lease_identity_body)
+        string(FIND "${${body}}" "std::string ${field};" identity_field)
+        if (identity_field EQUAL -1)
+            message(FATAL_ERROR
+                "D-S5/WS-4 identity mirror missing std::string ${field} in ${body}")
+        endif()
+    endforeach()
+endforeach()
+string(REGEX MATCHALL "std::string[ \t]+[a-zA-Z0-9_]+" lease_identity_strings
+    "${lease_identity_body}")
+list(LENGTH lease_identity_strings lease_identity_string_count)
+if (NOT lease_identity_string_count EQUAL 3)
+    message(FATAL_ERROR
+        "D-S5 identity mirror must contain exactly the three canonical WS-4 keys")
 endif()
 
 foreach(alias

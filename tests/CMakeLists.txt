@@ -165,6 +165,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-budget.cpp)
     target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(
+        test-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-lease PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
     llama_build_and_test(test-cache-plan-record.cpp)
     target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -173,7 +180,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(
         test-retention-sidecar.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp)
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
     target_include_directories(test-retention-sidecar PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)

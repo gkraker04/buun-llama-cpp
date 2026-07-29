@@ -1809,6 +1809,53 @@ void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
     }
 }
 
+bool server_cache_lease_build_identity(
+        const std::string & execution_identity,
+        const std::string & adapter_identity,
+        const server_tokens & tokens,
+        int64_t coverage_tokens,
+        server_cache_lease_identity & out) {
+    if (execution_identity.empty() ||
+        adapter_identity.empty() ||
+        coverage_tokens < 0) {
+        return false;
+    }
+    out.execution_identity = execution_identity;
+    out.adapter_config_identity = adapter_identity;
+    return tokens.media_content_identity(
+               coverage_tokens, out.media_content_identity) &&
+           out.valid();
+}
+
+static void server_prompt_cache_mirror_lease(
+        server_prompt_cache & cache,
+        bool mirrored,
+        const server_cache_lease_subject * source,
+        const server_cache_lease_subject & destination,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) {
+    if (!mirrored || !cache.lease_obs) {
+        return;
+    }
+    server_cache_lease_identity identity;
+    if (destination.valid() &&
+        cache.lease_execution_identity &&
+        server_cache_lease_build_identity(
+            *cache.lease_execution_identity, adapter_identity,
+            prompt.tokens, coverage_tokens, identity)) {
+        if (source) {
+            (void) cache.lease_obs->artifact_cloned(
+                *source, destination, identity);
+        } else {
+            (void) cache.lease_obs->artifact_rebound(
+                destination.artifact, identity);
+        }
+    } else {
+        cache.lease_obs->artifact_identity_unavailable(destination);
+    }
+}
+
 static void server_prompt_cache_observe_drop(
         server_prompt_cache & cache,
         const server_prompt_cache_state & state,
@@ -1931,19 +1978,51 @@ void server_prompt_cache::publish(
         acct_charge_entry(*self);
     }
     if (retention_obs && source_prompt && source_slot >= 0) {
-        (void) retention_obs->clone(
-            server_retention_instance_key::for_slot(source_slot),
-            server_retention_instance_key::for_host_entry(&*self));
+        const auto source_key =
+            server_retention_instance_key::for_slot(source_slot);
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&*self);
+        const bool cloned = retention_obs->clone(source_key, destination_key);
+        const server_cache_lease_subject source {
+            retention_obs->artifact_id(source_key),
+            common_retention_artifact_kind::live_slot,
+            source_slot,
+        };
+        const server_cache_lease_subject destination {
+            retention_obs->artifact_id(destination_key),
+            common_retention_artifact_kind::host_entry,
+            -1,
+        };
+        server_prompt_cache_mirror_lease(
+            *this, cloned, &source, destination, self->prompt,
+            self->adapter_config_key, self->prompt.n_tokens());
         auto source_checkpoint = source_prompt->checkpoints.begin();
         auto host_checkpoint = self->prompt.checkpoints.begin();
         for (; source_checkpoint != source_prompt->checkpoints.end() &&
                host_checkpoint != self->prompt.checkpoints.end();
                ++source_checkpoint, ++host_checkpoint) {
-            (void) retention_obs->clone(
+            const auto source_checkpoint_key =
                 server_retention_instance_key::for_checkpoint(
-                    source_slot, &*source_checkpoint),
+                    source_slot, &*source_checkpoint);
+            const auto host_checkpoint_key =
                 server_retention_instance_key::for_checkpoint(
-                    -1, &*host_checkpoint));
+                    -1, &*host_checkpoint);
+            const bool checkpoint_cloned = retention_obs->clone(
+                source_checkpoint_key, host_checkpoint_key);
+            const server_cache_lease_subject source_checkpoint_subject {
+                retention_obs->artifact_id(source_checkpoint_key),
+                common_retention_artifact_kind::checkpoint,
+                source_slot,
+            };
+            const server_cache_lease_subject host_checkpoint_subject {
+                retention_obs->artifact_id(host_checkpoint_key),
+                common_retention_artifact_kind::checkpoint,
+                -1,
+            };
+            server_prompt_cache_mirror_lease(
+                *this, checkpoint_cloned, &source_checkpoint_subject,
+                host_checkpoint_subject, self->prompt,
+                self->adapter_config_key, host_checkpoint->n_tokens);
         }
     }
 
@@ -2138,15 +2217,42 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         }
     }
     if (retention_obs) {
-        (void) retention_obs->clone(
-            server_retention_instance_key::for_host_entry(&*it_best),
-            server_retention_instance_key::for_slot(id_slot));
+        const auto host_key =
+            server_retention_instance_key::for_host_entry(&*it_best);
+        const auto live_key =
+            server_retention_instance_key::for_slot(id_slot);
+        const bool cloned = retention_obs->clone(host_key, live_key);
+        const server_cache_lease_subject source {
+            retention_obs->artifact_id(host_key),
+            common_retention_artifact_kind::host_entry,
+            -1,
+        };
+        const server_cache_lease_subject destination {
+            retention_obs->artifact_id(live_key),
+            common_retention_artifact_kind::live_slot,
+            id_slot,
+        };
+        server_prompt_cache_mirror_lease(
+            *this, cloned, &source, destination, it_best->prompt,
+            it_best->adapter_config_key, it_best->prompt.n_tokens());
         for (auto & checkpoint : it_best->prompt.checkpoints) {
-            (void) retention_obs->rebind(
+            const auto host_checkpoint =
                 server_retention_instance_key::for_checkpoint(
-                    -1, &checkpoint),
+                    -1, &checkpoint);
+            const auto live_checkpoint =
                 server_retention_instance_key::for_checkpoint(
-                    id_slot, &checkpoint));
+                    id_slot, &checkpoint);
+            const auto artifact = retention_obs->artifact_id(host_checkpoint);
+            const bool rebound = retention_obs->rebind(
+                host_checkpoint, live_checkpoint);
+            const server_cache_lease_subject destination {
+                artifact,
+                common_retention_artifact_kind::checkpoint,
+                id_slot,
+            };
+            server_prompt_cache_mirror_lease(
+                *this, rebound, nullptr, destination, it_best->prompt,
+                it_best->adapter_config_key, checkpoint.n_tokens);
         }
     }
     prompt = std::move(it_best->prompt);

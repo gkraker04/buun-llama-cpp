@@ -1,4 +1,5 @@
 #include "common-retention-sidecar.h"
+#include "server-cache-lease.h"
 #include "server-retention-sidecar.h"
 
 #include <cstdio>
@@ -14,6 +15,16 @@ static int failures = 0;
             failures++; \
         } \
     } while (0)
+
+class retention_test_clock final : public server_cache_lease_clock {
+public:
+    uint64_t now_ns() noexcept override {
+        return now++;
+    }
+
+private:
+    uint64_t now = 1;
+};
 
 static std::string to_hex(const std::vector<uint8_t> & bytes) {
     static constexpr char digits[] = "0123456789abcdef";
@@ -219,13 +230,30 @@ static void test_observer_store_accounting() {
     CHECK(ledger.certify_complete(
         domain, llama_cache_acct_producer::retention_sidecar));
 
+    retention_test_clock clock;
+    server_cache_lease_table leases(&clock);
     server_retention_sidecar_store store;
-    store.configure(&ledger, domain);
+    store.configure(&ledger, domain, &leases);
     const auto live = server_retention_instance_key::for_slot(3);
     CHECK(store.publish(
         live, common_retention_pool::recurrent, make_spans(), true,
         44, 30, true));
     CHECK(store.artifact_id(live).v != 0);
+    const auto live_artifact = store.artifact_id(live);
+    const server_cache_lease_identity lease_identity = {
+        "execution", "adapter", "media",
+    };
+    const auto lease = leases.grant_soft(
+        {
+            live_artifact,
+            common_retention_artifact_kind::live_slot,
+            3,
+        },
+        server_cache_lease_scope::from(
+            server_cache_context_scope_id { 1 }),
+        lease_identity,
+        100);
+    CHECK(lease);
     CHECK(store.live_bytes() > 0);
     CHECK(store.unavailable() == 0);
     const auto before_clone = store.live_bytes();
@@ -252,6 +280,8 @@ static void test_observer_store_accounting() {
 
     store.retire(rebound);
     store.retire(live);
+    CHECK(leases.evaluate(live_artifact, lease_identity).cls ==
+          server_cache_lease_class::none);
     CHECK(store.live_bytes() == 0);
     CHECK(ledger.snapshot().allocations.empty());
     CHECK(store.publish_ok() == 2);

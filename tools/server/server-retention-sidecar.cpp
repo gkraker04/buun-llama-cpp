@@ -1,4 +1,5 @@
 #include "server-retention-sidecar.h"
+#include "server-cache-lease.h"
 
 #include <algorithm>
 #include <limits>
@@ -74,9 +75,11 @@ server_retention_sidecar_store::~server_retention_sidecar_store() {
 
 void server_retention_sidecar_store::configure(
         llama_cache_acct_ledger * ledger_in,
-        const llama_cache_acct_resource_domain & domain_in) noexcept {
+        const llama_cache_acct_resource_domain & domain_in,
+        server_cache_lease_table * leases_in) noexcept {
     ledger = ledger_in;
     domain = domain_in;
+    leases = leases_in;
 }
 
 llama_cache_acct_artifact_id
@@ -281,6 +284,9 @@ void server_retention_sidecar_store::retire_association(
         association_map::iterator it) noexcept {
     const auto artifact = it->second;
     associations.erase(it);
+    if (leases) {
+        leases->artifact_retired(artifact);
+    }
     const auto entry = catalog.find(artifact.v);
     if (entry == catalog.end()) {
         mark_unavailable();

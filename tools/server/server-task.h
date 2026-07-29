@@ -4,6 +4,7 @@
 #include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
 #include "llama.h"
 #include "server-cache-lifecycle.h"
+#include "server-cache-lease.h"
 #include "server-retention-sidecar.h"
 
 #include <string>
@@ -15,6 +16,13 @@
 #include "server-common.h"
 
 using json = nlohmann::ordered_json;
+
+bool server_cache_lease_build_identity(
+    const std::string & execution_identity,
+    const std::string & adapter_identity,
+    const server_tokens & tokens,
+    int64_t coverage_tokens,
+    server_cache_lease_identity & out);
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -717,6 +725,8 @@ struct server_prompt_cache {
     llama_cache_acct_ledger * acct = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
+    server_cache_lease_table * lease_obs = nullptr;
+    const std::string * lease_execution_identity = nullptr;
 
     ~server_prompt_cache() {
         clear_accounting();
