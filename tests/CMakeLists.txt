@@ -165,6 +165,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-budget.cpp)
     target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-cache-authority.cpp)
+    target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(
         test-cache-lease.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)

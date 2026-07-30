@@ -39,6 +39,7 @@ add_library(llama
             llama-vocab.cpp
             llama-cache-accounting.cpp
             llama-cache-budget.cpp
+            llama-cache-authority.cpp
             llama-vbr-checkpoint.cpp
             llama-vbr-extent.cpp
             llama-vbr-generation.cpp

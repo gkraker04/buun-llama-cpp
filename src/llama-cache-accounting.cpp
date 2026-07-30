@@ -565,8 +565,44 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
         llama_cache_acct_attribution attribution,
         uint64_t expected_logical,
         uint64_t expected_resident) {
-    (void) expected_logical;
     std::lock_guard<std::mutex> lock(mtx);
+    return reserve_locked(category, domain, attribution, expected_logical, expected_resident);
+}
+
+llama_cache_conditional_reserve_result llama_cache_acct_ledger::reserve_if_serial(
+        uint64_t expected_serial,
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_attribution attribution,
+        uint64_t expected_logical,
+        uint64_t expected_resident) {
+    std::lock_guard<std::mutex> lock(mtx);
+    // Serial guard first: drift is expected optimistic-concurrency contention, not a fault. Leave
+    // the ledger completely untouched (no op, no cell, no serial bump) so a re-snapshot sees the
+    // real state; only the process-local conflict counter moves.
+    if (state.serial != expected_serial) {
+        serial_conflicts_++;
+        return { llama_cache_conditional_reserve_status::serial_conflict, {} };
+    }
+    // reserve_locked returns {} (and latches a fault) on a hard failure, else the minted op.
+    const llama_cache_acct_op_id op =
+        reserve_locked(category, domain, attribution, expected_logical, expected_resident);
+    return { op ? llama_cache_conditional_reserve_status::admitted
+                : llama_cache_conditional_reserve_status::ledger_fault, op };
+}
+
+uint64_t llama_cache_acct_ledger::serial_conflicts() const noexcept {
+    std::lock_guard<std::mutex> lock(mtx);
+    return serial_conflicts_;
+}
+
+llama_cache_acct_op_id llama_cache_acct_ledger::reserve_locked(
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_attribution attribution,
+        uint64_t expected_logical,
+        uint64_t expected_resident) {
+    (void) expected_logical;
     if (!domain_use_valid(category, domain)) {
         state.faults_invalid_transition++;
         bump_serial();
@@ -580,8 +616,25 @@ llama_cache_acct_op_id llama_cache_acct_ledger::reserve(
 
     try {
         // Aggregate/staging trackers were created atomically with the manifest.
-        if (!find_cell(category, domain)) {
+        auto * row = find_cell(category, domain);
+        if (!row) {
             state.faults_invalid_transition++;
+            bump_serial();
+            return {};
+        }
+        // Preflight the reserved aggregate: a reservation cell_add cannot record (target already
+        // unavailable, or the checked add would overflow) must fail-closed BEFORE minting an op.
+        // Otherwise reserve_if_serial would report `admitted` for a reservation the ledger never
+        // actually took, since cell_add is void and latches silently (Sol F0a review blocker 2).
+        // No phantom op, no next_op consumed.
+        auto & reserved = row->cell.measures[size_t(llama_cache_acct_measure::reserved)];
+        if (reserved.state == llama_cache_acct_known::unavailable) {
+            state.faults_invalid_transition++;
+            bump_serial();
+            return {};
+        }
+        if (reserved.value > std::numeric_limits<uint64_t>::max() - expected_resident) {
+            state.faults_overflow++;
             bump_serial();
             return {};
         }

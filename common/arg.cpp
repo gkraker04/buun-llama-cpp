@@ -4250,6 +4250,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
     add_opt(common_arg(
+        {"--cache-lifecycle"},
+        string_format("enable the P2 cache-lifecycle authority substrate (accounting-gated admission); no observer serialization, independent of --cache-debug (default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_lifecycle = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_LIFECYCLE"));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {

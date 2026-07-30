@@ -315,32 +315,21 @@ struct server_shadow_global_state {
     std::string last_reason;
 };
 
-// B0 shadow cache-plan observer state [P2 §7.7]. Enabled iff params_base.cache_debug (the
-// one flag; no mirror): records are allocated, populated, and serialized only under it, and
-// the C0 ledger is wired to the prompt cache only then. Observer faults are caught outside
-// the shipped decision path and become shadow_unavailable — never a changed live choice.
-// Both counters are surfaced on every emitted record ("observer" object).
-struct server_cache_plan_observer {
+// P2 F0a authority substrate. Owns the accounting ledger, budget coordinator, lease table,
+// retention store, and destruction seam — the state flag-on lifecycle enforcement acts on.
+// Constructed under (cache_debug || cache_lifecycle); the shadow observer below is a debug-only
+// record/serialization layer that REFERENCES this, so authority can run with debug off. Member
+// order is lifetime order: retention's destructor releases lease memberships and accounting ops,
+// so the ledger and leases must outlive it. The whole object must outlive prompt_cache (its
+// destructor releases accounting operations). F0a wires enforcement into NO mutation path.
+struct server_cache_authority {
     struct device_binding {
         ggml_backend_dev_t               device = nullptr;
         llama_cache_acct_resource_domain domain;
     };
 
-    uint64_t records_finalized  = 0;
-    uint64_t shadow_unavailable = 0;
-    // planner-attempt accounting (verify-r1 finding 8): refusals counted exactly once,
-    // distinct from observer faults; the per-record closed status carries the WHY
-    uint64_t planner_ok      = 0;
-    uint64_t planner_refused = 0;
-
-    // B-2 stable calibration-profile id ("{model class}/{hardware class}/b{batch}"),
-    // composed once at observer init; copied onto every record. Empty = unprofiled.
-    std::string calibration_profile;
-
-    // C0 shadow ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
+    // C0 ledger; in-vivo producer = host-cache entry payload leaves (server-task.cpp)
     llama_cache_acct_ledger ledger;
-    // Declaration order is lifetime order: retention's destructor releases lease memberships
-    // and accounting ops, so both authorities must outlive it.
     server_cache_lease_table leases;
     server_retention_sidecar_store retention;
     server_cache_destruction_observer destruction;
@@ -353,6 +342,23 @@ struct server_cache_plan_observer {
     // D-S2: fixed-at-reserve-time compute rows. Point-in-time physical capacity is
     // deliberately sampled later, immediately before each CACHE_BUDGET emission.
     std::vector<llama_cache_budget_device_input> budget_devices;
+};
+
+// B0 shadow cache-plan observer state [P2 §7.7]. Debug-only record/serialization layer over the
+// authority substrate: records are allocated, populated, and serialized only under
+// params_base.cache_debug. Observer faults are caught outside the shipped decision path and become
+// shadow_unavailable — never a changed live choice. Both counters are surfaced on every record.
+struct server_cache_plan_observer {
+    uint64_t records_finalized  = 0;
+    uint64_t shadow_unavailable = 0;
+    // planner-attempt accounting (verify-r1 finding 8): refusals counted exactly once,
+    // distinct from observer faults; the per-record closed status carries the WHY
+    uint64_t planner_ok      = 0;
+    uint64_t planner_refused = 0;
+
+    // B-2 stable calibration-profile id ("{model class}/{hardware class}/b{batch}"),
+    // composed once at observer init; copied onto every record. Empty = unprofiled.
+    std::string calibration_profile;
 };
 
 // D-S4 keeps retention policy at the server's logical-operation boundary. These functions
@@ -1853,10 +1859,15 @@ private:
     // F5 applicability latch, versioned WS-7 evidence, and the /slots surface source.
     server_shadow_global_state shadow_state;
 
-    // B0 shadow cache-plan observer + C0 ledger [P2]. Constructed ONLY under
-    // params_base.cache_debug (B-a literal: no observer object, no 456-cell ledger init, no
-    // hook work of any kind on the disabled path — absence IS the disabled state). Declared
-    // before prompt_cache so the ledger outlives the cache's accounting-release destructor.
+    // P2 F0a authority substrate (C0 ledger + coordinator + leases + retention + destruction).
+    // Constructed under (cache_debug || cache_lifecycle). Declared before cache_plan_obs and
+    // prompt_cache so it outlives both the observer that references it and the cache's
+    // accounting-release destructor.
+    std::unique_ptr<server_cache_authority> cache_authority;
+
+    // B0 shadow cache-plan observer [P2]. Constructed ONLY under params_base.cache_debug (B-a
+    // literal: no observer object, no record init, no hook work of any kind on the disabled path
+    // — absence IS the disabled state). References cache_authority for the substrate it records.
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
 
     // D-S1 live producer. This is observer-only and is called only while --cache-debug owns
@@ -1865,13 +1876,13 @@ private:
     // cells. A multi-device meta row cannot be assigned without per-shard bytes and therefore
     // fails closed rather than applying topology weights to a physical measurement.
     bool cache_plan_observe_live_memory(bool certify) noexcept {
-        if (!cache_plan_obs || cache_plan_obs->live_device_domains.empty()) {
+        if (!cache_plan_obs || cache_authority->live_device_domains.empty()) {
             return true;
         }
 
         try {
             using live_row = llama_live_memory_breakdown_data;
-            std::vector<live_row> totals(cache_plan_obs->live_device_domains.size());
+            std::vector<live_row> totals(cache_authority->live_device_domains.size());
             bool complete = true;
 
             const auto add_checked = [&complete](size_t & dst, size_t value) {
@@ -1909,18 +1920,18 @@ private:
 
                     ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
                     const auto it = std::find_if(
-                        cache_plan_obs->live_device_domains.begin(),
-                        cache_plan_obs->live_device_domains.end(),
+                        cache_authority->live_device_domains.begin(),
+                        cache_authority->live_device_domains.end(),
                         [device](const auto & binding) {
                             return binding.device == device;
                         });
-                    if (it == cache_plan_obs->live_device_domains.end()) {
+                    if (it == cache_authority->live_device_domains.end()) {
                         complete = false;
                         continue;
                     }
 
                     auto & total = totals[size_t(
-                        it - cache_plan_obs->live_device_domains.begin())];
+                        it - cache_authority->live_device_domains.begin())];
                     add_checked(total.attention,           row.attention);
                     add_checked(total.recurrent,           row.recurrent);
                     add_checked(total.recurrent_rollback,  row.recurrent_rollback);
@@ -1931,49 +1942,49 @@ private:
             // complete is fixed after accumulation; when unavailable, every domain is marked
             // the same way, so the fail path is hoisted out of the per-domain gauge loop.
             if (!complete) {
-                for (const auto & binding : cache_plan_obs->live_device_domains) {
+                for (const auto & binding : cache_authority->live_device_domains) {
                     for (const auto category : {
                             llama_cache_acct_category::live_attention_state,
                             llama_cache_acct_category::live_recurrent_state,
                             llama_cache_acct_category::recurrent_rollback_planes,
                             llama_cache_acct_category::rolling_window_tape }) {
-                        cache_plan_obs->ledger.mark_unavailable(
+                        cache_authority->ledger.mark_unavailable(
                             category, binding.domain,
                             llama_cache_acct_measure::resident_allocated);
                     }
-                    cache_plan_obs->ledger.mark_producer_unavailable(
+                    cache_authority->ledger.mark_producer_unavailable(
                         binding.domain, llama_cache_acct_producer::live_memory);
                 }
                 return false;
             }
 
             for (size_t i = 0; i < totals.size(); ++i) {
-                const auto & domain = cache_plan_obs->live_device_domains[i].domain;
+                const auto & domain = cache_authority->live_device_domains[i].domain;
                 const auto & total  = totals[i];
-                cache_plan_obs->ledger.gauge_set(
+                cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::live_attention_state, domain,
                     llama_cache_acct_measure::resident_allocated, total.attention);
-                cache_plan_obs->ledger.gauge_set(
+                cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::live_recurrent_state, domain,
                     llama_cache_acct_measure::resident_allocated, total.recurrent);
-                cache_plan_obs->ledger.gauge_set(
+                cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::recurrent_rollback_planes, domain,
                     llama_cache_acct_measure::resident_allocated,
                     total.recurrent_rollback);
-                cache_plan_obs->ledger.gauge_set(
+                cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::rolling_window_tape, domain,
                     llama_cache_acct_measure::resident_allocated,
                     total.rolling_window_tape);
                 if (certify) {
-                    (void) cache_plan_obs->ledger.certify_complete(
+                    (void) cache_authority->ledger.certify_complete(
                         domain, llama_cache_acct_producer::live_memory);
                 }
             }
 
             return complete;
         } catch (...) {
-            for (const auto & binding : cache_plan_obs->live_device_domains) {
-                cache_plan_obs->ledger.mark_producer_unavailable(
+            for (const auto & binding : cache_authority->live_device_domains) {
+                cache_authority->ledger.mark_producer_unavailable(
                     binding.domain, llama_cache_acct_producer::live_memory);
             }
             return false;
@@ -1988,10 +1999,10 @@ private:
             return true;
         }
         try {
-            cache_plan_obs->budget_devices.clear();
-            cache_plan_obs->budget_devices.reserve(
-                cache_plan_obs->live_device_domains.size());
-            for (const auto & binding : cache_plan_obs->live_device_domains) {
+            cache_authority->budget_devices.clear();
+            cache_authority->budget_devices.reserve(
+                cache_authority->live_device_domains.size());
+            for (const auto & binding : cache_authority->live_device_domains) {
                 llama_cache_budget_device_input input;
                 input.backend_device = binding.device;
                 input.domain = binding.domain;
@@ -2000,7 +2011,7 @@ private:
                 input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
                 input.reserve_provenance =
                     llama_cache_budget_reserve_provenance::configured;
-                cache_plan_obs->budget_devices.push_back(input);
+                cache_authority->budget_devices.push_back(input);
             }
 
             bool complete = true;
@@ -2042,12 +2053,12 @@ private:
                     const ggml_backend_dev_t device =
                         ggml_backend_buft_get_device(buft);
                     auto it = std::find_if(
-                        cache_plan_obs->budget_devices.begin(),
-                        cache_plan_obs->budget_devices.end(),
+                        cache_authority->budget_devices.begin(),
+                        cache_authority->budget_devices.end(),
                         [device](const auto & input) {
                             return input.backend_device == device;
                         });
-                    if (it == cache_plan_obs->budget_devices.end()) {
+                    if (it == cache_authority->budget_devices.end()) {
                         complete = false;
                         continue;
                     }
@@ -2055,7 +2066,7 @@ private:
                 }
             }
 
-            for (auto & input : cache_plan_obs->budget_devices) {
+            for (auto & input : cache_authority->budget_devices) {
                 input.configured_compute_reserve =
                     input.current_compute_allocated;
                 if (!complete) {
@@ -2065,7 +2076,7 @@ private:
             }
             return complete;
         } catch (...) {
-            cache_plan_obs->budget_devices.clear();
+            cache_authority->budget_devices.clear();
             return false;
         }
     }
@@ -2079,7 +2090,7 @@ private:
         }
         try {
             llama_cache_budget_config config;
-            config.devices = cache_plan_obs->budget_devices;
+            config.devices = cache_authority->budget_devices;
             for (auto & input : config.devices) {
                 size_t free = 0;
                 size_t total = 0;
@@ -2127,11 +2138,11 @@ private:
 
             llama_cache_budget_plan baseline;
             baseline.accounting_serial = snapshot.serial;
-            if (!cache_plan_obs->budget.reset(snapshot, config)) {
+            if (!cache_authority->budget.reset(snapshot, config)) {
                 cache_plan_obs->shadow_unavailable++;
                 return;
             }
-            const auto result = cache_plan_obs->budget.fits(baseline);
+            const auto result = cache_authority->budget.fits(baseline);
 
             const auto compute_json = [](
                     const llama_cache_budget_device_input & input,
@@ -2422,9 +2433,9 @@ private:
                 }
             };
             if (!server_cache_yield_assemble(
-                    catalog, cache_plan_obs->leases, resolve, candidates)) {
-                cache_plan_obs->last_yield = {};
-                cache_plan_obs->last_yield.accounting_serial =
+                    catalog, cache_authority->leases, resolve, candidates)) {
+                cache_authority->last_yield = {};
+                cache_authority->last_yield.accounting_serial =
                     snapshot.serial;
                 return;
             }
@@ -2432,26 +2443,26 @@ private:
             const auto preview = [&](const auto & ops,
                                      uint64_t expected_serial,
                                      auto & out) {
-                return cache_plan_obs->ledger.preview_release_set(
+                return cache_authority->ledger.preview_release_set(
                     ops, expected_serial, out);
             };
             const auto fit = [&](const llama_cache_budget_plan & plan) {
                 // The empty baseline has no prefix preview, so probe the live
                 // ledger here to preserve Lock A4's atomic-capture serial guard.
                 llama_cache_acct_release_set_preview serial_probe;
-                if (!cache_plan_obs->ledger.preview_release_set(
+                if (!cache_authority->ledger.preview_release_set(
                         {}, snapshot.serial, serial_probe)) {
                     llama_cache_budget_result unavailable;
                     unavailable.accounting_serial = snapshot.serial;
                     return unavailable;
                 }
-                return cache_plan_obs->budget.fits(plan);
+                return cache_authority->budget.fits(plan);
             };
-            cache_plan_obs->last_yield = server_cache_yield_plan(
+            cache_authority->last_yield = server_cache_yield_plan(
                 candidates, snapshot.serial, preview, fit);
         } catch (...) {
-            cache_plan_obs->last_yield = {};
-            cache_plan_obs->last_yield.accounting_serial =
+            cache_authority->last_yield = {};
+            cache_authority->last_yield.accounting_serial =
                 snapshot.serial;
             cache_plan_obs->shadow_unavailable++;
         }
@@ -2685,14 +2696,14 @@ private:
                 if (!cache_plan_observe_live_memory(false)) {
                     cache_plan_obs->shadow_unavailable++;
                 }
-                rec.acct = cache_plan_obs->ledger.snapshot();
+                rec.acct = cache_authority->ledger.snapshot();
                 auto retention_candidates =
-                    cache_plan_obs->retention.candidate_snapshot();
+                    cache_authority->retention.candidate_snapshot();
                 cache_plan_emit_budget(rec.acct);
                 cache_plan_run_yield(
                     rec.acct, std::move(retention_candidates));
-                cache_plan_project_yield(rec, cache_plan_obs->last_yield);
-                cache_plan_emit_yield(cache_plan_obs->last_yield);
+                cache_plan_project_yield(rec, cache_authority->last_yield);
+                cache_plan_emit_yield(cache_authority->last_yield);
             }
 
             // ---- planner boundary [A2]: estimation, tie-set construction, and shadow
@@ -4223,18 +4234,28 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        // B0/C0 shadow observer [P2]: constructed only under params_base.cache_debug — the
-        // observer object, the C0 ledger, and both surfaces exist iff the flag is set. Off =
-        // strictly zero observer work (B-a).
+        // P2 F0a authority substrate: constructed under (cache_debug || cache_lifecycle) so
+        // enforcement can run with debug off. F0a only lifts the OWNERSHIP out of the observer —
+        // the substrate's configuration (producer manifest, slot/prompt-cache wiring) still lives
+        // in the cache_debug block below, so under lifecycle-only the authority is constructed but
+        // UNCONFIGURED and wired into no path; F0b moves that configuration to this gate. Either
+        // way no shipped behavior changes. Neither flag = the strictly-zero-work legacy path.
+        if (params_base.cache_debug || params_base.cache_lifecycle) {
+            cache_authority = std::make_unique<server_cache_authority>();
+        }
+
+        // B0 shadow observer [P2]: constructed only under params_base.cache_debug — the observer
+        // object and both surfaces exist iff the flag is set. Off = strictly zero observer work
+        // (B-a). It records the shared authority substrate above (owned by server_context).
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
-            cache_plan_obs->destruction.lease_context = &cache_plan_obs->leases;
-            cache_plan_obs->destruction.lease_evaluator =
+            cache_authority->destruction.lease_context = &cache_authority->leases;
+            cache_authority->destruction.lease_evaluator =
                 server_cache_lease_evaluate_request;
             for (auto & slot : slots) {
-                slot.destruction_obs = &cache_plan_obs->destruction;
-                slot.retention_obs = &cache_plan_obs->retention;
-                slot.lease_obs = &cache_plan_obs->leases;
+                slot.destruction_obs = &cache_authority->destruction;
+                slot.retention_obs = &cache_authority->retention;
+                slot.lease_obs = &cache_authority->leases;
                 slot.lease_execution_identity = &frontier_execution_identity;
                 slot.retention_pool =
                     (llama_model_is_recurrent(model_tgt) ||
@@ -4243,9 +4264,9 @@ private:
                         : common_retention_pool::attention;
             }
             if (prompt_cache) {
-                prompt_cache->destruction_obs = &cache_plan_obs->destruction;
-                prompt_cache->retention_obs = &cache_plan_obs->retention;
-                prompt_cache->lease_obs = &cache_plan_obs->leases;
+                prompt_cache->destruction_obs = &cache_authority->destruction;
+                prompt_cache->retention_obs = &cache_authority->retention;
+                prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
             }
@@ -4301,15 +4322,15 @@ private:
                         topology)) {
                     for (size_t i = 0; i < gpu_identities.size(); ++i) {
                         llama_cache_acct_resource_domain domain;
-                        if (!cache_plan_obs->ledger.make_device_domain(
+                        if (!cache_authority->ledger.make_device_domain(
                                 topology,
                                 llama_cache_acct_device_ordinal{ uint16_t(i) },
                                 domain)) {
                             cache_plan_obs->shadow_unavailable++;
-                            cache_plan_obs->live_device_domains.clear();
+                            cache_authority->live_device_domains.clear();
                             break;
                         }
-                        cache_plan_obs->live_device_domains.push_back({
+                        cache_authority->live_device_domains.push_back({
                             gpu_devices[i], domain,
                         });
                     }
@@ -4322,7 +4343,7 @@ private:
             // producer. Device/live-memory rows are part of this SAME one-shot call; no
             // producer is allowed to append its own domain after cells exist.
             std::vector<llama_cache_acct_completeness_requirement> required;
-            required.reserve(3 + cache_plan_obs->live_device_domains.size());
+            required.reserve(3 + cache_authority->live_device_domains.size());
             required.push_back({
                 observer_domain, llama_cache_acct_producer::observer_init,
             });
@@ -4334,26 +4355,26 @@ private:
             required.push_back({
                 host_domain, llama_cache_acct_producer::retention_sidecar,
             });
-            for (const auto & binding : cache_plan_obs->live_device_domains) {
+            for (const auto & binding : cache_authority->live_device_domains) {
                 required.push_back({
                     binding.domain, llama_cache_acct_producer::live_memory,
                 });
             }
-            (void) cache_plan_obs->ledger.configure_required_producers(
+            (void) cache_authority->ledger.configure_required_producers(
                 required.data(), required.size());
-            cache_plan_obs->retention.configure(
-                &cache_plan_obs->ledger, host_domain, &cache_plan_obs->leases);
+            cache_authority->retention.configure(
+                &cache_authority->ledger, host_domain, &cache_authority->leases);
             for (const auto measure : {
                     llama_cache_acct_measure::logical_payload,
                     llama_cache_acct_measure::resident_allocated,
                     llama_cache_acct_measure::reserved }) {
-                cache_plan_obs->ledger.gauge_set(
+                cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::artifact_descriptor_metadata,
                     host_domain,
                     measure,
                     0);
             }
-            (void) cache_plan_obs->ledger.certify_complete(
+            (void) cache_authority->ledger.certify_complete(
                 host_domain, llama_cache_acct_producer::retention_sidecar);
 
             // Host-cache absence is itself an observed zero. Initialize all three
@@ -4367,24 +4388,24 @@ private:
                         llama_cache_acct_measure::logical_payload,
                         llama_cache_acct_measure::resident_allocated,
                         llama_cache_acct_measure::reserved }) {
-                    cache_plan_obs->ledger.gauge_set(
+                    cache_authority->ledger.gauge_set(
                         cat, host_domain, measure, 0);
                 }
             }
             if (prompt_cache) {
-                prompt_cache->acct = &cache_plan_obs->ledger;
+                prompt_cache->acct = &cache_authority->ledger;
                 // Empty-cache gauges are real observations. Certification follows them,
                 // rather than merely proving that wiring code ran.
-                (void) cache_plan_obs->ledger.certify_complete(
+                (void) cache_authority->ledger.certify_complete(
                     host_domain, llama_cache_acct_producer::host_cache);
             }
             // the parked rolling-window tape's zero is OBSERVED, not implied: an explicit
             // measured-zero gauge, distinct from every unknown cell
-            cache_plan_obs->ledger.gauge_set(
+            cache_authority->ledger.gauge_set(
                     llama_cache_acct_category::rolling_window_tape,
                     observer_domain,
                     llama_cache_acct_measure::logical_payload, 0);
-            (void) cache_plan_obs->ledger.certify_complete(
+            (void) cache_authority->ledger.certify_complete(
                 observer_domain, llama_cache_acct_producer::observer_init);
 
             // Observe real resident allocations before certifying live_memory. A failed

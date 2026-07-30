@@ -795,6 +795,11 @@ struct common_params {
     // B0 shadow cache-plan observer: strictly zero observer work when disabled
     bool cache_debug = false;
 
+    // P2 F: cache-lifecycle authority substrate (accounting-gated admission). Constructs the
+    // authority (ledger/coordinator/leases/retention) independent of --cache-debug; enforcement
+    // is default-off and wired into no mutation path until F0b.
+    bool cache_lifecycle = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
 

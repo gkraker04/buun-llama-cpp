@@ -538,6 +538,22 @@ struct llama_cache_acct_release_set_preview {
     std::vector<llama_cache_acct_release_set_row> rows;
 };
 
+// F0a conditional-reserve outcome. A bare op id cannot separate expected optimistic-concurrency
+// drift (retry) from a hard ledger fault (refuse); the admission caller needs that distinction
+// before F0b acts, so reserve_if_serial() returns it typed. serial_conflict mints no op, mutates
+// nothing, and is NOT a ledger fault; ledger_fault collapses the reserve()-class hard failures.
+enum class llama_cache_conditional_reserve_status : uint8_t {
+    admitted,
+    serial_conflict,
+    ledger_fault,
+    _count,
+};
+
+struct llama_cache_conditional_reserve_result {
+    llama_cache_conditional_reserve_status status = llama_cache_conditional_reserve_status::ledger_fault;
+    llama_cache_acct_op_id                  op     = {};
+};
+
 // Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
 // (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
@@ -569,6 +585,25 @@ struct llama_cache_acct_ledger {
             llama_cache_acct_attribution   attribution,
             uint64_t                       expected_logical,
             uint64_t                       expected_resident);
+
+    // F0a admission-gating reservation: reserve() only if the ledger is still at expected_serial
+    // (the serial the caller's coordinator snapshot was priced against), closing the
+    // snapshot→fits→reserve TOCTOU. Policy-free: it never consults capacity — that is the
+    // coordinator's job before this call. On drift the ledger is untouched (no op, no cell change,
+    // no serial bump, serial_conflicts++), so the caller re-snapshots and retries. Wired into no
+    // mutation path in F0a.
+    llama_cache_conditional_reserve_result reserve_if_serial(
+            uint64_t                       expected_serial,
+            llama_cache_acct_category      category,
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_attribution   attribution,
+            uint64_t                       expected_logical,
+            uint64_t                       expected_resident);
+
+    // Process-local count of reserve_if_serial() drift refusals. Deliberately OUTSIDE the
+    // serialized snapshot (adding it there would bump accounting schema 2) — it is authority
+    // telemetry, not versioned accounting state.
+    uint64_t serial_conflicts() const noexcept;
 
     // Associate the op with a minted physical allocation and its actual resident size.
     // Validates the allocation tuple against any existing citation. Updates the concurrent
@@ -726,8 +761,18 @@ private:
     // valid claim that may still commit)
     void maybe_retire(alloc_entry & entry);
 
+    // Unlocked reserve body shared by reserve() and reserve_if_serial() (callers hold the mutex).
+    // Returns the minted op, or {} after latching the appropriate fault + bumping serial.
+    llama_cache_acct_op_id reserve_locked(
+            llama_cache_acct_category      category,
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_attribution   attribution,
+            uint64_t                       expected_logical,
+            uint64_t                       expected_resident);
+
     mutable std::mutex mtx;
     llama_cache_acct_snapshot state;    // durable gauges + serial + faults live here (rows built on demand)
+    uint64_t                  serial_conflicts_ = 0; // NOT in `state`: authority telemetry, unversioned
     llama_cache_acct_op_id    next_op       = {1};
     llama_cache_acct_alloc_id next_alloc_id = {1};
     std::unordered_map<llama_cache_acct_op_id, txn>            ops;

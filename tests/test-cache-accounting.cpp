@@ -7,9 +7,12 @@
 
 #include "llama-cache-accounting.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <thread>
 
 static int failures = 0;
 
@@ -660,6 +663,141 @@ static void test_v1_adapter_fail_closed() {
     CHECK(v1.completeness == llama_cache_acct_known::unavailable);
 }
 
+// F0a conditional reserve — serial matches: admits exactly like reserve(), no conflict counted.
+static void test_reserve_if_serial_match() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const uint64_t serial = ledger.snapshot().serial;
+    const auto r = ledger.reserve_if_serial(serial, CAT, DOM, {}, 100, 128);
+    CHECK(r.status == llama_cache_conditional_reserve_status::admitted);
+    CHECK(bool(r.op));
+    const auto s = ledger.snapshot();
+    CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::reserved).value == 128);
+    CHECK(ledger.serial_conflicts() == 0);
+    CHECK(s.faults_invalid_transition == 0 && s.faults_overflow == 0);
+}
+
+// F0a conditional reserve — serial drifted: refuses with the ledger COMPLETELY untouched (no op,
+// no cell change, no serial bump, no fault), only the process-local conflict counter moves.
+static void test_reserve_if_serial_drift() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const uint64_t stale = ledger.snapshot().serial;
+    CHECK(bool(ledger.reserve(CAT, DOM, {}, 10, 10)));   // advance the ledger past `stale`
+    const auto before = ledger.snapshot();
+
+    const auto r = ledger.reserve_if_serial(stale, CAT, DOM, {}, 100, 128);
+    CHECK(r.status == llama_cache_conditional_reserve_status::serial_conflict);
+    CHECK(!bool(r.op));
+
+    const auto after = ledger.snapshot();
+    CHECK(after.serial == before.serial);              // no bump on drift
+    CHECK(cell(after, CAT, DOM, llama_cache_acct_measure::reserved).value ==
+          cell(before, CAT, DOM, llama_cache_acct_measure::reserved).value);
+    CHECK(after.faults_invalid_transition == before.faults_invalid_transition);
+    CHECK(after.faults_overflow == before.faults_overflow);
+    CHECK(ledger.serial_conflicts() == 1);             // conflict is telemetry, not a fault
+}
+
+// F0a conditional reserve — serial matches but the reservation itself hard-faults (unmanifested
+// domain): ledger_fault, distinct from a conflict.
+static void test_reserve_if_serial_ledger_fault() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const auto bad = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::not_applicable);   // never configured on this ledger
+    const uint64_t serial = ledger.snapshot().serial;
+    const auto r = ledger.reserve_if_serial(serial, CAT, bad, {}, 100, 128);
+    CHECK(r.status == llama_cache_conditional_reserve_status::ledger_fault);
+    CHECK(!bool(r.op));
+    CHECK(ledger.serial_conflicts() == 0);             // a fault is not a conflict
+    CHECK(ledger.snapshot().faults_invalid_transition >= 1);
+}
+
+// F0a conditional reserve — two admissions priced against one serial: exactly one wins, the other
+// sees the drift caused by the first (no fault). The conflict must consume NO op id: a following
+// fresh-serial reservation gets the id immediately after the winner's (proves next_op preserved).
+static void test_reserve_if_serial_serial_reuse() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+
+    const uint64_t serial = ledger.snapshot().serial;
+    const auto a = ledger.reserve_if_serial(serial, CAT, DOM, {}, 100, 128);
+    const auto b = ledger.reserve_if_serial(serial, CAT, DOM, {}, 100, 128);
+    CHECK(a.status == llama_cache_conditional_reserve_status::admitted);
+    CHECK(b.status == llama_cache_conditional_reserve_status::serial_conflict);
+    CHECK(ledger.serial_conflicts() == 1);
+    CHECK(ledger.snapshot().faults_invalid_transition == 0);
+
+    const auto c = ledger.reserve_if_serial(ledger.snapshot().serial, CAT, DOM, {}, 100, 128);
+    CHECK(c.status == llama_cache_conditional_reserve_status::admitted);
+    CHECK(c.op.v == a.op.v + 1); // b consumed no op id
+}
+
+// F0a conditional reserve — a reservation the ledger cannot record must be ledger_fault BEFORE an op
+// is minted (Sol review blocker 2): a reserved-aggregate overflow, and an already-unavailable
+// reserved cell. Neither may consume an op id or report admitted.
+static void test_reserve_if_serial_unrecordable() {
+    // (a) reserved overflow: prime reserved near the ceiling, then a big reservation would overflow.
+    {
+        llama_cache_acct_ledger ledger;
+        configure_default(ledger);
+        ledger.gauge_set(CAT, DOM, llama_cache_acct_measure::reserved,
+                         std::numeric_limits<uint64_t>::max() - 10);
+        const auto r = ledger.reserve_if_serial(ledger.snapshot().serial, CAT, DOM, {}, 100, 128);
+        CHECK(r.status == llama_cache_conditional_reserve_status::ledger_fault);
+        CHECK(!bool(r.op));
+        CHECK(ledger.snapshot().faults_overflow >= 1);
+        // no op consumed: a valid reservation now gets op id 1
+        ledger.gauge_set(CAT, DOM, llama_cache_acct_measure::reserved, 0);
+        const auto ok = ledger.reserve_if_serial(ledger.snapshot().serial, CAT, DOM, {}, 1, 1);
+        CHECK(ok.status == llama_cache_conditional_reserve_status::admitted);
+        CHECK(ok.op.v == 1);
+    }
+    // (b) already-unavailable reserved cell: reserving into it is a hard fault, not a silent admit.
+    {
+        llama_cache_acct_ledger ledger;
+        configure_default(ledger);
+        ledger.mark_unavailable(CAT, DOM, llama_cache_acct_measure::reserved);
+        const auto r = ledger.reserve_if_serial(ledger.snapshot().serial, CAT, DOM, {}, 100, 128);
+        CHECK(r.status == llama_cache_conditional_reserve_status::ledger_fault);
+        CHECK(!bool(r.op));
+    }
+}
+
+// F0a conditional reserve — under REAL concurrency the serial guard is the admission gate: two
+// threads price against one serial and race; exactly one is admitted, the other conflicts, no fault.
+static void test_reserve_if_serial_threads() {
+    llama_cache_acct_ledger ledger;
+    configure_default(ledger);
+    const uint64_t serial = ledger.snapshot().serial;
+
+    std::atomic<bool> go{false};
+    llama_cache_conditional_reserve_result results[2];
+    auto worker = [&](int i) {
+        while (!go.load(std::memory_order_acquire)) { /* spin to maximize overlap */ }
+        results[i] = ledger.reserve_if_serial(serial, CAT, DOM, {}, 100, 128);
+    };
+    std::thread t0(worker, 0), t1(worker, 1);
+    go.store(true, std::memory_order_release);
+    t0.join();
+    t1.join();
+
+    int admitted = 0, conflicts = 0;
+    for (const auto & r : results) {
+        admitted  += r.status == llama_cache_conditional_reserve_status::admitted;
+        conflicts += r.status == llama_cache_conditional_reserve_status::serial_conflict;
+    }
+    CHECK(admitted == 1);
+    CHECK(conflicts == 1);
+    CHECK(ledger.serial_conflicts() == 1);
+    CHECK(ledger.snapshot().faults_invalid_transition == 0 &&
+          ledger.snapshot().faults_overflow == 0);
+}
+
 int main() {
     test_lifecycle();
     test_reserve_stage_mismatch();
@@ -680,6 +818,12 @@ int main() {
     test_resource_domains_and_tuple();
     test_per_domain_completeness();
     test_v1_adapter_fail_closed();
+    test_reserve_if_serial_match();
+    test_reserve_if_serial_drift();
+    test_reserve_if_serial_ledger_fault();
+    test_reserve_if_serial_serial_reuse();
+    test_reserve_if_serial_unrecordable();
+    test_reserve_if_serial_threads();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
