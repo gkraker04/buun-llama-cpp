@@ -17,6 +17,22 @@ inline void llama_store_le_u64(uint8_t (&data)[8], uint64_t value) {
     }
 }
 
+inline uint32_t llama_load_le_u32(const uint8_t (&data)[4]) {
+    uint32_t value = 0;
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        value |= uint32_t(data[i]) << (8*i);
+    }
+    return value;
+}
+
+inline uint64_t llama_load_le_u64(const uint8_t (&data)[8]) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        value |= uint64_t(data[i]) << (8*i);
+    }
+    return value;
+}
+
 // Compact SHA-256 for internal identity digests (adapter identities, VBR checkpoint
 // identity/policy/order digests). Callers version their own serialization domains.
 class llama_sha256 {

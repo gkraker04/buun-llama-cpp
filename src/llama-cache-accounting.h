@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -106,6 +107,12 @@ public:
 
     const std::array<uint8_t, 32> & bytes() const { return bytes_; }
 
+    bool valid() const noexcept {
+        return std::any_of(bytes_.begin(), bytes_.end(), [](uint8_t value) {
+            return value != 0;
+        });
+    }
+
     friend bool operator==(const llama_cache_acct_digest & a,
                            const llama_cache_acct_digest & b) {
         return a.bytes_ == b.bytes_;
@@ -159,6 +166,11 @@ bool llama_cache_acct_build_shard_topology(
         int32_t main_device,
         const float * shard_weights,
         llama_cache_acct_shard_topology & out) noexcept;
+
+// Canonical digest door for a normalized topology. Portable artifact readers use this
+// to verify that an imported descriptor will intern to the same topology identity.
+llama_cache_acct_topology_digest llama_cache_acct_compute_topology_digest(
+        const llama_cache_acct_shard_topology & topology) noexcept;
 
 inline bool operator==(const llama_cache_acct_shard_topology & a,
                        const llama_cache_acct_shard_topology & b) {

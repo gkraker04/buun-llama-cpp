@@ -42,6 +42,7 @@ add_library(llama
             llama-cache-authority.cpp
             llama-vbr-checkpoint.cpp
             llama-vbr-extent.cpp
+            llama-vbr-artifact.cpp
             llama-vbr-generation.cpp
             llama-vbr-generation-oracle.cpp
             llama-vbr-operation.cpp

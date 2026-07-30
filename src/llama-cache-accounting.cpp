@@ -23,24 +23,28 @@ static Digest acct_sha256(const void * data, size_t size) {
     return Digest::from_sha256(writer.finish());
 }
 
-static llama_cache_acct_topology_digest acct_compute_topology_digest(
-        const llama_cache_acct_shard_topology & topology) {
-    llama_sha256_writer writer;
-    static constexpr char domain_separator[] = "llama-cache-acct/shard-topology";
-    writer.string(domain_separator, sizeof(domain_separator) - 1);
-    writer.u32(topology.version);
-    writer.u32(topology.device_count);
-    writer.u32(uint32_t(topology.split_mode));
-    writer.u32(topology.main_device.v);
-    const size_t n = std::min(topology.device_identities.size(),
-                              topology.shard_weights.size());
-    writer.u64(n);
-    for (size_t i = 0; i < n; ++i) {
-        const auto & identity = topology.device_identities[i].bytes();
-        writer.string(identity.data(), identity.size());
-        writer.u32(topology.shard_weights[i]);
+llama_cache_acct_topology_digest llama_cache_acct_compute_topology_digest(
+        const llama_cache_acct_shard_topology & topology) noexcept {
+    try {
+        llama_sha256_writer writer;
+        static constexpr char domain_separator[] = "llama-cache-acct/shard-topology";
+        writer.string(domain_separator, sizeof(domain_separator) - 1);
+        writer.u32(topology.version);
+        writer.u32(topology.device_count);
+        writer.u32(uint32_t(topology.split_mode));
+        writer.u32(topology.main_device.v);
+        const size_t n = std::min(topology.device_identities.size(),
+                                  topology.shard_weights.size());
+        writer.u64(n);
+        for (size_t i = 0; i < n; ++i) {
+            const auto & identity = topology.device_identities[i].bytes();
+            writer.string(identity.data(), identity.size());
+            writer.u32(topology.shard_weights[i]);
+        }
+        return llama_cache_acct_topology_digest::from_sha256(writer.finish());
+    } catch (...) {
+        return {};
     }
-    return llama_cache_acct_topology_digest::from_sha256(writer.finish());
 }
 
 bool llama_cache_acct_build_shard_topology(
@@ -122,7 +126,7 @@ bool llama_cache_acct_build_shard_topology(
             built.shard_weights[remainders[
                 (i - uint32_t(assigned)) % remainders.size()].index]++;
         }
-        built.digest = acct_compute_topology_digest(built);
+        built.digest = llama_cache_acct_compute_topology_digest(built);
         if (!acct_digest_nonzero(built.digest.bytes())) {
             return false;
         }
@@ -168,7 +172,7 @@ static bool acct_topology_valid(const llama_cache_acct_shard_topology & topology
         !topology.main_device ||
         topology.main_device.v >= topology.device_count ||
         !acct_digest_nonzero(topology.digest.bytes()) ||
-        topology.digest != acct_compute_topology_digest(topology)) {
+        topology.digest != llama_cache_acct_compute_topology_digest(topology)) {
         return false;
     }
     uint64_t weight_sum = 0;

@@ -168,6 +168,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-authority.cpp)
     target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-vbr-artifact.cpp)
+    target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(
         test-cache-lease.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
@@ -317,6 +320,13 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-generation-isolation.cmake
+)
+
+add_test(
+    NAME test-vbr-artifact-format-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-format.cmake
 )
 
 add_test(

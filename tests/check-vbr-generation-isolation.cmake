@@ -25,8 +25,9 @@ endif()
 
 # Raw generation fields may be compared only by the one eligibility authority. Mutation code uses
 # tracker methods; the disabled oracle independently uses canonical bytes plus covered masks.
-# C2 hardening: the scan covers headers as well as sources; the only exemptions are the files
-# where these identifiers ARE the struct/tracker definitions themselves.
+# C2 hardening: the scan covers headers as well as sources. F2.1 adds one reviewed,
+# value-only wire codec for the complete generation record; it may serialize these fields
+# but is not an admission reader and imports only the immutable generation-types vocabulary.
 file(GLOB_RECURSE raw_scan_files
     "${SOURCE_ROOT}/src/*.cpp" "${SOURCE_ROOT}/src/*.h"
     "${SOURCE_ROOT}/common/*.cpp" "${SOURCE_ROOT}/common/*.h"
@@ -43,9 +44,8 @@ set(raw_generation_symbols
     "global_generation_"
     "repr_gen")
 foreach(path IN LISTS raw_scan_files)
-    if (path STREQUAL "${SOURCE_ROOT}/src/llama-vbr-generation.cpp" OR
-        path STREQUAL "${SOURCE_ROOT}/src/llama-vbr-generation.h" OR
-        path STREQUAL "${SOURCE_ROOT}/src/llama-vbr-generation-types.h")
+    if (path MATCHES
+        "/src/llama-vbr-(generation(\\.cpp|\\.h|-types\\.h)|artifact\\.(cpp|h))$")
         continue()
     endif()
     file(READ "${path}" text)
@@ -226,11 +226,14 @@ set(c2_handle_allowed
 # The composite generation record may be named ONLY where the record vocabulary is defined, in
 # the two record-typed implementation TUs, and in the two named test files.
 set(c2_record_allowed
+    "${SOURCE_ROOT}/src/llama-vbr-artifact.h"
+    "${SOURCE_ROOT}/src/llama-vbr-artifact.cpp"
     "${SOURCE_ROOT}/src/llama-vbr-generation-types.h"
     "${SOURCE_ROOT}/src/llama-vbr-generation.h"
     "${SOURCE_ROOT}/src/llama-vbr-generation.cpp"
     "${SOURCE_ROOT}/src/llama-vbr-checkpoint.cpp"
     "${SOURCE_ROOT}/src/llama-vbr-checkpoint-compose.inc"
+    "${SOURCE_ROOT}/tests/test-vbr-artifact.cpp"
     "${SOURCE_ROOT}/tests/test-vbr-representation-epoch.cpp"
     "${SOURCE_ROOT}/tests/test-checkpoint-shadow-lifecycle.cpp")
 
