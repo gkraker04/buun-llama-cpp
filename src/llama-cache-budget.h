@@ -30,12 +30,12 @@ enum class llama_cache_budget_fit_state : uint8_t {
 
 // The classification vocabulary is closed. The CI census requires exactly one
 // entry for every llama_cache_acct_category. `excluded` means D-S2 has no
-// certified durable-supply producer for that leaf yet; it is not a claim that
+// certified capacity-participating producer for that leaf yet; it is not a claim that
 // the underlying subsystem consumes no memory. In particular, D-S3 retention
 // metadata remains non-participating while D is shadow.
-enum class llama_cache_budget_durability : uint8_t {
+enum class llama_cache_budget_capacity_participation : uint8_t {
     excluded = 0,
-    durable,
+    participating,
     _count,
 };
 
@@ -49,31 +49,32 @@ enum class llama_cache_budget_residency_scope : uint8_t {
     none = 0,
     device,
     host,
+    by_domain,
     _count,
 };
 
 #define LLAMA_CACHE_BUDGET_CATEGORY_TABLE(X)                                                   \
-    X(live_attention_state,                  durable, direct_gauge,  device)                    \
-    X(live_recurrent_state,                  durable, direct_gauge,  device)                    \
-    X(recurrent_rollback_planes,             durable, direct_gauge,  device)                    \
-    X(full_snapshot_payload,                 durable, transactional, host)                      \
-    X(checkpoint_state_payload,              durable, transactional, host)                      \
-    X(typed_accelerator_payload,             durable, transactional, host)                      \
+    X(live_attention_state,                  participating, direct_gauge,  device)              \
+    X(live_recurrent_state,                  participating, direct_gauge,  device)              \
+    X(recurrent_rollback_planes,             participating, direct_gauge,  device)              \
+    X(full_snapshot_payload,                 participating, transactional, host)                \
+    X(checkpoint_state_payload,              participating, transactional, host)                \
+    X(typed_accelerator_payload,             participating, transactional, host)                \
     X(checkpoint_generation_page_metadata,   excluded, direct_gauge,  none)                     \
     X(checkpoint_generation_unit_metadata,   excluded, direct_gauge,  none)                     \
     X(live_generation_metadata,              excluded, direct_gauge,  none)                     \
     X(ownership_index_metadata,              excluded, direct_gauge,  none)                     \
-    X(unit_version_payload,                  excluded, transactional, none)                     \
-    X(clean_stash_payload,                   excluded, transactional, none)                     \
-    X(artifact_descriptor_metadata,          excluded, transactional, none)                     \
-    X(artifact_reference_metadata,           excluded, transactional, none)                     \
-    X(transfer_staging,                      excluded, transactional, none)                     \
-    X(codec_workspace,                       excluded, transactional, none)                     \
-    X(pinned_preimage_ring,                  excluded, direct_gauge,  none)                     \
-    X(rolling_window_tape,                   durable, direct_gauge,  device)                    \
+    X(unit_version_payload,                  participating, transactional, by_domain)           \
+    X(clean_stash_payload,                   participating, transactional, by_domain)           \
+    X(artifact_descriptor_metadata,          participating, transactional, by_domain)           \
+    X(artifact_reference_metadata,           participating, transactional, by_domain)           \
+    X(transfer_staging,                      participating, transactional, by_domain)           \
+    X(codec_workspace,                       participating, transactional, by_domain)           \
+    X(pinned_preimage_ring,                  participating, direct_gauge,  by_domain)           \
+    X(rolling_window_tape,                   participating, direct_gauge,  device)              \
     X(container_overhead,                    excluded, direct_gauge,  none)
 
-#define LLAMA_CACHE_BUDGET_COUNT_CATEGORY(name, durability, mode, scope) + 1
+#define LLAMA_CACHE_BUDGET_COUNT_CATEGORY(name, participation, mode, scope) + 1
 constexpr size_t LLAMA_CACHE_BUDGET_CATEGORY_COUNT =
     0 LLAMA_CACHE_BUDGET_CATEGORY_TABLE(LLAMA_CACHE_BUDGET_COUNT_CATEGORY);
 #undef LLAMA_CACHE_BUDGET_COUNT_CATEGORY
@@ -82,7 +83,8 @@ static_assert(LLAMA_CACHE_BUDGET_CATEGORY_COUNT ==
               "every accounting category needs one budget classification");
 
 struct llama_cache_budget_category_classification {
-    llama_cache_budget_durability      durability = llama_cache_budget_durability::excluded;
+    llama_cache_budget_capacity_participation participation =
+        llama_cache_budget_capacity_participation::excluded;
     llama_cache_budget_accounting_mode mode       = llama_cache_budget_accounting_mode::direct_gauge;
     llama_cache_budget_residency_scope scope      = llama_cache_budget_residency_scope::none;
 };

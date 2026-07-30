@@ -240,9 +240,9 @@ llama_cache_budget_row & add_rollup_group(
 llama_cache_budget_category_classification llama_cache_budget_classify(
         llama_cache_acct_category category) noexcept {
     switch (category) {
-#define LLAMA_CACHE_BUDGET_CLASSIFY_CASE(name, durability, mode, scope)          \
+#define LLAMA_CACHE_BUDGET_CLASSIFY_CASE(name, participation, mode, scope)       \
         case llama_cache_acct_category::name:                                    \
-            return { llama_cache_budget_durability::durability,                  \
+            return { llama_cache_budget_capacity_participation::participation,   \
                      llama_cache_budget_accounting_mode::mode,                   \
                      llama_cache_budget_residency_scope::scope };
         LLAMA_CACHE_BUDGET_CATEGORY_TABLE(LLAMA_CACHE_BUDGET_CLASSIFY_CASE)
@@ -250,7 +250,7 @@ llama_cache_budget_category_classification llama_cache_budget_classify(
         case llama_cache_acct_category::_count:
             break;
     }
-    return { llama_cache_budget_durability::_count,
+    return { llama_cache_budget_capacity_participation::_count,
              llama_cache_budget_accounting_mode::_count,
              llama_cache_budget_residency_scope::_count };
 }
@@ -325,20 +325,27 @@ llama_cache_budget_result llama_cache_budget_coordinator::fits(
             }
 
             const auto classification = llama_cache_budget_classify(cell.category);
-            if (classification.durability == llama_cache_budget_durability::_count) {
+            if (classification.participation ==
+                    llama_cache_budget_capacity_participation::_count) {
                 return out;
             }
-            if (classification.durability != llama_cache_budget_durability::durable) {
+            if (classification.participation !=
+                    llama_cache_budget_capacity_participation::participating) {
                 continue;
             }
-            const bool device_scope =
+            const bool by_domain =
                 classification.scope ==
-                    llama_cache_budget_residency_scope::device &&
+                    llama_cache_budget_residency_scope::by_domain;
+            const bool device_scope =
+                (classification.scope ==
+                     llama_cache_budget_residency_scope::device ||
+                 by_domain) &&
                 cell.domain.residency ==
                     llama_cache_acct_residency::device;
             const bool host_scope =
-                classification.scope ==
-                    llama_cache_budget_residency_scope::host &&
+                (classification.scope ==
+                     llama_cache_budget_residency_scope::host ||
+                 by_domain) &&
                 (cell.domain.residency ==
                     llama_cache_acct_residency::pinned_host ||
                  cell.domain.residency ==
@@ -346,20 +353,31 @@ llama_cache_budget_result llama_cache_budget_coordinator::fits(
             if (!device_scope && !host_scope) {
                 continue;
             }
+            // F2 capacity rows are dormant until their producer observes at
+            // least one capacity measure. This preserves the pre-F2 budget
+            // surface when artifact machinery is not allocated, while a
+            // partially-observed active row still fails closed below.
+            const auto resident =
+                cell.cell.measures[size_t(llama_cache_acct_measure::resident_allocated)];
+            const auto reserved =
+                cell.cell.measures[size_t(llama_cache_acct_measure::reserved)];
+            if (by_domain &&
+                resident.state == llama_cache_acct_known::unknown &&
+                (classification.mode !=
+                     llama_cache_budget_accounting_mode::transactional ||
+                 reserved.state == llama_cache_acct_known::unknown)) {
+                continue;
+            }
             domain->saw_cell = true;
             if (cell.certification != llama_cache_acct_known::known) {
                 domain->available = false;
                 continue;
             }
-            const auto resident =
-                cell.cell.measures[size_t(llama_cache_acct_measure::resident_allocated)];
             if (resident.state != llama_cache_acct_known::known ||
                 !add_checked(domain->resident, resident.value, domain->resident)) {
                 domain->available = false;
             }
             if (classification.mode == llama_cache_budget_accounting_mode::transactional) {
-                const auto reserved =
-                    cell.cell.measures[size_t(llama_cache_acct_measure::reserved)];
                 if (reserved.state != llama_cache_acct_known::known ||
                     !add_checked(domain->outstanding_reserved, reserved.value,
                                  domain->outstanding_reserved)) {

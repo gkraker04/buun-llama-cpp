@@ -1,11 +1,14 @@
 #include "llama-vbr-artifact.h"
+#include "llama-vbr-artifact-catalog.h"
 #include "llama-sha256.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int failures = 0;
@@ -882,6 +885,450 @@ static void test_stream_larger_than_capture_ring() {
     CHECK(generated.max_request <= 1024*1024);
 }
 
+static llama_cache_acct_value catalog_cell(
+        const llama_cache_acct_snapshot & snapshot,
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure measure) {
+    const auto row = std::find_if(
+        snapshot.cells.begin(), snapshot.cells.end(),
+        [&](const llama_cache_acct_cell_row & candidate) {
+            return candidate.category == category &&
+                   candidate.domain == domain;
+        });
+    return row == snapshot.cells.end()
+        ? llama_cache_acct_value {}
+        : row->cell.measures[size_t(measure)];
+}
+
+struct catalog_fixture {
+    fixture_storage storage;
+    vbr_artifact_package package;
+    llama_cache_acct_ledger ledger;
+    std::unique_ptr<llama_vbr_artifact_catalog> catalog;
+    std::vector<llama_vbr_artifact_domain_binding> bindings;
+    llama_cache_budget_config budget;
+    llama_cache_acct_resource_domain host =
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pageable_host);
+
+    catalog_fixture()
+        : package(make_package(storage)),
+          catalog(new llama_vbr_artifact_catalog(ledger)) {
+        CHECK(catalog->bind_topologies(package.topologies, bindings));
+        std::vector<llama_cache_acct_completeness_requirement> required;
+        required.push_back({
+            host, llama_cache_acct_producer::retention_sidecar,
+        });
+        for (const auto & binding : bindings) {
+            required.push_back({
+                binding.domain, llama_cache_acct_producer::live_memory,
+            });
+        }
+        CHECK(ledger.configure_required_producers(
+            required.data(), required.size()));
+        CHECK(catalog->configure_accounting(package));
+        const auto initialize = [&](llama_cache_acct_category category,
+                                    const llama_cache_acct_resource_domain & domain,
+                                    bool transactional) {
+            ledger.gauge_set(
+                category, domain,
+                llama_cache_acct_measure::resident_allocated, 0);
+            if (transactional) {
+                ledger.gauge_set(
+                    category, domain,
+                    llama_cache_acct_measure::reserved, 0);
+            }
+        };
+        initialize(
+            llama_cache_acct_category::full_snapshot_payload,
+            host, true);
+        initialize(
+            llama_cache_acct_category::checkpoint_state_payload,
+            host, true);
+        initialize(
+            llama_cache_acct_category::typed_accelerator_payload,
+            host, true);
+        for (const auto & binding : bindings) {
+            initialize(
+                llama_cache_acct_category::live_attention_state,
+                binding.domain, false);
+            initialize(
+                llama_cache_acct_category::live_recurrent_state,
+                binding.domain, false);
+            initialize(
+                llama_cache_acct_category::recurrent_rollback_planes,
+                binding.domain, false);
+            initialize(
+                llama_cache_acct_category::rolling_window_tape,
+                binding.domain, false);
+        }
+        CHECK(ledger.certify_complete(
+            host, llama_cache_acct_producer::retention_sidecar));
+        for (const auto & binding : bindings) {
+            CHECK(ledger.certify_complete(
+                binding.domain, llama_cache_acct_producer::live_memory));
+            llama_cache_budget_device_input input;
+            input.backend_device =
+                reinterpret_cast<const void *>(uintptr_t(1));
+            input.domain = binding.domain;
+            input.physical_total = 1ull << 30;
+            // Fake-shard storage is already resident when publication begins,
+            // so the injected point-in-time sample must include it in physical
+            // used just as a backend sample would.
+            input.physical_free = (1ull << 30) - 1024;
+            input.phys_state =
+                llama_cache_budget_capacity_state::known;
+            input.current_compute_allocated = 0;
+            input.configured_compute_reserve = 0;
+            input.compute_state =
+                llama_cache_budget_capacity_state::known;
+            input.cache_cap_state =
+                llama_cache_budget_capacity_state::unbounded;
+            budget.devices.push_back(input);
+        }
+        budget.host.pageable_state =
+            llama_cache_budget_capacity_state::unbounded;
+    }
+
+    std::vector<llama_vbr_artifact_fake_shard_completion>
+    completions() const {
+        return {
+            { 0, 1, true,  true, storage.stash1.bytes },
+            { 0, 0, false, true, storage.payload0.bytes },
+            { 0, 0, true,  true, storage.stash0.bytes },
+            { 0, 1, false, true, storage.payload1.bytes },
+        };
+    }
+};
+
+static void test_catalog_charge_once_and_retire() {
+    catalog_fixture f;
+    const auto first =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(first.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(first.reference_artifact.v != 0);
+    CHECK(first.unit_content.v != 0);
+
+    auto snapshot = f.ledger.snapshot();
+    for (const auto & binding : f.bindings) {
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::unit_version_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 4);
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::clean_stash_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 8);
+    }
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_descriptor_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 512);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 256);
+
+    const auto second =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(second.status ==
+          llama_vbr_artifact_publish_status::adopted);
+    CHECK(second.reference_artifact.v != first.reference_artifact.v);
+    CHECK(second.unit_content == first.unit_content);
+    CHECK(second.reference_lineage == first.reference_lineage);
+    snapshot = f.ledger.snapshot();
+    for (const auto & binding : f.bindings) {
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::unit_version_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 4);
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::clean_stash_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 8);
+    }
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 512);
+    const auto catalog_state = f.catalog->snapshot();
+    CHECK(catalog_state.blobs == 1);
+    CHECK(catalog_state.stashes == 1);
+    CHECK(catalog_state.references == 2);
+
+    CHECK(f.catalog->retire(first.reference_artifact));
+    snapshot = f.ledger.snapshot();
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::unit_version_payload,
+        f.bindings[0].domain,
+        llama_cache_acct_measure::resident_allocated).value == 4);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 256);
+    CHECK(f.catalog->retire(second.reference_artifact));
+    snapshot = f.ledger.snapshot();
+    CHECK(snapshot.live_ops == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::unit_version_payload,
+        f.bindings[0].domain,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::clean_stash_payload,
+        f.bindings[0].domain,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_descriptor_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+    const auto empty = f.catalog->snapshot();
+    CHECK(empty.blobs == 0 && empty.stashes == 0 &&
+          empty.references == 0);
+}
+
+static void test_catalog_all_shard_failures_and_rollback() {
+    for (uint32_t mode = 0; mode < 6; ++mode) {
+        catalog_fixture f;
+        auto completions = f.completions();
+        llama_vbr_artifact_publish_fault fault;
+        llama_vbr_artifact_publish_status expected;
+        switch (mode) {
+            case 0:
+                completions.pop_back();
+                expected =
+                    llama_vbr_artifact_publish_status::missing_completion;
+                break;
+            case 1:
+                completions.back() = completions.front();
+                expected =
+                    llama_vbr_artifact_publish_status::duplicate_completion;
+                break;
+            case 2:
+                completions[1].success = false;
+                expected =
+                    llama_vbr_artifact_publish_status::shard_failed;
+                break;
+            case 3:
+                fault.fail_stage_at = 1;
+                expected =
+                    llama_vbr_artifact_publish_status::stage_failed;
+                break;
+            case 4:
+                fault.fail_commit_at = 2;
+                expected =
+                    llama_vbr_artifact_publish_status::commit_failed;
+                break;
+            default:
+                fault.fail_after_commit = true;
+                expected =
+                    llama_vbr_artifact_publish_status::publication_failed;
+                break;
+        }
+        const auto result =
+            f.catalog->publish(f.package, completions, f.budget, fault);
+        CHECK(result.status == expected);
+        const auto catalog_state = f.catalog->snapshot();
+        CHECK(catalog_state.blobs == 0);
+        CHECK(catalog_state.stashes == 0);
+        CHECK(catalog_state.references == 0);
+        const auto ledger_state = f.ledger.snapshot();
+        CHECK(ledger_state.live_ops == 0);
+        for (const auto & row : f.package.manifest.accounting) {
+            const auto category =
+                vbr_artifact_accounting_category(row.role);
+            const auto domain =
+                row.domain.residency ==
+                        llama_cache_acct_residency::device
+                    ? f.bindings[row.domain.device_ordinal].domain
+                    : f.host;
+            for (const auto measure : {
+                    llama_cache_acct_measure::logical_payload,
+                    llama_cache_acct_measure::resident_allocated,
+                    llama_cache_acct_measure::reserved }) {
+                const auto value = catalog_cell(
+                    ledger_state, category, domain, measure);
+                CHECK(value.state == llama_cache_acct_known::known);
+                CHECK(value.value == 0);
+            }
+        }
+    }
+}
+
+static void test_catalog_destructor_releases_live_references() {
+    catalog_fixture f;
+    const auto first =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    const auto second =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(first.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(second.status ==
+          llama_vbr_artifact_publish_status::adopted);
+    CHECK(f.ledger.snapshot().live_ops > 0);
+
+    f.catalog.reset();
+    const auto snapshot = f.ledger.snapshot();
+    CHECK(snapshot.live_ops == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::unit_version_payload,
+        f.bindings[0].domain,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+}
+
+static void test_catalog_dedup_race() {
+    catalog_fixture f;
+    const auto completions = f.completions();
+    std::array<llama_vbr_artifact_publish_result, 2> results;
+    std::thread a([&] {
+        results[0] =
+            f.catalog->publish(f.package, completions, f.budget);
+    });
+    std::thread b([&] {
+        results[1] =
+            f.catalog->publish(f.package, completions, f.budget);
+    });
+    a.join();
+    b.join();
+    const bool first_published =
+        results[0].status ==
+            llama_vbr_artifact_publish_status::published;
+    const bool second_published =
+        results[1].status ==
+            llama_vbr_artifact_publish_status::published;
+    CHECK(first_published != second_published);
+    CHECK((results[0].status ==
+               llama_vbr_artifact_publish_status::adopted) !=
+          (results[1].status ==
+               llama_vbr_artifact_publish_status::adopted));
+    const auto state = f.catalog->snapshot();
+    CHECK(state.blobs == 1 && state.stashes == 1 &&
+          state.references == 2);
+    CHECK(state.published == 1 && state.adopted == 1);
+    CHECK(f.catalog->retire(results[0].reference_artifact));
+    CHECK(f.catalog->retire(results[1].reference_artifact));
+}
+
+static void test_catalog_full_id_interning_and_stash_dedup() {
+    catalog_fixture f;
+    const auto first =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(first.status ==
+          llama_vbr_artifact_publish_status::published);
+
+    fixture_storage changed_storage;
+    changed_storage.payload0.bytes[0] ^= 1;
+    auto changed = make_package(changed_storage);
+    const auto second = f.catalog->publish(changed, {
+        { 0, 1, true,  true, changed_storage.stash1.bytes },
+        { 0, 0, false, true, changed_storage.payload0.bytes },
+        { 0, 0, true,  true, changed_storage.stash0.bytes },
+        { 0, 1, false, true, changed_storage.payload1.bytes },
+    }, f.budget);
+    CHECK(second.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(second.reference_artifact != first.reference_artifact);
+    CHECK(second.unit_content != first.unit_content);
+    CHECK(second.reference_lineage != first.reference_lineage);
+    const auto state = f.catalog->snapshot();
+    CHECK(state.blobs == 2);
+    CHECK(state.stashes == 1);
+    CHECK(state.references == 2);
+    const auto accounting = f.ledger.snapshot();
+    for (const auto & binding : f.bindings) {
+        CHECK(catalog_cell(
+            accounting,
+            llama_cache_acct_category::clean_stash_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 8);
+    }
+    CHECK(f.catalog->retire(first.reference_artifact));
+    CHECK(f.catalog->retire(second.reference_artifact));
+}
+
+static void test_catalog_capacity_sequential_and_temporaries() {
+    catalog_fixture f;
+    for (auto & device : f.budget.devices) {
+        device.physical_total = 28;
+        device.physical_free = 28;
+        device.configured_cache_cap = 28;
+        device.cache_cap_state =
+            llama_cache_budget_capacity_state::known;
+    }
+    const auto first =
+        f.catalog->publish(f.package, f.completions(), f.budget);
+    CHECK(first.status ==
+          llama_vbr_artifact_publish_status::published);
+
+    fixture_storage changed_storage;
+    changed_storage.payload0.bytes[0] ^= 1;
+    auto changed = make_package(changed_storage);
+    const auto refused =
+        f.catalog->publish(changed, {
+            { 0, 0, false, true, changed_storage.payload0.bytes },
+            { 0, 1, false, true, changed_storage.payload1.bytes },
+            { 0, 0, true, true, changed_storage.stash0.bytes },
+            { 0, 1, true, true, changed_storage.stash1.bytes },
+        }, f.budget);
+    CHECK(refused.status ==
+          llama_vbr_artifact_publish_status::admission_refused);
+    CHECK(f.catalog->snapshot().references == 1);
+    CHECK(f.ledger.snapshot().live_ops > 0);
+
+    llama_cache_budget_config generous = f.budget;
+    for (auto & device : generous.devices) {
+        device.physical_total = 100;
+        device.physical_free = 70;
+        device.configured_cache_cap = 100;
+    }
+    const auto domain = f.bindings[0].domain;
+    llama_cache_authority_request staging;
+    staging.category =
+        llama_cache_acct_category::transfer_staging;
+    staging.domain = domain;
+    staging.expected_logical = 40;
+    staging.expected_resident = 40;
+    auto held = llama_cache_admit_reservation(
+        f.ledger, generous, staging);
+    CHECK(held.status == llama_cache_admission_status::admitted);
+
+    llama_cache_authority_request workspace = staging;
+    workspace.category =
+        llama_cache_acct_category::codec_workspace;
+    workspace.expected_logical = 70;
+    workspace.expected_resident = 70;
+    auto blocked = llama_cache_admit_reservation(
+        f.ledger, generous, workspace);
+    CHECK(blocked.status ==
+          llama_cache_admission_status::exceeds_budget);
+    CHECK(!blocked.claim.has_op());
+    CHECK(f.catalog->retire(first.reference_artifact));
+}
+
 int main() {
     test_golden_and_native_lineage();
     test_identity_and_reference_separation();
@@ -890,6 +1337,12 @@ int main() {
     test_validation_and_ordering();
     test_companion_payload();
     test_stream_larger_than_capture_ring();
+    test_catalog_charge_once_and_retire();
+    test_catalog_all_shard_failures_and_rollback();
+    test_catalog_destructor_releases_live_references();
+    test_catalog_dedup_race();
+    test_catalog_full_id_interning_and_stash_dedup();
+    test_catalog_capacity_sequential_and_temporaries();
     if (failures != 0) {
         fprintf(stderr, "%d VBR artifact test(s) failed\n", failures);
         return 1;

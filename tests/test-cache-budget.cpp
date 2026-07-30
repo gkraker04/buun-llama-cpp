@@ -319,14 +319,129 @@ static void test_capacity_states_and_classification() {
           llama_cache_budget_fit_state::unavailable);
 
     CHECK(llama_cache_budget_classify(
-              llama_cache_acct_category::live_attention_state).durability ==
-          llama_cache_budget_durability::durable);
+              llama_cache_acct_category::live_attention_state).participation ==
+          llama_cache_budget_capacity_participation::participating);
+    for (const auto category : {
+            llama_cache_acct_category::unit_version_payload,
+            llama_cache_acct_category::clean_stash_payload,
+            llama_cache_acct_category::artifact_descriptor_metadata,
+            llama_cache_acct_category::artifact_reference_metadata,
+            llama_cache_acct_category::transfer_staging,
+            llama_cache_acct_category::codec_workspace,
+            llama_cache_acct_category::pinned_preimage_ring }) {
+        const auto row = llama_cache_budget_classify(category);
+        CHECK(row.participation ==
+              llama_cache_budget_capacity_participation::participating);
+        CHECK(row.scope ==
+              llama_cache_budget_residency_scope::by_domain);
+    }
     CHECK(llama_cache_budget_classify(
-              llama_cache_acct_category::transfer_staging).durability ==
-          llama_cache_budget_durability::excluded);
+              llama_cache_acct_category::unit_version_payload).scope ==
+          llama_cache_budget_residency_scope::by_domain);
     CHECK(llama_cache_budget_classify(
               llama_cache_acct_category::full_snapshot_payload).mode ==
           llama_cache_budget_accounting_mode::transactional);
+}
+
+static void test_f2_capacity_activation_is_inert_until_observed() {
+    auto baseline_snapshot = base_snapshot();
+    const auto config = base_config();
+    llama_cache_budget_coordinator coordinator;
+    CHECK(coordinator.reset(baseline_snapshot, config));
+    const llama_cache_budget_plan baseline_plan {
+        baseline_snapshot.serial, {},
+    };
+    const auto baseline = coordinator.fits(baseline_plan);
+
+    auto dormant_snapshot = baseline_snapshot;
+    for (const auto category : {
+            llama_cache_acct_category::unit_version_payload,
+            llama_cache_acct_category::clean_stash_payload,
+            llama_cache_acct_category::artifact_descriptor_metadata,
+            llama_cache_acct_category::artifact_reference_metadata,
+            llama_cache_acct_category::transfer_staging,
+            llama_cache_acct_category::codec_workspace,
+            llama_cache_acct_category::pinned_preimage_ring }) {
+        add_cell(
+            dormant_snapshot, category, device_domain(0, 1),
+            0, 0, 0, llama_cache_acct_known::unknown);
+    }
+    CHECK(coordinator.reset(dormant_snapshot, config));
+    const auto dormant = coordinator.fits({
+        dormant_snapshot.serial, {},
+    });
+    const auto * baseline_device = find_group(
+        baseline, llama_cache_budget_resource_kind::physical_device);
+    const auto * dormant_device = find_group(
+        dormant, llama_cache_budget_resource_kind::physical_device);
+    CHECK(dormant.state == baseline.state);
+    CHECK(dormant.domains.size() == baseline.domains.size());
+    CHECK(dormant.groups.size() == baseline.groups.size());
+    CHECK(baseline_device && dormant_device);
+    CHECK(baseline_device && dormant_device &&
+          dormant_device->before.value == baseline_device->before.value &&
+          dormant_device->before.state == baseline_device->before.state);
+    CHECK(baseline_device && dormant_device &&
+          dormant_device->headroom_after.value ==
+              baseline_device->headroom_after.value &&
+          dormant_device->headroom_after.state ==
+              baseline_device->headroom_after.state);
+
+    auto active_snapshot = dormant_snapshot;
+    auto & active = active_snapshot.cells[
+        baseline_snapshot.cells.size()];
+    active.certification = llama_cache_acct_known::known;
+    active.cell.measures[
+        size_t(llama_cache_acct_measure::resident_allocated)] =
+            llama_cache_acct_value::measured(7);
+    active.cell.measures[
+        size_t(llama_cache_acct_measure::reserved)] =
+            llama_cache_acct_value::measured(3);
+    CHECK(coordinator.reset(active_snapshot, config));
+    const auto active_result = coordinator.fits({
+        active_snapshot.serial, {},
+    });
+    const auto * active_device = find_group(
+        active_result, llama_cache_budget_resource_kind::physical_device);
+    CHECK(active_result.state == llama_cache_budget_fit_state::fits);
+    CHECK(active_device && baseline_device &&
+          active_device->before.value == baseline_device->before.value + 10);
+
+    active.cell.measures[
+        size_t(llama_cache_acct_measure::reserved)] = {};
+    CHECK(coordinator.reset(active_snapshot, config));
+    CHECK(coordinator.fits({ active_snapshot.serial, {} }).state ==
+          llama_cache_budget_fit_state::unavailable);
+
+    active.cell.measures[
+        size_t(llama_cache_acct_measure::resident_allocated)] = {};
+    active.cell.measures[
+        size_t(llama_cache_acct_measure::reserved)] =
+            llama_cache_acct_value::measured(3);
+    CHECK(coordinator.reset(active_snapshot, config));
+    CHECK(coordinator.fits({ active_snapshot.serial, {} }).state ==
+          llama_cache_budget_fit_state::unavailable);
+
+    auto pinned_snapshot = baseline_snapshot;
+    const auto pinned = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pinned_host);
+    add_domain(pinned_snapshot, pinned);
+    add_cell(
+        pinned_snapshot,
+        llama_cache_acct_category::pinned_preimage_ring,
+        pinned, 11);
+    CHECK(coordinator.reset(pinned_snapshot, config));
+    CHECK(coordinator.fits({ pinned_snapshot.serial, {} }).state ==
+          llama_cache_budget_fit_state::exceeds);
+
+    const auto disk = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::disk);
+    llama_cache_budget_plan unsupported {
+        baseline_snapshot.serial, { { disk, 1, 0 } },
+    };
+    CHECK(coordinator.reset(baseline_snapshot, config));
+    CHECK(coordinator.fits(unsupported).state ==
+          llama_cache_budget_fit_state::unavailable);
 }
 
 int main() {
@@ -334,6 +449,7 @@ int main() {
     test_optional_hierarchy();
     test_fail_closed_inputs();
     test_capacity_states_and_classification();
+    test_f2_capacity_activation_is_inert_until_observed();
     if (failures) {
         std::fprintf(stderr, "%d cache-budget checks failed\n", failures);
         return 1;

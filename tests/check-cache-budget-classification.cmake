@@ -1,4 +1,4 @@
-# D-S2 source contract: every accounting category has exactly one durability /
+# D-S2 source contract: every accounting category has exactly one capacity-participation /
 # transactional classification, and process-local budget types stay out of wire
 # and shipped artifact structs. Negative controls mutate source copies in memory.
 
@@ -38,7 +38,7 @@ function(cache_budget_classification_valid table_header output)
     endforeach()
 
     string(REGEX MATCHALL
-        "X\\([A-Za-z_][A-Za-z0-9_]*,[ \t]*(durable|excluded),[ \t]*(direct_gauge|transactional),[ \t]*(device|host|none)\\)"
+        "X\\([A-Za-z_][A-Za-z0-9_]*,[ \t]*(participating|excluded),[ \t]*(direct_gauge|transactional),[ \t]*(device|host|by_domain|none)\\)"
         table_rows "${table_header}")
     set(classified "")
     foreach(row IN LISTS table_rows)

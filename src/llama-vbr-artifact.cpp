@@ -2787,6 +2787,23 @@ bool vbr_artifact_validate_portable_accounting(
     }
 }
 
+llama_cache_acct_category vbr_artifact_accounting_category(
+        vbr_artifact_accounting_role role) noexcept {
+    return role_category(role);
+}
+
+std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
+        const vbr_artifact_unit_descriptor & descriptor) noexcept {
+    llama_sha256_writer hash;
+    static constexpr char domain[] = "buun.vbr.logical-unit";
+    hash.string(domain, sizeof(domain) - 1);
+    hash.u64(descriptor.pool_uuid.hi);
+    hash.u64(descriptor.pool_uuid.lo);
+    hash.u32(descriptor.logical_unit_id);
+    hash.u64(descriptor.repr_gen);
+    return hash.finish();
+}
+
 vbr_artifact_status vbr_artifact_prepare(
         vbr_artifact_package & package) noexcept {
     try {

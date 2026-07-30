@@ -413,4 +413,15 @@ bool vbr_artifact_validate_portable_accounting(
     const std::vector<vbr_artifact_portable_topology> & topologies,
     const std::vector<vbr_artifact_portable_accounting_row> & rows) noexcept;
 
+// Closed wire-role to C-leaf mapping shared by format validation and the F2.2
+// transactional catalog. `_count` maps to the category sentinel.
+llama_cache_acct_category vbr_artifact_accounting_category(
+    vbr_artifact_accounting_role role) noexcept;
+
+// Canonical process-local lineage key for one logical VBR unit. Keeping the
+// generation-bearing tuple inside the reviewed artifact-format authority
+// prevents catalog clients from becoming raw generation readers.
+std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
+    const vbr_artifact_unit_descriptor & descriptor) noexcept;
+
 const char * vbr_artifact_status_name(vbr_artifact_status status) noexcept;
