@@ -13,13 +13,19 @@
 //     atomic release/mutate transaction would let a reservation be admitted against bytes that are
 //     not yet actually free (false admission).
 //   - single-shot: on serial drift it returns serial_conflict immediately rather than retrying with
-//     a possibly-stale capacity config; F0b owns the bounded resample→resnapshot→fits→reserve retry.
+//     a possibly-stale capacity config; the shared multi-leaf primitive below owns the bounded
+//     resnapshot→fits→reserve retry over one caller-sampled capacity config.
 //
-// F0a wires this into NO production mutation path. It is exercised by unit tests only; F0b converts
-// the destructive call sites and owns the mutation + stage/commit/abort that follows an admission.
+// `llama_cache_admit_reservation` (the single-leaf composer) is called in production only by the
+// shared multi-leaf transaction primitive below; direct callers are unit tests. That primitive owns
+// the mutation-adjacent stage/commit/abort sequence and is wired into two production mutation paths:
+// F0b's host-cache publish (server-cache-authority) and F2's artifact catalog publish.
 
 #include "llama-cache-accounting.h"
 #include "llama-cache-budget.h"
+
+#include <cstddef>
+#include <vector>
 
 // One typed reservation request. Exactly one target domain; no release credits.
 struct llama_cache_authority_request {
@@ -106,3 +112,76 @@ llama_cache_admission_result llama_cache_admit_reservation(
         llama_cache_acct_ledger          & ledger,
         const llama_cache_budget_config  & budget_config,
         const llama_cache_authority_request & request) noexcept;
+
+// One leaf in the shared all-or-nothing authority transaction. A zero existing_allocation asks
+// the primitive to mint a fresh allocation; a nonzero one joins that immutable allocation and
+// normally reserves zero new physical bytes while staging its full resident tuple. Output pointers
+// are written only after EVERY leaf commits and the post-commit fault seam passes.
+struct llama_cache_transaction_leaf {
+    llama_cache_acct_category        category = llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    llama_cache_acct_attribution     attribution;
+    uint64_t expected_logical = 0;
+    uint64_t reserve_resident = 0;
+    uint64_t stage_resident   = 0;
+    llama_cache_acct_artifact_id    artifact;
+    llama_cache_acct_content_digest content;
+    llama_cache_acct_lineage_id     lineage;
+    llama_cache_acct_alloc_id       existing_allocation;
+    llama_cache_acct_op_id *        committed_op  = nullptr;
+    llama_cache_acct_alloc_id *     allocation_out = nullptr;
+};
+
+// Library-owned fault vocabulary shared by F0b's translated server fault and F2's fake-shard
+// tests. UINT32_MAX disables an indexed seam.
+struct llama_cache_transaction_fault {
+    uint32_t fail_stage_at  = UINT32_MAX;
+    uint32_t fail_commit_at = UINT32_MAX;
+    bool fail_after_commit  = false;
+};
+
+// Optional call-site preparation that must remain between "all capacity claims admitted" and
+// "first C stage". F2 uses it to allocate catalog-owned shard storage without crossing the
+// reserve-before-mutate boundary; F0b has no preparation hook. Exceptions are caught by the
+// primitive and become internal_fault.
+struct llama_cache_transaction_after_admit {
+    void * context = nullptr;
+    bool (*run)(void * context) = nullptr;
+};
+
+enum class llama_cache_transaction_status : uint8_t {
+    committed,
+    invalid_argument,
+    admission_refused,
+    after_admit_failed,
+    stage_failed,
+    commit_failed,
+    post_commit_fault,
+    internal_fault,
+    _count,
+};
+
+const char * llama_cache_transaction_status_name(
+        llama_cache_transaction_status status) noexcept;
+
+struct llama_cache_transaction_result {
+    llama_cache_transaction_status status =
+        llama_cache_transaction_status::internal_fault;
+    llama_cache_admission_status admission_status =
+        llama_cache_admission_status::internal_fault;
+    size_t failed_leaf = SIZE_MAX;
+    uint32_t attempts = 0;
+    uint64_t serial_retries = 0;
+    uint64_t rolled_back = 0;
+};
+
+// Shared F0/F2 transaction:
+//   admit every leaf (bounded serial-conflict retry) → optional preparation → stage all →
+//   commit all → post-commit fault seam → publish success-only outputs.
+// Any failure releases already-committed ops and lets the move-only claims abort the rest.
+llama_cache_transaction_result llama_cache_execute_reservation_transaction(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget_config,
+        const std::vector<llama_cache_transaction_leaf> & leaves,
+        const llama_cache_transaction_fault & fault = {},
+        const llama_cache_transaction_after_admit & after_admit = {}) noexcept;

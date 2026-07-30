@@ -14,6 +14,22 @@ const char * llama_cache_admission_status_name(llama_cache_admission_status stat
     return "unknown";
 }
 
+const char * llama_cache_transaction_status_name(
+        llama_cache_transaction_status status) noexcept {
+    switch (status) {
+        case llama_cache_transaction_status::committed:          return "committed";
+        case llama_cache_transaction_status::invalid_argument:   return "invalid_argument";
+        case llama_cache_transaction_status::admission_refused:  return "admission_refused";
+        case llama_cache_transaction_status::after_admit_failed: return "after_admit_failed";
+        case llama_cache_transaction_status::stage_failed:       return "stage_failed";
+        case llama_cache_transaction_status::commit_failed:      return "commit_failed";
+        case llama_cache_transaction_status::post_commit_fault:  return "post_commit_fault";
+        case llama_cache_transaction_status::internal_fault:     return "internal_fault";
+        case llama_cache_transaction_status::_count:             break;
+    }
+    return "unknown";
+}
+
 llama_cache_reservation_claim::llama_cache_reservation_claim(
         llama_cache_acct_ledger * ledger, llama_cache_acct_op_id op) noexcept
     : ledger_(ledger), op_(op) {}
@@ -118,4 +134,184 @@ llama_cache_admission_result llama_cache_admit_reservation(
     // a function-try-block turns any allocation failure into a typed fail-closed verdict, so no
     // exception ever crosses the authority boundary into F0b.
     return { llama_cache_admission_status::internal_fault, {} };
+}
+
+llama_cache_transaction_result llama_cache_execute_reservation_transaction(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget_config,
+        const std::vector<llama_cache_transaction_leaf> & leaves,
+        const llama_cache_transaction_fault & fault,
+        const llama_cache_transaction_after_admit & after_admit) noexcept {
+    llama_cache_transaction_result out;
+    try {
+        if (leaves.empty() ||
+            (after_admit.context != nullptr) !=
+                (after_admit.run != nullptr)) {
+            out.status = llama_cache_transaction_status::invalid_argument;
+            return out;
+        }
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            const auto & leaf = leaves[i];
+            if (!leaf.committed_op ||
+                (leaf.existing_allocation &&
+                 leaf.reserve_resident != 0) ||
+                (!leaf.existing_allocation &&
+                 leaf.stage_resident != leaf.reserve_resident)) {
+                out.status = llama_cache_transaction_status::invalid_argument;
+                out.failed_leaf = i;
+                return out;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (leaves[j].committed_op == leaf.committed_op ||
+                    (leaf.allocation_out &&
+                     leaves[j].allocation_out == leaf.allocation_out)) {
+                    out.status =
+                        llama_cache_transaction_status::invalid_argument;
+                    out.failed_leaf = i;
+                    return out;
+                }
+            }
+        }
+
+        std::vector<llama_cache_admission_result> admissions(
+            leaves.size());
+        static constexpr uint32_t MAX_ATTEMPTS = 3;
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            llama_cache_admission_status last =
+                llama_cache_admission_status::serial_conflict;
+            uint32_t attempts = 0;
+            for (; attempts < MAX_ATTEMPTS; ++attempts) {
+                const auto & leaf = leaves[i];
+                llama_cache_authority_request request;
+                request.category = leaf.category;
+                request.domain = leaf.domain;
+                request.attribution = leaf.attribution;
+                request.expected_logical = leaf.expected_logical;
+                request.expected_resident = leaf.reserve_resident;
+                admissions[i] = llama_cache_admit_reservation(
+                    ledger, budget_config, request);
+                last = admissions[i].status;
+                if (last !=
+                        llama_cache_admission_status::serial_conflict) {
+                    attempts++;
+                    break;
+                }
+                out.serial_retries++;
+            }
+            if (last != llama_cache_admission_status::admitted) {
+                out.status =
+                    llama_cache_transaction_status::admission_refused;
+                out.admission_status = last;
+                out.failed_leaf = i;
+                out.attempts = attempts;
+                return out;
+            }
+        }
+
+        if (after_admit.run &&
+            !after_admit.run(after_admit.context)) {
+            out.status =
+                llama_cache_transaction_status::after_admit_failed;
+            return out;
+        }
+
+        std::vector<llama_cache_acct_alloc_id> allocations(
+            leaves.size());
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            if (fault.fail_stage_at == i) {
+                out.status =
+                    llama_cache_transaction_status::stage_failed;
+                out.failed_leaf = i;
+                return out;
+            }
+            allocations[i] = leaves[i].existing_allocation
+                ? leaves[i].existing_allocation
+                : ledger.new_alloc();
+            // The ledger has no join-without-stage primitive. Re-staging an
+            // existing immutable allocation therefore raises transient_peak
+            // briefly even though no payload bytes move and durable charge
+            // remains governed by first/last reference.
+            if (!allocations[i] ||
+                !ledger.stage(
+                    admissions[i].claim.op(),
+                    allocations[i],
+                    leaves[i].stage_resident,
+                    leaves[i].artifact,
+                    leaves[i].content,
+                    leaves[i].lineage)) {
+                out.status =
+                    llama_cache_transaction_status::stage_failed;
+                out.failed_leaf = i;
+                return out;
+            }
+        }
+
+        std::vector<llama_cache_acct_op_id> committed;
+        committed.reserve(leaves.size());
+        struct rollback_guard {
+            llama_cache_acct_ledger * ledger = nullptr;
+            std::vector<llama_cache_acct_op_id> * operations = nullptr;
+            uint64_t * rolled_back = nullptr;
+            bool keep = false;
+
+            void rollback() noexcept {
+                if (keep || !ledger || !operations || !rolled_back) {
+                    return;
+                }
+                for (const auto op : *operations) {
+                    if (ledger->release(op)) {
+                        (*rolled_back)++;
+                    }
+                }
+                keep = true;
+            }
+
+            ~rollback_guard() {
+                rollback();
+            }
+        } rollback {
+            &ledger, &committed, &out.rolled_back, false,
+        };
+
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            if (fault.fail_commit_at == i) {
+                out.status =
+                    llama_cache_transaction_status::commit_failed;
+                out.failed_leaf = i;
+                rollback.rollback();
+                return out;
+            }
+            llama_cache_acct_op_id operation;
+            if (!admissions[i].claim.commit(
+                    leaves[i].expected_logical, operation)) {
+                out.status =
+                    llama_cache_transaction_status::commit_failed;
+                out.failed_leaf = i;
+                rollback.rollback();
+                return out;
+            }
+            committed.push_back(operation);
+        }
+
+        if (fault.fail_after_commit) {
+            out.status =
+                llama_cache_transaction_status::post_commit_fault;
+            rollback.rollback();
+            return out;
+        }
+
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            *leaves[i].committed_op = committed[i];
+            if (leaves[i].allocation_out) {
+                *leaves[i].allocation_out = allocations[i];
+            }
+        }
+        rollback.keep = true;
+        out.status = llama_cache_transaction_status::committed;
+        out.admission_status = llama_cache_admission_status::admitted;
+        return out;
+    } catch (...) {
+        out.status = llama_cache_transaction_status::internal_fault;
+        return out;
+    }
 }

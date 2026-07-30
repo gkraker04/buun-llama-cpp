@@ -43,14 +43,10 @@ struct llama_vbr_artifact_fake_shard_completion {
     std::vector<uint8_t> bytes;
 };
 
-// Unit-test fault seams for the all-or-nothing C transaction. UINT32_MAX means
-// disabled. They are library-test inputs only; F3 backend errors arrive through
-// shard completion state instead.
-struct llama_vbr_artifact_publish_fault {
-    uint32_t fail_stage_at = UINT32_MAX;
-    uint32_t fail_commit_at = UINT32_MAX;
-    bool fail_after_commit = false;
-};
+// F2 keeps its public test vocabulary while using the one authority-owned
+// transaction fault type shared with F0b.
+using llama_vbr_artifact_publish_fault =
+    llama_cache_transaction_fault;
 
 struct llama_vbr_artifact_publish_result {
     llama_vbr_artifact_publish_status status =

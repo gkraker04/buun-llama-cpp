@@ -643,108 +643,153 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             leaves.push_back(leaf);
         }
 
-        std::vector<llama_cache_admission_result> admissions(
+        std::vector<llama_cache_acct_op_id> committed(
             leaves.size());
-        static constexpr uint32_t MAX_ATTEMPTS = 3;
+        std::vector<llama_cache_acct_alloc_id> allocations(
+            leaves.size());
+        std::vector<llama_cache_transaction_leaf>
+            transaction_leaves;
+        transaction_leaves.reserve(leaves.size());
         for (size_t i = 0; i < leaves.size(); ++i) {
-            llama_cache_admission_status last =
-                llama_cache_admission_status::serial_conflict;
-            for (uint32_t attempt = 0;
-                 attempt < MAX_ATTEMPTS; ++attempt) {
-                llama_cache_authority_request request;
-                request.category = leaves[i].binding.category;
-                request.domain = leaves[i].binding.domain;
-                request.attribution = {
-                    llama_cache_acct_attr_kind::artifact,
-                    -1,
-                    leaves[i].binding.artifact,
-                };
-                request.expected_logical =
-                    leaves[i].binding.logical;
-                request.expected_resident =
-                    leaves[i].reserve_resident;
-                admissions[i] = llama_cache_admit_reservation(
-                    impl_->ledger, budget, request);
-                last = admissions[i].status;
-                if (last !=
-                        llama_cache_admission_status::serial_conflict) {
-                    break;
+            llama_cache_transaction_leaf leaf;
+            leaf.category = leaves[i].binding.category;
+            leaf.domain = leaves[i].binding.domain;
+            leaf.attribution = {
+                llama_cache_acct_attr_kind::artifact,
+                -1,
+                leaves[i].binding.artifact,
+            };
+            leaf.expected_logical =
+                leaves[i].binding.logical;
+            leaf.reserve_resident =
+                leaves[i].reserve_resident;
+            leaf.stage_resident =
+                leaves[i].binding.resident;
+            leaf.artifact = leaves[i].binding.artifact;
+            leaf.content = leaves[i].binding.content;
+            leaf.lineage = leaves[i].binding.lineage;
+            leaf.existing_allocation =
+                leaves[i].existing
+                    ? leaves[i].binding.alloc
+                    : llama_cache_acct_alloc_id {};
+            leaf.committed_op = &committed[i];
+            leaf.allocation_out = &allocations[i];
+            transaction_leaves.push_back(leaf);
+        }
+
+        struct materialize_context {
+            impl::blob * blob = nullptr;
+            impl::stash * stash = nullptr;
+            const vbr_artifact_unit_descriptor * descriptor =
+                nullptr;
+            const std::vector<
+                llama_vbr_artifact_fake_shard_completion> *
+                    completions = nullptr;
+            bool blob_exists = false;
+            bool stash_exists = false;
+            bool has_stash = false;
+        } materialize {
+            &pending_blob,
+            &pending_stash,
+            &descriptor,
+            &completions,
+            blob_exists,
+            stash_exists,
+            has_stash,
+        };
+        const auto materialize_storage = [](void * opaque) -> bool {
+            auto * context =
+                static_cast<materialize_context *>(opaque);
+            if (!context || !context->blob ||
+                !context->stash || !context->descriptor ||
+                !context->completions) {
+                return false;
+            }
+            if (!context->blob_exists) {
+                context->blob->payload_shards.reserve(
+                    context->descriptor->shards.size());
+                for (const auto & shard :
+                     context->descriptor->shards) {
+                    const auto completion = std::find_if(
+                        context->completions->begin(),
+                        context->completions->end(),
+                        [&](const auto & candidate) {
+                            return !candidate.clean_stash &&
+                                   candidate.shard_index ==
+                                       shard.shard_index;
+                        });
+                    if (completion ==
+                            context->completions->end()) {
+                        return false;
+                    }
+                    context->blob->payload_shards.push_back(
+                        completion->bytes);
                 }
             }
-            if (last != llama_cache_admission_status::admitted) {
-                result.status =
-                    llama_vbr_artifact_publish_status::admission_refused;
-                impl_->n_refusals++;
-                return result;
+            if (context->has_stash &&
+                !context->stash_exists) {
+                context->stash->shards.reserve(
+                    context->descriptor->clean_stash.shards.size());
+                for (const auto & shard :
+                     context->descriptor->clean_stash.shards) {
+                    const auto completion = std::find_if(
+                        context->completions->begin(),
+                        context->completions->end(),
+                        [&](const auto & candidate) {
+                            return candidate.clean_stash &&
+                                   candidate.shard_index ==
+                                       shard.shard_index;
+                        });
+                    if (completion ==
+                            context->completions->end()) {
+                        return false;
+                    }
+                    context->stash->shards.push_back(
+                        completion->bytes);
+                }
             }
+            return true;
+        };
+        const llama_cache_transaction_after_admit after_admit {
+            &materialize, materialize_storage,
+        };
+        const auto transaction =
+            llama_cache_execute_reservation_transaction(
+                impl_->ledger, budget, transaction_leaves,
+                fault, after_admit);
+        if (transaction.status !=
+                llama_cache_transaction_status::committed) {
+            switch (transaction.status) {
+                case llama_cache_transaction_status::admission_refused:
+                    result.status =
+                        llama_vbr_artifact_publish_status::admission_refused;
+                    break;
+                case llama_cache_transaction_status::stage_failed:
+                    result.status =
+                        llama_vbr_artifact_publish_status::stage_failed;
+                    break;
+                case llama_cache_transaction_status::commit_failed:
+                    result.status =
+                        llama_vbr_artifact_publish_status::commit_failed;
+                    break;
+                case llama_cache_transaction_status::post_commit_fault:
+                    result.status =
+                        llama_vbr_artifact_publish_status::publication_failed;
+                    break;
+                case llama_cache_transaction_status::invalid_argument:
+                case llama_cache_transaction_status::after_admit_failed:
+                case llama_cache_transaction_status::internal_fault:
+                case llama_cache_transaction_status::_count:
+                    result.status =
+                        llama_vbr_artifact_publish_status::internal_error;
+                    break;
+                case llama_cache_transaction_status::committed:
+                    break;
+            }
+            impl_->n_refusals++;
+            return result;
         }
 
-        // The fake completion buffers belong to the caller. Catalog-owned
-        // payload storage is allocated only after every capacity claim has
-        // been admitted, matching F0b's reserve-before-mutate discipline.
-        if (!blob_exists) {
-            pending_blob.payload_shards.reserve(
-                descriptor.shards.size());
-            for (const auto & shard : descriptor.shards) {
-                const auto completion = std::find_if(
-                    completions.begin(), completions.end(),
-                    [&](const auto & candidate) {
-                        return !candidate.clean_stash &&
-                               candidate.shard_index ==
-                                   shard.shard_index;
-                    });
-                pending_blob.payload_shards.push_back(
-                    completion->bytes);
-            }
-        }
-        if (has_stash && !stash_exists) {
-            pending_stash.shards.reserve(
-                descriptor.clean_stash.shards.size());
-            for (const auto & shard :
-                 descriptor.clean_stash.shards) {
-                const auto completion = std::find_if(
-                    completions.begin(), completions.end(),
-                    [&](const auto & candidate) {
-                        return candidate.clean_stash &&
-                               candidate.shard_index ==
-                                   shard.shard_index;
-                    });
-                pending_stash.shards.push_back(
-                    completion->bytes);
-            }
-        }
-
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            if (fault.fail_stage_at == i) {
-                result.status =
-                    llama_vbr_artifact_publish_status::stage_failed;
-                impl_->n_refusals++;
-                return result;
-            }
-            if (!leaves[i].existing) {
-                leaves[i].binding.alloc =
-                    impl_->ledger.new_alloc();
-            }
-            // Joining an immutable allocation must pass through stage(), so
-            // transient_peak observes the brief join even though no payload
-            // bytes are copied and durable charge stays singular.
-            if (!leaves[i].binding.alloc ||
-                !impl_->ledger.stage(
-                    admissions[i].claim.op(),
-                    leaves[i].binding.alloc,
-                    leaves[i].binding.resident,
-                    leaves[i].binding.artifact,
-                    leaves[i].binding.content,
-                    leaves[i].binding.lineage)) {
-                result.status =
-                    llama_vbr_artifact_publish_status::stage_failed;
-                impl_->n_refusals++;
-                return result;
-            }
-        }
-
-        std::vector<llama_cache_acct_op_id> committed;
-        committed.reserve(leaves.size());
         struct rollback_guard {
             llama_cache_acct_ledger * ledger = nullptr;
             std::vector<llama_cache_acct_op_id> * ops = nullptr;
@@ -759,21 +804,7 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
         } rollback { &impl_->ledger, &committed, false };
 
         for (size_t i = 0; i < leaves.size(); ++i) {
-            if (fault.fail_commit_at == i) {
-                result.status =
-                    llama_vbr_artifact_publish_status::commit_failed;
-                impl_->n_refusals++;
-                return result;
-            }
-            llama_cache_acct_op_id op;
-            if (!admissions[i].claim.commit(
-                    leaves[i].binding.logical, op)) {
-                result.status =
-                    llama_vbr_artifact_publish_status::commit_failed;
-                impl_->n_refusals++;
-                return result;
-            }
-            committed.push_back(op);
+            leaves[i].binding.alloc = allocations[i];
             if (!leaves[i].existing) {
                 if (leaves[i].binding.category ==
                         llama_cache_acct_category::clean_stash_payload) {
@@ -785,12 +816,6 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                         leaves[i].binding);
                 }
             }
-        }
-        if (fault.fail_after_commit) {
-            result.status =
-                llama_vbr_artifact_publish_status::publication_failed;
-            impl_->n_refusals++;
-            return result;
         }
 
         pending_reference.operations = committed;

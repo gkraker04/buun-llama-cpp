@@ -122,8 +122,6 @@ bool server_cache_authority::sample_budget(
 
 bool server_cache_authority::admit_host_entry(
         server_prompt_cache_state & entry) noexcept {
-    static constexpr uint32_t MAX_ATTEMPTS = 3;
-
     if (!configured) {
         admission_refusals++;
         SRV_WRN("%s\n",
@@ -160,75 +158,80 @@ bool server_cache_authority::admit_host_entry(
         return false;
     }
 
-    std::array<llama_cache_admission_result, 3> admissions;
-    for (size_t i = 0; i < leaves.size(); ++i) {
-        llama_cache_admission_status last =
-            llama_cache_admission_status::serial_conflict;
-        uint32_t attempts = 0;
-        for (; attempts < MAX_ATTEMPTS; ++attempts) {
-            llama_cache_authority_request request;
-            request.category          = leaves[i].category;
-            request.domain            =
+    std::array<llama_cache_acct_op_id, 3> committed = {};
+    std::vector<llama_cache_transaction_leaf> transaction_leaves;
+    try {
+        transaction_leaves.reserve(leaves.size());
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            llama_cache_transaction_leaf leaf;
+            leaf.category = leaves[i].category;
+            leaf.domain =
                 llama_cache_acct_resource_domain::non_device(
                     llama_cache_acct_residency::pageable_host);
-            request.expected_logical  = leaves[i].bytes;
-            request.expected_resident = leaves[i].bytes;
-            admissions[i] = llama_cache_admit_reservation(
-                ledger, config, request);
-            last = admissions[i].status;
-            if (last != llama_cache_admission_status::serial_conflict) {
-                attempts++;
-                break;
-            }
-            admission_retries++;
+            leaf.expected_logical = leaves[i].bytes;
+            leaf.reserve_resident = leaves[i].bytes;
+            leaf.stage_resident = leaves[i].bytes;
+            leaf.committed_op = &committed[i];
+            transaction_leaves.push_back(leaf);
         }
-        if (last != llama_cache_admission_status::admitted) {
-            admission_refusals++;
-            SRV_WRN(
-                "CACHE_AUTHORITY host publish refused: category=%u status=%s attempts=%u\n",
-                unsigned(leaves[i].category),
-                llama_cache_admission_status_name(last),
-                attempts);
-            return false;
-        }
-
-        const auto alloc = ledger.new_alloc();
-        if (!alloc ||
-            !ledger.stage(
-                admissions[i].claim.op(), alloc, leaves[i].bytes)) {
-            admission_refusals++;
-            SRV_WRN(
-                "CACHE_AUTHORITY host publish refused: category=%u status=stage_failed\n",
-                unsigned(leaves[i].category));
-            return false;
-        }
-    }
-
-    std::array<llama_cache_acct_op_id, 3> committed = {};
-    for (size_t i = 0; i < leaves.size(); ++i) {
-        if (!admissions[i].claim.commit(leaves[i].bytes, committed[i])) {
-            for (size_t j = 0; j < i; ++j) {
-                if (committed[j] && ledger.release(committed[j])) {
-                    admission_rollbacks++;
-                }
-            }
-            admission_refusals++;
-            SRV_WRN(
-                "CACHE_AUTHORITY host publish refused: category=%u status=commit_failed\n",
-                unsigned(leaves[i].category));
-            return false;
-        }
-    }
-
-    if (server_fault("cache_lifecycle_after_commit")) {
-        for (const auto op : committed) {
-            if (ledger.release(op)) {
-                admission_rollbacks++;
-            }
-        }
+    } catch (...) {
         admission_refusals++;
         SRV_WRN("%s\n",
-                "CACHE_AUTHORITY host publish refused: injected post-commit failure");
+                "CACHE_AUTHORITY host publish refused: transaction setup failed");
+        return false;
+    }
+
+    llama_cache_transaction_fault fault;
+    fault.fail_after_commit =
+        server_fault("cache_lifecycle_after_commit");
+    const auto transaction =
+        llama_cache_execute_reservation_transaction(
+            ledger, config, transaction_leaves, fault);
+    admission_retries += transaction.serial_retries;
+    admission_rollbacks += transaction.rolled_back;
+
+    if (transaction.status !=
+            llama_cache_transaction_status::committed) {
+        admission_refusals++;
+        const auto category =
+            transaction.failed_leaf < leaves.size()
+                ? leaves[transaction.failed_leaf].category
+                : llama_cache_acct_category::container_overhead;
+        switch (transaction.status) {
+            case llama_cache_transaction_status::admission_refused:
+                SRV_WRN(
+                    "CACHE_AUTHORITY host publish refused: category=%u status=%s attempts=%u\n",
+                    unsigned(category),
+                    llama_cache_admission_status_name(
+                        transaction.admission_status),
+                    transaction.attempts);
+                break;
+            case llama_cache_transaction_status::stage_failed:
+                SRV_WRN(
+                    "CACHE_AUTHORITY host publish refused: category=%u status=stage_failed\n",
+                    unsigned(category));
+                break;
+            case llama_cache_transaction_status::commit_failed:
+                SRV_WRN(
+                    "CACHE_AUTHORITY host publish refused: category=%u status=commit_failed\n",
+                    unsigned(category));
+                break;
+            case llama_cache_transaction_status::post_commit_fault:
+                SRV_WRN("%s\n",
+                        "CACHE_AUTHORITY host publish refused: injected post-commit failure");
+                break;
+            case llama_cache_transaction_status::invalid_argument:
+            case llama_cache_transaction_status::after_admit_failed:
+            case llama_cache_transaction_status::internal_fault:
+            case llama_cache_transaction_status::_count:
+                SRV_WRN(
+                    "CACHE_AUTHORITY host publish refused: status=%s\n",
+                    llama_cache_transaction_status_name(
+                        transaction.status));
+                break;
+            case llama_cache_transaction_status::committed:
+                break;
+        }
         return false;
     }
 

@@ -105,15 +105,22 @@ static uint64_t host_reserved(llama_cache_acct_ledger & ledger) {
     return 0;
 }
 
-static uint64_t host_measure(
+static uint64_t host_category_measure(
         llama_cache_acct_ledger & ledger,
+        llama_cache_acct_category category,
         llama_cache_acct_measure measure) {
     for (const auto & row : ledger.snapshot().cells) {
-        if (row.category == PAYLOAD && row.domain == HOST) {
+        if (row.category == category && row.domain == HOST) {
             return row.cell.measures[size_t(measure)].value;
         }
     }
     return 0;
+}
+
+static uint64_t host_measure(
+        llama_cache_acct_ledger & ledger,
+        llama_cache_acct_measure measure) {
+    return host_category_measure(ledger, PAYLOAD, measure);
 }
 
 // Happy path: the reservation fits and is admitted, handing back a claim that owns the reserved op,
@@ -236,6 +243,184 @@ static void test_claim_commit_failure_auto_abort() {
     CHECK(host_reserved(ledger) == 0);
 }
 
+static llama_cache_transaction_leaf transaction_leaf(
+        llama_cache_acct_category category,
+        uint64_t bytes,
+        llama_cache_acct_op_id & committed,
+        llama_cache_acct_alloc_id & allocation) {
+    llama_cache_transaction_leaf leaf;
+    leaf.category = category;
+    leaf.domain = HOST;
+    leaf.expected_logical = bytes;
+    leaf.reserve_resident = bytes;
+    leaf.stage_resident = bytes;
+    leaf.committed_op = &committed;
+    leaf.allocation_out = &allocation;
+    return leaf;
+}
+
+struct after_admit_probe {
+    llama_cache_acct_ledger * ledger = nullptr;
+    uint64_t expected_live_ops = 0;
+    uint64_t calls = 0;
+    bool return_value = true;
+};
+
+static bool observe_after_admit(void * opaque) {
+    auto & probe = *static_cast<after_admit_probe *>(opaque);
+    probe.calls++;
+    return probe.ledger &&
+        probe.ledger->snapshot().live_ops == probe.expected_live_ops &&
+        probe.return_value;
+}
+
+// The shared transaction reserves every leaf before the optional preparation hook, then stages and
+// commits the group. Outputs are published only after the whole group has reached its terminal.
+static void test_transaction_fresh_group() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id committed[2];
+    llama_cache_acct_alloc_id allocations[2];
+    std::vector<llama_cache_transaction_leaf> leaves {
+        transaction_leaf(
+            llama_cache_acct_category::full_snapshot_payload,
+            40, committed[0], allocations[0]),
+        transaction_leaf(
+            llama_cache_acct_category::checkpoint_state_payload,
+            24, committed[1], allocations[1]),
+    };
+    after_admit_probe probe { &ledger, 2, 0, true };
+    const llama_cache_transaction_after_admit hook {
+        &probe, observe_after_admit,
+    };
+
+    const auto result = llama_cache_execute_reservation_transaction(
+        ledger, config, leaves, {}, hook);
+    CHECK(result.status == llama_cache_transaction_status::committed);
+    CHECK(result.admission_status == llama_cache_admission_status::admitted);
+    CHECK(result.rolled_back == 0);
+    CHECK(probe.calls == 1);
+    CHECK(bool(committed[0]));
+    CHECK(bool(committed[1]));
+    CHECK(bool(allocations[0]));
+    CHECK(bool(allocations[1]));
+    CHECK(allocations[0] != allocations[1]);
+    CHECK(ledger.snapshot().live_ops == 2);
+    CHECK(host_category_measure(
+        ledger, llama_cache_acct_category::full_snapshot_payload,
+        llama_cache_acct_measure::resident_allocated) == 40);
+    CHECK(host_category_measure(
+        ledger, llama_cache_acct_category::checkpoint_state_payload,
+        llama_cache_acct_measure::resident_allocated) == 24);
+
+    CHECK(ledger.release(committed[0]));
+    CHECK(ledger.release(committed[1]));
+    CHECK(ledger.snapshot().live_ops == 0);
+}
+
+// An existing-allocation leaf reserves no new resident capacity but stages the immutable allocation's
+// full tuple to acquire a second committed reference. First/last-reference charging stays authoritative.
+static void test_transaction_existing_allocation() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id first_op;
+    llama_cache_acct_alloc_id allocation;
+    std::vector<llama_cache_transaction_leaf> fresh {
+        transaction_leaf(PAYLOAD, 64, first_op, allocation),
+    };
+    CHECK(llama_cache_execute_reservation_transaction(
+        ledger, config, fresh).status ==
+            llama_cache_transaction_status::committed);
+
+    llama_cache_acct_op_id joined_op;
+    llama_cache_acct_alloc_id joined_allocation;
+    auto joined = transaction_leaf(
+        PAYLOAD, 64, joined_op, joined_allocation);
+    joined.reserve_resident = 0;
+    joined.existing_allocation = allocation;
+    std::vector<llama_cache_transaction_leaf> adopted { joined };
+    CHECK(llama_cache_execute_reservation_transaction(
+        ledger, config, adopted).status ==
+            llama_cache_transaction_status::committed);
+    CHECK(joined_allocation == allocation);
+    CHECK(host_measure(
+        ledger, llama_cache_acct_measure::resident_allocated) == 64);
+
+    CHECK(ledger.release(first_op));
+    CHECK(host_measure(
+        ledger, llama_cache_acct_measure::resident_allocated) == 64);
+    CHECK(ledger.release(joined_op));
+    CHECK(host_measure(
+        ledger, llama_cache_acct_measure::resident_allocated) == 0);
+    CHECK(ledger.snapshot().live_ops == 0);
+}
+
+// A group fault releases every already-committed leaf, lets the remaining claims abort, and leaves
+// success-only output destinations untouched. This is the rollback contract both F0b and F2 consume.
+static void test_transaction_fault_rollback() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id committed[2] { { 901 }, { 902 } };
+    llama_cache_acct_alloc_id allocations[2] { { 801 }, { 802 } };
+    std::vector<llama_cache_transaction_leaf> leaves {
+        transaction_leaf(
+            llama_cache_acct_category::full_snapshot_payload,
+            40, committed[0], allocations[0]),
+        transaction_leaf(
+            llama_cache_acct_category::checkpoint_state_payload,
+            24, committed[1], allocations[1]),
+    };
+    llama_cache_transaction_fault fault;
+    fault.fail_commit_at = 1;
+
+    const auto result = llama_cache_execute_reservation_transaction(
+        ledger, config, leaves, fault);
+    CHECK(result.status == llama_cache_transaction_status::commit_failed);
+    CHECK(result.failed_leaf == 1);
+    CHECK(result.rolled_back == 1);
+    CHECK(committed[0].v == 901);
+    CHECK(committed[1].v == 902);
+    CHECK(allocations[0].v == 801);
+    CHECK(allocations[1].v == 802);
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_category_measure(
+        ledger, llama_cache_acct_category::full_snapshot_payload,
+        llama_cache_acct_measure::resident_allocated) == 0);
+    CHECK(host_category_measure(
+        ledger, llama_cache_acct_category::checkpoint_state_payload,
+        llama_cache_acct_measure::resident_allocated) == 0);
+}
+
+// A preparation failure occurs only after all claims exist and before any stage. The claims' RAII
+// destructors return the ledger to its original state, and no output is exposed.
+static void test_transaction_after_admit_failure() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id committed { 901 };
+    llama_cache_acct_alloc_id allocation { 801 };
+    std::vector<llama_cache_transaction_leaf> leaves {
+        transaction_leaf(PAYLOAD, 64, committed, allocation),
+    };
+    after_admit_probe probe { &ledger, 1, 0, false };
+    const llama_cache_transaction_after_admit hook {
+        &probe, observe_after_admit,
+    };
+
+    const auto result = llama_cache_execute_reservation_transaction(
+        ledger, config, leaves, {}, hook);
+    CHECK(result.status ==
+        llama_cache_transaction_status::after_admit_failed);
+    CHECK(probe.calls == 1);
+    CHECK(committed.v == 901);
+    CHECK(allocation.v == 801);
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(ledger) == 0);
+}
+
 static void test_status_names() {
     CHECK(std::string(llama_cache_admission_status_name(
         llama_cache_admission_status::admitted)) == "admitted");
@@ -243,6 +428,11 @@ static void test_status_names() {
         llama_cache_admission_status::incomplete_evidence)) == "incomplete_evidence");
     CHECK(std::string(llama_cache_admission_status_name(
         llama_cache_admission_status::internal_fault)) == "internal_fault");
+    CHECK(std::string(llama_cache_transaction_status_name(
+        llama_cache_transaction_status::committed)) == "committed");
+    CHECK(std::string(llama_cache_transaction_status_name(
+        llama_cache_transaction_status::post_commit_fault)) ==
+        "post_commit_fault");
 }
 
 int main() {
@@ -255,6 +445,10 @@ int main() {
     test_claim_move_assign();
     test_claim_commit_terminal();
     test_claim_commit_failure_auto_abort();
+    test_transaction_fresh_group();
+    test_transaction_existing_allocation();
+    test_transaction_fault_rollback();
+    test_transaction_after_admit_failure();
     test_status_names();
 
     if (failures > 0) {
