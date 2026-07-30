@@ -185,6 +185,37 @@ bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation
     return false;
 }
 
+bool vbr_operation_registry_quiescent_for(
+        const vbr_operation_pool_key * pools,
+        size_t n_pools) noexcept {
+    if (pools == nullptr || n_pools == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
+    for (size_t slot = 0; slot < VBR_OPERATION_REGISTRY_CAPACITY;
+         ++slot) {
+        const uint64_t live =
+            g_vbr_live_operations[slot].load(std::memory_order_acquire);
+        if (live == 0 ||
+            live == std::numeric_limits<uint64_t>::max()) {
+            continue;
+        }
+        const auto & binding = g_vbr_live_bindings[slot];
+        GGML_ASSERT(binding.operation_id.value == live);
+        for (uint8_t i = 0; i < binding.n_targets; ++i) {
+            const auto & target = binding.targets[i];
+            for (size_t p = 0; p < n_pools; ++p) {
+                if ((target.pool_hi == 0 && target.pool_lo == 0) ||
+                    (target.pool_hi == pools[p].hi &&
+                     target.pool_lo == pools[p].lo)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void vbr_recovery_autorecord_on_close(vbr_operation_id operation_id);
 
 bool vbr_operation_registry_close(vbr_operation_id operation_id, vbr_operation_outcome outcome) {

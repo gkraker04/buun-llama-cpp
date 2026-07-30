@@ -1242,6 +1242,178 @@ static void test_catalog_streaming_protocol() {
     CHECK(unconfigured.ledger.snapshot().live_ops == 0);
 }
 
+static void test_catalog_multi_unit_atomic_publish() {
+    catalog_fixture f;
+    auto & package = f.package;
+    auto second = package.unit_blobs.front();
+    second.descriptor.logical_unit_id = 1;
+    second.descriptor.clean_stash_state =
+        vbr_artifact_clean_stash_state::absent_at_source;
+    second.descriptor.clean_stash = {};
+    second.unit_version_id = {};
+    second.payload_digest = {};
+    package.unit_blobs.push_back(second);
+    package.manifest.generation.controllers[0].units.push_back(
+        package.manifest.generation.controllers[0].units.front());
+    auto second_reference =
+        package.manifest.unit_references.front();
+    second_reference.logical_unit_id = 1;
+    second_reference.unit_version_id = {};
+    second_reference.payload_digest = {};
+    second_reference.has_stash_reference = false;
+    second_reference.stash_reference = {};
+    package.manifest.unit_references.push_back(second_reference);
+    for (auto & row : package.manifest.accounting) {
+        if (row.role ==
+                vbr_artifact_accounting_role::unit_payload) {
+            row.logical_bytes *= 2;
+            row.resident_bytes *= 2;
+        }
+    }
+    package.manifest.manifest_digest = {};
+    package.manifest.capture_generation_id = {};
+    package.manifest.consistency = {};
+
+    CHECK(f.catalog->configure_accounting(package));
+    vbr_capture_stream_status status;
+    {
+        auto aborted = f.catalog->begin_capture(
+            package, f.budget, {}, status);
+        CHECK(aborted);
+        auto first_only = aborted
+            ? aborted->begin_unit(0, status) : nullptr;
+        CHECK(first_only);
+        if (first_only) {
+            for (const auto & completion : f.completions()) {
+                auto segment = verified_segment(completion, 2);
+                CHECK(first_only->accept_verified_segment(segment) ==
+                      vbr_capture_stream_status::ok);
+            }
+            CHECK(first_only->seal_unit() ==
+                  vbr_capture_stream_status::ok);
+        }
+        first_only.reset();
+        aborted.reset();
+        CHECK(f.catalog->snapshot().references == 0);
+        CHECK(f.ledger.snapshot().live_ops == 0);
+    }
+    auto build = f.catalog->begin_capture(
+        package, f.budget, {}, status);
+    CHECK(build);
+    if (!build) {
+        return;
+    }
+    const auto completions = f.completions();
+    auto first = build->begin_unit(0, status);
+    CHECK(first);
+    for (const auto & completion : completions) {
+        auto segment = verified_segment(completion, 2);
+        CHECK(first->accept_verified_segment(segment) ==
+              vbr_capture_stream_status::ok);
+    }
+    CHECK(first->seal_unit() ==
+          vbr_capture_stream_status::ok);
+    first.reset();
+
+    auto second_unit = build->begin_unit(1, status);
+    CHECK(second_unit);
+    for (const auto & completion : completions) {
+        if (completion.clean_stash) {
+            continue;
+        }
+        auto copy = completion;
+        copy.unit_index = 1;
+        auto segment = verified_segment(copy, 3);
+        CHECK(second_unit->accept_verified_segment(segment) ==
+              vbr_capture_stream_status::ok);
+    }
+    CHECK(second_unit->seal_unit() ==
+          vbr_capture_stream_status::ok);
+    second_unit.reset();
+
+    const auto published = build->publish_reference();
+    CHECK(published.status == vbr_capture_stream_status::ok);
+    CHECK(published.reference_artifact.v != 0);
+    const auto snapshot = f.catalog->snapshot();
+    CHECK(snapshot.blobs == 2);
+    CHECK(snapshot.stashes == 1);
+    CHECK(snapshot.references == 1);
+    build.reset();
+    CHECK(f.catalog->retire(published.reference_artifact));
+    CHECK(f.catalog->snapshot().blobs == 0);
+    CHECK(f.catalog->snapshot().stashes == 0);
+    CHECK(f.ledger.snapshot().live_ops == 0);
+}
+
+static void test_catalog_streaming_companion_lifetime() {
+    catalog_fixture f;
+    vbr_artifact_companion_payload companion;
+    companion.kind = vbr_artifact_companion_kind::recurrent;
+    companion.format_version = 1;
+    companion.build_identity_digest = marker(0xa1);
+    companion.domain = {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX,
+        UINT16_MAX,
+    };
+    companion.payload_bytes = f.storage.recurrent.bytes.size();
+    f.package.companions.push_back(companion);
+    f.package.manifest.accounting.push_back({
+        vbr_artifact_accounting_role::recurrent_payload,
+        companion.domain,
+        companion.payload_bytes,
+        companion.payload_bytes,
+        llama_cache_acct_attr_kind::artifact,
+    });
+    CHECK(f.catalog->configure_accounting(f.package));
+
+    vbr_capture_stream_status status;
+    auto build = f.catalog->begin_capture(
+        f.package, f.budget, {}, status);
+    CHECK(build);
+    if (!build) {
+        return;
+    }
+    auto unit = build->begin_unit(0, status);
+    CHECK(unit);
+    for (const auto & completion : f.completions()) {
+        const auto segment = verified_segment(completion, 2);
+        CHECK(unit->accept_verified_segment(segment) ==
+              vbr_capture_stream_status::ok);
+    }
+    CHECK(unit->seal_unit() ==
+          vbr_capture_stream_status::ok);
+    unit.reset();
+
+    auto companion_bytes =
+        std::make_shared<artifact_segment_chain>();
+    CHECK(companion_bytes->append(
+        f.storage.recurrent.bytes.data(),
+        f.storage.recurrent.bytes.size()));
+    vbr_verified_companion verified;
+    verified.companion_index = 0;
+    verified.bytes = companion_bytes;
+    verified.streaming_digest =
+        vbr_capture_stream_digest(*companion_bytes);
+    CHECK(build->accept_verified_companion(verified) ==
+          vbr_capture_stream_status::ok);
+    const auto published = build->publish_reference();
+    CHECK(published.status == vbr_capture_stream_status::ok);
+    build.reset();
+    companion_bytes.reset();
+
+    const auto snapshot = f.ledger.snapshot();
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::full_snapshot_payload,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value ==
+        f.storage.recurrent.bytes.size());
+    CHECK(f.catalog->retire(published.reference_artifact));
+    CHECK(f.ledger.snapshot().live_ops == 0);
+}
+
 static void test_catalog_charge_once_and_retire() {
     catalog_fixture f;
     const size_t alloc_baseline =
@@ -1583,6 +1755,8 @@ int main() {
     test_companion_payload();
     test_stream_larger_than_capture_ring();
     test_catalog_streaming_protocol();
+    test_catalog_multi_unit_atomic_publish();
+    test_catalog_streaming_companion_lifetime();
     test_catalog_charge_once_and_retire();
     test_catalog_all_shard_failures_and_rollback();
     test_catalog_destructor_releases_live_references();

@@ -91,6 +91,11 @@ public:
     // producer and never resets a cell already configured by this catalog.
     bool configure_accounting(const vbr_artifact_package & package) noexcept;
 
+    // F3 explicit-capture preparation door: atomically requires/binds the
+    // package topology set and creates every measured-zero accounting cell.
+    bool prepare_capture_package(
+        const vbr_artifact_package & package) noexcept;
+
     // Bounded F2.2 per-unit publication. The format package must contain one
     // unit blob/reference; F3 composes checkpoint-wide capture from these
     // immutable unit publications.
@@ -121,6 +126,13 @@ private:
     std::unique_ptr<impl> impl_;
 
     llama_vbr_artifact_publish_result publish_stream(
+        const vbr_artifact_package & package,
+        const std::vector<vbr_verified_segment> & segments,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        void * prepared_stream_state) noexcept;
+
+    llama_vbr_artifact_publish_result publish_stream_complete(
         const vbr_artifact_package & package,
         const std::vector<vbr_verified_segment> & segments,
         const llama_cache_budget_config & budget,

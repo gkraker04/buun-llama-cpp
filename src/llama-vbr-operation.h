@@ -566,6 +566,17 @@ bool vbr_operation_registry_has_capacity();
 // kind/seq/range instead of caller-supplied values. Returns false once the operation ended.
 bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation_binding & out);
 
+struct vbr_operation_pool_key {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+};
+
+// Read-only F3 stable-reader probe. It scans the fixed registry under the
+// existing mutex and never allocates or mints an operation id.
+bool vbr_operation_registry_quiescent_for(
+    const vbr_operation_pool_key * pools,
+    size_t n_pools) noexcept;
+
 // A2 explicit close semantics (design D-A2-4v3). `vbr_operation_registry_end` remains the
 // committed-close alias for the non-mutating legacy callers (freeze scopes).
 enum class vbr_operation_outcome : uint8_t {

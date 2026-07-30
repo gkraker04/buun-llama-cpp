@@ -163,6 +163,12 @@ struct vbr_verified_segment {
     std::array<uint8_t, 32> streaming_digest = {};
 };
 
+struct vbr_verified_companion {
+    uint32_t companion_index = UINT32_MAX;
+    std::shared_ptr<const artifact_segment_chain> bytes;
+    std::array<uint8_t, 32> streaming_digest = {};
+};
+
 struct vbr_capture_sink_result {
     vbr_capture_stream_status status =
         vbr_capture_stream_status::internal_error;
@@ -186,6 +192,8 @@ public:
     virtual std::unique_ptr<vbr_unit_build> begin_unit(
         uint32_t unit_index,
         vbr_capture_stream_status & status) noexcept = 0;
+    virtual vbr_capture_stream_status accept_verified_companion(
+        const vbr_verified_companion & companion) noexcept = 0;
     virtual vbr_capture_sink_result publish_reference() noexcept = 0;
 };
 

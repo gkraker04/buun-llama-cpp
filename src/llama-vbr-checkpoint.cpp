@@ -5,6 +5,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-tree.h"
 #include "llama-vbr-checkpoint-compose.inc"
 #include "llama-vbr-generation.h"
 #include "llama-vbr-generation-oracle.h"
@@ -37,23 +38,21 @@ struct walk_child {
 };
 
 bool collect_children(llama_memory_i * mem, std::vector<walk_child> & out) {
-    if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
-        out.push_back({ iswa->get_base(), /*live_guarded=*/true  });
-        out.push_back({ iswa->get_swa(),  /*live_guarded=*/false });
-        return true;
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(mem, tree)) {
+        return false;
     }
-    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
-        return collect_children(hybrid_iswa->get_mem_attn(), out);
+    out.clear();
+    for (const auto & child : tree) {
+        if (child.attention != nullptr) {
+            out.push_back({
+                child.attention,
+                child.dependency_mode ==
+                    checkpoint_child_dependency_mode::live_guarded,
+            });
+        }
     }
-    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
-        out.push_back({ hybrid->get_mem_attn(), /*live_guarded=*/true });
-        return true;
-    }
-    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
-        out.push_back({ kv, /*live_guarded=*/false });
-        return true;
-    }
-    return dynamic_cast<llama_memory_recurrent *>(mem) != nullptr;
+    return true;
 }
 
 struct child_capture_ctx {

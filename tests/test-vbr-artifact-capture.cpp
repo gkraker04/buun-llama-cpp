@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact-capture.h"
+#include "llama-vbr-operation.h"
 
 #include "ggml.h"
 
@@ -64,6 +65,38 @@ static void test_segment_chain_offsets() {
     CHECK(source.read(source.context, 7, &one, 1));
     CHECK(one == 7);
     CHECK(!chain.read(8, &one, 1));
+}
+
+static void test_registry_quiescence_query() {
+    const vbr_operation_pool_key pool { 0x1111, 0x2222 };
+    const vbr_operation_pool_key other { 0x3333, 0x4444 };
+    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+
+    {
+        auto binding = vbr_mutation_binding(
+            vbr_operation_kind::sequence_edit,
+            0, 0, 1,
+            vbr_operation_class::explicit_destructive_trim,
+            pool.hi, pool.lo, 0);
+        vbr_scoped_operation operation(binding);
+        CHECK(bool(operation));
+        CHECK(!vbr_operation_registry_quiescent_for(&pool, 1));
+        CHECK(vbr_operation_registry_quiescent_for(&other, 1));
+    }
+    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+
+    {
+        auto binding = vbr_mutation_binding(
+            vbr_operation_kind::recovery,
+            -1, -1, -1,
+            vbr_operation_class::state_api);
+        vbr_scoped_operation operation(binding);
+        CHECK(bool(operation));
+        CHECK(!vbr_operation_registry_quiescent_for(&pool, 1));
+        CHECK(!vbr_operation_registry_quiescent_for(&other, 1));
+    }
+    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+    CHECK(!vbr_operation_registry_quiescent_for(nullptr, 0));
 }
 
 static void test_cpu_ring_boundaries() {
@@ -283,6 +316,7 @@ static void test_cuda_ring() {
 
 int main(int argc, char ** argv) {
     test_segment_chain_offsets();
+    test_registry_quiescence_query();
     test_cpu_ring_boundaries();
     test_ring_accounting_once();
     if (argc == 2 && std::string(argv[1]) == "--cuda") {

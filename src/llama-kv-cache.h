@@ -24,6 +24,9 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class vbr_unit_build;
+class vbr_pinned_chunk_ring;
+struct vbr_capture_stream_stats;
 
 //
 // llama_kv_cache
@@ -338,6 +341,77 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    friend class vbr_live_capture_adapter;
+    struct vbr_capture_unit_request {
+        uint32_t child_id = 0;
+        const void * bindings = nullptr;
+    };
+    struct vbr_capture_unit_plan {
+        struct shard {
+            void * pool = nullptr;
+            void * extent = nullptr;
+            uint32_t shard_index = 0;
+            uint32_t topology_index = UINT32_MAX;
+            uint16_t device_ordinal = UINT16_MAX;
+            uint32_t lane = UINT32_MAX;
+            uint64_t payload_bytes = 0;
+            uint64_t row_bytes = 0;
+            uint64_t columns = 0;
+            uint64_t stash_bytes = 0;
+        };
+        uint32_t child_id = 0;
+        uint32_t logical_unit = 0;
+        uint32_t capture_index = UINT32_MAX;
+        bool is_v = false;
+        vbr_unit_generation generation;
+        uint32_t n_stream = 0;
+        bool unified = false;
+        uint32_t wm_cells = 0;
+        std::vector<shard> shards;
+    };
+    struct vbr_capture_stability_token {
+        struct geometry {
+            uint32_t logical_unit = 0;
+            vbr_unit_generation generation;
+            uint32_t wm_cells = 0;
+            std::vector<const ggml_tensor *> tensors;
+            std::vector<size_t> byte_offsets;
+            std::vector<uint32_t> stash_valid;
+            std::vector<size_t> stash_offsets;
+        };
+        vbr_pool_uuid pool_uuid;
+        uint64_t controller_generation = 0;
+        uint64_t mutation_serial = 0;
+        std::array<uint8_t, 32> degrade_order_digest = {};
+        std::array<uint8_t, 32> policy_digest = {};
+        uint64_t degrade_cursor = 0;
+        int32_t floor_type = -1;
+        uint64_t pressure_independent_settings = 0;
+        bool completed_wave = false;
+        std::vector<geometry> units;
+    };
+
+    bool vbr_capture_settle() noexcept;
+    bool vbr_capture_size_pass(
+        const vbr_capture_unit_request & request,
+        std::vector<vbr_capture_unit_plan> & output,
+        vbr_capture_stability_token & stability) const noexcept;
+    bool vbr_capture_stream_unit(
+        const vbr_capture_unit_plan & plan,
+        vbr_unit_build & sink,
+        vbr_pinned_chunk_ring & ring,
+        vbr_capture_stream_stats & stats) const noexcept;
+    bool vbr_capture_stability_matches(
+        const vbr_capture_stability_token & token) const noexcept;
+    bool vbr_capture_generation_record(
+        uint32_t child_id,
+        checkpoint_child_dependency_mode dependency_mode,
+        llama_seq_id sequence,
+        llama_pos frontier,
+        vbr_checkpoint_generation_controller & output) const noexcept;
+    bool vbr_capture_policy_snapshot(
+        vbr_capture_stability_token & output) const noexcept;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -839,6 +913,7 @@ private:
     void vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
                                        bool add, llama_seq_id exclude_seq = -1);
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
+    void     vbr_invalidate_dirty_stash();            // one dirty-stash settlement implementation
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed

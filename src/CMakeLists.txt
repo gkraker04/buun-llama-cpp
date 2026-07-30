@@ -30,6 +30,7 @@ add_library(llama
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
+            llama-memory-tree.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
@@ -45,6 +46,7 @@ add_library(llama
             llama-vbr-artifact.cpp
             llama-vbr-artifact-capture.cpp
             llama-vbr-artifact-catalog.cpp
+            llama-vbr-explicit-capture.cpp
             llama-vbr-generation.cpp
             llama-vbr-generation-oracle.cpp
             llama-vbr-operation.cpp
