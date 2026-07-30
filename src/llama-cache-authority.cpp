@@ -46,12 +46,24 @@ llama_cache_reservation_claim & llama_cache_reservation_claim::operator=(
     return *this;
 }
 
+bool llama_cache_reservation_claim::commit(
+        uint64_t logical_bytes,
+        llama_cache_acct_op_id & committed_op) noexcept {
+    committed_op = {};
+    if (!has_op() || !ledger_->commit(op_, logical_bytes)) {
+        return false;
+    }
+    committed_op = op_;
+    release();
+    return true;
+}
+
 llama_cache_admission_result llama_cache_admit_reservation(
         llama_cache_acct_ledger          & ledger,
         const llama_cache_budget_config  & budget_config,
         const llama_cache_authority_request & request) noexcept try {
     // 1. Coherent snapshot under one serial.
-    const llama_cache_acct_snapshot snap = ledger.snapshot();
+    llama_cache_acct_snapshot snap = ledger.snapshot();
 
     // 2. Fail-closed on incomplete evidence: an explicitly non-known manifest means the ledger
     //    cannot vouch for completeness, so refuse before pricing (never admit on private counters).
@@ -60,16 +72,17 @@ llama_cache_admission_result llama_cache_admit_reservation(
     }
 
     // 3. Local coordinator (reset() mutates it; a shared instance is unsafe across admissions).
-    //    reset() deep-copies `snap`; harmless here (F0a is on no hot path). F0b, which drives this
-    //    per eviction attempt, should add an rvalue reset() overload and std::move the snapshot in.
+    //    Move the potentially-large accounting snapshot into the one-shot coordinator now that
+    //    this composer is on F0b's authority path.
     llama_cache_budget_coordinator coordinator;
-    if (!coordinator.reset(snap, budget_config)) {
+    const uint64_t accounting_serial = snap.serial;
+    if (!coordinator.reset(std::move(snap), budget_config)) {
         return { llama_cache_admission_status::budget_unavailable, {} };
     }
 
     // 4. Reserve-only plan priced at the snapshot's serial: one domain, no release credits.
     llama_cache_budget_plan plan;
-    plan.accounting_serial = snap.serial;
+    plan.accounting_serial = accounting_serial;
     plan.entries.push_back({ request.domain, request.expected_resident, /* release_bytes */ 0 });
 
     // 5. Price it.
@@ -87,7 +100,7 @@ llama_cache_admission_result llama_cache_admit_reservation(
 
     // 6. Conditional reserve at the priced serial (single-shot: drift refuses, F0b re-drives).
     const llama_cache_conditional_reserve_result cr = ledger.reserve_if_serial(
-        snap.serial, request.category, request.domain, request.attribution,
+        accounting_serial, request.category, request.domain, request.attribution,
         request.expected_logical, request.expected_resident);
     switch (cr.status) {
         case llama_cache_conditional_reserve_status::admitted:

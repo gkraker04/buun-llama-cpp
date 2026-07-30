@@ -17,14 +17,12 @@
 // accounting interface: no consumer grows private byte counters (C/F freeze requirement 9).
 // Presentation (name strings, JSON) lives above, in common/ and server adapters — never here.
 //
-// P2 SEMANTICS (C-a containment): the ledger is a SHADOW OBSERVER. `commit` records that the
-// shipped publication boundary happened; `reserve` is observational, not an admission
-// reservation. No ledger fault, allocation failure, overflow, or incomplete snapshot may
-// alter a shipped mutation — every entry point is genuinely non-throwing (internal
-// allocation failure latches a fault and returns failure) and faults become counters plus
-// typed-unavailable cells. F's later enforcement commit deliberately flips this authority
-// (reservation precedes mutation; publication waits on accounting) — that flip is an F
-// decision, not made here.
+// P2 SEMANTICS: the policy-free ledger supports both C-a shadow observation and F0b authority.
+// Plain `reserve` remains observational. The separately composed F authority path uses
+// `reserve_if_serial` before mutation and makes publication wait for stage/commit; without the
+// lifecycle flag, existing producers retain the shadow behavior. Every ledger entry point remains
+// genuinely non-throwing: allocation/transition/overflow failures latch counters and typed-
+// unavailable cells, while the authority composer decides whether those failures refuse a mutation.
 
 constexpr uint32_t LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2;
 constexpr uint32_t LLAMA_CACHE_ACCT_TOPOLOGY_VERSION        = 1;

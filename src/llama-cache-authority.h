@@ -53,9 +53,9 @@ struct llama_cache_admission_result;
 // holding a live op (an exception or early return before F0b's stage/commit), it aborts that op so a
 // reserved operation can never leak (snapshot.live_ops would otherwise never return to zero). Only
 // the composer mints an armed claim (constructor is private + friended), so no two claims can ever
-// own the same op. F0a deliberately has NO disarm-without-abort path: an admitted claim ALWAYS
-// auto-aborts. F0b adds a commit-through-claim terminal that disarms ONLY on a verified commit —
-// exposing a bare "discharge" here would let a still-reserved (or committed-then-failed) op leak.
+// own the same op. The only disarm-without-abort path is F0b's commit-through-claim terminal, which
+// disarms ONLY on a verified commit and hands the committed id to its durable artifact. Exposing a
+// bare "discharge" would let a still-reserved (or committed-then-failed) op leak.
 class llama_cache_reservation_claim {
 public:
     llama_cache_reservation_claim() = default;
@@ -68,6 +68,12 @@ public:
 
     bool                   has_op() const noexcept { return ledger_ != nullptr && op_.v != 0; }
     llama_cache_acct_op_id op()     const noexcept { return op_; }
+
+    // Publish the staged accounting transaction through its sole owning claim. Success returns
+    // the committed operation id to the durable artifact and disarms this claim; the artifact later
+    // uses ledger.release() both for ordinary retirement and for rollback if publication fails.
+    // Failure leaves the claim armed, so its destructor still aborts the reserved/staged operation.
+    bool commit(uint64_t logical_bytes, llama_cache_acct_op_id & committed_op) noexcept;
 
 private:
     llama_cache_reservation_claim(llama_cache_acct_ledger * ledger, llama_cache_acct_op_id op) noexcept;
@@ -85,7 +91,7 @@ private:
 };
 
 // The composer's result: a status plus, when admitted, the move-only claim that owns the reserved
-// op until F0b's commit-through-claim terminal takes it over. Move-only (the claim is).
+// op until commit-through-claim hands the committed id to the durable artifact. Move-only.
 struct llama_cache_admission_result {
     llama_cache_admission_status  status = llama_cache_admission_status::ledger_fault;
     llama_cache_reservation_claim claim;

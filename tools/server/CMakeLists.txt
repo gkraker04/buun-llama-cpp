@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-cache-authority.cpp
+    server-cache-authority.h
     server-cache-lease.cpp
     server-cache-lease.h
     server-cache-yield.cpp
@@ -79,4 +81,12 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-media-prefix PRIVATE cxx_std_17)
     add_test(NAME test-server-media-prefix COMMAND test-server-media-prefix)
     set_property(TEST test-server-media-prefix PROPERTY LABELS main)
+
+    add_executable(test-server-prompt-cache ${CMAKE_SOURCE_DIR}/tests/test-server-prompt-cache.cpp)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context mtmd llama llama-common)
+    target_include_directories(test-server-prompt-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
+    add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
+    set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
 endif()

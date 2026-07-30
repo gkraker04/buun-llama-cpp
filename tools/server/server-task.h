@@ -7,6 +7,7 @@
 #include "server-cache-lease.h"
 #include "server-retention-sidecar.h"
 
+#include <array>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -666,6 +667,15 @@ struct server_prompt_cache_state {
     }
 };
 
+struct server_cache_authority;
+
+struct server_prompt_cache_payload_leaf {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::full_snapshot_payload;
+    uint64_t bytes = 0;
+    llama_cache_acct_op_id * operation = nullptr;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -696,7 +706,7 @@ struct server_prompt_cache {
     // allocation, no throw). A failed fill drops the staged node — never a poisoned/half-filled
     // published entry, never an eviction that bought nothing.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
-    void publish(
+    bool publish(
             std::list<server_prompt_cache_state> entry,
             const server_prompt * source_prompt = nullptr,
             int32_t source_slot = -1);
@@ -723,6 +733,9 @@ struct server_prompt_cache {
     // blocks, orders, or interrupts the shipped mutation [C-a]; the ledger is non-throwing
     // and outlives this cache by member order in server_context_impl.
     llama_cache_acct_ledger * acct = nullptr;
+    // F0b lifecycle authority. Null keeps the exact pre-F0 publication path. When present, it
+    // reserves/stages/commits every durable leaf before publish() splices the detached node.
+    server_cache_authority * publish_authority = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
     server_cache_lease_table * lease_obs = nullptr;
@@ -735,6 +748,15 @@ struct server_prompt_cache {
     void clear_accounting();
     void acct_charge_entry(server_prompt_cache_state & st);
     void acct_release_entry(server_prompt_cache_state & st);
+
+    static bool payload_bytes(
+            const server_prompt_cache_state & st,
+            uint64_t & snapshot_bytes,
+            uint64_t & checkpoint_bytes,
+            uint64_t & accelerator_bytes) noexcept;
+    static bool payload_leaves(
+            server_prompt_cache_state & st,
+            std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
 };
 
 // used exclusively by router mode

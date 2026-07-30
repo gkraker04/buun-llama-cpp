@@ -105,6 +105,17 @@ static uint64_t host_reserved(llama_cache_acct_ledger & ledger) {
     return 0;
 }
 
+static uint64_t host_measure(
+        llama_cache_acct_ledger & ledger,
+        llama_cache_acct_measure measure) {
+    for (const auto & row : ledger.snapshot().cells) {
+        if (row.category == PAYLOAD && row.domain == HOST) {
+            return row.cell.measures[size_t(measure)].value;
+        }
+    }
+    return 0;
+}
+
 // Happy path: the reservation fits and is admitted, handing back a claim that owns the reserved op,
 // and the reserved aggregate actually moved by the requested amount (not just live_ops).
 static void test_admitted() {
@@ -179,6 +190,52 @@ static void test_claim_move_assign() {
     CHECK(ledger.snapshot().live_ops == 1);
 }
 
+// The only non-abort terminal commits through the owning claim. Success disarms it and hands the
+// committed id to the durable artifact; destroying the former claim must not abort that transaction.
+static void test_claim_commit_terminal() {
+    llama_cache_acct_ledger ledger;
+    llama_cache_acct_op_id committed;
+    {
+        auto res = admit_fresh_host(ledger, 64);
+        CHECK(res.status == llama_cache_admission_status::admitted);
+        const auto alloc = ledger.new_alloc();
+        CHECK(bool(alloc));
+        CHECK(ledger.stage(res.claim.op(), alloc, 64));
+        CHECK(res.claim.commit(64, committed));
+        CHECK(bool(committed));
+        CHECK(!res.claim.has_op());
+
+        llama_cache_acct_op_id duplicate = { 99 };
+        CHECK(!res.claim.commit(64, duplicate));
+        CHECK(!bool(duplicate));
+    }
+    CHECK(ledger.snapshot().live_ops == 1);
+    CHECK(host_reserved(ledger) == 0);
+    CHECK(host_measure(ledger, llama_cache_acct_measure::logical_payload) == 64);
+    CHECK(host_measure(ledger, llama_cache_acct_measure::resident_allocated) == 64);
+
+    // release() is the ledger's existing committed-transaction rollback/retirement primitive.
+    CHECK(ledger.release(committed));
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_measure(ledger, llama_cache_acct_measure::logical_payload) == 0);
+    CHECK(host_measure(ledger, llama_cache_acct_measure::resident_allocated) == 0);
+}
+
+// A failed commit does not disarm the claim. The destructor can still abort its reserved op,
+// preventing a double-terminal or failed-commit leak.
+static void test_claim_commit_failure_auto_abort() {
+    llama_cache_acct_ledger ledger;
+    {
+        auto res = admit_fresh_host(ledger, 64);
+        llama_cache_acct_op_id committed;
+        CHECK(!res.claim.commit(64, committed)); // not staged
+        CHECK(!bool(committed));
+        CHECK(res.claim.has_op());
+    }
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(ledger) == 0);
+}
+
 static void test_status_names() {
     CHECK(std::string(llama_cache_admission_status_name(
         llama_cache_admission_status::admitted)) == "admitted");
@@ -196,6 +253,8 @@ int main() {
     test_claim_auto_abort();
     test_claim_move_ctor();
     test_claim_move_assign();
+    test_claim_commit_terminal();
+    test_claim_commit_failure_auto_abort();
     test_status_names();
 
     if (failures > 0) {

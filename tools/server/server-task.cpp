@@ -1,6 +1,7 @@
 #include "server-task.h"
 
 #include "build-info.h"
+#include "server-cache-authority.h"
 #include "server-chat.h"
 #include "chat.h"
 #include "common.h"
@@ -1741,6 +1742,65 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     return staged;
 }
 
+bool server_prompt_cache::payload_bytes(
+        const server_prompt_cache_state & st,
+        uint64_t & snapshot_bytes,
+        uint64_t & checkpoint_bytes,
+        uint64_t & accelerator_bytes) noexcept {
+    snapshot_bytes    = uint64_t(st.data.size());
+    checkpoint_bytes  = 0;
+    accelerator_bytes = 0;
+    const auto add_checked = [](uint64_t & acc, size_t value) {
+        if (uint64_t(value) > std::numeric_limits<uint64_t>::max() - acc) {
+            return false;
+        }
+        acc += uint64_t(value);
+        return true;
+    };
+    for (const auto & ckpt : st.prompt.checkpoints) {
+        if (!add_checked(checkpoint_bytes, ckpt.data_tgt.size()) ||
+            !add_checked(checkpoint_bytes, ckpt.data_dft.size()) ||
+            !add_checked(accelerator_bytes, ckpt.accel.size())) {
+            snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool server_prompt_cache::payload_leaves(
+        server_prompt_cache_state & st,
+        std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept {
+    leaves = {{
+        {
+            llama_cache_acct_category::full_snapshot_payload,
+            0,
+            &st.acct_op_snapshot,
+        },
+        {
+            llama_cache_acct_category::checkpoint_state_payload,
+            0,
+            &st.acct_op_ckpt,
+        },
+        {
+            llama_cache_acct_category::typed_accelerator_payload,
+            0,
+            &st.acct_op_accel,
+        },
+    }};
+    uint64_t snapshot_bytes = 0;
+    uint64_t checkpoint_bytes = 0;
+    uint64_t accelerator_bytes = 0;
+    if (!payload_bytes(
+            st, snapshot_bytes, checkpoint_bytes, accelerator_bytes)) {
+        return false;
+    }
+    leaves[0].bytes = snapshot_bytes;
+    leaves[1].bytes = checkpoint_bytes;
+    leaves[2].bytes = accelerator_bytes;
+    return true;
+}
+
 // C0 shadow producer [P2]: one accounting transaction per charged leaf category of a published
 // entry, at the publication boundary (the splice into `states`), released when the entry leaves
 // `states` on any path. Aggregate entry size is a provider grouping and is NEVER charged — the
@@ -1757,44 +1817,24 @@ void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
 
     // checked sums: an overflowing observation latches the leaf unavailable instead of
     // charging a fabricated value (the shipped path is untouched either way)
-    uint64_t ckpt_bytes  = 0;
-    uint64_t accel_bytes = 0;
-    bool     sums_ok     = true;
-    const auto add_checked = [&sums_ok](uint64_t & acc, size_t v) {
-        if (acc > std::numeric_limits<uint64_t>::max() - (uint64_t) v) {
-            sums_ok = false;
-            return;
-        }
-        acc += (uint64_t) v;
-    };
-    for (const auto & ckpt : st.prompt.checkpoints) {
-        add_checked(ckpt_bytes, ckpt.data_tgt.size());
-        add_checked(ckpt_bytes, ckpt.data_dft.size());
-        add_checked(accel_bytes, ckpt.accel.size());
-    }
+    std::array<server_prompt_cache_payload_leaf, 3> leaves;
+    const bool sums_ok = payload_leaves(st, leaves);
 
     if (!sums_ok || server_fault("acct_unavailable")) { // [P2 gate] shipped-path invariance seam
-        for (const auto cat : { llama_cache_acct_category::full_snapshot_payload,
-                                llama_cache_acct_category::checkpoint_state_payload,
-                                llama_cache_acct_category::typed_accelerator_payload }) {
+        for (const auto & leaf : leaves) {
             server_cache_acct_mark_shadow_unavailable(
-                *acct, cat, domain, llama_cache_acct_producer::host_cache);
+                *acct, leaf.category, domain,
+                llama_cache_acct_producer::host_cache);
         }
         return;
     }
 
-    st.acct_op_snapshot = server_cache_acct_charge_shadow(
-        *acct, llama_cache_acct_category::full_snapshot_payload, domain,
-        llama_cache_acct_producer::host_cache, {},
-        st.data.size(), st.data.size());
-    st.acct_op_ckpt = server_cache_acct_charge_shadow(
-        *acct, llama_cache_acct_category::checkpoint_state_payload, domain,
-        llama_cache_acct_producer::host_cache, {},
-        ckpt_bytes, ckpt_bytes);
-    st.acct_op_accel = server_cache_acct_charge_shadow(
-        *acct, llama_cache_acct_category::typed_accelerator_payload, domain,
-        llama_cache_acct_producer::host_cache, {},
-        accel_bytes, accel_bytes);
+    for (const auto & leaf : leaves) {
+        *leaf.operation = server_cache_acct_charge_shadow(
+            *acct, leaf.category, domain,
+            llama_cache_acct_producer::host_cache, {},
+            leaf.bytes, leaf.bytes);
+    }
 }
 
 void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
@@ -1957,12 +1997,21 @@ void server_prompt_cache::clear_accounting() {
     }
 }
 
-void server_prompt_cache::publish(
+bool server_prompt_cache::publish(
         std::list<server_prompt_cache_state> entry,
         const server_prompt * source_prompt,
         int32_t source_slot) {
     if (entry.empty()) {
-        return;
+        return false;
+    }
+
+    // F0b authority boundary: the detached entry is complete, but no shipped cache state has
+    // changed yet. Refusal drops only this detached node; the live slot remains the sole copy.
+    // The callback commits all accounting leaves before returning true, and states.splice below
+    // is allocation-free/noexcept, so accounting can never lag a published entry.
+    if (publish_authority &&
+        !publish_authority->admit_host_entry(entry.front())) {
+        return false;
     }
 
     // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably
@@ -1974,7 +2023,7 @@ void server_prompt_cache::publish(
     states.splice(states.end(), entry);
     const auto self = std::prev(states.end());
 
-    if (acct) {
+    if (acct && !publish_authority) {
         acct_charge_entry(*self);
     }
     if (retention_obs && source_prompt && source_slot >= 0) {
@@ -2044,6 +2093,7 @@ void server_prompt_cache::publish(
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
     update();
+    return true;
 }
 
 // The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer

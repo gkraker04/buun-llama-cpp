@@ -258,9 +258,22 @@ llama_cache_budget_category_classification llama_cache_budget_classify(
 bool llama_cache_budget_coordinator::reset(
         const llama_cache_acct_snapshot & snapshot,
         const llama_cache_budget_config & config) noexcept {
+    try {
+        return reset(llama_cache_acct_snapshot(snapshot), config);
+    } catch (...) {
+        configured_ = false;
+        snapshot_ = {};
+        config_ = {};
+        return false;
+    }
+}
+
+bool llama_cache_budget_coordinator::reset(
+        llama_cache_acct_snapshot && snapshot,
+        const llama_cache_budget_config & config) noexcept {
     configured_ = false;
     try {
-        snapshot_ = snapshot;
+        snapshot_ = std::move(snapshot);
         config_ = config;
         configured_ = true;
     } catch (...) {

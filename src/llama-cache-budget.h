@@ -192,6 +192,8 @@ class llama_cache_budget_coordinator {
 public:
     bool reset(const llama_cache_acct_snapshot & snapshot,
                const llama_cache_budget_config & config) noexcept;
+    bool reset(llama_cache_acct_snapshot && snapshot,
+               const llama_cache_budget_config & config) noexcept;
 
     llama_cache_budget_result fits(const llama_cache_budget_plan & plan) const noexcept;
 
