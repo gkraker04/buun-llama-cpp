@@ -73,6 +73,7 @@ static void configure_default(llama_cache_acct_ledger & ledger) {
 static void test_lifecycle() {
     llama_cache_acct_ledger ledger;
     configure_default(ledger);
+    const size_t alloc_baseline = ledger.allocation_registry_size();
 
     const auto op = ledger.reserve(CAT, DOM, {}, 100, 128);
     CHECK(bool(op));
@@ -83,6 +84,7 @@ static void test_lifecycle() {
 
     const auto alloc = ledger.new_alloc();
     CHECK(bool(alloc));
+    CHECK(ledger.allocation_registry_size() == alloc_baseline + 1);
     CHECK(ledger.stage(op, alloc, 128));
     CHECK(ledger.commit(op, 100));
     s = ledger.snapshot();
@@ -101,6 +103,7 @@ static void test_lifecycle() {
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::logical_payload).state ==
           llama_cache_acct_known::known);
     CHECK(s.allocations.empty());
+    CHECK(ledger.allocation_registry_size() == alloc_baseline);
     CHECK(s.faults_invalid_transition == 0 && s.faults_overflow == 0 &&
           s.faults_unknown_id == 0 && s.faults_allocation == 0);
 }
@@ -215,9 +218,11 @@ static void test_alloc_tuple_immutable() {
 static void test_abort_retains_peak() {
     llama_cache_acct_ledger ledger;
     configure_default(ledger);
+    const size_t alloc_baseline = ledger.allocation_registry_size();
 
     const auto op = ledger.reserve(CAT, DOM, {}, 50, 64);
     CHECK(ledger.stage(op, ledger.new_alloc(), 64));
+    CHECK(ledger.allocation_registry_size() == alloc_baseline + 1);
     CHECK(ledger.abort(op));
 
     const auto s = ledger.snapshot();
@@ -226,6 +231,7 @@ static void test_abort_retains_peak() {
           llama_cache_acct_known::unknown);
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::transient_peak).value  == 64);
     CHECK(s.allocations.empty()); // the staged-only allocation entry is gone with the abort
+    CHECK(ledger.allocation_registry_size() == alloc_baseline);
 }
 
 // charge-once: two committed references to one allocation charge the durable bytes once;
@@ -233,8 +239,10 @@ static void test_abort_retains_peak() {
 static void test_charge_once() {
     llama_cache_acct_ledger ledger;
     configure_default(ledger);
+    const size_t alloc_baseline = ledger.allocation_registry_size();
 
     const auto alloc = ledger.new_alloc();
+    CHECK(ledger.allocation_registry_size() == alloc_baseline + 1);
     const auto op1 = ledger.reserve(CAT, DOM, {}, 100, 100);
     const auto op2 = ledger.reserve(CAT, DOM, {}, 100, 100);
     CHECK(ledger.stage(op1, alloc, 100));
@@ -252,10 +260,12 @@ static void test_charge_once() {
                      llama_cache_acct_measure::logical_payload, 2 * 16);
 
     CHECK(ledger.release(op1));
+    CHECK(ledger.allocation_registry_size() == alloc_baseline + 1);
     s = ledger.snapshot();
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 100);
 
     CHECK(ledger.release(op2));
+    CHECK(ledger.allocation_registry_size() == alloc_baseline);
     s = ledger.snapshot();
     CHECK(cell(s, CAT, DOM, llama_cache_acct_measure::logical_payload).value == 0);
 }
@@ -344,9 +354,9 @@ static void test_release_set_preview() {
     CHECK(ledger.release(op1));
 }
 
-// Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical
-// allocation (tombstone survives the last release), and the complete citation tuple —
-// identity fields included — is immutable on every shared citation
+// Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical allocation.
+// Terminal entries are reaped, so a stale id is unknown rather than a retained tombstone; monotone
+// allocation ids still prevent reuse. The complete live citation tuple remains immutable.
 static void test_alloc_no_resurrection() {
     llama_cache_acct_ledger ledger;
     configure_default(ledger);
@@ -361,7 +371,7 @@ static void test_alloc_no_resurrection() {
     auto s0 = ledger.snapshot();
     CHECK(!ledger.stage(op2, a, 2)); // resurrection under a different size -> fault
     auto s1 = ledger.snapshot();
-    CHECK(s1.faults_invalid_transition == s0.faults_invalid_transition + 1);
+    CHECK(s1.faults_unknown_id == s0.faults_unknown_id + 1);
     CHECK(ledger.abort(op2));
 
     // identity-field mismatches on a LIVE shared allocation
@@ -408,9 +418,10 @@ static void test_staged_handoff() {
     CHECK(ledger.commit(op3, 4));
     CHECK(ledger.release(op2));
     CHECK(ledger.release(op3));        // both claim kinds drained -> retired
+    CHECK(ledger.allocation_registry_size() == 0);
 
     const auto op4 = ledger.reserve(CAT, DOM, {}, 4, 4);
-    CHECK(!ledger.stage(op4, a, 4));   // retired id stays dead
+    CHECK(!ledger.stage(op4, a, 4));   // reaped id stays dead
     CHECK(ledger.abort(op4));
 
     s = ledger.snapshot();

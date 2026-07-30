@@ -1004,6 +1004,8 @@ struct catalog_fixture {
 
 static void test_catalog_charge_once_and_retire() {
     catalog_fixture f;
+    const size_t alloc_baseline =
+        f.ledger.allocation_registry_size();
     const auto first =
         f.catalog->publish(f.package, f.completions(), f.budget);
     CHECK(first.status ==
@@ -1064,8 +1066,10 @@ static void test_catalog_charge_once_and_retire() {
     CHECK(catalog_state.blobs == 1);
     CHECK(catalog_state.stashes == 1);
     CHECK(catalog_state.references == 2);
+    CHECK(f.ledger.allocation_registry_size() > alloc_baseline);
 
     CHECK(f.catalog->retire(first.reference_artifact));
+    CHECK(f.ledger.allocation_registry_size() > alloc_baseline);
     snapshot = f.ledger.snapshot();
     CHECK(catalog_cell(
         snapshot,
@@ -1078,6 +1082,7 @@ static void test_catalog_charge_once_and_retire() {
         f.host,
         llama_cache_acct_measure::resident_allocated).value == 256);
     CHECK(f.catalog->retire(second.reference_artifact));
+    CHECK(f.ledger.allocation_registry_size() == alloc_baseline);
     snapshot = f.ledger.snapshot();
     CHECK(snapshot.live_ops == 0);
     CHECK(catalog_cell(

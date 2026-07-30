@@ -615,6 +615,11 @@ struct llama_cache_acct_ledger {
     // telemetry, not versioned accounting state.
     uint64_t serial_conflicts() const noexcept;
 
+    // Process-local registry size for lifecycle diagnostics/tests. This is deliberately absent
+    // from the schema-v2 snapshot: allocation-map storage is an implementation detail, not a
+    // serialized accounting measure.
+    size_t allocation_registry_size() const noexcept;
+
     // Associate the op with a minted physical allocation and its actual resident size.
     // Validates the allocation tuple against any existing citation. Updates the concurrent
     // staged high-water mark. The three opaque identities are retained on the transaction
@@ -694,14 +699,11 @@ private:
     };
 
     // Allocation lifecycle: MINTED (registry entry created by new_alloc) → LIVE (first stage
-    // fixes the complete immutable citation tuple) → RETIRED (last committed reference
-    // released; the entry survives as a tombstone so a retired id can never resurrect as a
-    // different physical allocation). One entry per id ever minted — bounded by allocation
-    // churn, acceptable for the shadow ledger; F revisits lifecycle compaction.
+    // fixes the complete immutable citation tuple) → erased when the last staged/committed
+    // reference leaves. Allocation ids are monotone and never reused, so a stale id remains
+    // fail-closed as unknown without retaining an unbounded tombstone map.
     struct alloc_entry {
         bool     tuple_set      = false;
-        bool     ever_committed = false;
-        bool     retired        = false;
         uint32_t staged_refs    = 0;
         uint32_t committed_refs = 0;
         // immutable citation tuple, fixed by the first stage — ALL fields compared on every
@@ -766,10 +768,10 @@ private:
                           const llama_cache_acct_resource_domain & domain) const;
     llama_cache_acct_known domain_certification(
             const llama_cache_acct_resource_domain & domain) const;
-    // retirement accounts for BOTH claim kinds: an allocation that ever committed retires
-    // only when its last committed AND last staged reference are gone (a staged op holds a
-    // valid claim that may still commit)
-    void maybe_retire(alloc_entry & entry);
+    // Retirement accounts for BOTH claim kinds. Once the last staged and committed reference
+    // leaves, erase its registry slot. Callers remove the terminal operation first, so no live
+    // op can cite an erased allocation.
+    void maybe_retire(llama_cache_acct_alloc_id alloc);
 
     // Unlocked reserve body shared by reserve() and reserve_if_serial() (callers hold the mutex).
     // Returns the minted op, or {} after latching the appropriate fault + bumping serial.

@@ -496,9 +496,17 @@ void llama_cache_acct_ledger::staged_sub(
     row->staged -= v;
 }
 
-void llama_cache_acct_ledger::maybe_retire(alloc_entry & entry) {
-    if (entry.ever_committed && entry.staged_refs == 0 && entry.committed_refs == 0) {
-        entry.retired = true;
+void llama_cache_acct_ledger::maybe_retire(
+        llama_cache_acct_alloc_id alloc) {
+    const auto it = allocs.find(alloc);
+    if (it == allocs.end()) {
+        return;
+    }
+    auto & entry = it->second;
+    if (entry.tuple_set &&
+        entry.staged_refs == 0 &&
+        entry.committed_refs == 0) {
+        allocs.erase(it);
     }
 }
 
@@ -600,6 +608,11 @@ uint64_t llama_cache_acct_ledger::serial_conflicts() const noexcept {
     return serial_conflicts_;
 }
 
+size_t llama_cache_acct_ledger::allocation_registry_size() const noexcept {
+    std::lock_guard<std::mutex> lock(mtx);
+    return allocs.size();
+}
+
 llama_cache_acct_op_id llama_cache_acct_ledger::reserve_locked(
         llama_cache_acct_category category,
         const llama_cache_acct_resource_domain & domain,
@@ -689,12 +702,6 @@ bool llama_cache_acct_ledger::stage(
         bump_serial();
         return false;
     }
-    if (ait->second.retired) {
-        state.faults_invalid_transition++;
-        bump_serial();
-        return false;
-    }
-
     if (ait->second.tuple_set) {
         if (ait->second.category       != it->second.category ||
             ait->second.domain         != domain ||
@@ -756,8 +763,8 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
     }
 
     auto & entry = ait->second;
-    if (entry.retired ||
-        (entry.committed_refs > 0 && entry.charged_logical != logical_bytes)) {
+    if (entry.committed_refs > 0 &&
+        entry.charged_logical != logical_bytes) {
         state.faults_invalid_transition++;
         bump_serial();
         return false;
@@ -777,7 +784,6 @@ bool llama_cache_acct_ledger::commit(llama_cache_acct_op_id op, uint64_t logical
              llama_cache_acct_measure::reserved, it->second.reserved_bytes);
 
     entry.committed_refs++;
-    entry.ever_committed = true;
     if (entry.committed_refs == 1) {
         entry.charged_logical = logical_bytes;
         entry.attribution     = it->second.attribution;
@@ -807,15 +813,19 @@ bool llama_cache_acct_ledger::abort(llama_cache_acct_op_id op) {
 
     cell_sub(it->second.category, it->second.domain,
              llama_cache_acct_measure::reserved, it->second.reserved_bytes);
+    llama_cache_acct_alloc_id staged_alloc;
     if (it->second.state == llama_cache_acct_txn_state::staged) {
         staged_sub(it->second.category, it->second.domain, it->second.resident_bytes);
         auto ait = allocs.find(it->second.alloc);
         if (ait != allocs.end() && ait->second.staged_refs > 0) {
+            staged_alloc = it->second.alloc;
             ait->second.staged_refs--;
-            maybe_retire(ait->second);
         }
     }
     ops.erase(it);
+    if (staged_alloc) {
+        maybe_retire(staged_alloc);
+    }
     bump_serial();
     return true;
 }
@@ -857,7 +867,8 @@ bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
 
     // resolve_release_locked validated this id under the same lock; the mutable lookup only
     // obtains the entry for applying the already-resolved release.
-    auto & entry = allocs.find(resolved.operation->alloc)->second;
+    const llama_cache_acct_alloc_id alloc = resolved.operation->alloc;
+    auto & entry = allocs.find(alloc)->second;
     entry.committed_refs--;
     if (entry.committed_refs == 0) {
         cell_sub(entry.category, entry.domain,
@@ -865,8 +876,8 @@ bool llama_cache_acct_ledger::release(llama_cache_acct_op_id op) {
         cell_sub(entry.category, entry.domain,
                  llama_cache_acct_measure::resident_allocated, entry.resident_bytes);
     }
-    maybe_retire(entry);
     ops.erase(op);
+    maybe_retire(alloc);
     bump_serial();
     return true;
 }
