@@ -1,5 +1,7 @@
 #include "llama-vbr-artifact-catalog.h"
 
+#include "llama-sha256.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -45,26 +47,6 @@ bool operator<(const configured_cell & a, const configured_cell & b) {
     return a.domain.device_ordinal.v < b.domain.device_ordinal.v;
 }
 
-bool source_read(
-        const void * context,
-        uint64_t offset,
-        uint8_t * destination,
-        size_t size) noexcept {
-    const auto * bytes =
-        static_cast<const std::vector<uint8_t> *>(context);
-    if (!bytes || offset > bytes->size() ||
-        size > bytes->size() - size_t(offset)) {
-        return false;
-    }
-    std::copy_n(bytes->data() + size_t(offset), size, destination);
-    return true;
-}
-
-vbr_artifact_byte_source byte_source(
-        const std::vector<uint8_t> & bytes) {
-    return { bytes.size(), &bytes, source_read };
-}
-
 } // namespace
 
 struct llama_vbr_artifact_catalog::impl {
@@ -88,7 +70,8 @@ struct llama_vbr_artifact_catalog::impl {
         llama_cache_acct_content_digest content;
         llama_cache_acct_lineage_id lineage;
         vbr_artifact_unit_descriptor descriptor;
-        std::vector<std::vector<uint8_t>> payload_shards;
+        std::vector<std::shared_ptr<const artifact_segment_chain>>
+            payload_shards;
         std::vector<allocation> allocations;
     };
 
@@ -98,7 +81,8 @@ struct llama_vbr_artifact_catalog::impl {
         llama_cache_acct_content_digest content;
         llama_cache_acct_lineage_id lineage;
         vbr_artifact_clean_stash descriptor;
-        std::vector<std::vector<uint8_t>> shards;
+        std::vector<std::shared_ptr<const artifact_segment_chain>>
+            shards;
         std::vector<allocation> allocations;
     };
 
@@ -237,6 +221,335 @@ struct llama_vbr_artifact_catalog::impl {
     uint64_t n_published = 0;
     uint64_t n_adopted = 0;
     uint64_t n_refusals = 0;
+    uint64_t n_staging_overlap_refusals = 0;
+};
+
+namespace {
+
+bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
+    return std::any_of(
+        digest.begin(), digest.end(),
+        [](uint8_t byte) { return byte != 0; });
+}
+
+struct catalog_stream_state {
+    // Borrowed by the move-only build: every build/unit handle must be
+    // destroyed before its catalog and ledger.
+    llama_vbr_artifact_catalog * catalog = nullptr;
+    llama_cache_acct_ledger * ledger = nullptr;
+    vbr_artifact_package package;
+    llama_cache_budget_config budget;
+    llama_cache_transaction_fault fault;
+    bool charge_transfer_staging = true;
+    llama_cache_acct_artifact_id blob_artifact;
+    llama_cache_acct_artifact_id stash_artifact;
+    llama_cache_acct_artifact_id reference_artifact;
+    std::vector<llama_cache_transaction_leaf>
+        durable_prepared_leaves;
+    std::vector<llama_cache_transaction_leaf> staging_leaves;
+    std::vector<llama_cache_acct_op_id> durable_ops;
+    std::vector<llama_cache_acct_alloc_id> durable_allocs;
+    std::vector<llama_cache_acct_op_id> staging_ops;
+    std::vector<llama_cache_acct_alloc_id> staging_allocs;
+    llama_cache_prepared_claim_group durable_prepared;
+    llama_cache_prepared_claim_group staging_prepared;
+    bool staging_committed = false;
+    std::vector<vbr_verified_segment> segments;
+    bool unit_open = false;
+    bool unit_sealed = false;
+    bool published = false;
+    vbr_capture_stream_status failed =
+        vbr_capture_stream_status::ok;
+
+    ~catalog_stream_state() {
+        if (ledger && staging_committed) {
+            for (const auto op : staging_ops) {
+                if (op) {
+                    const bool released = ledger->release(op);
+                    GGML_ASSERT(released);
+                }
+            }
+        }
+    }
+
+    bool commit_staging() noexcept {
+        if (!charge_transfer_staging ||
+            staging_committed) {
+            return true;
+        }
+        const auto result =
+            staging_prepared.materialize_and_commit(
+                staging_leaves);
+        if (result.status !=
+                llama_cache_transaction_status::committed) {
+            failed = result.status ==
+                    llama_cache_transaction_status::stage_failed
+                ? vbr_capture_stream_status::stage_failed
+                : result.status ==
+                      llama_cache_transaction_status::
+                          commit_failed
+                    ? vbr_capture_stream_status::commit_failed
+                    : vbr_capture_stream_status::
+                        accounting_refused;
+            return false;
+        }
+        staging_committed = true;
+        return true;
+    }
+};
+
+class catalog_unit_build final : public vbr_unit_build {
+public:
+    explicit catalog_unit_build(
+            std::shared_ptr<catalog_stream_state> state)
+        : state_(std::move(state)) {}
+
+    ~catalog_unit_build() override {
+        if (state_ && !state_->unit_sealed &&
+            state_->failed == vbr_capture_stream_status::ok) {
+            state_->failed =
+                vbr_capture_stream_status::missing_segment;
+        }
+    }
+
+    vbr_capture_stream_status accept_verified_segment(
+            const vbr_verified_segment & segment) noexcept override {
+        try {
+            if (!state_ || state_->published ||
+                state_->unit_sealed) {
+                return vbr_capture_stream_status::late_segment;
+            }
+            if (state_->failed !=
+                    vbr_capture_stream_status::ok) {
+                return state_->failed;
+            }
+            if (!state_->commit_staging()) {
+                return state_->failed;
+            }
+            if (segment.unit_index != 0 ||
+                !segment.bytes ||
+                segment.bytes->size() == 0 ||
+                !digest_nonzero(segment.streaming_digest) ||
+                vbr_capture_stream_digest(*segment.bytes) !=
+                    segment.streaming_digest) {
+                state_->failed =
+                    vbr_capture_stream_status::hash_mismatch;
+                return state_->failed;
+            }
+            const auto duplicate = std::find_if(
+                state_->segments.begin(),
+                state_->segments.end(),
+                [&](const vbr_verified_segment & current) {
+                    return current.unit_index ==
+                               segment.unit_index &&
+                           current.shard_index ==
+                               segment.shard_index &&
+                           current.clean_stash ==
+                               segment.clean_stash;
+                });
+            if (duplicate != state_->segments.end()) {
+                state_->failed =
+                    vbr_capture_stream_status::duplicate_segment;
+                return state_->failed;
+            }
+            state_->segments.push_back(segment);
+            return vbr_capture_stream_status::ok;
+        } catch (...) {
+            if (state_) {
+                state_->failed =
+                    vbr_capture_stream_status::internal_error;
+            }
+            return vbr_capture_stream_status::internal_error;
+        }
+    }
+
+    vbr_capture_stream_status seal_unit() noexcept override {
+        try {
+            if (!state_ || state_->published ||
+                state_->unit_sealed) {
+                return vbr_capture_stream_status::late_segment;
+            }
+            if (state_->failed !=
+                    vbr_capture_stream_status::ok) {
+                return state_->failed;
+            }
+            const auto & descriptor =
+                state_->package.unit_blobs[0].descriptor;
+            const size_t expected =
+                descriptor.shards.size() +
+                (descriptor.clean_stash_state ==
+                     vbr_artifact_clean_stash_state::present
+                     ? descriptor.clean_stash.shards.size()
+                     : 0);
+            if (state_->segments.size() != expected) {
+                state_->failed =
+                    vbr_capture_stream_status::missing_segment;
+                return state_->failed;
+            }
+            for (const auto & shard : descriptor.shards) {
+                const auto found = std::find_if(
+                    state_->segments.begin(),
+                    state_->segments.end(),
+                    [&](const vbr_verified_segment & value) {
+                        return !value.clean_stash &&
+                               value.shard_index ==
+                                   shard.shard_index &&
+                               value.bytes->size() ==
+                                   shard.payload_bytes;
+                    });
+                if (found == state_->segments.end()) {
+                    state_->failed =
+                        vbr_capture_stream_status::
+                            missing_segment;
+                    return state_->failed;
+                }
+            }
+            if (descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present) {
+                for (const auto & shard :
+                     descriptor.clean_stash.shards) {
+                    const auto found = std::find_if(
+                        state_->segments.begin(),
+                        state_->segments.end(),
+                        [&](const vbr_verified_segment & value) {
+                            return value.clean_stash &&
+                                   value.shard_index ==
+                                       shard.shard_index &&
+                                   value.bytes->size() ==
+                                       shard.payload_bytes;
+                        });
+                    if (found == state_->segments.end()) {
+                        state_->failed =
+                            vbr_capture_stream_status::
+                                missing_segment;
+                        return state_->failed;
+                    }
+                }
+            }
+            state_->unit_sealed = true;
+            return vbr_capture_stream_status::ok;
+        } catch (...) {
+            if (state_) {
+                state_->failed =
+                    vbr_capture_stream_status::internal_error;
+            }
+            return vbr_capture_stream_status::internal_error;
+        }
+    }
+
+private:
+    std::shared_ptr<catalog_stream_state> state_;
+};
+
+} // namespace
+
+class llama_vbr_artifact_catalog_stream_build final
+        : public vbr_capture_build {
+public:
+    explicit llama_vbr_artifact_catalog_stream_build(
+            std::shared_ptr<catalog_stream_state> state)
+        : state_(std::move(state)) {}
+
+    std::unique_ptr<vbr_unit_build> begin_unit(
+            uint32_t unit_index,
+            vbr_capture_stream_status & status) noexcept override {
+        status = vbr_capture_stream_status::invalid_argument;
+        try {
+            if (!state_ || state_->published ||
+                state_->unit_open || unit_index != 0 ||
+                state_->package.unit_blobs.size() != 1) {
+                return nullptr;
+            }
+            state_->unit_open = true;
+            status = vbr_capture_stream_status::ok;
+            return std::unique_ptr<vbr_unit_build>(
+                new catalog_unit_build(state_));
+        } catch (...) {
+            status = vbr_capture_stream_status::internal_error;
+            return nullptr;
+        }
+    }
+
+    vbr_capture_sink_result publish_reference() noexcept override {
+        vbr_capture_sink_result out;
+        if (!state_ || state_->published ||
+            !state_->unit_sealed ||
+            state_->failed != vbr_capture_stream_status::ok) {
+            out.status = state_ &&
+                    state_->failed !=
+                        vbr_capture_stream_status::ok
+                ? state_->failed
+                : vbr_capture_stream_status::missing_segment;
+            return out;
+        }
+        state_->published = true;
+        const auto result = state_->catalog->publish_stream(
+            state_->package, state_->segments,
+            state_->budget, state_->fault,
+            state_.get());
+        out.reference_artifact = result.reference_artifact;
+        out.unit_content = result.unit_content;
+        out.reference_lineage = result.reference_lineage;
+        out.adopted =
+            result.status ==
+                llama_vbr_artifact_publish_status::adopted;
+        switch (result.status) {
+            case llama_vbr_artifact_publish_status::published:
+            case llama_vbr_artifact_publish_status::adopted:
+                out.status = vbr_capture_stream_status::ok;
+                break;
+            case llama_vbr_artifact_publish_status::invalid_argument:
+                out.status =
+                    vbr_capture_stream_status::invalid_argument;
+                break;
+            case llama_vbr_artifact_publish_status::shard_failed:
+                out.status =
+                    vbr_capture_stream_status::transfer_failed;
+                break;
+            case llama_vbr_artifact_publish_status::duplicate_completion:
+                out.status =
+                    vbr_capture_stream_status::duplicate_segment;
+                break;
+            case llama_vbr_artifact_publish_status::missing_completion:
+                out.status =
+                    vbr_capture_stream_status::missing_segment;
+                break;
+            case llama_vbr_artifact_publish_status::format_rejected:
+                out.status =
+                    vbr_capture_stream_status::format_rejected;
+                break;
+            case llama_vbr_artifact_publish_status::accounting_unavailable:
+                out.status =
+                    vbr_capture_stream_status::
+                        accounting_unavailable;
+                break;
+            case llama_vbr_artifact_publish_status::admission_refused:
+                out.status =
+                    vbr_capture_stream_status::accounting_refused;
+                break;
+            case llama_vbr_artifact_publish_status::stage_failed:
+                out.status =
+                    vbr_capture_stream_status::stage_failed;
+                break;
+            case llama_vbr_artifact_publish_status::commit_failed:
+                out.status =
+                    vbr_capture_stream_status::commit_failed;
+                break;
+            case llama_vbr_artifact_publish_status::publication_failed:
+                out.status =
+                    vbr_capture_stream_status::publication_failed;
+                break;
+            case llama_vbr_artifact_publish_status::internal_error:
+            case llama_vbr_artifact_publish_status::_count:
+                out.status =
+                    vbr_capture_stream_status::internal_error;
+                break;
+        }
+        return out;
+    }
+
+private:
+    std::shared_ptr<catalog_stream_state> state_;
 };
 
 llama_vbr_artifact_catalog::llama_vbr_artifact_catalog(
@@ -313,6 +626,11 @@ bool llama_vbr_artifact_catalog::configure_accounting(
         }
 
         std::set<configured_cell> needed;
+        needed.insert({
+            llama_cache_acct_category::transfer_staging,
+            llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::pageable_host),
+        });
         for (const auto & row : package.manifest.accounting) {
             llama_cache_acct_resource_domain domain;
             const auto category =
@@ -322,8 +640,12 @@ bool llama_vbr_artifact_catalog::configure_accounting(
                 return false;
             }
             needed.insert({ category, domain });
+            // Kept for the landed F2/F0 capacity tests and future
+            // device-local codec staging. F3's pageable segment image uses
+            // the single host-domain transfer_staging cell inserted above.
             needed.insert({
-                llama_cache_acct_category::transfer_staging, domain,
+                llama_cache_acct_category::transfer_staging,
+                domain,
             });
             needed.insert({
                 llama_cache_acct_category::codec_workspace, domain,
@@ -377,13 +699,441 @@ bool llama_vbr_artifact_catalog::configure_accounting(
     }
 }
 
+std::unique_ptr<vbr_capture_build>
+llama_vbr_artifact_catalog::begin_capture(
+        const vbr_artifact_package & package,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        vbr_capture_stream_status & status) noexcept {
+    return begin_capture_impl(
+        package, budget, fault, true, status);
+}
+
+std::unique_ptr<vbr_capture_build>
+llama_vbr_artifact_catalog::begin_capture_impl(
+        const vbr_artifact_package & package,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        bool charge_transfer_staging,
+        vbr_capture_stream_status & status) noexcept {
+    status = vbr_capture_stream_status::invalid_argument;
+    try {
+        if (package.unit_blobs.size() != 1 ||
+            package.manifest.unit_references.size() != 1 ||
+            !package.companions.empty()) {
+            return nullptr;
+        }
+        auto state = std::make_shared<catalog_stream_state>();
+        state->catalog = this;
+        state->ledger = &impl_->ledger;
+        state->package = package;
+        state->budget = budget;
+        state->fault = fault;
+        state->charge_transfer_staging =
+            charge_transfer_staging;
+        if (charge_transfer_staging) {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            const bool has_stash =
+                package.unit_blobs[0].descriptor
+                    .clean_stash_state ==
+                vbr_artifact_clean_stash_state::present;
+            if (impl_->topologies != package.topologies ||
+                !impl_->issue_artifact(
+                    state->blob_artifact) ||
+                (has_stash &&
+                 !impl_->issue_artifact(
+                     state->stash_artifact)) ||
+                !impl_->issue_artifact(
+                    state->reference_artifact)) {
+                status =
+                    vbr_capture_stream_status::
+                        accounting_refused;
+                return nullptr;
+            }
+            llama_cache_acct_content_digest staging_content;
+            llama_cache_acct_lineage_id staging_lineage;
+            llama_sha256_writer staging_hash;
+            static constexpr char STAGING_DOMAIN[] =
+                "buun.vbr.capture.transfer-staging";
+            staging_hash.string(
+                STAGING_DOMAIN,
+                sizeof(STAGING_DOMAIN) - 1);
+            staging_hash.u64(
+                package.manifest.accounting.size());
+            for (const auto & row :
+                 package.manifest.accounting) {
+                staging_hash.u32(uint32_t(row.role));
+                staging_hash.u32(
+                    uint32_t(row.domain.residency));
+                staging_hash.u32(
+                    uint32_t(row.domain.kind));
+                staging_hash.u32(
+                    row.domain.topology_index);
+                staging_hash.u32(
+                    row.domain.device_ordinal);
+                staging_hash.u64(row.logical_bytes);
+                staging_hash.u64(row.resident_bytes);
+            }
+            const auto staging_digest =
+                staging_hash.finish();
+            if (!impl_->intern_content(
+                    intern_purpose::manifest,
+                    staging_digest,
+                    staging_content) ||
+                !impl_->intern_lineage(
+                    intern_purpose::manifest,
+                    staging_digest,
+                    staging_lineage)) {
+                status =
+                    vbr_capture_stream_status::
+                        accounting_refused;
+                return nullptr;
+            }
+
+            const size_t count =
+                package.manifest.accounting.size();
+            state->durable_ops.resize(count);
+            state->durable_allocs.resize(count);
+            state->staging_ops.resize(1);
+            state->staging_allocs.resize(1);
+            state->durable_prepared_leaves.reserve(count);
+            state->staging_leaves.reserve(count);
+            for (size_t i = 0; i < count; ++i) {
+                const auto & row =
+                    package.manifest.accounting[i];
+                llama_cache_acct_resource_domain domain;
+                const auto category =
+                    vbr_artifact_accounting_category(
+                        row.role);
+                if (!impl_->resolve_domain(
+                        row.domain, domain) ||
+                    !impl_->configured.count({
+                        category, domain })) {
+                    status =
+                        vbr_capture_stream_status::
+                            accounting_refused;
+                    return nullptr;
+                }
+                const auto artifact =
+                    row.role ==
+                        vbr_artifact_accounting_role::
+                            clean_stash_payload
+                        ? state->stash_artifact
+                        : row.role ==
+                              vbr_artifact_accounting_role::
+                                  reference_metadata
+                            ? state->reference_artifact
+                            : state->blob_artifact;
+                llama_cache_transaction_leaf durable;
+                durable.category = category;
+                durable.domain = domain;
+                durable.attribution = {
+                    llama_cache_acct_attr_kind::artifact,
+                    -1, artifact,
+                };
+                durable.expected_logical =
+                    row.logical_bytes;
+                durable.reserve_resident =
+                    row.resident_bytes;
+                durable.stage_resident =
+                    row.resident_bytes;
+                durable.artifact = artifact;
+                durable.committed_op =
+                    &state->durable_ops[i];
+                durable.allocation_out =
+                    &state->durable_allocs[i];
+                state->durable_prepared_leaves.push_back(
+                    durable);
+
+            }
+            uint64_t staging_bytes = 0;
+            for (const auto & row :
+                 package.manifest.accounting) {
+                if (row.resident_bytes >
+                        UINT64_MAX - staging_bytes) {
+                    status =
+                        vbr_capture_stream_status::
+                            accounting_refused;
+                    return nullptr;
+                }
+                staging_bytes += row.resident_bytes;
+            }
+            const auto staging_domain =
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::
+                        pageable_host);
+            if (staging_bytes == 0 ||
+                !impl_->configured.count({
+                    llama_cache_acct_category::
+                        transfer_staging,
+                    staging_domain })) {
+                status =
+                    vbr_capture_stream_status::
+                        accounting_refused;
+                return nullptr;
+            }
+            llama_cache_transaction_leaf staging;
+            staging.category =
+                llama_cache_acct_category::transfer_staging;
+            staging.domain = staging_domain;
+            staging.attribution = {
+                llama_cache_acct_attr_kind::artifact,
+                -1, state->blob_artifact,
+            };
+            staging.expected_logical = staging_bytes;
+            staging.reserve_resident = staging_bytes;
+            staging.stage_resident = staging_bytes;
+            staging.artifact = state->blob_artifact;
+            staging.content = staging_content;
+            staging.lineage = staging_lineage;
+            staging.committed_op = &state->staging_ops[0];
+            staging.allocation_out =
+                &state->staging_allocs[0];
+            state->staging_leaves.push_back(staging);
+            state->staging_prepared =
+                llama_cache_prepare_reservation_transaction(
+                    impl_->ledger, budget,
+                    state->staging_leaves);
+            if (!state->staging_prepared.ready()) {
+                impl_->n_staging_overlap_refusals++;
+                status =
+                    vbr_capture_stream_status::
+                        accounting_refused;
+                return nullptr;
+            }
+            state->durable_prepared =
+                llama_cache_prepare_reservation_transaction(
+                    impl_->ledger, budget,
+                    state->durable_prepared_leaves);
+            if (!state->durable_prepared.ready()) {
+                impl_->n_staging_overlap_refusals++;
+                status =
+                    vbr_capture_stream_status::
+                        accounting_refused;
+                return nullptr;
+            }
+        }
+        status = vbr_capture_stream_status::ok;
+        return std::unique_ptr<vbr_capture_build>(
+            new llama_vbr_artifact_catalog_stream_build(
+                std::move(state)));
+    } catch (...) {
+        status = vbr_capture_stream_status::internal_error;
+        return nullptr;
+    }
+}
+
 llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
         const vbr_artifact_package & package,
         const std::vector<llama_vbr_artifact_fake_shard_completion> & completions,
         const llama_cache_budget_config & budget,
         const llama_vbr_artifact_publish_fault & fault) noexcept {
+    llama_vbr_artifact_publish_result out;
+    try {
+        const uint64_t expected =
+            package.unit_blobs.size() == 1
+                ? package.unit_blobs[0].descriptor.shards.size() +
+                      (package.unit_blobs[0].descriptor
+                                   .clean_stash_state ==
+                               vbr_artifact_clean_stash_state::present
+                           ? package.unit_blobs[0].descriptor
+                                 .clean_stash.shards.size()
+                           : 0)
+                : 0;
+        if (completions.size() != expected) {
+            out.status = completions.size() < expected
+                ? llama_vbr_artifact_publish_status::
+                    missing_completion
+                : llama_vbr_artifact_publish_status::
+                    duplicate_completion;
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->n_refusals++;
+            return out;
+        }
+        vbr_capture_stream_status stream_status;
+        // F2's fake completions are already caller-owned resident vectors;
+        // unlike the F3 D2H stream they do not allocate a pageable transfer
+        // image. They still drive the exact same seal/dedup/publication core.
+        auto build = begin_capture_impl(
+            package, budget, fault, false, stream_status);
+        if (!build) {
+            out.status =
+                llama_vbr_artifact_publish_status::
+                    invalid_argument;
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->n_refusals++;
+            return out;
+        }
+        auto unit = build->begin_unit(0, stream_status);
+        if (!unit) {
+            out.status =
+                llama_vbr_artifact_publish_status::
+                    invalid_argument;
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->n_refusals++;
+            return out;
+        }
+        for (const auto & completion : completions) {
+            if (completion.unit_index != 0) {
+                out.status =
+                    llama_vbr_artifact_publish_status::
+                        invalid_argument;
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->n_refusals++;
+                return out;
+            }
+            if (!completion.success) {
+                out.status =
+                    llama_vbr_artifact_publish_status::
+                        shard_failed;
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->n_refusals++;
+                return out;
+            }
+            auto chain =
+                std::make_shared<artifact_segment_chain>();
+            if (!chain->append(
+                    completion.bytes.data(),
+                    completion.bytes.size())) {
+                out.status =
+                    llama_vbr_artifact_publish_status::
+                        internal_error;
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->n_refusals++;
+                return out;
+            }
+            vbr_verified_segment segment;
+            segment.unit_index = completion.unit_index;
+            segment.shard_index = completion.shard_index;
+            segment.clean_stash = completion.clean_stash;
+            segment.bytes = std::move(chain);
+            segment.streaming_digest =
+                vbr_capture_stream_digest(*segment.bytes);
+            stream_status =
+                unit->accept_verified_segment(segment);
+            if (stream_status !=
+                    vbr_capture_stream_status::ok) {
+                out.status =
+                    stream_status ==
+                        vbr_capture_stream_status::
+                            duplicate_segment
+                    ? llama_vbr_artifact_publish_status::
+                        duplicate_completion
+                    : llama_vbr_artifact_publish_status::
+                        invalid_argument;
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->n_refusals++;
+                return out;
+            }
+        }
+        stream_status = unit->seal_unit();
+        if (stream_status != vbr_capture_stream_status::ok) {
+            out.status =
+                stream_status ==
+                    vbr_capture_stream_status::missing_segment
+                ? llama_vbr_artifact_publish_status::
+                    missing_completion
+                : llama_vbr_artifact_publish_status::
+                    invalid_argument;
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->n_refusals++;
+            return out;
+        }
+        const auto streamed = build->publish_reference();
+        out.reference_artifact = streamed.reference_artifact;
+        out.unit_content = streamed.unit_content;
+        out.reference_lineage = streamed.reference_lineage;
+        if (streamed.status != vbr_capture_stream_status::ok) {
+            switch (streamed.status) {
+                case vbr_capture_stream_status::format_rejected:
+                case vbr_capture_stream_status::hash_mismatch:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            format_rejected;
+                    break;
+                case vbr_capture_stream_status::
+                        accounting_unavailable:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            accounting_unavailable;
+                    break;
+                case vbr_capture_stream_status::accounting_refused:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            admission_refused;
+                    break;
+                case vbr_capture_stream_status::stage_failed:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            stage_failed;
+                    break;
+                case vbr_capture_stream_status::commit_failed:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            commit_failed;
+                    break;
+                case vbr_capture_stream_status::publication_failed:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            publication_failed;
+                    break;
+                case vbr_capture_stream_status::duplicate_segment:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            duplicate_completion;
+                    break;
+                case vbr_capture_stream_status::missing_segment:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            missing_completion;
+                    break;
+                case vbr_capture_stream_status::transfer_failed:
+                case vbr_capture_stream_status::short_read:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            shard_failed;
+                    break;
+                case vbr_capture_stream_status::invalid_argument:
+                case vbr_capture_stream_status::ring_unavailable:
+                case vbr_capture_stream_status::late_segment:
+                case vbr_capture_stream_status::internal_error:
+                case vbr_capture_stream_status::_count:
+                    out.status =
+                        llama_vbr_artifact_publish_status::
+                            internal_error;
+                    break;
+                case vbr_capture_stream_status::ok:
+                    break;
+            }
+            return out;
+        }
+        out.status = streamed.adopted
+            ? llama_vbr_artifact_publish_status::adopted
+            : llama_vbr_artifact_publish_status::published;
+        return out;
+    } catch (...) {
+        out.status =
+            llama_vbr_artifact_publish_status::internal_error;
+        if (impl_) {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->n_refusals++;
+        }
+        return out;
+    }
+}
+
+llama_vbr_artifact_publish_result
+llama_vbr_artifact_catalog::publish_stream(
+        const vbr_artifact_package & package,
+        const std::vector<vbr_verified_segment> & segments,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        void * prepared_stream_state) noexcept {
     llama_vbr_artifact_publish_result result;
     try {
+        auto * stream_state =
+            static_cast<catalog_stream_state *>(
+                prepared_stream_state);
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (impl_->topologies != package.topologies ||
             package.unit_blobs.size() != 1 ||
@@ -402,9 +1152,9 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             (descriptor.clean_stash_state ==
                  vbr_artifact_clean_stash_state::present
                  ? descriptor.clean_stash.shards.size() : 0);
-        if (completions.size() != expected) {
+        if (segments.size() != expected) {
             result.status =
-                completions.size() < expected
+                segments.size() < expected
                     ? llama_vbr_artifact_publish_status::missing_completion
                     : llama_vbr_artifact_publish_status::duplicate_completion;
             impl_->n_refusals++;
@@ -412,35 +1162,41 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
         }
 
         std::set<std::pair<bool, uint32_t>> seen;
-        for (const auto & completion : completions) {
-            if (completion.unit_index != 0) {
+        for (const auto & segment : segments) {
+            if (segment.unit_index != 0 || !segment.bytes) {
                 result.status =
                     llama_vbr_artifact_publish_status::invalid_argument;
                 impl_->n_refusals++;
                 return result;
             }
-            if (!completion.success) {
+            // The accepting pass hashes each completed D2H segment. Re-read
+            // its immutable backing at the publication boundary so a source
+            // mutation/corruption between completion and final artifact
+            // encoding cannot silently mint a different content address.
+            if (vbr_capture_stream_digest(*segment.bytes) !=
+                    segment.streaming_digest) {
                 result.status =
-                    llama_vbr_artifact_publish_status::shard_failed;
+                    llama_vbr_artifact_publish_status::
+                        format_rejected;
                 impl_->n_refusals++;
                 return result;
             }
             if (!seen.insert({
-                    completion.clean_stash,
-                    completion.shard_index }).second) {
+                    segment.clean_stash,
+                    segment.shard_index }).second) {
                 result.status =
                     llama_vbr_artifact_publish_status::duplicate_completion;
                 impl_->n_refusals++;
                 return result;
             }
-            auto & shards = completion.clean_stash
+            auto & shards = segment.clean_stash
                 ? descriptor.clean_stash.shards
                 : descriptor.shards;
             const auto shard = std::find_if(
                 shards.begin(), shards.end(),
                 [&](const vbr_artifact_shard_descriptor & candidate) {
                     return candidate.shard_index ==
-                           completion.shard_index;
+                           segment.shard_index;
                 });
             if (shard == shards.end()) {
                 result.status =
@@ -448,8 +1204,8 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 impl_->n_refusals++;
                 return result;
             }
-            shard->payload = byte_source(completion.bytes);
-            shard->payload_bytes = completion.bytes.size();
+            shard->payload = segment.bytes->source();
+            shard->payload_bytes = segment.bytes->size();
         }
 
         const auto prepared = vbr_artifact_prepare(working);
@@ -504,7 +1260,14 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                  pending_blob.descriptor.clean_stash.shards) {
                 shard.payload = {};
             }
-            if (!impl_->issue_artifact(pending_blob.artifact) ||
+            pending_blob.artifact =
+                stream_state &&
+                    stream_state->charge_transfer_staging
+                ? stream_state->blob_artifact
+                : llama_cache_acct_artifact_id {};
+            if ((pending_blob.artifact.v == 0 &&
+                 !impl_->issue_artifact(
+                     pending_blob.artifact)) ||
                 !impl_->intern_content(
                     intern_purpose::unit, unit_key,
                     pending_blob.content) ||
@@ -530,7 +1293,14 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 for (auto & shard : pending_stash.descriptor.shards) {
                     shard.payload = {};
                 }
-                if (!impl_->issue_artifact(pending_stash.artifact) ||
+                pending_stash.artifact =
+                    stream_state &&
+                        stream_state->charge_transfer_staging
+                    ? stream_state->stash_artifact
+                    : llama_cache_acct_artifact_id {};
+                if ((pending_stash.artifact.v == 0 &&
+                     !impl_->issue_artifact(
+                         pending_stash.artifact)) ||
                     !impl_->intern_content(
                         intern_purpose::stash, stash_key,
                         pending_stash.content) ||
@@ -545,7 +1315,14 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             }
         }
 
-        if (!impl_->issue_artifact(pending_reference.artifact) ||
+        pending_reference.artifact =
+            stream_state &&
+                stream_state->charge_transfer_staging
+            ? stream_state->reference_artifact
+            : llama_cache_acct_artifact_id {};
+        if ((pending_reference.artifact.v == 0 &&
+             !impl_->issue_artifact(
+                 pending_reference.artifact)) ||
             !impl_->intern_lineage(
                 intern_purpose::manifest,
                 working.manifest.manifest_digest.bytes(),
@@ -677,14 +1454,52 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             transaction_leaves.push_back(leaf);
         }
 
+        // A real stream prepared both capacity groups before its first D2H
+        // allocation.  The staging group is committed on first acceptance
+        // and remains live through this terminal.  A content-addressed
+        // adoption changes the allocation shape, so its deliberately
+        // conservative fresh durable claims are aborted and re-priced while
+        // staging is still live.
+        llama_cache_prepared_claim_group local_durable;
+        llama_cache_prepared_claim_group * prepared_durable =
+            nullptr;
+        const bool use_stream_preparation =
+            stream_state &&
+            stream_state->charge_transfer_staging &&
+            !blob_exists && !stash_exists;
+        if (use_stream_preparation) {
+            prepared_durable =
+                &stream_state->durable_prepared;
+        } else {
+            if (stream_state &&
+                stream_state->charge_transfer_staging) {
+                stream_state->durable_prepared = {};
+            }
+            local_durable =
+                llama_cache_prepare_reservation_transaction(
+                    impl_->ledger, budget,
+                    transaction_leaves);
+            prepared_durable = &local_durable;
+        }
+        if (!prepared_durable->ready()) {
+            result.status =
+                llama_vbr_artifact_publish_status::
+                    admission_refused;
+            if (stream_state &&
+                stream_state->charge_transfer_staging) {
+                impl_->n_staging_overlap_refusals++;
+            }
+            impl_->n_refusals++;
+            return result;
+        }
+
         struct materialize_context {
             impl::blob * blob = nullptr;
             impl::stash * stash = nullptr;
             const vbr_artifact_unit_descriptor * descriptor =
                 nullptr;
-            const std::vector<
-                llama_vbr_artifact_fake_shard_completion> *
-                    completions = nullptr;
+            const std::vector<vbr_verified_segment> *
+                    segments = nullptr;
             bool blob_exists = false;
             bool stash_exists = false;
             bool has_stash = false;
@@ -692,7 +1507,7 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             &pending_blob,
             &pending_stash,
             &descriptor,
-            &completions,
+            &segments,
             blob_exists,
             stash_exists,
             has_stash,
@@ -702,7 +1517,7 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 static_cast<materialize_context *>(opaque);
             if (!context || !context->blob ||
                 !context->stash || !context->descriptor ||
-                !context->completions) {
+                !context->segments) {
                 return false;
             }
             if (!context->blob_exists) {
@@ -711,15 +1526,16 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 for (const auto & shard :
                      context->descriptor->shards) {
                     const auto completion = std::find_if(
-                        context->completions->begin(),
-                        context->completions->end(),
+                        context->segments->begin(),
+                        context->segments->end(),
                         [&](const auto & candidate) {
                             return !candidate.clean_stash &&
                                    candidate.shard_index ==
                                        shard.shard_index;
                         });
                     if (completion ==
-                            context->completions->end()) {
+                            context->segments->end() ||
+                        !completion->bytes) {
                         return false;
                     }
                     context->blob->payload_shards.push_back(
@@ -733,15 +1549,16 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
                 for (const auto & shard :
                      context->descriptor->clean_stash.shards) {
                     const auto completion = std::find_if(
-                        context->completions->begin(),
-                        context->completions->end(),
+                        context->segments->begin(),
+                        context->segments->end(),
                         [&](const auto & candidate) {
                             return candidate.clean_stash &&
                                    candidate.shard_index ==
                                        shard.shard_index;
                         });
                     if (completion ==
-                            context->completions->end()) {
+                            context->segments->end() ||
+                        !completion->bytes) {
                         return false;
                     }
                     context->stash->shards.push_back(
@@ -754,9 +1571,8 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
             &materialize, materialize_storage,
         };
         const auto transaction =
-            llama_cache_execute_reservation_transaction(
-                impl_->ledger, budget, transaction_leaves,
-                fault, after_admit);
+            prepared_durable->materialize_and_commit(
+                transaction_leaves, fault, after_admit);
         if (transaction.status !=
                 llama_cache_transaction_status::committed) {
             switch (transaction.status) {
@@ -968,6 +1784,8 @@ llama_vbr_artifact_catalog::snapshot() const noexcept {
         out.published = impl_->n_published;
         out.adopted = impl_->n_adopted;
         out.refusals = impl_->n_refusals;
+        out.staging_overlap_refusals =
+            impl_->n_staging_overlap_refusals;
     } catch (...) {
         out = {};
     }

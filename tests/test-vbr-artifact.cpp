@@ -912,7 +912,7 @@ struct catalog_fixture {
         llama_cache_acct_resource_domain::non_device(
             llama_cache_acct_residency::pageable_host);
 
-    catalog_fixture()
+    explicit catalog_fixture(bool configure_catalog = true)
         : package(make_package(storage)),
           catalog(new llama_vbr_artifact_catalog(ledger)) {
         CHECK(catalog->bind_topologies(package.topologies, bindings));
@@ -927,7 +927,9 @@ struct catalog_fixture {
         }
         CHECK(ledger.configure_required_producers(
             required.data(), required.size()));
-        CHECK(catalog->configure_accounting(package));
+        if (configure_catalog) {
+            CHECK(catalog->configure_accounting(package));
+        }
         const auto initialize = [&](llama_cache_acct_category category,
                                     const llama_cache_acct_resource_domain & domain,
                                     bool transactional) {
@@ -1001,6 +1003,244 @@ struct catalog_fixture {
         };
     }
 };
+
+static vbr_verified_segment verified_segment(
+        const llama_vbr_artifact_fake_shard_completion & completion,
+        size_t split = SIZE_MAX) {
+    auto chain = std::make_shared<artifact_segment_chain>();
+    const size_t first = std::min(
+        split, completion.bytes.size());
+    CHECK(chain->append(completion.bytes.data(), first));
+    if (first < completion.bytes.size()) {
+        CHECK(chain->append(
+            completion.bytes.data() + first,
+            completion.bytes.size() - first));
+    }
+    vbr_verified_segment out;
+    out.unit_index = completion.unit_index;
+    out.shard_index = completion.shard_index;
+    out.clean_stash = completion.clean_stash;
+    out.bytes = std::move(chain);
+    out.streaming_digest =
+        vbr_capture_stream_digest(*out.bytes);
+    return out;
+}
+
+static void test_catalog_streaming_protocol() {
+    catalog_fixture f;
+    vbr_capture_stream_status status;
+    auto build = f.catalog->begin_capture(
+        f.package, f.budget, {}, status);
+    CHECK(build);
+    CHECK(status == vbr_capture_stream_status::ok);
+    if (!build) {
+        return;
+    }
+    const uint64_t claims =
+        f.ledger.snapshot().live_ops;
+    CHECK(claims ==
+          f.package.manifest.accounting.size() + 1);
+
+    auto unit = build->begin_unit(0, status);
+    CHECK(unit);
+    const auto completions = f.completions();
+    const size_t order[] = { 3, 0, 2, 1 };
+    for (const size_t index : order) {
+        auto segment = verified_segment(
+            completions[index], 1);
+        CHECK(unit->accept_verified_segment(segment) ==
+              vbr_capture_stream_status::ok);
+    }
+    CHECK(f.ledger.snapshot().live_ops == claims);
+    CHECK(unit->seal_unit() ==
+          vbr_capture_stream_status::ok);
+    auto late = verified_segment(completions[0]);
+    CHECK(unit->accept_verified_segment(late) ==
+          vbr_capture_stream_status::late_segment);
+    const auto streamed = build->publish_reference();
+    CHECK(streamed.status ==
+          vbr_capture_stream_status::ok);
+    CHECK(!streamed.adopted);
+    CHECK(streamed.reference_artifact.v != 0);
+    CHECK(streamed.unit_content.v != 0);
+    unit.reset();
+    build.reset();
+
+    auto snapshot = f.ledger.snapshot();
+    CHECK(snapshot.live_ops ==
+          f.package.manifest.accounting.size());
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::transfer_staging,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 0);
+
+    auto adopted_build = f.catalog->begin_capture(
+        f.package, f.budget, {}, status);
+    CHECK(adopted_build);
+    auto adopted_unit =
+        adopted_build->begin_unit(0, status);
+    CHECK(adopted_unit);
+    for (const auto & completion : f.completions()) {
+        auto value = verified_segment(completion, 2);
+        CHECK(adopted_unit->accept_verified_segment(value) ==
+              vbr_capture_stream_status::ok);
+    }
+    CHECK(adopted_unit->seal_unit() ==
+          vbr_capture_stream_status::ok);
+    const auto adopted =
+        adopted_build->publish_reference();
+    CHECK(adopted.status == vbr_capture_stream_status::ok);
+    CHECK(adopted.adopted);
+    CHECK(adopted.reference_artifact !=
+          streamed.reference_artifact);
+    CHECK(adopted.unit_content == streamed.unit_content);
+    CHECK(adopted.reference_lineage ==
+          streamed.reference_lineage);
+    adopted_unit.reset();
+    adopted_build.reset();
+
+    snapshot = f.ledger.snapshot();
+    CHECK(snapshot.live_ops ==
+          2*f.package.manifest.accounting.size());
+    for (const auto & binding : f.bindings) {
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::unit_version_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 4);
+        CHECK(catalog_cell(
+            snapshot,
+            llama_cache_acct_category::clean_stash_payload,
+            binding.domain,
+            llama_cache_acct_measure::resident_allocated).value == 8);
+    }
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_descriptor_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 512);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::artifact_reference_metadata,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == 512);
+    const auto adopted_state = f.catalog->snapshot();
+    CHECK(adopted_state.blobs == 1);
+    CHECK(adopted_state.stashes == 1);
+    CHECK(adopted_state.references == 2);
+    CHECK(adopted_state.published == 1);
+    CHECK(adopted_state.adopted == 1);
+
+    catalog_fixture fake_equivalent;
+    const auto fake_first = fake_equivalent.catalog->publish(
+        fake_equivalent.package,
+        fake_equivalent.completions(),
+        fake_equivalent.budget);
+    CHECK(fake_first.status ==
+          llama_vbr_artifact_publish_status::published);
+    CHECK(fake_first.reference_artifact ==
+          streamed.reference_artifact);
+
+    catalog_fixture invalid;
+    auto bad_build = invalid.catalog->begin_capture(
+        invalid.package, invalid.budget, {}, status);
+    CHECK(bad_build);
+    auto bad_unit = bad_build->begin_unit(0, status);
+    CHECK(bad_unit);
+    auto segment = verified_segment(
+        invalid.completions()[0]);
+    CHECK(bad_unit->accept_verified_segment(segment) ==
+          vbr_capture_stream_status::ok);
+    CHECK(bad_unit->accept_verified_segment(segment) ==
+          vbr_capture_stream_status::duplicate_segment);
+    CHECK(bad_unit->seal_unit() ==
+          vbr_capture_stream_status::duplicate_segment);
+    CHECK(bad_build->publish_reference().status ==
+          vbr_capture_stream_status::duplicate_segment);
+    bad_unit.reset();
+    bad_build.reset();
+    CHECK(invalid.ledger.snapshot().live_ops == 0);
+    CHECK(invalid.catalog->snapshot().references == 0);
+
+    catalog_fixture missing;
+    auto missing_build = missing.catalog->begin_capture(
+        missing.package, missing.budget, {}, status);
+    CHECK(missing_build);
+    auto missing_unit =
+        missing_build->begin_unit(0, status);
+    CHECK(missing_unit);
+    auto only = verified_segment(missing.completions()[0]);
+    CHECK(missing_unit->accept_verified_segment(only) ==
+          vbr_capture_stream_status::ok);
+    CHECK(missing_unit->seal_unit() ==
+          vbr_capture_stream_status::missing_segment);
+    missing_unit.reset();
+    missing_build.reset();
+    CHECK(missing.ledger.snapshot().live_ops == 0);
+    CHECK(missing.catalog->snapshot().references == 0);
+
+    for (const bool commit_fault : { false, true }) {
+        catalog_fixture faulted;
+        llama_cache_transaction_fault fault;
+        if (commit_fault) {
+            fault.fail_commit_at = 0;
+        } else {
+            fault.fail_stage_at = 0;
+        }
+        auto fault_build = faulted.catalog->begin_capture(
+            faulted.package, faulted.budget, fault, status);
+        CHECK(fault_build);
+        auto fault_unit =
+            fault_build->begin_unit(0, status);
+        CHECK(fault_unit);
+        for (const auto & completion :
+             faulted.completions()) {
+            auto value = verified_segment(completion);
+            CHECK(fault_unit->accept_verified_segment(value) ==
+                  vbr_capture_stream_status::ok);
+        }
+        CHECK(fault_unit->seal_unit() ==
+              vbr_capture_stream_status::ok);
+        const auto failed = fault_build->publish_reference();
+        CHECK(failed.status ==
+              (commit_fault
+                   ? vbr_capture_stream_status::commit_failed
+                   : vbr_capture_stream_status::stage_failed));
+        fault_unit.reset();
+        fault_build.reset();
+        CHECK(faulted.ledger.snapshot().live_ops == 0);
+        CHECK(faulted.catalog->snapshot().references == 0);
+    }
+
+    catalog_fixture overlap;
+    const auto generous_overlap_budget = overlap.budget;
+    overlap.budget.host.pageable_cap = 1000;
+    overlap.budget.host.pageable_state =
+        llama_cache_budget_capacity_state::known;
+    auto refused = overlap.catalog->begin_capture(
+        overlap.package, overlap.budget, {}, status);
+    CHECK(!refused);
+    CHECK(status ==
+          vbr_capture_stream_status::accounting_refused);
+    CHECK(overlap.catalog->snapshot()
+              .staging_overlap_refusals == 1);
+    CHECK(overlap.ledger.snapshot().live_ops == 0);
+    const auto fake_after_refusal = overlap.catalog->publish(
+        overlap.package, overlap.completions(),
+        generous_overlap_budget);
+    CHECK(fake_after_refusal.status ==
+          llama_vbr_artifact_publish_status::published);
+
+    catalog_fixture unconfigured(false);
+    const auto unavailable = unconfigured.catalog->publish(
+        unconfigured.package, unconfigured.completions(),
+        unconfigured.budget);
+    CHECK(unavailable.status ==
+          llama_vbr_artifact_publish_status::
+              accounting_unavailable);
+    CHECK(unconfigured.ledger.snapshot().live_ops == 0);
+}
 
 static void test_catalog_charge_once_and_retire() {
     catalog_fixture f;
@@ -1342,6 +1582,7 @@ int main() {
     test_validation_and_ordering();
     test_companion_payload();
     test_stream_larger_than_capture_ring();
+    test_catalog_streaming_protocol();
     test_catalog_charge_once_and_retire();
     test_catalog_all_shard_failures_and_rollback();
     test_catalog_destructor_releases_live_references();

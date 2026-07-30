@@ -379,6 +379,8 @@ static void test_transaction_fault_rollback() {
     const auto result = llama_cache_execute_reservation_transaction(
         ledger, config, leaves, fault);
     CHECK(result.status == llama_cache_transaction_status::commit_failed);
+    CHECK(result.admission_status ==
+          llama_cache_admission_status::internal_fault);
     CHECK(result.failed_leaf == 1);
     CHECK(result.rolled_back == 1);
     CHECK(committed[0].v == 901);
@@ -392,6 +394,18 @@ static void test_transaction_fault_rollback() {
     CHECK(host_category_measure(
         ledger, llama_cache_acct_category::checkpoint_state_payload,
         llama_cache_acct_measure::resident_allocated) == 0);
+
+    fault.fail_commit_at = UINT32_MAX;
+    fault.fail_after_commit = true;
+    const auto post_commit =
+        llama_cache_execute_reservation_transaction(
+            ledger, config, leaves, fault);
+    CHECK(post_commit.status ==
+          llama_cache_transaction_status::post_commit_fault);
+    CHECK(post_commit.admission_status ==
+          llama_cache_admission_status::internal_fault);
+    CHECK(post_commit.rolled_back == leaves.size());
+    CHECK(ledger.snapshot().live_ops == 0);
 }
 
 // A preparation failure occurs only after all claims exist and before any stage. The claims' RAII
@@ -421,6 +435,54 @@ static void test_transaction_after_admit_failure() {
     CHECK(host_reserved(ledger) == 0);
 }
 
+static void test_prepared_transaction_split_phase() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    llama_cache_budget_config config;
+    llama_cache_acct_op_id committed { 901 };
+    llama_cache_acct_alloc_id allocation { 801 };
+    std::vector<llama_cache_transaction_leaf> leaves {
+        transaction_leaf(PAYLOAD, 64, committed, allocation),
+    };
+
+    {
+        auto dropped =
+            llama_cache_prepare_reservation_transaction(
+                ledger, config, leaves);
+        CHECK(dropped.ready());
+        CHECK(dropped.preparation().status ==
+              llama_cache_prepare_status::prepared);
+        CHECK(ledger.snapshot().live_ops == 1);
+        CHECK(host_reserved(ledger) == 64);
+    }
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(host_reserved(ledger) == 0);
+
+    auto prepared =
+        llama_cache_prepare_reservation_transaction(
+            ledger, config, leaves);
+    CHECK(prepared.ready());
+    auto changed = leaves;
+    changed[0].stage_resident++;
+    const auto refused =
+        prepared.materialize_and_commit(changed);
+    CHECK(refused.status ==
+          llama_cache_transaction_status::invalid_argument);
+    CHECK(prepared.ready());
+    CHECK(ledger.snapshot().live_ops == 1);
+
+    const auto committed_result =
+        prepared.materialize_and_commit(leaves);
+    CHECK(committed_result.status ==
+          llama_cache_transaction_status::committed);
+    CHECK(!prepared.ready());
+    CHECK(committed.v != 901);
+    CHECK(allocation.v != 801);
+    CHECK(ledger.snapshot().live_ops == 1);
+    CHECK(ledger.release(committed));
+    CHECK(ledger.snapshot().live_ops == 0);
+}
+
 static void test_status_names() {
     CHECK(std::string(llama_cache_admission_status_name(
         llama_cache_admission_status::admitted)) == "admitted");
@@ -433,6 +495,8 @@ static void test_status_names() {
     CHECK(std::string(llama_cache_transaction_status_name(
         llama_cache_transaction_status::post_commit_fault)) ==
         "post_commit_fault");
+    CHECK(std::string(llama_cache_prepare_status_name(
+        llama_cache_prepare_status::prepared)) == "prepared");
 }
 
 int main() {
@@ -449,6 +513,7 @@ int main() {
     test_transaction_existing_allocation();
     test_transaction_fault_rollback();
     test_transaction_after_admit_failure();
+    test_prepared_transaction_split_phase();
     test_status_names();
 
     if (failures > 0) {

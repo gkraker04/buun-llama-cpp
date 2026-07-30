@@ -43,6 +43,7 @@ add_library(llama
             llama-vbr-checkpoint.cpp
             llama-vbr-extent.cpp
             llama-vbr-artifact.cpp
+            llama-vbr-artifact-capture.cpp
             llama-vbr-artifact-catalog.cpp
             llama-vbr-generation.cpp
             llama-vbr-generation-oracle.cpp

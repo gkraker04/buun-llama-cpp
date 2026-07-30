@@ -25,6 +25,7 @@
 #include "llama-cache-budget.h"
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 // One typed reservation request. Exactly one target domain; no release credits.
@@ -175,10 +176,93 @@ struct llama_cache_transaction_result {
     uint64_t rolled_back = 0;
 };
 
+enum class llama_cache_prepare_status : uint8_t {
+    prepared,
+    invalid_argument,
+    admission_refused,
+    internal_fault,
+    _count,
+};
+
+const char * llama_cache_prepare_status_name(
+        llama_cache_prepare_status status) noexcept;
+
+struct llama_cache_prepare_result {
+    llama_cache_prepare_status status =
+        llama_cache_prepare_status::internal_fault;
+    llama_cache_admission_status admission_status =
+        llama_cache_admission_status::internal_fault;
+    size_t failed_leaf = SIZE_MAX;
+    uint32_t attempts = 0;
+    uint64_t serial_retries = 0;
+};
+
+// Split-phase form of the shared authority transaction. A prepared group owns
+// every admitted reservation claim until its one materialize-and-commit
+// terminal runs. Dropping or replacing the group aborts all still-live claims.
+// This is the F3 streaming seam: capacity is proven before a bounded D2H
+// materialization without introducing a second admission or rollback path.
+class llama_cache_prepared_claim_group {
+public:
+    llama_cache_prepared_claim_group();
+    ~llama_cache_prepared_claim_group();
+
+    llama_cache_prepared_claim_group(
+        const llama_cache_prepared_claim_group &) = delete;
+    llama_cache_prepared_claim_group & operator=(
+        const llama_cache_prepared_claim_group &) = delete;
+    llama_cache_prepared_claim_group(
+        llama_cache_prepared_claim_group &&) noexcept;
+    llama_cache_prepared_claim_group & operator=(
+        llama_cache_prepared_claim_group &&) noexcept;
+
+    bool ready() const noexcept;
+    const llama_cache_prepare_result & preparation() const noexcept;
+
+    // Single terminal. The optional hook remains after all claims are admitted
+    // and before the first stage. Re-entry or a failed preparation returns a
+    // typed invalid/internal result and never exposes success outputs.
+    llama_cache_transaction_result materialize_and_commit(
+        const llama_cache_transaction_fault & fault = {},
+        const llama_cache_transaction_after_admit & after_admit = {}) noexcept;
+
+    // F3 prepares capacity before the content-addressed byte stream exists.
+    // The terminal may bind the final artifact/content/lineage citations and
+    // success-output locations, while every priced field remains identical
+    // to the prepared leaf. Any shape change fails closed before staging.
+    llama_cache_transaction_result materialize_and_commit(
+        const std::vector<llama_cache_transaction_leaf> & finalized_leaves,
+        const llama_cache_transaction_fault & fault = {},
+        const llama_cache_transaction_after_admit & after_admit = {}) noexcept;
+
+private:
+    struct impl;
+    explicit llama_cache_prepared_claim_group(
+        std::unique_ptr<impl> state) noexcept;
+
+    std::unique_ptr<impl> impl_;
+
+    friend llama_cache_prepared_claim_group
+    llama_cache_prepare_reservation_transaction(
+        llama_cache_acct_ledger &,
+        const llama_cache_budget_config &,
+        const std::vector<llama_cache_transaction_leaf> &) noexcept;
+};
+
+// Admit every leaf with the same bounded resnapshot/fits/reserve retry used by
+// the historical one-shot helper, but retain the move-only claims for a later
+// materialization terminal.
+llama_cache_prepared_claim_group
+llama_cache_prepare_reservation_transaction(
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget_config,
+        const std::vector<llama_cache_transaction_leaf> & leaves) noexcept;
+
 // Shared F0/F2 transaction:
 //   admit every leaf (bounded serial-conflict retry) → optional preparation → stage all →
 //   commit all → post-commit fault seam → publish success-only outputs.
-// Any failure releases already-committed ops and lets the move-only claims abort the rest.
+// Any failure releases already-committed ops and lets the move-only claims
+// abort the rest. This one-shot API is a thin prepare + terminal wrapper.
 llama_cache_transaction_result llama_cache_execute_reservation_transaction(
         llama_cache_acct_ledger & ledger,
         const llama_cache_budget_config & budget_config,

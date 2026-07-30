@@ -1,7 +1,6 @@
 #pragma once
 
-#include "llama-cache-authority.h"
-#include "llama-vbr-artifact.h"
+#include "llama-vbr-artifact-capture.h"
 
 #include <cstdint>
 #include <memory>
@@ -63,6 +62,7 @@ struct llama_vbr_artifact_catalog_snapshot {
     uint64_t published = 0;
     uint64_t adopted = 0;
     uint64_t refusals = 0;
+    uint64_t staging_overlap_refusals = 0;
 };
 
 struct llama_vbr_artifact_reference_tokens {
@@ -71,7 +71,7 @@ struct llama_vbr_artifact_reference_tokens {
     llama_cache_acct_lineage_id lineage;
 };
 
-class llama_vbr_artifact_catalog {
+class llama_vbr_artifact_catalog : public vbr_unit_version_sink {
 public:
     explicit llama_vbr_artifact_catalog(llama_cache_acct_ledger & ledger);
     ~llama_vbr_artifact_catalog();
@@ -100,6 +100,13 @@ public:
         const llama_cache_budget_config & budget,
         const llama_vbr_artifact_publish_fault & fault = {}) noexcept;
 
+    // F3.1 streaming path and the abstract F3.2 capture sink entry point.
+    std::unique_ptr<vbr_capture_build> begin_capture(
+        const vbr_artifact_package & package,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        vbr_capture_stream_status & status) noexcept override;
+
     // Release every ledger reference owned by this checkpoint reference.
     // Physical payload/stash bytes discharge only when C observes the last op.
     bool retire(llama_cache_acct_artifact_id reference) noexcept;
@@ -112,6 +119,22 @@ public:
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
+
+    llama_vbr_artifact_publish_result publish_stream(
+        const vbr_artifact_package & package,
+        const std::vector<vbr_verified_segment> & segments,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        void * prepared_stream_state) noexcept;
+
+    std::unique_ptr<vbr_capture_build> begin_capture_impl(
+        const vbr_artifact_package & package,
+        const llama_cache_budget_config & budget,
+        const llama_cache_transaction_fault & fault,
+        bool charge_transfer_staging,
+        vbr_capture_stream_status & status) noexcept;
+
+    friend class llama_vbr_artifact_catalog_stream_build;
 };
 
 const char * llama_vbr_artifact_publish_status_name(

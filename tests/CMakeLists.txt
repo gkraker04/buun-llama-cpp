@@ -171,6 +171,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-vbr-artifact.cpp)
     target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    llama_build_and_test(test-vbr-artifact-capture.cpp)
+    target_include_directories(test-vbr-artifact-capture PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(
         test-cache-lease.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
