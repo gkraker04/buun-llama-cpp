@@ -1,5 +1,6 @@
 #include "llama-vbr-artifact.h"
 #include "llama-vbr-artifact-catalog.h"
+#include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-artifact-validate.h"
 #include "llama-sha256.h"
 
@@ -26,6 +27,10 @@ static_assert(!std::is_copy_constructible<vbr_validated_manifest>::value);
 static_assert(!std::is_copy_assignable<vbr_validated_manifest>::value);
 static_assert(std::is_nothrow_move_constructible<vbr_validated_manifest>::value);
 static_assert(std::is_nothrow_move_assignable<vbr_validated_manifest>::value);
+static_assert(!std::is_copy_constructible<vbr_staged_payloads>::value);
+static_assert(!std::is_copy_assignable<vbr_staged_payloads>::value);
+static_assert(std::is_nothrow_move_constructible<vbr_staged_payloads>::value);
+static_assert(std::is_nothrow_move_assignable<vbr_staged_payloads>::value);
 
 #define CHECK(cond) \
     do { \
@@ -1074,8 +1079,13 @@ struct catalog_fixture {
     llama_cache_acct_resource_domain host =
         llama_cache_acct_resource_domain::non_device(
             llama_cache_acct_residency::pageable_host);
+    llama_cache_acct_resource_domain pinned =
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pinned_host);
 
-    explicit catalog_fixture(bool configure_catalog = true)
+    explicit catalog_fixture(
+            bool configure_catalog = true,
+            bool include_pinned = false)
         : package(make_package(storage)),
           catalog(new llama_vbr_artifact_catalog(ledger)) {
         CHECK(catalog->bind_topologies(package.topologies, bindings));
@@ -1083,6 +1093,11 @@ struct catalog_fixture {
         required.push_back({
             host, llama_cache_acct_producer::retention_sidecar,
         });
+        if (include_pinned) {
+            required.push_back({
+                pinned, llama_cache_acct_producer::retention_sidecar,
+            });
+        }
         for (const auto & binding : bindings) {
             required.push_back({
                 binding.domain, llama_cache_acct_producer::live_memory,
@@ -1114,6 +1129,29 @@ struct catalog_fixture {
         initialize(
             llama_cache_acct_category::typed_accelerator_payload,
             host, true);
+        if (include_pinned) {
+            for (uint8_t raw = 0;
+                 raw < uint8_t(llama_cache_acct_category::_count);
+                 ++raw) {
+                const auto category = llama_cache_acct_category(raw);
+                const auto classification =
+                    llama_cache_budget_classify(category);
+                if (classification.participation !=
+                        llama_cache_budget_capacity_participation::participating ||
+                    (classification.scope !=
+                         llama_cache_budget_residency_scope::host &&
+                     classification.scope !=
+                         llama_cache_budget_residency_scope::by_domain)) {
+                    continue;
+                }
+                for (const auto measure : {
+                        llama_cache_acct_measure::logical_payload,
+                        llama_cache_acct_measure::resident_allocated,
+                        llama_cache_acct_measure::reserved }) {
+                    ledger.gauge_set(category, pinned, measure, 0);
+                }
+            }
+        }
         for (const auto & binding : bindings) {
             initialize(
                 llama_cache_acct_category::live_attention_state,
@@ -1130,6 +1168,10 @@ struct catalog_fixture {
         }
         CHECK(ledger.certify_complete(
             host, llama_cache_acct_producer::retention_sidecar));
+        if (include_pinned) {
+            CHECK(ledger.certify_complete(
+                pinned, llama_cache_acct_producer::retention_sidecar));
+        }
         for (const auto & binding : bindings) {
             CHECK(ledger.certify_complete(
                 binding.domain, llama_cache_acct_producer::live_memory));
@@ -1154,6 +1196,10 @@ struct catalog_fixture {
         }
         budget.host.pageable_state =
             llama_cache_budget_capacity_state::unbounded;
+        if (include_pinned) {
+            budget.host.pinned_state =
+                llama_cache_budget_capacity_state::unbounded;
+        }
     }
 
     std::vector<llama_vbr_artifact_fake_shard_completion>
@@ -2063,7 +2109,11 @@ struct validator_fixture {
 
     // stash_case: 0 = exact full prefix, 1 = source-present partial
     // authorization, 2 = absent at source.
-    explicit validator_fixture(bool legacy_v1 = false, int stash_case = 0) {
+    explicit validator_fixture(
+            bool legacy_v1 = false,
+            int stash_case = 0,
+            bool include_pinned = false)
+        : base(true, include_pinned) {
         // Keep the historical artifact golden intact while making this
         // validator fixture's physical authorization fit its one-row unit.
         auto & manifest = base.package.manifest;
@@ -2613,6 +2663,115 @@ static void test_manifest_validator_matrix() {
     }
 }
 
+static vbr_adopt_stage_policy stage_policy_for(
+        validator_fixture & fixture,
+        llama_cache_budget_config & budget) {
+    budget = fixture.base.budget;
+    budget.host.pinned_cap = 1024*1024;
+    budget.host.pinned_state =
+        llama_cache_budget_capacity_state::known;
+    budget.host.total_state =
+        llama_cache_budget_capacity_state::unbounded;
+
+    vbr_adopt_stage_policy policy;
+    policy.ledger = &fixture.base.ledger;
+    policy.budget = &budget;
+    policy.pinned_domain = fixture.base.pinned;
+    policy.pinned_ring_bytes = 32;
+    policy.chunk_bytes = 8;
+    for (const auto & binding : fixture.base.bindings) {
+        policy.lanes.push_back({ binding.domain, nullptr, nullptr, false });
+    }
+    return policy;
+}
+
+static void test_validated_manifest_staging() {
+    validator_fixture fixture(false, 0, true);
+    auto validated = validate(fixture, fixture.target, fixture.policy);
+    CHECK(validated.status == vbr_manifest_validation_status::validated);
+    CHECK(validated.proof);
+    const uint64_t nonce = validated.proof->adoption_nonce();
+    const auto digest = validated.proof->manifest_digest();
+    const uint64_t validation_serial =
+        validated.proof->target().accounting_serial;
+    const uint64_t baseline_ops = fixture.base.ledger.snapshot().live_ops;
+
+    llama_cache_budget_config budget;
+    auto policy = stage_policy_for(fixture, budget);
+    auto staged = vbr_stage_validated_manifest(
+        std::move(validated.proof), policy);
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest);
+    CHECK(staged.staged);
+    if (staged.staged) {
+        CHECK(staged.staged->adoption_nonce() == nonce);
+        CHECK(staged.staged->manifest_digest() == digest);
+        CHECK(staged.staged->decision() ==
+              vbr_import_decision::native_import);
+        CHECK(staged.staged->validation_accounting_serial() ==
+              validation_serial);
+        CHECK(staged.staged->accounting_serial_after_prepare() >
+              validation_serial);
+        CHECK(staged.staged->accounting_serial_after_prepare() ==
+              fixture.base.ledger.snapshot().serial);
+        CHECK(staged.staged->claims_ready());
+        CHECK(staged.staged->ring_capacity_bytes() == 32);
+        CHECK(staged.staged->read_count() >= 5);
+        for (const auto & read : staged.staged->reads()) {
+            CHECK(read.source);
+            CHECK(read.size != 0);
+            CHECK(std::any_of(
+                read.verified_digest.begin(), read.verified_digest.end(),
+                [](uint8_t value) { return value != 0; }));
+        }
+    }
+    CHECK(fixture.base.ledger.snapshot().live_ops > baseline_ops);
+    staged.staged.reset();
+    CHECK(fixture.base.ledger.snapshot().live_ops == baseline_ops);
+    CHECK(staged.manifest && staged.manifest->adoption_nonce() == nonce);
+
+    const auto run_failure = [&](vbr_adopt_stage_policy failed_policy,
+                                 vbr_adopt_stage_status expected) {
+        fixture.accounting = fixture.base.ledger.snapshot();
+        fixture.target.accounting_serial = fixture.accounting.serial;
+        fixture.serials.accounting = fixture.accounting.serial;
+        fixture.policy.accounting_snapshot = &fixture.accounting;
+        auto proof = validate(fixture, fixture.target, fixture.policy);
+        CHECK(proof.proof);
+        const uint64_t before = fixture.base.ledger.snapshot().live_ops;
+        auto result = vbr_stage_validated_manifest(
+            std::move(proof.proof), failed_policy);
+        CHECK(result.status == expected);
+        CHECK(result.manifest);
+        CHECK(!result.staged);
+        CHECK(fixture.base.ledger.snapshot().live_ops == before);
+    };
+
+    policy.fault.fail_source_verify_at = 0;
+    run_failure(policy, vbr_adopt_stage_status::source_hash_mismatch);
+    policy.fault = {};
+    policy.fault.fail_before_prepare = true;
+    run_failure(policy, vbr_adopt_stage_status::internal_error);
+    policy.fault = {};
+    policy.fault.fail_ring_allocation = true;
+    run_failure(policy, vbr_adopt_stage_status::ring_unavailable);
+
+    policy.fault = {};
+    llama_cache_budget_config refused_budget = budget;
+    for (auto & device : refused_budget.devices) {
+        device.configured_cache_cap = 0;
+        device.cache_cap_state = llama_cache_budget_capacity_state::known;
+    }
+    policy.budget = &refused_budget;
+    run_failure(policy, vbr_adopt_stage_status::admission_refused);
+
+    // Duplicate domain bindings are ambiguous and therefore fail before any
+    // claim or ring allocation.
+    policy.budget = &budget;
+    policy.lanes.push_back(policy.lanes.front());
+    run_failure(policy, vbr_adopt_stage_status::source_unavailable);
+}
+
 int main() {
     test_golden_and_native_lineage();
     test_v1_decode_and_v2_restore_metadata();
@@ -2633,6 +2792,7 @@ int main() {
     test_catalog_capacity_sequential_and_temporaries();
     test_catalog_package_lease_and_reference_placement();
     test_manifest_validator_matrix();
+    test_validated_manifest_staging();
     if (failures != 0) {
         fprintf(stderr, "%d VBR artifact test(s) failed\n", failures);
         return 1;

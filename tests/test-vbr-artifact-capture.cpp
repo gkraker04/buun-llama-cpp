@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact-capture.h"
+#include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-operation.h"
 #include "server-vbr-artifact-store.h"
 
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static int failures = 0;
@@ -139,6 +141,18 @@ static void test_cpu_ring_boundaries() {
     CHECK(chain.size() > ring->capacity_bytes());
     CHECK(read_chain(chain) == input.bytes);
 
+    // Test-local pre-refactor oracle: the historical CPU adapter appended one
+    // pageable segment per ring-sized chunk and hashed the resulting byte
+    // stream. This pins the D2H facade across the shared-core extraction.
+    artifact_segment_chain legacy;
+    for (size_t offset = 0; offset < input.bytes.size(); offset += 8) {
+        const size_t count = std::min<size_t>(8, input.bytes.size() - offset);
+        CHECK(legacy.append(input.bytes.data() + offset, count));
+    }
+    CHECK(read_chain(legacy) == read_chain(chain));
+    CHECK(vbr_capture_stream_digest(legacy) == stats.streaming_digest);
+    CHECK(legacy.segment_count() == stats.chunks);
+
     auto other = vbr_pinned_chunk_ring::create(
         { {} }, 14, 7, status);
     CHECK(other);
@@ -163,6 +177,139 @@ static void test_cpu_ring_boundaries() {
             vbr_capture_stream_status::transfer_failed);
 }
 
+struct generated_h2d_source {
+    uint64_t size = 0;
+
+    static uint8_t byte_at(uint64_t offset) noexcept {
+        return uint8_t((offset*29 + 17) & 0xff);
+    }
+
+    static bool read(
+            const void * context, uint64_t offset,
+            uint8_t * destination, size_t size) noexcept {
+        const auto & source =
+            *static_cast<const generated_h2d_source *>(context);
+        if (offset > source.size || size > source.size - offset) {
+            return false;
+        }
+        for (size_t i = 0; i < size; ++i) {
+            destination[i] = byte_at(offset + i);
+        }
+        return true;
+    }
+};
+
+struct fake_h2d_destination {
+    struct pending {
+        uint64_t offset = 0;
+        const uint8_t * data = nullptr;
+        size_t size = 0;
+        uint64_t digest = 0;
+    };
+    std::unordered_map<uint64_t, pending> operations;
+    uint64_t bytes = 0;
+    bool valid = true;
+
+    static uint64_t digest(const uint8_t * data, size_t size) noexcept {
+        uint64_t value = 1469598103934665603ull;
+        for (size_t i = 0; i < size; ++i) {
+            value = (value ^ data[i])*1099511628211ull;
+        }
+        return value;
+    }
+
+    static bool issue(
+            void * context, uint64_t ticket, uint64_t offset,
+            const uint8_t * data, size_t size,
+            bool) noexcept {
+        auto & destination =
+            *static_cast<fake_h2d_destination *>(context);
+        if (!data || size == 0 || destination.operations.count(ticket) != 0) {
+            return false;
+        }
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] != generated_h2d_source::byte_at(offset + i)) {
+                destination.valid = false;
+                return false;
+            }
+        }
+        destination.operations.emplace(ticket, pending {
+            offset, data, size, digest(data, size),
+        });
+        return true;
+    }
+
+    static bool complete(void * context, uint64_t ticket) noexcept {
+        auto & destination =
+            *static_cast<fake_h2d_destination *>(context);
+        const auto found = destination.operations.find(ticket);
+        if (found == destination.operations.end()) {
+            return false;
+        }
+        // If the ring reused this pinned chunk before completion, its digest
+        // changed and the fake event fails.
+        if (digest(found->second.data, found->second.size) !=
+                found->second.digest) {
+            destination.valid = false;
+            return false;
+        }
+        destination.bytes += found->second.size;
+        destination.operations.erase(found);
+        return true;
+    }
+};
+
+static void test_h2d_bounded_streaming() {
+    const uint64_t transfer_bytes =
+        VBR_PINNED_RING_MAX_BYTES + 1024*1024 + 17;
+    generated_h2d_source generated { transfer_bytes };
+    vbr_h2d_status status;
+    auto ring = vbr_h2d_chunk_ring::create(
+        { {} }, 8*1024*1024, 4*1024*1024, status);
+    CHECK(ring && status == vbr_h2d_status::ok);
+    CHECK(ring->capacity_bytes() < transfer_bytes);
+
+    fake_h2d_destination event_destination;
+    vbr_h2d_transfer transfer;
+    transfer.source = {
+        transfer_bytes, &generated, generated_h2d_source::read,
+    };
+    transfer.size = transfer_bytes;
+    transfer.fake = {
+        &event_destination,
+        fake_h2d_destination::issue,
+        fake_h2d_destination::complete,
+        true,
+    };
+    vbr_h2d_stats stats;
+    CHECK(ring->stream(transfer, stats) == vbr_h2d_status::ok);
+    CHECK(event_destination.valid);
+    CHECK(event_destination.operations.empty());
+    CHECK(event_destination.bytes == transfer_bytes);
+    CHECK(stats.bytes == transfer_bytes);
+    CHECK(stats.backpressure_waits > 0);
+    CHECK(stats.event_completions == stats.chunks);
+    CHECK(stats.synchronous_fallbacks == 0);
+    CHECK(stats.peak_pinned_bytes <= ring->capacity_bytes());
+
+    fake_h2d_destination sync_destination;
+    transfer.fake.context = &sync_destination;
+    transfer.fake.supports_events = false;
+    CHECK(ring->stream(transfer, stats) == vbr_h2d_status::ok);
+    CHECK(sync_destination.valid);
+    CHECK(sync_destination.bytes == transfer_bytes);
+    CHECK(stats.synchronous_fallbacks == stats.chunks);
+    CHECK(stats.event_completions == 0);
+
+    fake_h2d_destination failed;
+    transfer.fake.context = &failed;
+    transfer.fake.supports_events = true;
+    transfer.fail_completion_at = 1;
+    CHECK(ring->stream(transfer, stats) ==
+          vbr_h2d_status::transfer_failed);
+    CHECK(failed.operations.empty());
+}
+
 static uint64_t ring_resident(
         llama_cache_acct_ledger & ledger,
         const llama_cache_acct_resource_domain & domain) {
@@ -176,6 +323,19 @@ static uint64_t ring_resident(
         }
     }
     return 0;
+}
+
+struct ring_charge_fault_context {
+    llama_cache_acct_ledger * ledger = nullptr;
+};
+
+static void inject_ring_charge_fault(void * opaque) noexcept {
+    auto & context = *static_cast<ring_charge_fault_context *>(opaque);
+    context.ledger->gauge_set(
+        llama_cache_acct_category::pinned_preimage_ring,
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pageable_host),
+        llama_cache_acct_measure::resident_allocated, 1);
 }
 
 static void test_ring_accounting_once() {
@@ -219,6 +379,21 @@ static void test_ring_accounting_once() {
     CHECK(status == vbr_capture_stream_status::accounting_refused);
     CHECK(failure ==
           vbr_capture_ring_create_failure::budget_exceeded);
+
+    // M1: a fault raised after physical chunk allocation but during the final
+    // C gauge remains accounting_unavailable, exactly as before ring factoring.
+    ring_charge_fault_context fault_context { &ledger };
+    auto charge_fault_accounting = accounting;
+    charge_fault_accounting.charge_fault_context = &fault_context;
+    charge_fault_accounting.inject_charge_fault =
+        inject_ring_charge_fault;
+    auto charge_failed = vbr_pinned_chunk_ring::create(
+        { {} }, 16, 8, status, &charge_fault_accounting, &failure);
+    CHECK(!charge_failed);
+    CHECK(status == vbr_capture_stream_status::accounting_unavailable);
+    CHECK(failure ==
+          vbr_capture_ring_create_failure::accounting_charge_failed);
+    CHECK(ring_resident(ledger, domain) == 0);
 
     auto ring = vbr_pinned_chunk_ring::create(
         { {} }, 16, 8, status, &accounting, &failure);
@@ -659,6 +834,7 @@ int main(int argc, char ** argv) {
     test_segment_chain_offsets();
     test_registry_quiescence_query();
     test_cpu_ring_boundaries();
+    test_h2d_bounded_streaming();
     test_ring_accounting_once();
     test_capture_reservation_domain_preparation();
     test_server_store_construction_and_lifetime();

@@ -44,9 +44,11 @@ add_library(llama
             llama-vbr-checkpoint.cpp
             llama-vbr-extent.cpp
             llama-vbr-artifact.cpp
+            llama-vbr-pinned-ring.cpp
             llama-vbr-artifact-capture.cpp
             llama-vbr-artifact-catalog.cpp
             llama-vbr-artifact-validate.cpp
+            llama-vbr-artifact-stage.cpp
             llama-vbr-explicit-capture.cpp
             llama-vbr-controller-id.cpp
             llama-vbr-generation.cpp

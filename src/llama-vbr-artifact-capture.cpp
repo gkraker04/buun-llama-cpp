@@ -63,6 +63,8 @@ const char * vbr_capture_ring_create_failure_name(
             return "budget_unavailable";
         case vbr_capture_ring_create_failure::budget_exceeded:
             return "budget_exceeded";
+        case vbr_capture_ring_create_failure::global_capacity_exceeded:
+            return "global_capacity_exceeded";
         case vbr_capture_ring_create_failure::invalid_lane_binding:
             return "invalid_lane_binding";
         case vbr_capture_ring_create_failure::duplicate_device_lane:
@@ -86,6 +88,40 @@ const char * vbr_capture_ring_create_failure_name(
     }
     return "invalid";
 }
+
+namespace {
+
+vbr_capture_stream_status capture_status_for_ring_failure(
+        vbr_capture_ring_create_failure failure) noexcept {
+    switch (failure) {
+        case vbr_capture_ring_create_failure::budget_exceeded:
+            return vbr_capture_stream_status::accounting_refused;
+        case vbr_capture_ring_create_failure::invalid_accounting_binding:
+        case vbr_capture_ring_create_failure::existing_ring_charge:
+        case vbr_capture_ring_create_failure::accounting_update_failed:
+        case vbr_capture_ring_create_failure::budget_reset_failed:
+        case vbr_capture_ring_create_failure::budget_unavailable:
+        case vbr_capture_ring_create_failure::accounting_charge_failed:
+            return vbr_capture_stream_status::accounting_unavailable;
+        case vbr_capture_ring_create_failure::internal_error:
+            return vbr_capture_stream_status::internal_error;
+        case vbr_capture_ring_create_failure::none:
+        case vbr_capture_ring_create_failure::invalid_geometry:
+        case vbr_capture_ring_create_failure::global_capacity_exceeded:
+        case vbr_capture_ring_create_failure::invalid_lane_binding:
+        case vbr_capture_ring_create_failure::duplicate_device_lane:
+        case vbr_capture_ring_create_failure::host_buffer_type_unavailable:
+        case vbr_capture_ring_create_failure::host_buffer_allocation_failed:
+        case vbr_capture_ring_create_failure::host_buffer_too_small:
+        case vbr_capture_ring_create_failure::host_buffer_base_unavailable:
+        case vbr_capture_ring_create_failure::lane_underprovisioned:
+        case vbr_capture_ring_create_failure::_count:
+            return vbr_capture_stream_status::ring_unavailable;
+    }
+    return vbr_capture_stream_status::ring_unavailable;
+}
+
+} // namespace
 
 struct artifact_segment_chain::impl {
     std::vector<artifact_segment> segments;
@@ -221,63 +257,14 @@ std::array<uint8_t, 32> vbr_capture_stream_digest(
 }
 
 struct vbr_pinned_chunk_ring::impl {
-    struct chunk {
-        ggml_backend_buffer_t buffer = nullptr;
-        ggml_backend_event_t event = nullptr;
-        std::vector<uint8_t> synthetic;
-        uint8_t * data = nullptr;
-        size_t valid = 0;
-        bool busy = false;
-
-        ~chunk() {
-            if (event) {
-                ggml_backend_event_free(event);
-            }
-            if (buffer) {
-                ggml_backend_buffer_free(buffer);
-            }
-        }
-    };
-
-    struct lane {
-        vbr_capture_lane binding;
-        std::vector<std::unique_ptr<chunk>> chunks;
-        size_t next = 0;
-    };
-
-    uint64_t capacity = 0;
-    size_t chunk_size = 0;
-    std::vector<lane> lanes;
-    llama_cache_acct_ledger * accounting = nullptr;
-    llama_cache_acct_resource_domain accounting_domain;
-    bool ring_charged = false;
-
+    std::unique_ptr<vbr_bounded_pinned_ring_core> core;
 };
 
 vbr_pinned_chunk_ring::vbr_pinned_chunk_ring(
         std::unique_ptr<impl> state) noexcept
     : impl_(std::move(state)) {}
 
-vbr_pinned_chunk_ring::~vbr_pinned_chunk_ring() {
-    if (!impl_) {
-        return;
-    }
-    auto * ledger = impl_->accounting;
-    const auto domain = impl_->accounting_domain;
-    const bool charged = impl_->ring_charged;
-    impl_->ring_charged = false;
-    impl_.reset(); // free the pinned buffers before removing their gauge
-    if (ledger && charged) {
-        ledger->gauge_set(
-            llama_cache_acct_category::pinned_preimage_ring,
-            domain,
-            llama_cache_acct_measure::logical_payload, 0);
-        ledger->gauge_set(
-            llama_cache_acct_category::pinned_preimage_ring,
-            domain,
-            llama_cache_acct_measure::resident_allocated, 0);
-    }
-}
+vbr_pinned_chunk_ring::~vbr_pinned_chunk_ring() = default;
 
 std::unique_ptr<vbr_pinned_chunk_ring>
 vbr_pinned_chunk_ring::create(
@@ -288,297 +275,44 @@ vbr_pinned_chunk_ring::create(
         const vbr_capture_ring_accounting * accounting,
         vbr_capture_ring_create_failure * failure) noexcept {
     status = vbr_capture_stream_status::ring_unavailable;
-    if (failure) {
-        *failure = vbr_capture_ring_create_failure::none;
-    }
-    const auto reject = [&](vbr_capture_stream_status rejected_status,
-                            vbr_capture_ring_create_failure reason) {
-        status = rejected_status;
-        if (failure) {
-            *failure = reason;
-        }
-    };
+    vbr_capture_ring_create_failure reason =
+        vbr_capture_ring_create_failure::none;
     try {
-        if (lanes.empty() || chunk_bytes == 0 ||
-            total_bytes == 0 ||
-            total_bytes >
-                VBR_CAPTURE_PINNED_RING_MAX_BYTES ||
-            lanes.size() >
-                std::numeric_limits<size_t>::max()/2 ||
-            total_bytes / chunk_bytes <
-                lanes.size()*2 ||
-            chunk_bytes >
-                std::numeric_limits<uint64_t>::max() /
-                    (total_bytes / chunk_bytes)) {
-            reject(
-                vbr_capture_stream_status::ring_unavailable,
-                vbr_capture_ring_create_failure::invalid_geometry);
-            return nullptr;
-        }
-        const size_t n_chunks =
-            size_t(total_bytes / chunk_bytes);
         std::unique_ptr<impl> state(new impl);
-        state->chunk_size = chunk_bytes;
-        state->capacity = uint64_t(n_chunks)*chunk_bytes;
-        if (accounting) {
-            if (!accounting->ledger ||
-                !accounting->budget ||
-                accounting->domain.residency !=
-                    llama_cache_acct_residency::pinned_host) {
-                reject(
-                    vbr_capture_stream_status::accounting_unavailable,
-                    vbr_capture_ring_create_failure::
-                        invalid_accounting_binding);
-                return nullptr;
+        state->core = vbr_bounded_pinned_ring_core::create(
+            lanes, total_bytes, chunk_bytes, accounting, reason);
+        if (!state->core) {
+            status = capture_status_for_ring_failure(reason);
+            if (failure) {
+                *failure = reason;
             }
-            auto & ledger = *accounting->ledger;
-            const auto before = ledger.snapshot();
-            const auto existing = std::find_if(
-                before.cells.begin(), before.cells.end(),
-                [&](const llama_cache_acct_cell_row & row) {
-                    return row.category ==
-                               llama_cache_acct_category::
-                                   pinned_preimage_ring &&
-                           row.domain == accounting->domain;
-                });
-            if (existing == before.cells.end() ||
-                existing->certification !=
-                    llama_cache_acct_known::known) {
-                reject(
-                    vbr_capture_stream_status::accounting_unavailable,
-                    vbr_capture_ring_create_failure::
-                        accounting_update_failed);
-                return nullptr;
-            }
-            for (const auto measure : {
-                    llama_cache_acct_measure::logical_payload,
-                    llama_cache_acct_measure::resident_allocated,
-                    llama_cache_acct_measure::reserved }) {
-                const auto value =
-                    existing->cell.measures[size_t(measure)];
-                if (value.state !=
-                        llama_cache_acct_known::known) {
-                    reject(
-                        vbr_capture_stream_status::accounting_unavailable,
-                        vbr_capture_ring_create_failure::
-                            accounting_update_failed);
-                    return nullptr;
-                }
-                if (value.value != 0) {
-                    reject(
-                        vbr_capture_stream_status::accounting_unavailable,
-                        vbr_capture_ring_create_failure::
-                            existing_ring_charge);
-                    return nullptr;
-                }
-            }
-            ledger.gauge_set(
-                llama_cache_acct_category::pinned_preimage_ring,
-                accounting->domain,
-                llama_cache_acct_measure::logical_payload, 0);
-            ledger.gauge_set(
-                llama_cache_acct_category::pinned_preimage_ring,
-                accounting->domain,
-                llama_cache_acct_measure::resident_allocated, 0);
-            const auto priced = ledger.snapshot();
-            if (priced.faults_overflow !=
-                    before.faults_overflow ||
-                priced.faults_invalid_transition !=
-                    before.faults_invalid_transition ||
-                priced.faults_allocation !=
-                    before.faults_allocation) {
-                reject(
-                    vbr_capture_stream_status::accounting_unavailable,
-                    vbr_capture_ring_create_failure::
-                        accounting_update_failed);
-                return nullptr;
-            }
-            llama_cache_budget_coordinator coordinator;
-            if (!coordinator.reset(priced, *accounting->budget)) {
-                reject(
-                    vbr_capture_stream_status::accounting_unavailable,
-                    vbr_capture_ring_create_failure::
-                        budget_reset_failed);
-                return nullptr;
-            }
-            llama_cache_budget_plan plan;
-            plan.accounting_serial = priced.serial;
-            plan.entries.push_back({
-                accounting->domain, state->capacity, 0,
-            });
-            const auto fit = coordinator.fits(plan);
-            if (fit.state != llama_cache_budget_fit_state::fits) {
-                reject(
-                    fit.state == llama_cache_budget_fit_state::exceeds
-                        ? vbr_capture_stream_status::accounting_refused
-                        : vbr_capture_stream_status::
-                            accounting_unavailable,
-                    fit.state == llama_cache_budget_fit_state::exceeds
-                        ? vbr_capture_ring_create_failure::budget_exceeded
-                        : vbr_capture_ring_create_failure::
-                            budget_unavailable);
-                return nullptr;
-            }
-            state->accounting = &ledger;
-            state->accounting_domain =
-                accounting->domain;
-        }
-        state->lanes.resize(lanes.size());
-        for (size_t i = 0; i < lanes.size(); ++i) {
-            if ((lanes[i].device == nullptr) !=
-                    (lanes[i].backend == nullptr) ||
-                (lanes[i].backend &&
-                 ggml_backend_get_device(
-                     lanes[i].backend) !=
-                     lanes[i].device)) {
-                reject(
-                    vbr_capture_stream_status::ring_unavailable,
-                    vbr_capture_ring_create_failure::
-                        invalid_lane_binding);
-                return nullptr;
-            }
-            if (lanes[i].device) {
-                for (size_t j = 0; j < i; ++j) {
-                    if (lanes[j].device ==
-                            lanes[i].device) {
-                        reject(
-                            vbr_capture_stream_status::ring_unavailable,
-                            vbr_capture_ring_create_failure::
-                                duplicate_device_lane);
-                        return nullptr;
-                    }
-                }
-            }
-            state->lanes[i].binding = lanes[i];
-        }
-
-        for (size_t i = 0; i < n_chunks; ++i) {
-            auto & lane =
-                state->lanes[i % state->lanes.size()];
-            std::unique_ptr<impl::chunk> entry(
-                new impl::chunk);
-            if (lane.binding.device) {
-                auto * host_buft =
-                    ggml_backend_dev_host_buffer_type(
-                        lane.binding.device);
-                if (!host_buft) {
-                    reject(
-                        vbr_capture_stream_status::ring_unavailable,
-                        vbr_capture_ring_create_failure::
-                            host_buffer_type_unavailable);
-                    return nullptr;
-                }
-                entry->buffer =
-                    ggml_backend_buft_alloc_buffer(
-                        host_buft, chunk_bytes);
-                if (!entry->buffer) {
-                    reject(
-                        vbr_capture_stream_status::ring_unavailable,
-                        vbr_capture_ring_create_failure::
-                            host_buffer_allocation_failed);
-                    return nullptr;
-                }
-                if (ggml_backend_buffer_get_size(
-                        entry->buffer) < chunk_bytes) {
-                    reject(
-                        vbr_capture_stream_status::ring_unavailable,
-                        vbr_capture_ring_create_failure::
-                            host_buffer_too_small);
-                    return nullptr;
-                }
-                entry->data = static_cast<uint8_t *>(
-                    ggml_backend_buffer_get_base(
-                        entry->buffer));
-                if (!entry->data) {
-                    reject(
-                        vbr_capture_stream_status::ring_unavailable,
-                        vbr_capture_ring_create_failure::
-                            host_buffer_base_unavailable);
-                    return nullptr;
-                }
-                if (!lane.binding.force_synchronous) {
-                    entry->event =
-                        ggml_backend_event_new(
-                            lane.binding.device);
-                }
-            } else {
-                entry->synthetic.resize(chunk_bytes);
-                entry->data = entry->synthetic.data();
-            }
-            lane.chunks.push_back(std::move(entry));
-        }
-        for (const auto & lane : state->lanes) {
-            if (lane.chunks.size() < 2) {
-                reject(
-                    vbr_capture_stream_status::ring_unavailable,
-                    vbr_capture_ring_create_failure::
-                        lane_underprovisioned);
-                return nullptr;
-            }
-        }
-        if (state->accounting) {
-            const auto before = state->accounting->snapshot();
-            state->accounting->gauge_set(
-                llama_cache_acct_category::pinned_preimage_ring,
-                state->accounting_domain,
-                llama_cache_acct_measure::logical_payload,
-                state->capacity);
-            state->accounting->gauge_set(
-                llama_cache_acct_category::pinned_preimage_ring,
-                state->accounting_domain,
-                llama_cache_acct_measure::resident_allocated,
-                state->capacity);
-            const auto after = state->accounting->snapshot();
-            if (after.faults_overflow !=
-                    before.faults_overflow ||
-                after.faults_invalid_transition !=
-                    before.faults_invalid_transition ||
-                after.faults_allocation !=
-                    before.faults_allocation) {
-                state->accounting->gauge_set(
-                    llama_cache_acct_category::
-                        pinned_preimage_ring,
-                    state->accounting_domain,
-                    llama_cache_acct_measure::
-                        logical_payload, 0);
-                state->accounting->gauge_set(
-                    llama_cache_acct_category::
-                        pinned_preimage_ring,
-                    state->accounting_domain,
-                    llama_cache_acct_measure::
-                        resident_allocated, 0);
-                reject(
-                    vbr_capture_stream_status::accounting_unavailable,
-                    vbr_capture_ring_create_failure::
-                        accounting_charge_failed);
-                return nullptr;
-            }
-            state->ring_charged = true;
+            return nullptr;
         }
         status = vbr_capture_stream_status::ok;
         if (failure) {
-            *failure = vbr_capture_ring_create_failure::none;
+            *failure = reason;
         }
         return std::unique_ptr<vbr_pinned_chunk_ring>(
             new vbr_pinned_chunk_ring(std::move(state)));
     } catch (...) {
-        reject(
-            vbr_capture_stream_status::internal_error,
-            vbr_capture_ring_create_failure::internal_error);
+        status = vbr_capture_stream_status::internal_error;
+        if (failure) {
+            *failure = vbr_capture_ring_create_failure::internal_error;
+        }
         return nullptr;
     }
 }
 
 uint64_t vbr_pinned_chunk_ring::capacity_bytes() const noexcept {
-    return impl_->capacity;
+    return impl_ && impl_->core ? impl_->core->capacity_bytes() : 0;
 }
 
 size_t vbr_pinned_chunk_ring::chunk_bytes() const noexcept {
-    return impl_->chunk_size;
+    return impl_ && impl_->core ? impl_->core->chunk_bytes() : 0;
 }
 
 size_t vbr_pinned_chunk_ring::lane_count() const noexcept {
-    return impl_->lanes.size();
+    return impl_ && impl_->core ? impl_->core->lane_count() : 0;
 }
 
 vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
@@ -586,20 +320,19 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
         artifact_segment_chain & destination,
         vbr_capture_stream_stats & stats) noexcept {
     stats = {};
-    if (source.lane >= impl_->lanes.size() ||
-        source.size == 0) {
+    if (source.lane >= impl_->core->lane_count() || source.size == 0) {
         return vbr_capture_stream_status::invalid_argument;
     }
-    auto & lane = impl_->lanes[source.lane];
+    const auto * lane = impl_->core->lane_binding(source.lane);
     const bool tensor_source = source.tensor != nullptr;
     if (tensor_source) {
         // The store may be constructed before VBR lazily creates its dedicated
         // side-stream backend. Events and pinned buffers are device-scoped, so
         // bind the lane to the physical device rather than one backend handle.
         if (!source.backend || !source.device ||
-            source.device != lane.binding.device ||
+            !lane || source.device != lane->device ||
             ggml_backend_get_device(source.backend) !=
-                lane.binding.device ||
+                lane->device ||
             source.tensor_offset >
                 std::numeric_limits<uint64_t>::max() -
                     source.size ||
@@ -612,8 +345,9 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
     } else if (!source.read) {
         return vbr_capture_stream_status::invalid_argument;
     }
+    const size_t chunk_size = impl_->core->chunk_bytes();
 
-    std::deque<impl::chunk *> pending;
+    std::deque<vbr_pinned_chunk_lease> pending;
     llama_sha256_writer hash;
     static constexpr char DOMAIN[] =
         "buun.vbr.capture.segment-stream";
@@ -621,14 +355,10 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
     hash.u64(source.size);
 
     const auto synchronize_only = [&]() noexcept {
-        for (auto * entry : pending) {
-            if (entry->event) {
-                ggml_backend_event_synchronize(entry->event);
-            } else if (tensor_source) {
-                ggml_backend_synchronize(source.backend);
-            }
-            entry->busy = false;
-            entry->valid = 0;
+        for (auto & entry : pending) {
+            bool event_completion = false;
+            impl_->core->wait(entry, event_completion);
+            impl_->core->release(entry);
         }
         pending.clear();
     };
@@ -636,10 +366,14 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
         if (pending.empty()) {
             return vbr_capture_stream_status::ok;
         }
-        auto * entry = pending.front();
+        auto entry = std::move(pending.front());
         pending.pop_front();
-        if (entry->event) {
-            ggml_backend_event_synchronize(entry->event);
+        bool event_completion = false;
+        if (!impl_->core->wait(entry, event_completion)) {
+            impl_->core->release(entry);
+            return vbr_capture_stream_status::internal_error;
+        }
+        if (event_completion) {
             stats.event_completions++;
         }
         // KNOWN LIMITATION: ggml's asynchronous copy/event APIs return no
@@ -647,67 +381,67 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
         // while a real device error can only surface later as a length or
         // digest mismatch; the F3.2 hardware gate must account for that.
         if (stats.chunks == source.fail_completion_at) {
-            entry->busy = false;
-            entry->valid = 0;
+            impl_->core->release(entry);
             return vbr_capture_stream_status::transfer_failed;
         }
-        if (!destination.append(entry->data, entry->valid)) {
-            entry->busy = false;
-            entry->valid = 0;
+        if (!destination.append(entry.data(), entry.valid())) {
+            impl_->core->release(entry);
             return vbr_capture_stream_status::internal_error;
         }
-        hash.bytes(entry->data, entry->valid);
-        stats.bytes += entry->valid;
+        hash.bytes(entry.data(), entry.valid());
+        stats.bytes += entry.valid();
         stats.chunks++;
-        entry->busy = false;
-        entry->valid = 0;
+        impl_->core->release(entry);
         return vbr_capture_stream_status::ok;
     };
 
+    // TODO(F4.2a follow-up): lift shared drive(fill,consume) pump into the core.
     try {
         uint64_t offset = 0;
         while (offset < source.size) {
-            auto * entry =
-                lane.chunks[lane.next].get();
-            lane.next =
-                (lane.next + 1) % lane.chunks.size();
-            if (entry->busy) {
+            bool would_block = false;
+            auto entry = impl_->core->acquire(source.lane, would_block);
+            if (!entry && would_block) {
                 stats.backpressure_waits++;
                 const auto drained = drain_front();
                 if (drained != vbr_capture_stream_status::ok) {
                     synchronize_only();
                     return drained;
                 }
-                if (entry->busy) {
-                    synchronize_only();
-                    return vbr_capture_stream_status::
-                        internal_error;
-                }
+                entry = impl_->core->acquire(source.lane, would_block);
+            }
+            if (!entry || would_block) {
+                synchronize_only();
+                return vbr_capture_stream_status::internal_error;
             }
             const size_t count = size_t(std::min<uint64_t>(
-                impl_->chunk_size, source.size - offset));
+                chunk_size, source.size - offset));
             if (tensor_source) {
                 ggml_backend_tensor_get_async(
                     source.backend, source.tensor,
-                    entry->data,
+                    entry.data(),
                     size_t(source.tensor_offset + offset),
                     count);
-                if (entry->event) {
-                    ggml_backend_event_record(
-                        entry->event, source.backend);
-                } else {
-                    ggml_backend_synchronize(source.backend);
-                    stats.synchronous_fallbacks++;
-                }
             } else if (!source.read(
                            source.context, offset,
-                           entry->data, count)) {
+                           entry.data(), count)) {
+                impl_->core->release(entry);
                 synchronize_only();
                 return vbr_capture_stream_status::short_read;
             }
-            entry->valid = count;
-            entry->busy = true;
-            pending.push_back(entry);
+            bool synchronous_fallback = false;
+            if (!impl_->core->submit(
+                    entry, count,
+                    tensor_source ? source.backend : nullptr,
+                    synchronous_fallback)) {
+                impl_->core->release(entry);
+                synchronize_only();
+                return vbr_capture_stream_status::internal_error;
+            }
+            if (synchronous_fallback) {
+                stats.synchronous_fallbacks++;
+            }
+            pending.push_back(std::move(entry));
             offset += count;
         }
         while (!pending.empty()) {

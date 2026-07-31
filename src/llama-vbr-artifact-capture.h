@@ -2,6 +2,7 @@
 
 #include "llama-cache-authority.h"
 #include "llama-vbr-artifact.h"
+#include "llama-vbr-pinned-ring.h"
 
 #include "ggml-backend.h"
 
@@ -14,7 +15,7 @@
 // F3.1 bounded streaming substrate. These types are internal to libllama:
 // no live KV/cache or server policy enters this unit.
 static constexpr uint64_t VBR_CAPTURE_PINNED_RING_MAX_BYTES =
-    256ull*1024*1024;
+    VBR_PINNED_RING_MAX_BYTES;
 
 enum class vbr_capture_stream_status : uint8_t {
     ok = 0,
@@ -39,26 +40,8 @@ enum class vbr_capture_stream_status : uint8_t {
 const char * vbr_capture_stream_status_name(
     vbr_capture_stream_status status) noexcept;
 
-enum class vbr_capture_ring_create_failure : uint8_t {
-    none = 0,
-    invalid_geometry,
-    invalid_accounting_binding,
-    existing_ring_charge,
-    accounting_update_failed,
-    budget_reset_failed,
-    budget_unavailable,
-    budget_exceeded,
-    invalid_lane_binding,
-    duplicate_device_lane,
-    host_buffer_type_unavailable,
-    host_buffer_allocation_failed,
-    host_buffer_too_small,
-    host_buffer_base_unavailable,
-    lane_underprovisioned,
-    accounting_charge_failed,
-    internal_error,
-    _count,
-};
+using vbr_capture_ring_create_failure =
+    vbr_pinned_ring_create_failure;
 
 const char * vbr_capture_ring_create_failure_name(
     vbr_capture_ring_create_failure failure) noexcept;
@@ -97,19 +80,10 @@ private:
 std::array<uint8_t, 32> vbr_capture_stream_digest(
     const artifact_segment_chain & chain) noexcept;
 
-struct vbr_capture_lane {
-    ggml_backend_dev_t device = nullptr;
-    ggml_backend_t backend = nullptr;
-    // Test/backend capability seam: skip optional event creation and use the
-    // synchronized fallback required on devices without event support.
-    bool force_synchronous = false;
-};
+using vbr_capture_lane = vbr_pinned_ring_lane;
 
-struct vbr_capture_ring_accounting {
-    llama_cache_acct_ledger * ledger = nullptr;
-    llama_cache_acct_resource_domain domain;
-    const llama_cache_budget_config * budget = nullptr;
-};
+using vbr_capture_ring_accounting =
+    vbr_pinned_ring_accounting;
 
 struct vbr_capture_stream_source {
     using read_fn = bool (*)(

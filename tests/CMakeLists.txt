@@ -173,6 +173,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-vbr-artifact.cpp)
     target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(
+        NAME test-vbr-artifact-stage-contract
+        COMMAND ${CMAKE_COMMAND} -P
+                ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-stage.cmake)
 
     llama_build_and_test(
         test-vbr-artifact-capture.cpp

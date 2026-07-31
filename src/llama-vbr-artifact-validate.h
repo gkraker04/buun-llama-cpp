@@ -365,6 +365,11 @@ public:
     llama_cache_acct_artifact_id source_artifact() const noexcept {
         return source_lease_.reference_artifact();
     }
+    // F4.2 staging retains this lease through the proof and uses the same
+    // canonical package door for its pre-transfer repeatability check.
+    const vbr_artifact_package_view & source_package() const noexcept {
+        return source_lease_;
+    }
 
 private:
     vbr_validated_manifest() = default;
