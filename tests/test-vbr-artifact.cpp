@@ -1218,11 +1218,19 @@ static void test_catalog_streaming_protocol() {
     overlap.budget.host.pageable_cap = 1000;
     overlap.budget.host.pageable_state =
         llama_cache_budget_capacity_state::known;
+    vbr_capture_begin_diagnostics refusal_diagnostics;
     auto refused = overlap.catalog->begin_capture(
-        overlap.package, overlap.budget, {}, status);
+        overlap.package, overlap.budget, {}, status,
+        &refusal_diagnostics);
     CHECK(!refused);
     CHECK(status ==
           vbr_capture_stream_status::accounting_refused);
+    CHECK(refusal_diagnostics.reservation_group ==
+          vbr_capture_reservation_group::durable_artifact);
+    CHECK(refusal_diagnostics.prepare_status ==
+          llama_cache_prepare_status::admission_refused);
+    CHECK(refusal_diagnostics.admission_status ==
+          llama_cache_admission_status::exceeds_budget);
     CHECK(overlap.catalog->snapshot()
               .staging_overlap_refusals == 1);
     CHECK(overlap.ledger.snapshot().live_ops == 0);

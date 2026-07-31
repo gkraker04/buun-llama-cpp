@@ -2,8 +2,10 @@
 
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-checkpoint-types.h"
+#include "llama-vbr-generation.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -43,6 +45,96 @@ enum class vbr_explicit_capture_status : uint8_t {
 const char * vbr_explicit_capture_status_name(
     vbr_explicit_capture_status status) noexcept;
 
+enum class vbr_explicit_capture_phase : uint8_t {
+    validation = 0,
+    memory_tree,
+    settlement,
+    pre_capture_quiescence,
+    metadata_and_manifest,
+    pre_transfer_stability,
+    accounting_configuration,
+    reservation_preparation,
+    companion_capture,
+    unit_transfer,
+    post_transfer_stability,
+    publication,
+    complete,
+    _count,
+};
+
+const char * vbr_explicit_capture_phase_name(
+    vbr_explicit_capture_phase phase) noexcept;
+
+// Closed diagnostic for the metadata/generation half of explicit capture.
+// This is process-local observability only; it is not part of an artifact or
+// cache-plan wire format.
+enum class vbr_explicit_generation_failure : uint8_t {
+    none = 0,
+    size_pass,
+    tracker_missing,
+    tracker_unstable,
+    tracker_shadow_unavailable,
+    invalid_sequence_or_frontier,
+    invalid_stream,
+    ownership_index_missing,
+    ownership_view_missing,
+    ownership_view_unavailable,
+    ownership_rank_failed,
+    ownership_enumeration_failed,
+    ownership_cardinality_mismatch,
+    stream_capture_failed,
+    controller_capture_failed,
+    stability_reread_failed,
+    internal_error,
+    _count,
+};
+
+const char * vbr_explicit_generation_failure_name(
+    vbr_explicit_generation_failure failure) noexcept;
+
+// Closed diagnostic for the byte-geometry half of explicit capture. This
+// remains process-local observability; it is never serialized into the
+// artifact envelope.
+enum class vbr_explicit_size_failure : uint8_t {
+    none = 0,
+    not_armed,
+    tracker_missing,
+    tracker_unstable,
+    bindings_missing,
+    stream_layout,
+    policy_snapshot,
+    unit_index,
+    extents_empty,
+    extent_missing,
+    vmm_missing,
+    backend_unavailable,
+    wm_cells_zero,
+    extent_type_mismatch,
+    promote_hops_mismatch,
+    domain_mismatch,
+    shard_disagreement,
+    binding_missing,
+    topology_order,
+    bounds,
+    stash_bounds,
+    stability_reread,
+    internal_error,
+    _count,
+};
+
+const char * vbr_explicit_size_failure_name(
+    vbr_explicit_size_failure failure) noexcept;
+
+// Pure production predicate used by size-pass and its CPU regression. A
+// never-retiered F16 unit is valid when ordinary decode has established a
+// nonzero mapped watermark; the VBR side-stream backend is deliberately not
+// part of this generation predicate because capture initializes it lazily.
+vbr_explicit_size_failure vbr_explicit_capture_validate_extent_generation(
+    uint32_t wm_cells,
+    int32_t extent_type,
+    uint8_t extent_promote_hops,
+    const vbr_unit_generation & generation) noexcept;
+
 // One runtime pool-to-portable-topology binding. Device ordinals are portable
 // only within the cited topology; lane identifies the F3.1 D2H ring lane.
 struct vbr_explicit_capture_pool_binding {
@@ -53,6 +145,21 @@ struct vbr_explicit_capture_pool_binding {
     uint32_t lane = UINT32_MAX;
 };
 
+// Internal F3.3 discovery result. It exposes only the runtime backend binding
+// needed to build the server-owned ring and the portable pool mapping; no KV
+// bytes, masks, or ownership state cross this seam.
+struct vbr_explicit_capture_runtime_pool {
+    vbr_pool_uuid pool_uuid;
+    int device = -1;
+    ggml_backend_dev_t backend_device = nullptr;
+    ggml_backend_t backend = nullptr;
+};
+
+bool vbr_explicit_capture_runtime_pools(
+    llama_memory_i & memory,
+    std::vector<vbr_explicit_capture_runtime_pool> & pools,
+    uint32_t & attention_children) noexcept;
+
 struct vbr_explicit_representation_identity {
     uint32_t codec_id = 0;
     uint32_t codec_version = 0;
@@ -60,6 +167,20 @@ struct vbr_explicit_representation_identity {
     std::array<uint8_t, 32> rotation_digest = {};
     std::array<uint8_t, 32> meansub_digest = {};
 };
+
+// Server policy input to the library-owned codec identity recipe. The build
+// identity distinguishes compiled-in codebooks; file overrides, rotations,
+// and mean-subtraction state are discovered and hashed by the codec layer.
+struct vbr_explicit_representation_policy {
+    const char * build_identity = nullptr;
+    size_t build_identity_len = 0;
+};
+
+bool vbr_explicit_capture_representation_identity(
+    const void * context,
+    int32_t current_type,
+    bool value_side,
+    vbr_explicit_representation_identity & output) noexcept;
 
 struct vbr_explicit_companion_provider {
     using capture_fn = bool (*)(
@@ -92,6 +213,9 @@ struct vbr_explicit_capture_request {
     llama_seq_id sequence = -1;
     vbr_checkpoint_frontier_fields frontier;
     vbr_artifact_identity_block identity;
+    // Optional expected canonical digest. Zero asks the library to derive it
+    // from frontier + ordered memory-tree child policy; a nonzero value must
+    // match exactly.
     std::array<uint8_t, 32> identity_policy_order_digest = {};
     bool idle_decode_thread = false;
     vbr_pinned_chunk_ring * ring = nullptr;
@@ -119,6 +243,17 @@ struct vbr_explicit_capture_accounting {
 struct vbr_explicit_capture_result {
     vbr_explicit_capture_status status =
         vbr_explicit_capture_status::internal_error;
+    vbr_explicit_capture_phase phase =
+        vbr_explicit_capture_phase::validation;
+    // Populated when a sink/ring/catalog boundary supplies a more specific
+    // terminal. `_count` means the phase failed before such a boundary.
+    vbr_capture_stream_status inner_stream_status =
+        vbr_capture_stream_status::_count;
+    vbr_explicit_generation_failure generation_failure =
+        vbr_explicit_generation_failure::none;
+    vbr_explicit_size_failure size_failure =
+        vbr_explicit_size_failure::none;
+    vbr_capture_begin_diagnostics begin_diagnostics;
     vbr_capture_sink_result sink;
     uint32_t controllers = 0;
     uint32_t units = 0;
@@ -126,6 +261,10 @@ struct vbr_explicit_capture_result {
     uint64_t payload_bytes = 0;
     uint64_t stash_bytes = 0;
     uint64_t companion_bytes = 0;
+    uint64_t chunks = 0;
+    uint64_t backpressure_waits = 0;
+    uint64_t event_completions = 0;
+    uint64_t synchronous_fallbacks = 0;
 };
 
 vbr_explicit_capture_result vbr_capture_explicit_manifest(

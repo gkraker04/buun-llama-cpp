@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "server-cache-authority.h"
+#include "server-vbr-artifact-store.h"
 #include "server-chat.h"
 #include "chat.h"
 #include "common.h"
@@ -1620,6 +1621,36 @@ json server_task_result_slot_erase::to_json() {
     return json {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
+    };
+}
+
+json server_task_result_cache_capture::to_json() {
+    const char * consistency_name = "_count";
+    switch (consistency) {
+        case server_cache_capture_consistency::unavailable:
+            consistency_name = "unavailable";
+            break;
+        case server_cache_capture_consistency::capture_exact:
+            consistency_name = "capture_exact";
+            break;
+        case server_cache_capture_consistency::_count:
+            break;
+    }
+    return json {
+        { "status", server_vbr_artifact_capture_status_name(status) },
+        { "consistency", consistency_name },
+        { "reference", reference },
+        { "controllers", controllers },
+        { "units", units },
+        { "companions", companions },
+        { "payload_bytes", payload_bytes },
+        { "stash_bytes", stash_bytes },
+        { "companion_bytes", companion_bytes },
+        { "chunks", chunks },
+        { "backpressure_waits", backpressure_waits },
+        { "event_completions", event_completions },
+        { "synchronous_fallbacks", synchronous_fallbacks },
+        { "dedup", dedup },
     };
 }
 

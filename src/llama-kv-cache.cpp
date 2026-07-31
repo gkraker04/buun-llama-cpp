@@ -3896,38 +3896,70 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
         uint32_t child_id,
         llama_seq_id seq_id,
         llama_pos computation_frontier,
-        vbr_checkpoint_generation_controller & output) const {
+        vbr_checkpoint_generation_controller & output,
+        vbr_explicit_generation_failure * failure) const {
+    if (failure != nullptr) {
+        *failure = vbr_explicit_generation_failure::none;
+    }
+    const auto fail = [&](vbr_explicit_generation_failure why) {
+        output = {};
+        if (failure != nullptr) {
+            *failure = why;
+        }
+        return false;
+    };
     if (other != nullptr) {
         return other->vbr_generation_capture_live_guarded(
-                child_id, seq_id, computation_frontier, output);
+                child_id, seq_id, computation_frontier, output, failure);
     }
 
     const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || tracker->shadow_unavailable() ||
-            seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+    if (tracker == nullptr) {
+        return fail(vbr_explicit_generation_failure::tracker_missing);
+    }
+    if (tracker->shadow_unavailable()) {
+        return fail(
+            vbr_explicit_generation_failure::tracker_shadow_unavailable);
+    }
+    if (!tracker->stable()) {
+        return fail(vbr_explicit_generation_failure::tracker_unstable);
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
             computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
-        return false;
+        return fail(
+            vbr_explicit_generation_failure::invalid_sequence_or_frontier);
     }
 
     const uint32_t stream = seq_to_stream[seq_id];
     if (stream >= v_cells.size()) {
-        return false;
+        return fail(vbr_explicit_generation_failure::invalid_stream);
     }
 
     // Gap fix (review): capture enumerates owned cells from the ownership-index masks in page
     // order — never a legacy cell scan. The scan remains only as the env-gated oracle check.
     const auto & cells = v_cells[stream];
     if (vbr_ownership_ == nullptr) {
-        return false;
+        return fail(
+            vbr_explicit_generation_failure::ownership_index_missing);
+    }
+    if (!vbr_ownership_->initialized(stream, seq_id)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_view_missing);
+    }
+    if (!vbr_ownership_->available(stream, seq_id)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_view_unavailable);
     }
     uint32_t expected_rank = 0;
     if (!vbr_ownership_->rank_below(stream, seq_id, computation_frontier, expected_rank)) {
-        return false;  // unavailable view: generation capture unavailable (fail-closed)
+        return fail(
+            vbr_explicit_generation_failure::ownership_rank_failed);
     }
     std::vector<uint32_t> owned_cells;
     owned_cells.reserve(expected_rank);
     if (!vbr_ownership_->enumerate_owned(stream, seq_id, owned_cells)) {
-        return false;
+        return fail(
+            vbr_explicit_generation_failure::ownership_enumeration_failed);
     }
     std::vector<uint32_t> dependency_cells;
     dependency_cells.reserve(expected_rank);
@@ -3937,7 +3969,8 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
         }
     }
     if (dependency_cells.size() != expected_rank) {
-        return false;
+        return fail(
+            vbr_explicit_generation_failure::ownership_cardinality_mismatch);
     }
     if (vbr_generation_oracle_enabled()) {
         GGML_ASSERT(expected_rank == cells.seq_pos_count_before(seq_id, computation_frontier) &&
@@ -3947,15 +3980,19 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     vbr_checkpoint_generation_stream captured_stream;
     if (!vbr_generation_capture_stream(
                 *tracker, stream, seq_id, computation_frontier, dependency_cells, captured_stream)) {
-        return false;
+        return fail(vbr_explicit_generation_failure::stream_capture_failed);
     }
 
-    return vbr_generation_capture_controller(
-            *tracker,
-            child_id,
-            checkpoint_child_dependency_mode::live_guarded,
-            {std::move(captured_stream)},
-            output);
+    if (!vbr_generation_capture_controller(
+                *tracker,
+                child_id,
+                checkpoint_child_dependency_mode::live_guarded,
+                {std::move(captured_stream)},
+                output)) {
+        return fail(
+            vbr_explicit_generation_failure::controller_capture_failed);
+    }
+    return true;
 }
 
 // VBR_EXPLICIT_CAPTURE_STABILITY_REGION_BEGIN
@@ -4032,6 +4069,21 @@ bool llama_kv_cache::vbr_capture_settle() noexcept {
         vbr_flush_deferred_unmaps();
         vbr_arm_wave_fences();
         for (auto & pool : vbr_pools_) {
+            // The dedicated side stream is normally created by the first
+            // degrade/promote. A fresh F16 cache has mapped KV bytes but has
+            // never needed that stream. Explicit capture is its first D2H
+            // consumer, so initialize the stream here while the slot is idle.
+            // This creates capture infrastructure only; it changes no tier,
+            // watermark, ownership, generation, or KV byte.
+            if (pool.backend == nullptr) {
+                if (pool.be == nullptr || pool.device < 0) {
+                    return false;
+                }
+                pool.backend = pool.be->backend_init(pool.device);
+                if (pool.backend == nullptr) {
+                    return false;
+                }
+            }
             if (pool.backend != nullptr) {
                 ggml_backend_synchronize(pool.backend);
             }
@@ -4058,23 +4110,47 @@ bool llama_kv_cache::vbr_capture_settle() noexcept {
 bool llama_kv_cache::vbr_capture_size_pass(
         const vbr_capture_unit_request & request,
         std::vector<vbr_capture_unit_plan> & output,
-        vbr_capture_stability_token & stability) const noexcept {
+        vbr_capture_stability_token & stability,
+        vbr_explicit_size_failure * failure) const noexcept {
     output.clear();
     stability = {};
+    if (failure != nullptr) {
+        *failure = vbr_explicit_size_failure::none;
+    }
+    const auto fail = [&](vbr_explicit_size_failure why) {
+        if (failure != nullptr) {
+            *failure = why;
+        }
+        output.clear();
+        stability = {};
+        return false;
+    };
     if (other != nullptr) {
-        return other->vbr_capture_size_pass(request, output, stability);
+        return other->vbr_capture_size_pass(
+            request, output, stability, failure);
     }
     const auto * tracker = vbr_generation_tracker_get();
-    if (!vbr_operation_armed() || tracker == nullptr || !tracker->stable() ||
-        request.bindings == nullptr || n_stream != 1 || v_trans) {
-        return false;
+    if (!vbr_operation_armed()) {
+        return fail(vbr_explicit_size_failure::not_armed);
+    }
+    if (tracker == nullptr) {
+        return fail(vbr_explicit_size_failure::tracker_missing);
+    }
+    if (!tracker->stable()) {
+        return fail(vbr_explicit_size_failure::tracker_unstable);
+    }
+    if (request.bindings == nullptr) {
+        return fail(vbr_explicit_size_failure::bindings_missing);
+    }
+    if (n_stream != 1 || v_trans) {
+        return fail(vbr_explicit_size_failure::stream_layout);
     }
     try {
         const auto & bindings = *static_cast<
             const std::vector<vbr_explicit_capture_pool_binding> *>(
                 request.bindings);
         if (!vbr_capture_policy_snapshot(stability)) {
-            return false;
+            return fail(vbr_explicit_size_failure::policy_snapshot);
         }
         const uint32_t count = tracker->unit_count();
         output.reserve(count);
@@ -4083,11 +4159,11 @@ bool llama_kv_cache::vbr_capture_size_pass(
             const size_t ikv = unit / 2;
             const bool is_v = (unit & 1u) != 0;
             if (ikv >= layers.size()) {
-                return false;
+                return fail(vbr_explicit_size_failure::unit_index);
             }
             const auto & extents = vbr_units_of(ikv, is_v);
             if (extents.empty()) {
-                return false;
+                return fail(vbr_explicit_size_failure::extents_empty);
             }
             vbr_capture_unit_plan plan;
             plan.child_id = request.child_id;
@@ -4107,18 +4183,26 @@ bool llama_kv_cache::vbr_capture_size_pass(
             uint32_t topology_index = UINT32_MAX;
             uint16_t prior_ordinal = 0;
             for (const auto & [pool, extent] : extents) {
-                if (pool == nullptr || extent == nullptr || extent->t == nullptr ||
-                    pool->vmm == nullptr || pool->backend == nullptr ||
-                    pool->wm_cells == 0 || extent->t->type != plan.generation.current_type) {
-                    return false;
+                if (pool == nullptr || extent == nullptr ||
+                    extent->t == nullptr) {
+                    return fail(
+                        vbr_explicit_size_failure::extent_missing);
                 }
-                if (extent->promote_hops !=
-                        plan.generation.promote_hops ||
-                    ((plan.generation.current_type == GGML_TYPE_F16 ||
-                      plan.generation.current_type == GGML_TYPE_TURBO8_0)
-                         ? plan.generation.domain != vbr_repr_domain::full
-                         : plan.generation.domain != vbr_repr_domain::tapped)) {
-                    return false;
+                if (pool->vmm == nullptr) {
+                    return fail(vbr_explicit_size_failure::vmm_missing);
+                }
+                if (pool->backend == nullptr) {
+                    return fail(
+                        vbr_explicit_size_failure::backend_unavailable);
+                }
+                const auto generation_failure =
+                    vbr_explicit_capture_validate_extent_generation(
+                        pool->wm_cells,
+                        static_cast<int32_t>(extent->t->type),
+                        extent->promote_hops, plan.generation);
+                if (generation_failure !=
+                        vbr_explicit_size_failure::none) {
+                    return fail(generation_failure);
                 }
                 if (first) {
                     watermark = pool->wm_cells;
@@ -4128,7 +4212,8 @@ bool llama_kv_cache::vbr_capture_size_pass(
                 } else if (watermark != pool->wm_cells ||
                            stash_present != (extent->stash_valid != 0) ||
                            stash_rows != extent->stash_valid) {
-                    return false;
+                    return fail(
+                        vbr_explicit_size_failure::shard_disagreement);
                 }
                 const auto binding = std::find_if(
                     bindings.begin(), bindings.end(),
@@ -4140,14 +4225,16 @@ bool llama_kv_cache::vbr_capture_size_pass(
                     binding->topology_index == UINT32_MAX ||
                     binding->device_ordinal == UINT16_MAX ||
                     binding->lane == UINT32_MAX) {
-                    return false;
+                    return fail(
+                        vbr_explicit_size_failure::binding_missing);
                 }
                 if (topology_index == UINT32_MAX) {
                     topology_index = binding->topology_index;
                     prior_ordinal = binding->device_ordinal;
                 } else if (binding->topology_index != topology_index ||
                            binding->device_ordinal <= prior_ordinal) {
-                    return false;
+                    return fail(
+                        vbr_explicit_size_failure::topology_order);
                 } else {
                     prior_ordinal = binding->device_ordinal;
                 }
@@ -4155,14 +4242,14 @@ bool llama_kv_cache::vbr_capture_size_pass(
                     ggml_row_size(extent->t->type, extent->t->ne[0]);
                 if (row_bytes == 0 ||
                     watermark > UINT64_MAX / row_bytes) {
-                    return false;
+                    return fail(vbr_explicit_size_failure::bounds);
                 }
                 const uint64_t bytes = uint64_t(watermark) * row_bytes;
                 if (bytes == 0 || bytes > ggml_nbytes(extent->t) ||
                     bytes > vbr_slot_bytes(extent->t) ||
                     extent->byte_off > pool->size ||
                     bytes > pool->size - extent->byte_off) {
-                    return false;
+                    return fail(vbr_explicit_size_failure::bounds);
                 }
                 uint64_t stash_bytes = 0;
                 if (stash_present) {
@@ -4170,19 +4257,22 @@ bool llama_kv_cache::vbr_capture_size_pass(
                         pool->stash_buf == nullptr ||
                         extent->t->ne[0] >
                             int64_t(UINT64_MAX / sizeof(uint16_t))) {
-                        return false;
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
                     }
                     const uint64_t stash_row_bytes =
                         uint64_t(extent->t->ne[0]) * sizeof(uint16_t);
                     if (stash_rows > UINT64_MAX / stash_row_bytes) {
-                        return false;
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
                     }
                     stash_bytes = uint64_t(stash_rows) * stash_row_bytes;
                     const size_t stash_size =
                         ggml_backend_buffer_get_size(pool->stash_buf);
                     if (extent->stash_off > stash_size ||
                         stash_bytes > stash_size - extent->stash_off) {
-                        return false;
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
                     }
                 }
                 plan.shards.push_back({
@@ -4201,12 +4291,14 @@ bool llama_kv_cache::vbr_capture_size_pass(
             output.push_back(std::move(plan));
             stability.units.push_back(std::move(geometry));
         }
-        return !output.empty() && tracker->stable() &&
-               tracker->mutation_serial() == stability.mutation_serial;
+        if (output.empty() || !tracker->stable() ||
+            tracker->mutation_serial() != stability.mutation_serial) {
+            return fail(
+                vbr_explicit_size_failure::stability_reread);
+        }
+        return true;
     } catch (...) {
-        output.clear();
-        stability = {};
-        return false;
+        return fail(vbr_explicit_size_failure::internal_error);
     }
 }
 
@@ -4381,18 +4473,66 @@ bool llama_kv_cache::vbr_capture_generation_record(
         checkpoint_child_dependency_mode dependency_mode,
         llama_seq_id sequence,
         llama_pos frontier,
-        vbr_checkpoint_generation_controller & output) const noexcept {
+        vbr_checkpoint_generation_controller & output,
+        vbr_explicit_generation_failure * failure) const noexcept {
     output = {};
-    if (other != nullptr) {
-        return other->vbr_capture_generation_record(
-            child_id, dependency_mode, sequence, frontier, output);
+    if (failure != nullptr) {
+        *failure = vbr_explicit_generation_failure::none;
     }
-    if (!vbr_generation_capture_live_guarded(
-            child_id, sequence, frontier, output)) {
+    try {
+        if (other != nullptr) {
+            return other->vbr_capture_generation_record(
+                child_id, dependency_mode, sequence, frontier, output,
+                failure);
+        }
+        if (dependency_mode ==
+                checkpoint_child_dependency_mode::payload_complete) {
+            const auto * tracker = vbr_generation_tracker_get();
+            if (tracker == nullptr) {
+                if (failure != nullptr) {
+                    *failure =
+                        vbr_explicit_generation_failure::tracker_missing;
+                }
+                return false;
+            }
+            if (!tracker->stable()) {
+                if (failure != nullptr) {
+                    *failure =
+                        vbr_explicit_generation_failure::tracker_unstable;
+                }
+                return false;
+            }
+            // Payload-complete children serialize their bytes directly and
+            // therefore carry a vacuous ownership row. The unit payload
+            // descriptors retain their exact representation generations.
+            output.child_id = child_id;
+            output.dependency_mode = dependency_mode;
+            output.pool_uuid = tracker->pool_identity();
+            return tracker->stable() &&
+                   vbr_pool_uuid_is_set(output.pool_uuid);
+        }
+        if (dependency_mode !=
+                checkpoint_child_dependency_mode::live_guarded) {
+            if (failure != nullptr) {
+                *failure = vbr_explicit_generation_failure::
+                    invalid_sequence_or_frontier;
+            }
+            return false;
+        }
+        if (!vbr_generation_capture_live_guarded(
+                child_id, sequence, frontier, output, failure)) {
+            return false;
+        }
+        output.dependency_mode = dependency_mode;
+        return true;
+    } catch (...) {
+        output = {};
+        if (failure != nullptr) {
+            *failure =
+                vbr_explicit_generation_failure::internal_error;
+        }
         return false;
     }
-    output.dependency_mode = dependency_mode;
-    return true;
 }
 // VBR_EXPLICIT_CAPTURE_STABILITY_REGION_END
 

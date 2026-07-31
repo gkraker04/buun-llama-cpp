@@ -7,6 +7,7 @@
 
 #include "llama-sha256.h"
 #include "llama-vbr-generation-types.h"
+#include "llama-vbr-identity-digest.h"
 
 #include <algorithm>
 #include <array>
@@ -49,23 +50,14 @@ inline bool vbr_checkpoint_frontier_valid(const vbr_checkpoint_frontier_fields &
 inline std::array<uint8_t, 32> vbr_checkpoint_identity_digest(
         const vbr_checkpoint_frontier_fields &           frontier,
         const std::vector<vbr_checkpoint_child_policy> & policy) {
-    llama_sha256_writer hash;
-    static const char domain[] = "vbr checkpoint identity/policy/order digest v1";
-    hash.bytes(domain, sizeof(domain) - 1);
-    hash.string(frontier.execution_identity, frontier.execution_identity_len);
-    hash.string(frontier.adapter_config_identity, frontier.adapter_config_identity_len);
-    hash.string(frontier.media_content_identity, frontier.media_content_identity_len);
-    hash.u64(frontier.sequence_epoch);
-    hash.u64(uint64_t(frontier.token_count));
-    hash.u64(uint64_t(int64_t(frontier.next_position)));
-    hash.u64(policy.size());
+    std::vector<vbr_identity_policy_digest_row> canonical;
+    canonical.reserve(policy.size());
     for (const auto & row : policy) {
-        hash.u64(row.child_id);
-        hash.u64(uint64_t(static_cast<uint8_t>(row.mode)));
-        hash.u64(row.pool_uuid.hi);
-        hash.u64(row.pool_uuid.lo);
+        canonical.push_back({
+            row.child_id, row.mode, row.pool_uuid,
+        });
     }
-    return hash.finish();
+    return vbr_identity_policy_digest(frontier, canonical);
 }
 
 // §9.1 all-or-nothing composite assembly over the pre-ordered children. Any armed-child

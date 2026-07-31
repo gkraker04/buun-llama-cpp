@@ -171,9 +171,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-vbr-artifact.cpp)
     target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-    llama_build_and_test(test-vbr-artifact-capture.cpp)
+    llama_build_and_test(
+        test-vbr-artifact-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp)
     target_include_directories(test-vbr-artifact-capture PRIVATE
-        ${PROJECT_SOURCE_DIR}/src)
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
 
     llama_build_and_test(
         test-cache-lease.cpp
@@ -331,6 +334,13 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-format.cmake
+)
+
+add_test(
+    NAME test-vbr-artifact-server-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-server.cmake
 )
 
 add_test(

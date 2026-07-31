@@ -433,6 +433,8 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    ggml_backend_t backend_for_device(
+        ggml_backend_dev_t device) const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;

@@ -479,6 +479,47 @@ static bool run_a1_cpu_tests() {
         fprintf(stderr, "A1 tracker did not initialize\n");
         return false;
     }
+    // F3.3: a freshly initialized F16 unit does not need a tier transition
+    // before it can produce an exact generation/ownership record. Ownership
+    // comes from ordinary decode appends; the unit tuple starts at the
+    // controller's initial representation generation.
+    {
+        vbr_ownership_index fresh_ownership(1, 1, 768);
+        if (!fresh_ownership.add_cell(0, 0, 4, 0) ||
+                !fresh_ownership.add_cell(0, 0, 9, 1) ||
+                !fresh_ownership.add_cell(0, 0, 15, 2)) {
+            fprintf(stderr, "F3.3 fresh-F16 ownership seed failed\n");
+            return false;
+        }
+        uint32_t rank = 0;
+        std::vector<uint32_t> owned;
+        if (!fresh_ownership.rank_below(0, 0, 3, rank) ||
+                rank != 3 ||
+                !fresh_ownership.enumerate_owned(0, 0, owned) ||
+                owned != std::vector<uint32_t>({4, 9, 15})) {
+            fprintf(stderr, "F3.3 fresh-F16 ownership view was incomplete\n");
+            return false;
+        }
+        vbr_checkpoint_generation_stream fresh_stream;
+        vbr_checkpoint_generation_controller fresh_controller;
+        if (!vbr_generation_capture_stream(
+                    tracker, 0, 0, 3, owned, fresh_stream) ||
+                !vbr_generation_capture_controller(
+                    tracker, 7,
+                    checkpoint_child_dependency_mode::live_guarded,
+                    {fresh_stream}, fresh_controller) ||
+                fresh_controller.child_id != 7 ||
+                fresh_controller.streams.size() != 1 ||
+                fresh_controller.streams[0].captured_dependency_count != 3 ||
+                fresh_controller.units.size() != 1 ||
+                fresh_controller.units[0].repr_gen != 1 ||
+                fresh_controller.units[0].current_type != GGML_TYPE_F16 ||
+                fresh_controller.units[0].last_transition !=
+                    vbr_repr_transition::initial) {
+            fprintf(stderr, "F3.3 fresh-F16 generation capture failed\n");
+            return false;
+        }
+    }
     vbr_generation_tracker distinct_tracker(1, 768, 1);
     if (distinct_tracker.pool_identity() == tracker.pool_identity()) {
         fprintf(stderr, "A1 process-local pool UUID was reused\n");

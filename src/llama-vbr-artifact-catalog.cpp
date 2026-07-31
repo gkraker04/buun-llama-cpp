@@ -795,9 +795,10 @@ llama_vbr_artifact_catalog::begin_capture(
         const vbr_artifact_package & package,
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
-        vbr_capture_stream_status & status) noexcept {
+        vbr_capture_stream_status & status,
+        vbr_capture_begin_diagnostics * diagnostics) noexcept {
     return begin_capture_impl(
-        package, budget, fault, true, status);
+        package, budget, fault, true, status, diagnostics);
 }
 
 std::unique_ptr<vbr_capture_build>
@@ -806,8 +807,12 @@ llama_vbr_artifact_catalog::begin_capture_impl(
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
         bool charge_transfer_staging,
-        vbr_capture_stream_status & status) noexcept {
+        vbr_capture_stream_status & status,
+        vbr_capture_begin_diagnostics * diagnostics) noexcept {
     status = vbr_capture_stream_status::invalid_argument;
+    if (diagnostics) {
+        *diagnostics = {};
+    }
     try {
         if (package.unit_blobs.empty() ||
             package.manifest.unit_references.size() !=
@@ -995,6 +1000,19 @@ llama_vbr_artifact_catalog::begin_capture_impl(
                     impl_->ledger, budget,
                     state->staging_leaves);
             if (!state->staging_prepared.ready()) {
+                if (diagnostics) {
+                    diagnostics->reservation_group =
+                        vbr_capture_reservation_group::
+                            transfer_staging;
+                    diagnostics->prepare_status =
+                        state->staging_prepared.preparation().status;
+                    diagnostics->admission_status =
+                        state->staging_prepared.preparation().
+                            admission_status;
+                    diagnostics->failed_leaf =
+                        state->staging_prepared.preparation().
+                            failed_leaf;
+                }
                 impl_->n_staging_overlap_refusals++;
                 status =
                     vbr_capture_stream_status::
@@ -1006,6 +1024,19 @@ llama_vbr_artifact_catalog::begin_capture_impl(
                     impl_->ledger, budget,
                     state->durable_prepared_leaves);
             if (!state->durable_prepared.ready()) {
+                if (diagnostics) {
+                    diagnostics->reservation_group =
+                        vbr_capture_reservation_group::
+                            durable_artifact;
+                    diagnostics->prepare_status =
+                        state->durable_prepared.preparation().status;
+                    diagnostics->admission_status =
+                        state->durable_prepared.preparation().
+                            admission_status;
+                    diagnostics->failed_leaf =
+                        state->durable_prepared.preparation().
+                            failed_leaf;
+                }
                 impl_->n_staging_overlap_refusals++;
                 status =
                     vbr_capture_stream_status::
@@ -1055,7 +1086,8 @@ llama_vbr_artifact_publish_result llama_vbr_artifact_catalog::publish(
         // unlike the F3 D2H stream they do not allocate a pageable transfer
         // image. They still drive the exact same seal/dedup/publication core.
         auto build = begin_capture_impl(
-            package, budget, fault, false, stream_status);
+            package, budget, fault, false, stream_status,
+            nullptr);
         if (!build) {
             out.status =
                 llama_vbr_artifact_publish_status::

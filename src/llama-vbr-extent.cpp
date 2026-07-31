@@ -334,6 +334,10 @@ bool vbr_ownership_index::available(uint32_t stream, llama_seq_id seq_id) const 
     return view != nullptr && !view->unavailable;
 }
 
+bool vbr_ownership_index::initialized(uint32_t stream, llama_seq_id seq_id) const {
+    return find_view(stream, seq_id) != nullptr;
+}
+
 bool vbr_ownership_index::rank_below(uint32_t stream, llama_seq_id seq_id, llama_pos frontier,
                                      uint32_t & rank) const {
     const auto * view = find_view(stream, seq_id);

@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-cache-authority.h"
 #include "server-cache-yield.h"
+#include "server-vbr-artifact-store.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -18,6 +19,8 @@
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
+#include "../../src/llama-context.h"
+#include "../../src/llama-sha256.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -39,6 +42,7 @@
 #include <filesystem>
 #include <string>
 #include <type_traits>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -61,6 +65,41 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
 static bool server_vbr_dynamic_active(const common_params & params) {
     return params.vbr_dynamic();
+}
+
+static std::string server_cache_capture_tenant_key(
+        const server_http_req & req) {
+    std::string credential =
+        req.get_header_value("Authorization");
+    if (credential.empty()) {
+        credential = req.get_header_value("X-Api-Key");
+    }
+    if (credential.empty()) {
+        credential = "authenticated-local";
+    }
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.server-tenant/v1";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.string(credential.data(), credential.size());
+    const auto digest = writer.finish();
+    static constexpr char HEX[] = "0123456789abcdef";
+    std::string output;
+    output.reserve(32);
+    for (size_t i = 0; i < 16; ++i) {
+        output.push_back(HEX[digest[i] >> 4]);
+        output.push_back(HEX[digest[i] & 0x0f]);
+    }
+    return output;
+}
+
+static std::array<uint8_t, 32>
+server_cache_capture_build_digest(const char * domain) {
+    llama_sha256_writer writer;
+    writer.string(domain, strlen(domain));
+    const char * commit = llama_commit();
+    writer.string(commit, strlen(commit));
+    return writer.finish();
 }
 
 // A flip is deliberately per-boot: persisting migration confidence across a
@@ -1839,6 +1878,12 @@ private:
     // prompt_cache so it outlives both the observer that references it and the cache's
     // accounting-release destructor.
     std::unique_ptr<server_cache_authority> cache_authority;
+
+    // F3 artifact machinery is a lifecycle-authority sibling: it references
+    // the frozen ledger but is destroyed before it. It exists only for an
+    // armed dynamic-VBR memory after the one-shot manifest and ring admission.
+    std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    std::thread::id vbr_capture_scheduler_thread;
 
     // B0 shadow cache-plan observer [P2]. Constructed ONLY under params_base.cache_debug (B-a
     // literal: no observer object, no record init, no hook work of any kind on the disabled path
@@ -4226,6 +4271,18 @@ private:
         }
 
         std::vector<std::string> gpu_descs;
+        std::vector<vbr_artifact_portable_topology>
+            capture_topologies;
+        std::vector<vbr_explicit_capture_runtime_pool>
+            capture_runtime_pools;
+        std::vector<vbr_explicit_capture_pool_binding>
+            capture_pool_bindings;
+        std::vector<vbr_capture_lane> capture_lanes;
+        uint32_t capture_attention_children = 0;
+        bool capture_manifest_enabled = false;
+        const bool capture_requested =
+            params_base.cache_lifecycle &&
+            server_vbr_dynamic_active(params_base);
         int ngl_eff = 0;
         if (cache_authority) {
             const auto observer_domain = llama_cache_acct_resource_domain::non_device(
@@ -4277,6 +4334,9 @@ private:
                         params_base.main_gpu,
                         params_base.tensor_split,
                         topology)) {
+                    if (capture_requested) {
+                        capture_topologies.push_back(topology);
+                    }
                     for (size_t i = 0; i < gpu_identities.size(); ++i) {
                         llama_cache_acct_resource_domain domain;
                         if (!cache_authority->ledger.make_device_domain(
@@ -4296,11 +4356,82 @@ private:
                 }
             }
 
+            // F3.3 construction discovery is read-only and occurs before the
+            // one-shot C manifest. Every attention child and every pool must
+            // be armed and exactly attributable to a topology device.
+            if (capture_requested &&
+                cache_authority->configured &&
+                capture_topologies.size() == 1 &&
+                vbr_explicit_capture_runtime_pools(
+                    *llama_get_memory(ctx_tgt),
+                    capture_runtime_pools,
+                    capture_attention_children)) {
+                for (const auto & pool : capture_runtime_pools) {
+                    const auto domain = std::find_if(
+                        cache_authority->live_device_domains.begin(),
+                        cache_authority->live_device_domains.end(),
+                        [&](const auto & binding) {
+                            return binding.device ==
+                                pool.backend_device;
+                        });
+                    if (domain ==
+                        cache_authority->live_device_domains.end()) {
+                        capture_pool_bindings.clear();
+                        capture_lanes.clear();
+                        break;
+                    }
+                    auto lane = std::find_if(
+                        capture_lanes.begin(), capture_lanes.end(),
+                        [&](const auto & candidate) {
+                            return candidate.device ==
+                                pool.backend_device;
+                        });
+                    uint32_t lane_index = 0;
+                    if (lane == capture_lanes.end()) {
+                        ggml_backend_t ring_backend = pool.backend;
+                        if (ring_backend == nullptr) {
+                            ring_backend =
+                                ctx_tgt->backend_for_device(
+                                    pool.backend_device);
+                            if (ring_backend == nullptr) {
+                                capture_pool_bindings.clear();
+                                capture_lanes.clear();
+                                break;
+                            }
+                        }
+                        lane_index = uint32_t(capture_lanes.size());
+                        capture_lanes.push_back({
+                            pool.backend_device, ring_backend, false,
+                        });
+                    } else {
+                        lane_index = uint32_t(
+                            lane - capture_lanes.begin());
+                    }
+                    capture_pool_bindings.push_back({
+                        pool.pool_uuid,
+                        pool.device,
+                        0,
+                        domain->domain.device_ordinal.v,
+                        lane_index,
+                    });
+                }
+                capture_manifest_enabled =
+                    !capture_pool_bindings.empty() &&
+                    !capture_lanes.empty() &&
+                    capture_pool_bindings.size() ==
+                        capture_runtime_pools.size();
+            }
+
             // C schema-v2 completeness manifest is owned by configuration, not by either
             // producer. Device/live-memory rows are part of this SAME one-shot call; no
             // producer is allowed to append its own domain after cells exist.
+            // Artifact cells and the pinned domain therefore precede ring-budget
+            // admission. If that later admission refuses the ring, these manifested
+            // cells remain certified measured-zero. This is intentional, harmless,
+            // limited to lifecycle+armed VBR, and must not become a second manifest.
             std::vector<llama_cache_acct_completeness_requirement> required;
-            required.reserve(3 + cache_authority->live_device_domains.size());
+            required.reserve(
+                4 + cache_authority->live_device_domains.size());
             required.push_back({
                 observer_domain, llama_cache_acct_producer::observer_init,
             });
@@ -4312,6 +4443,15 @@ private:
             required.push_back({
                 host_domain, llama_cache_acct_producer::retention_sidecar,
             });
+            const auto pinned_domain =
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pinned_host);
+            if (capture_manifest_enabled) {
+                required.push_back({
+                    pinned_domain,
+                    llama_cache_acct_producer::retention_sidecar,
+                });
+            }
             for (const auto & binding : cache_authority->live_device_domains) {
                 required.push_back({
                     binding.domain, llama_cache_acct_producer::live_memory,
@@ -4321,6 +4461,33 @@ private:
                     required.data(), required.size())) {
                 cache_authority_config_failed(false);
             }
+            if (capture_manifest_enabled) {
+                // Capture reservations span pageable metadata/companions and
+                // topology-qualified device payloads. This runs BEFORE the
+                // ordinary host/live producers below, so it co-initializes every
+                // host-scope participating cell in this domain to measured-zero —
+                // including the F0b host-cache cells (full_snapshot/checkpoint_state/
+                // typed_accelerator) — so the host domain is complete when the
+                // store's first host reservation prices it. The later F0b block
+                // re-gauges those same cells to the same 0 (gauge_set is idempotent),
+                // so this co-init is load-bearing here yet behavior-neutral for F0b.
+                if (!server_vbr_artifact_store_observe_empty_accounting(
+                        cache_authority->ledger, host_domain)) {
+                    cache_authority_config_failed(true);
+                }
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    if (!server_vbr_artifact_store_observe_empty_accounting(
+                            cache_authority->ledger,
+                            binding.domain)) {
+                        cache_authority_config_failed(true);
+                    }
+                }
+                if (!server_vbr_artifact_store_configure_pinned_accounting(
+                        cache_authority->ledger, pinned_domain)) {
+                    cache_authority_config_failed(true);
+                }
+            }
             cache_authority->retention.configure(
                 &cache_authority->ledger, host_domain, &cache_authority->leases);
             for (const auto measure : {
@@ -4328,13 +4495,10 @@ private:
                     llama_cache_acct_measure::resident_allocated,
                     llama_cache_acct_measure::reserved }) {
                 cache_authority->ledger.gauge_set(
-                    llama_cache_acct_category::artifact_descriptor_metadata,
-                    host_domain,
-                    measure,
-                    0);
+                    llama_cache_acct_category::
+                        artifact_descriptor_metadata,
+                    host_domain, measure, 0);
             }
-            (void) cache_authority->ledger.certify_complete(
-                host_domain, llama_cache_acct_producer::retention_sidecar);
 
             // Host-cache absence is itself an observed zero. Initialize all three
             // transactional leaves before an optional cache attaches; later C
@@ -4357,6 +4521,40 @@ private:
                 (void) cache_authority->ledger.certify_complete(
                     host_domain, llama_cache_acct_producer::host_cache);
             }
+            if (capture_manifest_enabled) {
+                for (const auto category : {
+                        llama_cache_acct_category::
+                            artifact_reference_metadata,
+                        llama_cache_acct_category::transfer_staging,
+                        llama_cache_acct_category::codec_workspace }) {
+                    for (const auto measure : {
+                            llama_cache_acct_measure::logical_payload,
+                            llama_cache_acct_measure::resident_allocated,
+                            llama_cache_acct_measure::reserved }) {
+                        cache_authority->ledger.gauge_set(
+                            category, host_domain, measure, 0);
+                    }
+                }
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    for (const auto category : {
+                            llama_cache_acct_category::unit_version_payload,
+                            llama_cache_acct_category::clean_stash_payload,
+                            llama_cache_acct_category::transfer_staging,
+                            llama_cache_acct_category::codec_workspace }) {
+                        for (const auto measure : {
+                                llama_cache_acct_measure::logical_payload,
+                                llama_cache_acct_measure::resident_allocated,
+                                llama_cache_acct_measure::reserved }) {
+                            cache_authority->ledger.gauge_set(
+                                category, binding.domain, measure, 0);
+                        }
+                    }
+                }
+            }
+            (void) cache_authority->ledger.certify_complete(
+                host_domain,
+                llama_cache_acct_producer::retention_sidecar);
             // the parked rolling-window tape's zero is OBSERVED, not implied: an explicit
             // measured-zero gauge, distinct from every unknown cell
             cache_authority->ledger.gauge_set(
@@ -4375,6 +4573,24 @@ private:
             if (!cache_plan_configure_budget()) {
                 cache_authority_config_failed(true);
             }
+            if (capture_manifest_enabled) {
+                std::vector<llama_cache_acct_resource_domain>
+                    capture_accounting_domains;
+                capture_accounting_domains.reserve(
+                    2 + cache_authority->live_device_domains.size());
+                capture_accounting_domains.push_back(host_domain);
+                capture_accounting_domains.push_back(pinned_domain);
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    capture_accounting_domains.push_back(
+                        binding.domain);
+                }
+                if (!server_vbr_artifact_store_verify_accounting(
+                        cache_authority->ledger,
+                        capture_accounting_domains)) {
+                    cache_authority_config_failed(true);
+                }
+            }
 
             // Establish an initial coherent budget object so lifecycle-only is a fully configured
             // authority, not merely a set of producer pointers. Each admission re-samples physical
@@ -4384,6 +4600,86 @@ private:
                     cache_authority->ledger.snapshot(),
                     cache_authority->budget_config)) {
                 cache_authority_config_failed(false);
+            }
+
+            if (capture_manifest_enabled &&
+                cache_authority->configured) {
+                server_vbr_artifact_store_config config;
+                config.ledger = &cache_authority->ledger;
+                config.pinned_domain = pinned_domain;
+                config.topologies = capture_topologies;
+                config.pool_bindings = capture_pool_bindings;
+                config.lanes = capture_lanes;
+                config.attention_children =
+                    capture_attention_children;
+                static constexpr uint64_t RING_FLOOR =
+                    64ull*1024*1024;
+                static constexpr size_t RING_CHUNK =
+                    8ull*1024*1024;
+                const uint64_t lane_floor =
+                    uint64_t(config.lanes.size())*2*RING_CHUNK;
+                config.ring_bytes = std::min<uint64_t>(
+                    VBR_CAPTURE_PINNED_RING_MAX_BYTES,
+                    std::max<uint64_t>(RING_FLOOR, lane_floor));
+                config.chunk_bytes = RING_CHUNK;
+                config.budget_context = cache_authority.get();
+                config.sample_budget = [](
+                        void * context,
+                        llama_cache_budget_config & output) noexcept {
+                    auto * authority =
+                        static_cast<server_cache_authority *>(context);
+                    if (!authority->sample_budget(output)) {
+                        return false;
+                    }
+                    // The pinned ring and pageable artifact bytes share the
+                    // same physical host headroom. Preserve the sampled
+                    // pageable ceiling as a shared host-total constraint and
+                    // leave the pinned leaf policy-unbounded within it.
+                    output.host.total_cap = output.host.pageable_cap;
+                    output.host.total_state =
+                        output.host.pageable_state;
+                    output.host.pinned_state =
+                        llama_cache_budget_capacity_state::unbounded;
+                    return true;
+                };
+                server_vbr_artifact_capture_status status;
+                server_vbr_artifact_store_create_diagnostics diagnostics;
+                vbr_artifact_store =
+                    server_vbr_artifact_store::create(
+                        config, status, &diagnostics);
+                if (!vbr_artifact_store) {
+                    SRV_WRN(
+                        "VBR_ARTIFACT_CAPTURE store unavailable status=%s "
+                        "failure=%s ring_status=%s ring_failure=%s "
+                        "attention_children=%u lanes=%zu "
+                        "requested_ring=%" PRIu64
+                        " attempted_ring=%" PRIu64
+                        " chunk=%zu\n",
+                        server_vbr_artifact_capture_status_name(status),
+                        server_vbr_artifact_store_create_failure_name(
+                            diagnostics.failure),
+                        vbr_capture_stream_status_name(
+                            diagnostics.ring_status),
+                        vbr_capture_ring_create_failure_name(
+                            diagnostics.ring_failure),
+                        diagnostics.attention_children,
+                        diagnostics.lane_count,
+                        diagnostics.requested_ring_bytes,
+                        diagnostics.attempted_ring_bytes,
+                        diagnostics.chunk_bytes);
+                } else {
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE store ready "
+                        "attention_children=%u lanes=%zu "
+                        "requested_ring=%" PRIu64
+                        " constructed_ring=%" PRIu64
+                        " chunk=%zu\n",
+                        diagnostics.attention_children,
+                        diagnostics.lane_count,
+                        diagnostics.requested_ring_bytes,
+                        diagnostics.constructed_ring_bytes,
+                        diagnostics.chunk_bytes);
+                }
             }
 
             if (prompt_cache) {
@@ -5861,6 +6157,157 @@ private:
     // The live capture path fills accel.ring only; accel.spec remains a stash slot
     // for spec impls that need it (e.g. eagle3), applied on restore when present.
 
+    bool build_capture_request(
+            server_slot & slot,
+            vbr_explicit_capture_request & request,
+            server_vbr_artifact_capture_status & status) {
+        const int64_t token_count = slot.prompt.n_tokens();
+        const llama_pos next_position =
+            slot.prompt.tokens.pos_next();
+        std::string media_identity;
+        if (next_position < 0 ||
+            !slot.prompt.tokens.media_content_identity(
+                token_count, media_identity)) {
+            status =
+                server_vbr_artifact_capture_status::identity_unavailable;
+            return false;
+        }
+        const uint64_t sequence_epoch =
+            ensure_frontier_sequence_epoch(slot.prompt);
+        request.identity = {
+            frontier_execution_identity,
+            lora_config_identity(slot.lora),
+            std::move(media_identity),
+            sequence_epoch,
+            token_count,
+            next_position,
+        };
+        request.sequence = slot.id;
+        request.frontier.execution_identity =
+            request.identity.execution_identity.data();
+        request.frontier.execution_identity_len =
+            request.identity.execution_identity.size();
+        request.frontier.adapter_config_identity =
+            request.identity.adapter_config_identity.data();
+        request.frontier.adapter_config_identity_len =
+            request.identity.adapter_config_identity.size();
+        request.frontier.media_content_identity =
+            request.identity.media_content_identity.data();
+        request.frontier.media_content_identity_len =
+            request.identity.media_content_identity.size();
+        request.frontier.sequence_epoch = sequence_epoch;
+        request.frontier.token_count = token_count;
+        request.frontier.next_position = next_position;
+        request.idle_decode_thread = true;
+
+        const auto pageable_domain =
+            vbr_artifact_portable_domain {
+                llama_cache_acct_residency::pageable_host,
+                llama_cache_acct_domain_kind::not_applicable,
+                UINT32_MAX, UINT16_MAX,
+            };
+        if (ctx_dft) {
+            vbr_explicit_companion_provider draft;
+            draft.kind =
+                vbr_artifact_companion_kind::required_spec_payload;
+            draft.build_identity_digest =
+                server_cache_capture_build_digest(
+                    "buun.vbr.draft-state-codec/v1");
+            draft.domain = pageable_domain;
+            draft.context = ctx_dft.get();
+            draft.size = [](
+                    const void * context,
+                    llama_seq_id sequence,
+                    uint64_t & output) noexcept {
+                const auto size =
+                    llama_state_seq_get_size_ext(
+                        static_cast<llama_context *>(
+                            const_cast<void *>(context)),
+                        sequence,
+                        LLAMA_STATE_SEQ_FLAGS_NONE);
+                output = uint64_t(size);
+                return size != 0;
+            };
+            draft.capture = [](
+                    const void * context,
+                    llama_seq_id sequence,
+                    std::vector<uint8_t> & output) noexcept {
+                try {
+                    auto * ctx =
+                        static_cast<llama_context *>(
+                            const_cast<void *>(context));
+                    const size_t size =
+                        llama_state_seq_get_size_ext(
+                            ctx, sequence,
+                            LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (size == 0) {
+                        return false;
+                    }
+                    output.resize(size);
+                    return llama_state_seq_get_data_ext(
+                               ctx, output.data(), size, sequence,
+                               LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+                } catch (...) {
+                    output.clear();
+                    return false;
+                }
+            };
+            request.companions.push_back(draft);
+        }
+        if (slot.can_speculate()) {
+            const size_t ring_size =
+                common_speculative_ring_state_size(slot.get_spec());
+            if (ring_size != 0) {
+                vbr_explicit_companion_provider accelerator;
+                accelerator.kind =
+                    vbr_artifact_companion_kind::typed_accelerator;
+                accelerator.build_identity_digest =
+                    server_cache_capture_build_digest(
+                        "buun.vbr.accelerator-ring-codec/v1");
+                accelerator.domain = pageable_domain;
+                accelerator.context = &slot;
+                accelerator.size = [](
+                        const void * context,
+                        llama_seq_id,
+                        uint64_t & output) noexcept {
+                    const auto * owner =
+                        static_cast<const server_slot *>(context);
+                    const size_t size =
+                        common_speculative_ring_state_size(
+                            owner->get_spec());
+                    output = uint64_t(size);
+                    return size != 0;
+                };
+                accelerator.capture = [](
+                        const void * context,
+                        llama_seq_id,
+                        std::vector<uint8_t> & output) noexcept {
+                    try {
+                        const auto * owner =
+                            static_cast<const server_slot *>(context);
+                        const size_t size =
+                            common_speculative_ring_state_size(
+                                owner->get_spec());
+                        if (size == 0) {
+                            return false;
+                        }
+                        output.resize(size);
+                        common_speculative_ring_state_save(
+                            owner->get_spec(),
+                            output.data(), output.size());
+                        return true;
+                    } catch (...) {
+                        output.clear();
+                        return false;
+                    }
+                };
+                request.companions.push_back(accelerator);
+            }
+        }
+        status = server_vbr_artifact_capture_status::ok;
+        return true;
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -6121,6 +6568,190 @@ private:
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CACHE_CAPTURE:
+                {
+                    auto send_capture = [&](server_vbr_artifact_capture_status status) {
+                        auto res =
+                            std::make_unique<server_task_result_cache_capture>();
+                        res->id = task.id;
+                        res->id_slot = task.cache_capture.id_slot;
+                        res->status = status;
+                        queue_results.send(std::move(res));
+                    };
+
+                    // The route remains present so gated configurations return
+                    // a typed result, but no slot/model inspection occurs when
+                    // the full lifecycle+armed construction gate did not pass.
+                    if (!vbr_artifact_store) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::unsupported);
+                        break;
+                    }
+                    try {
+                    const auto current_thread = std::this_thread::get_id();
+                    if (vbr_capture_scheduler_thread ==
+                            std::thread::id{}) {
+                        vbr_capture_scheduler_thread = current_thread;
+                    }
+                    GGML_ASSERT(
+                        vbr_capture_scheduler_thread == current_thread &&
+                        "VBR artifact capture must run on scheduler thread");
+
+                    server_slot * slot =
+                        get_slot_by_id(task.cache_capture.id_slot);
+                    if (slot == nullptr) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::invalid_slot);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG(
+                            "requested capture slot is processing; defer task, id_task = %d\n",
+                            task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (slot->state != SLOT_STATE_IDLE ||
+                        slot->prompt.n_tokens() <= 0) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::stale_frontier);
+                        break;
+                    }
+
+                    vbr_explicit_capture_request request;
+                    server_vbr_artifact_capture_status request_status;
+                    if (!build_capture_request(
+                            *slot, request, request_status)) {
+                        send_capture(request_status);
+                        break;
+                    }
+
+                    if (!cache_plan_observe_live_memory(false)) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::unavailable);
+                        break;
+                    }
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE begin task=%d slot=%d controllers=%u\n",
+                        task.id, slot->id,
+                        vbr_artifact_store->attention_children());
+                    const int64_t started = ggml_time_us();
+                    const auto captured = vbr_artifact_store->capture(
+                        *llama_get_memory(ctx_tgt), std::move(request),
+                        task.cache_capture.tenant_key);
+                    const auto & capture_totals =
+                        vbr_artifact_store->counters();
+                    const double duration_ms =
+                        (ggml_time_us() - started)/1000.0;
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE end task=%d slot=%d status=%s "
+                        "library_status=%s phase=%s inner_status=%s "
+                        "generation_failure=%s size_failure=%s "
+                        "reservation_group=%s prepare_status=%s "
+                        "admission_status=%s failed_leaf=%zu "
+                        "consistency=%s units=%u payload=%" PRIu64
+                        " stash=%" PRIu64 " companion=%" PRIu64
+                        " chunks=%" PRIu64 " backpressure=%" PRIu64
+                        " events=%" PRIu64 " sync_fallbacks=%" PRIu64
+                        " dedup=%d duration_ms=%.3f"
+                        " total_requested=%" PRIu64
+                        " total_published=%" PRIu64
+                        " total_refused=%" PRIu64
+                        " total_unavailable=%" PRIu64
+                        " total_internal=%" PRIu64
+                        " total_payload=%" PRIu64
+                        " total_stash=%" PRIu64
+                        " total_companion=%" PRIu64
+                        " pinned_bytes=%" PRIu64
+                        " total_chunks=%" PRIu64
+                        " total_events=%" PRIu64
+                        " total_sync_fallbacks=%" PRIu64
+                        " total_backpressure=%" PRIu64
+                        " total_dedup_hits=%" PRIu64
+                        " total_dedup_misses=%" PRIu64
+                        " staging_overlap_refusals=%" PRIu64 "\n",
+                        task.id, slot->id,
+                        server_vbr_artifact_capture_status_name(
+                            captured.status),
+                        vbr_explicit_capture_status_name(
+                            captured.library_status),
+                        vbr_explicit_capture_phase_name(
+                            captured.phase),
+                        vbr_capture_stream_status_name(
+                            captured.inner_stream_status),
+                        vbr_explicit_generation_failure_name(
+                            captured.generation_failure),
+                        vbr_explicit_size_failure_name(
+                            captured.size_failure),
+                        vbr_capture_reservation_group_name(
+                            captured.begin_diagnostics.
+                                reservation_group),
+                        llama_cache_prepare_status_name(
+                            captured.begin_diagnostics.
+                                prepare_status),
+                        llama_cache_admission_status_name(
+                            captured.begin_diagnostics.
+                                admission_status),
+                        captured.begin_diagnostics.failed_leaf,
+                        captured.status ==
+                                server_vbr_artifact_capture_status::ok
+                            ? "capture_exact" : "unavailable",
+                        captured.units, captured.payload_bytes,
+                        captured.stash_bytes,
+                        captured.companion_bytes, captured.chunks,
+                        captured.backpressure_waits,
+                        captured.event_completions,
+                        captured.synchronous_fallbacks,
+                        captured.dedup, duration_ms,
+                        capture_totals.requested,
+                        capture_totals.exact_published,
+                        capture_totals.refused,
+                        capture_totals.unavailable,
+                        capture_totals.internal_error,
+                        capture_totals.payload_bytes,
+                        capture_totals.stash_bytes,
+                        capture_totals.companion_bytes,
+                        capture_totals.pinned_bytes,
+                        capture_totals.chunks,
+                        capture_totals.event_completions,
+                        capture_totals.synchronous_fallbacks,
+                        capture_totals.backpressure_waits,
+                        capture_totals.dedup_hits,
+                        capture_totals.dedup_misses,
+                        capture_totals.staging_overlap_refusals);
+
+                    auto res =
+                        std::make_unique<server_task_result_cache_capture>();
+                    res->id = task.id;
+                    res->id_slot = slot->id;
+                    res->status = captured.status;
+                    if (captured.status ==
+                            server_vbr_artifact_capture_status::ok) {
+                        res->consistency =
+                            server_cache_capture_consistency::capture_exact;
+                    }
+                    res->reference = captured.reference;
+                    res->controllers = captured.controllers;
+                    res->units = captured.units;
+                    res->companions = captured.companions;
+                    res->payload_bytes = captured.payload_bytes;
+                    res->stash_bytes = captured.stash_bytes;
+                    res->companion_bytes = captured.companion_bytes;
+                    res->chunks = captured.chunks;
+                    res->backpressure_waits =
+                        captured.backpressure_waits;
+                    res->event_completions =
+                        captured.event_completions;
+                    res->synchronous_fallbacks =
+                        captured.synchronous_fallbacks;
+                    res->dedup = captured.dedup;
+                    queue_results.send(std::move(res));
+                    } catch (...) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::
+                                internal_error);
+                    }
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
@@ -10462,11 +11093,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
         std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
@@ -10479,6 +11105,13 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "capture") {
+            return handle_slots_capture(req, id_slot);
+        }
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
@@ -11126,6 +11759,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     }
 
     res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_capture(
+        const server_http_req & req,
+        int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_CACHE_CAPTURE);
+        task.id = rd.get_new_id();
+        task.cache_capture.id_slot = id_slot;
+        task.cache_capture.tenant_key =
+            server_cache_capture_tenant_key(req);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    auto * captured =
+        dynamic_cast<server_task_result_cache_capture *>(result.get());
+    GGML_ASSERT(captured != nullptr);
+    res->ok(captured->to_json());
     return res;
 }
 

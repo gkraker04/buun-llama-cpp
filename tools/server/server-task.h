@@ -37,6 +37,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_CACHE_CAPTURE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -180,6 +181,13 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_CACHE_CAPTURE
+    struct cache_capture_action {
+        int id_slot = -1;
+        std::string tenant_key;
+    };
+    cache_capture_action cache_capture;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -572,6 +580,34 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+enum class server_vbr_artifact_capture_status : uint8_t;
+
+enum class server_cache_capture_consistency : uint8_t {
+    unavailable = 0,
+    capture_exact,
+    _count,
+};
+
+struct server_task_result_cache_capture : server_task_result {
+    server_vbr_artifact_capture_status status {};
+    server_cache_capture_consistency consistency =
+        server_cache_capture_consistency::unavailable;
+    std::string reference;
+    uint32_t controllers = 0;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t stash_bytes = 0;
+    uint64_t companion_bytes = 0;
+    uint64_t chunks = 0;
+    uint64_t backpressure_waits = 0;
+    uint64_t event_completions = 0;
+    uint64_t synchronous_fallbacks = 0;
+    bool dedup = false;
 
     virtual json to_json() override;
 };

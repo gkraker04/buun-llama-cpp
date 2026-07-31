@@ -110,7 +110,9 @@ public:
         const vbr_artifact_package & package,
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
-        vbr_capture_stream_status & status) noexcept override;
+        vbr_capture_stream_status & status,
+        vbr_capture_begin_diagnostics * diagnostics =
+            nullptr) noexcept override;
 
     // Release every ledger reference owned by this checkpoint reference.
     // Physical payload/stash bytes discharge only when C observes the last op.
@@ -144,7 +146,8 @@ private:
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
         bool charge_transfer_staging,
-        vbr_capture_stream_status & status) noexcept;
+        vbr_capture_stream_status & status,
+        vbr_capture_begin_diagnostics * diagnostics) noexcept;
 
     friend class llama_vbr_artifact_catalog_stream_build;
 };

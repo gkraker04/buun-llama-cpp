@@ -39,6 +39,30 @@ enum class vbr_capture_stream_status : uint8_t {
 const char * vbr_capture_stream_status_name(
     vbr_capture_stream_status status) noexcept;
 
+enum class vbr_capture_ring_create_failure : uint8_t {
+    none = 0,
+    invalid_geometry,
+    invalid_accounting_binding,
+    existing_ring_charge,
+    accounting_update_failed,
+    budget_reset_failed,
+    budget_unavailable,
+    budget_exceeded,
+    invalid_lane_binding,
+    duplicate_device_lane,
+    host_buffer_type_unavailable,
+    host_buffer_allocation_failed,
+    host_buffer_too_small,
+    host_buffer_base_unavailable,
+    lane_underprovisioned,
+    accounting_charge_failed,
+    internal_error,
+    _count,
+};
+
+const char * vbr_capture_ring_create_failure_name(
+    vbr_capture_ring_create_failure failure) noexcept;
+
 struct artifact_segment {
     std::shared_ptr<const std::vector<uint8_t>> storage;
     uint64_t offset = 0;
@@ -134,6 +158,8 @@ public:
         size_t chunk_bytes,
         vbr_capture_stream_status & status,
         const vbr_capture_ring_accounting * accounting =
+            nullptr,
+        vbr_capture_ring_create_failure * failure =
             nullptr) noexcept;
 
     ~vbr_pinned_chunk_ring();
@@ -178,6 +204,26 @@ struct vbr_capture_sink_result {
     bool adopted = false;
 };
 
+enum class vbr_capture_reservation_group : uint8_t {
+    none = 0,
+    transfer_staging,
+    durable_artifact,
+    _count,
+};
+
+const char * vbr_capture_reservation_group_name(
+    vbr_capture_reservation_group group) noexcept;
+
+struct vbr_capture_begin_diagnostics {
+    vbr_capture_reservation_group reservation_group =
+        vbr_capture_reservation_group::none;
+    llama_cache_prepare_status prepare_status =
+        llama_cache_prepare_status::prepared;
+    llama_cache_admission_status admission_status =
+        llama_cache_admission_status::admitted;
+    size_t failed_leaf = SIZE_MAX;
+};
+
 class vbr_unit_build {
 public:
     virtual ~vbr_unit_build() = default;
@@ -204,5 +250,7 @@ public:
         const vbr_artifact_package & package,
         const llama_cache_budget_config & budget,
         const llama_cache_transaction_fault & fault,
-        vbr_capture_stream_status & status) noexcept = 0;
+        vbr_capture_stream_status & status,
+        vbr_capture_begin_diagnostics * diagnostics =
+            nullptr) noexcept = 0;
 };

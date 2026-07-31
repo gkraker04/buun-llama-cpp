@@ -151,6 +151,9 @@ class vbr_ownership_index {
     bool enumerate_owned(uint32_t stream, llama_seq_id seq_id, std::vector<uint32_t> & cells) const;
 
     bool available(uint32_t stream, llama_seq_id seq_id) const;
+    // Diagnostics distinguish a view that was never populated from one that
+    // was populated and later failed the bounded logical-position contract.
+    bool initialized(uint32_t stream, llama_seq_id seq_id) const;
 
     // Memory note (design Rev 4 item 7): the Fenwick domain is n_cells positions * 4 B,
     // ~800 KB per ACTIVE seq at 200k cells, lazily allocated on first add; capacity is

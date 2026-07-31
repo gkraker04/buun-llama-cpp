@@ -5,9 +5,16 @@
 #include "llama-memory-recurrent.h"
 #include "llama-memory-tree.h"
 #include "llama-sha256.h"
+#include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
+#include "turbo-rotation-data.h"
+
+#include "ggml-turbo-meansub.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -15,6 +22,147 @@
 #include <utility>
 
 namespace {
+
+std::array<uint8_t, 32> representation_hash_file_or_marker(
+        const char * tag,
+        const char * path,
+        uint32_t type,
+        bool value_side,
+        const vbr_explicit_representation_policy & policy,
+        bool & ok) {
+    llama_sha256_writer writer;
+    writer.string(tag, strlen(tag));
+    writer.u32(type);
+    writer.u32(value_side);
+    if (path == nullptr || path[0] == '\0') {
+        static constexpr char BUILTIN[] =
+            "compiled-in/build-identity";
+        writer.string(BUILTIN, sizeof(BUILTIN) - 1);
+        if (policy.build_identity == nullptr ||
+            policy.build_identity_len == 0) {
+            ok = false;
+            return {};
+        }
+        writer.string(
+            policy.build_identity, policy.build_identity_len);
+        return writer.finish();
+    }
+    FILE * file = fopen(path, "rb");
+    if (file == nullptr) {
+        ok = false;
+        return {};
+    }
+    std::array<uint8_t, 64*1024> buffer;
+    for (;;) {
+        const size_t size =
+            fread(buffer.data(), 1, buffer.size(), file);
+        if (size != 0) {
+            writer.bytes(buffer.data(), size);
+        }
+        if (size != buffer.size()) {
+            if (ferror(file)) {
+                ok = false;
+            }
+            break;
+        }
+    }
+    fclose(file);
+    return ok ? writer.finish() : std::array<uint8_t, 32>{};
+}
+
+const char * representation_override(
+        int32_t type,
+        bool value_side) {
+    switch (type) {
+        case GGML_TYPE_TURBO8_0:
+            return std::getenv("TURBO_CB_T8");
+        case GGML_TYPE_TURBO4_0:
+            return std::getenv("TURBO_CB_T4");
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ: {
+            const char * side = std::getenv(value_side
+                ? "TURBO_TCQ_CB_V" : "TURBO_TCQ_CB_K");
+            return side ? side : std::getenv("TURBO_TCQ_CB");
+        }
+        case GGML_TYPE_TURBO1_TCQ: {
+            const char * side = std::getenv(value_side
+                ? "TURBO1_TCQ_CB_V" : "TURBO1_TCQ_CB_K");
+            return side ? side : std::getenv("TURBO1_TCQ_CB");
+        }
+        default:
+            return nullptr;
+    }
+}
+
+std::array<uint8_t, 32> representation_rotation_identity(
+        int32_t type,
+        bool value_side) {
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.codec-rotation/v1";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.u32(uint32_t(type));
+    writer.u32(value_side);
+    const auto * matrix = value_side
+        ? TURBO_ROTATION_RT : TURBO_ROTATION_R;
+    writer.bytes(matrix, 128*128*sizeof(matrix[0]));
+    return writer.finish();
+}
+
+std::array<uint8_t, 32> representation_meansub_identity(
+        int32_t type,
+        bool value_side,
+        const vbr_explicit_representation_policy & policy,
+        bool & ok) {
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] =
+        "buun.vbr.codec-meansub/v1";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.u32(uint32_t(type));
+    writer.u32(value_side);
+
+    const char * disabled = std::getenv("TURBO_MEANSUB_OFF");
+    if (disabled != nullptr) {
+        static constexpr char OFF[] = "disabled";
+        writer.string(OFF, sizeof(OFF) - 1);
+        return writer.finish();
+    }
+    const char * path = std::getenv(
+        value_side ? "TURBO_VMEAN_SUB" : "TURBO_KMEAN_SUB");
+    if (path != nullptr && path[0] != '\0') {
+        return representation_hash_file_or_marker(
+            "buun.vbr.codec-meansub-file/v1",
+            path, uint32_t(type), value_side, policy, ok);
+    }
+
+    int max_layers = 0;
+    int max_channels = 0;
+    int live_layers = 0;
+    const float * active = ggml_turbo_meansub_active(
+        value_side ? 1 : 0,
+        &max_layers, &max_channels, &live_layers);
+    if (active == nullptr || max_layers <= 0 ||
+        max_channels <= 0 || live_layers <= 0) {
+        static constexpr char INACTIVE[] = "inactive";
+        writer.string(INACTIVE, sizeof(INACTIVE) - 1);
+        return writer.finish();
+    }
+    if (size_t(max_layers) >
+            std::numeric_limits<size_t>::max() /
+                size_t(max_channels) ||
+        size_t(max_layers)*size_t(max_channels) >
+            std::numeric_limits<size_t>::max() / sizeof(float)) {
+        ok = false;
+        return {};
+    }
+    writer.u32(uint32_t(max_layers));
+    writer.u32(uint32_t(max_channels));
+    writer.u32(uint32_t(live_layers));
+    writer.bytes(
+        active,
+        size_t(max_layers)*size_t(max_channels)*sizeof(float));
+    return writer.finish();
+}
 
 bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return std::any_of(digest.begin(), digest.end(),
@@ -148,6 +296,39 @@ vbr_explicit_capture_status stream_status(
 
 } // namespace
 
+bool vbr_explicit_capture_representation_identity(
+        const void * context,
+        int32_t current_type,
+        bool value_side,
+        vbr_explicit_representation_identity & output) noexcept {
+    try {
+        if (context == nullptr ||
+            current_type < 0 || current_type >= GGML_TYPE_COUNT) {
+            return false;
+        }
+        const auto & policy =
+            *static_cast<const vbr_explicit_representation_policy *>(
+                context);
+        output.codec_id = uint32_t(current_type) + 1;
+        output.codec_version = 1;
+        bool ok = true;
+        output.codebook_digest =
+            representation_hash_file_or_marker(
+                "buun.vbr.codec-codebook/v1",
+                representation_override(current_type, value_side),
+                uint32_t(current_type), value_side, policy, ok);
+        output.rotation_digest =
+            representation_rotation_identity(
+                current_type, value_side);
+        output.meansub_digest =
+            representation_meansub_identity(
+                current_type, value_side, policy, ok);
+        return ok;
+    } catch (...) {
+        return false;
+    }
+}
+
 class vbr_live_capture_adapter {
 public:
     struct child {
@@ -164,6 +345,54 @@ public:
         return cache.vbr_capture_settle();
     }
 
+    static bool runtime_pools(
+            llama_kv_cache & cache,
+            std::vector<vbr_explicit_capture_runtime_pool> & output) {
+        if (cache.other != nullptr) {
+            return runtime_pools(*cache.other, output);
+        }
+        const auto pool_uuid = cache.vbr_pool_id();
+        const auto * tracker =
+            cache.vbr_generation_tracker_get();
+        if (!cache.vbr_operation_armed() ||
+            tracker == nullptr || !tracker->active() ||
+            !vbr_pool_uuid_is_set(pool_uuid) ||
+            cache.vbr_pools_.empty()) {
+            return false;
+        }
+        for (const auto & pool : cache.vbr_pools_) {
+            if (pool.vmm == nullptr || pool.buf == nullptr ||
+                pool.device < 0) {
+                return false;
+            }
+            const auto backend_device =
+                ggml_backend_buft_get_device(
+                    ggml_backend_buffer_get_type(pool.buf));
+            if (backend_device == nullptr) {
+                return false;
+            }
+            const auto duplicate = std::find_if(
+                output.begin(), output.end(),
+                [&](const auto & current) {
+                    return current.pool_uuid == pool_uuid &&
+                           current.device == pool.device;
+                });
+            if (duplicate != output.end()) {
+                if (duplicate->backend_device != backend_device ||
+                    (duplicate->backend != nullptr &&
+                     pool.backend != nullptr &&
+                     duplicate->backend != pool.backend)) {
+                    return false;
+                }
+                continue;
+            }
+            output.push_back({
+                pool_uuid, pool.device, backend_device, pool.backend,
+            });
+        }
+        return true;
+    }
+
     static bool capture_metadata(
             llama_kv_cache & cache,
             uint32_t child_id,
@@ -171,7 +400,11 @@ public:
             llama_seq_id sequence,
             llama_pos frontier,
             const std::vector<vbr_explicit_capture_pool_binding> & bindings,
-            child & output) {
+            child & output,
+            vbr_explicit_generation_failure & failure,
+            vbr_explicit_size_failure & size_failure) {
+        failure = vbr_explicit_generation_failure::none;
+        size_failure = vbr_explicit_size_failure::none;
         llama_kv_cache::vbr_capture_unit_request request;
         request.child_id = child_id;
         request.bindings = &bindings;
@@ -182,12 +415,27 @@ public:
         // ownership.  The final stability reread binds the ownership record
         // to that exact token: a mutation between these two calls advances a
         // monotone controller serial or unit publish_seq and fails closed.
-        return cache.vbr_capture_size_pass(
-                   request, output.units, output.stability) &&
-               cache.vbr_capture_generation_record(
-                   child_id, mode, sequence, frontier,
-                   output.generation) &&
-               cache.vbr_capture_stability_matches(output.stability);
+        if (!cache.vbr_capture_size_pass(
+                request, output.units, output.stability,
+                &size_failure)) {
+            failure = vbr_explicit_generation_failure::size_pass;
+            return false;
+        }
+        if (!cache.vbr_capture_generation_record(
+                child_id, mode, sequence, frontier,
+                output.generation, &failure)) {
+            if (failure == vbr_explicit_generation_failure::none) {
+                failure =
+                    vbr_explicit_generation_failure::internal_error;
+            }
+            return false;
+        }
+        if (!cache.vbr_capture_stability_matches(output.stability)) {
+            failure =
+                vbr_explicit_generation_failure::stability_reread_failed;
+            return false;
+        }
+        return true;
     }
 
     static bool stable(const child & value) {
@@ -207,6 +455,37 @@ public:
     }
 };
 
+bool vbr_explicit_capture_runtime_pools(
+        llama_memory_i & memory,
+        std::vector<vbr_explicit_capture_runtime_pool> & pools,
+        uint32_t & attention_children) noexcept {
+    pools.clear();
+    attention_children = 0;
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        for (const auto & node : tree) {
+            if (node.attention == nullptr) {
+                continue;
+            }
+            ++attention_children;
+            if (!vbr_live_capture_adapter::runtime_pools(
+                    *node.attention, pools)) {
+                pools.clear();
+                attention_children = 0;
+                return false;
+            }
+        }
+        return attention_children != 0 && !pools.empty();
+    } catch (...) {
+        pools.clear();
+        attention_children = 0;
+        return false;
+    }
+}
+
 vbr_explicit_capture_result vbr_capture_explicit_manifest(
         llama_memory_i & memory,
         const vbr_explicit_capture_request & request,
@@ -221,7 +500,6 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         request.ring == nullptr || accounting.budget == nullptr ||
         request.topologies.empty() || request.pool_bindings.empty() ||
         request.representation_identity == nullptr ||
-        !digest_nonzero(request.identity_policy_order_digest) ||
         request.identity.execution_identity.empty() ||
         request.identity.adapter_config_identity.empty() ||
         request.identity.media_content_identity.empty()) {
@@ -230,6 +508,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
     }
 
     try {
+        result.phase = vbr_explicit_capture_phase::memory_tree;
         std::vector<llama_memory_tree_child> tree;
         if (!llama_memory_tree_collect(&memory, tree)) {
             result.status = vbr_explicit_capture_status::unsupported_layout;
@@ -259,6 +538,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             return result;
         }
 
+        result.phase = vbr_explicit_capture_phase::settlement;
         // Settlement is deliberately before both quiescence proofs. It flushes
         // only already-deferred housekeeping and dirty stash metadata.
         for (auto & child : children) {
@@ -268,7 +548,11 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             }
         }
 
+        result.phase =
+            vbr_explicit_capture_phase::pre_capture_quiescence;
         std::vector<vbr_operation_pool_key> pools;
+        result.phase =
+            vbr_explicit_capture_phase::metadata_and_manifest;
         for (auto & child : children) {
             const auto pool = child.cache->vbr_pool_id();
             if (!vbr_pool_uuid_is_set(pool) ||
@@ -296,10 +580,32 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             if (!vbr_live_capture_adapter::capture_metadata(
                     *child.cache, child.child_id, child.dependency_mode,
                     request.sequence, request.frontier.next_position,
-                    request.pool_bindings, child)) {
+                    request.pool_bindings, child,
+                    result.generation_failure,
+                    result.size_failure)) {
                 result.status = vbr_explicit_capture_status::generation_unavailable;
                 return result;
             }
+        }
+
+        std::vector<vbr_identity_policy_digest_row> identity_policy;
+        identity_policy.reserve(children.size());
+        for (const auto & child : children) {
+            identity_policy.push_back({
+                child.child_id,
+                child.dependency_mode,
+                child.stability.pool_uuid,
+            });
+        }
+        const auto identity_policy_order_digest =
+            vbr_identity_policy_digest(
+                request.frontier, identity_policy);
+        if (digest_nonzero(request.identity_policy_order_digest) &&
+            request.identity_policy_order_digest !=
+                identity_policy_order_digest) {
+            result.status =
+                vbr_explicit_capture_status::identity_unavailable;
+            return result;
         }
 
         // Recurrent state uses the existing exact state codec. Accelerator
@@ -308,12 +614,12 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         package.topologies = request.topologies;
         package.manifest.identity = request.identity;
         package.manifest.identity_policy_order_digest =
-            request.identity_policy_order_digest;
+            identity_policy_order_digest;
         package.manifest.generation.version = 1;
         package.manifest.generation.status =
             vbr_checkpoint_generation_status::complete;
         package.manifest.generation.identity_policy_order_digest =
-            request.identity_policy_order_digest;
+            identity_policy_order_digest;
 
         uint32_t global_unit = 0;
         for (auto & child : children) {
@@ -652,6 +958,8 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         package.manifest.consistency.kind =
             vbr_artifact_consistency_kind::capture_exact;
 
+        result.phase =
+            vbr_explicit_capture_phase::pre_transfer_stability;
         // Exact equality immediately before the first data byte.
         for (const auto & child : children) {
             if (!vbr_live_capture_adapter::stable(child)) {
@@ -666,20 +974,27 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             return result;
         }
 
+        result.phase =
+            vbr_explicit_capture_phase::accounting_configuration;
         if (accounting.prepare != nullptr &&
             !accounting.prepare(accounting.context, package)) {
             result.status = vbr_explicit_capture_status::accounting_failed;
             return result;
         }
+        result.phase =
+            vbr_explicit_capture_phase::reservation_preparation;
         vbr_capture_stream_status begin_status;
         auto build = sink.begin_capture(
             package, *accounting.budget, accounting.fault,
-            begin_status);
+            begin_status, &result.begin_diagnostics);
         if (!build) {
+            result.inner_stream_status = begin_status;
             result.status = stream_status(begin_status);
             return result;
         }
 
+        result.phase =
+            vbr_explicit_capture_phase::companion_capture;
         // Durable + transfer-staging claims now exist. Only at this point may
         // companion codecs allocate their pageable byte images.
         for (size_t i = 0; i < pending_companions.size(); ++i) {
@@ -729,17 +1044,20 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             const auto accepted =
                 build->accept_verified_companion(verified);
             if (accepted != vbr_capture_stream_status::ok) {
+                result.inner_stream_status = accepted;
                 result.status = stream_status(accepted);
                 return result;
             }
         }
 
+        result.phase = vbr_explicit_capture_phase::unit_transfer;
         uint32_t unit_index = 0;
         for (const auto & child : children) {
             for (const auto & plan : child.units) {
                 vbr_capture_stream_status unit_status;
                 auto unit = build->begin_unit(unit_index, unit_status);
                 if (!unit) {
+                    result.inner_stream_status = unit_status;
                     result.status = stream_status(unit_status);
                     return result;
                 }
@@ -750,8 +1068,14 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                         vbr_explicit_capture_status::transfer_failed;
                     return result;
                 }
-                if (unit->seal_unit() !=
-                        vbr_capture_stream_status::ok) {
+                result.chunks += stats.chunks;
+                result.backpressure_waits += stats.backpressure_waits;
+                result.event_completions += stats.event_completions;
+                result.synchronous_fallbacks +=
+                    stats.synchronous_fallbacks;
+                const auto sealed = unit->seal_unit();
+                if (sealed != vbr_capture_stream_status::ok) {
+                    result.inner_stream_status = sealed;
                     result.status =
                         vbr_explicit_capture_status::hash_mismatch;
                     return result;
@@ -772,6 +1096,8 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             }
         }
 
+        result.phase =
+            vbr_explicit_capture_phase::post_transfer_stability;
         // Both levels of stability and quiescence are re-read after all D2H
         // completions, before the catalog's final reference publication.
         for (const auto & child : children) {
@@ -789,16 +1115,123 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             return result;
         }
 
+        result.phase = vbr_explicit_capture_phase::publication;
         result.sink = build->publish_reference();
+        result.inner_stream_status = result.sink.status;
         result.status = stream_status(result.sink.status);
         result.controllers = children.size();
         result.units = unit_index;
         result.companions = package.companions.size();
+        if (result.status == vbr_explicit_capture_status::ok) {
+            result.phase = vbr_explicit_capture_phase::complete;
+        }
         return result;
     } catch (...) {
         result.status = vbr_explicit_capture_status::internal_error;
         return result;
     }
+}
+
+const char * vbr_explicit_capture_phase_name(
+        vbr_explicit_capture_phase phase) noexcept {
+    switch (phase) {
+        case vbr_explicit_capture_phase::validation: return "validation";
+        case vbr_explicit_capture_phase::memory_tree: return "memory_tree";
+        case vbr_explicit_capture_phase::settlement: return "settlement";
+        case vbr_explicit_capture_phase::pre_capture_quiescence: return "pre_capture_quiescence";
+        case vbr_explicit_capture_phase::metadata_and_manifest: return "metadata_and_manifest";
+        case vbr_explicit_capture_phase::pre_transfer_stability: return "pre_transfer_stability";
+        case vbr_explicit_capture_phase::accounting_configuration: return "accounting_configuration";
+        case vbr_explicit_capture_phase::reservation_preparation: return "reservation_preparation";
+        case vbr_explicit_capture_phase::companion_capture: return "companion_capture";
+        case vbr_explicit_capture_phase::unit_transfer: return "unit_transfer";
+        case vbr_explicit_capture_phase::post_transfer_stability: return "post_transfer_stability";
+        case vbr_explicit_capture_phase::publication: return "publication";
+        case vbr_explicit_capture_phase::complete: return "complete";
+        case vbr_explicit_capture_phase::_count: return "_count";
+    }
+    return "invalid";
+}
+
+const char * vbr_explicit_generation_failure_name(
+        vbr_explicit_generation_failure failure) noexcept {
+    switch (failure) {
+        case vbr_explicit_generation_failure::none: return "none";
+        case vbr_explicit_generation_failure::size_pass: return "size_pass";
+        case vbr_explicit_generation_failure::tracker_missing: return "tracker_missing";
+        case vbr_explicit_generation_failure::tracker_unstable: return "tracker_unstable";
+        case vbr_explicit_generation_failure::tracker_shadow_unavailable: return "tracker_shadow_unavailable";
+        case vbr_explicit_generation_failure::invalid_sequence_or_frontier: return "invalid_sequence_or_frontier";
+        case vbr_explicit_generation_failure::invalid_stream: return "invalid_stream";
+        case vbr_explicit_generation_failure::ownership_index_missing: return "ownership_index_missing";
+        case vbr_explicit_generation_failure::ownership_view_missing: return "ownership_view_missing";
+        case vbr_explicit_generation_failure::ownership_view_unavailable: return "ownership_view_unavailable";
+        case vbr_explicit_generation_failure::ownership_rank_failed: return "ownership_rank_failed";
+        case vbr_explicit_generation_failure::ownership_enumeration_failed: return "ownership_enumeration_failed";
+        case vbr_explicit_generation_failure::ownership_cardinality_mismatch: return "ownership_cardinality_mismatch";
+        case vbr_explicit_generation_failure::stream_capture_failed: return "stream_capture_failed";
+        case vbr_explicit_generation_failure::controller_capture_failed: return "controller_capture_failed";
+        case vbr_explicit_generation_failure::stability_reread_failed: return "stability_reread_failed";
+        case vbr_explicit_generation_failure::internal_error: return "internal_error";
+        case vbr_explicit_generation_failure::_count: return "_count";
+    }
+    return "_count";
+}
+
+const char * vbr_explicit_size_failure_name(
+        vbr_explicit_size_failure failure) noexcept {
+    switch (failure) {
+        case vbr_explicit_size_failure::none: return "none";
+        case vbr_explicit_size_failure::not_armed: return "not_armed";
+        case vbr_explicit_size_failure::tracker_missing: return "tracker_missing";
+        case vbr_explicit_size_failure::tracker_unstable: return "tracker_unstable";
+        case vbr_explicit_size_failure::bindings_missing: return "bindings_missing";
+        case vbr_explicit_size_failure::stream_layout: return "stream_layout";
+        case vbr_explicit_size_failure::policy_snapshot: return "policy_snapshot";
+        case vbr_explicit_size_failure::unit_index: return "unit_index";
+        case vbr_explicit_size_failure::extents_empty: return "extents_empty";
+        case vbr_explicit_size_failure::extent_missing: return "extent_missing";
+        case vbr_explicit_size_failure::vmm_missing: return "vmm_missing";
+        case vbr_explicit_size_failure::backend_unavailable: return "backend_unavailable";
+        case vbr_explicit_size_failure::wm_cells_zero: return "wm_cells_zero";
+        case vbr_explicit_size_failure::extent_type_mismatch: return "extent_type_mismatch";
+        case vbr_explicit_size_failure::promote_hops_mismatch: return "promote_hops_mismatch";
+        case vbr_explicit_size_failure::domain_mismatch: return "domain_mismatch";
+        case vbr_explicit_size_failure::shard_disagreement: return "shard_disagreement";
+        case vbr_explicit_size_failure::binding_missing: return "binding_missing";
+        case vbr_explicit_size_failure::topology_order: return "topology_order";
+        case vbr_explicit_size_failure::bounds: return "bounds";
+        case vbr_explicit_size_failure::stash_bounds: return "stash_bounds";
+        case vbr_explicit_size_failure::stability_reread: return "stability_reread";
+        case vbr_explicit_size_failure::internal_error: return "internal_error";
+        case vbr_explicit_size_failure::_count: return "_count";
+    }
+    return "_count";
+}
+
+vbr_explicit_size_failure vbr_explicit_capture_validate_extent_generation(
+        uint32_t wm_cells,
+        int32_t extent_type,
+        uint8_t extent_promote_hops,
+        const vbr_unit_generation & generation) noexcept {
+    if (wm_cells == 0) {
+        return vbr_explicit_size_failure::wm_cells_zero;
+    }
+    if (extent_type != generation.current_type) {
+        return vbr_explicit_size_failure::extent_type_mismatch;
+    }
+    if (extent_promote_hops != generation.promote_hops) {
+        return vbr_explicit_size_failure::promote_hops_mismatch;
+    }
+    const auto expected_domain =
+        generation.current_type == GGML_TYPE_F16 ||
+        generation.current_type == GGML_TYPE_TURBO8_0
+            ? vbr_repr_domain::full
+            : vbr_repr_domain::tapped;
+    if (generation.domain != expected_domain) {
+        return vbr_explicit_size_failure::domain_mismatch;
+    }
+    return vbr_explicit_size_failure::none;
 }
 
 const char * vbr_explicit_capture_status_name(

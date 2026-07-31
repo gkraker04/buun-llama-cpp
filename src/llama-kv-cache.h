@@ -27,6 +27,8 @@ struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
 struct vbr_capture_stream_stats;
+enum class vbr_explicit_generation_failure : uint8_t;
+enum class vbr_explicit_size_failure : uint8_t;
 
 //
 // llama_kv_cache
@@ -202,7 +204,8 @@ public:
             uint32_t child_id,
             llama_seq_id seq_id,
             llama_pos computation_frontier,
-            vbr_checkpoint_generation_controller & output) const;
+            vbr_checkpoint_generation_controller & output,
+            vbr_explicit_generation_failure * failure = nullptr) const;
     bool vbr_generation_live_guarded_view(
             uint32_t child_id,
             llama_seq_id seq_id,
@@ -395,7 +398,8 @@ private:
     bool vbr_capture_size_pass(
         const vbr_capture_unit_request & request,
         std::vector<vbr_capture_unit_plan> & output,
-        vbr_capture_stability_token & stability) const noexcept;
+        vbr_capture_stability_token & stability,
+        vbr_explicit_size_failure * failure = nullptr) const noexcept;
     bool vbr_capture_stream_unit(
         const vbr_capture_unit_plan & plan,
         vbr_unit_build & sink,
@@ -408,7 +412,8 @@ private:
         checkpoint_child_dependency_mode dependency_mode,
         llama_seq_id sequence,
         llama_pos frontier,
-        vbr_checkpoint_generation_controller & output) const noexcept;
+        vbr_checkpoint_generation_controller & output,
+        vbr_explicit_generation_failure * failure = nullptr) const noexcept;
     bool vbr_capture_policy_snapshot(
         vbr_capture_stability_token & output) const noexcept;
 
