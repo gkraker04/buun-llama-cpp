@@ -208,6 +208,18 @@ bool vbr_controller_instance_release(
     return true;
 }
 
+bool vbr_controller_instance_owned_by(
+        vbr_controller_instance_id instance,
+        const void * owner) noexcept {
+    if (!vbr_controller_instance_id_is_set(instance) || owner == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_controller_registry_mutex);
+    const size_t slot = find_owned_slot_locked(instance);
+    return slot != g_controller_registry_capacity &&
+           g_controller_registry[slot].owner == owner;
+}
+
 bool vbr_lineage_origin_provider_set_for_tests(
         vbr_lineage_origin_provider provider) noexcept {
     if (provider == nullptr) {

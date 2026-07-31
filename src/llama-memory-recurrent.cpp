@@ -6,8 +6,7 @@
 #include "llama-batch.h"
 #include "llama-model.h"
 #include "llama-vram-demand.h"
-
-#include "ggml-backend.h"
+#include "llama-vbr-artifact-adopt.h"
 
 #include <algorithm>
 #include <cassert>
@@ -23,6 +22,317 @@ struct ggml_backend_buft_comparator {
     }
 };
 } // namespace
+
+namespace {
+
+struct recurrent_tensor_row {
+    bool present = false;
+    ggml_type type = GGML_TYPE_COUNT;
+    uint64_t row_bytes = 0;
+    std::vector<uint8_t> bytes;
+};
+
+class recurrent_cursor {
+  public:
+    explicit recurrent_cursor(std::vector<uint8_t> bytes)
+        : bytes_(std::move(bytes)) {}
+
+    template <typename T>
+    bool scalar(T & value) noexcept {
+        if (offset_ > bytes_.size() ||
+            sizeof(T) > bytes_.size() - offset_) {
+            return false;
+        }
+        std::memcpy(&value, bytes_.data() + offset_, sizeof(T));
+        offset_ += sizeof(T);
+        return true;
+    }
+
+    bool block(std::vector<uint8_t> & value, size_t size) {
+        if (offset_ > bytes_.size() || size > bytes_.size() - offset_) {
+            return false;
+        }
+        value.assign(bytes_.begin() + offset_,
+                     bytes_.begin() + offset_ + size);
+        offset_ += size;
+        return true;
+    }
+
+    bool finished() const noexcept { return offset_ == bytes_.size(); }
+
+  private:
+    std::vector<uint8_t> bytes_;
+    size_t offset_ = 0;
+};
+
+class vbr_recurrent_parsed_image final :
+        public vbr_parsed_companion_image {
+  public:
+    vbr_artifact_companion_kind kind() const noexcept override {
+        return vbr_artifact_companion_kind::recurrent;
+    }
+    uint32_t format_version() const noexcept override { return 1; }
+
+    llama_memory_recurrent * target = nullptr;
+    llama_pos position = -1;
+    std::vector<recurrent_tensor_row> r;
+    std::vector<recurrent_tensor_row> s;
+};
+
+} // namespace
+
+class vbr_recurrent_prepared_image final :
+        public vbr_prepared_companion_image {
+  public:
+    llama_memory_recurrent * target = nullptr;
+    llama_seq_id destination = -1;
+    std::vector<llama_memory_recurrent::mem_cell> cells;
+    uint32_t head = 0;
+    uint32_t used = 0;
+    int32_t rs_z = -1;
+    std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rollback_valid_depth;
+    std::vector<ggml_tensor *> r_l;
+    std::vector<ggml_tensor *> s_l;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    static bool prepare(
+            const void * context,
+            std::unique_ptr<vbr_parsed_companion_image> parsed_base,
+            llama_seq_id destination,
+            std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+        try {
+            auto * target = static_cast<llama_memory_recurrent *>(
+                const_cast<void *>(context));
+            auto * parsed = dynamic_cast<vbr_recurrent_parsed_image *>(
+                parsed_base.get());
+            if (!target || !parsed || parsed->target != target ||
+                destination < 0 ||
+                uint32_t(destination) >= target->n_seq_max ||
+                target->used != 0 ||
+                std::any_of(target->cells.begin(), target->cells.end(),
+                    [](const llama_memory_recurrent::mem_cell & cell) {
+                        return !cell.is_empty();
+                    }) ||
+                parsed->r.size() != target->r_l.size() ||
+                parsed->s.size() != target->s_l.size()) {
+                return false;
+            }
+
+            auto image = std::make_unique<vbr_recurrent_prepared_image>();
+            image->target = target;
+            image->destination = destination;
+            image->cells.resize(target->size);
+            image->head = 0;
+            image->used = 1;
+            image->rs_idx.assign(target->rs_idx.size(), 0);
+            image->rollback_valid_depth.assign(
+                target->rollback_valid_depth.size(), 0);
+            auto & cell = image->cells[0];
+            cell.pos = parsed->position;
+            cell.src = 0;
+            cell.seq_id.insert(destination);
+            image->cells[size_t(destination)].tail = 0;
+
+            std::map<ggml_backend_buffer_type_t, ggml_context_ptr,
+                     ggml_backend_buft_comparator> contexts;
+            const size_t context_bytes = std::max<size_t>(
+                2*target->r_l.size()*ggml_tensor_overhead(),
+                2*ggml_tensor_overhead());
+            const auto context_for = [&](ggml_backend_buffer_type_t buft)
+                    -> ggml_context * {
+                auto found = contexts.find(buft);
+                if (found != contexts.end()) {
+                    return found->second.get();
+                }
+                ggml_init_params params = { context_bytes, nullptr, true };
+                ggml_context * created = ggml_init(params);
+                if (!created) {
+                    return nullptr;
+                }
+                contexts.emplace(buft, created);
+                return created;
+            };
+
+            image->r_l.resize(target->r_l.size());
+            image->s_l.resize(target->s_l.size());
+            for (size_t i = 0; i < target->r_l.size(); ++i) {
+                ggml_backend_buffer_type_t buft = nullptr;
+                if (target->r_l[i]) {
+                    buft = ggml_backend_buffer_get_type(target->r_l[i]->buffer);
+                } else if (target->s_l[i]) {
+                    buft = ggml_backend_buffer_get_type(target->s_l[i]->buffer);
+                }
+                if (!buft) {
+                    if (parsed->r[i].present || parsed->s[i].present) {
+                        return false;
+                    }
+                    continue;
+                }
+                ggml_context * ggml_ctx = context_for(buft);
+                if (!ggml_ctx) {
+                    return false;
+                }
+                if (target->r_l[i]) {
+                    image->r_l[i] = ggml_dup_tensor(ggml_ctx, target->r_l[i]);
+                }
+                if (target->s_l[i]) {
+                    image->s_l[i] = ggml_dup_tensor(ggml_ctx, target->s_l[i]);
+                }
+            }
+            for (auto & entry : contexts) {
+                ggml_backend_buffer_t buffer =
+                    ggml_backend_alloc_ctx_tensors_from_buft(
+                        entry.second.get(), entry.first);
+                if (!buffer) {
+                    return false;
+                }
+                ggml_backend_buffer_clear(buffer, 0);
+                image->ctxs_bufs.emplace_back(
+                    std::move(entry.second), buffer);
+            }
+            for (size_t i = 0; i < image->r_l.size(); ++i) {
+                if (image->r_l[i]) {
+                    ggml_backend_tensor_set(
+                        image->r_l[i], parsed->r[i].bytes.data(), 0,
+                        parsed->r[i].bytes.size());
+                }
+                if (image->s_l[i]) {
+                    ggml_backend_tensor_set(
+                        image->s_l[i], parsed->s[i].bytes.data(), 0,
+                        parsed->s[i].bytes.size());
+                }
+            }
+            output = std::move(image);
+            return true;
+        } catch (...) {
+            output.reset();
+            return false;
+        }
+    }
+
+    static void publish(
+            const void * context,
+            vbr_prepared_companion_image & base) noexcept {
+        // BEGIN VBR_IMPORT_RECURRENT_METADATA_SWAP
+        auto * target = static_cast<llama_memory_recurrent *>(
+            const_cast<void *>(context));
+        auto & image = static_cast<vbr_recurrent_prepared_image &>(base);
+        GGML_ASSERT(target && image.target == target && image.destination >= 0);
+        target->cells.swap(image.cells);
+        std::swap(target->head, image.head);
+        std::swap(target->used, image.used);
+        std::swap(target->rs_z, image.rs_z);
+        target->rs_idx.swap(image.rs_idx);
+        target->rollback_valid_depth.swap(image.rollback_valid_depth);
+        target->r_l.swap(image.r_l);
+        target->s_l.swap(image.s_l);
+        target->ctxs_bufs.swap(image.ctxs_bufs);
+        image.target = nullptr;
+        // END VBR_IMPORT_RECURRENT_METADATA_SWAP
+    }
+
+    static void rollback(
+            const void *, vbr_prepared_companion_image &) noexcept {
+        // All resources remain owned by the off-side image until publish.
+    }
+
+    static bool target_empty(const void * context) noexcept {
+        const auto * target = static_cast<const llama_memory_recurrent *>(context);
+        return target != nullptr && target->used == 0 &&
+               std::all_of(target->cells.begin(), target->cells.end(),
+                   [](const llama_memory_recurrent::mem_cell & cell) {
+                       return cell.is_empty();
+                   });
+    }
+};
+
+bool vbr_parse_recurrent_companion(
+        const void *,
+        const vbr_artifact_companion_payload & descriptor,
+        const artifact_segment_chain & source,
+        const vbr_target_companion_snapshot & target_snapshot,
+        std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
+    try {
+        output.reset();
+        auto * target = static_cast<llama_memory_recurrent *>(
+            const_cast<void *>(target_snapshot.target_cookie));
+        if (!target || !target_snapshot.available ||
+            descriptor.kind != vbr_artifact_companion_kind::recurrent ||
+            descriptor.format_version != 1 ||
+            descriptor.payload_bytes != source.size() ||
+            source.size() > std::numeric_limits<size_t>::max()) {
+            return false;
+        }
+        std::vector<uint8_t> bytes(size_t(source.size()));
+        if (!source.read(0, bytes.data(), bytes.size())) {
+            return false;
+        }
+        recurrent_cursor cursor(std::move(bytes));
+        uint32_t cell_count = 0;
+        llama_pos position = -1;
+        uint32_t n_seq_id = 0;
+        uint32_t s_trans = 0;
+        uint32_t n_layer = 0;
+        if (!cursor.scalar(cell_count) || cell_count != 1 ||
+            !cursor.scalar(position) || position < 0 ||
+            !cursor.scalar(n_seq_id) || n_seq_id != 0 ||
+            !cursor.scalar(s_trans) || s_trans != 0 ||
+            !cursor.scalar(n_layer) || n_layer != target->r_l.size()) {
+            return false;
+        }
+        auto parsed = std::make_unique<vbr_recurrent_parsed_image>();
+        parsed->target = target;
+        parsed->position = position;
+        parsed->r.resize(n_layer);
+        parsed->s.resize(n_layer);
+        const auto read_rows = [&](const std::vector<ggml_tensor *> & tensors,
+                                   std::vector<recurrent_tensor_row> & rows) {
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                if (!tensors[i]) {
+                    continue;
+                }
+                int32_t type = -1;
+                uint64_t row_bytes = 0;
+                if (!cursor.scalar(type) ||
+                    type != int32_t(tensors[i]->type) ||
+                    !cursor.scalar(row_bytes) ||
+                    row_bytes != uint64_t(ggml_row_size(
+                        tensors[i]->type, tensors[i]->ne[0])) ||
+                    row_bytes > std::numeric_limits<size_t>::max() ||
+                    !cursor.block(rows[i].bytes, size_t(row_bytes))) {
+                    return false;
+                }
+                rows[i].present = true;
+                rows[i].type = tensors[i]->type;
+                rows[i].row_bytes = row_bytes;
+            }
+            return true;
+        };
+        if (!read_rows(target->r_l, parsed->r) ||
+            !read_rows(target->s_l, parsed->s) || !cursor.finished()) {
+            return false;
+        }
+        output = std::move(parsed);
+        return true;
+    } catch (...) {
+        output.reset();
+        return false;
+    }
+}
+
+vbr_companion_adoption_provider vbr_recurrent_companion_adoption_provider(
+        llama_memory_recurrent & target) noexcept {
+    vbr_companion_adoption_provider provider;
+    provider.kind = vbr_artifact_companion_kind::recurrent;
+    provider.target_cookie = &target;
+    provider.context = &target;
+    provider.prepare = &vbr_recurrent_prepared_image::prepare;
+    provider.target_empty = &vbr_recurrent_prepared_image::target_empty;
+    provider.publish_swap = &vbr_recurrent_prepared_image::publish;
+    provider.rollback = &vbr_recurrent_prepared_image::rollback;
+    return provider;
+}
 
 //
 // llama_memory_recurrent

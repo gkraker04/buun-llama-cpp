@@ -341,6 +341,24 @@ bool vbr_staged_payloads::claims_ready() const noexcept {
     return impl_ && impl_->prepared.ready();
 }
 
+llama_cache_transaction_result
+vbr_staged_payloads::adoption_materialize_claims() noexcept {
+    if (!impl_) {
+        return {};
+    }
+    return impl_->prepared.materialize_and_commit(impl_->leaves);
+}
+
+vbr_h2d_chunk_ring * vbr_staged_payloads::adoption_ring() noexcept {
+    return impl_ ? impl_->ring.get() : nullptr;
+}
+
+const std::vector<llama_cache_acct_op_id> &
+vbr_staged_payloads::adoption_committed_ops() const noexcept {
+    static const std::vector<llama_cache_acct_op_id> empty;
+    return impl_ ? impl_->committed_ops : empty;
+}
+
 namespace {
 
 bool add_checked(uint64_t a, uint64_t b, uint64_t & out) noexcept {

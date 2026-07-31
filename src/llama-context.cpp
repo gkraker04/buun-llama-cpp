@@ -594,6 +594,15 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // A decode operation owns its VBR registry entry until the scheduler fence
+    // promotes the submitted extents and delivers the terminal result.  Most
+    // callers reach that fence while consuming outputs, but context teardown is
+    // also a terminal lifecycle boundary (including server shutdown between
+    // decode and sampling).  Drain it while both the scheduler and the memory
+    // tree are still alive; the VBR tracker destructor must never inherit a
+    // live deferred-decode operation.
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];

@@ -2108,7 +2108,7 @@ struct validator_fixture {
     vbr_adopt_policy policy;
 
     // stash_case: 0 = exact full prefix, 1 = source-present partial
-    // authorization, 2 = absent at source.
+    // authorization, 2 = tapped/absent at source, 3 = full-domain/absent.
     explicit validator_fixture(
             bool legacy_v1 = false,
             int stash_case = 0,
@@ -2142,7 +2142,7 @@ struct validator_fixture {
             stash.captured_sink_count = 1;
             stash.covered_sink_pages[0].covered_mask[0] = 1;
         }
-        if (stash_case == 2) {
+        if (stash_case >= 2) {
             auto & descriptor = base.package.unit_blobs[0].descriptor;
             descriptor.clean_stash_state =
                 vbr_artifact_clean_stash_state::absent_at_source;
@@ -2158,6 +2158,13 @@ struct validator_fixture {
                             vbr_artifact_accounting_role::clean_stash_payload;
                     }),
                 manifest.accounting.end());
+            if (stash_case == 3) {
+                descriptor.current_type = GGML_TYPE_TURBO8_0;
+                manifest.generation.controllers[0].units[0].current_type =
+                    GGML_TYPE_TURBO8_0;
+                manifest.generation.controllers[0].units[0].domain =
+                    vbr_repr_domain::full;
+            }
         }
         manifest.manifest_digest = {};
         CHECK(base.catalog->configure_accounting(base.package));
@@ -2200,7 +2207,7 @@ struct validator_fixture {
             auto unit = build->begin_unit(0, status);
             CHECK(unit && status == vbr_capture_stream_status::ok);
             for (const auto & completion : base.completions()) {
-                if (completion.clean_stash && stash_case == 2) {
+                if (completion.clean_stash && stash_case >= 2) {
                     continue;
                 }
                 const auto segment = verified_segment(completion, 2);
@@ -2633,6 +2640,18 @@ static void test_manifest_validator_matrix() {
           vbr_import_decision::live_rebased);
     CHECK(stashless_result.proof);
     CHECK(stashless_result.proof->children()[0].stash_action ==
+          vbr_validated_stash_action::none_at_source);
+
+    validator_fixture full_stashless(false, 3);
+    full_stashless.policy.adoption_nonce = first_nonce + 12;
+    const auto full_stashless_result = validate(
+        full_stashless, full_stashless.target, full_stashless.policy);
+    CHECK(full_stashless_result.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(full_stashless_result.decision ==
+          vbr_import_decision::native_import);
+    CHECK(full_stashless_result.proof);
+    CHECK(full_stashless_result.proof->children()[0].stash_action ==
           vbr_validated_stash_action::none_at_source);
 
     validator_fixture legacy(true);

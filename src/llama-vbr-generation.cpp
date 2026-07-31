@@ -1,11 +1,15 @@
 #include "llama-vbr-generation.h"
 
+#include "llama-vbr-artifact-validate.h"
+
 #include "ggml.h"
 #include "llama-cparams.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <new>
+#include <set>
 
 namespace {
 
@@ -311,7 +315,7 @@ bool vbr_generation_event::finish() {
     return true;
 }
 
-struct vbr_generation_tracker::stream_state {
+struct vbr_generation_stream_state {
     std::vector<uint32_t> page_event_gen;
     std::vector<uint32_t> page_last_destructive_gen;
     std::vector<uint32_t> page_last_import_gen;
@@ -332,6 +336,77 @@ struct vbr_generation_tracker::stream_state {
     std::vector<uint64_t> cell_membership_in_range;
 };
 
+struct vbr_tracker_import_image::impl {
+    vbr_lineage_uuid lineage;
+    vbr_controller_instance_id instance;
+    uint64_t global_generation = 0;
+    uint64_t mutation_serial = 0;
+    uint32_t active_event_depth = 0;
+    std::vector<vbr_generation_stream_state> streams;
+    std::vector<vbr_unit_generation> units;
+    vbr_extent_store * extent_store = nullptr;
+    std::vector<vbr_extent_handle> extent_handles;
+    std::vector<vbr_extent_ref> extent_guard_refs;
+    bool ready = false;
+
+    ~impl() {
+        if (extent_store == nullptr) {
+            return;
+        }
+        for (auto & stream : streams) {
+            for (const auto ref : stream.cell_dependency_extent) {
+                extent_store->release_ref(ref);
+            }
+            for (const auto ref : stream.cell_membership_extent) {
+                extent_store->release_ref(ref);
+            }
+        }
+        for (const auto ref : extent_guard_refs) {
+            extent_store->release_ref(ref);
+        }
+        for (const auto handle : extent_handles) {
+            extent_store->fail(handle);
+        }
+    }
+};
+
+static void resize_stream_state(
+        vbr_generation_stream_state & stream,
+        uint32_t n_pages, uint32_t n_cells) {
+    stream.page_event_gen.resize(n_pages);
+    stream.page_last_destructive_gen.resize(n_pages);
+    stream.page_last_import_gen.resize(n_pages);
+    stream.page_event_serial.resize(n_pages);
+    stream.cell_last_dependency_gen.resize(n_cells);
+    stream.cell_last_membership_gen.resize(n_cells);
+    stream.cell_dependency_provenance.resize(n_cells);
+    stream.cell_membership_provenance.resize(n_cells);
+    stream.cell_last_membership_seq.resize(n_cells, -1);
+    stream.cell_dependency_extent.resize(n_cells);
+    stream.cell_membership_extent.resize(n_cells);
+    stream.cell_dependency_in_range.resize((n_cells + 63)/64);
+    stream.cell_membership_in_range.resize((n_cells + 63)/64);
+}
+
+vbr_tracker_import_image::vbr_tracker_import_image()
+    : impl_(new impl) {}
+vbr_tracker_import_image::~vbr_tracker_import_image() = default;
+vbr_tracker_import_image::vbr_tracker_import_image(
+        vbr_tracker_import_image &&) noexcept = default;
+vbr_tracker_import_image & vbr_tracker_import_image::operator=(
+        vbr_tracker_import_image &&) noexcept = default;
+bool vbr_tracker_import_image::ready() const noexcept {
+    return impl_ && impl_->ready;
+}
+bool vbr_tracker_import_image::stable() const noexcept {
+    return impl_ && impl_->ready && impl_->active_event_depth == 0 &&
+           (impl_->mutation_serial & 1u) == 0 &&
+           std::all_of(impl_->units.begin(), impl_->units.end(),
+               [](const vbr_unit_generation & unit) {
+                   return (unit.publish_seq & 1u) == 0;
+               });
+}
+
 static void set_range_bit(std::vector<uint64_t> & bits, uint32_t cell, bool value) {
     if (value) {
         bits[cell / 64] |= uint64_t(1) << (cell % 64);
@@ -344,14 +419,45 @@ static bool get_range_bit(const std::vector<uint64_t> & bits, uint32_t cell) {
     return (bits[cell / 64] & (uint64_t(1) << (cell % 64))) != 0;
 }
 
-vbr_generation_tracker::~vbr_generation_tracker() {
+const char * vbr_generation_teardown_state_name(
+        vbr_generation_teardown_state state) noexcept {
+    switch (state) {
+        case vbr_generation_teardown_state::clean: return "clean";
+        case vbr_generation_teardown_state::active_event: return "active_event";
+        case vbr_generation_teardown_state::operation_live: return "operation_live";
+        case vbr_generation_teardown_state::recovery_owned: return "recovery_owned";
+        case vbr_generation_teardown_state::instance_owner_mismatch: return "instance_owner_mismatch";
+        case vbr_generation_teardown_state::_count: break;
+    }
+    return "invalid";
+}
+
+vbr_generation_teardown_state
+vbr_generation_tracker::teardown_state() const noexcept {
     if (active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0) {
+        return vbr_generation_teardown_state::active_event;
+    }
+    if (!instance_enrolled_) {
+        return vbr_generation_teardown_state::clean;
+    }
+    if (!vbr_operation_registry_quiescent_for(&instance_id_, 1)) {
+        return vbr_generation_teardown_state::operation_live;
+    }
+    if (vbr_recovery_owned_by(instance_id_)) {
+        return vbr_generation_teardown_state::recovery_owned;
+    }
+    if (!vbr_controller_instance_owned_by(instance_id_, this)) {
+        return vbr_generation_teardown_state::instance_owner_mismatch;
+    }
+    return vbr_generation_teardown_state::clean;
+}
+
+vbr_generation_tracker::~vbr_generation_tracker() {
+    if (teardown_state() != vbr_generation_teardown_state::clean) {
         std::abort();
     }
     if (instance_enrolled_) {
-        if (!vbr_operation_registry_quiescent_for(&instance_id_, 1) ||
-            vbr_recovery_owned_by(instance_id_) ||
-            !vbr_controller_instance_release(instance_id_, this)) {
+        if (!vbr_controller_instance_release(instance_id_, this)) {
             std::abort();
         }
         instance_enrolled_ = false;
@@ -365,19 +471,7 @@ vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cel
     units_(n_units) {
     const uint32_t n_pages = page_count(n_cells);
     for (auto & stream : streams_) {
-        stream.page_event_gen.resize(n_pages);
-        stream.page_last_destructive_gen.resize(n_pages);
-        stream.page_last_import_gen.resize(n_pages);
-        stream.page_event_serial.resize(n_pages);
-        stream.cell_last_dependency_gen.resize(n_cells);
-        stream.cell_last_membership_gen.resize(n_cells);
-        stream.cell_dependency_provenance.resize(n_cells);
-        stream.cell_membership_provenance.resize(n_cells);
-        stream.cell_last_membership_seq.resize(n_cells, -1);
-        stream.cell_dependency_extent.resize(n_cells);
-        stream.cell_membership_extent.resize(n_cells);
-        stream.cell_dependency_in_range.resize((n_cells + 63) / 64);
-        stream.cell_membership_in_range.resize((n_cells + 63) / 64);
+        resize_stream_state(stream, n_pages, n_cells);
     }
 
     lineage_uuid_ = vbr_lineage_uuid_is_set(lineage)
@@ -795,6 +889,240 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
     ++state.publish_seq;
     return true;
 }
+
+// VBR_GENERATION_IMPORT_REGION_BEGIN
+// F4's validator-authenticated import is the fourth narrow authority allowed
+// to consume captured page generations. It constructs an off-side image only;
+// live admission still remains checkpoint_vbr_eligibility().
+bool vbr_generation_tracker::prepare_import_image(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const std::vector<vbr_artifact_stream_placement> & placements,
+        vbr_tracker_import_image & output) noexcept {
+    try {
+        if (!active() || !stable() || !output.impl_ ||
+            plan.child_id != source.child_id ||
+            plan.target_instance != instance_id_ ||
+            destination < 0 || destination >= LLAMA_MAX_SEQ ||
+            plan.units.size() != units_.size() ||
+            source.units.size() != units_.size() ||
+            source.streams.size() != streams_.size() ||
+            (plan.transition != vbr_tracker_install_transition::native_clone &&
+             plan.transition != vbr_tracker_install_transition::whole_import)) {
+            return false;
+        }
+        if (plan.transition == vbr_tracker_install_transition::native_clone) {
+            if (plan.lineage_uuid != source.lineage_uuid ||
+                plan.global_generation != source.global_generation ||
+                plan.units != source.units) {
+                return false;
+            }
+        } else {
+            if (plan.lineage_uuid != lineage_uuid_ ||
+                plan.global_generation != 1 ||
+                std::any_of(plan.units.begin(), plan.units.end(),
+                    [](const vbr_checkpoint_unit_generation & unit) {
+                        return unit.repr_gen != 1 ||
+                               unit.last_transition !=
+                                   vbr_repr_transition::whole_import;
+                    })) {
+                return false;
+            }
+        }
+        auto next = std::make_unique<vbr_tracker_import_image::impl>();
+        next->instance = instance_id_;
+        next->lineage = plan.transition ==
+                vbr_tracker_install_transition::native_clone
+            ? plan.lineage_uuid : lineage_uuid_;
+        next->global_generation = plan.global_generation;
+        if (!vbr_lineage_uuid_is_set(next->lineage) ||
+            next->global_generation == 0) {
+            return false;
+        }
+        next->streams.resize(streams_.size());
+        const uint32_t n_pages = page_count(n_cells_);
+        for (auto & stream : next->streams) {
+            resize_stream_state(stream, n_pages, n_cells_);
+        }
+        next->extent_store = &extents_;
+        std::vector<vbr_extent_handle> import_extents(streams_.size());
+        for (const auto & source_stream : source.streams) {
+            if (source_stream.stream_index >= streams_.size() ||
+                source_stream.computation_frontier <= 0 ||
+                import_extents[source_stream.stream_index]) {
+                return false;
+            }
+            const auto handle = extents_.reserve(
+                vbr_mutation_family::import,
+                vbr_operation_class::state_api,
+                uint16_t(source_stream.stream_index), destination,
+                0, source_stream.computation_frontier);
+            if (!handle) {
+                return false;
+            }
+            const auto guard = extents_.add_ref(handle);
+            if (!guard) {
+                extents_.fail(handle);
+                return false;
+            }
+            next->extent_guard_refs.push_back(guard);
+            if (!extents_.commit(handle)) {
+                return false;
+            }
+            import_extents[source_stream.stream_index] = handle;
+            next->extent_handles.push_back(handle);
+        }
+
+        std::set<std::pair<uint32_t, uint32_t>> installed_cells;
+        for (const auto & placement : placements) {
+            if (placement.child_id != plan.child_id ||
+                placement.stream_index >= next->streams.size()) {
+                return false;
+            }
+            const auto source_stream = std::find_if(
+                source.streams.begin(), source.streams.end(),
+                [&](const vbr_checkpoint_generation_stream & value) {
+                    return value.stream_index == placement.stream_index;
+                });
+            if (source_stream == source.streams.end()) {
+                return false;
+            }
+            auto & stream = next->streams[placement.stream_index];
+            for (const auto & cell : placement.cells) {
+                if (cell.physical_cell >= n_cells_) {
+                    return false;
+                }
+                const uint32_t page =
+                    cell.physical_cell / VBR_GENERATION_PAGE_CELLS;
+                uint32_t generation = 1;
+                if (plan.transition ==
+                        vbr_tracker_install_transition::native_clone) {
+                    const auto page_ref = std::find_if(
+                        source_stream->pages.begin(), source_stream->pages.end(),
+                        [&](const vbr_generation_page_ref & value) {
+                            return value.page_index == page;
+                        });
+                    if (page_ref == source_stream->pages.end() ||
+                        page_ref->captured_page_gen == 0 ||
+                        (page_ref->covered_mask[
+                            (cell.physical_cell % VBR_GENERATION_PAGE_CELLS)/64] &
+                         (uint64_t(1) <<
+                            (cell.physical_cell % 64))) == 0) {
+                        return false;
+                    }
+                    generation = page_ref->captured_page_gen;
+                }
+                const auto installed = std::make_pair(
+                    placement.stream_index, cell.physical_cell);
+                if (!installed_cells.insert(installed).second) {
+                    if (stream.cell_last_dependency_gen[cell.physical_cell] !=
+                            generation ||
+                        stream.cell_last_membership_seq[cell.physical_cell] !=
+                            destination) {
+                        return false;
+                    }
+                    continue;
+                }
+                stream.page_event_gen[page] =
+                    std::max(stream.page_event_gen[page], generation);
+                stream.page_last_import_gen[page] =
+                    std::max(stream.page_last_import_gen[page], generation);
+                stream.cell_last_dependency_gen[cell.physical_cell] = generation;
+                stream.cell_last_membership_gen[cell.physical_cell] = generation;
+                const uint16_t provenance = pack_provenance(
+                    vbr_mutation_family::import,
+                    vbr_operation_class::state_api);
+                stream.cell_dependency_provenance[cell.physical_cell] = provenance;
+                stream.cell_membership_provenance[cell.physical_cell] = provenance;
+                stream.cell_last_membership_seq[cell.physical_cell] =
+                    static_cast<int16_t>(destination);
+                const auto handle = import_extents[placement.stream_index];
+                stream.cell_dependency_extent[cell.physical_cell] =
+                    extents_.add_ref(handle);
+                stream.cell_membership_extent[cell.physical_cell] =
+                    extents_.add_ref(handle);
+                if (!stream.cell_dependency_extent[cell.physical_cell] ||
+                    !stream.cell_membership_extent[cell.physical_cell]) {
+                    return false;
+                }
+                set_range_bit(stream.cell_dependency_in_range,
+                              cell.physical_cell, true);
+                set_range_bit(stream.cell_membership_in_range,
+                              cell.physical_cell, true);
+            }
+        }
+
+        for (const auto guard : next->extent_guard_refs) {
+            extents_.release_ref(guard);
+        }
+        next->extent_guard_refs.clear();
+
+        next->units.reserve(plan.units.size());
+        for (const auto & unit : plan.units) {
+            if (unit.repr_gen == 0) {
+                return false;
+            }
+            vbr_unit_generation installed;
+            installed.repr_gen = unit.repr_gen;
+            installed.publish_seq = 0;
+            installed.current_type = unit.current_type;
+            installed.last_source_type = unit.last_source_type;
+            installed.domain = unit.domain;
+            installed.promote_hops = unit.promote_hops;
+            installed.last_transition = unit.last_transition;
+            next->units.push_back(installed);
+        }
+        next->mutation_serial = 0;
+        next->ready = true;
+        output.impl_ = std::move(next);
+        return true;
+    } catch (...) {
+        output.impl_.reset(new (std::nothrow) vbr_tracker_import_image::impl);
+        return false;
+    }
+}
+
+bool vbr_generation_tracker::import_image_installable(
+        const vbr_tracker_import_image & image,
+        vbr_operation_id operation_id) const noexcept {
+    if (!image.impl_ || !image.stable() || !active() || !stable() ||
+        image.impl_->instance != instance_id_ ||
+        image.impl_->streams.size() != streams_.size() ||
+        image.impl_->units.size() != units_.size() ||
+        !vbr_controller_instance_owned_by(instance_id_, this)) {
+        return false;
+    }
+    vbr_operation_binding binding;
+    return operation_id &&
+           vbr_operation_registry_binding(operation_id, binding) &&
+           binding.find_covering_target(
+               instance_id_, VBR_STREAM_ANY,
+               vbr_operation_class::state_api,
+               vbr_registrant_bit(vbr_mutation_registrant::whole_import)) != nullptr;
+}
+
+// BEGIN VBR_IMPORT_TRACKER_METADATA_SWAP
+void vbr_generation_tracker::install_import_image_swap(
+        vbr_tracker_import_image & image) noexcept {
+    GGML_ASSERT(image.impl_ && image.stable());
+    GGML_ASSERT(image.impl_->instance == instance_id_);
+    lineage_uuid_ = image.impl_->lineage;
+    global_generation_ = image.impl_->global_generation;
+    mutation_serial_ = image.impl_->mutation_serial;
+    event_serial_ = 0;
+    active_event_depth_ = 0;
+    generation_at_latch_ = 0;
+    shadow_unavailable_ = false;
+    streams_.swap(image.impl_->streams);
+    units_.swap(image.impl_->units);
+    // Extent references are now owned by the live stream vectors.  Detach the
+    // off-side image's rollback owner without touching the imported handles.
+    image.impl_->extent_store = nullptr;
+    image.impl_->ready = false;
+}
+// END VBR_IMPORT_TRACKER_METADATA_SWAP
+// VBR_GENERATION_IMPORT_REGION_END
 
 bool vbr_generation_tracker::reset_unit_generations_before_wrap() {
     if (global_generation_ == std::numeric_limits<uint64_t>::max() ||

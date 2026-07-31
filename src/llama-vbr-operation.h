@@ -569,6 +569,10 @@ bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation
 bool vbr_operation_registry_quiescent_for(
     const vbr_controller_instance_id * instances,
     size_t n_instances) noexcept;
+bool vbr_operation_registry_quiescent_for_except(
+    const vbr_controller_instance_id * instances,
+    size_t n_instances,
+    vbr_operation_id allowed) noexcept;
 
 // A2 explicit close semantics (design D-A2-4v3). `vbr_operation_registry_end` remains the
 // committed-close alias for the non-mutating legacy callers (freeze scopes).
@@ -706,6 +710,12 @@ vbr_quarantine_work vbr_recovery_take_quarantine(vbr_controller_instance_id inst
 int32_t vbr_recovery_advance_recorded(vbr_controller_instance_id instance);
 // v4 review F3: any unresolved recovery work (recorded/awaiting/taken) serviceable here?
 bool vbr_recovery_pending_for(vbr_controller_instance_id instance);
+// Import opens its authenticated recovery reservation before the final empty
+// target recheck. Ignore only that operation's still-reserved record; every
+// other non-free record, including wildcard recovery work, remains a conflict.
+bool vbr_recovery_pending_for_except(
+    vbr_controller_instance_id instance,
+    vbr_operation_id allowed_reserved_operation);
 // F4.0 retirement is narrower than service routing: a legacy wildcard record is serviceable
 // by any controller, but it is not owned by every controller.
 bool vbr_recovery_owned_by(vbr_controller_instance_id instance);

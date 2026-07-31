@@ -88,11 +88,12 @@ if (NOT evaluator_markers EQUAL 1)
     message(FATAL_ERROR "the sole VBR generation eligibility authority marker is missing")
 endif()
 
-# C2: three separately counted narrow authority regions — (a) §5.5 classifier, (b) capture
-# helpers, (c) evaluator. The raw-comparison ban re-runs over ALL text outside the three
+# C2/F4: four separately counted narrow authority regions — (a) §5.5 classifier, (b) capture
+# helpers, (c) evaluator, and (d) validator-authenticated off-side import construction. The
+# raw-comparison ban re-runs over ALL text outside the four
 # regions, so tracker mutation code between them cannot silently grow record-comparison logic.
 set(generation_outside "${generation_source}")
-foreach(region CLASSIFIER CAPTURE EVALUATOR)
+foreach(region CLASSIFIER CAPTURE EVALUATOR IMPORT)
     set(begin_marker "VBR_GENERATION_${region}_REGION_BEGIN")
     set(end_marker   "VBR_GENERATION_${region}_REGION_END")
     count_literal("${generation_outside}" "${begin_marker}" begin_count)
@@ -204,7 +205,7 @@ foreach(path IN LISTS a2_scan_files)
     endif()
     # Recovery capabilities are registry-minted only.
     string(FIND "${text}" "vbr_recovery_mint" found)
-    if (NOT found EQUAL -1 AND NOT path MATCHES "llama-vbr-operation\.(cpp|h)$|llama-kv-cache\.cpp$")
+    if (NOT found EQUAL -1 AND NOT path MATCHES "llama-vbr-operation\.(cpp|h)$|llama-kv-cache\.cpp$|llama-vbr-artifact-adopt\.cpp$")
         message(FATAL_ERROR "recovery capability minted outside the registry trust domain: ${path}")
     endif()
 endforeach()

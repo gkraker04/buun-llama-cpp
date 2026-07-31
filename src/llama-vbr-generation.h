@@ -8,7 +8,30 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <vector>
+
+struct vbr_artifact_stream_placement;
+struct vbr_tracker_install_child;
+struct vbr_generation_stream_state;
+
+class vbr_tracker_import_image {
+  public:
+    vbr_tracker_import_image();
+    ~vbr_tracker_import_image();
+    vbr_tracker_import_image(vbr_tracker_import_image &&) noexcept;
+    vbr_tracker_import_image & operator=(vbr_tracker_import_image &&) noexcept;
+    vbr_tracker_import_image(const vbr_tracker_import_image &) = delete;
+    vbr_tracker_import_image & operator=(const vbr_tracker_import_image &) = delete;
+
+    bool ready() const noexcept;
+    bool stable() const noexcept;
+
+  private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+    friend class vbr_generation_tracker;
+};
 
 struct vbr_unit_generation {
     uint64_t            repr_gen         = 0;
@@ -27,6 +50,18 @@ enum class vbr_generation_stamp_kind : uint8_t {
 };
 
 class vbr_generation_tracker;
+
+enum class vbr_generation_teardown_state : uint8_t {
+    clean,
+    active_event,
+    operation_live,
+    recovery_owned,
+    instance_owner_mismatch,
+    _count,
+};
+
+const char * vbr_generation_teardown_state_name(
+    vbr_generation_teardown_state state) noexcept;
 
 // P1v2 (v6): per-target lazy extent supplier. The tracker calls back into the owning mutation
 // scope at each destructive stamp with the SELECTED manifest-target index; the scope reserves
@@ -125,6 +160,10 @@ class vbr_generation_tracker {
     uint32_t cell_count() const;
     uint32_t unit_count() const;
     bool     stable() const;
+    // The destructor remains the enforcing boundary.  This read-only view lets
+    // transaction terminals and tests prove the same predicate before a
+    // successfully imported controller is handed back to decode.
+    vbr_generation_teardown_state teardown_state() const noexcept;
 
     vbr_lineage_uuid            lineage_identity() const;
     vbr_controller_instance_id  runtime_instance() const;
@@ -186,6 +225,21 @@ class vbr_generation_tracker {
                       vbr_mutation_registrant registrant,
                       vbr_operation_id        operation_id = {});
 
+    // F4 import is built completely off-side. Preparation may allocate; the
+    // final swap is allocation-free and preserves this tracker's enrolled
+    // process-local runtime instance.
+    bool prepare_import_image(
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        llama_seq_id destination,
+        const std::vector<vbr_artifact_stream_placement> & placements,
+        vbr_tracker_import_image & output) noexcept;
+    bool import_image_installable(
+        const vbr_tracker_import_image & image,
+        vbr_operation_id operation_id) const noexcept;
+    void install_import_image_swap(
+        vbr_tracker_import_image & image) noexcept;
+
     // Read-only accessors are intentionally value-returning. Callers may capture them, but CI
     // forbids comparison of raw stamp fields outside checkpoint_vbr_eligibility().
     uint32_t            page_generation(uint32_t stream, uint32_t page) const;
@@ -200,7 +254,6 @@ class vbr_generation_tracker {
 
   private:
     friend struct vbr_generation_event;
-    struct stream_state;
     bool reset_page_generations_before_wrap();
     bool reset_unit_generations_before_wrap();
     bool finish_event(uint64_t serial);
@@ -222,7 +275,7 @@ class vbr_generation_tracker {
     static constexpr uint32_t             MAX_EVENT_DEPTH     = 64;
     std::array<uint64_t, MAX_EVENT_DEPTH> active_event_stack_ = {};
     uint32_t                              n_cells_            = 0;
-    std::vector<stream_state>             streams_;
+    std::vector<vbr_generation_stream_state> streams_;
     std::vector<vbr_unit_generation>      units_;
 };
 

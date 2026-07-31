@@ -786,7 +786,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 case vbr_artifact_clean_stash_state::absent_at_source:
                     stash_action =
                         vbr_validated_stash_action::none_at_source;
-                    needs_live_rebase = true;
+                    // A full-domain F16/raw unit has no clean-stash by
+                    // construction; that honest absence is capture-exact.
+                    // A tapped unit without its source-present clean prefix
+                    // cannot preserve native generations and must rebase.
+                    if (source_domain != vbr_repr_domain::full) {
+                        needs_live_rebase = true;
+                    }
                     break;
                 case vbr_artifact_clean_stash_state::omitted_source_present:
                     stash_action =
@@ -1098,6 +1104,10 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->accounting_leaves_ = std::move(leaves);
         proof->tracker_install_ = std::move(tracker);
         proof->adoption_nonce_ = policy.adoption_nonce;
+        proof->recheck_context_ = policy.context;
+        proof->recheck_target_empty_ = policy.recheck_target_empty;
+        proof->read_accounting_serial_ = policy.read_accounting_serial;
+        proof->read_policy_epoch_ = policy.read_policy_epoch;
 
         vbr_manifest_validation_result result;
         result.status = vbr_manifest_validation_status::validated;

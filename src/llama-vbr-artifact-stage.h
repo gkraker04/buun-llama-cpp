@@ -147,6 +147,8 @@ struct vbr_adopt_stage_policy {
 };
 
 struct vbr_adopt_stage_result;
+struct vbr_adopt_result;
+struct vbr_composite_publish_hooks;
 
 class vbr_staged_payloads {
 public:
@@ -169,6 +171,10 @@ public:
     bool claims_ready() const noexcept;
 
 private:
+    llama_cache_transaction_result adoption_materialize_claims() noexcept;
+    vbr_h2d_chunk_ring * adoption_ring() noexcept;
+    const std::vector<llama_cache_acct_op_id> &
+        adoption_committed_ops() const noexcept;
     struct impl;
     explicit vbr_staged_payloads(std::unique_ptr<impl> state) noexcept;
     std::unique_ptr<impl> impl_;
@@ -177,6 +183,11 @@ private:
     friend vbr_adopt_stage_result vbr_stage_validated_manifest(
         std::unique_ptr<vbr_validated_manifest>,
         const vbr_adopt_stage_policy &) noexcept;
+    friend vbr_adopt_result vbr_adopt_empty_manifest(
+        llama_memory_i &, llama_seq_id,
+        vbr_validated_manifest &&, vbr_staged_payloads &&,
+        llama_cache_acct_ledger &,
+        const vbr_composite_publish_hooks &) noexcept;
 };
 
 struct vbr_adopt_stage_result {

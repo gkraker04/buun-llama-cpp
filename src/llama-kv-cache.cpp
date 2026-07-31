@@ -1584,6 +1584,9 @@ llama_kv_cache::~llama_kv_cache() {
             p.vmm = nullptr;
         }
     }
+    // TQ2: retire the imported-live accounting receipt only after the mapped
+    // target ranges are no longer live. Never create a release-first window.
+    vbr_import_receipts_release();
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1634,6 +1637,13 @@ void llama_kv_cache::clear(bool data) {
     if (vbr_ownership_) {
         vbr_ownership_->clear_all();
     }
+    // The target is now logically empty (and, for data clears, byte-cleared),
+    // so its conservative import receipt can finally be released.
+    vbr_import_receipts_release();
+}
+
+void llama_kv_cache::vbr_import_receipts_release() noexcept {
+    vbr_import_receipt_.reset();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

@@ -188,6 +188,14 @@ bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation
 bool vbr_operation_registry_quiescent_for(
         const vbr_controller_instance_id * instances,
         size_t n_instances) noexcept {
+    return vbr_operation_registry_quiescent_for_except(
+        instances, n_instances, {});
+}
+
+bool vbr_operation_registry_quiescent_for_except(
+        const vbr_controller_instance_id * instances,
+        size_t n_instances,
+        vbr_operation_id allowed) noexcept {
     if (instances == nullptr || n_instances == 0) {
         return false;
     }
@@ -202,6 +210,9 @@ bool vbr_operation_registry_quiescent_for(
         }
         const auto & binding = g_vbr_live_bindings[slot];
         GGML_ASSERT(binding.operation_id.value == live);
+        if (allowed && binding.operation_id == allowed) {
+            continue;
+        }
         for (uint8_t i = 0; i < binding.n_targets; ++i) {
             const auto & target = binding.targets[i];
             for (size_t p = 0; p < n_instances; ++p) {
@@ -506,9 +517,15 @@ bool vbr_recovery_untake_quarantine(vbr_quarantine_token token,
 
 static bool ring_has_nonfree(
         vbr_controller_instance_id instance,
-        bool count_wildcard_owner) {
+        bool count_wildcard_owner,
+        vbr_operation_id allowed_reserved_operation = {}) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     for (const auto & record : g_vbr_recovery_ring) {
+        if (allowed_reserved_operation &&
+            record.state == vbr_recovery_state::reserved &&
+            record.binding.operation_id == allowed_reserved_operation) {
+            continue;
+        }
         if (record.state != vbr_recovery_state::free_slot &&
             (record.owner_instance == instance ||
              (count_wildcard_owner &&
@@ -524,6 +541,17 @@ bool vbr_recovery_pending_for(vbr_controller_instance_id instance) {
     // capability_minted (recovery mid-execution) block re-arm exactly like recorded and
     // awaiting_ack; every non-free state is unresolved recovery work serviceable here.
     return ring_has_nonfree(instance, /*count_wildcard_owner=*/true);
+}
+
+bool vbr_recovery_pending_for_except(
+        vbr_controller_instance_id instance,
+        vbr_operation_id allowed_reserved_operation) {
+    if (!allowed_reserved_operation) {
+        return true;
+    }
+    return ring_has_nonfree(
+        instance, /*count_wildcard_owner=*/true,
+        allowed_reserved_operation);
 }
 
 bool vbr_recovery_owned_by(vbr_controller_instance_id instance) {

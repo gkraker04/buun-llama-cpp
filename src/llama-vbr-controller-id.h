@@ -58,6 +58,12 @@ bool vbr_controller_instance_check_and_claim(
 bool vbr_controller_instance_release(
     vbr_controller_instance_id instance,
     const void * owner) noexcept;
+// Allocation-free exact-owner probe used by the F4 import barrier. It never
+// claims or refreshes an instance and therefore cannot turn stale evidence
+// into a live routing identity.
+bool vbr_controller_instance_owned_by(
+    vbr_controller_instance_id instance,
+    const void * owner) noexcept;
 
 // Internal test seams. Reconfiguration is accepted only while the live-controller registry is
 // empty, so a test cannot rewrite identity under a live tracker.
@@ -66,4 +72,3 @@ bool vbr_lineage_origin_provider_set_for_tests(
 bool vbr_controller_instance_registry_capacity_set_for_tests(
     size_t capacity) noexcept;
 size_t vbr_controller_instance_registry_capacity() noexcept;
-

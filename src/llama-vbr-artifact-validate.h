@@ -189,6 +189,9 @@ struct vbr_target_validation_snapshot {
 };
 
 struct vbr_target_empty_fingerprint;
+class vbr_staged_payloads;
+struct vbr_adopt_result;
+struct vbr_composite_publish_hooks;
 
 struct vbr_adopt_policy {
     using inspect_target_fn = bool (*)(
@@ -386,6 +389,10 @@ private:
     std::vector<llama_cache_transaction_leaf> accounting_leaves_;
     vbr_tracker_install_plan tracker_install_;
     uint64_t adoption_nonce_ = 0;
+    const void * recheck_context_ = nullptr;
+    vbr_adopt_policy::target_recheck_fn recheck_target_empty_ = nullptr;
+    vbr_adopt_policy::serial_fn read_accounting_serial_ = nullptr;
+    vbr_adopt_policy::serial_fn read_policy_epoch_ = nullptr;
 
     friend struct vbr_manifest_validation_result;
     friend vbr_manifest_validation_result vbr_validate_unit_manifest(
@@ -396,6 +403,11 @@ private:
         const vbr_target_validation_snapshot &,
         const vbr_artifact_package_view &,
         const vbr_adopt_policy &) noexcept;
+    friend vbr_adopt_result vbr_adopt_empty_manifest(
+        llama_memory_i &, llama_seq_id,
+        vbr_validated_manifest &&, vbr_staged_payloads &&,
+        llama_cache_acct_ledger &,
+        const vbr_composite_publish_hooks &) noexcept;
 };
 
 struct vbr_manifest_validation_result {

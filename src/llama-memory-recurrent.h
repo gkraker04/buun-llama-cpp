@@ -8,6 +8,8 @@
 #include <set>
 #include <vector>
 
+class vbr_recurrent_prepared_image;
+
 //
 // llama_memory_recurrent
 //
@@ -130,6 +132,7 @@ public:
     std::vector<ggml_tensor *> s_l;
 
 private:
+    friend class vbr_recurrent_prepared_image;
     //const llama_model & model;
     const llama_hparams & hparams;
 

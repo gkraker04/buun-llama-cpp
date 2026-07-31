@@ -1,0 +1,2488 @@
+#include "llama-vbr-artifact-adopt.h"
+
+#include "common.h"
+#include "llama-kv-cache.h"
+#include "llama-vbr-generation.h"
+#include "llama-vbr-operation.h"
+#include "llama-memory-tree.h"
+#include "llama-vbr-artifact-catalog.h"
+#include "llama-vbr-explicit-capture.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <array>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+static int failures = 0;
+
+#define CHECK(cond) \
+    do { \
+        if (!(cond)) { \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", \
+                         __FILE__, __LINE__, #cond); \
+            ++failures; \
+        } \
+    } while (0)
+
+// Friend-only harness view. It never mutates a cache; it projects the fresh
+// target's actual tensor/pool/runtime identities into the validator's opaque
+// snapshot and checks the post-adopt metadata against the captured manifest.
+struct llama_kv_cache_vbr_epoch_test {
+    static bool empty(const llama_kv_cache * cache) noexcept {
+        return cache && cache->other == nullptr &&
+               std::all_of(cache->v_cells.begin(), cache->v_cells.end(),
+                   [](const llama_kv_cells & cells) {
+                       return cells.get_used() == 0;
+                   }) &&
+               std::all_of(cache->vbr_pools_.begin(), cache->vbr_pools_.end(),
+                   [](const llama_kv_cache::vbr_pool & pool) {
+                       return pool.wm_cells == 0;
+                   });
+    }
+
+    static bool fill_target_child(
+            const llama_memory_tree_child & tree_child,
+            const vbr_artifact_package_view & package,
+            const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+            bool previously_observed,
+            uint64_t policy_epoch,
+            vbr_target_child_snapshot & output) noexcept {
+        auto * cache = tree_child.attention;
+        if (!cache || !cache->vbr_operation_armed()) {
+            return false;
+        }
+        const auto * tracker = cache->vbr_generation_tracker_get();
+        if (!tracker || !tracker->active() || !tracker->stable()) {
+            return false;
+        }
+        llama_kv_cache::vbr_capture_stability_token live_policy;
+        if (!cache->vbr_capture_policy_snapshot(live_policy) ||
+            tree_child.child_id >= package.manifest().controller_policy.size()) {
+            return false;
+        }
+        const auto & source_policy =
+            package.manifest().controller_policy[tree_child.child_id];
+        // Cursor/watermark/current-type digest are imported state. The
+        // pressure-independent policy identity must already match.
+        if (live_policy.degrade_order_digest != source_policy.degrade_order_digest ||
+            live_policy.floor_type != source_policy.floor_type ||
+            live_policy.pressure_independent_settings !=
+                source_policy.pressure_independent_settings ||
+            cache->n_stream != source_policy.n_stream ||
+            (cache->n_stream == 1) != source_policy.unified) {
+            return false;
+        }
+
+        output = {};
+        output.child_id = tree_child.child_id;
+        output.dependency_mode = tree_child.dependency_mode;
+        output.memory_cookie = cache;
+        output.empty = empty(cache);
+        output.dedicated = cache->other == nullptr;
+        output.armed = true;
+        output.previously_observed = previously_observed;
+        output.lineage_uuid = tracker->lineage_identity();
+        output.instance_id = tracker->runtime_instance();
+        output.state_serial = cache->vbr_representation_epoch_;
+        output.policy_epoch = policy_epoch;
+        output.controller_policy = source_policy;
+
+        for (const auto & source_unit : package.units()) {
+            const auto & descriptor = source_unit.descriptor;
+            if (descriptor.child_id != tree_child.child_id) {
+                continue;
+            }
+            const size_t ikv = descriptor.logical_unit_id/2;
+            const bool is_v = (descriptor.logical_unit_id & 1u) != 0;
+            if (ikv >= cache->layers.size()) {
+                return false;
+            }
+            const auto & extents = cache->vbr_units_of(ikv, is_v);
+            ggml_tensor * tensor = is_v
+                ? cache->layers[ikv].v : cache->layers[ikv].k;
+            if (!tensor || int32_t(tensor->type) != descriptor.current_type ||
+                extents.size() != descriptor.shards.size()) {
+                return false;
+            }
+            vbr_target_unit_snapshot target;
+            target.child_id = descriptor.child_id;
+            target.logical_unit_id = descriptor.logical_unit_id;
+            target.current_type = descriptor.current_type;
+            target.last_source_type = descriptor.last_source_type;
+            target.promote_hops = descriptor.promote_hops;
+            target.last_transition = descriptor.last_transition;
+            target.representation_kind = descriptor.representation.kind;
+            target.codec_id = descriptor.representation.codec_id;
+            target.codec_version = descriptor.representation.codec_version;
+            target.representation_reference_digest =
+                descriptor.representation.reference_digest;
+            target.source_loss_history =
+                descriptor.representation.source_loss_history;
+            target.checkpoint_codec_hops =
+                descriptor.representation.checkpoint_codec_hops;
+            target.recoverability = descriptor.recoverability;
+            target.side = descriptor.side;
+            target.layout = descriptor.layout;
+            target.row_codec_version = descriptor.row_codec_version;
+            target.current_domain =
+                tracker->unit_generation(descriptor.logical_unit_id).domain;
+            target.codebook_digest = descriptor.codebook_digest;
+            target.rotation_digest = descriptor.rotation_digest;
+            target.meansub_digest = descriptor.meansub_digest;
+            target.n_stream = descriptor.n_stream;
+            target.unified = descriptor.unified;
+            target.wm_cells = descriptor.wm_cells;
+            target.rank = descriptor.rank;
+            target.dimensions = descriptor.dimensions;
+            target.row_alignment = descriptor.row_alignment;
+            for (size_t i = 0; i < extents.size(); ++i) {
+                const auto & source = descriptor.shards[i];
+                const auto binding = std::find_if(
+                    bindings.begin(), bindings.end(),
+                    [&](const llama_vbr_artifact_domain_binding & value) {
+                        return value.topology_index == source.topology_index &&
+                               value.device_ordinal == source.device_ordinal;
+                    });
+                if (binding == bindings.end() || !extents[i].first ||
+                    !extents[i].second || !extents[i].second->t) {
+                    return false;
+                }
+                target.shards.push_back({
+                    uint32_t(i), extents[i].first, binding->domain,
+                    source.topology_index, source.device_ordinal,
+                    package.topologies()[source.topology_index].digest,
+                    source.logical_offset, source.row_count,
+                    uint64_t(ggml_row_size(
+                        extents[i].second->t->type,
+                        extents[i].second->t->ne[0])),
+                    uint64_t(ggml_nbytes(extents[i].second->t)),
+                });
+            }
+            output.units.push_back(std::move(target));
+        }
+        return !output.units.empty();
+    }
+
+    static bool adopted_matches(
+            const llama_kv_cache * cache,
+            const vbr_artifact_package_view & package,
+            const vbr_artifact_reference_manifest & manifest,
+            llama_seq_id destination) noexcept {
+        if (!cache || !cache->vbr_generation_tracker_get() ||
+            !cache->vbr_generation_tracker_get()->stable()) {
+            return false;
+        }
+        const auto controller = std::find_if(
+            manifest.generation.controllers.begin(),
+            manifest.generation.controllers.end(),
+            [](const vbr_checkpoint_generation_controller & value) {
+                return value.child_id == 0;
+            });
+        if (controller == manifest.generation.controllers.end() ||
+            cache->vbr_generation_tracker_get()->lineage_identity() !=
+                controller->lineage_uuid) {
+            return false;
+        }
+        for (const auto & placement : manifest.stream_placements) {
+            if (placement.child_id != 0 ||
+                placement.stream_index >= cache->v_cells.size()) {
+                continue;
+            }
+            const auto & cells = cache->v_cells[placement.stream_index];
+            std::vector<uint32_t> owned;
+            if (!cache->vbr_ownership_ ||
+                !cache->vbr_ownership_->enumerate_owned(
+                    placement.stream_index, destination, owned)) {
+                return false;
+            }
+            std::vector<uint32_t> expected_owned;
+            for (const auto & cell : placement.cells) {
+                if (cell.physical_cell >= cells.size() ||
+                    cells.pos_get(cell.physical_cell) != cell.logical_position ||
+                    !cells.seq_has(cell.physical_cell, destination) ||
+                    cells.ext_get(cell.physical_cell).x != cell.ext_x ||
+                    cells.ext_get(cell.physical_cell).y != cell.ext_y) {
+                    return false;
+                }
+                expected_owned.push_back(cell.physical_cell);
+            }
+            std::sort(expected_owned.begin(), expected_owned.end());
+            if (owned != expected_owned) {
+                return false;
+            }
+        }
+        for (const auto & unit : package.units()) {
+            const auto & descriptor = unit.descriptor;
+            const size_t ikv = descriptor.logical_unit_id/2;
+            const bool is_v = (descriptor.logical_unit_id & 1u) != 0;
+            if (ikv >= cache->layers.size()) {
+                return false;
+            }
+            const auto * tensor = is_v ? cache->layers[ikv].v : cache->layers[ikv].k;
+            if (!tensor || tensor->type != descriptor.current_type) {
+                return false;
+            }
+            const auto generation = cache->vbr_generation_tracker_get()->
+                unit_generation(descriptor.logical_unit_id);
+            const auto source_controller = std::find_if(
+                manifest.generation.controllers.begin(),
+                manifest.generation.controllers.end(),
+                [&](const vbr_checkpoint_generation_controller & value) {
+                    return value.child_id == descriptor.child_id;
+                });
+            if (source_controller == manifest.generation.controllers.end() ||
+                descriptor.logical_unit_id >= source_controller->units.size() ||
+                generation.domain !=
+                    source_controller->units[descriptor.logical_unit_id].domain ||
+                generation.current_type != descriptor.current_type) {
+                return false;
+            }
+        }
+        for (const auto & policy : manifest.controller_policy) {
+            if (policy.child_id == 0 &&
+                (cache->vbr_degrade_cursor_ != policy.cursor ||
+                 std::any_of(cache->vbr_pools_.begin(), cache->vbr_pools_.end(),
+                    [&](const llama_kv_cache::vbr_pool & pool) {
+                        return pool.wm_cells != policy.wm_cells;
+                    }))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool tracker_identity(
+            const llama_kv_cache * cache,
+            vbr_controller_instance_id & instance,
+            vbr_lineage_uuid & lineage,
+            uint64_t & generation,
+            vbr_repr_transition & unit_transition) noexcept {
+        const auto * tracker = cache ? cache->vbr_generation_tracker_get() : nullptr;
+        if (!tracker || !tracker->stable() || tracker->unit_count() == 0) {
+            return false;
+        }
+        instance = tracker->runtime_instance();
+        lineage = tracker->lineage_identity();
+        generation = tracker->controller_generation();
+        unit_transition = tracker->unit_generation(0).last_transition;
+        return true;
+    }
+
+    static vbr_generation_teardown_state tracker_teardown_state(
+            const llama_kv_cache * cache) noexcept {
+        const auto * tracker = cache ? cache->vbr_generation_tracker_get() : nullptr;
+        return tracker ? tracker->teardown_state()
+                       : vbr_generation_teardown_state::instance_owner_mismatch;
+    }
+};
+
+struct f42a_harness_target {
+    llama_memory_i * memory = nullptr;
+    llama_cache_acct_ledger * ledger = nullptr;
+    uint64_t policy_epoch = 1;
+
+    static uint64_t accounting_serial(const void * context) noexcept {
+        const auto * self = static_cast<const f42a_harness_target *>(context);
+        return self && self->ledger ? self->ledger->snapshot().serial : 0;
+    }
+    static uint64_t policy_serial(const void * context) noexcept {
+        const auto * self = static_cast<const f42a_harness_target *>(context);
+        return self ? self->policy_epoch : 0;
+    }
+    static bool recheck(
+            const void * context,
+            const vbr_target_empty_fingerprint & expected) noexcept {
+        const auto * self = static_cast<const f42a_harness_target *>(context);
+        if (!self || !self->memory || !self->ledger ||
+            expected.memory_instance_cookie !=
+                uint64_t(reinterpret_cast<uintptr_t>(self->memory)) ||
+            expected.accounting_serial != self->ledger->snapshot().serial ||
+            expected.policy_epoch != self->policy_epoch) {
+            return false;
+        }
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(self->memory, tree)) {
+            return false;
+        }
+        size_t attention = 0;
+        for (const auto & child : tree) {
+            if (!child.attention) {
+                continue;
+            }
+            ++attention;
+            const auto item = std::find_if(
+                expected.children.begin(), expected.children.end(),
+                [&](const vbr_child_empty_fingerprint & value) {
+                    return value.child_id == child.child_id;
+                });
+            if (item == expected.children.end() ||
+                item->memory_cookie != child.attention ||
+                !llama_kv_cache_vbr_epoch_test::empty(child.attention)) {
+                return false;
+            }
+        }
+        return attention == expected.children.size();
+    }
+};
+
+static bool f42a_owner_token(
+        const void * context,
+        const void * token,
+        const llama_memory_i * target) noexcept {
+    return context != nullptr && token == context && target == context;
+}
+
+static bool f42a_decode(
+        llama_context * context,
+        const std::vector<llama_token> & tokens,
+        llama_pos first_position) {
+    if (!context || tokens.empty()) {
+        return false;
+    }
+    llama_batch batch = llama_batch_init(int32_t(tokens.size()), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i],
+                         first_position+llama_pos(i), { 0 },
+                         i+1 == tokens.size());
+    }
+    const bool ok = llama_decode(context, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static bool f42a_initialize_accounting(
+        llama_cache_acct_ledger & ledger,
+        const std::vector<llama_cache_acct_resource_domain> & domains) {
+    std::vector<llama_cache_acct_completeness_requirement> required;
+    for (const auto & domain : domains) {
+        required.push_back({
+            domain,
+            domain.residency == llama_cache_acct_residency::device
+                ? llama_cache_acct_producer::live_memory
+                : llama_cache_acct_producer::retention_sidecar,
+        });
+    }
+    if (!ledger.configure_required_producers(
+            required.data(), required.size())) {
+        return false;
+    }
+    for (const auto & domain : domains) {
+        for (uint8_t raw = 0;
+             raw < uint8_t(llama_cache_acct_category::_count); ++raw) {
+            const auto category = llama_cache_acct_category(raw);
+            for (const auto measure : {
+                    llama_cache_acct_measure::logical_payload,
+                    llama_cache_acct_measure::resident_allocated,
+                    llama_cache_acct_measure::reserved }) {
+                ledger.gauge_set(category, domain, measure, 0);
+            }
+        }
+        const auto producer =
+            domain.residency == llama_cache_acct_residency::device
+                ? llama_cache_acct_producer::live_memory
+                : llama_cache_acct_producer::retention_sidecar;
+        if (!ledger.certify_complete(domain, producer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static llama_cache_budget_config f42a_budget(
+        ggml_backend_dev_t device,
+        const llama_cache_acct_resource_domain & domain) {
+    llama_cache_budget_config budget;
+    llama_cache_budget_device_input input;
+    input.backend_device = device;
+    input.domain = domain;
+    input.physical_total = 1ull << 40;
+    input.physical_free = 1ull << 40;
+    input.phys_state = llama_cache_budget_capacity_state::known;
+    input.current_compute_allocated = 0;
+    input.configured_compute_reserve = 0;
+    input.compute_state = llama_cache_budget_capacity_state::known;
+    input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
+    budget.devices.push_back(input);
+    budget.host.pageable_state = llama_cache_budget_capacity_state::unbounded;
+    budget.host.pinned_state = llama_cache_budget_capacity_state::unbounded;
+    budget.host.total_state = llama_cache_budget_capacity_state::unbounded;
+    return budget;
+}
+
+static bool f42a_target_snapshot(
+        llama_memory_i & memory,
+        const vbr_artifact_package_view & package,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        bool previously_observed,
+        uint64_t accounting_serial,
+        uint64_t policy_epoch,
+        vbr_target_validation_snapshot & output) {
+    output = {};
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(&memory, tree)) {
+        return false;
+    }
+    output.memory_instance_cookie =
+        uint64_t(reinterpret_cast<uintptr_t>(&memory));
+    output.accounting_serial = accounting_serial;
+    output.policy_epoch = policy_epoch;
+    output.scheduler_idle = true;
+    output.destination_sequence_absent = true;
+    output.tree_shape_digest = UINT64_C(0xf42a000000000001) ^ tree.size();
+    output.target_state_serial = 1;
+    for (const auto & child : tree) {
+        if (child.recurrent) {
+            // The retained 27B gate is attention-only. Complete-tree recurrent
+            // adoption is covered by the CPU barrier and provider tests.
+            return false;
+        }
+        if (!child.attention) {
+            continue;
+        }
+        vbr_target_child_snapshot snapshot;
+        if (!llama_kv_cache_vbr_epoch_test::fill_target_child(
+                child, package, bindings, previously_observed,
+                policy_epoch, snapshot)) {
+            return false;
+        }
+        output.target_state_serial += snapshot.state_serial;
+        output.children.push_back(std::move(snapshot));
+    }
+    return !output.children.empty() &&
+           output.children.size() ==
+               package.manifest().generation.controllers.size();
+}
+
+static vbr_checkpoint_generation_controller source_controller(
+        vbr_lineage_uuid lineage) {
+    vbr_checkpoint_generation_controller source;
+    source.child_id = 0;
+    source.dependency_mode =
+        checkpoint_child_dependency_mode::payload_complete;
+    source.lineage_uuid = lineage;
+    source.global_generation = 9;
+    source.units.push_back({
+        17, GGML_TYPE_F16, GGML_TYPE_F16,
+        vbr_repr_domain::full, 0, vbr_repr_transition::initial,
+    });
+    vbr_checkpoint_generation_stream stream;
+    stream.stream_index = 0;
+    stream.dependency_seq_id = 0;
+    stream.computation_frontier = 11;
+    stream.captured_dependency_count = 1;
+    vbr_generation_page_ref page;
+    page.page_index = 0;
+    page.captured_page_gen = 23;
+    page.covered_mask[0] = uint64_t(1) << 5;
+    stream.pages.push_back(page);
+    source.streams.push_back(stream);
+    return source;
+}
+
+static vbr_artifact_stream_placement one_cell_placement() {
+    vbr_artifact_stream_placement placement;
+    placement.child_id = 0;
+    placement.stream_index = 0;
+    placement.source_sequence = 0;
+    placement.cells.push_back({ 5, 10, 1, 1 });
+    return placement;
+}
+
+static vbr_operation_binding import_binding(
+        vbr_controller_instance_id instance) {
+    vbr_operation_binding binding;
+    binding.kind = vbr_operation_kind::state_import;
+    binding.child_phase = vbr_operation_phase::mutate;
+    CHECK(vbr_binding_add_instance_target(
+        binding, vbr_operation_kind::state_import,
+        vbr_operation_class::state_api, instance, VBR_STREAM_ANY,
+        1, 0, std::numeric_limits<llama_pos>::max()));
+    return binding;
+}
+
+static void install_and_check(
+        vbr_generation_tracker & target,
+        const vbr_tracker_install_child & plan,
+        const vbr_checkpoint_generation_controller & source,
+        bool native) {
+    const auto runtime = target.runtime_instance();
+    const auto target_lineage = target.lineage_identity();
+    vbr_tracker_import_image image;
+    CHECK(target.prepare_import_image(
+        plan, source, 1, { one_cell_placement() }, image));
+    CHECK(image.ready());
+    CHECK(image.stable());
+
+    auto binding = import_binding(runtime);
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    CHECK(target.import_image_installable(image, operation.id()));
+    target.install_import_image_swap(image);
+    CHECK(!image.ready());
+    CHECK(target.runtime_instance() == runtime);
+    CHECK(vbr_controller_instance_owned_by(runtime, &target));
+    CHECK(target.stable());
+    CHECK(target.controller_generation() == plan.global_generation);
+    CHECK(target.lineage_identity() ==
+          (native ? source.lineage_uuid : target_lineage));
+    CHECK(target.page_generation(0, 0) == (native ? 23u : 1u));
+    CHECK(target.dependency_generation(0, 5) ==
+          (native ? 23u : 1u));
+    CHECK(target.membership_generation(0, 5) ==
+          (native ? 23u : 1u));
+    CHECK(target.last_membership_seq(0, 5) == 1);
+    const uint16_t import_provenance =
+        uint16_t(vbr_mutation_family::import) |
+        (uint16_t(vbr_operation_class::state_api) << 8);
+    CHECK(target.dependency_provenance(0, 5) == import_provenance);
+    CHECK(target.membership_provenance(0, 5) == import_provenance);
+    const auto dep = target.dependency_extent(0, 5);
+    const auto mem = target.membership_extent(0, 5);
+    const auto * dep_extent = target.extent_store().lookup_committed(dep);
+    const auto * mem_extent = target.extent_store().lookup_committed(mem);
+    CHECK(dep_extent != nullptr);
+    CHECK(mem_extent != nullptr);
+    if (dep_extent) {
+        CHECK(dep_extent->family == vbr_mutation_family::import);
+        CHECK(dep_extent->operation_class == vbr_operation_class::state_api);
+        CHECK(dep_extent->stream == 0);
+        CHECK(dep_extent->seq_id == 1);
+        CHECK(dep_extent->p0 == 0);
+        CHECK(dep_extent->p1 == 11);
+    }
+    if (mem_extent) {
+        CHECK(mem_extent->family == vbr_mutation_family::import);
+        CHECK(mem_extent->operation_class == vbr_operation_class::state_api);
+        CHECK(mem_extent->stream == 0);
+        CHECK(mem_extent->seq_id == 1);
+        CHECK(mem_extent->p0 == 0);
+        CHECK(mem_extent->p1 == 11);
+    }
+    CHECK(target.unit_generation(0).repr_gen == plan.units[0].repr_gen);
+    CHECK(target.unit_generation(0).last_transition ==
+          plan.units[0].last_transition);
+    operation.close(vbr_operation_outcome::committed);
+}
+
+static void test_native_tracker_image_preserves_lineage_and_runtime() {
+    const vbr_lineage_uuid source_lineage { 0x1234, 0x5678 };
+    const auto source = source_controller(source_lineage);
+    vbr_generation_tracker target(1, 256, 1,
+                                  vbr_lineage_uuid { 0xa1, 0xb2 });
+    CHECK(target.active());
+    CHECK(target.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full));
+
+    vbr_tracker_install_child plan;
+    plan.child_id = 0;
+    plan.transition = vbr_tracker_install_transition::native_clone;
+    plan.lineage_uuid = source_lineage;
+    plan.target_instance = target.runtime_instance();
+    plan.global_generation = source.global_generation;
+    plan.units = source.units;
+    install_and_check(target, plan, source, true);
+}
+
+static void test_real_tracker_import_settle_and_teardown() {
+    const auto source = source_controller(
+        vbr_lineage_uuid { 0x1234, 0x5678 });
+    auto target = std::make_unique<vbr_generation_tracker>(
+        1, 256, 1, vbr_lineage_uuid { 0xa3, 0xb4 });
+    CHECK(target->active());
+    CHECK(target->initialize_unit(
+        0, GGML_TYPE_F16, vbr_repr_domain::full));
+
+    vbr_tracker_install_child plan;
+    plan.child_id = 0;
+    plan.transition = vbr_tracker_install_transition::native_clone;
+    plan.lineage_uuid = source.lineage_uuid;
+    plan.target_instance = target->runtime_instance();
+    plan.global_generation = source.global_generation;
+    plan.units = source.units;
+
+    vbr_tracker_import_image image;
+    CHECK(target->prepare_import_image(
+        plan, source, 1, { one_cell_placement() }, image));
+    auto binding = import_binding(target->runtime_instance());
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    const int32_t recovery = vbr_recovery_reserve(
+        operation.id(), target->runtime_instance());
+    CHECK(recovery >= 0);
+    CHECK(target->import_image_installable(image, operation.id()));
+    target->install_import_image_swap(image);
+    CHECK(target->stable());
+    CHECK(vbr_recovery_release_unused(recovery, operation.id()));
+    CHECK(operation.close(vbr_operation_outcome::committed));
+
+    // Model the first post-import append under a normal decode operation.  Its
+    // event must settle mutation parity before the imported tracker dies.
+    vbr_operation_binding decode;
+    decode.kind = vbr_operation_kind::decode;
+    decode.child_phase = vbr_operation_phase::mutate;
+    CHECK(vbr_binding_add_instance_target(
+        decode, vbr_operation_kind::decode,
+        vbr_operation_class::ordinary_decode,
+        target->runtime_instance(), 0, 1, 11,
+        std::numeric_limits<llama_pos>::max()));
+    vbr_scoped_operation decode_operation(decode);
+    CHECK(bool(decode_operation));
+    const int32_t decode_recovery = vbr_recovery_reserve(
+        decode_operation.id(), target->runtime_instance());
+    CHECK(decode_recovery >= 0);
+    {
+        auto event = target->begin_event(
+            vbr_mutation_registrant::apply_ubatch_append,
+            vbr_operation_class::ordinary_decode, 0,
+            vbr_generation_stamp_kind::dependency,
+            decode_operation.id());
+        CHECK(bool(event));
+        CHECK(target->stamp_cell(event, 6, 1, 11));
+    }
+    CHECK(target->stable());
+    vbr_operation_binding live_decode;
+    CHECK(vbr_operation_registry_binding(
+        decode_operation.id(), live_decode));
+    CHECK(live_decode.kind == vbr_operation_kind::decode);
+    CHECK(live_decode.n_targets == 1);
+    CHECK(live_decode.targets[0].operation_class ==
+          vbr_operation_class::ordinary_decode);
+    CHECK(live_decode.targets[0].instance_id ==
+          target->runtime_instance());
+    CHECK(target->teardown_state() ==
+          vbr_generation_teardown_state::operation_live);
+    CHECK(vbr_recovery_release_unused(
+        decode_recovery, decode_operation.id()));
+    CHECK(decode_operation.close(vbr_operation_outcome::committed));
+    CHECK(target->teardown_state() ==
+          vbr_generation_teardown_state::clean);
+    target.reset();
+}
+
+static void test_live_rebased_tracker_image_is_fresh() {
+    const auto source = source_controller(vbr_lineage_uuid { 0x1234, 0x5678 });
+    const vbr_lineage_uuid target_lineage { 0xc1, 0xd2 };
+    vbr_generation_tracker target(1, 256, 1, target_lineage);
+    CHECK(target.active());
+    CHECK(target.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full));
+
+    vbr_tracker_install_child plan;
+    plan.child_id = 0;
+    plan.transition = vbr_tracker_install_transition::whole_import;
+    plan.lineage_uuid = target_lineage;
+    plan.target_instance = target.runtime_instance();
+    plan.global_generation = 1;
+    plan.units.push_back({
+        1, GGML_TYPE_F16, GGML_TYPE_F16,
+        vbr_repr_domain::full, 0, vbr_repr_transition::whole_import,
+    });
+    install_and_check(target, plan, source, false);
+}
+
+static void test_native_tracker_rejects_uncovered_cell_and_tuple_splice() {
+    const vbr_lineage_uuid source_lineage { 0x1234, 0x5678 };
+    const auto source = source_controller(source_lineage);
+    vbr_generation_tracker target(1, 256, 1,
+                                  vbr_lineage_uuid { 0x91, 0x92 });
+    CHECK(target.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full));
+    vbr_tracker_install_child plan;
+    plan.child_id = 0;
+    plan.transition = vbr_tracker_install_transition::native_clone;
+    plan.lineage_uuid = source_lineage;
+    plan.target_instance = target.runtime_instance();
+    plan.global_generation = source.global_generation;
+    plan.units = source.units;
+
+    auto foreign = one_cell_placement();
+    foreign.cells[0].physical_cell = 6;
+    vbr_tracker_import_image image;
+    CHECK(!target.prepare_import_image(plan, source, 1, { foreign }, image));
+    CHECK(!image.ready());
+    CHECK(target.extent_store().live_entries() == 0);
+
+    plan.global_generation++;
+    CHECK(!target.prepare_import_image(
+        plan, source, 1, { one_cell_placement() }, image));
+    CHECK(!image.ready());
+    CHECK(target.extent_store().live_entries() == 0);
+}
+
+static void test_closed_vocabularies() {
+    for (uint8_t i = 0; i < uint8_t(vbr_adopt_phase::_count); ++i) {
+        CHECK(std::string(vbr_adopt_phase_name(vbr_adopt_phase(i))) !=
+              "invalid");
+    }
+    for (uint8_t i = 0; i < uint8_t(vbr_adopt_status::_count); ++i) {
+        CHECK(std::string(vbr_adopt_status_name(vbr_adopt_status(i))) !=
+              "invalid");
+    }
+    CHECK(std::string(vbr_adopt_phase_name(vbr_adopt_phase::_count)) ==
+          "invalid");
+    CHECK(std::string(vbr_adopt_status_name(vbr_adopt_status::_count)) ==
+          "invalid");
+}
+
+static bool fake_target_empty(const void * context) noexcept {
+    return context && *static_cast<const bool *>(context);
+}
+
+static void test_complete_tree_barrier_fail_closed() {
+    auto * attention0 = reinterpret_cast<llama_kv_cache *>(uintptr_t(0x1010));
+    auto * attention1 = reinterpret_cast<llama_kv_cache *>(uintptr_t(0x2020));
+    auto * recurrent = reinterpret_cast<llama_memory_recurrent *>(uintptr_t(0x3030));
+    const std::vector<vbr_adopt_expected_attention> expected = {
+        { 0, attention0 }, { 1, attention1 },
+    };
+    std::vector<llama_memory_tree_child> live = {
+        { 0, attention0, nullptr,
+          checkpoint_child_dependency_mode::payload_complete },
+    };
+    CHECK(vbr_adopt_check_complete_tree(expected, live, {}) ==
+          vbr_adopt_status::target_drift);
+
+    live.push_back({ 1, attention1, recurrent,
+                     checkpoint_child_dependency_mode::payload_complete });
+    CHECK(vbr_adopt_check_complete_tree(expected, live, {}) ==
+          vbr_adopt_status::required_companion_unavailable);
+
+    bool empty = false;
+    vbr_companion_adoption_provider provider;
+    provider.kind = vbr_artifact_companion_kind::recurrent;
+    provider.target_cookie = recurrent;
+    provider.context = &empty;
+    provider.target_empty = fake_target_empty;
+    CHECK(vbr_adopt_check_complete_tree(expected, live, { provider }) ==
+          vbr_adopt_status::target_drift);
+
+    empty = true;
+    CHECK(vbr_adopt_check_complete_tree(expected, live, { provider }) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider, provider }) ==
+          vbr_adopt_status::required_companion_unavailable);
+}
+
+namespace g2 {
+
+struct byte_source {
+    std::vector<uint8_t> bytes;
+
+    static bool read(const void * context, uint64_t offset,
+                     uint8_t * out, size_t size) noexcept {
+        const auto * self = static_cast<const byte_source *>(context);
+        if (!self || offset > self->bytes.size() ||
+            size > self->bytes.size()-size_t(offset)) {
+            return false;
+        }
+        std::memcpy(out, self->bytes.data()+offset, size);
+        return true;
+    }
+
+    vbr_artifact_byte_source source() const noexcept {
+        return { bytes.size(), this, read };
+    }
+};
+
+static std::array<uint8_t, 32> marker(uint8_t value) {
+    std::array<uint8_t, 32> out;
+    out.fill(value);
+    return out;
+}
+
+static vbr_generation_page_ref page(uint64_t mask) {
+    vbr_generation_page_ref out;
+    out.page_index = 0;
+    out.captured_page_gen = 7;
+    out.covered_mask[0] = mask;
+    return out;
+}
+
+struct storage {
+    std::array<byte_source, 4> payload {
+        byte_source { { 0x10, 0x11, 0x12, 0x13, 0x14 } },
+        byte_source { { 0x20, 0x21, 0x22, 0x23, 0x24 } },
+        byte_source { { 0x30, 0x31, 0x32, 0x33, 0x34 } },
+        byte_source { { 0x40, 0x41, 0x42, 0x43, 0x44 } },
+    };
+    byte_source companion { { 0x90, 0x91, 0x92 } };
+};
+
+static vbr_artifact_portable_topology topology() {
+    llama_cache_acct_shard_topology out;
+    const std::vector<std::string> devices = {
+        "g2-device-a", "g2-device-b",
+    };
+    const float weights[] = { 0.5f, 0.5f };
+    CHECK(llama_cache_acct_build_shard_topology(
+        devices, LLAMA_SPLIT_MODE_TENSOR, 0, weights, out));
+    return out;
+}
+
+static vbr_artifact_shard_descriptor shard(
+        uint32_t index, const byte_source & source) {
+    vbr_artifact_shard_descriptor out;
+    out.shard_index = index;
+    out.topology_index = 0;
+    out.device_ordinal = uint16_t(index);
+    out.logical_offset = 0;
+    out.row_count = 5;
+    out.column_count = 1;
+    out.row_bytes = 1;
+    out.payload_bytes = 5;
+    out.payload = source.source();
+    return out;
+}
+
+static vbr_artifact_package package(storage & bytes, bool companion) {
+    vbr_artifact_package out;
+    out.topologies.push_back(topology());
+    auto & manifest = out.manifest;
+    manifest.identity_policy_order_digest = marker(0x71);
+    manifest.identity.execution_identity = "g2:exec";
+    manifest.identity.adapter_config_identity = "g2:adapter";
+    manifest.identity.media_content_identity = "g2:media";
+    manifest.identity.sequence_epoch = 1;
+    manifest.identity.token_count = 5;
+    manifest.identity.next_position = 5;
+    manifest.token_block.tokens = { 1, 2, 3, 4, 5 };
+    manifest.generation.version = 1;
+    manifest.generation.status = vbr_checkpoint_generation_status::complete;
+    manifest.generation.identity_policy_order_digest =
+        manifest.identity_policy_order_digest;
+    manifest.consistency.kind =
+        vbr_artifact_consistency_kind::capture_exact;
+
+    for (uint32_t child_id = 0; child_id < 2; ++child_id) {
+        vbr_artifact_unit_blob blob;
+        auto & descriptor = blob.descriptor;
+        descriptor.child_id = child_id;
+        descriptor.logical_unit_id = 0;
+        descriptor.lineage_uuid = {
+            UINT64_C(0x1010101010101010)+child_id,
+            UINT64_C(0x2020202020202020)+child_id,
+        };
+        descriptor.repr_gen = 17+child_id;
+        descriptor.current_type = GGML_TYPE_TURBO8_0;
+        descriptor.last_source_type = GGML_TYPE_TURBO8_0;
+        descriptor.last_transition = vbr_repr_transition::initial;
+        descriptor.representation.kind =
+            vbr_artifact_representation_kind::approximate;
+        descriptor.representation.codec_id = 0x5438;
+        descriptor.representation.codec_version = 1;
+        descriptor.representation.reference_digest = marker(0x50+child_id);
+        descriptor.side = vbr_artifact_side::key;
+        descriptor.n_stream = 1;
+        descriptor.unified = true;
+        descriptor.wm_cells = 5;
+        descriptor.rank = 2;
+        descriptor.dimensions = { 1, 5, 0, 0 };
+        descriptor.row_alignment = 1;
+        descriptor.row_codec_version = 1;
+        descriptor.codebook_digest = marker(0x60+child_id);
+        descriptor.rotation_digest = marker(0x62+child_id);
+        descriptor.meansub_digest = marker(0x64+child_id);
+        descriptor.shards = {
+            shard(0, bytes.payload[child_id*2]),
+            shard(1, bytes.payload[child_id*2+1]),
+        };
+        descriptor.clean_stash_state =
+            vbr_artifact_clean_stash_state::absent_at_source;
+        out.unit_blobs.push_back(blob);
+
+        vbr_checkpoint_generation_controller controller;
+        controller.child_id = child_id;
+        controller.dependency_mode =
+            checkpoint_child_dependency_mode::live_guarded;
+        controller.lineage_uuid = descriptor.lineage_uuid;
+        controller.global_generation = 5+child_id;
+        controller.units.push_back({
+            descriptor.repr_gen, descriptor.current_type,
+            descriptor.last_source_type, vbr_repr_domain::full,
+            descriptor.promote_hops, descriptor.last_transition,
+        });
+        vbr_checkpoint_generation_stream stream;
+        stream.stream_index = 0;
+        stream.dependency_seq_id = llama_seq_id(child_id);
+        stream.computation_frontier = 5;
+        stream.captured_dependency_count = 5;
+        stream.pages.push_back(page(0x1f));
+        controller.streams.push_back(stream);
+        manifest.generation.controllers.push_back(controller);
+
+        vbr_artifact_controller_policy policy;
+        policy.child_id = child_id;
+        policy.dependency_mode = controller.dependency_mode;
+        policy.degrade_order_digest = marker(0x72);
+        policy.policy_digest = marker(0x73);
+        policy.floor_type = GGML_TYPE_TURBO8_0;
+        policy.n_stream = 1;
+        policy.unified = true;
+        policy.wm_cells = 5;
+        policy.current_type_vector_digest = marker(0x74);
+        policy.completed_wave = true;
+        manifest.controller_policy.push_back(policy);
+
+        vbr_artifact_stream_placement placement;
+        placement.child_id = child_id;
+        placement.stream_index = 0;
+        placement.source_sequence = llama_seq_id(child_id);
+        placement.computation_frontier = 5;
+        for (uint32_t cell = 0; cell < 5; ++cell) {
+            placement.cells.push_back({
+                cell, llama_pos(cell), uint16_t(10+cell),
+                uint16_t(20+cell),
+            });
+        }
+        manifest.stream_placements.push_back(placement);
+
+        vbr_artifact_unit_reference reference;
+        reference.lineage_uuid = descriptor.lineage_uuid;
+        reference.logical_unit_id = 0;
+        reference.repr_gen = descriptor.repr_gen;
+        reference.authorized_stream_refs = { 0 };
+        manifest.unit_references.push_back(reference);
+    }
+
+    const vbr_artifact_portable_domain device0 {
+        llama_cache_acct_residency::device,
+        llama_cache_acct_domain_kind::device_topology, 0, 0,
+    };
+    const vbr_artifact_portable_domain device1 {
+        llama_cache_acct_residency::device,
+        llama_cache_acct_domain_kind::device_topology, 0, 1,
+    };
+    const vbr_artifact_portable_domain host {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX, UINT16_MAX,
+    };
+    manifest.accounting = {
+        { vbr_artifact_accounting_role::unit_payload,
+          device0, 10, 10, llama_cache_acct_attr_kind::artifact },
+        { vbr_artifact_accounting_role::unit_payload,
+          device1, 10, 10, llama_cache_acct_attr_kind::artifact },
+        { vbr_artifact_accounting_role::descriptor_metadata,
+          host, 512, 512, llama_cache_acct_attr_kind::artifact },
+        { vbr_artifact_accounting_role::reference_metadata,
+          host, 256, 256, llama_cache_acct_attr_kind::artifact },
+    };
+    if (companion) {
+        vbr_artifact_companion_payload row;
+        row.kind = vbr_artifact_companion_kind::recurrent;
+        row.format_version = 1;
+        row.build_identity_digest = marker(0xa1);
+        row.domain = host;
+        row.payload_bytes = bytes.companion.bytes.size();
+        row.payload = bytes.companion.source();
+        out.companions.push_back(row);
+        manifest.accounting.push_back({
+            vbr_artifact_accounting_role::recurrent_payload,
+            host, row.payload_bytes, row.payload_bytes,
+            llama_cache_acct_attr_kind::artifact,
+        });
+    }
+    return out;
+}
+
+class parsed_companion final : public vbr_parsed_companion_image {
+  public:
+    vbr_artifact_companion_kind kind() const noexcept override {
+        return vbr_artifact_companion_kind::recurrent;
+    }
+    uint32_t format_version() const noexcept override { return 1; }
+};
+
+struct child_state {
+    uint32_t child_id = UINT32_MAX;
+    vbr_controller_instance_id instance;
+    bool armed = false;
+    bool image_ready = false;
+    bool published = false;
+    bool receipts = false;
+    uint32_t mapped = 0;
+    uint32_t unmapped = 0;
+    std::vector<uint32_t> mapped_ranges;
+    std::vector<uint32_t> unmapped_ranges;
+    uint64_t h2d_bytes = 0;
+    std::set<uint32_t> completed_units;
+    std::array<uint8_t, 8> destination = {};
+};
+
+struct recurrent_state {
+    bool empty = true;
+    bool prepared = false;
+    bool published = false;
+    bool fail_prepare = false;
+    bool report_nonempty = false;
+    uint32_t rollbacks = 0;
+};
+
+class fake_memory final : public llama_memory_i {
+  public:
+    llama_memory_context_ptr init_batch(
+        llama_batch_allocr &, uint32_t, bool) override { return {}; }
+    llama_memory_context_ptr init_full() override { return {}; }
+    llama_memory_context_ptr init_update(llama_context *, bool) override {
+        return {};
+    }
+    bool get_can_shift() const override { return false; }
+    void clear(bool) override {}
+    bool seq_rm(llama_seq_id, llama_pos, llama_pos) override { return false; }
+    void seq_cp(llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {}
+    void seq_keep(llama_seq_id) override {}
+    void seq_add(llama_seq_id, llama_pos, llama_pos, llama_pos) override {}
+    void seq_div(llama_seq_id, llama_pos, llama_pos, int) override {}
+    llama_pos seq_pos_min(llama_seq_id) const override { return -1; }
+    llama_pos seq_pos_max(llama_seq_id) const override { return -1; }
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override {
+        return {};
+    }
+    void state_write(llama_io_write_i &, llama_seq_id,
+                     llama_state_seq_flags) const override {}
+    void state_read(llama_io_read_i &, llama_seq_id,
+                    llama_state_seq_flags) override {}
+};
+
+class prepared_companion final : public vbr_prepared_companion_image {};
+
+struct seam final : vbr_adopt_test_seam {
+    fake_memory target;
+    std::array<child_state, 2> children;
+    recurrent_state recurrent;
+    std::vector<llama_memory_tree_child> live;
+    vbr_adopt_phase inject_phase = vbr_adopt_phase::_count;
+    bool inject_after = false;
+    uint32_t fail_map_child = UINT32_MAX;
+    uint32_t fail_map_after = UINT32_MAX;
+    uint32_t fail_transfer_child = UINT32_MAX;
+    uint32_t fail_transfer_shard = UINT32_MAX;
+    bool drift_recurrent_at_barrier = false;
+    bool drop_attention_at_barrier = false;
+    bool add_recurrent_at_barrier = false;
+    bool drift_serial_at_phase3 = false;
+    bool drift_serial_at_phase10 = false;
+    uint64_t * observed_serial = nullptr;
+    bool operation_opened = false;
+    bool recovery_reserved = false;
+    uint32_t events = 0;
+    uint32_t publish_calls = 0;
+    uint32_t map_calls = 0;
+    uint32_t transfer_calls = 0;
+    uint32_t mark_calls = 0;
+
+    seam() {
+        for (uint32_t i = 0; i < children.size(); ++i) {
+            children[i].child_id = i;
+            children[i].instance = { UINT64_C(0x9000)+i,
+                                     UINT64_C(0xa000)+i };
+            live.push_back({
+                i, reinterpret_cast<llama_kv_cache *>(&children[i]), nullptr,
+                checkpoint_child_dependency_mode::live_guarded,
+            });
+        }
+    }
+
+    bool phase_boundary(vbr_adopt_phase phase, bool after) noexcept override {
+        if (!after && phase == vbr_adopt_phase::target_recheck &&
+            drift_serial_at_phase3 && observed_serial) {
+            ++*observed_serial;
+        }
+        if (!after && phase == vbr_adopt_phase::complete_tree_barrier) {
+            if (drift_serial_at_phase10 && observed_serial) {
+                ++*observed_serial;
+            }
+            if (drift_recurrent_at_barrier) {
+                recurrent.report_nonempty = true;
+            }
+            if (drop_attention_at_barrier && live.size() > 1) {
+                live.erase(live.begin()+1);
+            }
+            if (add_recurrent_at_barrier) {
+                live.push_back({
+                    2, nullptr,
+                    reinterpret_cast<llama_memory_recurrent *>(&recurrent),
+                    checkpoint_child_dependency_mode::payload_complete,
+                });
+            }
+        }
+        return phase == inject_phase && after == inject_after;
+    }
+
+    bool collect_tree(llama_memory_i & memory,
+                      std::vector<llama_memory_tree_child> & output) noexcept override {
+        if (&memory != &target) {
+            return false;
+        }
+        output = live;
+        return true;
+    }
+
+    vbr_adopt_status operation_open(
+            const vbr_validated_manifest & manifest, llama_seq_id,
+            const std::vector<llama_memory_tree_child> &,
+            std::vector<vbr_controller_instance_id> & instances,
+            vbr_operation_id & operation) noexcept override {
+        instances.clear();
+        for (const auto & child : manifest.tracker_install().children) {
+            instances.push_back(child.target_instance);
+        }
+        if (instances.empty()) {
+            return vbr_adopt_status::operation_unavailable;
+        }
+        operation = { 0xf42a2001 };
+        operation_opened = true;
+        recovery_reserved = true;
+        return vbr_adopt_status::adopted;
+    }
+
+    void operation_finish(vbr_operation_id, bool, bool) noexcept override {
+        operation_opened = false;
+        recovery_reserved = false;
+    }
+
+    bool operation_quiescent(
+            const std::vector<vbr_controller_instance_id> &,
+            vbr_operation_id) const noexcept override {
+        return operation_opened && recovery_reserved;
+    }
+
+    bool session_recheck(uint32_t child_id,
+            const vbr_child_empty_fingerprint & expected,
+            bool journal_armed) const noexcept override {
+        if (child_id >= children.size()) {
+            return false;
+        }
+        const auto & child = children[child_id];
+        return expected.child_id == child_id &&
+               expected.memory_cookie == &child &&
+               expected.instance_id == child.instance &&
+               child.armed == journal_armed && !child.published &&
+               (journal_armed ||
+                (child.mapped == 0 && child.h2d_bytes == 0));
+    }
+
+    bool session_arm(uint32_t child_id, vbr_operation_id) noexcept override {
+        if (child_id >= children.size() || children[child_id].armed) {
+            return false;
+        }
+        children[child_id].armed = true;
+        return true;
+    }
+
+    bool session_prepare_backing(uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans) noexcept override {
+        if (child_id >= children.size() || plans.empty() ||
+            !children[child_id].armed) {
+            return false;
+        }
+        auto & child = children[child_id];
+        for (uint32_t range = 0; range < 5; ++range) {
+            ++child.mapped;
+            ++map_calls;
+            child.mapped_ranges.push_back(range);
+            if (child_id == fail_map_child &&
+                child.mapped == fail_map_after) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool session_transfer(uint32_t child_id,
+            const vbr_staged_read_descriptor & read,
+            uint64_t fail_completion, vbr_h2d_stats & stats) noexcept override {
+        if (child_id >= children.size() || !read.source ||
+            fail_completion == 0 ||
+            (child_id == fail_transfer_child &&
+             read.shard_index == fail_transfer_shard)) {
+            return false;
+        }
+        std::vector<uint8_t> bytes(size_t(read.size));
+        if (!read.source->read(read.source_offset, bytes.data(), bytes.size())) {
+            return false;
+        }
+        auto & child = children[child_id];
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            child.destination[i % child.destination.size()] ^= bytes[i];
+        }
+        child.h2d_bytes += read.size;
+        ++transfer_calls;
+        stats.bytes = read.size;
+        stats.chunks = 1;
+        ++events;
+        return true;
+    }
+
+    bool session_mark_complete(uint32_t child_id,
+                               uint32_t unit) noexcept override {
+        if (child_id >= children.size() ||
+            !children[child_id].completed_units.insert(unit).second) {
+            return false;
+        }
+        ++mark_calls;
+        return true;
+    }
+
+    bool session_build_live_image(uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans,
+            const vbr_tracker_install_child &,
+            const vbr_checkpoint_generation_controller &) noexcept override {
+        if (child_id >= children.size() || plans.empty() ||
+            children[child_id].completed_units.size() != plans.size()) {
+            return false;
+        }
+        children[child_id].image_ready = true;
+        return true;
+    }
+
+    bool session_prepare_receipts(uint32_t child_id) noexcept override {
+        if (child_id >= children.size()) {
+            return false;
+        }
+        children[child_id].receipts = true;
+        return true;
+    }
+
+    bool session_mapped_prefixes_complete(
+            uint32_t child_id) const noexcept override {
+        return child_id < children.size() && children[child_id].mapped == 5;
+    }
+
+    bool session_barrier(uint32_t child_id, uint64_t serial,
+                         const vbr_validated_manifest &) const noexcept override {
+        return child_id < children.size() && serial != 0 &&
+               children[child_id].armed && children[child_id].image_ready;
+    }
+
+    void session_publish_metadata(uint32_t child_id) noexcept override {
+        auto & child = children[child_id];
+        child.published = true;
+        ++publish_calls;
+    }
+
+    void session_publish_receipts(uint32_t child_id) noexcept override {
+        children[child_id].receipts = true;
+    }
+
+    void session_finish_publish(uint32_t child_id) noexcept override {
+        children[child_id].armed = false;
+    }
+
+    bool session_rollback(uint32_t child_id, bool inject_failure) noexcept override {
+        if (child_id >= children.size()) {
+            return false;
+        }
+        auto & child = children[child_id];
+        child.unmapped += child.mapped;
+        child.unmapped_ranges.insert(
+            child.unmapped_ranges.end(),
+            child.mapped_ranges.rbegin(), child.mapped_ranges.rend());
+        child.mapped = 0;
+        child.mapped_ranges.clear();
+        child.h2d_bytes = 0;
+        child.destination.fill(0);
+        child.completed_units.clear();
+        child.image_ready = false;
+        child.receipts = false;
+        child.armed = false;
+        events = 0;
+        return !inject_failure;
+    }
+
+    bool construction_empty() const noexcept {
+        return !operation_opened && !recovery_reserved && events == 0 &&
+               publish_calls == 0 &&
+               std::all_of(children.begin(), children.end(),
+                   [](const child_state & child) {
+                       return !child.armed && !child.image_ready &&
+                              !child.published && !child.receipts &&
+                              child.mapped == 0 && child.h2d_bytes == 0 &&
+                              child.mapped_ranges.empty() &&
+                              child.completed_units.empty() &&
+                              std::all_of(child.destination.begin(),
+                                  child.destination.end(),
+                                  [](uint8_t value) { return value == 0; });
+                   }) &&
+               recurrent.empty && !recurrent.prepared &&
+               !recurrent.published && !recurrent.report_nonempty;
+    }
+};
+
+struct validation_context {
+    seam * target = nullptr;
+    llama_cache_acct_ledger * ledger = nullptr;
+    uint64_t serial_bias = 0;
+    uint64_t policy_epoch = 0;
+
+    static uint64_t read_accounting(const void * context) noexcept {
+        const auto * self = static_cast<const validation_context *>(context);
+        return self && self->ledger
+            ? self->ledger->snapshot().serial + self->serial_bias
+            : 0;
+    }
+
+    static uint64_t read_policy(const void * context) noexcept {
+        const auto * self = static_cast<const validation_context *>(context);
+        return self ? self->policy_epoch : 0;
+    }
+
+    static bool recheck(const void * context,
+                        const vbr_target_empty_fingerprint & expected) noexcept {
+        const auto * self = static_cast<const validation_context *>(context);
+        if (!self || !self->target ||
+            expected.accounting_serial != read_accounting(context) ||
+            expected.policy_epoch != self->policy_epoch ||
+            expected.memory_instance_cookie !=
+                uint64_t(reinterpret_cast<uintptr_t>(&self->target->target)) ||
+            expected.children.size() != self->target->children.size()) {
+            return false;
+        }
+        for (const auto & child : expected.children) {
+            if (child.child_id >= self->target->children.size()) {
+                return false;
+            }
+            const auto & live = self->target->children[child.child_id];
+            if (child.memory_cookie != &live ||
+                child.instance_id != live.instance || live.published) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool parse_companion(
+            const void *, const vbr_artifact_companion_payload & descriptor,
+            const artifact_segment_chain & source,
+            const vbr_target_companion_snapshot & target,
+            std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
+        if (descriptor.kind != vbr_artifact_companion_kind::recurrent ||
+            descriptor.format_version != 1 || !target.available ||
+            target.kind != descriptor.kind ||
+            target.format_version != descriptor.format_version ||
+            target.build_identity_digest != descriptor.build_identity_digest ||
+            source.size() != descriptor.payload_bytes) {
+            return false;
+        }
+        output = std::make_unique<parsed_companion>();
+        return true;
+    }
+};
+
+static bool owner_token_valid(
+        const void * context, const void * token,
+        const llama_memory_i * target) noexcept {
+    return context && token == context && target == context;
+}
+
+static bool companion_prepare(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> parsed,
+        llama_seq_id,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept {
+    auto * state = const_cast<recurrent_state *>(
+        static_cast<const recurrent_state *>(context));
+    if (!state || !state->empty || state->prepared || state->fail_prepare ||
+        !parsed || parsed->kind() != vbr_artifact_companion_kind::recurrent) {
+        return false;
+    }
+    state->prepared = true;
+    output = std::make_unique<prepared_companion>();
+    return true;
+}
+
+static bool companion_empty(const void * context) noexcept {
+    const auto * state = static_cast<const recurrent_state *>(context);
+    return state && state->empty && !state->published &&
+           !state->report_nonempty;
+}
+
+static void companion_publish(
+        const void * context, vbr_prepared_companion_image &) noexcept {
+    auto * state = const_cast<recurrent_state *>(
+        static_cast<const recurrent_state *>(context));
+    state->prepared = false;
+    state->published = true;
+    state->empty = false;
+}
+
+static void companion_rollback(
+        const void * context, vbr_prepared_companion_image &) noexcept {
+    auto * state = const_cast<recurrent_state *>(
+        static_cast<const recurrent_state *>(context));
+    state->prepared = false;
+    state->report_nonempty = false;
+    ++state->rollbacks;
+}
+
+static vbr_verified_segment segment(
+        uint32_t unit, uint32_t shard_index,
+        const byte_source & bytes) {
+    auto chain = std::make_shared<artifact_segment_chain>();
+    CHECK(chain->append(bytes.bytes.data(), bytes.bytes.size()));
+    vbr_verified_segment out;
+    out.unit_index = unit;
+    out.shard_index = shard_index;
+    out.bytes = std::move(chain);
+    out.streaming_digest = vbr_capture_stream_digest(*out.bytes);
+    return out;
+}
+
+struct fixture {
+    storage bytes;
+    vbr_artifact_package source;
+    llama_cache_acct_ledger ledger;
+    llama_vbr_artifact_catalog catalog;
+    std::vector<llama_vbr_artifact_domain_binding> bindings;
+    llama_cache_budget_config budget;
+    llama_cache_acct_resource_domain host =
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pageable_host);
+    llama_cache_acct_resource_domain pinned =
+        llama_cache_acct_resource_domain::non_device(
+            llama_cache_acct_residency::pinned_host);
+    llama_cache_acct_artifact_id reference;
+    vbr_artifact_package_view view;
+    seam target;
+    validation_context validation;
+    vbr_target_validation_snapshot snapshot;
+    vbr_adopt_policy policy;
+    uint64_t catalog_live_ops = 0;
+    bool with_companion = false;
+
+    explicit fixture(bool companion = false)
+        : source(package(bytes, companion)), catalog(ledger),
+          with_companion(companion) {
+        const auto prepared = vbr_artifact_prepare(source);
+        if (prepared != vbr_artifact_status::ok) {
+            std::fprintf(stderr, "G2 prepare status=%s\n",
+                         vbr_artifact_status_name(prepared));
+        }
+        CHECK(prepared == vbr_artifact_status::ok);
+        CHECK(catalog.bind_topologies(source.topologies, bindings));
+        CHECK(bindings.size() == 2);
+        std::vector<llama_cache_acct_completeness_requirement> required = {
+            { host, llama_cache_acct_producer::retention_sidecar },
+            { pinned, llama_cache_acct_producer::retention_sidecar },
+        };
+        for (const auto & binding : bindings) {
+            required.push_back({
+                binding.domain, llama_cache_acct_producer::live_memory,
+            });
+        }
+        CHECK(ledger.configure_required_producers(
+            required.data(), required.size()));
+        CHECK(catalog.configure_accounting(source));
+        const auto initialize_domain = [&](const auto & domain) {
+            for (uint8_t raw = 0;
+                 raw < uint8_t(llama_cache_acct_category::_count); ++raw) {
+                const auto category = llama_cache_acct_category(raw);
+                const auto classification =
+                    llama_cache_budget_classify(category);
+                if (classification.participation !=
+                        llama_cache_budget_capacity_participation::participating) {
+                    continue;
+                }
+                for (const auto measure : {
+                        llama_cache_acct_measure::logical_payload,
+                        llama_cache_acct_measure::resident_allocated,
+                        llama_cache_acct_measure::reserved }) {
+                    ledger.gauge_set(category, domain, measure, 0);
+                }
+            }
+        };
+        initialize_domain(host);
+        initialize_domain(pinned);
+        for (const auto & binding : bindings) {
+            initialize_domain(binding.domain);
+        }
+        CHECK(ledger.certify_complete(
+            host, llama_cache_acct_producer::retention_sidecar));
+        CHECK(ledger.certify_complete(
+            pinned, llama_cache_acct_producer::retention_sidecar));
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            CHECK(ledger.certify_complete(
+                bindings[i].domain, llama_cache_acct_producer::live_memory));
+            llama_cache_budget_device_input input;
+            input.backend_device = reinterpret_cast<const void *>(i+1);
+            input.domain = bindings[i].domain;
+            input.physical_total = 1ull << 30;
+            input.physical_free = (1ull << 30) - (1ull << 20);
+            input.phys_state = llama_cache_budget_capacity_state::known;
+            input.current_compute_allocated = 0;
+            input.configured_compute_reserve = 0;
+            input.compute_state = llama_cache_budget_capacity_state::known;
+            input.cache_cap_state =
+                llama_cache_budget_capacity_state::unbounded;
+            budget.devices.push_back(input);
+        }
+        budget.host.pageable_state =
+            llama_cache_budget_capacity_state::unbounded;
+        budget.host.pinned_state =
+            llama_cache_budget_capacity_state::unbounded;
+
+        vbr_capture_stream_status stream_status;
+        auto build = catalog.begin_capture(source, budget, {}, stream_status);
+        CHECK(build && stream_status == vbr_capture_stream_status::ok);
+        if (!build) {
+            return;
+        }
+        for (uint32_t unit_index = 0;
+             unit_index < source.unit_blobs.size(); ++unit_index) {
+            auto unit = build->begin_unit(unit_index, stream_status);
+            CHECK(unit && stream_status == vbr_capture_stream_status::ok);
+            if (!unit) {
+                return;
+            }
+            for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
+                const auto verified = segment(
+                    unit_index, shard_index,
+                    bytes.payload[unit_index*2+shard_index]);
+                CHECK(unit->accept_verified_segment(verified) ==
+                      vbr_capture_stream_status::ok);
+            }
+            CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+        }
+        if (companion) {
+            auto chain = std::make_shared<artifact_segment_chain>();
+            CHECK(chain->append(
+                bytes.companion.bytes.data(), bytes.companion.bytes.size()));
+            vbr_verified_companion verified;
+            verified.companion_index = 0;
+            verified.bytes = std::move(chain);
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*verified.bytes);
+            CHECK(build->accept_verified_companion(verified) ==
+                  vbr_capture_stream_status::ok);
+        }
+        const auto published = build->publish_reference();
+        if (published.status != vbr_capture_stream_status::ok) {
+            std::fprintf(stderr, "G2 publish status=%s\n",
+                         vbr_capture_stream_status_name(published.status));
+        }
+        CHECK(published.status == vbr_capture_stream_status::ok);
+        reference = published.reference_artifact;
+        CHECK(reference.v != 0);
+        build.reset();
+        CHECK(catalog.resolve_reference(reference, view) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(view.validate() == vbr_artifact_status::ok);
+        catalog_live_ops = ledger.snapshot().live_ops;
+
+        validation.target = &target;
+        validation.ledger = &ledger;
+        validation.policy_epoch = 91;
+        target.observed_serial = &validation.serial_bias;
+        fill_snapshot();
+        fill_policy();
+    }
+
+    ~fixture() {
+        view.reset();
+        if (reference.v != 0) {
+            CHECK(catalog.retire(reference) ==
+                  vbr_artifact_retire_status::retired);
+        }
+        CHECK(ledger.snapshot().live_ops == 0);
+    }
+
+    void fill_snapshot() {
+        snapshot.memory_instance_cookie =
+            uint64_t(reinterpret_cast<uintptr_t>(&target.target));
+        snapshot.target_state_serial = 31;
+        snapshot.accounting_serial = ledger.snapshot().serial;
+        snapshot.tree_shape_digest = 0x4242;
+        snapshot.policy_epoch = validation.policy_epoch;
+        snapshot.scheduler_idle = true;
+        snapshot.destination_sequence_absent = true;
+        for (uint32_t child_id = 0; child_id < 2; ++child_id) {
+            const auto & descriptor = view.units()[child_id].descriptor;
+            vbr_target_child_snapshot child;
+            child.child_id = child_id;
+            child.dependency_mode =
+                checkpoint_child_dependency_mode::live_guarded;
+            child.memory_cookie = &target.children[child_id];
+            child.empty = true;
+            child.dedicated = true;
+            child.armed = true;
+            child.lineage_uuid = { 0x7000+child_id, 0x8000+child_id };
+            child.instance_id = target.children[child_id].instance;
+            child.state_serial = snapshot.target_state_serial;
+            child.policy_epoch = snapshot.policy_epoch;
+            child.controller_policy =
+                view.manifest().controller_policy[child_id];
+            vbr_target_unit_snapshot unit;
+            unit.child_id = child_id;
+            unit.logical_unit_id = descriptor.logical_unit_id;
+            unit.current_type = descriptor.current_type;
+            unit.last_source_type = descriptor.last_source_type;
+            unit.promote_hops = descriptor.promote_hops;
+            unit.last_transition = descriptor.last_transition;
+            unit.representation_kind = descriptor.representation.kind;
+            unit.codec_id = descriptor.representation.codec_id;
+            unit.codec_version = descriptor.representation.codec_version;
+            unit.representation_reference_digest =
+                descriptor.representation.reference_digest;
+            unit.source_loss_history =
+                descriptor.representation.source_loss_history;
+            unit.checkpoint_codec_hops =
+                descriptor.representation.checkpoint_codec_hops;
+            unit.recoverability = descriptor.recoverability;
+            unit.side = descriptor.side;
+            unit.layout = descriptor.layout;
+            unit.row_codec_version = descriptor.row_codec_version;
+            unit.current_domain =
+                view.manifest().generation.controllers[child_id].units[0].domain;
+            unit.codebook_digest = descriptor.codebook_digest;
+            unit.rotation_digest = descriptor.rotation_digest;
+            unit.meansub_digest = descriptor.meansub_digest;
+            unit.n_stream = descriptor.n_stream;
+            unit.unified = descriptor.unified;
+            unit.wm_cells = descriptor.wm_cells;
+            unit.rank = descriptor.rank;
+            unit.dimensions = descriptor.dimensions;
+            unit.row_alignment = descriptor.row_alignment;
+            for (uint32_t shard_index = 0;
+                 shard_index < descriptor.shards.size(); ++shard_index) {
+                const auto & source_shard = descriptor.shards[shard_index];
+                unit.shards.push_back({
+                    shard_index,
+                    reinterpret_cast<const void *>(uintptr_t(
+                        0x5000+child_id*16+shard_index)),
+                    bindings[source_shard.device_ordinal].domain,
+                    source_shard.topology_index,
+                    source_shard.device_ordinal,
+                    source.topologies[source_shard.topology_index].digest,
+                    source_shard.logical_offset,
+                    source_shard.row_count,
+                    source_shard.row_bytes,
+                    source_shard.payload_bytes,
+                });
+            }
+            child.units.push_back(std::move(unit));
+            snapshot.children.push_back(std::move(child));
+        }
+        if (with_companion) {
+            const auto & descriptor = view.companions()[0].descriptor;
+            snapshot.companions.push_back({
+                descriptor.kind, descriptor.format_version,
+                descriptor.build_identity_digest, true,
+                &target.recurrent,
+            });
+            target.live.push_back({
+                2, nullptr,
+                reinterpret_cast<llama_memory_recurrent *>(&target.recurrent),
+                checkpoint_child_dependency_mode::payload_complete,
+            });
+        }
+    }
+
+    void fill_policy() {
+        policy.authorized = true;
+        policy.identity.execution_identity =
+            view.manifest().identity.execution_identity;
+        policy.identity.adapter_config_identity =
+            view.manifest().identity.adapter_config_identity;
+        policy.identity.media_content_identity =
+            view.manifest().identity.media_content_identity;
+        policy.identity.sequence_epoch =
+            view.manifest().identity.sequence_epoch;
+        policy.identity.requested_frontier =
+            view.manifest().identity.next_position;
+        policy.identity.tokens = view.manifest().token_block.tokens;
+        policy.destination_sequence = 0;
+        policy.domain_bindings = bindings;
+        policy.domain_bindings.push_back({ UINT32_MAX, UINT16_MAX, host });
+        policy.accounting_snapshot = &snapshot_accounting;
+        policy.budget_config = &budget;
+        policy.context = &validation;
+        policy.adoption_nonce = 0xf42a2001;
+        policy.parse_companion = validation_context::parse_companion;
+        policy.recheck_target_empty = validation_context::recheck;
+        policy.read_accounting_serial = validation_context::read_accounting;
+        policy.read_policy_epoch = validation_context::read_policy;
+    }
+
+    llama_cache_acct_snapshot snapshot_accounting;
+
+    void refresh() {
+        snapshot_accounting = ledger.snapshot();
+        snapshot.accounting_serial = snapshot_accounting.serial;
+        policy.accounting_snapshot = &snapshot_accounting;
+    }
+
+    vbr_adopt_stage_result stage(
+            const vbr_adopt_stage_fault & fault = {},
+            const llama_cache_budget_config * budget_override = nullptr) {
+        refresh();
+        auto validated = vbr_validate_unit_manifest_snapshot(
+            snapshot, view, policy);
+        CHECK(validated.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validated.proof);
+        vbr_adopt_stage_policy stage_policy;
+        stage_policy.ledger = &ledger;
+        stage_policy.budget = budget_override ? budget_override : &budget;
+        stage_policy.pinned_domain = pinned;
+        stage_policy.pinned_ring_bytes = 32;
+        stage_policy.chunk_bytes = 8;
+        for (const auto & binding : bindings) {
+            stage_policy.lanes.push_back({
+                binding.domain, nullptr, nullptr, false,
+            });
+        }
+        stage_policy.fault = fault;
+        return vbr_stage_validated_manifest(
+            std::move(validated.proof), stage_policy);
+    }
+
+    vbr_companion_adoption_provider companion_provider() {
+        vbr_companion_adoption_provider out;
+        out.kind = vbr_artifact_companion_kind::recurrent;
+        out.target_cookie = &target.recurrent;
+        out.context = &target.recurrent;
+        out.prepare = companion_prepare;
+        out.target_empty = companion_empty;
+        out.publish_swap = companion_publish;
+        out.rollback = companion_rollback;
+        return out;
+    }
+};
+
+static vbr_adopt_result adopt(
+        fixture & f, vbr_adopt_fault * fault = nullptr,
+        bool install_companion = false) {
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return {};
+    }
+    f.validation.serial_bias = 0;
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    if (fault) {
+        test.fault = *fault;
+    }
+    test.target = &f.target;
+    hooks.test = &test;
+    if (install_companion) {
+        hooks.companions.push_back(f.companion_provider());
+    }
+    return vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+}
+
+static void test_g2_real_driver_smoke() {
+    fixture f;
+    const auto result = adopt(f);
+    if (result.status != vbr_adopt_status::adopted) {
+        std::fprintf(stderr, "G2 adopt status=%s phase=%s accounting=%d\n",
+                     vbr_adopt_status_name(result.status),
+                     vbr_adopt_phase_name(result.phase),
+                     int(result.accounting_status));
+    }
+    CHECK(result.status == vbr_adopt_status::adopted);
+    CHECK(result.phase == vbr_adopt_phase::close);
+    CHECK(result.children == 2);
+    CHECK(result.units == 2);
+    CHECK(f.target.transfer_calls == 4);
+    CHECK(f.target.mark_calls == 2);
+    CHECK(f.target.publish_calls == 2);
+    if (f.ledger.snapshot().live_ops != f.catalog_live_ops) {
+        std::fprintf(stderr, "G2 live_ops=%llu baseline=%llu\n",
+                     (unsigned long long) f.ledger.snapshot().live_ops,
+                     (unsigned long long) f.catalog_live_ops);
+    }
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+}
+
+static void check_failed_transaction(
+        fixture & f, const vbr_adopt_result & result) {
+    CHECK(result.status != vbr_adopt_status::adopted);
+    CHECK(f.target.construction_empty());
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    CHECK(f.view.validate() == vbr_artifact_status::ok);
+}
+
+static void test_g2_phase_fault_matrix() {
+    // Phases 1-11 are fallible on both sides of their work. Phase 12 has only
+    // the pre-boundary seam; phase 12 publication through phase 13 close is
+    // the deliberately seam-free no-fail region.
+    for (uint8_t raw = uint8_t(vbr_adopt_phase::consume_capabilities);
+         raw <= uint8_t(vbr_adopt_phase::tracker_prepare); ++raw) {
+        for (const bool after : { false, true }) {
+            fixture f;
+            f.target.inject_phase = vbr_adopt_phase(raw);
+            f.target.inject_after = after;
+            const auto result = adopt(f);
+            check_failed_transaction(f, result);
+            if (raw < uint8_t(vbr_adopt_phase::private_backing) ||
+                (raw == uint8_t(vbr_adopt_phase::private_backing) &&
+                 !after)) {
+                CHECK(f.target.map_calls == 0);
+            }
+            if (raw < uint8_t(vbr_adopt_phase::unit_h2d) ||
+                (raw == uint8_t(vbr_adopt_phase::unit_h2d) && !after)) {
+                CHECK(f.target.transfer_calls == 0);
+            }
+        }
+    }
+    {
+        fixture f;
+        f.target.inject_phase = vbr_adopt_phase::composite_publish;
+        const auto result = adopt(f);
+        check_failed_transaction(f, result);
+    }
+
+    // There is intentionally no post-publication or pre-close injection
+    // point: attempts to arm those non-boundaries are inert and must commit.
+    for (const auto & attempt : {
+            std::make_pair(vbr_adopt_phase::composite_publish, true),
+            std::make_pair(vbr_adopt_phase::close, false),
+            std::make_pair(vbr_adopt_phase::close, true) }) {
+        fixture f;
+        f.target.inject_phase = attempt.first;
+        f.target.inject_after = attempt.second;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.phase == vbr_adopt_phase::close);
+        CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    }
+}
+
+static void test_g2_shard_child_and_partial_map_matrix() {
+    for (uint32_t child = 0; child < 2; ++child) {
+        for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
+            fixture f;
+            f.target.fail_transfer_child = child;
+            f.target.fail_transfer_shard = shard_index;
+            const auto result = adopt(f);
+            CHECK(result.status == vbr_adopt_status::transfer_failed);
+            CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+            CHECK(result.units == 0);
+            CHECK(f.target.mark_calls == 0);
+            CHECK(f.target.publish_calls == 0);
+            check_failed_transaction(f, result);
+        }
+    }
+    {
+        fixture f;
+        f.target.fail_map_child = 0;
+        f.target.fail_map_after = 3;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::private_backing_failed);
+        CHECK(f.target.map_calls == 3);
+        CHECK(f.target.children[0].unmapped == 3);
+        CHECK(f.target.children[0].unmapped_ranges ==
+              std::vector<uint32_t>({ 2, 1, 0 }));
+        CHECK(f.target.children[1].mapped == 0);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        vbr_adopt_fault fault;
+        fault.fail_h2d_completion = 0;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.h2d_bytes == 0);
+        CHECK(f.target.transfer_calls == 0);
+        check_failed_transaction(f, result);
+    }
+}
+
+static void test_g2_complete_tree_barrier_matrix() {
+    {
+        fixture f;
+        f.target.drop_attention_at_barrier = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        f.target.add_recurrent_at_barrier = true;
+        const auto result = adopt(f);
+        CHECK(result.status ==
+              vbr_adopt_status::required_companion_unavailable);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(true);
+        f.target.drift_recurrent_at_barrier = true;
+        const auto result = adopt(f, nullptr, true);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        CHECK(f.target.recurrent.rollbacks == 1);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(true);
+        f.target.recurrent.fail_prepare = true;
+        const auto result = adopt(f, nullptr, true);
+        CHECK(result.status == vbr_adopt_status::companion_failed);
+        CHECK(result.phase == vbr_adopt_phase::stash_and_companions);
+        // Both attention children reached private backing/H2D first, then
+        // the recurrent failure rolled both journals back to empty.
+        CHECK(f.target.children[0].unmapped == 5);
+        CHECK(f.target.children[1].unmapped == 5);
+        CHECK(f.target.transfer_calls == 4);
+        CHECK(f.target.mark_calls == 2);
+        check_failed_transaction(f, result);
+    }
+}
+
+static void test_g2_serial_and_admission_faults() {
+    {
+        fixture f;
+        f.target.drift_serial_at_phase3 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::target_recheck);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        f.target.drift_serial_at_phase10 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::barrier_failed);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        vbr_adopt_stage_fault fault;
+        fault.fail_before_prepare = true;
+        auto staged = f.stage(fault);
+        CHECK(staged.status == vbr_adopt_stage_status::internal_error);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+    {
+        fixture f;
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        auto refused = f.budget;
+        for (auto & device : refused.devices) {
+            device.configured_cache_cap = 0;
+            device.cache_cap_state =
+                llama_cache_budget_capacity_state::known;
+        }
+        auto staged = f.stage({}, &refused);
+        CHECK(staged.status == vbr_adopt_stage_status::admission_refused);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+}
+
+} // namespace g2
+
+static void test_cuda_h2d_adapter() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t device = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * candidate = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(candidate) ==
+                GGML_BACKEND_DEVICE_TYPE_GPU) {
+            device = candidate;
+            break;
+        }
+    }
+    CHECK(device != nullptr);
+    if (!device) {
+        return;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    CHECK(backend != nullptr);
+    if (!backend) {
+        return;
+    }
+    constexpr size_t n = 3*1024*1024 + 29;
+    std::vector<uint8_t> expected(n);
+    for (size_t i = 0; i < n; ++i) {
+        expected[i] = uint8_t((i*41 + 7) & 0xff);
+    }
+    auto chain = std::make_shared<artifact_segment_chain>();
+    CHECK(chain->append(expected.data(), expected.size()));
+    ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * context = ggml_init(params);
+    CHECK(context != nullptr);
+    ggml_tensor * tensor = context
+        ? ggml_new_tensor_1d(context, GGML_TYPE_I8, n) : nullptr;
+    ggml_backend_buffer_t buffer = tensor
+        ? ggml_backend_alloc_ctx_tensors(context, backend) : nullptr;
+    CHECK(tensor != nullptr && buffer != nullptr);
+    if (tensor && buffer) {
+        vbr_h2d_status ring_status;
+        vbr_h2d_lane_binding lane;
+        lane.device = device;
+        lane.backend = backend;
+        auto ring = vbr_h2d_chunk_ring::create(
+            { lane }, 2*1024*1024,
+            1024*1024, ring_status);
+        CHECK(ring != nullptr);
+        CHECK(ring_status == vbr_h2d_status::ok);
+        if (ring) {
+            vbr_h2d_transfer transfer;
+            transfer.lane = 0;
+            transfer.source = chain->source();
+            transfer.size = chain->size();
+            transfer.backend = backend;
+            transfer.device = device;
+            transfer.destination = tensor;
+            vbr_h2d_stats stats;
+            CHECK(ring->stream(transfer, stats) == vbr_h2d_status::ok);
+            CHECK(stats.bytes == n);
+            CHECK(stats.chunks >= 4);
+            ggml_backend_synchronize(backend);
+            std::vector<uint8_t> actual(n);
+            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+            CHECK(actual == expected);
+        }
+    }
+    if (buffer) {
+        ggml_backend_buffer_free(buffer);
+    }
+    if (context) {
+        ggml_free(context);
+    }
+    ggml_backend_free(backend);
+}
+
+static bool f42a_model_backed_adoption(const char * model_path) {
+    ggml_backend_load_all();
+    setenv("VBR_FORCE_GENERIC", "1", 1);
+    setenv("VBR_PROMOTE", "0", 1);
+    setenv("VBR_STASH_ROWS", "0", 1);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = 99;
+    llama_model_ptr model(llama_model_load_from_file(model_path, model_params));
+    CHECK(model != nullptr);
+    if (!model) {
+        return false;
+    }
+
+    llama_context_params context_params = llama_context_default_params();
+    context_params.n_ctx = 256;
+    context_params.n_batch = 64;
+    context_params.n_ubatch = 64;
+    context_params.n_seq_max = 1;
+    context_params.n_threads = 2;
+    context_params.n_threads_batch = 2;
+    context_params.type_k = GGML_TYPE_F16;
+    context_params.type_v = GGML_TYPE_F16;
+    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    context_params.vbr_dynamic = true;
+    context_params.vbr_budget_explicit = true;
+    context_params.vbr_vram_budget_bytes = 4ull*1024*1024*1024;
+
+    auto make_context = [&]() {
+        return llama_context_ptr(llama_init_from_model(model.get(), context_params));
+    };
+    auto source = make_context();
+    CHECK(source != nullptr);
+    if (!source) {
+        return false;
+    }
+    auto tokens = common_tokenize(
+        source.get(), "Atomic artifact restore parity fixture.", true, false);
+    if (tokens.size() < 4) {
+        return false;
+    }
+    if (tokens.size() > 32) {
+        tokens.resize(32);
+    }
+    CHECK(f42a_decode(source.get(), tokens, 0));
+    if (failures) {
+        return false;
+    }
+
+    llama_memory_i * source_memory = llama_get_memory(source.get());
+    std::vector<vbr_explicit_capture_runtime_pool> source_pools;
+    uint32_t source_children = 0;
+    CHECK(source_memory && vbr_explicit_capture_runtime_pools(
+        *source_memory, source_pools, source_children));
+    CHECK(source_children == 1 && !source_pools.empty());
+    if (!source_memory || source_children != 1 || source_pools.empty()) {
+        return false;
+    }
+    ggml_backend_dev_t device = source_pools.front().backend_device;
+    ggml_backend_t source_backend = source_pools.front().backend;
+    if (!source_backend) {
+        return false;
+    }
+
+    vbr_artifact_portable_topology topology;
+    const std::vector<std::string> identities = {
+        std::string(ggml_backend_dev_name(device)) + "\n" +
+        ggml_backend_dev_description(device),
+    };
+    const float split[] = { 1.0f };
+    CHECK(llama_cache_acct_build_shard_topology(
+        identities, LLAMA_SPLIT_MODE_LAYER, 0, split, topology));
+
+    llama_cache_acct_ledger ledger;
+    llama_vbr_artifact_catalog catalog(ledger);
+    std::vector<llama_vbr_artifact_domain_binding> bindings;
+    CHECK(catalog.bind_topologies({ topology }, bindings));
+    CHECK(bindings.size() == 1);
+    const auto host = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    const auto pinned = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pinned_host);
+    CHECK(f42a_initialize_accounting(
+        ledger, { bindings[0].domain, host, pinned }));
+    auto budget = f42a_budget(device, bindings[0].domain);
+
+    std::vector<vbr_capture_lane> capture_lanes = {
+        { device, source_backend, false },
+    };
+    vbr_capture_stream_status ring_status;
+    auto capture_ring = vbr_pinned_chunk_ring::create(
+        capture_lanes, 64ull*1024*1024, 8ull*1024*1024,
+        ring_status);
+    CHECK(capture_ring && ring_status == vbr_capture_stream_status::ok);
+    if (!capture_ring) {
+        return false;
+    }
+
+    vbr_explicit_capture_request request;
+    request.sequence = 0;
+    request.identity = {
+        "f42a:model", "f42a:no-adapter", "f42a:text-only",
+        1, int64_t(tokens.size()), llama_pos(tokens.size()),
+    };
+    request.token_block = tokens;
+    request.frontier.execution_identity =
+        request.identity.execution_identity.data();
+    request.frontier.execution_identity_len =
+        request.identity.execution_identity.size();
+    request.frontier.adapter_config_identity =
+        request.identity.adapter_config_identity.data();
+    request.frontier.adapter_config_identity_len =
+        request.identity.adapter_config_identity.size();
+    request.frontier.media_content_identity =
+        request.identity.media_content_identity.data();
+    request.frontier.media_content_identity_len =
+        request.identity.media_content_identity.size();
+    request.frontier.sequence_epoch = request.identity.sequence_epoch;
+    request.frontier.token_count = request.identity.token_count;
+    request.frontier.next_position = request.identity.next_position;
+    request.idle_decode_thread = true;
+    request.ring = capture_ring.get();
+    request.topologies = { topology };
+    for (const auto & pool : source_pools) {
+        request.pool_bindings.push_back({
+            pool.instance_id, pool.device, 0, 0, 0,
+        });
+    }
+    const vbr_explicit_representation_policy representation_policy {
+        "f42a-model-harness", sizeof("f42a-model-harness")-1,
+    };
+    request.representation_context = &representation_policy;
+    request.representation_identity =
+        vbr_explicit_capture_representation_identity;
+
+    vbr_explicit_capture_accounting capture_accounting;
+    capture_accounting.budget = &budget;
+    capture_accounting.context = &catalog;
+    capture_accounting.prepare = [](
+            void * context,
+            const vbr_artifact_package & package) noexcept {
+        return static_cast<llama_vbr_artifact_catalog *>(context)
+            ->prepare_capture_package(package);
+    };
+    const auto captured = vbr_capture_explicit_manifest(
+        *source_memory, request, catalog, capture_accounting);
+    CHECK(captured.status == vbr_explicit_capture_status::ok);
+    CHECK(captured.sink.reference_artifact.v != 0);
+    if (captured.status != vbr_explicit_capture_status::ok ||
+        captured.sink.reference_artifact.v == 0) {
+        std::fprintf(stderr,
+            "capture failed status=%s phase=%s inner=%s\n",
+            vbr_explicit_capture_status_name(captured.status),
+            vbr_explicit_capture_phase_name(captured.phase),
+            vbr_capture_stream_status_name(captured.inner_stream_status));
+        return false;
+    }
+    const auto reference = captured.sink.reference_artifact;
+    vbr_artifact_package_view package;
+    CHECK(catalog.resolve_reference(reference, package) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(package && package.validate() == vbr_artifact_status::ok);
+    const auto source_instance = source_pools.front().instance_id;
+
+    const llama_token continuation = tokens.back();
+    CHECK(f42a_decode(source.get(), { continuation }, llama_pos(tokens.size())));
+    const int32_t vocab_size = llama_vocab_n_tokens(
+        llama_model_get_vocab(model.get()));
+    float * source_logits_ptr = llama_get_logits_ith(source.get(), -1);
+    CHECK(source_logits_ptr != nullptr && vocab_size > 0);
+    if (!source_logits_ptr || vocab_size <= 0) {
+        return false;
+    }
+    std::vector<float> source_logits(
+        source_logits_ptr, source_logits_ptr+vocab_size);
+    // Context destruction is a terminal scheduler boundary.  Keep the retained
+    // hardware harness explicit about the same settle contract used by the
+    // production context destructor, even though logits retrieval also fences.
+    llama_synchronize(source.get());
+    source.reset();
+    capture_ring.reset();
+
+    const auto run_import = [&](bool previously_observed,
+                                vbr_import_decision expected_decision,
+                                vbr_adopt_phase fail_before_phase =
+                                    vbr_adopt_phase::_count) {
+        const uint64_t baseline_live_ops = ledger.snapshot().live_ops;
+        auto target_context = make_context();
+        CHECK(target_context != nullptr);
+        if (!target_context) {
+            return false;
+        }
+        llama_memory_i * target_memory = llama_get_memory(target_context.get());
+        std::vector<vbr_explicit_capture_runtime_pool> target_pools;
+        uint32_t target_children = 0;
+        CHECK(target_memory && vbr_explicit_capture_runtime_pools(
+            *target_memory, target_pools, target_children));
+        if (!target_memory || target_children != 1 || target_pools.empty()) {
+            return false;
+        }
+        CHECK(target_pools.front().instance_id != source_instance);
+
+        const auto accounting_snapshot = ledger.snapshot();
+        vbr_target_validation_snapshot target_snapshot;
+        CHECK(f42a_target_snapshot(
+            *target_memory, package, bindings, previously_observed,
+            accounting_snapshot.serial, 1, target_snapshot));
+        if (target_snapshot.children.empty()) {
+            return false;
+        }
+        const auto target_lineage = target_snapshot.children[0].lineage_uuid;
+        const auto target_instance = target_snapshot.children[0].instance_id;
+
+        f42a_harness_target target_owner {
+            target_memory, &ledger, 1,
+        };
+        vbr_adopt_policy policy;
+        policy.authorized = true;
+        policy.identity = {
+            package.manifest().identity.execution_identity,
+            package.manifest().identity.adapter_config_identity,
+            package.manifest().identity.media_content_identity,
+            package.manifest().identity.sequence_epoch,
+            package.manifest().identity.next_position,
+            package.manifest().token_block.tokens,
+        };
+        policy.destination_sequence = 0;
+        policy.adoption_nonce = previously_observed ? 0xf42a02 : 0xf42a01;
+        policy.domain_bindings = bindings;
+        policy.domain_bindings.push_back({ UINT32_MAX, UINT16_MAX, host });
+        policy.domain_bindings.push_back({ UINT32_MAX, UINT16_MAX, pinned });
+        policy.accounting_snapshot = &accounting_snapshot;
+        policy.budget_config = &budget;
+        policy.context = &target_owner;
+        policy.recheck_target_empty = f42a_harness_target::recheck;
+        policy.read_accounting_serial =
+            f42a_harness_target::accounting_serial;
+        policy.read_policy_epoch = f42a_harness_target::policy_serial;
+
+        auto validated = vbr_validate_unit_manifest_snapshot(
+            target_snapshot, package, policy);
+        CHECK(validated.status == vbr_manifest_validation_status::validated);
+        CHECK(validated.decision == expected_decision);
+        CHECK(validated.proof);
+        if (!validated.proof || validated.decision != expected_decision) {
+            return false;
+        }
+
+        vbr_adopt_stage_policy stage_policy;
+        stage_policy.ledger = &ledger;
+        stage_policy.budget = &budget;
+        stage_policy.pinned_domain = pinned;
+        stage_policy.pinned_ring_bytes = 64ull*1024*1024;
+        stage_policy.chunk_bytes = 8ull*1024*1024;
+        stage_policy.lanes.push_back({
+            bindings[0].domain,
+            target_pools.front().backend_device,
+            target_pools.front().backend,
+            false,
+        });
+        auto staged = vbr_stage_validated_manifest(
+            std::move(validated.proof), stage_policy);
+        CHECK(staged.status == vbr_adopt_stage_status::staged);
+        CHECK(staged.manifest && staged.staged);
+        if (!staged.manifest || !staged.staged) {
+            return false;
+        }
+
+        vbr_composite_publish_hooks hooks;
+        hooks.context = target_memory;
+        hooks.owner_token = target_memory;
+        hooks.validate_owner_token = f42a_owner_token;
+        vbr_adopt_test_control test;
+        test.fault.fail_before = fail_before_phase;
+        hooks.test = fail_before_phase == vbr_adopt_phase::_count
+            ? nullptr : &test;
+        auto adopted = vbr_adopt_empty_manifest(
+            *target_memory, 0, std::move(*staged.manifest),
+            std::move(*staged.staged), ledger, hooks);
+        if (fail_before_phase != vbr_adopt_phase::_count) {
+            CHECK(adopted.status != vbr_adopt_status::adopted);
+            CHECK(llama_kv_cache_vbr_epoch_test::empty(
+                target_snapshot.children[0].memory_cookie
+                    ? static_cast<const llama_kv_cache *>(
+                        target_snapshot.children[0].memory_cookie)
+                    : nullptr));
+            CHECK(!vbr_recovery_pending_for(target_instance));
+            CHECK(vbr_operation_registry_quiescent_for(&target_instance, 1));
+            target_context.reset();
+            CHECK(ledger.snapshot().live_ops == baseline_live_ops);
+            return adopted.status != vbr_adopt_status::adopted;
+        }
+        CHECK(adopted.status == vbr_adopt_status::adopted);
+        CHECK(adopted.decision == expected_decision);
+        if (adopted.status != vbr_adopt_status::adopted) {
+            std::fprintf(stderr, "adopt failed status=%s phase=%s accounting=%s\n",
+                vbr_adopt_status_name(adopted.status),
+                vbr_adopt_phase_name(adopted.phase),
+                llama_cache_transaction_status_name(adopted.accounting_status));
+            return false;
+        }
+
+        std::vector<llama_memory_tree_child> adopted_tree;
+        CHECK(llama_memory_tree_collect(target_memory, adopted_tree));
+        CHECK(adopted_tree.size() == 1 && adopted_tree[0].attention);
+        if (adopted_tree.size() != 1 || !adopted_tree[0].attention) {
+            return false;
+        }
+        auto * adopted_cache = adopted_tree[0].attention;
+        vbr_controller_instance_id adopted_instance;
+        vbr_lineage_uuid adopted_lineage;
+        uint64_t adopted_generation = 0;
+        vbr_repr_transition adopted_transition = vbr_repr_transition::initial;
+        CHECK(llama_kv_cache_vbr_epoch_test::tracker_identity(
+            adopted_cache, adopted_instance, adopted_lineage,
+            adopted_generation, adopted_transition));
+        CHECK(adopted_instance == target_instance);
+        if (expected_decision == vbr_import_decision::native_import) {
+            CHECK(llama_kv_cache_vbr_epoch_test::adopted_matches(
+                adopted_cache, package, package.manifest(), 0));
+        } else {
+            CHECK(adopted_lineage == target_lineage);
+            CHECK(adopted_generation == 1);
+            CHECK(adopted_transition == vbr_repr_transition::whole_import);
+        }
+
+        CHECK(f42a_decode(target_context.get(),
+                          { continuation }, llama_pos(tokens.size())));
+        float * target_logits = llama_get_logits_ith(target_context.get(), -1);
+        CHECK(target_logits != nullptr);
+        if (!target_logits || std::memcmp(
+                source_logits.data(), target_logits,
+                source_logits.size()*sizeof(float)) != 0) {
+            CHECK(false && "capture/adopt continuation logits differ");
+            return false;
+        }
+        CHECK(!vbr_recovery_pending_for(target_instance));
+        llama_synchronize(target_context.get());
+        CHECK(vbr_operation_registry_quiescent_for(&target_instance, 1));
+        CHECK(llama_kv_cache_vbr_epoch_test::tracker_teardown_state(
+                  adopted_cache) == vbr_generation_teardown_state::clean);
+        target_context.reset();
+        return true;
+    };
+
+    // Every fallible boundary from operation-open through the final
+    // pre-publication checkpoint is driven on a real target. A fail-before
+    // at phase N is also the fail-after oracle for phase N-1. Composite
+    // publication and close deliberately have no post-boundary fault seam.
+    for (uint8_t phase = uint8_t(vbr_adopt_phase::operation_open);
+         phase <= uint8_t(vbr_adopt_phase::composite_publish); ++phase) {
+        CHECK(run_import(false, vbr_import_decision::native_import,
+                         vbr_adopt_phase(phase)));
+    }
+    CHECK(run_import(false, vbr_import_decision::native_import));
+    CHECK(run_import(true, vbr_import_decision::live_rebased));
+    package.reset();
+    CHECK(catalog.retire(reference) == vbr_artifact_retire_status::retired);
+    CHECK(ledger.snapshot().live_ops == 0);
+    return failures == 0;
+}
+
+static void test_final_recheck_excludes_only_own_reservation() {
+    vbr_generation_tracker tracker(1, 256, 1,
+                                  vbr_lineage_uuid { 0xe1, 0xf2 });
+    CHECK(tracker.active());
+    auto binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    const int32_t own = vbr_recovery_reserve(
+        operation.id(), tracker.runtime_instance());
+    CHECK(own >= 0);
+    CHECK(vbr_recovery_pending_for(tracker.runtime_instance()));
+    CHECK(!vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+
+    auto second_binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation second(second_binding);
+    CHECK(bool(second));
+    const int32_t foreign = vbr_recovery_reserve(
+        second.id(), tracker.runtime_instance());
+    CHECK(foreign >= 0);
+    CHECK(vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+    CHECK(vbr_recovery_release_unused(foreign, second.id()));
+    second.close(vbr_operation_outcome::aborted);
+    CHECK(!vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+    CHECK(vbr_recovery_release_unused(own, operation.id()));
+    operation.close(vbr_operation_outcome::aborted);
+}
+
+int main(int argc, char ** argv) {
+    test_closed_vocabularies();
+    test_complete_tree_barrier_fail_closed();
+    g2::test_g2_real_driver_smoke();
+    g2::test_g2_phase_fault_matrix();
+    g2::test_g2_shard_child_and_partial_map_matrix();
+    g2::test_g2_complete_tree_barrier_matrix();
+    g2::test_g2_serial_and_admission_faults();
+    test_final_recheck_excludes_only_own_reservation();
+    test_native_tracker_image_preserves_lineage_and_runtime();
+    test_real_tracker_import_settle_and_teardown();
+    test_live_rebased_tracker_image_is_fresh();
+    test_native_tracker_rejects_uncovered_cell_and_tuple_splice();
+    if (argc >= 2 && std::string(argv[1]) == "--f42a-cuda") {
+        if (argc != 3) {
+            std::fprintf(stderr, "usage: %s --f42a-cuda MODEL\n", argv[0]);
+            return 2;
+        }
+        test_cuda_h2d_adapter();
+        if (failures == 0) {
+            f42a_model_backed_adoption(argv[2]);
+        }
+    }
+    if (failures != 0) {
+        std::fprintf(stderr, "%d F4.2a adoption test(s) failed\n", failures);
+        return 1;
+    }
+    std::printf("VBR artifact adoption: PASS\n");
+    return 0;
+}

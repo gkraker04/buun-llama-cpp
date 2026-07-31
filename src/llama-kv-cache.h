@@ -26,6 +26,8 @@ struct llama_model;
 struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
+class vbr_kv_import_session;
+class vbr_import_receipt_group;
 struct vbr_capture_stream_stats;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
@@ -347,6 +349,7 @@ public:
 
 private:
     friend class vbr_live_capture_adapter;
+    friend class vbr_kv_import_session;
     struct vbr_capture_unit_request {
         uint32_t child_id = 0;
         const void * bindings = nullptr;
@@ -528,6 +531,17 @@ private:
     // A2 dual-view ownership index: updated in the SAME registrant transactions that stamp the
     // tracker; capture consumes rank_below for scan-free exact dependency cardinality.
     std::unique_ptr<vbr_ownership_index>    vbr_ownership_;
+    // F4 import receipts keep every committed adoption/staging reference
+    // accounted until reset/retirement. This is the fail-closed side of the
+    // TQ2 handoff: no release-first window can exist before a live producer
+    // gains an explicit serial-bound acknowledgement seam.
+    // One receipt group is shared by every attention child in a composite
+    // import. It releases only after the LAST child resets/retires, so a
+    // sequential tree clear cannot expose an unaccounted still-live sibling.
+    std::shared_ptr<vbr_import_receipt_group> vbr_import_receipt_;
+    bool vbr_import_in_progress_ = false;
+    vbr_operation_id vbr_import_operation_ = {};
+    void vbr_import_receipts_release() noexcept;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
