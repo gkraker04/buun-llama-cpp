@@ -245,8 +245,8 @@ struct iswa_forwarded_op {
     int  exceptions_at_entry_ = std::uncaught_exceptions();
 };
 
-// P5v2 (v6): synchronous wrapper families carry an EXACT-pool manifest — one target per
-// ARMED child, never a pool wildcard through default arguments. Raw public-API ranges
+// P5v2 (v6): synchronous wrapper families carry an exact-instance manifest — one target per
+// ARMED child, never an instance wildcard through default arguments. Raw public-API ranges
 // normalize here so the closed mint range rules see canonical values.
 vbr_operation_binding iswa_edit_binding(const llama_kv_cache * base, const llama_kv_cache * swa,
                                         vbr_operation_kind kind, vbr_operation_class cls,
@@ -255,9 +255,10 @@ vbr_operation_binding iswa_edit_binding(const llama_kv_cache * base, const llama
     vbr_operation_binding binding;
     binding.kind        = kind;
     binding.child_phase = vbr_operation_phase::mutate;
-    for (const vbr_pool_uuid pool : { base->vbr_pool_id(), swa->vbr_pool_id() }) {
-        vbr_binding_add_pool_target(binding, kind, cls, pool.hi, pool.lo,
-                                    VBR_STREAM_ANY, seq_id, p0, p1);
+    for (const vbr_controller_instance_id instance :
+            { base->vbr_instance_id(), swa->vbr_instance_id() }) {
+        vbr_binding_add_instance_target(
+            binding, kind, cls, instance, VBR_STREAM_ANY, seq_id, p0, p1);
     }
     return binding;
 }
@@ -663,10 +664,10 @@ bool llama_kv_cache_iswa_context::apply() {
     // armed child's ubatch scan succeeded; any overflow leaves a zero-target manifest, the
     // registry refuses the mint, and the refusal PROPAGATES to both children — never
     // independent minters (A0 one-id even in refusal).
-    const vbr_pool_uuid base_pool = kv->get_base()->vbr_pool_id();
-    const vbr_pool_uuid swa_pool  = kv->get_swa ()->vbr_pool_id();
-    const bool base_armed = base_pool.hi != 0 || base_pool.lo != 0;
-    const bool swa_armed  = swa_pool.hi  != 0 || swa_pool.lo  != 0;
+    const vbr_controller_instance_id base_instance = kv->get_base()->vbr_instance_id();
+    const vbr_controller_instance_id swa_instance  = kv->get_swa ()->vbr_instance_id();
+    const bool base_armed = vbr_controller_instance_id_is_set(base_instance);
+    const bool swa_armed  = vbr_controller_instance_id_is_set(swa_instance);
     if (!base_armed && !swa_armed) {
         res = res & ctx_base->apply();
         res = res & ctx_swa ->apply();
@@ -678,9 +679,9 @@ bool llama_kv_cache_iswa_context::apply() {
     composite_binding.child_phase = vbr_operation_phase::mutate;
     // A failed scan zeroes the whole manifest (transactional inside the builder).
     (void) ((!base_armed || llama_kv_cache::vbr_decode_targets_from_ubatch(
-                    composite_binding, base_pool.hi, base_pool.lo, false, VBR_STREAM_ANY, cur_ubatch)) &&
+                    composite_binding, base_instance, false, VBR_STREAM_ANY, cur_ubatch)) &&
             (!swa_armed  || llama_kv_cache::vbr_decode_targets_from_ubatch(
-                    composite_binding, swa_pool.hi, swa_pool.lo, true, VBR_STREAM_ANY, cur_ubatch)));
+                    composite_binding, swa_instance, true, VBR_STREAM_ANY, cur_ubatch)));
     iswa_forwarded_op composite(kv->get_base(), kv->get_swa(), composite_binding, /*armed=*/true);
     composite.adopt_composite((base_armed ? 1 : 0) + (swa_armed ? 1 : 0));
 

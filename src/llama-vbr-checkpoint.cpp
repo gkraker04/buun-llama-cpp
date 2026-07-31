@@ -262,8 +262,8 @@ bool build_live_view(
         const auto mode = walk[child_id].live_guarded
                 ? checkpoint_child_dependency_mode::live_guarded
                 : checkpoint_child_dependency_mode::payload_complete;
-        const vbr_pool_uuid pool = armed ? cache->vbr_pool_id() : vbr_pool_uuid{};
-        policy.push_back({ child_id, mode, pool });
+        const vbr_lineage_uuid lineage = armed ? cache->vbr_lineage_id() : vbr_lineage_uuid{};
+        policy.push_back({ child_id, mode, lineage });
 
         vbr_generation_live_controller_view controller;
         if (walk[child_id].live_guarded && armed) {
@@ -393,7 +393,7 @@ void llama_vbr_checkpoint_shadow_capture(
             input.live_guarded = walk[i].live_guarded;
             input.armed        = cache != nullptr && cache->vbr_operation_armed();
             if (input.armed) {
-                input.pool_uuid = cache->vbr_pool_id();
+                input.lineage_uuid = cache->vbr_lineage_id();
             }
             if (input.live_guarded && input.armed) {
                 contexts[i] = {

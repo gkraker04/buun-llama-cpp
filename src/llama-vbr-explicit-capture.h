@@ -138,7 +138,7 @@ vbr_explicit_size_failure vbr_explicit_capture_validate_extent_generation(
 // One runtime pool-to-portable-topology binding. Device ordinals are portable
 // only within the cited topology; lane identifies the F3.1 D2H ring lane.
 struct vbr_explicit_capture_pool_binding {
-    vbr_pool_uuid pool_uuid;
+    vbr_controller_instance_id instance_id;
     int device = -1;
     uint32_t topology_index = UINT32_MAX;
     uint16_t device_ordinal = UINT16_MAX;
@@ -149,7 +149,7 @@ struct vbr_explicit_capture_pool_binding {
 // needed to build the server-owned ring and the portable pool mapping; no KV
 // bytes, masks, or ownership state cross this seam.
 struct vbr_explicit_capture_runtime_pool {
-    vbr_pool_uuid pool_uuid;
+    vbr_controller_instance_id instance_id;
     int device = -1;
     ggml_backend_dev_t backend_device = nullptr;
     ggml_backend_t backend = nullptr;

@@ -1432,6 +1432,8 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_budget_bytes_ > 0) {
                 vbr_generation_ = std::make_unique<vbr_generation_tracker>(
                         n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
+                // F4.0 has no capture/import refusal surface yet. Keep construction fail-closed;
+                // F4.1 will route unavailable durable lineage into its typed refusal path.
                 GGML_ASSERT(vbr_generation_->active());
                 // A2 dual-view ownership index (D-A2-1v2): physical masks for enumeration +
                 // per-active-seq logical-position order statistic for scan-free exact rank.
@@ -2401,10 +2403,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
     // ring slot. Failures without capabilities resolve here too, keeping the ring live.
     if (auto * tracker = vbr_generation_tracker_mut()) {
-        const vbr_pool_uuid pool = tracker->pool_identity();
-        vbr_recovery_advance_recorded(pool.hi, pool.lo);  // B3: recorded failures quarantine
+        const vbr_controller_instance_id instance = tracker->runtime_instance();
+        vbr_recovery_advance_recorded(instance);  // B3: recorded failures quarantine
         for (;;) {
-            auto work = vbr_recovery_take_quarantine(pool.hi, pool.lo);
+            auto work = vbr_recovery_take_quarantine(instance);
             if (!work.token) {
                 break;
             }
@@ -2415,10 +2417,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 // RELEASE the take so the record stays serviceable, and retry next boundary
                 // — never ack unperformed work.
                 tracker->set_shadow_unavailable();
-                GGML_ASSERT(vbr_recovery_untake_quarantine(work.token, pool.hi, pool.lo));
+                GGML_ASSERT(vbr_recovery_untake_quarantine(work.token, instance));
                 break;
             }
-            GGML_ASSERT(vbr_recovery_ack_quarantine(work.token, pool.hi, pool.lo));
+            GGML_ASSERT(vbr_recovery_ack_quarantine(work.token, instance));
         }
         // B7/v4-F3 upgraded by P4v2 (v6): monotone re-arm — the tracker owns the whole
         // availability-creating transition (ring + capacity proof, sanctioned invalidation,
@@ -2734,14 +2736,15 @@ void llama_kv_cache::apply_ubatch(
             wrap_provenance ? vbr_operation_class::swa_wrap : vbr_operation_class::ordinary_decode;
     const uint16_t extent_stream =
             static_cast<uint16_t>(sinfo.n_stream() == 1 ? sinfo.strm[0] : VBR_STREAM_ANY);
-    const vbr_pool_uuid decode_pool = decode_armed ? vbr_pool_id() : vbr_pool_uuid{};
+    const vbr_controller_instance_id decode_instance =
+            decode_armed ? vbr_instance_id() : vbr_controller_instance_id{};
     // v4 review F4: seq/range-bound manifest from the actual ubatch; ceiling overflow yields a
     // zero-target binding, which the registry REFUSES -> fail-closed shadow-unavailable.
     vbr_operation_binding decode_manifest;
     decode_manifest.kind        = vbr_operation_kind::decode;
     decode_manifest.child_phase = vbr_operation_phase::mutate;
     if (decode_armed && !vbr_adopted_operation_ && !vbr_adopted_refused_) {
-        (void) vbr_decode_targets_from_ubatch(decode_manifest, decode_pool.hi, decode_pool.lo,
+        (void) vbr_decode_targets_from_ubatch(decode_manifest, decode_instance,
                                               wrap_provenance, extent_stream, ubatch);
     }
     // v3.1 amendment 1 (fully applied per v4 review F1): EVERY async decode op reserves
@@ -4005,7 +4008,8 @@ bool llama_kv_cache::vbr_capture_policy_snapshot(
     if (tracker == nullptr || !tracker->stable()) {
         return false;
     }
-    output.pool_uuid = tracker->pool_identity();
+    output.lineage_uuid = tracker->lineage_identity();
+    output.instance_id = tracker->runtime_instance();
     output.controller_generation = tracker->controller_generation();
     output.mutation_serial = tracker->mutation_serial();
 
@@ -4218,7 +4222,7 @@ bool llama_kv_cache::vbr_capture_size_pass(
                 const auto binding = std::find_if(
                     bindings.begin(), bindings.end(),
                     [&](const vbr_explicit_capture_pool_binding & candidate) {
-                        return candidate.pool_uuid == stability.pool_uuid &&
+                        return candidate.instance_id == stability.instance_id &&
                                candidate.device == pool->device;
                     });
                 if (binding == bindings.end() ||
@@ -4414,7 +4418,8 @@ bool llama_kv_cache::vbr_capture_stability_matches(
     const auto * tracker = vbr_generation_tracker_get();
     vbr_capture_stability_token policy;
     if (tracker == nullptr || !vbr_capture_policy_snapshot(policy) ||
-        policy.pool_uuid != token.pool_uuid ||
+        policy.lineage_uuid != token.lineage_uuid ||
+        policy.instance_id != token.instance_id ||
         policy.controller_generation != token.controller_generation ||
         policy.mutation_serial != token.mutation_serial ||
         policy.degrade_order_digest != token.degrade_order_digest ||
@@ -4507,9 +4512,9 @@ bool llama_kv_cache::vbr_capture_generation_record(
             // descriptors retain their exact representation generations.
             output.child_id = child_id;
             output.dependency_mode = dependency_mode;
-            output.pool_uuid = tracker->pool_identity();
+            output.lineage_uuid = tracker->lineage_identity();
             return tracker->stable() &&
-                   vbr_pool_uuid_is_set(output.pool_uuid);
+                   vbr_lineage_uuid_is_set(output.lineage_uuid);
         }
         if (dependency_mode !=
                 checkpoint_child_dependency_mode::live_guarded) {
@@ -4738,7 +4743,7 @@ bool llama_kv_cache::vbr_generation_live_guarded_view(
 
 
 bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
-                                                    uint64_t pool_hi, uint64_t pool_lo,
+                                                    vbr_controller_instance_id instance,
                                                     bool wrap_possible, uint16_t stream,
                                                     const llama_ubatch & ubatch) {
     // one (seq -> [min,max+1)) range per touched sequence
@@ -4777,7 +4782,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
     for (uint8_t j = 0; j < n_seqs; ++j) {
         binding.targets[binding.n_targets++] = vbr_make_target(
                 vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
-                pool_hi, pool_lo, stream, seqs[j], lo[j], hi[j]);
+                instance, stream, seqs[j], lo[j], hi[j]);
         if (wrap_possible) {
             // v6-fix F1: unified-SWA slot selection may reuse a masked cell of a DIFFERENT
             // sequence whose position is unbounded by this batch (find_slot checks only the
@@ -4785,7 +4790,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
             // whole range — the SELECTED target still binds the exact seq's damage extent.
             binding.targets[binding.n_targets++] = vbr_make_target(
                     vbr_operation_kind::decode, vbr_operation_class::swa_wrap,
-                    pool_hi, pool_lo, stream, seqs[j], 0,
+                    instance, stream, seqs[j], 0,
                     std::numeric_limits<llama_pos>::max());
         }
     }
@@ -4794,11 +4799,11 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
         // (apply_ubatch's nested seq_rm, the §7.3 composite purge). Those owners are chosen
         // by slot selection INSIDE apply — unknowable at manifest build (the composite mints
         // before its children run) — so the purge is DECLARED as one seq-wildcard whole-range
-        // target: still pool-exact, operation-bound, and confined to the generic seq_rm
+        // target: still instance-exact, operation-bound, and confined to the generic seq_rm
         // trim class (v6 P1: wildcards match only where the manifest declared them).
         binding.targets[binding.n_targets++] = vbr_make_target(
                 vbr_operation_kind::decode, vbr_operation_class::state_api,
-                pool_hi, pool_lo, stream, -1, 0, std::numeric_limits<llama_pos>::max());
+                instance, stream, -1, 0, std::numeric_limits<llama_pos>::max());
     }
     return true;
 }
@@ -4835,10 +4840,10 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *    cache,
                                                  uint16_t            extent_stream)
     : vbr_mutation_op(cache,
                       cache != nullptr && cache->vbr_generation_tracker_mut() != nullptr
-                          ? vbr_mutation_binding(kind, seq_id, p0, p1, operation_class,
-                                                 cache->vbr_generation_tracker_mut()->pool_identity().hi,
-                                                 cache->vbr_generation_tracker_mut()->pool_identity().lo,
-                                                 extent_stream)
+                          ? vbr_mutation_binding(
+                                kind, seq_id, p0, p1, operation_class,
+                                cache->vbr_generation_tracker_mut()->runtime_instance(),
+                                extent_stream)
                           : vbr_operation_binding{},
                       provenance_bearing) {}
 
@@ -4897,10 +4902,10 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
         // uncompromised). The provenance EXTENTS are lazy: reserved per SELECTED target by
         // ensure_extent_for() at the first destructive stamp, so a wrap-free SWA decode pays
         // no extent traffic.
-        const vbr_pool_uuid owner_pool = tracker->pool_identity();
+        const vbr_controller_instance_id owner_instance = tracker->runtime_instance();
         recovery_index_ = owned_op_
-                ? vbr_recovery_reserve(owned_op_->binding(), owner_pool.hi, owner_pool.lo)
-                : vbr_recovery_reserve(operation_id_, owner_pool.hi, owner_pool.lo);
+                ? vbr_recovery_reserve(owned_op_->binding(), owner_instance)
+                : vbr_recovery_reserve(operation_id_, owner_instance);
         if (recovery_index_ < 0) {
             abort_to_shadow_unavailable();
         }
@@ -6080,8 +6085,8 @@ bool llama_kv_cache::vbr_recovery_service_pending() const {
     if (tracker == nullptr) {
         return false;
     }
-    const vbr_pool_uuid pool = tracker->pool_identity();
-    return tracker->shadow_unavailable() || vbr_recovery_pending_for(pool.hi, pool.lo);
+    return tracker->shadow_unavailable() ||
+           vbr_recovery_pending_for(tracker->runtime_instance());
 }
 
 bool llama_kv_cache::vbr_retier_freeze_begin(
@@ -6707,15 +6712,16 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         vbr_operation_binding shed_binding;
         shed_binding.kind        = vbr_operation_kind::controller_retier;
         shed_binding.child_phase = vbr_operation_phase::mutate;
-        const vbr_pool_uuid shed_own_pool = vbr_pool_id();
-        vbr_binding_add_pool_target(shed_binding,
+        const vbr_controller_instance_id shed_own_instance = vbr_instance_id();
+        vbr_binding_add_instance_target(shed_binding,
                 vbr_operation_kind::controller_retier, vbr_operation_class::controller,
-                shed_own_pool.hi, shed_own_pool.lo, VBR_STREAM_ANY, -1, -1, -1);
+                shed_own_instance, VBR_STREAM_ANY, -1, -1, -1);
         if (vbr_ledger_sibling_ != nullptr) {
-            const vbr_pool_uuid shed_sib_pool = vbr_ledger_sibling_->vbr_pool_id();
-            vbr_binding_add_pool_target(shed_binding,
+            const vbr_controller_instance_id shed_sib_instance =
+                    vbr_ledger_sibling_->vbr_instance_id();
+            vbr_binding_add_instance_target(shed_binding,
                     vbr_operation_kind::controller_retier, vbr_operation_class::controller,
-                    shed_sib_pool.hi, shed_sib_pool.lo, VBR_STREAM_ANY, -1, -1, -1);
+                    shed_sib_instance, VBR_STREAM_ANY, -1, -1, -1);
         }
         vbr_mutation_op shed_op(this, shed_binding, /*provenance_bearing=*/false);
         const vbr_mutation_op::success_on_return shed_ok(shed_op);

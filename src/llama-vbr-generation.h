@@ -76,7 +76,8 @@ struct vbr_generation_event {
 // through begin_event(); no caller supplies an open-ended family string.
 class vbr_generation_tracker {
   public:
-    vbr_generation_tracker(uint32_t n_stream, uint32_t n_cells, uint32_t n_units);
+    vbr_generation_tracker(uint32_t n_stream, uint32_t n_cells, uint32_t n_units,
+                           vbr_lineage_uuid lineage = {});
     ~vbr_generation_tracker();
 
     vbr_generation_tracker(const vbr_generation_tracker &)             = delete;
@@ -100,7 +101,7 @@ class vbr_generation_tracker {
                                        ? generation_at_latch_ : global_generation_;
     }
     // P4v2 (v6): the WHOLE availability-creating transition in one place — while latched (and
-    // only then) it proves an empty recovery ring for this pool across every non-free state
+    // only then) it proves an empty recovery ring for this instance across every non-free state
     // and registry capacity, performs the sanctioned global invalidation (the named exemption
     // that runs outside any operation), and clears the monotone latch that invalidation
     // provably post-dates. Boundaries just call this; the ordering cannot be re-derived
@@ -125,8 +126,9 @@ class vbr_generation_tracker {
     uint32_t unit_count() const;
     bool     stable() const;
 
-    vbr_pool_uuid pool_identity() const;
-    uint64_t      controller_generation() const;
+    vbr_lineage_uuid            lineage_identity() const;
+    vbr_controller_instance_id  runtime_instance() const;
+    uint64_t                    controller_generation() const;
     // F9: value accessor for the evaluator's post-read stability recheck. Even = stable.
     uint64_t      mutation_serial() const { return mutation_serial_; }
 
@@ -203,7 +205,9 @@ class vbr_generation_tracker {
     bool reset_unit_generations_before_wrap();
     bool finish_event(uint64_t serial);
 
-    vbr_pool_uuid                         pool_uuid_          = {};
+    vbr_lineage_uuid                      lineage_uuid_       = {};
+    vbr_controller_instance_id            instance_id_        = {};
+    bool                                  instance_enrolled_  = false;
     bool                                  shadow_unavailable_ = false;
     // P4v2 (v6): monotone latch token — controller generation at the newest latch.
     uint64_t                              generation_at_latch_ = 0;
@@ -293,6 +297,7 @@ enum class vbr_checkpoint_eligibility_reason : uint8_t {
     dependency_mode,
     controller_inactive,
     controller_unstable,
+    // Frozen schema-4 wire ordinal/spelling; semantic meaning is lineage mismatch.
     pool_uuid,
     global_generation,
     unit_shape,

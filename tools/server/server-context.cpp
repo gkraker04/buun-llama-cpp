@@ -4408,7 +4408,7 @@ private:
                             lane - capture_lanes.begin());
                     }
                     capture_pool_bindings.push_back({
-                        pool.pool_uuid,
+                        pool.instance_id,
                         pool.device,
                         0,
                         domain->domain.device_ordinal.v,

@@ -228,7 +228,7 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     descriptor.logical_unit_id = 0;
     // This UUID is the validated SOURCE controller identity. The golden therefore proves the
     // buun OQ5 native-lineage branch is representable without rebasing it to a target UUID.
-    descriptor.pool_uuid = { 0x0102030405060708ull, 0x1112131415161718ull };
+    descriptor.lineage_uuid = { 0x0102030405060708ull, 0x1112131415161718ull };
     descriptor.repr_gen = 17;
     descriptor.current_type = GGML_TYPE_TURBO4_0;
     descriptor.last_source_type = GGML_TYPE_TURBO8_0;
@@ -287,7 +287,7 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     controller.child_id = 0;
     controller.dependency_mode =
         checkpoint_child_dependency_mode::live_guarded;
-    controller.pool_uuid = descriptor.pool_uuid;
+    controller.lineage_uuid = descriptor.lineage_uuid;
     controller.global_generation = 5;
     controller.units.push_back({
         descriptor.repr_gen,
@@ -324,7 +324,7 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     manifest.controller_policy.push_back(policy);
 
     vbr_artifact_unit_reference reference;
-    reference.pool_uuid = descriptor.pool_uuid;
+    reference.lineage_uuid = descriptor.lineage_uuid;
     reference.logical_unit_id = descriptor.logical_unit_id;
     reference.repr_gen = descriptor.repr_gen;
     reference.authorized_stream_refs = { 0 };
@@ -426,10 +426,10 @@ static void test_golden_and_native_lineage() {
     CHECK(decoded.version == VBR_UNIT_ARTIFACT_FORMAT_VERSION);
     CHECK(decoded.unit_blobs.size() == 1);
     CHECK(decoded.manifest.generation.controllers.size() == 1);
-    CHECK(decoded.manifest.generation.controllers[0].pool_uuid ==
-          package.manifest.generation.controllers[0].pool_uuid);
-    CHECK(decoded.manifest.generation.controllers[0].pool_uuid ==
-          package.unit_blobs[0].descriptor.pool_uuid);
+    CHECK(decoded.manifest.generation.controllers[0].lineage_uuid ==
+          package.manifest.generation.controllers[0].lineage_uuid);
+    CHECK(decoded.manifest.generation.controllers[0].lineage_uuid ==
+          package.unit_blobs[0].descriptor.lineage_uuid);
     CHECK(decoded.manifest.consistency.kind ==
           vbr_artifact_consistency_kind::capture_exact);
     CHECK(decoded.manifest.consistency.source_capture_generation_id ==
@@ -463,8 +463,8 @@ static void test_identity_and_reference_separation() {
     CHECK(vbr_artifact_encode_vector(
               payload_changed, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
-    CHECK(payload_changed.unit_blobs[0].descriptor.pool_uuid ==
-          first.unit_blobs[0].descriptor.pool_uuid);
+    CHECK(payload_changed.unit_blobs[0].descriptor.lineage_uuid ==
+          first.unit_blobs[0].descriptor.lineage_uuid);
     CHECK(payload_changed.unit_blobs[0].descriptor.repr_gen ==
           first.unit_blobs[0].descriptor.repr_gen);
     CHECK(payload_changed.unit_blobs[0].unit_version_id !=
@@ -488,7 +488,7 @@ static void test_identity_and_reference_separation() {
     auto mismatched_tuple = first;
     CHECK(mismatched_tuple.manifest.unit_references[0].unit_version_id ==
           mismatched_tuple.unit_blobs[0].unit_version_id);
-    mismatched_tuple.manifest.unit_references[0].pool_uuid.lo ^= 1;
+    mismatched_tuple.manifest.unit_references[0].lineage_uuid.lo ^= 1;
     CHECK(vbr_artifact_encode_vector(
               mismatched_tuple, bytes, 1024*1024) ==
           vbr_artifact_status::generation_mismatch);
@@ -496,9 +496,9 @@ static void test_identity_and_reference_separation() {
     // A different logical unit may intern the same immutable clean-stash
     // subobject without sharing the unit address.
     auto shared_stash = make_package(storage);
-    shared_stash.unit_blobs[0].descriptor.pool_uuid.lo++;
-    shared_stash.manifest.generation.controllers[0].pool_uuid.lo++;
-    shared_stash.manifest.unit_references[0].pool_uuid.lo++;
+    shared_stash.unit_blobs[0].descriptor.lineage_uuid.lo++;
+    shared_stash.manifest.generation.controllers[0].lineage_uuid.lo++;
+    shared_stash.manifest.unit_references[0].lineage_uuid.lo++;
     CHECK(vbr_artifact_encode_vector(
               shared_stash, bytes, 1024*1024) ==
           vbr_artifact_status::ok);
@@ -610,8 +610,8 @@ static void test_fail_closed_decode() {
     CHECK(vbr_artifact_decode_vector(
               corrupt_payload, limits(1024*1024), decoded) !=
           vbr_artifact_status::ok);
-    CHECK(tuple_before.pool_uuid ==
-          package.manifest.unit_references[0].pool_uuid);
+    CHECK(tuple_before.lineage_uuid ==
+          package.manifest.unit_references[0].lineage_uuid);
     CHECK(tuple_before.logical_unit_id ==
           package.manifest.unit_references[0].logical_unit_id);
     CHECK(tuple_before.repr_gen ==

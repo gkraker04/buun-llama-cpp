@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-vbr-checkpoint-types.h"
+#include "llama-vbr-controller-id.h"
 
 #include <array>
 #include <cstdint>
@@ -11,25 +12,6 @@
 // tracker/index/mutation helpers deliberately do not appear in this header.
 constexpr uint32_t VBR_GENERATION_PAGE_CELLS = 256;
 constexpr uint32_t VBR_GENERATION_MASK_WORDS = VBR_GENERATION_PAGE_CELLS / (8u * sizeof(uint64_t));
-
-struct vbr_pool_uuid {
-    uint64_t hi = 0;
-    uint64_t lo = 0;
-};
-
-inline bool operator==(const vbr_pool_uuid & lhs, const vbr_pool_uuid & rhs) {
-    return lhs.hi == rhs.hi && lhs.lo == rhs.lo;
-}
-
-inline bool operator!=(const vbr_pool_uuid & lhs, const vbr_pool_uuid & rhs) {
-    return !(lhs == rhs);
-}
-
-// The one definition of a real (non-sentinel) pool identity; matches the tracker's active()
-// convention.
-inline bool vbr_pool_uuid_is_set(const vbr_pool_uuid & uuid) {
-    return uuid.hi != 0 && uuid.lo != 0;
-}
 
 enum class vbr_repr_domain : uint8_t {
     full,
@@ -87,7 +69,7 @@ struct vbr_checkpoint_generation_stream {
 struct vbr_checkpoint_generation_controller {
     uint32_t                                      child_id          = 0;
     checkpoint_child_dependency_mode              dependency_mode   = checkpoint_child_dependency_mode::absent;
-    vbr_pool_uuid                                 pool_uuid         = {};
+    vbr_lineage_uuid                              lineage_uuid      = {};
     uint64_t                                      global_generation = 0;
     std::vector<vbr_checkpoint_unit_generation>   units;
     std::vector<vbr_checkpoint_generation_stream> streams;
@@ -122,7 +104,7 @@ inline bool operator==(const vbr_checkpoint_generation_stream & lhs, const vbr_c
 
 inline bool operator==(const vbr_checkpoint_generation_controller & lhs, const vbr_checkpoint_generation_controller & rhs) {
     return lhs.child_id == rhs.child_id && lhs.dependency_mode == rhs.dependency_mode &&
-           lhs.pool_uuid == rhs.pool_uuid && lhs.global_generation == rhs.global_generation &&
+           lhs.lineage_uuid == rhs.lineage_uuid && lhs.global_generation == rhs.global_generation &&
            lhs.units == rhs.units && lhs.streams == rhs.streams;
 }
 

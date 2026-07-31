@@ -14,7 +14,7 @@ struct vbr_identity_policy_digest_row {
     uint32_t child_id = 0;
     checkpoint_child_dependency_mode mode =
         checkpoint_child_dependency_mode::absent;
-    vbr_pool_uuid pool_uuid = {};
+    vbr_lineage_uuid lineage_uuid = {};
 };
 
 inline std::array<uint8_t, 32> vbr_identity_policy_digest(
@@ -40,8 +40,8 @@ inline std::array<uint8_t, 32> vbr_identity_policy_digest(
     for (const auto & row : policy) {
         hash.u64(row.child_id);
         hash.u64(uint64_t(static_cast<uint8_t>(row.mode)));
-        hash.u64(row.pool_uuid.hi);
-        hash.u64(row.pool_uuid.lo);
+        hash.u64(row.lineage_uuid.hi);
+        hash.u64(row.lineage_uuid.lo);
     }
     return hash.finish();
 }

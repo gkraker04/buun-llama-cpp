@@ -61,6 +61,7 @@ enum class vbr_checkpoint_shadow_reason : uint8_t {
     dependency_mode,
     controller_inactive,
     controller_unstable,
+    // Frozen schema-4 wire ordinal/spelling; semantic meaning is lineage mismatch.
     pool_uuid,
     global_generation,
     unit_shape,

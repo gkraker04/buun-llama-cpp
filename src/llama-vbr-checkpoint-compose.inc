@@ -17,24 +17,24 @@ namespace {
 
 // One controller candidate per memory-tree child, in fixed pre-order. Armed live_guarded
 // children capture through the callback; per-child applicability is vbr_operation_armed()
-// (pool UUID is identity, not liveness — consulted only after armed).
+// (lineage UUID is identity, not liveness — consulted only after armed).
 struct vbr_checkpoint_child_input {
     bool live_guarded = false;  // else payload_complete
     bool armed        = false;
     // unarmed live_guarded children: whether any live covered cells exist for the checkpoint
     // sequence below the frontier (nonempty coverage the shadow cannot represent -> row 16)
     bool live_covered = false;
-    // armed children: exact nonzero pool identity (digest envelope)
-    vbr_pool_uuid pool_uuid = {};
+    // armed children: exact nonzero lineage identity (digest envelope)
+    vbr_lineage_uuid lineage_uuid = {};
     bool (*capture)(void * ctx, uint32_t child_id, vbr_checkpoint_generation_controller & out) = nullptr;
     void * capture_ctx = nullptr;
 };
 
-// Ordered (child_id, dependency_mode, pool_uuid) digest envelope row.
+// Ordered (child_id, dependency_mode, lineage_uuid) digest envelope row.
 struct vbr_checkpoint_child_policy {
     uint32_t                         child_id  = 0;
     checkpoint_child_dependency_mode mode      = checkpoint_child_dependency_mode::absent;
-    vbr_pool_uuid                    pool_uuid = {};
+    vbr_lineage_uuid                 lineage_uuid = {};
 };
 
 inline bool vbr_checkpoint_frontier_valid(const vbr_checkpoint_frontier_fields & frontier) {
@@ -54,7 +54,7 @@ inline std::array<uint8_t, 32> vbr_checkpoint_identity_digest(
     canonical.reserve(policy.size());
     for (const auto & row : policy) {
         canonical.push_back({
-            row.child_id, row.mode, row.pool_uuid,
+            row.child_id, row.mode, row.lineage_uuid,
         });
     }
     return vbr_identity_policy_digest(frontier, canonical);
@@ -97,13 +97,13 @@ inline vbr_checkpoint_capture_reason vbr_checkpoint_compose(
             controller.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
         } else {
             // §11.1 row 17: payload_complete rows are vacuous (mode recorded, zero streams);
-            // an armed child still contributes its exact pool identity to the envelope.
-            if (child.armed && !vbr_pool_uuid_is_set(child.pool_uuid)) {
+            // an armed child still contributes its exact lineage identity to the envelope.
+            if (child.armed && !vbr_lineage_uuid_is_set(child.lineage_uuid)) {
                 return vbr_checkpoint_capture_reason::child_capture_failed;
             }
             controller.child_id        = child_id;
             controller.dependency_mode = checkpoint_child_dependency_mode::payload_complete;
-            controller.pool_uuid       = child.armed ? child.pool_uuid : vbr_pool_uuid{};
+            controller.lineage_uuid    = child.armed ? child.lineage_uuid : vbr_lineage_uuid{};
         }
         record.controllers.push_back(std::move(controller));
     }
@@ -111,7 +111,7 @@ inline vbr_checkpoint_capture_reason vbr_checkpoint_compose(
     std::vector<vbr_checkpoint_child_policy> policy;
     policy.reserve(record.controllers.size());
     for (const auto & controller : record.controllers) {
-        policy.push_back({ controller.child_id, controller.dependency_mode, controller.pool_uuid });
+        policy.push_back({ controller.child_id, controller.dependency_mode, controller.lineage_uuid });
     }
     record.identity_policy_order_digest = vbr_checkpoint_identity_digest(frontier, policy);
     record.status                       = vbr_checkpoint_generation_status::complete;

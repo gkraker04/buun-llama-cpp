@@ -382,7 +382,8 @@ private:
             std::vector<uint32_t> stash_valid;
             std::vector<size_t> stash_offsets;
         };
-        vbr_pool_uuid pool_uuid;
+        vbr_lineage_uuid lineage_uuid;
+        vbr_controller_instance_id instance_id;
         uint64_t controller_generation = 0;
         uint64_t mutation_serial = 0;
         std::array<uint8_t, 32> degrade_order_digest = {};
@@ -888,13 +889,18 @@ private:
     // TRANSACTIONAL: any target-ceiling overflow zeroes the manifest and returns false — the
     // registry then refuses the mint (fail-closed shadow-unavailable), never partial.
     static bool vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
-                                               uint64_t pool_hi, uint64_t pool_lo,
+                                               vbr_controller_instance_id instance,
                                                bool wrap_possible, uint16_t stream,
                                                const llama_ubatch & ubatch);
-    // Pool identity for manifest construction ({0,0} = unarmed/wildcard).
-    vbr_pool_uuid vbr_pool_id() const {
+    // Durable trajectory identity for checkpoint/artifact capture.
+    vbr_lineage_uuid vbr_lineage_id() const {
         const auto * tracker = vbr_generation_tracker_get();
-        return tracker != nullptr ? tracker->pool_identity() : vbr_pool_uuid{};
+        return tracker != nullptr ? tracker->lineage_identity() : vbr_lineage_uuid{};
+    }
+    // Process-local routing identity for authenticated mutation/recovery manifests.
+    vbr_controller_instance_id vbr_instance_id() const {
+        const auto * tracker = vbr_generation_tracker_get();
+        return tracker != nullptr ? tracker->runtime_instance() : vbr_controller_instance_id{};
     }
 
   private:

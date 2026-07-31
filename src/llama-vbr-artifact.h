@@ -261,7 +261,7 @@ struct vbr_artifact_representation {
 struct vbr_artifact_unit_descriptor {
     uint32_t child_id = 0;
     uint32_t logical_unit_id = 0;
-    vbr_pool_uuid pool_uuid;
+    vbr_lineage_uuid lineage_uuid;
     uint64_t repr_gen = 0;
     int32_t current_type = -1;
     int32_t last_source_type = -1;
@@ -331,7 +331,7 @@ struct vbr_artifact_stash_reference {
 };
 
 struct vbr_artifact_unit_reference {
-    vbr_pool_uuid pool_uuid;
+    vbr_lineage_uuid lineage_uuid;
     uint32_t logical_unit_id = 0;
     uint64_t repr_gen = 0;
     vbr_unit_version_id unit_version_id;

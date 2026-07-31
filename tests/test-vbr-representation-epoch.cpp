@@ -14,7 +14,50 @@
 #include <thread>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
+
+template<typename L, typename R, typename = void>
+struct f40_has_equal : std::false_type {};
+
+template<typename L, typename R>
+struct f40_has_equal<L, R,
+    std::void_t<decltype(std::declval<L>() == std::declval<R>())>> : std::true_type {};
+
+static_assert(!std::is_same<vbr_lineage_uuid, vbr_controller_instance_id>::value,
+              "lineage and runtime instance must stay distinct strong types");
+static_assert(!std::is_constructible<vbr_lineage_uuid,
+                                     vbr_controller_instance_id>::value,
+              "runtime instance must not initialize durable lineage");
+static_assert(!std::is_constructible<vbr_controller_instance_id,
+                                     vbr_lineage_uuid>::value,
+              "lineage must not initialize a runtime operation target");
+static_assert(!std::is_assignable<vbr_lineage_uuid &, vbr_controller_instance_id>::value &&
+              !std::is_assignable<vbr_controller_instance_id &, vbr_lineage_uuid>::value,
+              "lineage and runtime instance must not be assignable across domains");
+static_assert(!f40_has_equal<vbr_lineage_uuid, vbr_controller_instance_id>::value &&
+              !f40_has_equal<vbr_controller_instance_id, vbr_lineage_uuid>::value,
+              "cross-domain identity equality must not compile");
+static_assert(std::is_same<decltype(vbr_checkpoint_generation_controller{}.lineage_uuid),
+                           vbr_lineage_uuid>::value,
+              "checkpoint controller must serialize lineage only");
+static_assert(std::is_same<decltype(vbr_operation_target{}.instance_id),
+                           vbr_controller_instance_id>::value,
+              "operation target must authenticate runtime instance only");
+static_assert(std::is_same<decltype(vbr_failed_operation_record{}.owner_instance),
+                           vbr_controller_instance_id>::value,
+              "recovery must route by runtime instance only");
+
+static bool f40_deterministic_origin(uint64_t & origin) noexcept {
+    origin = UINT64_C(0x56425247454e4131);
+    return true;
+}
+
+static bool f40_unavailable_origin(uint64_t & origin) noexcept {
+    origin = 0;
+    return false;
+}
 
 // Friend of llama_kv_cache: the production low-LCP path reaches the same two operations through
 // clear() followed by prepare(). Driving them directly makes the cursor-at-zero state observable
@@ -256,21 +299,21 @@ struct llama_kv_cache_vbr_epoch_test {
         if (tracker == nullptr) {
             return nullptr;
         }
-        const auto pool = tracker->pool_identity();
+        const auto instance = tracker->runtime_instance();
         vbr_operation_binding binding;
         binding.kind        = vbr_operation_kind::sequence_edit;
         binding.child_phase = vbr_operation_phase::mutate;
         binding.n_targets   = 2;
         binding.targets[0]  = vbr_make_target(vbr_operation_kind::sequence_edit,
                                               vbr_operation_class::explicit_destructive_trim,
-                                              pool.hi, pool.lo, 0, 0, 0, 2);
+                                              instance, 0, 0, 0, 2);
         // real nested seq_rm authenticates as membership-only state_api
         // (llama-kv-cache.cpp seq_rm scope); authorize that class on the SAME narrow range so
         // its refusal happens at per-stamp range selection (positions >= 2), never at
         // begin-time class authentication
         binding.targets[1]  = vbr_make_target(vbr_operation_kind::sequence_edit,
                                               vbr_operation_class::state_api,
-                                              pool.hi, pool.lo, 0, 0, 0, 2);
+                                              instance, 0, 0, 0, 2);
         auto * op = new llama_kv_cache::vbr_mutation_op(kv, binding, /*provenance_bearing=*/true);
         if (!op->active()) {
             delete op;
@@ -437,13 +480,13 @@ static vbr_generation_live_view a1_make_live(
 
 // A2: every mutation event must cite a live registry operation. Tests reuse the production
 // RAII (reuse review) — one begin/close idiom in the whole tree. P5v2 (v6): mutation targets
-// carry exact nonzero pools, so every test operation is bound to its tracker's pool.
+// carry exact nonzero instances, so every test operation is bound to its tracker instance.
 struct test_operation {
     vbr_scoped_operation op;
-    test_operation(vbr_operation_kind kind, vbr_pool_uuid pool, llama_seq_id seq = -1,
+    test_operation(vbr_operation_kind kind, vbr_controller_instance_id instance, llama_seq_id seq = -1,
                    llama_pos p0 = 0, llama_pos p1 = std::numeric_limits<llama_pos>::max(),
                    vbr_operation_class operation_class = vbr_operation_class::state_api)
-        : op(vbr_mutation_binding(kind, seq, p0, p1, operation_class, pool.hi, pool.lo)) {}
+        : op(vbr_mutation_binding(kind, seq, p0, p1, operation_class, instance)) {}
     vbr_operation_id id() const { return op.id(); }
 };
 
@@ -459,6 +502,210 @@ static vbr_extent_handle test_multi_extent_cb(void * ctx, uint8_t target_index) 
     auto * supplier = static_cast<test_multi_extent_supplier *>(ctx);
     supplier->last  = target_index;
     return target_index < 2 ? supplier->handles[target_index] : vbr_extent_handle{};
+}
+
+static bool run_f40_cpu_tests() {
+    // Entropy failure is terminal for that construction attempt, never replaced by the old
+    // fixed-domain fallback. The deterministic provider is restored before the remaining rows.
+    if (!vbr_lineage_origin_provider_set_for_tests(f40_unavailable_origin)) {
+        fprintf(stderr, "F4.0 could not install unavailable-origin test provider\n");
+        return false;
+    }
+    {
+        vbr_generation_tracker unavailable(1, 8, 1);
+        if (unavailable.active() ||
+                vbr_lineage_uuid_is_set(unavailable.lineage_identity()) ||
+                vbr_controller_instance_id_is_set(unavailable.runtime_instance())) {
+            fprintf(stderr, "F4.0 entropy failure did not fail closed\n");
+            return false;
+        }
+    }
+    if (!vbr_lineage_origin_provider_set_for_tests(f40_deterministic_origin)) {
+        fprintf(stderr, "F4.0 could not install deterministic origin provider\n");
+        return false;
+    }
+
+    // The live-controller registry rejects duplicate/corrupt claims, enforces its bound, and
+    // releases only the exact (instance, owner) pair.
+    const size_t full_capacity = vbr_controller_instance_registry_capacity();
+    if (!vbr_controller_instance_registry_capacity_set_for_tests(1)) {
+        fprintf(stderr, "F4.0 could not narrow the controller registry\n");
+        return false;
+    }
+    int owner_a = 0;
+    int owner_b = 0;
+    const vbr_controller_instance_id instance_a = {
+        UINT64_C(0x564252494e535431), UINT64_C(0x1001),
+    };
+    const vbr_controller_instance_id instance_b = {
+        UINT64_C(0x564252494e535431), UINT64_C(0x1002),
+    };
+    if (!vbr_controller_instance_check_and_claim(instance_a, &owner_a) ||
+            vbr_controller_instance_check_and_claim(instance_a, &owner_b) ||
+            vbr_controller_instance_check_and_claim(instance_b, &owner_b) ||
+            vbr_controller_instance_release(instance_a, &owner_b) ||
+            !vbr_controller_instance_release(instance_a, &owner_a) ||
+            !vbr_controller_instance_registry_capacity_set_for_tests(full_capacity)) {
+        fprintf(stderr, "F4.0 controller registry claim/release matrix failed\n");
+        return false;
+    }
+
+    // Tracker construction itself claims one slot, capacity failure leaves the competing
+    // tracker inactive, and destruction makes that exact slot reusable without reusing its ID.
+    if (!vbr_controller_instance_registry_capacity_set_for_tests(1)) {
+        fprintf(stderr, "F4.0 could not narrow the tracker enrollment registry\n");
+        return false;
+    }
+    {
+        vbr_generation_tracker enrolled(1, 8, 1);
+        vbr_generation_tracker refused(1, 8, 1);
+        if (!enrolled.active() || refused.active() ||
+                enrolled.runtime_instance() == refused.runtime_instance()) {
+            fprintf(stderr, "F4.0 tracker enrollment capacity did not fail closed\n");
+            return false;
+        }
+    }
+    {
+        vbr_generation_tracker after_release(1, 8, 1);
+        if (!after_release.active()) {
+            fprintf(stderr, "F4.0 tracker destruction did not release its registry row\n");
+            return false;
+        }
+    }
+    if (!vbr_controller_instance_registry_capacity_set_for_tests(full_capacity)) {
+        fprintf(stderr, "F4.0 could not restore controller registry capacity\n");
+        return false;
+    }
+
+    {
+        vbr_generation_tracker source(1, 64, 1);
+        vbr_generation_tracker clone(1, 64, 1, source.lineage_identity());
+        vbr_generation_tracker unrelated(1, 64, 1);
+        if (!source.active() || !clone.active() || !unrelated.active() ||
+                source.lineage_identity() != clone.lineage_identity() ||
+                source.lineage_identity() == unrelated.lineage_identity() ||
+                source.runtime_instance() == clone.runtime_instance() ||
+                !vbr_lineage_uuid_is_set(source.lineage_identity()) ||
+                !vbr_controller_instance_id_is_set(source.runtime_instance()) ||
+                !source.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full) ||
+                !clone.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full) ||
+                !unrelated.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full)) {
+            fprintf(stderr, "F4.0 source/clone identity model failed\n");
+            return false;
+        }
+
+        // An operation aimed at one runtime instance cannot authenticate the other, in either
+        // direction, even though the two trackers intentionally share durable lineage.
+        {
+            test_operation source_op(
+                vbr_operation_kind::sequence_edit, source.runtime_instance(), 0, 0, 8);
+            auto source_event = source.begin_event(
+                vbr_mutation_registrant::seq_rm,
+                vbr_operation_class::state_api, 0,
+                vbr_generation_stamp_kind::membership, source_op.id());
+            auto clone_event = clone.begin_event(
+                vbr_mutation_registrant::seq_rm,
+                vbr_operation_class::state_api, 0,
+                vbr_generation_stamp_kind::membership, source_op.id());
+            if (!source_event || clone_event || !source_event.finish()) {
+                fprintf(stderr, "F4.0 source operation authenticated the clone\n");
+                return false;
+            }
+        }
+        {
+            test_operation clone_op(
+                vbr_operation_kind::sequence_edit, clone.runtime_instance(), 0, 0, 8);
+            auto source_event = source.begin_event(
+                vbr_mutation_registrant::seq_rm,
+                vbr_operation_class::state_api, 0,
+                vbr_generation_stamp_kind::membership, clone_op.id());
+            auto clone_event = clone.begin_event(
+                vbr_mutation_registrant::seq_rm,
+                vbr_operation_class::state_api, 0,
+                vbr_generation_stamp_kind::membership, clone_op.id());
+            if (source_event || !clone_event || !clone_event.finish()) {
+                fprintf(stderr, "F4.0 clone operation authenticated the source\n");
+                return false;
+            }
+        }
+
+        // Recovery ownership is exact-instance: clone cannot observe, take, or acknowledge the
+        // source record. Resolve it before tracker destruction so unregister proves quiescence.
+        {
+            test_operation source_op(
+                vbr_operation_kind::sequence_edit, source.runtime_instance(), 0, 0, 8);
+            const int32_t record =
+                vbr_recovery_reserve(source_op.id(), source.runtime_instance());
+            if (record < 0 ||
+                    !vbr_recovery_record_failure(
+                        record, source_op.id(), vbr_operation_phase::mutate,
+                        vbr_recovery_failure_site::metadata_mutation, false)) {
+                fprintf(stderr, "F4.0 could not create source-owned recovery record\n");
+                return false;
+            }
+            {
+                auto capability = vbr_recovery_mint(record);
+                if (!capability || !capability.resolve_quarantined()) {
+                    fprintf(stderr, "F4.0 could not quarantine source recovery\n");
+                    return false;
+                }
+            }
+            if (!vbr_recovery_pending_for(source.runtime_instance()) ||
+                    vbr_recovery_pending_for(clone.runtime_instance()) ||
+                    vbr_recovery_take_quarantine(clone.runtime_instance()).token) {
+                fprintf(stderr, "F4.0 recovery ownership crossed runtime instances\n");
+                return false;
+            }
+            auto work = vbr_recovery_take_quarantine(source.runtime_instance());
+            if (!work.token ||
+                    vbr_recovery_ack_quarantine(work.token, clone.runtime_instance()) ||
+                    !vbr_recovery_ack_quarantine(work.token, source.runtime_instance())) {
+                fprintf(stderr, "F4.0 recovery ack was not exact-instance\n");
+                return false;
+            }
+        }
+
+        // Runtime instance is absent from the durable generation record: equal tracker state +
+        // shared lineage produces equal records despite distinct live routing identities.
+        vbr_checkpoint_generation_controller source_record;
+        vbr_checkpoint_generation_controller clone_record;
+        if (!vbr_generation_capture_controller(
+                    source, 0, checkpoint_child_dependency_mode::live_guarded, {}, source_record) ||
+                !vbr_generation_capture_controller(
+                    clone, 0, checkpoint_child_dependency_mode::live_guarded, {}, clone_record) ||
+                !(source_record == clone_record) ||
+                source_record.lineage_uuid != source.lineage_identity()) {
+            fprintf(stderr, "F4.0 runtime instance leaked into durable generation record\n");
+            return false;
+        }
+
+        // Restore eligibility follows durable lineage, not the process-local controller route:
+        // an exact native clone is accepted, while otherwise-identical unrelated lineage is not.
+        vbr_checkpoint_generation_record durable_record;
+        durable_record.status = vbr_checkpoint_generation_status::complete;
+        durable_record.version = 1;
+        durable_record.controllers = { source_record };
+        vbr_generation_live_controller_view live_controller;
+        live_controller.child_id = 0;
+        live_controller.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
+        live_controller.tracker = &clone;
+        vbr_generation_live_view live;
+        live.legacy_eligible = true;
+        live.controllers = { live_controller };
+        if (!checkpoint_vbr_eligibility(durable_record, live).strict) {
+            fprintf(stderr, "F4.0 evaluator rejected an exact same-lineage clone\n");
+            return false;
+        }
+        live.controllers[0].tracker = &unrelated;
+        if (checkpoint_vbr_eligibility(durable_record, live).reason !=
+                vbr_checkpoint_eligibility_reason::pool_uuid) {
+            fprintf(stderr, "F4.0 evaluator accepted unrelated lineage\n");
+            return false;
+        }
+    }
+
+    fprintf(stderr, "F4.0 lineage/runtime-instance CPU rows PASS\n");
+    return true;
 }
 
 static bool run_a1_cpu_tests() {
@@ -521,17 +768,18 @@ static bool run_a1_cpu_tests() {
         }
     }
     vbr_generation_tracker distinct_tracker(1, 768, 1);
-    if (distinct_tracker.pool_identity() == tracker.pool_identity()) {
-        fprintf(stderr, "A1 process-local pool UUID was reused\n");
+    if (distinct_tracker.runtime_instance() == tracker.runtime_instance() ||
+            distinct_tracker.lineage_identity() == tracker.lineage_identity()) {
+        fprintf(stderr, "F4.0 tracker identity was reused\n");
         return false;
     }
-    test_operation a1_op(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+    test_operation a1_op(vbr_operation_kind::decode, tracker.runtime_instance(), -1,
                          0, std::numeric_limits<llama_pos>::max(),
                          vbr_operation_class::ordinary_decode);
-    test_operation a1_edit_op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), -1,
+    test_operation a1_edit_op(vbr_operation_kind::sequence_edit, tracker.runtime_instance(), -1,
                               0, std::numeric_limits<llama_pos>::max(),
                               vbr_operation_class::prompt_share);
-    test_operation distinct_op(vbr_operation_kind::decode, distinct_tracker.pool_identity(), -1,
+    test_operation distinct_op(vbr_operation_kind::decode, distinct_tracker.runtime_instance(), -1,
                                0, std::numeric_limits<llama_pos>::max(),
                                vbr_operation_class::ordinary_decode);
     if (!a1_op.id() || !a1_edit_op.id() || !distinct_op.id()) {
@@ -682,7 +930,7 @@ static bool run_a1_cpu_tests() {
     // Durable transition provenance, not a debug-ring entry, is the only live_rebased proof.
     vbr_generation_tracker rebased_tracker(1, 512, 1);
     rebased_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-    test_operation rebased_op(vbr_operation_kind::decode, rebased_tracker.pool_identity(), -1,
+    test_operation rebased_op(vbr_operation_kind::decode, rebased_tracker.runtime_instance(), -1,
                               0, std::numeric_limits<llama_pos>::max(),
                               vbr_operation_class::ordinary_decode);
     auto rebased_append = rebased_tracker.begin_event(
@@ -718,7 +966,7 @@ static bool run_a1_cpu_tests() {
 
     vbr_generation_tracker unproven_tracker(1, 512, 1);
     unproven_tracker.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-    test_operation unproven_op(vbr_operation_kind::decode, unproven_tracker.pool_identity(), -1,
+    test_operation unproven_op(vbr_operation_kind::decode, unproven_tracker.runtime_instance(), -1,
                                0, std::numeric_limits<llama_pos>::max(),
                                vbr_operation_class::ordinary_decode);
     auto unproven_append = unproven_tracker.begin_event(
@@ -828,7 +1076,7 @@ static bool run_a1_cpu_tests() {
 static bool run_a2_cpu_tests() {
     // --- extent store lifecycle -------------------------------------------------------------
     vbr_generation_tracker tracker(1, 768, 1);
-    test_operation op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 0, 0, 100);
+    test_operation op(vbr_operation_kind::sequence_edit, tracker.runtime_instance(), 0, 0, 100);
     auto & store = tracker.extent_store();
 
     auto handle = store.reserve(vbr_mutation_family::trim,
@@ -907,7 +1155,7 @@ static bool run_a2_cpu_tests() {
     }
     vbr_operation_id dead_id;
     {
-        test_operation ephemeral(vbr_operation_kind::sequence_edit, tracker.pool_identity());
+        test_operation ephemeral(vbr_operation_kind::sequence_edit, tracker.runtime_instance());
         dead_id = ephemeral.id();
     }
     auto dead_cited = tracker.begin_event(
@@ -976,7 +1224,7 @@ static bool run_a2_cpu_tests() {
 
     // --- recovery ring + capability ----------------------------------------------------------
     {
-        test_operation rop(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 2, 0, 64);
+        test_operation rop(vbr_operation_kind::sequence_edit, tracker.runtime_instance(), 2, 0, 64);
         const int32_t idx = vbr_recovery_reserve(rop.id());
         if (idx < 0 || !vbr_recovery_release_unused(idx, rop.id())) {
             fprintf(stderr, "A2 recovery reserve/release failed\n");
@@ -999,18 +1247,18 @@ static bool run_a2_cpu_tests() {
             // deliberately no resolve: destructor must fail-close to quarantined
         }
         // C4: the fail-closed destructor left the record awaiting_ack. Take it for the
-        // (wildcard-pool) target, ack with the token; a stale token must not ack twice.
-        auto work = vbr_recovery_take_quarantine(0, 0);
+        // wildcard-instance target, ack with the token; a stale token must not ack twice.
+        auto work = vbr_recovery_take_quarantine({});
         if (!work.token) {
             fprintf(stderr, "C4 fail-closed capability left no pending quarantine\n");
             return false;
         }
-        if (!vbr_recovery_ack_quarantine(work.token, 0, 0) ||
-                vbr_recovery_ack_quarantine(work.token, 0, 0)) {
+        if (!vbr_recovery_ack_quarantine(work.token, {}) ||
+                vbr_recovery_ack_quarantine(work.token, {})) {
             fprintf(stderr, "C4 quarantine token ack was not single-use\n");
             return false;
         }
-        if (vbr_recovery_take_quarantine(0, 0).token) {
+        if (vbr_recovery_take_quarantine({}).token) {
             fprintf(stderr, "C4 acked quarantine still pending\n");
             return false;
         }
@@ -1024,7 +1272,7 @@ static bool run_a2_cpu_tests() {
     // --- registry binding retention + close(failed) autorecord --------------------------------
     {
         vbr_operation_binding probe;
-        test_operation bop(vbr_operation_kind::state_import, tracker.pool_identity(), 4, 10, 20);
+        test_operation bop(vbr_operation_kind::state_import, tracker.runtime_instance(), 4, 10, 20);
         if (!vbr_operation_registry_binding(bop.id(), probe) ||
                 probe.seq_id() != 4 || probe.range().p0 != 10 || probe.range().p1 != 20 ||
                 probe.kind != vbr_operation_kind::state_import) {
@@ -1054,7 +1302,7 @@ static bool run_a2_cpu_tests() {
     {
         vbr_generation_tracker t2(1, 768, 1);
         t2.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-        test_operation cap_op(vbr_operation_kind::decode, t2.pool_identity(), -1,
+        test_operation cap_op(vbr_operation_kind::decode, t2.runtime_instance(), -1,
                               0, std::numeric_limits<llama_pos>::max(),
                               vbr_operation_class::ordinary_decode);
         {
@@ -1083,7 +1331,7 @@ static bool run_a2_cpu_tests() {
         record.controllers = {controller};
 
         // destructive trim of both cells, provenance-bearing with committed extent
-        test_operation trim_op(vbr_operation_kind::sequence_edit, t2.pool_identity(), 0, 0, 400,
+        test_operation trim_op(vbr_operation_kind::sequence_edit, t2.runtime_instance(), 0, 0, 400,
                                vbr_operation_class::explicit_destructive_trim);
         auto trim_extent = t2.extent_store().reserve(
                 vbr_mutation_family::trim, vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 400);
@@ -1143,7 +1391,7 @@ static bool run_a2_cpu_tests() {
     // F4: a decode-kind operation must NOT authorize a prompt-share membership event.
     {
         vbr_generation_tracker t3(1, 256, 1);
-        test_operation decode_op(vbr_operation_kind::decode, t3.pool_identity(), -1,
+        test_operation decode_op(vbr_operation_kind::decode, t3.runtime_instance(), -1,
                                  0, std::numeric_limits<llama_pos>::max(),
                                  vbr_operation_class::ordinary_decode);
         auto misused = t3.begin_event(
@@ -1157,7 +1405,7 @@ static bool run_a2_cpu_tests() {
         // P1v2 (v6) seq scope: an op bound to seq 2 stamps seq 2 fine; a seq-3 stamp has no
         // covering target, so it POISONS the event and latches unavailable IMMEDIATELY, and
         // every further stamp from the poisoned event is inert.
-        test_operation seq2_op(vbr_operation_kind::sequence_edit, t3.pool_identity(), 2, 0, 100);
+        test_operation seq2_op(vbr_operation_kind::sequence_edit, t3.runtime_instance(), 2, 0, 100);
         auto scoped = t3.begin_event(
                 vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
                 0, vbr_generation_stamp_kind::membership, seq2_op.id());
@@ -1180,7 +1428,7 @@ static bool run_a2_cpu_tests() {
     }
     // F6: resolved recovery records reclaim their slots — the ring survives > capacity cycles.
     {
-        test_operation cyc_op(vbr_operation_kind::sequence_edit, tracker.pool_identity(), 0, 0, 8);
+        test_operation cyc_op(vbr_operation_kind::sequence_edit, tracker.runtime_instance(), 0, 0, 8);
         for (int cycle = 0; cycle < 70; ++cycle) {
             const int32_t idx = vbr_recovery_reserve(cyc_op.id());
             if (idx < 0) {
@@ -1205,7 +1453,7 @@ static bool run_a2_cpu_tests() {
     {
         vbr_generation_tracker t4(1, 768, 1);
         t4.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-        test_operation cap_op(vbr_operation_kind::decode, t4.pool_identity(), -1,
+        test_operation cap_op(vbr_operation_kind::decode, t4.runtime_instance(), -1,
                               0, std::numeric_limits<llama_pos>::max(),
                               vbr_operation_class::ordinary_decode);
         {
@@ -1229,7 +1477,7 @@ static bool run_a2_cpu_tests() {
             return false;
         }
         record.controllers = {controller};
-        test_operation trim_op(vbr_operation_kind::sequence_edit, t4.pool_identity(), 0, 0, 400,
+        test_operation trim_op(vbr_operation_kind::sequence_edit, t4.runtime_instance(), 0, 0, 400,
                                vbr_operation_class::explicit_destructive_trim);
         auto trim_extent = t4.extent_store().reserve(
                 vbr_mutation_family::trim, vbr_operation_class::explicit_destructive_trim, 0, 0, 0, 400);
@@ -1273,38 +1521,38 @@ static bool run_a2_cpu_tests() {
     // Forged-field matrix (§11.1): each forged manifest dimension must refuse the event.
     {
         vbr_generation_tracker t5(1, 256, 1);
-        const vbr_pool_uuid t5_pool = t5.pool_identity();
+        const vbr_controller_instance_id t5_instance = t5.runtime_instance();
         // wrong class
-        test_operation wrong_class(vbr_operation_kind::sequence_edit, t5_pool, 0, 0, 10,
+        test_operation wrong_class(vbr_operation_kind::sequence_edit, t5_instance, 0, 0, 10,
                                    vbr_operation_class::prompt_share);
         auto e1 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
                                  0, vbr_generation_stamp_kind::membership, wrong_class.id());
         // wrong kind for registrant (controller_retier cannot authorize seq_rm)
-        test_operation wrong_kind(vbr_operation_kind::controller_retier, t5_pool, -1, -1, -1,
+        test_operation wrong_kind(vbr_operation_kind::controller_retier, t5_instance, -1, -1, -1,
                                   vbr_operation_class::state_api);
         auto e2 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
                                  0, vbr_generation_stamp_kind::membership, wrong_kind.id());
         // wrong stream target
         vbr_operation_binding far_stream = vbr_mutation_binding(
                 vbr_operation_kind::sequence_edit, 0, 0, 10, vbr_operation_class::state_api,
-                t5_pool.hi, t5_pool.lo, /*stream=*/7);
+                t5_instance, /*stream=*/7);
         vbr_scoped_operation far_op(far_stream);
-        // foreign pool: a manifest bound to ANOTHER controller's pool never covers this one
+        // Foreign instance: a manifest bound to another controller never covers this one.
         vbr_generation_tracker t5_foreign(1, 64, 1);
-        test_operation foreign_pool(vbr_operation_kind::sequence_edit,
-                                    t5_foreign.pool_identity(), 0, 0, 10,
-                                    vbr_operation_class::state_api);
+        test_operation foreign_instance_op(
+                vbr_operation_kind::sequence_edit, t5_foreign.runtime_instance(), 0, 0, 10,
+                vbr_operation_class::state_api);
         auto e3 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
                                  0, vbr_generation_stamp_kind::membership, far_op.id());
         auto e5 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
-                                 0, vbr_generation_stamp_kind::membership, foreign_pool.id());
+                                 0, vbr_generation_stamp_kind::membership, foreign_instance_op.id());
         if (e1 || e2 || e3 || e5) {
             fprintf(stderr, "v3 forged-field matrix: a forged manifest authorized an event\n");
             return false;
         }
         // correct manifest, wrong stamped seq (target seq 2, stamping seq 3): authorized
         // stamp first, then the forged one — which poisons the event (P1v2).
-        test_operation seq_scope(vbr_operation_kind::sequence_edit, t5_pool, 2, 0, 10,
+        test_operation seq_scope(vbr_operation_kind::sequence_edit, t5_instance, 2, 0, 10,
                                  vbr_operation_class::state_api);
         auto e4 = t5.begin_event(vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api,
                                  0, vbr_generation_stamp_kind::membership, seq_scope.id());
@@ -1321,7 +1569,7 @@ static bool run_a2_cpu_tests() {
     {
         vbr_generation_tracker t6(1, 768, 1);
         t6.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-        test_operation cap_op6(vbr_operation_kind::decode, t6.pool_identity(), -1,
+        test_operation cap_op6(vbr_operation_kind::decode, t6.runtime_instance(), -1,
                                0, std::numeric_limits<llama_pos>::max(),
                                vbr_operation_class::ordinary_decode);
         {
@@ -1347,7 +1595,7 @@ static bool run_a2_cpu_tests() {
         record6.controllers = {controller6};
         // whole-range trim, stamped at an UNKNOWN position (-1): selection covers via the
         // whole-range form, but the in_range proof bit stays false -> row 3 unexplained
-        test_operation trim6(vbr_operation_kind::sequence_edit, t6.pool_identity(), 0,
+        test_operation trim6(vbr_operation_kind::sequence_edit, t6.runtime_instance(), 0,
                              0, std::numeric_limits<llama_pos>::max(),
                              vbr_operation_class::explicit_destructive_trim);
         auto extent6 = t6.extent_store().reserve(
@@ -1413,10 +1661,10 @@ static bool run_a2_cpu_tests() {
     // Two-thread stress: concurrent registry begin/end + recovery reserve/mint/resolve.
     {
         std::atomic<bool> failed{false};
-        const vbr_pool_uuid stress_pool = tracker.pool_identity();
-        auto worker = [&failed, stress_pool]() {
+        const vbr_controller_instance_id stress_instance = tracker.runtime_instance();
+        auto worker = [&failed, stress_instance]() {
             for (int i = 0; i < 2000 && !failed.load(); ++i) {
-                test_operation op(vbr_operation_kind::sequence_edit, stress_pool, i % 4, 0, 64,
+                test_operation op(vbr_operation_kind::sequence_edit, stress_instance, i % 4, 0, 64,
                                   vbr_operation_class::state_api);
                 if (!op.id()) {
                     failed.store(true);
@@ -1460,10 +1708,10 @@ static bool run_a2_cpu_tests() {
         two_seq.child_phase = vbr_operation_phase::mutate;
         two_seq.targets[two_seq.n_targets++] = vbr_make_target(
                 vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
-                t7.pool_identity().hi, t7.pool_identity().lo, VBR_STREAM_ANY, 0, 0, 200);
+                t7.runtime_instance(), VBR_STREAM_ANY, 0, 0, 200);
         two_seq.targets[two_seq.n_targets++] = vbr_make_target(
                 vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
-                t7.pool_identity().hi, t7.pool_identity().lo, VBR_STREAM_ANY, 1, 100, 300);
+                t7.runtime_instance(), VBR_STREAM_ANY, 1, 100, 300);
         vbr_scoped_operation two_seq_op(two_seq);
         if (!two_seq_op) {
             fprintf(stderr, "P1v2: two-target selection manifest failed to mint\n");
@@ -1525,7 +1773,7 @@ static bool run_a2_cpu_tests() {
         for (llama_seq_id s = 0; s < 2; ++s) {
             set_manifest.targets[set_manifest.n_targets++] = vbr_make_target(
                     vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
-                    t7b.pool_identity().hi, t7b.pool_identity().lo, VBR_STREAM_ANY, s, 0, 200);
+                    t7b.runtime_instance(), VBR_STREAM_ANY, s, 0, 200);
         }
         vbr_scoped_operation set_op(set_manifest);
         auto append = t7b.begin_event(
@@ -1546,14 +1794,14 @@ static bool run_a2_cpu_tests() {
 
     // --- v6 rows: P5v2 closed mint predicates ---------------------------------------------
     {
-        const vbr_pool_uuid pool = tracker.pool_identity();
+        const vbr_controller_instance_id instance = tracker.runtime_instance();
         auto refused = [](vbr_operation_binding b) {
             vbr_scoped_operation probe(b);
             return !probe;
         };
         const auto good = vbr_mutation_binding(
                 vbr_operation_kind::sequence_edit, 0, 0, 10,
-                vbr_operation_class::state_api, pool.hi, pool.lo);
+                vbr_operation_class::state_api, instance);
         auto zero_mask = good;
         zero_mask.targets[0].registrant_mask = 0;
         auto foreign_bit = good;
@@ -1569,27 +1817,27 @@ static bool run_a2_cpu_tests() {
             return false;
         }
         if (!refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, 0, 10,
-                                          vbr_operation_class::state_api, 0, 0))) {
-            fprintf(stderr, "P5v2: pool-wildcard mutation target minted\n");
+                                          vbr_operation_class::state_api, {}))) {
+            fprintf(stderr, "P5v2: instance-wildcard mutation target minted\n");
             return false;
         }
         if (!refused(vbr_mutation_binding(vbr_operation_kind::decode, 0, 5, 5,
-                                          vbr_operation_class::ordinary_decode, pool.hi, pool.lo))) {
+                                          vbr_operation_class::ordinary_decode, instance))) {
             fprintf(stderr, "P5v2: empty decode range minted (p0 < p1 required)\n");
             return false;
         }
         if (refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, 5, 5,
-                                         vbr_operation_class::state_api, pool.hi, pool.lo))) {
+                                         vbr_operation_class::state_api, instance))) {
             fprintf(stderr, "P5v2: enumerated sequence_edit empty no-op form refused\n");
             return false;
         }
         if (!refused(vbr_mutation_binding(vbr_operation_kind::sequence_edit, 0, -1, -1,
-                                          vbr_operation_class::state_api, pool.hi, pool.lo))) {
+                                          vbr_operation_class::state_api, instance))) {
             fprintf(stderr, "P5v2: undeclared sequence_edit range wildcard minted\n");
             return false;
         }
         if (refused(vbr_mutation_binding(vbr_operation_kind::controller_retier, -1, -1, -1,
-                                         vbr_operation_class::controller, pool.hi, pool.lo))) {
+                                         vbr_operation_class::controller, instance))) {
             fprintf(stderr, "P5v2: declared controller_retier range wildcard refused\n");
             return false;
         }
@@ -1598,7 +1846,7 @@ static bool run_a2_cpu_tests() {
     // --- v6 rows: P3v2 fixed-participant sealed aggregate ---------------------------------
     {
         // seal marks never-claimed declared slots failed; pre-seal reports cannot close.
-        test_operation root(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+        test_operation root(vbr_operation_kind::decode, tracker.runtime_instance(), -1,
                             0, std::numeric_limits<llama_pos>::max(),
                             vbr_operation_class::ordinary_decode);
         const vbr_operation_id root_id = root.op.release();
@@ -1618,7 +1866,7 @@ static bool run_a2_cpu_tests() {
         }
         aggregate.report_terminal(true);  // late report must be inert (no double close)
         // detach-transfer shape: sealed with open tokens stays open until the LAST terminal.
-        test_operation root2(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+        test_operation root2(vbr_operation_kind::decode, tracker.runtime_instance(), -1,
                              0, std::numeric_limits<llama_pos>::max(),
                              vbr_operation_class::ordinary_decode);
         const vbr_operation_id root2_id = root2.op.release();
@@ -1665,7 +1913,8 @@ static bool run_a2_cpu_tests() {
         manifest.kind        = vbr_operation_kind::decode;
         manifest.child_phase = vbr_operation_phase::mutate;
         if (llama_kv_cache::vbr_decode_targets_from_ubatch(
-                    manifest, 1, 1, false, VBR_STREAM_ANY, overflow_ub) ||
+                    manifest, vbr_controller_instance_id{1, 1}, false,
+                    VBR_STREAM_ANY, overflow_ub) ||
                 manifest.n_targets != 0) {
             fprintf(stderr, "P2v2: seq-ceiling overflow did not zero the manifest\n");
             return false;
@@ -1682,7 +1931,8 @@ static bool run_a2_cpu_tests() {
         manifest.kind        = vbr_operation_kind::decode;
         manifest.child_phase = vbr_operation_phase::mutate;
         if (!llama_kv_cache::vbr_decode_targets_from_ubatch(
-                    manifest, 1, 1, true, VBR_STREAM_ANY, one_ub) ||
+                    manifest, vbr_controller_instance_id{1, 1}, true,
+                    VBR_STREAM_ANY, one_ub) ||
                 manifest.n_targets != 3 ||
                 manifest.targets[1].operation_class != vbr_operation_class::swa_wrap ||
                 manifest.targets[1].range.p1 != std::numeric_limits<llama_pos>::max() ||
@@ -1701,7 +1951,7 @@ static bool run_a2_cpu_tests() {
         wrap_manifest.kind        = vbr_operation_kind::decode;
         wrap_manifest.child_phase = vbr_operation_phase::mutate;
         if (!llama_kv_cache::vbr_decode_targets_from_ubatch(
-                    wrap_manifest, t10.pool_identity().hi, t10.pool_identity().lo,
+                    wrap_manifest, t10.runtime_instance(),
                     true, VBR_STREAM_ANY, one_ub)) {
             return false;
         }
@@ -1739,7 +1989,7 @@ static bool run_a2_cpu_tests() {
         // F6: a record whose only target names exact stream 1 must NOT authorize stream 0.
         vbr_operation_binding far = vbr_mutation_binding(
                 vbr_operation_kind::sequence_edit, 2, 0, 64, vbr_operation_class::state_api,
-                tracker.pool_identity().hi, tracker.pool_identity().lo, /*stream=*/1);
+                tracker.runtime_instance(), /*stream=*/1);
         vbr_scoped_operation far_op(far);
         const int32_t ridx = vbr_recovery_reserve(far_op.id());
         if (ridx < 0 ||
@@ -1760,11 +2010,11 @@ static bool run_a2_cpu_tests() {
         auto over = vbr_mutation_binding(
                 vbr_operation_kind::sequence_edit, LLAMA_MAX_SEQ, 0, 8,
                 vbr_operation_class::state_api,
-                tracker.pool_identity().hi, tracker.pool_identity().lo);
+                tracker.runtime_instance());
         auto edge = vbr_mutation_binding(
                 vbr_operation_kind::sequence_edit, LLAMA_MAX_SEQ - 1, 0, 8,
                 vbr_operation_class::state_api,
-                tracker.pool_identity().hi, tracker.pool_identity().lo);
+                tracker.runtime_instance());
         vbr_scoped_operation over_op(over);
         vbr_scoped_operation edge_op(edge);
         if (over_op || !edge_op) {
@@ -1777,7 +2027,7 @@ static bool run_a2_cpu_tests() {
     {
         vbr_generation_tracker t9(1, 64, 1);
         t9.initialize_unit(0, GGML_TYPE_F16, vbr_repr_domain::full);
-        test_operation ctrl(vbr_operation_kind::controller_retier, t9.pool_identity(), -1, -1, -1,
+        test_operation ctrl(vbr_operation_kind::controller_retier, t9.runtime_instance(), -1, -1, -1,
                             vbr_operation_class::controller);
         if (!t9.publish_unit(0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, vbr_repr_domain::full, 0,
                              vbr_repr_transition::degrade_other,
@@ -1818,7 +2068,7 @@ static bool run_c2_cpu_tests() {
         fprintf(stderr, "C2 tracker did not initialize\n");
         return false;
     }
-    test_operation op(vbr_operation_kind::decode, tracker.pool_identity(), -1,
+    test_operation op(vbr_operation_kind::decode, tracker.runtime_instance(), -1,
                       0, std::numeric_limits<llama_pos>::max(),
                       vbr_operation_class::ordinary_decode);
     auto append = tracker.begin_event(
@@ -1856,7 +2106,7 @@ static bool run_c2_cpu_tests() {
     vbr_checkpoint_child_input armed_lg;
     armed_lg.live_guarded = true;
     armed_lg.armed        = true;
-    armed_lg.pool_uuid    = tracker.pool_identity();
+    armed_lg.lineage_uuid = tracker.lineage_identity();
     armed_lg.capture      = c2_capture_cb;
     armed_lg.capture_ctx  = &fixture;
 
@@ -1891,7 +2141,7 @@ static bool run_c2_cpu_tests() {
                 record.controllers[1].dependency_mode != checkpoint_child_dependency_mode::payload_complete ||
                 !record.controllers[1].streams.empty() ||
                 !record.controllers[1].units.empty() ||
-                record.controllers[1].pool_uuid.hi != 0 || record.controllers[1].pool_uuid.lo != 0) {
+                record.controllers[1].lineage_uuid.hi != 0 || record.controllers[1].lineage_uuid.lo != 0) {
             fprintf(stderr, "C2 row 17: unarmed payload_complete child was not a vacuous row\n");
             return false;
         }
@@ -1910,21 +2160,21 @@ static bool run_c2_cpu_tests() {
         }
     }
 
-    // F5: an armed payload_complete child must carry its exact nonzero pool identity
+    // F5: an armed payload_complete child must carry its exact nonzero lineage identity.
     {
         vbr_checkpoint_child_input armed_pc;
-        armed_pc.armed = true;  // pool_uuid deliberately zero
+        armed_pc.armed = true;  // lineage deliberately zero
         vbr_checkpoint_generation_record unused;
         if (vbr_checkpoint_compose({ armed_lg, armed_pc }, frontier, unused) !=
                 vbr_checkpoint_capture_reason::child_capture_failed) {
-            fprintf(stderr, "C2 armed payload_complete child with zero pool identity was accepted\n");
+            fprintf(stderr, "C2 armed payload_complete child with zero lineage was accepted\n");
             return false;
         }
-        armed_pc.pool_uuid = tracker.pool_identity();
+        armed_pc.lineage_uuid = tracker.lineage_identity();
         if (vbr_checkpoint_compose({ armed_lg, armed_pc }, frontier, unused) !=
                     vbr_checkpoint_capture_reason::ok ||
-                unused.controllers[1].pool_uuid != tracker.pool_identity()) {
-            fprintf(stderr, "C2 armed payload_complete child did not record its pool identity\n");
+                unused.controllers[1].lineage_uuid != tracker.lineage_identity()) {
+            fprintf(stderr, "C2 armed payload_complete child did not record its lineage\n");
             return false;
         }
     }
@@ -1934,7 +2184,7 @@ static bool run_c2_cpu_tests() {
     {
         std::vector<vbr_checkpoint_child_policy> policy;
         for (const auto & controller : record.controllers) {
-            policy.push_back({ controller.child_id, controller.dependency_mode, controller.pool_uuid });
+            policy.push_back({ controller.child_id, controller.dependency_mode, controller.lineage_uuid });
         }
         if (vbr_checkpoint_identity_digest(frontier, policy) != record.identity_policy_order_digest) {
             fprintf(stderr, "C2 digest helper diverged from the composed record digest\n");
@@ -2011,7 +2261,7 @@ static bool run_c2_cpu_tests() {
         std::vector<vbr_checkpoint_child_policy> mixed_policy;
         for (const auto & controller : mixed_record.controllers) {
             mixed_policy.push_back(
-                    { controller.child_id, controller.dependency_mode, controller.pool_uuid });
+                    { controller.child_id, controller.dependency_mode, controller.lineage_uuid });
         }
         mixed_live.identity_policy_order_digest =
             vbr_checkpoint_identity_digest(frontier, mixed_policy);
@@ -2210,15 +2460,15 @@ static bool c2_bridge_capture_ok(llama_memory_t mem, int64_t n_past,
     return ok;
 }
 
-// recovery-ring census for one owner pool: every non-free record reserved on behalf of that
-// pool. Sampled before/after a scope lifetime, the delta is the exact mint count for the
-// whole logical operation tree (the reservation's owner pool is immutable, v4 review F2).
-static int32_t c2_recovery_census_pool(const vbr_pool_uuid & pool) {
+// Recovery-ring census for one owner instance. Sampled before/after a scope lifetime, the
+// delta is the exact mint count for the whole logical operation tree (the reservation's
+// owner instance is immutable, v4 review F2).
+static int32_t c2_recovery_census_instance(vbr_controller_instance_id instance) {
     int32_t count = 0;
     vbr_failed_operation_record record;
     for (int32_t i = 0; vbr_recovery_get_record(i, record); ++i) {
         if (record.state != vbr_recovery_state::free_slot &&
-                record.owner_pool_hi == pool.hi && record.owner_pool_lo == pool.lo) {
+                record.owner_instance == instance) {
             ++count;
         }
     }
@@ -2329,8 +2579,8 @@ static int c2_gpu_row_b(llama_model * model) {
         return 1;
     }
     const auto * tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
-    const auto pool = tracker->pool_identity();
-    const int32_t census_before = c2_recovery_census_pool(pool);
+    const auto instance = tracker->runtime_instance();
+    const int32_t census_before = c2_recovery_census_instance(instance);
     {
         void * scope = llama_kv_cache_vbr_epoch_test::open_narrow_trim_scope(base);
         if (scope == nullptr) {
@@ -2349,9 +2599,9 @@ static int c2_gpu_row_b(llama_model * model) {
         fprintf(stderr, "row b: refused stamp did not latch shadow-unavailable\n");
         return 1;
     }
-    // the root's failed close autorecorded EXACTLY ONE recovery entry for this pool
-    if (c2_recovery_census_pool(pool) != census_before + 1 ||
-            !vbr_recovery_pending_for(pool.hi, pool.lo)) {
+    // The root's failed close autorecorded exactly one recovery entry for this instance.
+    if (c2_recovery_census_instance(instance) != census_before + 1 ||
+            !vbr_recovery_pending_for(instance)) {
         fprintf(stderr, "row b: failed close did not autorecord exactly one recovery entry\n");
         return 1;
     }
@@ -2374,7 +2624,7 @@ static int c2_gpu_row_b(llama_model * model) {
         fprintf(stderr, "row b: decode-boundary quarantine drain did not rearm the child\n");
         return 1;
     }
-    if (vbr_recovery_pending_for(pool.hi, pool.lo)) {
+    if (vbr_recovery_pending_for(instance)) {
         fprintf(stderr, "row b: quarantine remained pending after the drain\n");
         return 1;
     }
@@ -2390,7 +2640,7 @@ static int c2_gpu_row_b(llama_model * model) {
 // row (c): a narrow-manifest parent held open across a REAL nested iSWA mutation — the base
 // child JOINS the parent (its trim stamps are outside the parent manifest and poison the
 // root) while the SWA sibling proceeds under the wrapper's adopted identity. The whole
-// refused tree mints exactly ONE recovery record (pool-keyed census delta), the sibling
+// refused tree mints exactly ONE recovery record (instance-keyed census delta), the sibling
 // stays healthy, and the drain must restore full capture.
 static int c2_gpu_row_c(llama_model * model) {
     llama_context_ptr ctx;
@@ -2411,8 +2661,8 @@ static int c2_gpu_row_c(llama_model * model) {
     }
     const auto * base_tracker = llama_kv_cache_vbr_epoch_test::tracker_get(base);
     const auto * swa_tracker  = llama_kv_cache_vbr_epoch_test::tracker_get(swa);
-    const auto pool = base_tracker->pool_identity();
-    const int32_t census_before = c2_recovery_census_pool(pool);
+    const auto instance = base_tracker->runtime_instance();
+    const int32_t census_before = c2_recovery_census_instance(instance);
     {
         void * scope = llama_kv_cache_vbr_epoch_test::open_narrow_trim_scope(base);
         if (scope == nullptr) {
@@ -2438,7 +2688,7 @@ static int c2_gpu_row_c(llama_model * model) {
         return 1;
     }
     // one-mint census: the whole nested tree reserved exactly one recovery record
-    if (c2_recovery_census_pool(pool) != census_before + 1) {
+    if (c2_recovery_census_instance(instance) != census_before + 1) {
         fprintf(stderr, "row c: refused tree census delta != 1\n");
         return 1;
     }
@@ -2457,7 +2707,7 @@ static int c2_gpu_row_c(llama_model * model) {
         fprintf(stderr, "row c: decode-boundary drain did not rearm the base child\n");
         return 1;
     }
-    if (vbr_recovery_pending_for(pool.hi, pool.lo)) {
+    if (vbr_recovery_pending_for(instance)) {
         fprintf(stderr, "row c: recovery work remained pending after the drain\n");
         return 1;
     }
@@ -3066,6 +3316,16 @@ static int run_c2_gpu_rows(llama_model * model) {
 }
 
 int main(int argc, char ** argv) {
+    // Every tracker in this test binary uses a deterministic process origin. Production uses
+    // the fail-closed entropy mixer; deterministic bytes keep checkpoint/artifact regressions
+    // attributable to logic rather than process entropy.
+    if (!vbr_lineage_origin_provider_set_for_tests(f40_deterministic_origin)) {
+        fprintf(stderr, "F4.0 deterministic lineage origin setup failed\n");
+        return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--f4-cpu") {
+        return run_f40_cpu_tests() ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--a1-cpu") {
         return run_a1_cpu_tests() ? 0 : 1;
     }
@@ -3076,7 +3336,7 @@ int main(int argc, char ** argv) {
         return run_c2_cpu_tests() ? 0 : 1;
     }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL | --a1-cpu | --a2-cpu | --c2-cpu\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL | --f4-cpu | --a1-cpu | --a2-cpu | --c2-cpu\n", argv[0]);
         return 1;
     }
 

@@ -351,12 +351,12 @@ public:
         if (cache.other != nullptr) {
             return runtime_pools(*cache.other, output);
         }
-        const auto pool_uuid = cache.vbr_pool_id();
+        const auto instance = cache.vbr_instance_id();
         const auto * tracker =
             cache.vbr_generation_tracker_get();
         if (!cache.vbr_operation_armed() ||
             tracker == nullptr || !tracker->active() ||
-            !vbr_pool_uuid_is_set(pool_uuid) ||
+            !vbr_controller_instance_id_is_set(instance) ||
             cache.vbr_pools_.empty()) {
             return false;
         }
@@ -374,7 +374,7 @@ public:
             const auto duplicate = std::find_if(
                 output.begin(), output.end(),
                 [&](const auto & current) {
-                    return current.pool_uuid == pool_uuid &&
+                    return current.instance_id == instance &&
                            current.device == pool.device;
                 });
             if (duplicate != output.end()) {
@@ -387,7 +387,7 @@ public:
                 continue;
             }
             output.push_back({
-                pool_uuid, pool.device, backend_device, pool.backend,
+                instance, pool.device, backend_device, pool.backend,
             });
         }
         return true;
@@ -550,28 +550,27 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
 
         result.phase =
             vbr_explicit_capture_phase::pre_capture_quiescence;
-        std::vector<vbr_operation_pool_key> pools;
+        std::vector<vbr_controller_instance_id> instances;
         result.phase =
             vbr_explicit_capture_phase::metadata_and_manifest;
         for (auto & child : children) {
-            const auto pool = child.cache->vbr_pool_id();
-            if (!vbr_pool_uuid_is_set(pool) ||
-                std::any_of(pools.begin(), pools.end(),
+            const auto instance = child.cache->vbr_instance_id();
+            if (!vbr_controller_instance_id_is_set(instance) ||
+                std::any_of(instances.begin(), instances.end(),
                     [&](const auto & current) {
-                        return current.hi == pool.hi &&
-                               current.lo == pool.lo;
+                        return current == instance;
                     })) {
                 result.status = vbr_explicit_capture_status::generation_unavailable;
                 return result;
             }
-            pools.push_back({ pool.hi, pool.lo });
-            if (vbr_recovery_pending_for(pool.hi, pool.lo)) {
+            instances.push_back(instance);
+            if (vbr_recovery_pending_for(instance)) {
                 result.status = vbr_explicit_capture_status::recovery_pending;
                 return result;
             }
         }
         if (!vbr_operation_registry_quiescent_for(
-                pools.data(), pools.size())) {
+                instances.data(), instances.size())) {
             result.status = vbr_explicit_capture_status::registry_busy;
             return result;
         }
@@ -594,7 +593,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             identity_policy.push_back({
                 child.child_id,
                 child.dependency_mode,
-                child.stability.pool_uuid,
+                child.stability.lineage_uuid,
             });
         }
         const auto identity_policy_order_digest =
@@ -657,7 +656,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 auto & descriptor = blob.descriptor;
                 descriptor.child_id = child.child_id;
                 descriptor.logical_unit_id = plan.logical_unit;
-                descriptor.pool_uuid = child.stability.pool_uuid;
+                descriptor.lineage_uuid = child.stability.lineage_uuid;
                 descriptor.repr_gen = plan.generation.repr_gen;
                 descriptor.current_type = plan.generation.current_type;
                 descriptor.last_source_type =
@@ -823,7 +822,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
                 package.unit_blobs.push_back(std::move(blob));
 
                 vbr_artifact_unit_reference reference;
-                reference.pool_uuid = child.stability.pool_uuid;
+                reference.lineage_uuid = child.stability.lineage_uuid;
                 reference.logical_unit_id = plan.logical_unit;
                 reference.repr_gen = plan.generation.repr_gen;
                 reference.authorized_stream_refs = { 0 };
@@ -969,7 +968,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             }
         }
         if (!vbr_operation_registry_quiescent_for(
-                pools.data(), pools.size())) {
+                instances.data(), instances.size())) {
             result.status = vbr_explicit_capture_status::registry_busy;
             return result;
         }
@@ -1101,16 +1100,16 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         // Both levels of stability and quiescence are re-read after all D2H
         // completions, before the catalog's final reference publication.
         for (const auto & child : children) {
-            const auto pool = child.cache->vbr_pool_id();
+            const auto instance = child.cache->vbr_instance_id();
             if (!vbr_live_capture_adapter::stable(child) ||
-                vbr_recovery_pending_for(pool.hi, pool.lo)) {
+                vbr_recovery_pending_for(instance)) {
                 result.status =
                     vbr_explicit_capture_status::source_changed;
                 return result;
             }
         }
         if (!vbr_operation_registry_quiescent_for(
-                pools.data(), pools.size())) {
+                instances.data(), instances.size())) {
             result.status = vbr_explicit_capture_status::registry_busy;
             return result;
         }

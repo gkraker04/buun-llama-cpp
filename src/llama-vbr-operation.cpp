@@ -76,7 +76,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
         // P5v2 (v6): closed validation domain per target. The registrant mask is a nonzero
         // subset of the kind's canonical set (equality valid): mask != 0 && no out-of-kind
         // bit. Targets carry the mutate phase (the stated convention). Mutation targets bind
-        // exact nonzero pools — recovery alone is capability-subset-restricted instead.
+        // exact nonzero instances — recovery alone is capability-subset-restricted instead.
         // Ranges follow the closed per-kind enumeration; seq stays in its declared domain
         // (-1 = declared wildcard).
         if (static_cast<uint8_t>(target.operation_class) >=
@@ -85,7 +85,7 @@ vbr_operation_id vbr_operation_registry_begin(vbr_operation_binding & binding) {
             target.registrant_mask == 0 ||
             (target.registrant_mask & ~vbr_operation_kind_registrants(binding.kind)) != 0 ||
             (binding.kind != vbr_operation_kind::recovery &&
-             target.pool_hi == 0 && target.pool_lo == 0) ||
+             !vbr_controller_instance_id_is_set(target.instance_id)) ||
             // v6-fix F7: the CLOSED seq domain — declared wildcard or [0, LLAMA_MAX_SEQ).
             target.seq_id < -1 || target.seq_id >= LLAMA_MAX_SEQ ||
             !vbr_target_range_valid(binding.kind, target.range)) {
@@ -186,9 +186,9 @@ bool vbr_operation_registry_binding(vbr_operation_id operation_id, vbr_operation
 }
 
 bool vbr_operation_registry_quiescent_for(
-        const vbr_operation_pool_key * pools,
-        size_t n_pools) noexcept {
-    if (pools == nullptr || n_pools == 0) {
+        const vbr_controller_instance_id * instances,
+        size_t n_instances) noexcept {
+    if (instances == nullptr || n_instances == 0) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
@@ -204,10 +204,9 @@ bool vbr_operation_registry_quiescent_for(
         GGML_ASSERT(binding.operation_id.value == live);
         for (uint8_t i = 0; i < binding.n_targets; ++i) {
             const auto & target = binding.targets[i];
-            for (size_t p = 0; p < n_pools; ++p) {
-                if ((target.pool_hi == 0 && target.pool_lo == 0) ||
-                    (target.pool_hi == pools[p].hi &&
-                     target.pool_lo == pools[p].lo)) {
+            for (size_t p = 0; p < n_instances; ++p) {
+                if (!vbr_controller_instance_id_is_set(target.instance_id) ||
+                    target.instance_id == instances[p]) {
                     return false;
                 }
             }
@@ -280,7 +279,7 @@ void vbr_recovery_autorecord_on_close(vbr_operation_id operation_id) {
 }
 
 static int32_t vbr_recovery_reserve_locked(const vbr_operation_binding & binding,
-                                           uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+                                           vbr_controller_instance_id owner_instance) {
     if (!binding.operation_id) {
         return -1;
     }
@@ -289,8 +288,7 @@ static int32_t vbr_recovery_reserve_locked(const vbr_operation_binding & binding
         if (record.state == vbr_recovery_state::free_slot) {
             record               = {};
             record.binding       = binding;
-            record.owner_pool_hi = owner_pool_hi;
-            record.owner_pool_lo = owner_pool_lo;
+            record.owner_instance = owner_instance;
             record.state         = vbr_recovery_state::reserved;
             return i;
         }
@@ -299,13 +297,13 @@ static int32_t vbr_recovery_reserve_locked(const vbr_operation_binding & binding
 }
 
 int32_t vbr_recovery_reserve(const vbr_operation_binding & binding,
-                             uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+                             vbr_controller_instance_id owner_instance) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
-    return vbr_recovery_reserve_locked(binding, owner_pool_hi, owner_pool_lo);
+    return vbr_recovery_reserve_locked(binding, owner_instance);
 }
 
 int32_t vbr_recovery_reserve(vbr_operation_id operation_id,
-                             uint64_t owner_pool_hi, uint64_t owner_pool_lo) {
+                             vbr_controller_instance_id owner_instance) {
     if (!operation_id) {
         return -1;
     }
@@ -317,7 +315,7 @@ int32_t vbr_recovery_reserve(vbr_operation_id operation_id,
         if (g_vbr_live_operations[slot].load(std::memory_order_acquire) != operation_id.value) {
             continue;
         }
-        return vbr_recovery_reserve_locked(g_vbr_live_bindings[slot], owner_pool_hi, owner_pool_lo);
+        return vbr_recovery_reserve_locked(g_vbr_live_bindings[slot], owner_instance);
     }
     return -1;
 }
@@ -463,7 +461,7 @@ bool vbr_recovery_capability::resolve_quarantined() {
     return true;
 }
 
-vbr_quarantine_work vbr_recovery_take_quarantine(uint64_t pool_hi, uint64_t pool_lo) {
+vbr_quarantine_work vbr_recovery_take_quarantine(vbr_controller_instance_id instance) {
     if (g_vbr_quarantine_pending.load(std::memory_order_acquire) == 0) {
         return {};
     }
@@ -473,15 +471,14 @@ vbr_quarantine_work vbr_recovery_take_quarantine(uint64_t pool_hi, uint64_t pool
         if (record.state != vbr_recovery_state::awaiting_ack || record.taken) {
             continue;
         }
-        // v4 review F2: OWNER-pool match only — never the composite manifest.
-        const bool matches = (record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
-                             (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo);
+        // v4 review F2: OWNER-instance match only — never the composite manifest.
+        const bool matches = !vbr_controller_instance_id_is_set(record.owner_instance) ||
+                             record.owner_instance == instance;
         if (!matches) {
             continue;
         }
-        record.taken       = true;
-        record.taken_by_hi = pool_hi;
-        record.taken_by_lo = pool_lo;
+        record.taken          = true;
+        record.taker_instance = instance;
         vbr_quarantine_work work;
         work.token   = { i, g_vbr_quarantine_nonce[i] };
         work.binding = record.binding;
@@ -490,42 +487,53 @@ vbr_quarantine_work vbr_recovery_take_quarantine(uint64_t pool_hi, uint64_t pool
     return {};
 }
 
-bool vbr_recovery_untake_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo) {
+bool vbr_recovery_untake_quarantine(vbr_quarantine_token token,
+                                    vbr_controller_instance_id instance) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     if (!token || token.record_index >= VBR_RECOVERY_RING_CAPACITY) {
         return false;
     }
     auto & record = g_vbr_recovery_ring[token.record_index];
     if (record.state != vbr_recovery_state::awaiting_ack || !record.taken ||
-        record.taken_by_hi != pool_hi || record.taken_by_lo != pool_lo ||
+        record.taker_instance != instance ||
         g_vbr_quarantine_nonce[token.record_index] != token.nonce) {
         return false;
     }
-    record.taken       = false;
-    record.taken_by_hi = 0;
-    record.taken_by_lo = 0;
+    record.taken          = false;
+    record.taker_instance = {};
     return true;
 }
 
-bool vbr_recovery_pending_for(uint64_t pool_hi, uint64_t pool_lo) {
+static bool ring_has_nonfree(
+        vbr_controller_instance_id instance,
+        bool count_wildcard_owner) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
-    for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
-        const auto & record = g_vbr_recovery_ring[i];
-        // P4v2 (v6): the FULL cause set — reserved (in-flight operation) and
-        // capability_minted (recovery mid-execution) block re-arm exactly like recorded and
-        // awaiting_ack; every non-free state is unresolved recovery work for its owner pool.
-        if (record.state == vbr_recovery_state::free_slot) {
-            continue;
-        }
-        if ((record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
-            (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo)) {
+    for (const auto & record : g_vbr_recovery_ring) {
+        if (record.state != vbr_recovery_state::free_slot &&
+            (record.owner_instance == instance ||
+             (count_wildcard_owner &&
+              !vbr_controller_instance_id_is_set(record.owner_instance)))) {
             return true;
         }
     }
     return false;
 }
 
-int32_t vbr_recovery_advance_recorded(uint64_t pool_hi, uint64_t pool_lo) {
+bool vbr_recovery_pending_for(vbr_controller_instance_id instance) {
+    // P4v2 (v6): the FULL cause set — reserved (in-flight operation) and
+    // capability_minted (recovery mid-execution) block re-arm exactly like recorded and
+    // awaiting_ack; every non-free state is unresolved recovery work serviceable here.
+    return ring_has_nonfree(instance, /*count_wildcard_owner=*/true);
+}
+
+bool vbr_recovery_owned_by(vbr_controller_instance_id instance) {
+    if (!vbr_controller_instance_id_is_set(instance)) {
+        return false;
+    }
+    return ring_has_nonfree(instance, /*count_wildcard_owner=*/false);
+}
+
+int32_t vbr_recovery_advance_recorded(vbr_controller_instance_id instance) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     int32_t advanced = 0;
     for (int32_t i = 0; i < VBR_RECOVERY_RING_CAPACITY; ++i) {
@@ -533,8 +541,8 @@ int32_t vbr_recovery_advance_recorded(uint64_t pool_hi, uint64_t pool_lo) {
         if (record.state != vbr_recovery_state::recorded) {
             continue;
         }
-        const bool matches = (record.owner_pool_hi == 0 && record.owner_pool_lo == 0) ||
-                             (record.owner_pool_hi == pool_hi && record.owner_pool_lo == pool_lo);
+        const bool matches = !vbr_controller_instance_id_is_set(record.owner_instance) ||
+                             record.owner_instance == instance;
         if (!matches) {
             continue;
         }
@@ -546,13 +554,13 @@ int32_t vbr_recovery_advance_recorded(uint64_t pool_hi, uint64_t pool_lo) {
     return advanced;
 }
 
-bool vbr_recovery_ack_quarantine(vbr_quarantine_token token, uint64_t pool_hi, uint64_t pool_lo) {
+bool vbr_recovery_ack_quarantine(vbr_quarantine_token token,
+                                 vbr_controller_instance_id instance) {
     std::lock_guard<std::mutex> lock(g_vbr_registry_mutex);
     if (!token || token.record_index >= VBR_RECOVERY_RING_CAPACITY ||
         g_vbr_recovery_ring[token.record_index].state != vbr_recovery_state::awaiting_ack ||
         !g_vbr_recovery_ring[token.record_index].taken ||
-        g_vbr_recovery_ring[token.record_index].taken_by_hi != pool_hi ||
-        g_vbr_recovery_ring[token.record_index].taken_by_lo != pool_lo ||
+        g_vbr_recovery_ring[token.record_index].taker_instance != instance ||
         g_vbr_quarantine_nonce[token.record_index] != token.nonce) {
         return false;
     }

@@ -54,7 +54,7 @@ static vbr_checkpoint_generation_record make_complete_record() {
     vbr_checkpoint_generation_controller controller;
     controller.child_id          = 0;
     controller.dependency_mode   = checkpoint_child_dependency_mode::live_guarded;
-    controller.pool_uuid         = { 0x1111, 0x2222 };
+    controller.lineage_uuid      = { 0x1111, 0x2222 };
     controller.global_generation = 3;
     controller.streams.push_back(std::move(stream));
 
@@ -842,15 +842,15 @@ static int run_gpu_fixture_rows(const char * model_path) {
             fprintf(stderr, "row f: composite child order/modes did not match [base=live_guarded, swa=payload_complete]\n");
             return 1;
         }
-        if (record.controllers[0].pool_uuid != base->vbr_pool_id() ||
-                record.controllers[1].pool_uuid != swa->vbr_pool_id() ||
-                record.controllers[1].pool_uuid.hi == 0) {
-            fprintf(stderr, "row f: armed children did not record their exact pool identities\n");
+        if (record.controllers[0].lineage_uuid != base->vbr_lineage_id() ||
+                record.controllers[1].lineage_uuid != swa->vbr_lineage_id() ||
+                record.controllers[1].lineage_uuid.hi == 0) {
+            fprintf(stderr, "row f: armed children did not record their exact lineages\n");
             return 1;
         }
         std::vector<vbr_checkpoint_child_policy> policy;
         for (const auto & controller : record.controllers) {
-            policy.push_back({ controller.child_id, controller.dependency_mode, controller.pool_uuid });
+            policy.push_back({ controller.child_id, controller.dependency_mode, controller.lineage_uuid });
         }
         if (vbr_checkpoint_identity_digest(gpu_frontier(n_past), policy) !=
                 record.identity_policy_order_digest) {
@@ -899,7 +899,7 @@ static int run_gpu_fixture_rows(const char * model_path) {
                 vbr_operation_kind::decode, 0, 0,
                 std::numeric_limits<llama_pos>::max(),
                 vbr_operation_class::ordinary_decode,
-                tracker->pool_identity().hi, tracker->pool_identity().lo));
+                tracker->runtime_instance()));
         if (!op.id()) {
             fprintf(stderr, "row g: test operation failed to register\n");
             return 1;

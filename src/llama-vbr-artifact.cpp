@@ -197,8 +197,8 @@ bool digest_matches_source(
     return digest_nonzero(out);
 }
 
-bool emit_pool(emitter & out, const vbr_pool_uuid & pool) {
-    return out.u64(pool.hi) && out.u64(pool.lo);
+bool emit_lineage(emitter & out, const vbr_lineage_uuid & lineage) {
+    return out.u64(lineage.hi) && out.u64(lineage.lo);
 }
 
 bool emit_portable_domain(emitter & out, const vbr_artifact_portable_domain & domain) {
@@ -244,7 +244,7 @@ bool emit_generation_record(
     for (const auto & controller : generation.controllers) {
         if (!out.u32(controller.child_id) ||
             !out.u32(uint32_t(controller.dependency_mode)) ||
-            !emit_pool(out, controller.pool_uuid) ||
+            !emit_lineage(out, controller.lineage_uuid) ||
             !out.u64(controller.global_generation) ||
             !out.u32(uint32_t(controller.units.size()))) {
             return false;
@@ -494,9 +494,9 @@ bool validate_generation_record(
             uint32_t(controller.dependency_mode) >
                 uint32_t(checkpoint_child_dependency_mode::live_guarded) ||
             (controller.dependency_mode != checkpoint_child_dependency_mode::absent &&
-             !vbr_pool_uuid_is_set(controller.pool_uuid)) ||
+             !vbr_lineage_uuid_is_set(controller.lineage_uuid)) ||
             (controller.dependency_mode == checkpoint_child_dependency_mode::absent &&
-             vbr_pool_uuid_is_set(controller.pool_uuid)) ||
+             vbr_lineage_uuid_is_set(controller.lineage_uuid)) ||
             (limits && (controller.units.size() > limits->max_units_per_controller ||
                         controller.streams.size() > limits->max_streams_per_controller))) {
             return false;
@@ -585,7 +585,7 @@ bool descriptor_metadata_valid(
         descriptor.last_source_type == GGML_TYPE_TURBO3_TCQ ||
         descriptor.last_source_type == GGML_TYPE_TURBO2_TCQ ||
         descriptor.last_source_type == GGML_TYPE_TURBO1_TCQ;
-    if (!vbr_pool_uuid_is_set(descriptor.pool_uuid) ||
+    if (!vbr_lineage_uuid_is_set(descriptor.lineage_uuid) ||
         descriptor.repr_gen == 0 ||
         !current_type_supported ||
         !source_type_supported ||
@@ -753,8 +753,8 @@ bool prepare_unit_id(vbr_artifact_unit_blob & blob) {
     llama_sha256_writer hash;
     hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
     hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    hash.u64(descriptor.pool_uuid.hi);
-    hash.u64(descriptor.pool_uuid.lo);
+    hash.u64(descriptor.lineage_uuid.hi);
+    hash.u64(descriptor.lineage_uuid.lo);
     hash.u32(descriptor.logical_unit_id);
     hash.u64(descriptor.repr_gen);
     if (!hash_sized_descriptor(hash, descriptor)) {
@@ -837,7 +837,7 @@ bool emit_stash_reference(
 bool emit_unit_reference(
         emitter & out,
         const vbr_artifact_unit_reference & reference) {
-    if (!emit_pool(out, reference.pool_uuid) ||
+    if (!emit_lineage(out, reference.lineage_uuid) ||
         !out.u32(reference.logical_unit_id) ||
         !out.u64(reference.repr_gen) ||
         !out.digest(reference.unit_version_id) ||
@@ -1157,7 +1157,7 @@ bool manifest_valid(
     }
     std::set<std::array<uint8_t, 32>> seen_unit_ids;
     for (const auto & reference : manifest.unit_references) {
-        if (!vbr_pool_uuid_is_set(reference.pool_uuid) ||
+        if (!vbr_lineage_uuid_is_set(reference.lineage_uuid) ||
             reference.repr_gen == 0 ||
             !reference.unit_version_id.valid() ||
             !reference.payload_digest.valid() ||
@@ -1168,7 +1168,7 @@ bool manifest_valid(
         const auto * blob = find_blob(package.unit_blobs, reference);
         if (!blob ||
             blob->payload_digest != reference.payload_digest ||
-            blob->descriptor.pool_uuid != reference.pool_uuid ||
+            blob->descriptor.lineage_uuid != reference.lineage_uuid ||
             blob->descriptor.logical_unit_id != reference.logical_unit_id ||
             blob->descriptor.repr_gen != reference.repr_gen) {
             return false;
@@ -1285,7 +1285,7 @@ bool manifest_valid(
                 manifest.unit_references.begin(),
                 manifest.unit_references.end(),
                 [&](const vbr_artifact_unit_reference & reference) {
-                    return reference.pool_uuid == controller.pool_uuid &&
+                    return reference.lineage_uuid == controller.lineage_uuid &&
                            reference.logical_unit_id == unit &&
                            reference.repr_gen ==
                                controller.units[unit].repr_gen;
@@ -1428,7 +1428,7 @@ bool emit_unit_section(
     const auto & descriptor = blob.descriptor;
     if (!out.digest(blob.unit_version_id) ||
         !out.digest(blob.payload_digest) ||
-        !emit_pool(out, descriptor.pool_uuid) ||
+        !emit_lineage(out, descriptor.lineage_uuid) ||
         !out.u32(descriptor.logical_unit_id) ||
         !out.u64(descriptor.repr_gen) ||
         !emit_unit_descriptor_body(out, descriptor) ||
@@ -1477,7 +1477,7 @@ bool emit_unit_section_verified(
     const auto & descriptor = blob.descriptor;
     if (!out.digest(blob.unit_version_id) ||
         !out.digest(blob.payload_digest) ||
-        !emit_pool(out, descriptor.pool_uuid) ||
+        !emit_lineage(out, descriptor.lineage_uuid) ||
         !out.u32(descriptor.logical_unit_id) ||
         !out.u64(descriptor.repr_gen) ||
         !emit_unit_descriptor_body(out, descriptor) ||
@@ -1491,8 +1491,8 @@ bool emit_unit_section_verified(
     llama_sha256_writer unit_hash;
     unit_hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
     unit_hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    unit_hash.u64(descriptor.pool_uuid.hi);
-    unit_hash.u64(descriptor.pool_uuid.lo);
+    unit_hash.u64(descriptor.lineage_uuid.hi);
+    unit_hash.u64(descriptor.lineage_uuid.lo);
     unit_hash.u32(descriptor.logical_unit_id);
     unit_hash.u64(descriptor.repr_gen);
     if (!hash_sized_descriptor(unit_hash, descriptor)) {
@@ -1913,8 +1913,8 @@ struct bounded_reader {
     }
 };
 
-bool read_pool(bounded_reader & in, vbr_pool_uuid & pool) {
-    return in.u64(pool.hi) && in.u64(pool.lo);
+bool read_lineage(bounded_reader & in, vbr_lineage_uuid & lineage) {
+    return in.u64(lineage.hi) && in.u64(lineage.lo);
 }
 
 bool read_portable_domain(
@@ -1998,7 +1998,7 @@ bool read_generation_record(
         uint32_t n_streams;
         if (!in.u32(controller.child_id) ||
             !in.u32(dependency_mode) ||
-            !read_pool(in, controller.pool_uuid) ||
+            !read_lineage(in, controller.lineage_uuid) ||
             !in.u64(controller.global_generation) ||
             !in.u32(n_units) ||
             dependency_mode >
@@ -2296,7 +2296,7 @@ bool decode_unit_section(
     vbr_artifact_unit_blob blob;
     if (!in.typed_digest_value(blob.unit_version_id) ||
         !in.typed_digest_value(blob.payload_digest) ||
-        !read_pool(in, blob.descriptor.pool_uuid) ||
+        !read_lineage(in, blob.descriptor.lineage_uuid) ||
         !in.u32(blob.descriptor.logical_unit_id) ||
         !in.u64(blob.descriptor.repr_gen) ||
         !read_unit_descriptor_body(in, limits, blob.descriptor)) {
@@ -2319,8 +2319,8 @@ bool decode_unit_section(
     llama_sha256_writer unit_hash;
     unit_hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
     unit_hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    unit_hash.u64(blob.descriptor.pool_uuid.hi);
-    unit_hash.u64(blob.descriptor.pool_uuid.lo);
+    unit_hash.u64(blob.descriptor.lineage_uuid.hi);
+    unit_hash.u64(blob.descriptor.lineage_uuid.lo);
     unit_hash.u32(blob.descriptor.logical_unit_id);
     unit_hash.u64(blob.descriptor.repr_gen);
     if (!hash_sized_descriptor(unit_hash, blob.descriptor)) {
@@ -2547,7 +2547,7 @@ bool read_unit_reference(
         vbr_artifact_unit_reference & reference) {
     uint32_t n_streams;
     uint32_t has_stash;
-    if (!read_pool(in, reference.pool_uuid) ||
+    if (!read_lineage(in, reference.lineage_uuid) ||
         !in.u32(reference.logical_unit_id) ||
         !in.u64(reference.repr_gen) ||
         !in.typed_digest_value(reference.unit_version_id) ||
@@ -2797,8 +2797,8 @@ std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
     llama_sha256_writer hash;
     static constexpr char domain[] = "buun.vbr.logical-unit";
     hash.string(domain, sizeof(domain) - 1);
-    hash.u64(descriptor.pool_uuid.hi);
-    hash.u64(descriptor.pool_uuid.lo);
+    hash.u64(descriptor.lineage_uuid.hi);
+    hash.u64(descriptor.lineage_uuid.lo);
     hash.u32(descriptor.logical_unit_id);
     hash.u64(descriptor.repr_gen);
     return hash.finish();
@@ -2876,7 +2876,7 @@ vbr_artifact_status vbr_artifact_prepare(
             const auto found = std::find_if(
                 package.unit_blobs.begin(), package.unit_blobs.end(),
                 [&](const vbr_artifact_unit_blob & blob) {
-                    return blob.descriptor.pool_uuid == reference.pool_uuid &&
+                    return blob.descriptor.lineage_uuid == reference.lineage_uuid &&
                            blob.descriptor.logical_unit_id ==
                                reference.logical_unit_id &&
                            blob.descriptor.repr_gen == reference.repr_gen;

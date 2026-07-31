@@ -4,7 +4,6 @@
 #include "llama-cparams.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <limits>
 
@@ -12,9 +11,6 @@ namespace {
 
 static_assert(LLAMA_MAX_SEQ <= std::numeric_limits<int16_t>::max(),
               "A1 packed membership provenance must widen with LLAMA_MAX_SEQ");
-
-std::atomic<uint64_t> g_vbr_pool_uuid_counter{ 1 };
-std::atomic<bool>     g_vbr_pool_uuid_exhausted{ false };
 
 enum class generation_dispatch_effect : uint8_t {
     dependency,
@@ -74,27 +70,6 @@ bool class_allowed(const vbr_mutation_registration & registration, vbr_operation
 
 uint32_t page_count(uint32_t cells) {
     return (cells + VBR_GENERATION_PAGE_CELLS - 1) / VBR_GENERATION_PAGE_CELLS;
-}
-
-vbr_pool_uuid allocate_pool_uuid() {
-    if (g_vbr_pool_uuid_exhausted.load(std::memory_order_acquire)) {
-        return {};
-    }
-    uint64_t expected = g_vbr_pool_uuid_counter.load(std::memory_order_relaxed);
-    for (;;) {
-        if (expected == 0) {
-            g_vbr_pool_uuid_exhausted.store(true, std::memory_order_release);
-            return {};
-        }
-        const uint64_t next = expected == std::numeric_limits<uint64_t>::max() ? 0 : expected + 1;
-        if (g_vbr_pool_uuid_counter.compare_exchange_weak(expected, next, std::memory_order_acq_rel,
-                                                          std::memory_order_relaxed)) {
-            if (next == 0) {
-                g_vbr_pool_uuid_exhausted.store(true, std::memory_order_release);
-            }
-            return { UINT64_C(0x56425247454e4131), expected };
-        }
-    }
 }
 
 bool mask_test(const std::array<uint64_t, VBR_GENERATION_MASK_WORDS> & mask, uint32_t offset) {
@@ -351,9 +326,18 @@ vbr_generation_tracker::~vbr_generation_tracker() {
     if (active_event_depth_ != 0 || (mutation_serial_ & 1u) != 0) {
         std::abort();
     }
+    if (instance_enrolled_) {
+        if (!vbr_operation_registry_quiescent_for(&instance_id_, 1) ||
+            vbr_recovery_owned_by(instance_id_) ||
+            !vbr_controller_instance_release(instance_id_, this)) {
+            std::abort();
+        }
+        instance_enrolled_ = false;
+    }
 }
 
-vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cells, uint32_t n_units) :
+vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cells, uint32_t n_units,
+                                               vbr_lineage_uuid lineage) :
     n_cells_(n_cells),
     streams_(n_stream),
     units_(n_units) {
@@ -374,13 +358,19 @@ vbr_generation_tracker::vbr_generation_tracker(uint32_t n_stream, uint32_t n_cel
         stream.cell_membership_in_range.resize((n_cells + 63) / 64);
     }
 
-    // A process-local construction identity, not a security nonce. A fixed nonzero domain tag
-    // prevents the all-zero sentinel; exhaustion latches instead of wrapping into an ABA.
-    pool_uuid_ = allocate_pool_uuid();
+    lineage_uuid_ = vbr_lineage_uuid_is_set(lineage)
+                        ? lineage
+                        : vbr_lineage_uuid_allocate();
+    if (vbr_lineage_uuid_is_set(lineage_uuid_)) {
+        instance_id_ = vbr_controller_instance_id_allocate();
+        instance_enrolled_ = vbr_controller_instance_check_and_claim(instance_id_, this);
+    }
 }
 
 bool vbr_generation_tracker::active() const {
-    return pool_uuid_.hi != 0 && pool_uuid_.lo != 0 && !streams_.empty() && n_cells_ != 0;
+    return vbr_lineage_uuid_is_set(lineage_uuid_) &&
+           vbr_controller_instance_id_is_set(instance_id_) && instance_enrolled_ &&
+           !streams_.empty() && n_cells_ != 0;
 }
 
 uint32_t vbr_generation_tracker::stream_count() const {
@@ -408,8 +398,12 @@ bool vbr_generation_tracker::stable() const {
     return true;
 }
 
-vbr_pool_uuid vbr_generation_tracker::pool_identity() const {
-    return pool_uuid_;
+vbr_lineage_uuid vbr_generation_tracker::lineage_identity() const {
+    return lineage_uuid_;
+}
+
+vbr_controller_instance_id vbr_generation_tracker::runtime_instance() const {
+    return instance_id_;
 }
 
 uint64_t vbr_generation_tracker::controller_generation() const {
@@ -447,15 +441,15 @@ vbr_generation_event vbr_generation_tracker::begin_event(vbr_mutation_registrant
     // C2 (v3.2, Sol CONCUR): full manifest authentication. The event must cite a live
     // operation whose manifest (a) lists this registrant in its closed mask, (b) declares
     // this exact operation class, (c) is in the mutate phase, and (d) carries a target
-    // covering this tracker's pool and the event's stream.
+    // covering this tracker's runtime instance and the event's stream.
     if (!operation_id || !vbr_operation_registry_binding(operation_id, result.manifest)) {
         return result;
     }
     // P1v2 (v6): begin still refuses when NO target could ever cover this
-    // pool/stream/class/registrant; the per-(seq, position) selection happens at EACH STAMP
+    // instance/stream/class/registrant; the per-(seq, position) selection happens at EACH STAMP
     // against the event's manifest copy, so multi-target manifests authenticate
     // multi-sequence ubatches exactly instead of citing target zero.
-    if (result.manifest.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, stream, operation_class,
+    if (result.manifest.find_covering_target(instance_id_, stream, operation_class,
                                              vbr_registrant_bit(registrant)) == nullptr) {
         return result;
     }
@@ -530,7 +524,7 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
         return false;
     }
     // P1v2 (v6): per-stamp covering-target selection over the event's authenticated manifest,
-    // keyed by (pool, stream, class, registrant, seq, pre-mutation position). EVERY member of
+    // keyed by (instance, stream, class, registrant, seq, pre-mutation position). EVERY member of
     // a shared cell's sequence set needs a covering target (target-set proof); the first
     // member's selection supplies the durable evidence binding. NO cover => the stamp
     // refuses, POISONS the event, and latches shadow-unavailable IMMEDIATELY — metadata may
@@ -544,7 +538,7 @@ bool vbr_generation_tracker::stamp_cell(vbr_generation_event & event,
         }
         uint8_t      index    = 0;
         const auto * covering = event.manifest.find_covering_target_at(
-                pool_uuid_.hi, pool_uuid_.lo, static_cast<uint16_t>(event.stream),
+                instance_id_, static_cast<uint16_t>(event.stream),
                 event.operation_class, event.registrant_bit, seqs[i], pre_mutation_pos, &index);
         if (covering == nullptr) {
             event.poisoned = true;
@@ -681,7 +675,7 @@ bool vbr_generation_tracker::try_rearm() {
     if (!shadow_unavailable_) {
         return true;
     }
-    if (vbr_recovery_pending_for(pool_uuid_.hi, pool_uuid_.lo) ||
+    if (vbr_recovery_pending_for(instance_id_) ||
         !vbr_operation_registry_has_capacity()) {
         return false;
     }
@@ -696,13 +690,13 @@ bool vbr_generation_tracker::global_transition(vbr_mutation_registrant registran
                                                vbr_operation_class     operation_class,
                                                vbr_operation_id        operation_id) {
     // v3 review B6 / v4 review F5: cited operations validate at manifest depth — the cited
-    // binding must carry a covering target for THIS pool authorizing this registrant + class.
+    // binding must carry a covering target for THIS instance authorizing this registrant + class.
     // The recovery drain and registry-refusal fallback run OUTSIDE any operation (empty id) —
     // a NAMED exemption: they are the paths that CREATE availability.
     if (operation_id) {
         vbr_operation_binding cited;
         if (!vbr_operation_registry_binding(operation_id, cited) ||
-            cited.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, 0, operation_class,
+            cited.find_covering_target(instance_id_, 0, operation_class,
                                        vbr_registrant_bit(registrant)) == nullptr) {
             return false;
         }
@@ -752,7 +746,7 @@ bool vbr_generation_tracker::publish_unit(uint32_t                unit,
         // v4-F5 + P5v2 (v6): the citation authenticates at manifest depth with the EXACT
         // registrant driving this publication — never an OR of plausible ones.
         if (!vbr_operation_registry_binding(operation_id, cited) ||
-            cited.find_covering_target(pool_uuid_.hi, pool_uuid_.lo, 0,
+            cited.find_covering_target(instance_id_, 0,
                                        vbr_operation_class::controller,
                                        vbr_registrant_bit(registrant)) == nullptr) {
             return false;
@@ -890,7 +884,7 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
     output                   = {};
     output.child_id          = child_id;
     output.dependency_mode   = dependency_mode;
-    output.pool_uuid         = tracker.pool_identity();
+    output.lineage_uuid      = tracker.lineage_identity();
     output.global_generation = tracker.controller_generation();
     output.streams           = streams;
     uint32_t previous_stream  = std::numeric_limits<uint32_t>::max();
@@ -928,7 +922,7 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
         });
     }
 
-    if (!tracker.stable() || tracker.pool_identity() != output.pool_uuid ||
+    if (!tracker.stable() || tracker.lineage_identity() != output.lineage_uuid ||
         tracker.controller_generation() != output.global_generation) {
         output = {};
         return false;
@@ -1000,11 +994,11 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
             continue;
         }
         // Mixed-child applicability: an unarmed live_guarded child with no covered cells is a
-        // vacuous row (capture §11.1 row 16's complement). It carries no tracker/pool/units or
+        // vacuous row (capture §11.1 row 16's complement). It carries no tracker/lineage/units or
         // streams; requiring an active controller here would make a valid mixed composite
         // permanently not-applicable at evaluation.
         if (captured.streams.empty() && captured.units.empty() &&
-                !vbr_pool_uuid_is_set(captured.pool_uuid)) {
+                !vbr_lineage_uuid_is_set(captured.lineage_uuid)) {
             if (!current.streams.empty() || current.tracker != nullptr) {
                 return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::controller_shape);
             }
@@ -1020,7 +1014,7 @@ vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_gener
         const uint64_t serial_at_read_start = current.tracker->mutation_serial();
         std::vector<std::pair<uint32_t, uint64_t>> unit_seq_snapshot;
         unit_seq_snapshot.reserve(captured.units.size());
-        if (captured.pool_uuid != current.tracker->pool_identity()) {
+        if (captured.lineage_uuid != current.tracker->lineage_identity()) {
             return reject(live.legacy_eligible, vbr_checkpoint_eligibility_reason::pool_uuid);
         }
         if (captured.global_generation != current.tracker->controller_generation()) {

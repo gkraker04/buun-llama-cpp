@@ -69,22 +69,22 @@ static void test_segment_chain_offsets() {
 }
 
 static void test_registry_quiescence_query() {
-    const vbr_operation_pool_key pool { 0x1111, 0x2222 };
-    const vbr_operation_pool_key other { 0x3333, 0x4444 };
-    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+    const vbr_controller_instance_id instance { 0x1111, 0x2222 };
+    const vbr_controller_instance_id other { 0x3333, 0x4444 };
+    CHECK(vbr_operation_registry_quiescent_for(&instance, 1));
 
     {
         auto binding = vbr_mutation_binding(
             vbr_operation_kind::sequence_edit,
             0, 0, 1,
             vbr_operation_class::explicit_destructive_trim,
-            pool.hi, pool.lo, 0);
+            instance, 0);
         vbr_scoped_operation operation(binding);
         CHECK(bool(operation));
-        CHECK(!vbr_operation_registry_quiescent_for(&pool, 1));
+        CHECK(!vbr_operation_registry_quiescent_for(&instance, 1));
         CHECK(vbr_operation_registry_quiescent_for(&other, 1));
     }
-    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+    CHECK(vbr_operation_registry_quiescent_for(&instance, 1));
 
     {
         auto binding = vbr_mutation_binding(
@@ -93,10 +93,10 @@ static void test_registry_quiescence_query() {
             vbr_operation_class::state_api);
         vbr_scoped_operation operation(binding);
         CHECK(bool(operation));
-        CHECK(!vbr_operation_registry_quiescent_for(&pool, 1));
+        CHECK(!vbr_operation_registry_quiescent_for(&instance, 1));
         CHECK(!vbr_operation_registry_quiescent_for(&other, 1));
     }
-    CHECK(vbr_operation_registry_quiescent_for(&pool, 1));
+    CHECK(vbr_operation_registry_quiescent_for(&instance, 1));
     CHECK(!vbr_operation_registry_quiescent_for(nullptr, 0));
 }
 

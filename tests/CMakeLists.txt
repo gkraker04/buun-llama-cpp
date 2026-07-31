@@ -155,6 +155,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-vbr-representation-epoch.cpp)
     target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(
+        NAME test-vbr-controller-id-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --f4-cpu)
 
     llama_build_and_test(test-checkpoint-shadow-lifecycle.cpp)
     target_include_directories(test-checkpoint-shadow-lifecycle PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -320,6 +323,13 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-operation-registry.cmake
+)
+
+add_test(
+    NAME test-vbr-controller-id-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-controller-id.cmake
 )
 
 add_test(
