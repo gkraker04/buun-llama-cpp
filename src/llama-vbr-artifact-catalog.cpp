@@ -98,6 +98,7 @@ struct llama_vbr_artifact_catalog::impl {
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             companion_payloads;
         std::vector<llama_cache_acct_op_id> operations;
+        std::vector<allocation> allocations;
         uint64_t borrow_count = 0;
     };
 
@@ -235,6 +236,7 @@ struct vbr_artifact_package_view::storage {
     vbr_artifact_reference_manifest manifest;
     std::vector<vbr_artifact_unit_view> units;
     std::vector<vbr_artifact_companion_view> companions;
+    std::vector<vbr_artifact_allocation_view> reference_allocations;
 };
 
 namespace {
@@ -692,6 +694,72 @@ const std::vector<vbr_artifact_companion_view> &
 vbr_artifact_package_view::companions() const noexcept {
     static const std::vector<vbr_artifact_companion_view> empty;
     return storage_ ? storage_->companions : empty;
+}
+
+const std::vector<vbr_artifact_allocation_view> &
+vbr_artifact_package_view::reference_allocations() const noexcept {
+    static const std::vector<vbr_artifact_allocation_view> empty;
+    return storage_ ? storage_->reference_allocations : empty;
+}
+
+vbr_artifact_status vbr_artifact_package_view::validate() const noexcept {
+    if (!storage_) {
+        return vbr_artifact_status::invalid_argument;
+    }
+    try {
+        vbr_artifact_package package;
+        package.version = storage_->manifest.version;
+        package.topologies = storage_->topologies;
+        package.manifest = storage_->manifest;
+        package.unit_blobs.reserve(storage_->units.size());
+        for (const auto & view : storage_->units) {
+            vbr_artifact_unit_blob blob;
+            blob.unit_version_id = view.unit_version_id;
+            blob.payload_digest = view.payload_digest;
+            blob.descriptor = view.descriptor;
+            if (blob.descriptor.shards.size() != view.payload_shards.size() ||
+                blob.descriptor.clean_stash.shards.size() !=
+                    view.stash_shards.size()) {
+                return vbr_artifact_status::malformed;
+            }
+            for (size_t i = 0; i < view.payload_shards.size(); ++i) {
+                if (!view.payload_shards[i]) {
+                    return vbr_artifact_status::malformed;
+                }
+                blob.descriptor.shards[i].payload =
+                    view.payload_shards[i]->source();
+            }
+            for (size_t i = 0; i < view.stash_shards.size(); ++i) {
+                if (!view.stash_shards[i]) {
+                    return vbr_artifact_status::malformed;
+                }
+                blob.descriptor.clean_stash.shards[i].payload =
+                    view.stash_shards[i]->source();
+            }
+            package.unit_blobs.push_back(std::move(blob));
+        }
+        package.companions.reserve(storage_->companions.size());
+        for (const auto & view : storage_->companions) {
+            if (!view.payload) {
+                return vbr_artifact_status::malformed;
+            }
+            auto companion = view.descriptor;
+            companion.payload = view.payload->source();
+            package.companions.push_back(std::move(companion));
+        }
+        return vbr_artifact_validate_prepared_package(package);
+    } catch (...) {
+        return vbr_artifact_status::internal_error;
+    }
+}
+
+vbr_artifact_resolve_status vbr_artifact_package_view::retain(
+        vbr_artifact_package_view & output) const noexcept {
+    if (owner_ == nullptr || !storage_) {
+        output.reset();
+        return vbr_artifact_resolve_status::not_found;
+    }
+    return owner_->resolve_reference(storage_->reference, output);
 }
 
 llama_vbr_artifact_catalog::~llama_vbr_artifact_catalog() {
@@ -1865,6 +1933,11 @@ llama_vbr_artifact_catalog::publish_stream(
 
         for (size_t i = 0; i < leaves.size(); ++i) {
             leaves[i].binding.alloc = allocations[i];
+            if (leaves[i].binding.artifact ==
+                    pending_reference.artifact) {
+                pending_reference.allocations.push_back(
+                    leaves[i].binding);
+            }
             if (!leaves[i].existing) {
                 if (leaves[i].binding.category ==
                         llama_cache_acct_category::clean_stash_payload) {
@@ -2498,6 +2571,11 @@ llama_vbr_artifact_catalog::publish_stream_complete(
         } rollback { &impl_->ledger, &committed, false };
         for (size_t i = 0; i < leaves.size(); ++i) {
             leaves[i].binding.alloc = allocations[i];
+            if (leaves[i].binding.artifact ==
+                    pending_reference.artifact) {
+                pending_reference.allocations.push_back(
+                    leaves[i].binding);
+            }
             if (leaves[i].existing) {
                 continue;
             }
@@ -2606,6 +2684,18 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
         }
 
         auto state = std::make_shared<vbr_artifact_package_view::storage>();
+        const auto allocation_view = [](const impl::allocation & value) {
+            return vbr_artifact_allocation_view {
+                value.category,
+                value.domain,
+                value.logical,
+                value.resident,
+                value.alloc,
+                value.artifact,
+                value.content,
+                value.lineage,
+            };
+        };
         state->reference = reference;
         state->topologies = impl_->topologies;
         state->manifest = it->second.manifest;
@@ -2626,6 +2716,10 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
                 shard.payload = {};
             }
             unit.payload_shards = found->second.payload_shards;
+            for (const auto & allocation : found->second.allocations) {
+                unit.payload_allocations.push_back(
+                    allocation_view(allocation));
+            }
             if (found->second.stash_id.valid()) {
                 const auto stash = impl_->stashes.find(
                     found->second.stash_id.bytes());
@@ -2633,6 +2727,10 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
                     return vbr_artifact_resolve_status::unavailable;
                 }
                 unit.stash_shards = stash->second.shards;
+                for (const auto & allocation : stash->second.allocations) {
+                    unit.stash_allocations.push_back(
+                        allocation_view(allocation));
+                }
             }
             state->units.push_back(std::move(unit));
         }
@@ -2647,6 +2745,10 @@ vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
             companion.descriptor.payload = {};
             companion.payload = it->second.companion_payloads[i];
             state->companions.push_back(std::move(companion));
+        }
+        for (const auto & allocation : it->second.allocations) {
+            state->reference_allocations.push_back(
+                allocation_view(allocation));
         }
 
         ++it->second.borrow_count;

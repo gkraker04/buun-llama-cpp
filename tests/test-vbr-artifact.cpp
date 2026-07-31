@@ -1,5 +1,6 @@
 #include "llama-vbr-artifact.h"
 #include "llama-vbr-artifact-catalog.h"
+#include "llama-vbr-artifact-validate.h"
 #include "llama-sha256.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -19,6 +21,11 @@ static_assert(!std::is_copy_constructible<vbr_artifact_package_view>::value);
 static_assert(!std::is_copy_assignable<vbr_artifact_package_view>::value);
 static_assert(std::is_nothrow_move_constructible<vbr_artifact_package_view>::value);
 static_assert(std::is_nothrow_move_assignable<vbr_artifact_package_view>::value);
+static_assert(!std::is_default_constructible<vbr_validated_manifest>::value);
+static_assert(!std::is_copy_constructible<vbr_validated_manifest>::value);
+static_assert(!std::is_copy_assignable<vbr_validated_manifest>::value);
+static_assert(std::is_nothrow_move_constructible<vbr_validated_manifest>::value);
+static_assert(std::is_nothrow_move_assignable<vbr_validated_manifest>::value);
 
 #define CHECK(cond) \
     do { \
@@ -1993,6 +2000,619 @@ static void test_catalog_package_lease_and_reference_placement() {
     }
 }
 
+class validator_companion_image final : public vbr_parsed_companion_image {
+public:
+    validator_companion_image(
+            vbr_artifact_companion_kind kind,
+            uint32_t format_version) noexcept :
+        kind_(kind), format_version_(format_version) {}
+
+    vbr_artifact_companion_kind kind() const noexcept override {
+        return kind_;
+    }
+
+    uint32_t format_version() const noexcept override {
+        return format_version_;
+    }
+
+private:
+    vbr_artifact_companion_kind kind_;
+    uint32_t format_version_;
+};
+
+struct validator_serials {
+    uint64_t accounting = 0;
+    uint64_t policy = 0;
+    bool target_stable = true;
+
+    static uint64_t read_accounting(const void * context) noexcept {
+        return static_cast<const validator_serials *>(context)->accounting;
+    }
+    static uint64_t read_policy(const void * context) noexcept {
+        return static_cast<const validator_serials *>(context)->policy;
+    }
+    static bool recheck_target(
+            const void * context,
+            const vbr_target_empty_fingerprint &) noexcept {
+        return static_cast<const validator_serials *>(context)->target_stable;
+    }
+    static bool parse_companion(
+            const void *,
+            const vbr_artifact_companion_payload & descriptor,
+            const artifact_segment_chain & source,
+            const vbr_target_companion_snapshot & target,
+            std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
+        if (!target.available || target.target_cookie == nullptr ||
+            source.size() != descriptor.payload_bytes) {
+            return false;
+        }
+        output.reset(new (std::nothrow) validator_companion_image(
+            descriptor.kind, descriptor.format_version));
+        return bool(output);
+    }
+};
+
+struct validator_fixture {
+    catalog_fixture base;
+    llama_cache_acct_artifact_id reference_artifact;
+    vbr_artifact_package_view view;
+    llama_cache_acct_snapshot accounting;
+    validator_serials serials;
+    vbr_target_validation_snapshot target;
+    vbr_adopt_policy policy;
+
+    // stash_case: 0 = exact full prefix, 1 = source-present partial
+    // authorization, 2 = absent at source.
+    explicit validator_fixture(bool legacy_v1 = false, int stash_case = 0) {
+        // Keep the historical artifact golden intact while making this
+        // validator fixture's physical authorization fit its one-row unit.
+        auto & manifest = base.package.manifest;
+        auto & stream = manifest.generation.controllers[0].streams[0];
+        auto & placement = manifest.stream_placements[0];
+        auto & stash = manifest.unit_references[0].stash_reference;
+        if (stash_case == 1) {
+            auto & descriptor = base.package.unit_blobs[0].descriptor;
+            descriptor.wm_cells = 2;
+            for (auto & shard : descriptor.shards) {
+                shard.row_count = 2;
+                shard.row_bytes = 2;
+            }
+            manifest.controller_policy[0].wm_cells = 2;
+            stash.captured_sink_count = 1;
+            stash.covered_sink_pages[0].covered_mask[0] = 2;
+        } else {
+            manifest.identity.token_count = 1;
+            manifest.identity.next_position = 1;
+            manifest.token_block.tokens = { 101 };
+            stream.computation_frontier = 1;
+            stream.captured_dependency_count = 1;
+            stream.pages[0].covered_mask[0] = 1;
+            placement.computation_frontier = 1;
+            placement.cells.resize(1);
+            stash.captured_sink_count = 1;
+            stash.covered_sink_pages[0].covered_mask[0] = 1;
+        }
+        if (stash_case == 2) {
+            auto & descriptor = base.package.unit_blobs[0].descriptor;
+            descriptor.clean_stash_state =
+                vbr_artifact_clean_stash_state::absent_at_source;
+            descriptor.clean_stash = {};
+            auto & reference = manifest.unit_references[0];
+            reference.has_stash_reference = false;
+            reference.stash_reference = {};
+            manifest.accounting.erase(
+                std::remove_if(
+                    manifest.accounting.begin(), manifest.accounting.end(),
+                    [](const vbr_artifact_portable_accounting_row & row) {
+                        return row.role ==
+                            vbr_artifact_accounting_role::clean_stash_payload;
+                    }),
+                manifest.accounting.end());
+        }
+        manifest.manifest_digest = {};
+        CHECK(base.catalog->configure_accounting(base.package));
+        if (legacy_v1) {
+            base.package.version = 1;
+            manifest.version = 1;
+            manifest.stream_placements.clear();
+            manifest.token_block = {};
+            const auto published = base.catalog->publish(
+                base.package, base.completions(), base.budget);
+            CHECK(published.status ==
+                  llama_vbr_artifact_publish_status::published);
+            reference_artifact = published.reference_artifact;
+        } else {
+            vbr_artifact_companion_payload companion;
+            companion.kind = vbr_artifact_companion_kind::recurrent;
+            companion.format_version = 1;
+            companion.build_identity_digest = marker(0xa1);
+            companion.domain = {
+                llama_cache_acct_residency::pageable_host,
+                llama_cache_acct_domain_kind::not_applicable,
+                UINT32_MAX,
+                UINT16_MAX,
+            };
+            companion.payload_bytes = base.storage.recurrent.bytes.size();
+            base.package.companions.push_back(companion);
+            manifest.accounting.push_back({
+                vbr_artifact_accounting_role::recurrent_payload,
+                companion.domain,
+                companion.payload_bytes,
+                companion.payload_bytes,
+                llama_cache_acct_attr_kind::artifact,
+            });
+            CHECK(base.catalog->configure_accounting(base.package));
+
+            vbr_capture_stream_status status;
+            auto build = base.catalog->begin_capture(
+                base.package, base.budget, {}, status);
+            CHECK(build && status == vbr_capture_stream_status::ok);
+            auto unit = build->begin_unit(0, status);
+            CHECK(unit && status == vbr_capture_stream_status::ok);
+            for (const auto & completion : base.completions()) {
+                if (completion.clean_stash && stash_case == 2) {
+                    continue;
+                }
+                const auto segment = verified_segment(completion, 2);
+                CHECK(unit->accept_verified_segment(segment) ==
+                      vbr_capture_stream_status::ok);
+            }
+            CHECK(unit->seal_unit() == vbr_capture_stream_status::ok);
+            unit.reset();
+            auto companion_bytes =
+                std::make_shared<artifact_segment_chain>();
+            CHECK(companion_bytes->append(
+                base.storage.recurrent.bytes.data(),
+                base.storage.recurrent.bytes.size()));
+            vbr_verified_companion verified;
+            verified.companion_index = 0;
+            verified.bytes = companion_bytes;
+            verified.streaming_digest =
+                vbr_capture_stream_digest(*companion_bytes);
+            CHECK(build->accept_verified_companion(verified) ==
+                  vbr_capture_stream_status::ok);
+            const auto published = build->publish_reference();
+            CHECK(published.status == vbr_capture_stream_status::ok);
+            reference_artifact = published.reference_artifact;
+        }
+        CHECK(base.catalog->resolve_reference(
+                  reference_artifact, view) ==
+              vbr_artifact_resolve_status::ok);
+        CHECK(view.validate() == vbr_artifact_status::ok);
+
+        accounting = base.ledger.snapshot();
+        serials.accounting = accounting.serial;
+        serials.policy = 77;
+
+        target.memory_instance_cookie = 0x1001;
+        target.target_state_serial = 31;
+        target.accounting_serial = accounting.serial;
+        target.tree_shape_digest = 0x2002;
+        target.policy_epoch = serials.policy;
+        target.scheduler_idle = true;
+        target.destination_sequence_absent = true;
+
+        vbr_target_child_snapshot child;
+        child.child_id = 0;
+        child.dependency_mode =
+            checkpoint_child_dependency_mode::live_guarded;
+        child.memory_cookie = reinterpret_cast<const void *>(uintptr_t(0x3003));
+        child.empty = true;
+        child.dedicated = true;
+        child.armed = true;
+        child.lineage_uuid = { 0x55, 0x66 };
+        child.instance_id = { 0x77, 0x88 };
+        child.state_serial = target.target_state_serial;
+        child.policy_epoch = target.policy_epoch;
+        child.controller_policy = manifest.controller_policy[0];
+
+        const auto & descriptor = view.units()[0].descriptor;
+        vbr_target_unit_snapshot unit;
+        unit.child_id = descriptor.child_id;
+        unit.logical_unit_id = descriptor.logical_unit_id;
+        unit.current_type = descriptor.current_type;
+        unit.last_source_type = descriptor.last_source_type;
+        unit.promote_hops = descriptor.promote_hops;
+        unit.last_transition = descriptor.last_transition;
+        unit.representation_kind = descriptor.representation.kind;
+        unit.codec_id = descriptor.representation.codec_id;
+        unit.codec_version = descriptor.representation.codec_version;
+        unit.representation_reference_digest =
+            descriptor.representation.reference_digest;
+        unit.source_loss_history =
+            descriptor.representation.source_loss_history;
+        unit.checkpoint_codec_hops =
+            descriptor.representation.checkpoint_codec_hops;
+        unit.recoverability = descriptor.recoverability;
+        unit.side = descriptor.side;
+        unit.layout = descriptor.layout;
+        unit.row_codec_version = descriptor.row_codec_version;
+        unit.current_domain = manifest.generation.controllers[0].units[0].domain;
+        unit.codebook_digest = descriptor.codebook_digest;
+        unit.rotation_digest = descriptor.rotation_digest;
+        unit.meansub_digest = descriptor.meansub_digest;
+        unit.n_stream = descriptor.n_stream;
+        unit.unified = descriptor.unified;
+        unit.wm_cells = descriptor.wm_cells;
+        unit.rank = descriptor.rank;
+        unit.dimensions = descriptor.dimensions;
+        unit.row_alignment = descriptor.row_alignment;
+        for (size_t i = 0; i < descriptor.shards.size(); ++i) {
+            const auto & source = descriptor.shards[i];
+            unit.shards.push_back({
+                uint32_t(i),
+                reinterpret_cast<const void *>(uintptr_t(0x4000 + i)),
+                base.bindings[source.device_ordinal].domain,
+                source.topology_index,
+                source.device_ordinal,
+                base.package.topologies[source.topology_index].digest,
+                source.logical_offset,
+                source.row_count,
+                source.row_bytes,
+                source.payload_bytes,
+            });
+        }
+        child.units.push_back(unit);
+        target.children.push_back(child);
+        for (const auto & companion : view.companions()) {
+            target.companions.push_back({
+                companion.descriptor.kind,
+                companion.descriptor.format_version,
+                companion.descriptor.build_identity_digest,
+                true,
+                reinterpret_cast<const void *>(uintptr_t(0x5005)),
+            });
+        }
+
+        policy.authorized = true;
+        policy.identity.execution_identity =
+            manifest.identity.execution_identity;
+        policy.identity.adapter_config_identity =
+            manifest.identity.adapter_config_identity;
+        policy.identity.media_content_identity =
+            manifest.identity.media_content_identity;
+        policy.identity.sequence_epoch =
+            manifest.identity.sequence_epoch;
+        policy.identity.requested_frontier =
+            manifest.identity.next_position;
+        policy.identity.tokens = manifest.token_block.tokens;
+        policy.destination_sequence = 4;
+        policy.domain_bindings = base.bindings;
+        policy.domain_bindings.push_back({
+            UINT32_MAX, UINT16_MAX, base.host,
+        });
+        policy.accounting_snapshot = &accounting;
+        policy.budget_config = &base.budget;
+        policy.context = &serials;
+        policy.adoption_nonce = 0x100 + uint64_t(stash_case) +
+            (legacy_v1 ? 0x10 : 0);
+        policy.parse_companion = validator_serials::parse_companion;
+        policy.recheck_target_empty = validator_serials::recheck_target;
+        policy.read_accounting_serial =
+            validator_serials::read_accounting;
+        policy.read_policy_epoch = validator_serials::read_policy;
+    }
+};
+
+static vbr_manifest_validation_result validate(
+        validator_fixture & fixture,
+        const vbr_target_validation_snapshot & target,
+        const vbr_adopt_policy & policy) {
+    return vbr_validate_unit_manifest_snapshot(
+        target, fixture.view, policy);
+}
+
+static void test_manifest_validator_matrix() {
+    validator_fixture f;
+
+    vbr_artifact_package_view absent_package;
+    const auto absent = vbr_validate_unit_manifest_snapshot(
+        f.target, absent_package, f.policy);
+    CHECK(absent.status ==
+          vbr_manifest_validation_status::unsupported_artifact_version);
+    CHECK(absent.decision == vbr_import_decision::reject);
+    CHECK(!absent.proof);
+
+    auto native = validate(f, f.target, f.policy);
+    CHECK(native.status == vbr_manifest_validation_status::validated);
+    CHECK(native.decision == vbr_import_decision::native_import);
+    CHECK(native.proof);
+    CHECK(native.proof->decision() == vbr_import_decision::native_import);
+    CHECK(native.proof->source_artifact() == f.reference_artifact);
+    CHECK(native.proof->children().size() == 1);
+    CHECK(native.proof->children()[0].placements.size() == 1);
+    CHECK(native.proof->children()[0].stash_action ==
+          vbr_validated_stash_action::restore_exact);
+    CHECK(native.proof->companions().size() == 1);
+    CHECK(native.proof->companions()[0].parsed);
+    CHECK(native.proof->companions()[0].parsed->kind() ==
+          vbr_artifact_companion_kind::recurrent);
+    size_t existing_leaves = 0;
+    size_t fresh_metadata_leaves = 0;
+    for (const auto & leaf : native.proof->accounting_leaves()) {
+        if (leaf.existing_allocation) {
+            ++existing_leaves;
+            CHECK(leaf.reserve_resident == 0);
+        } else if (leaf.category ==
+                       llama_cache_acct_category::artifact_descriptor_metadata ||
+                   leaf.category ==
+                       llama_cache_acct_category::artifact_reference_metadata) {
+            ++fresh_metadata_leaves;
+            CHECK(leaf.reserve_resident != 0);
+        }
+    }
+    CHECK(existing_leaves == 5);
+    CHECK(fresh_metadata_leaves == 2);
+    CHECK(native.proof->tracker_install().children[0].transition ==
+          vbr_tracker_install_transition::native_clone);
+    CHECK(native.proof->tracker_install().children[0].lineage_uuid ==
+          f.view.manifest().generation.controllers[0].lineage_uuid);
+    CHECK(native.proof->tracker_install().children[0].global_generation ==
+          f.view.manifest().generation.controllers[0].global_generation);
+    const uint64_t first_nonce = native.proof->adoption_nonce();
+    CHECK(first_nonce == f.policy.adoption_nonce);
+
+    auto second_policy = f.policy;
+    second_policy.adoption_nonce = first_nonce + 1;
+    auto second = validate(f, f.target, second_policy);
+    CHECK(second.status == vbr_manifest_validation_status::validated);
+    CHECK(second.proof && second.proof->adoption_nonce() != first_nonce);
+    CHECK(second.proof->adoption_nonce() == second_policy.adoption_nonce);
+    CHECK(second.proof->source_artifact() == native.proof->source_artifact());
+
+    // F4.0 clone semantics: source-lineage liveness/collision never blocks a
+    // native clone because operation authentication uses the fresh target
+    // runtime instance instead.
+    auto colliding_lineage = f.target;
+    colliding_lineage.children[0].lineage_uuid =
+        f.view.manifest().generation.controllers[0].lineage_uuid;
+    auto clone_policy = f.policy;
+    clone_policy.adoption_nonce = first_nonce + 2;
+    auto clone_with_live_source_lineage = validate(
+        f, colliding_lineage, clone_policy);
+    CHECK(clone_with_live_source_lineage.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(clone_with_live_source_lineage.decision ==
+          vbr_import_decision::native_import);
+    CHECK(clone_with_live_source_lineage.proof);
+    CHECK(clone_with_live_source_lineage.proof->tracker_install()
+              .children[0].target_instance ==
+          colliding_lineage.children[0].instance_id);
+
+    auto observed = f.target;
+    observed.children[0].previously_observed = true;
+    auto live_policy = f.policy;
+    live_policy.adoption_nonce = first_nonce + 3;
+    auto live = validate(f, observed, live_policy);
+    CHECK(live.status == vbr_manifest_validation_status::validated);
+    CHECK(live.decision == vbr_import_decision::live_rebased);
+    CHECK(live.proof);
+    CHECK(live.proof->tracker_install().children[0].transition ==
+          vbr_tracker_install_transition::whole_import);
+    CHECK(live.proof->tracker_install().children[0].lineage_uuid ==
+          observed.children[0].lineage_uuid);
+    CHECK(live.proof->tracker_install().children[0].global_generation == 1);
+    CHECK(live.proof->tracker_install().children[0].global_generation !=
+          f.view.manifest().generation.controllers[0].global_generation);
+    CHECK(live.proof->tracker_install().children[0].units.size() == 1);
+    CHECK(live.proof->tracker_install().children[0].units[0].repr_gen == 1);
+    CHECK(live.proof->tracker_install().children[0].units[0].repr_gen !=
+          f.view.manifest().generation.controllers[0].units[0].repr_gen);
+    CHECK(live.proof->tracker_install().children[0].units[0].last_transition ==
+          vbr_repr_transition::whole_import);
+    // Stash disposition is orthogonal to tracker provenance: an observed
+    // target rebases generation but may still restore a complete exact prefix.
+    CHECK(live.proof->children()[0].stash_action ==
+          vbr_validated_stash_action::restore_exact);
+
+    auto downward_target = f.target;
+    auto & downward_unit = downward_target.children[0].units[0];
+    downward_unit.current_type = GGML_TYPE_TURBO3_TCQ;
+    downward_unit.downward_supported = true;
+    downward_unit.downward_type = downward_unit.current_type;
+    downward_unit.downward_domain = vbr_repr_domain::tapped;
+    downward_unit.downward_recipe_id = 1;
+    downward_unit.downward_recipe_version = 1;
+    downward_unit.downward_build_identity_digest = marker(0xd1);
+    downward_unit.downward_row_bytes = 2;
+    downward_unit.downward_mapped_bytes = 2;
+    downward_unit.downward_transfer_bytes = 4;
+    downward_unit.downward_codec_workspace_bytes = 4;
+    llama_cache_budget_plan downward_plan;
+    downward_plan.accounting_serial = f.accounting.serial;
+    auto downward_policy = f.policy;
+    downward_policy.adoption_nonce = first_nonce + 4;
+    downward_policy.downward_budget_plan = &downward_plan;
+    auto downward = validate(f, downward_target, downward_policy);
+    CHECK(downward.status == vbr_manifest_validation_status::validated);
+    CHECK(downward.decision == vbr_import_decision::downward_rebase);
+    CHECK(downward.proof && downward.proof->children()[0].downward);
+    CHECK(downward.proof->tracker_install().children[0].transition ==
+          vbr_tracker_install_transition::whole_import);
+    CHECK(downward.proof->tracker_install().children[0].units[0].repr_gen == 1);
+    CHECK(downward.proof->tracker_install().children[0].units[0].last_transition ==
+          vbr_repr_transition::whole_import);
+
+    auto restrictive = f.base.budget;
+    for (auto & device : restrictive.devices) {
+        device.configured_cache_cap = 0;
+        device.cache_cap_state = llama_cache_budget_capacity_state::known;
+    }
+    auto fallback_policy = f.policy;
+    fallback_policy.budget_config = &restrictive;
+    auto rebuild = validate(f, f.target, fallback_policy);
+    CHECK(rebuild.status == vbr_manifest_validation_status::validated);
+    CHECK(rebuild.decision == vbr_import_decision::rebuild);
+    CHECK(!rebuild.proof);
+    fallback_policy.allow_rebuild = false;
+    auto cold = validate(f, f.target, fallback_policy);
+    CHECK(cold.status == vbr_manifest_validation_status::validated);
+    CHECK(cold.decision == vbr_import_decision::cold);
+    fallback_policy.allow_cold = false;
+    auto reject = validate(f, f.target, fallback_policy);
+    CHECK(reject.status == vbr_manifest_validation_status::validated);
+    CHECK(reject.decision == vbr_import_decision::reject);
+
+    auto check_status = [&](vbr_manifest_validation_status expected,
+                            vbr_target_validation_snapshot target,
+                            vbr_adopt_policy policy) {
+        const auto result = validate(f, target, policy);
+        CHECK(result.status == expected);
+        CHECK(result.decision == vbr_import_decision::reject);
+        CHECK(!result.proof);
+    };
+    auto policy = f.policy;
+    policy.authorized = false;
+    check_status(vbr_manifest_validation_status::unauthorized, f.target, policy);
+    policy = f.policy;
+    policy.identity.execution_identity += ":wrong";
+    check_status(vbr_manifest_validation_status::identity_mismatch, f.target, policy);
+    policy = f.policy;
+    policy.identity.tokens[0]++;
+    check_status(vbr_manifest_validation_status::token_block_mismatch, f.target, policy);
+
+    auto target = f.target;
+    target.children.clear();
+    check_status(vbr_manifest_validation_status::memory_tree_mismatch, target, f.policy);
+    target = f.target;
+    target.scheduler_idle = false;
+    check_status(vbr_manifest_validation_status::target_not_idle, target, f.policy);
+    target = f.target;
+    target.children[0].empty = false;
+    check_status(vbr_manifest_validation_status::target_not_empty, target, f.policy);
+    target = f.target;
+    target.destination_sequence_absent = false;
+    check_status(vbr_manifest_validation_status::target_not_empty, target, f.policy);
+    target = f.target;
+    target.children[0].dedicated = false;
+    check_status(vbr_manifest_validation_status::target_not_dedicated, target, f.policy);
+    target = f.target;
+    target.children[0].armed = false;
+    check_status(vbr_manifest_validation_status::target_not_armed, target, f.policy);
+    target = f.target;
+    target.children[0].units[0].n_stream = 2;
+    check_status(vbr_manifest_validation_status::target_not_armed, target, f.policy);
+    target = f.target;
+    target.children[0].units[0].rank++;
+    check_status(vbr_manifest_validation_status::geometry_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].units.push_back(target.children[0].units[0]);
+    check_status(vbr_manifest_validation_status::geometry_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].units[0].shards[0].device_ordinal = 1;
+    check_status(vbr_manifest_validation_status::topology_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].units[0].codec_id++;
+    check_status(vbr_manifest_validation_status::representation_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].units[0].codebook_digest[0] ^= 1;
+    check_status(vbr_manifest_validation_status::codebook_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].controller_policy.policy_digest[0] ^= 1;
+    check_status(vbr_manifest_validation_status::policy_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].generation_compatible = false;
+    check_status(vbr_manifest_validation_status::generation_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].ownership_compatible = false;
+    check_status(vbr_manifest_validation_status::ownership_mismatch, target, f.policy);
+    target = f.target;
+    target.children[0].stash_compatible = false;
+    check_status(vbr_manifest_validation_status::stash_inconsistent, target, f.policy);
+    target = f.target;
+    target.companions.clear();
+    check_status(
+        vbr_manifest_validation_status::required_companion_unavailable,
+        target, f.policy);
+    policy = f.policy;
+    policy.parse_companion = nullptr;
+    check_status(
+        vbr_manifest_validation_status::required_companion_unavailable,
+        f.target, policy);
+
+    policy = f.policy;
+    policy.accounting_snapshot = nullptr;
+    check_status(vbr_manifest_validation_status::accounting_unavailable, f.target, policy);
+    policy = f.policy;
+    policy.budget_config = nullptr;
+    check_status(vbr_manifest_validation_status::accounting_unavailable, f.target, policy);
+    policy = f.policy;
+    auto unavailable_budget = f.base.budget;
+    unavailable_budget.devices[0].phys_state =
+        llama_cache_budget_capacity_state::unavailable;
+    policy.budget_config = &unavailable_budget;
+    check_status(vbr_manifest_validation_status::budget_unavailable, f.target, policy);
+    policy = f.policy;
+    policy.native_instance_available = false;
+    check_status(vbr_manifest_validation_status::native_lineage_unavailable, f.target, policy);
+    policy = f.policy;
+    policy.adoption_nonce = 0;
+    check_status(vbr_manifest_validation_status::internal_error, f.target, policy);
+    policy = f.policy;
+    validator_serials drift = f.serials;
+    drift.accounting++;
+    policy.context = &drift;
+    check_status(vbr_manifest_validation_status::unavailable, f.target, policy);
+    policy = f.policy;
+    drift = f.serials;
+    drift.target_stable = false;
+    policy.context = &drift;
+    check_status(vbr_manifest_validation_status::unavailable, f.target, policy);
+
+    validator_fixture partial(false, 1);
+    partial.policy.adoption_nonce = first_nonce + 10;
+    const auto partial_result = validate(
+        partial, partial.target, partial.policy);
+    CHECK(partial_result.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(partial_result.decision == vbr_import_decision::live_rebased);
+    CHECK(partial_result.proof);
+    CHECK(partial_result.proof->children()[0].stash_action ==
+          vbr_validated_stash_action::omit_live_rebased);
+    CHECK(partial_result.proof->manifest_digest() !=
+          native.proof->manifest_digest());
+    CHECK(partial_result.proof->adoption_nonce() != first_nonce);
+
+    validator_fixture stashless(false, 2);
+    stashless.policy.adoption_nonce = first_nonce + 11;
+    const auto stashless_result = validate(
+        stashless, stashless.target, stashless.policy);
+    CHECK(stashless_result.status ==
+          vbr_manifest_validation_status::validated);
+    CHECK(stashless_result.decision ==
+          vbr_import_decision::live_rebased);
+    CHECK(stashless_result.proof);
+    CHECK(stashless_result.proof->children()[0].stash_action ==
+          vbr_validated_stash_action::none_at_source);
+
+    validator_fixture legacy(true);
+    const auto legacy_result = validate(
+        legacy, legacy.target, legacy.policy);
+    CHECK(legacy_result.status ==
+          vbr_manifest_validation_status::restore_metadata_missing);
+    CHECK(legacy_result.decision == vbr_import_decision::rebuild);
+    CHECK(!legacy_result.proof);
+    auto legacy_cold_policy = legacy.policy;
+    legacy_cold_policy.allow_rebuild = false;
+    const auto legacy_cold = validate(
+        legacy, legacy.target, legacy_cold_policy);
+    CHECK(legacy_cold.status ==
+          vbr_manifest_validation_status::restore_metadata_missing);
+    CHECK(legacy_cold.decision == vbr_import_decision::cold);
+    CHECK(!legacy_cold.proof);
+
+    for (uint8_t i = 0;
+         i < uint8_t(vbr_import_decision::_count); ++i) {
+        CHECK(strcmp(vbr_import_decision_name(
+                  vbr_import_decision(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0;
+         i < uint8_t(vbr_manifest_validation_status::_count); ++i) {
+        CHECK(strcmp(vbr_manifest_validation_status_name(
+                  vbr_manifest_validation_status(i)), "invalid") != 0);
+    }
+}
+
 int main() {
     test_golden_and_native_lineage();
     test_v1_decode_and_v2_restore_metadata();
@@ -2012,6 +2632,7 @@ int main() {
     test_catalog_full_id_interning_and_stash_dedup();
     test_catalog_capacity_sequential_and_temporaries();
     test_catalog_package_lease_and_reference_placement();
+    test_manifest_validator_matrix();
     if (failures != 0) {
         fprintf(stderr, "%d VBR artifact test(s) failed\n", failures);
         return 1;

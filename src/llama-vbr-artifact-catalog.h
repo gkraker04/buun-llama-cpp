@@ -88,12 +88,26 @@ enum class vbr_artifact_retire_status : uint8_t {
     _count,
 };
 
+struct vbr_artifact_allocation_view {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::container_overhead;
+    llama_cache_acct_resource_domain domain;
+    uint64_t logical = 0;
+    uint64_t resident = 0;
+    llama_cache_acct_alloc_id allocation;
+    llama_cache_acct_artifact_id artifact;
+    llama_cache_acct_content_digest content;
+    llama_cache_acct_lineage_id lineage;
+};
+
 struct vbr_artifact_unit_view {
     vbr_unit_version_id unit_version_id;
     vbr_payload_digest payload_digest;
     vbr_artifact_unit_descriptor descriptor;
     std::vector<std::shared_ptr<const artifact_segment_chain>> payload_shards;
     std::vector<std::shared_ptr<const artifact_segment_chain>> stash_shards;
+    std::vector<vbr_artifact_allocation_view> payload_allocations;
+    std::vector<vbr_artifact_allocation_view> stash_allocations;
 };
 
 struct vbr_artifact_companion_view {
@@ -121,6 +135,11 @@ public:
     const vbr_artifact_reference_manifest & manifest() const noexcept;
     const std::vector<vbr_artifact_unit_view> & units() const noexcept;
     const std::vector<vbr_artifact_companion_view> & companions() const noexcept;
+    const std::vector<vbr_artifact_allocation_view> &
+        reference_allocations() const noexcept;
+    vbr_artifact_status validate() const noexcept;
+    vbr_artifact_resolve_status retain(
+        vbr_artifact_package_view & output) const noexcept;
     void reset() noexcept;
 
 private:

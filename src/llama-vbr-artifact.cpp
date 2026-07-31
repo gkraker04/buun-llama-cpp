@@ -1550,6 +1550,84 @@ bool package_metadata_valid(
     return manifest_valid(package, limits, require_sources);
 }
 
+bool prepared_identity_equal(
+        const vbr_artifact_package & expected,
+        const vbr_artifact_package & canonical) {
+    if (expected.version != canonical.version ||
+        expected.flags != canonical.flags ||
+        expected.topologies.size() != canonical.topologies.size() ||
+        expected.unit_blobs.size() != canonical.unit_blobs.size() ||
+        expected.companions.size() != canonical.companions.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < expected.topologies.size(); ++i) {
+        if (expected.topologies[i].digest != canonical.topologies[i].digest) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < expected.unit_blobs.size(); ++i) {
+        const auto & lhs = expected.unit_blobs[i];
+        const auto & rhs = canonical.unit_blobs[i];
+        if (lhs.unit_version_id != rhs.unit_version_id ||
+            lhs.payload_digest != rhs.payload_digest ||
+            lhs.descriptor.clean_stash.payload_id !=
+                rhs.descriptor.clean_stash.payload_id ||
+            lhs.descriptor.shards.size() != rhs.descriptor.shards.size() ||
+            lhs.descriptor.clean_stash.shards.size() !=
+                rhs.descriptor.clean_stash.shards.size()) {
+            return false;
+        }
+        for (size_t j = 0; j < lhs.descriptor.shards.size(); ++j) {
+            if (lhs.descriptor.shards[j].section_checksum !=
+                    rhs.descriptor.shards[j].section_checksum) {
+                return false;
+            }
+        }
+        for (size_t j = 0;
+             j < lhs.descriptor.clean_stash.shards.size(); ++j) {
+            if (lhs.descriptor.clean_stash.shards[j].section_checksum !=
+                    rhs.descriptor.clean_stash.shards[j].section_checksum) {
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < expected.companions.size(); ++i) {
+        if (expected.companions[i].payload_digest !=
+                canonical.companions[i].payload_digest ||
+            expected.companions[i].section_checksum !=
+                canonical.companions[i].section_checksum) {
+            return false;
+        }
+    }
+    const auto & lhs = expected.manifest;
+    const auto & rhs = canonical.manifest;
+    if (lhs.capture_generation_id != rhs.capture_generation_id ||
+        lhs.token_block.digest != rhs.token_block.digest ||
+        lhs.manifest_digest != rhs.manifest_digest ||
+        lhs.unit_references.size() != rhs.unit_references.size() ||
+        lhs.companions.size() != rhs.companions.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.unit_references.size(); ++i) {
+        const auto & a = lhs.unit_references[i];
+        const auto & b = rhs.unit_references[i];
+        if (a.unit_version_id != b.unit_version_id ||
+            a.payload_digest != b.payload_digest ||
+            a.stash_reference.payload_id != b.stash_reference.payload_id) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < lhs.companions.size(); ++i) {
+        if (lhs.companions[i].payload_digest !=
+                rhs.companions[i].payload_digest ||
+            lhs.companions[i].section_checksum !=
+                rhs.companions[i].section_checksum) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool prepare_companion(
         uint32_t index,
         const std::vector<vbr_artifact_portable_topology> & topologies,
@@ -3180,6 +3258,22 @@ vbr_artifact_status vbr_artifact_prepare(
             return vbr_artifact_status::malformed;
         }
         return vbr_artifact_status::ok;
+    } catch (...) {
+        return vbr_artifact_status::internal_error;
+    }
+}
+
+vbr_artifact_status vbr_artifact_validate_prepared_package(
+        const vbr_artifact_package & package) noexcept {
+    try {
+        auto canonical = package;
+        const auto status = vbr_artifact_prepare(canonical);
+        if (status != vbr_artifact_status::ok) {
+            return status;
+        }
+        return prepared_identity_equal(package, canonical) ?
+            vbr_artifact_status::ok :
+            vbr_artifact_status::content_id_mismatch;
     } catch (...) {
         return vbr_artifact_status::internal_error;
     }

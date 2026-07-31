@@ -46,6 +46,7 @@ add_library(llama
             llama-vbr-artifact.cpp
             llama-vbr-artifact-capture.cpp
             llama-vbr-artifact-catalog.cpp
+            llama-vbr-artifact-validate.cpp
             llama-vbr-explicit-capture.cpp
             llama-vbr-controller-id.cpp
             llama-vbr-generation.cpp

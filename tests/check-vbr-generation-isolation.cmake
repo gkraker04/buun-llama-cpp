@@ -26,8 +26,10 @@ endif()
 # Raw generation fields may be compared only by the one eligibility authority. Mutation code uses
 # tracker methods; the disabled oracle independently uses canonical bytes plus covered masks.
 # C2 hardening: the scan covers headers as well as sources. F2.1 adds one reviewed,
-# value-only wire codec for the complete generation record; it may serialize these fields
-# but is not an admission reader and imports only the immutable generation-types vocabulary.
+# value-only wire codec for the complete generation record. F4.1b adds the
+# read-only import validator that copies the already codec-validated tuples
+# into a non-forgeable proof. Neither is an admission reader or a live tracker
+# comparison authority.
 file(GLOB_RECURSE raw_scan_files
     "${SOURCE_ROOT}/src/*.cpp" "${SOURCE_ROOT}/src/*.h"
     "${SOURCE_ROOT}/common/*.cpp" "${SOURCE_ROOT}/common/*.h"
@@ -45,7 +47,7 @@ set(raw_generation_symbols
     "repr_gen")
 foreach(path IN LISTS raw_scan_files)
     if (path MATCHES
-        "/src/llama-vbr-(generation(\\.cpp|\\.h|-types\\.h)|artifact\\.(cpp|h)|explicit-capture\\.cpp)$")
+        "/src/llama-vbr-(generation(\\.cpp|\\.h|-types\\.h)|artifact(\\.cpp|\\.h|-validate\\.cpp|-validate\\.h)|explicit-capture\\.cpp)$")
         continue()
     endif()
     file(READ "${path}" text)

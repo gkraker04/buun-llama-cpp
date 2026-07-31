@@ -354,6 +354,13 @@ add_test(
 )
 
 add_test(
+    NAME test-vbr-artifact-validator-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-validator.cmake
+)
+
+add_test(
     NAME test-cache-plan-contract-source
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
