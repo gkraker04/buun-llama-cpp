@@ -29,11 +29,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
-        ggml-cpu/quants.c
         ggml-cpu/quants.h
         ggml-cpu/traits.cpp
         ggml-cpu/traits.h
@@ -53,6 +51,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
+
+    # On ARM without ALL_VARIANTS, exclude generic quants/repack sources —
+    # arch/arm/quants.c and arch/arm/repack.cpp are complete supersets.
+    # Including both causes duplicate symbols after arch-fallback.h renames.
+    if (NOT (GGML_SYSTEM_ARCH STREQUAL "ARM" AND NOT GGML_CPU_ALL_VARIANTS))
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/quants.c
+            ggml-cpu/repack.cpp
+        )
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
