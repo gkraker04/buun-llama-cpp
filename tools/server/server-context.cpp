@@ -6182,6 +6182,10 @@ private:
             token_count,
             next_position,
         };
+        request.token_block.reserve(size_t(token_count));
+        for (int64_t i = 0; i < token_count; ++i) {
+            request.token_block.push_back(slot.prompt.tokens[size_t(i)]);
+        }
         request.sequence = slot.id;
         request.frontier.execution_identity =
             request.identity.execution_identity.data();

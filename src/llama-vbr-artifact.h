@@ -11,7 +11,14 @@
 
 // Internal Phase-2 VBR artifact format. This is intentionally not part of public llama.h:
 // F2.1 defines only immutable value types and a fail-closed streaming codec.
-constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 1;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_MIN = 1;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION = 2;
+constexpr uint32_t VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT = 2;
+constexpr uint32_t VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION = 1;
+
+constexpr bool artifact_has_reference_placement(uint32_t version) {
+    return version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_REFERENCE_PLACEMENT;
+}
 
 struct vbr_unit_version_id_tag;
 struct vbr_payload_digest_tag;
@@ -19,6 +26,7 @@ struct vbr_stash_payload_id_tag;
 struct vbr_manifest_digest_tag;
 struct vbr_capture_generation_id_tag;
 struct vbr_transition_lineage_id_tag;
+struct vbr_token_block_digest_tag;
 
 using vbr_unit_version_id       = llama_cache_acct_digest<vbr_unit_version_id_tag>;
 using vbr_payload_digest        = llama_cache_acct_digest<vbr_payload_digest_tag>;
@@ -26,6 +34,7 @@ using vbr_stash_payload_id      = llama_cache_acct_digest<vbr_stash_payload_id_t
 using vbr_manifest_digest       = llama_cache_acct_digest<vbr_manifest_digest_tag>;
 using vbr_capture_generation_id = llama_cache_acct_digest<vbr_capture_generation_id_tag>;
 using vbr_transition_lineage_id = llama_cache_acct_digest<vbr_transition_lineage_id_tag>;
+using vbr_token_block_digest    = llama_cache_acct_digest<vbr_token_block_digest_tag>;
 
 enum class vbr_artifact_status : uint8_t {
     ok = 0,
@@ -191,6 +200,9 @@ struct vbr_artifact_decode_limits {
     uint32_t max_streams_per_controller = 256;
     uint32_t max_pages_per_stream = 1048576;
     uint32_t max_accounting_rows = 1048576;
+    uint32_t max_stream_placements = 4096;
+    uint32_t max_placement_cells = 1048576;
+    uint32_t max_token_ids = 1048576;
     uint32_t max_string_bytes = 1048576;
 };
 
@@ -303,6 +315,30 @@ struct vbr_artifact_identity_block {
     llama_pos next_position = -1;
 };
 
+// Restore placement is reference-local: it authenticates which cells one
+// reference may install without changing the dense unit blob's content
+// address. `shift` is deliberately absent; capture accepts only zero shift.
+struct vbr_artifact_cell_placement {
+    uint32_t physical_cell = UINT32_MAX;
+    llama_pos logical_position = -1;
+    llama_pos ext_x = 0;
+    llama_pos ext_y = 0;
+};
+
+struct vbr_artifact_stream_placement {
+    uint32_t child_id = UINT32_MAX;
+    uint32_t stream_index = UINT32_MAX;
+    llama_seq_id source_sequence = -1;
+    llama_pos computation_frontier = -1;
+    std::vector<vbr_artifact_cell_placement> cells;
+};
+
+struct vbr_artifact_token_block {
+    uint32_t codec_version = VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION;
+    std::vector<llama_token> tokens;
+    vbr_token_block_digest digest;
+};
+
 struct vbr_artifact_controller_policy {
     uint32_t child_id = 0;
     checkpoint_child_dependency_mode dependency_mode =
@@ -364,10 +400,12 @@ struct vbr_artifact_reference_manifest {
     uint32_t version = VBR_UNIT_ARTIFACT_FORMAT_VERSION;
     std::array<uint8_t, 32> identity_policy_order_digest = {};
     vbr_artifact_identity_block identity;
+    vbr_artifact_token_block token_block;
     vbr_checkpoint_generation_record generation;
     vbr_capture_generation_id capture_generation_id;
     vbr_artifact_consistency consistency;
     std::vector<vbr_artifact_controller_policy> controller_policy;
+    std::vector<vbr_artifact_stream_placement> stream_placements;
     std::vector<vbr_artifact_unit_reference> unit_references;
     std::vector<vbr_artifact_companion_payload> companions;
     std::vector<vbr_artifact_portable_accounting_row> accounting;

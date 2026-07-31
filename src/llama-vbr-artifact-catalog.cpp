@@ -98,6 +98,7 @@ struct llama_vbr_artifact_catalog::impl {
         std::vector<std::shared_ptr<const artifact_segment_chain>>
             companion_payloads;
         std::vector<llama_cache_acct_op_id> operations;
+        uint64_t borrow_count = 0;
     };
 
     struct txn_leaf {
@@ -226,6 +227,14 @@ struct llama_vbr_artifact_catalog::impl {
     uint64_t n_adopted = 0;
     uint64_t n_refusals = 0;
     uint64_t n_staging_overlap_refusals = 0;
+};
+
+struct vbr_artifact_package_view::storage {
+    llama_cache_acct_artifact_id reference;
+    std::vector<vbr_artifact_portable_topology> topologies;
+    vbr_artifact_reference_manifest manifest;
+    std::vector<vbr_artifact_unit_view> units;
+    std::vector<vbr_artifact_companion_view> companions;
 };
 
 namespace {
@@ -624,15 +633,78 @@ llama_vbr_artifact_catalog::llama_vbr_artifact_catalog(
         llama_cache_acct_ledger & ledger)
     : impl_(new impl(ledger)) {}
 
+vbr_artifact_package_view::vbr_artifact_package_view(
+        vbr_artifact_package_view && other) noexcept
+    : owner_(other.owner_),
+      storage_(std::move(other.storage_)) {
+    other.owner_ = nullptr;
+}
+
+vbr_artifact_package_view & vbr_artifact_package_view::operator=(
+        vbr_artifact_package_view && other) noexcept {
+    if (this != &other) {
+        reset();
+        owner_ = other.owner_;
+        storage_ = std::move(other.storage_);
+        other.owner_ = nullptr;
+    }
+    return *this;
+}
+
+vbr_artifact_package_view::~vbr_artifact_package_view() {
+    reset();
+}
+
+void vbr_artifact_package_view::reset() noexcept {
+    auto * owner = owner_;
+    const auto reference = reference_artifact();
+    owner_ = nullptr;
+    storage_.reset();
+    if (owner != nullptr) {
+        owner->release_reference_lease(reference);
+    }
+}
+
+llama_cache_acct_artifact_id
+vbr_artifact_package_view::reference_artifact() const noexcept {
+    return storage_ ? storage_->reference : llama_cache_acct_artifact_id{};
+}
+
+const std::vector<vbr_artifact_portable_topology> &
+vbr_artifact_package_view::topologies() const noexcept {
+    static const std::vector<vbr_artifact_portable_topology> empty;
+    return storage_ ? storage_->topologies : empty;
+}
+
+const vbr_artifact_reference_manifest &
+vbr_artifact_package_view::manifest() const noexcept {
+    static const vbr_artifact_reference_manifest empty;
+    return storage_ ? storage_->manifest : empty;
+}
+
+const std::vector<vbr_artifact_unit_view> &
+vbr_artifact_package_view::units() const noexcept {
+    static const std::vector<vbr_artifact_unit_view> empty;
+    return storage_ ? storage_->units : empty;
+}
+
+const std::vector<vbr_artifact_companion_view> &
+vbr_artifact_package_view::companions() const noexcept {
+    static const std::vector<vbr_artifact_companion_view> empty;
+    return storage_ ? storage_->companions : empty;
+}
+
 llama_vbr_artifact_catalog::~llama_vbr_artifact_catalog() {
     while (impl_ && !impl_->references.empty()) {
         const llama_cache_acct_artifact_id reference {
             impl_->references.begin()->first,
         };
-        if (!retire(reference)) {
+        const auto status = retire(reference);
+        if (status != vbr_artifact_retire_status::retired) {
             GGML_ABORT(
-                "VBR artifact catalog teardown could not release reference %" PRIu64,
-                reference.v);
+                "VBR artifact catalog teardown could not release reference %" PRIu64
+                " status=%u (live package view outlived catalog)",
+                reference.v, unsigned(status));
         }
     }
 }
@@ -2519,25 +2591,104 @@ llama_vbr_artifact_catalog::publish_stream_complete(
     }
 }
 
-bool llama_vbr_artifact_catalog::retire(
+vbr_artifact_resolve_status llama_vbr_artifact_catalog::resolve_reference(
+        llama_cache_acct_artifact_id reference,
+        vbr_artifact_package_view & out) noexcept {
+    out.reset();
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto it = impl_->references.find(reference.v);
+        if (it == impl_->references.end()) {
+            return vbr_artifact_resolve_status::not_found;
+        }
+        if (it->second.borrow_count == UINT64_MAX) {
+            return vbr_artifact_resolve_status::busy;
+        }
+
+        auto state = std::make_shared<vbr_artifact_package_view::storage>();
+        state->reference = reference;
+        state->topologies = impl_->topologies;
+        state->manifest = it->second.manifest;
+        state->units.reserve(it->second.unit_ids.size());
+        for (const auto & id : it->second.unit_ids) {
+            const auto found = impl_->blobs.find(id.bytes());
+            if (found == impl_->blobs.end()) {
+                return vbr_artifact_resolve_status::unavailable;
+            }
+            vbr_artifact_unit_view unit;
+            unit.unit_version_id = found->second.id;
+            unit.payload_digest = found->second.payload_digest;
+            unit.descriptor = found->second.descriptor;
+            for (auto & shard : unit.descriptor.shards) {
+                shard.payload = {};
+            }
+            for (auto & shard : unit.descriptor.clean_stash.shards) {
+                shard.payload = {};
+            }
+            unit.payload_shards = found->second.payload_shards;
+            if (found->second.stash_id.valid()) {
+                const auto stash = impl_->stashes.find(
+                    found->second.stash_id.bytes());
+                if (stash == impl_->stashes.end()) {
+                    return vbr_artifact_resolve_status::unavailable;
+                }
+                unit.stash_shards = stash->second.shards;
+            }
+            state->units.push_back(std::move(unit));
+        }
+        if (it->second.companion_payloads.size() !=
+            it->second.manifest.companions.size()) {
+            return vbr_artifact_resolve_status::unavailable;
+        }
+        state->companions.reserve(it->second.companion_payloads.size());
+        for (size_t i = 0; i < it->second.companion_payloads.size(); ++i) {
+            vbr_artifact_companion_view companion;
+            companion.descriptor = it->second.manifest.companions[i];
+            companion.descriptor.payload = {};
+            companion.payload = it->second.companion_payloads[i];
+            state->companions.push_back(std::move(companion));
+        }
+
+        ++it->second.borrow_count;
+        out.owner_ = this;
+        out.storage_ = std::move(state);
+        return vbr_artifact_resolve_status::ok;
+    } catch (...) {
+        return vbr_artifact_resolve_status::internal_error;
+    }
+}
+
+void llama_vbr_artifact_catalog::release_reference_lease(
+        llama_cache_acct_artifact_id reference) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->references.find(reference.v);
+    GGML_ASSERT(it != impl_->references.end() &&
+                it->second.borrow_count > 0);
+    --it->second.borrow_count;
+}
+
+vbr_artifact_retire_status llama_vbr_artifact_catalog::retire(
         llama_cache_acct_artifact_id reference) noexcept {
     try {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         const auto it = impl_->references.find(reference.v);
         if (it == impl_->references.end()) {
-            return false;
+            return vbr_artifact_retire_status::not_found;
+        }
+        if (it->second.borrow_count != 0) {
+            return vbr_artifact_retire_status::busy;
         }
         const auto serial = impl_->ledger.snapshot().serial;
         llama_cache_acct_release_set_preview preview;
         if (!impl_->ledger.preview_release_set(
                 it->second.operations, serial, preview)) {
-            return false;
+            return vbr_artifact_retire_status::internal_error;
         }
         for (const auto op : it->second.operations) {
             const bool released = impl_->ledger.release(op);
             GGML_ASSERT(released);
             if (!released) {
-                return false;
+                return vbr_artifact_retire_status::internal_error;
             }
         }
         const auto units = it->second.unit_ids;
@@ -2580,9 +2731,9 @@ bool llama_vbr_artifact_catalog::retire(
                 impl_->stashes.erase(stash);
             }
         }
-        return true;
+        return vbr_artifact_retire_status::retired;
     } catch (...) {
-        return false;
+        return vbr_artifact_retire_status::internal_error;
     }
 }
 

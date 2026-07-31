@@ -1,4 +1,4 @@
-# F2.1 artifact-format contract: the wire vocabulary is internal, its six SHA-256
+# F2.1/F4.1a artifact-format contract: the wire vocabulary is internal, its tagged SHA-256
 # identity purposes remain non-interchangeable, and process-local coordination/accounting
 # identities never enter the codec. Negative controls mutate source text in memory.
 
@@ -10,6 +10,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/contract-scan-utils.cmake")
 
 file(READ "${SOURCE_ROOT}/src/llama-vbr-artifact.h" artifact_header)
 file(READ "${SOURCE_ROOT}/src/llama-vbr-artifact.cpp" artifact_source)
+file(READ "${SOURCE_ROOT}/src/llama-kv-cache.cpp" kv_cache_source)
 file(READ "${SOURCE_ROOT}/include/llama.h" public_header)
 file(READ "${SOURCE_ROOT}/src/llama-cache-accounting.h" accounting_header)
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" cache_plan_header)
@@ -20,7 +21,8 @@ foreach(identity IN ITEMS
         vbr_stash_payload_id
         vbr_manifest_digest
         vbr_capture_generation_id
-        vbr_transition_lineage_id)
+        vbr_transition_lineage_id
+        vbr_token_block_digest)
     count_literal("${artifact_header}" "using ${identity}" identity_definitions)
     if (NOT identity_definitions EQUAL 1)
         message(FATAL_ERROR
@@ -67,6 +69,58 @@ foreach(forbidden IN ITEMS
             "process-local identity '${forbidden}' leaked into the F2.1 format")
     endif()
 endforeach()
+
+count_literal("${artifact_header}"
+    "VBR_UNIT_ARTIFACT_FORMAT_VERSION = 2" artifact_format_v2)
+if (NOT artifact_format_v2 EQUAL 1)
+    message(FATAL_ERROR "F4.1a artifact format must be pinned to v2")
+endif()
+count_literal("${artifact_header}"
+    "artifact_has_reference_placement" placement_version_predicate)
+if (NOT placement_version_predicate EQUAL 1)
+    message(FATAL_ERROR
+        "F4.1a reference-placement version predicate must have one definition")
+endif()
+string(REGEX MATCH "version[ \t\r\n]*>=[ \t\r\n]*2"
+    raw_placement_version_test "${artifact_source}")
+if (NOT raw_placement_version_test STREQUAL "")
+    message(FATAL_ERROR
+        "F4.1a artifact codec bypassed artifact_has_reference_placement")
+endif()
+string(FIND "${artifact_header}${artifact_source}"
+    "vbr_controller_instance_id" runtime_instance_leak)
+if (NOT runtime_instance_leak EQUAL -1)
+    message(FATAL_ERROR "F4.1a runtime instance leaked into artifact v2")
+endif()
+foreach(split_access IN ITEMS "lineage_uuid.hi" "lineage_uuid.lo")
+    string(FIND "${artifact_header}${artifact_source}"
+        "${split_access}" split_found)
+    if (NOT split_found EQUAL -1)
+        message(FATAL_ERROR
+            "F4.1a consumers must treat lineage_uuid as opaque (${split_access})")
+    endif()
+endforeach()
+foreach(codec_access IN ITEMS "lineage.hi" "lineage.lo")
+    count_literal("${artifact_source}" "${codec_access}" codec_count)
+    if (NOT codec_count EQUAL 2)
+        message(FATAL_ERROR
+            "F4.1a opaque lineage codec door changed (${codec_access}=${codec_count})")
+    endif()
+endforeach()
+string(REGEX MATCH
+    "struct vbr_artifact_cell_placement[^\{]*\{[^}]*\}"
+    placement_struct "${artifact_header}")
+string(FIND "${placement_struct}" "shift" serialized_shift)
+if (placement_struct STREQUAL "" OR NOT serialized_shift EQUAL -1)
+    message(FATAL_ERROR
+        "F4.1a placement must exist and must not serialize shift")
+endif()
+count_literal("${kv_cache_source}"
+    "cells.get_shift(cell) != 0" capture_shift_guard)
+if (NOT capture_shift_guard EQUAL 1)
+    message(FATAL_ERROR
+        "F4.1a capture must fail closed on nonzero source shift")
+endif()
 
 set(process_local_negative
     "${artifact_header}\nstruct bad_wire { llama_cache_acct_op_id op; };")

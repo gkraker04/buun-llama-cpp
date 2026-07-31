@@ -139,11 +139,12 @@ foreach(token IN ITEMS vbr_lineage_uuid vbr_controller_instance_id)
     endif()
 endforeach()
 
-# F4.0 is type-only at the durable boundary: no format or schema version moves.
+# F4.1a is the reviewed artifact-only v2 move. F4.0 still pins the C/cache-plan
+# schemas and confirms the runtime identity remains absent from the wire.
 file(READ "${SOURCE_ROOT}/src/llama-vbr-artifact.h" artifact_header)
 file(READ "${SOURCE_ROOT}/src/llama-cache-accounting.h" accounting_header)
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" cache_plan_header)
-count_literal("${artifact_header}" "VBR_UNIT_ARTIFACT_FORMAT_VERSION = 1" artifact_version)
+count_literal("${artifact_header}" "VBR_UNIT_ARTIFACT_FORMAT_VERSION = 2" artifact_version)
 count_literal("${accounting_header}"
     "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2" accounting_version)
 count_literal("${cache_plan_header}"
@@ -151,7 +152,7 @@ count_literal("${cache_plan_header}"
 if (NOT artifact_version EQUAL 1 OR NOT accounting_version EQUAL 1 OR
     NOT cache_plan_version EQUAL 1)
     message(FATAL_ERROR
-        "F4.0 changed a frozen wire/schema version "
+        "F4.0/F4.1a changed an unreviewed wire/schema version "
         "(artifact=${artifact_version} C=${accounting_version} plan=${cache_plan_version})")
 endif()
 

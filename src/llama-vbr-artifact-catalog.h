@@ -71,6 +71,65 @@ struct llama_vbr_artifact_reference_tokens {
     llama_cache_acct_lineage_id lineage;
 };
 
+enum class vbr_artifact_resolve_status : uint8_t {
+    ok = 0,
+    not_found,
+    busy,
+    unavailable,
+    internal_error,
+    _count,
+};
+
+enum class vbr_artifact_retire_status : uint8_t {
+    retired = 0,
+    busy,
+    not_found,
+    internal_error,
+    _count,
+};
+
+struct vbr_artifact_unit_view {
+    vbr_unit_version_id unit_version_id;
+    vbr_payload_digest payload_digest;
+    vbr_artifact_unit_descriptor descriptor;
+    std::vector<std::shared_ptr<const artifact_segment_chain>> payload_shards;
+    std::vector<std::shared_ptr<const artifact_segment_chain>> stash_shards;
+};
+
+struct vbr_artifact_companion_view {
+    vbr_artifact_companion_payload descriptor;
+    std::shared_ptr<const artifact_segment_chain> payload;
+};
+
+class llama_vbr_artifact_catalog;
+
+// A catalog lease exposes only immutable restore inputs. The catalog is the
+// single owner and must outlive every view.
+class vbr_artifact_package_view {
+public:
+    vbr_artifact_package_view() = default;
+    vbr_artifact_package_view(vbr_artifact_package_view && other) noexcept;
+    vbr_artifact_package_view & operator=(vbr_artifact_package_view && other) noexcept;
+    ~vbr_artifact_package_view();
+
+    vbr_artifact_package_view(const vbr_artifact_package_view &) = delete;
+    vbr_artifact_package_view & operator=(const vbr_artifact_package_view &) = delete;
+
+    explicit operator bool() const noexcept { return owner_ != nullptr; }
+    llama_cache_acct_artifact_id reference_artifact() const noexcept;
+    const std::vector<vbr_artifact_portable_topology> & topologies() const noexcept;
+    const vbr_artifact_reference_manifest & manifest() const noexcept;
+    const std::vector<vbr_artifact_unit_view> & units() const noexcept;
+    const std::vector<vbr_artifact_companion_view> & companions() const noexcept;
+    void reset() noexcept;
+
+private:
+    struct storage;
+    friend class llama_vbr_artifact_catalog;
+    llama_vbr_artifact_catalog * owner_ = nullptr;
+    std::shared_ptr<const storage> storage_;
+};
+
 class llama_vbr_artifact_catalog : public vbr_unit_version_sink {
 public:
     explicit llama_vbr_artifact_catalog(llama_cache_acct_ledger & ledger);
@@ -116,7 +175,11 @@ public:
 
     // Release every ledger reference owned by this checkpoint reference.
     // Physical payload/stash bytes discharge only when C observes the last op.
-    bool retire(llama_cache_acct_artifact_id reference) noexcept;
+    vbr_artifact_resolve_status resolve_reference(
+        llama_cache_acct_artifact_id reference,
+        vbr_artifact_package_view & out) noexcept;
+    vbr_artifact_retire_status retire(
+        llama_cache_acct_artifact_id reference) noexcept;
 
     bool reference_tokens(
         llama_cache_acct_artifact_id reference,
@@ -150,6 +213,9 @@ private:
         vbr_capture_begin_diagnostics * diagnostics) noexcept;
 
     friend class llama_vbr_artifact_catalog_stream_build;
+    friend class vbr_artifact_package_view;
+    void release_reference_lease(
+        llama_cache_acct_artifact_id reference) noexcept;
 };
 
 const char * llama_vbr_artifact_publish_status_name(

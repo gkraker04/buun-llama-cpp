@@ -66,6 +66,12 @@ struct vbr_checkpoint_generation_stream {
     std::vector<vbr_generation_page_ref> pages;
 };
 
+// One canonical expansion of the production page masks. The oracle, artifact
+// validator, and any future readers share this door rather than replicating
+// mask-word geometry.
+std::vector<uint32_t> vbr_generation_production_covered_set(
+    const vbr_checkpoint_generation_stream & production_record);
+
 struct vbr_checkpoint_generation_controller {
     uint32_t                                      child_id          = 0;
     checkpoint_child_dependency_mode              dependency_mode   = checkpoint_child_dependency_mode::absent;

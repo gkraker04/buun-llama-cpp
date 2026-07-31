@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
 #include <set>
 #include <utility>
@@ -24,6 +25,8 @@ constexpr uint64_t MIN_WIRE_STREAM = 20;
 constexpr uint64_t MIN_WIRE_PAGE = 40;
 constexpr uint64_t MIN_WIRE_SHARD = 84;
 constexpr uint64_t MIN_WIRE_CONTROLLER_POLICY = 144;
+constexpr uint64_t MIN_WIRE_STREAM_PLACEMENT = 20;
+constexpr uint64_t MIN_WIRE_CELL_PLACEMENT = 16;
 constexpr uint64_t MIN_WIRE_UNIT_REFERENCE = 100;
 constexpr uint64_t MIN_WIRE_COMPANION_REFERENCE = 128;
 constexpr uint64_t MIN_WIRE_ACCOUNTING_ROW = 40;
@@ -38,6 +41,7 @@ constexpr char DOMAIN_MANIFEST[] = "buun.vbr.reference-manifest";
 constexpr char DOMAIN_CAPTURE[] = "buun.vbr.capture-generation";
 constexpr char DOMAIN_SHARD[] = "buun.vbr.shard";
 constexpr char DOMAIN_COMPANION[] = "buun.vbr.companion";
+constexpr char DOMAIN_TOKEN_BLOCK[] = "buun.vbr.token-block";
 
 static_assert(llama_cache_acct_all_ids_distinct<
         vbr_unit_version_id,
@@ -46,6 +50,7 @@ static_assert(llama_cache_acct_all_ids_distinct<
         vbr_manifest_digest,
         vbr_capture_generation_id,
         vbr_transition_lineage_id,
+        vbr_token_block_digest,
         llama_cache_acct_content_digest,
         llama_cache_acct_lineage_id>::value);
 static_assert(llama_cache_acct_distinct_from_all<
@@ -63,6 +68,11 @@ bool digest_nonzero(const std::array<uint8_t, 32> & bytes) {
     return std::any_of(bytes.begin(), bytes.end(), [](uint8_t value) {
         return value != 0;
     });
+}
+
+bool artifact_version_supported(uint32_t version) {
+    return version >= VBR_UNIT_ARTIFACT_FORMAT_VERSION_MIN &&
+           version <= VBR_UNIT_ARTIFACT_FORMAT_VERSION;
 }
 
 template <typename Digest>
@@ -748,13 +758,22 @@ bool prepare_stash_digest(vbr_artifact_unit_blob & blob) {
     return stash.payload_id.valid();
 }
 
-bool prepare_unit_id(vbr_artifact_unit_blob & blob) {
+bool hash_lineage(
+        llama_sha256_writer & hash,
+        const vbr_lineage_uuid & lineage) {
+    emitter out;
+    out.hash_a = &hash;
+    return emit_lineage(out, lineage) && out.ok;
+}
+
+bool prepare_unit_id(vbr_artifact_unit_blob & blob, uint32_t format_version) {
     const auto & descriptor = blob.descriptor;
     llama_sha256_writer hash;
     hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
-    hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    hash.u64(descriptor.lineage_uuid.hi);
-    hash.u64(descriptor.lineage_uuid.lo);
+    hash.u32(format_version);
+    if (!hash_lineage(hash, descriptor.lineage_uuid)) {
+        return false;
+    }
     hash.u32(descriptor.logical_unit_id);
     hash.u64(descriptor.repr_gen);
     if (!hash_sized_descriptor(hash, descriptor)) {
@@ -795,6 +814,65 @@ bool emit_identity(emitter & out, const vbr_artifact_identity_block & identity) 
            out.u64(identity.sequence_epoch) &&
            out.i64(identity.token_count) &&
            out.i32(identity.next_position);
+}
+
+bool emit_token_block(
+        emitter & out,
+        const vbr_artifact_token_block & block,
+        bool include_digest) {
+    if (!out.u32(block.codec_version) ||
+        !out.u32(uint32_t(block.tokens.size()))) {
+        return false;
+    }
+    for (llama_token token : block.tokens) {
+        if (!out.i32(token)) {
+            return false;
+        }
+    }
+    return !include_digest || out.digest(block.digest);
+}
+
+bool prepare_token_block(
+        const vbr_artifact_identity_block & identity,
+        const std::array<uint8_t, 32> & identity_policy_order_digest,
+        vbr_artifact_token_block & block) {
+    if (block.codec_version != VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION ||
+        block.tokens.size() != size_t(identity.token_count) ||
+        block.tokens.size() > UINT32_MAX) {
+        return false;
+    }
+    llama_sha256_writer hash;
+    hash.string(DOMAIN_TOKEN_BLOCK, sizeof(DOMAIN_TOKEN_BLOCK) - 1);
+    emitter out;
+    out.hash_a = &hash;
+    if (!emit_identity(out, identity) ||
+        !out.array_digest(identity_policy_order_digest) ||
+        !emit_token_block(out, block, false) || !out.ok) {
+        return false;
+    }
+    block.digest = typed_digest<vbr_token_block_digest>(hash);
+    return block.digest.valid();
+}
+
+bool emit_stream_placement(
+        emitter & out,
+        const vbr_artifact_stream_placement & placement) {
+    if (!out.u32(placement.child_id) ||
+        !out.u32(placement.stream_index) ||
+        !out.i32(placement.source_sequence) ||
+        !out.i32(placement.computation_frontier) ||
+        !out.u32(uint32_t(placement.cells.size()))) {
+        return false;
+    }
+    for (const auto & cell : placement.cells) {
+        if (!out.u32(cell.physical_cell) ||
+            !out.i32(cell.logical_position) ||
+            !out.i32(cell.ext_x) ||
+            !out.i32(cell.ext_y)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool emit_controller_policy(
@@ -892,6 +970,8 @@ bool emit_manifest_body(
     if (!out.u32(manifest.version) ||
         !out.array_digest(manifest.identity_policy_order_digest) ||
         !emit_identity(out, manifest.identity) ||
+        (artifact_has_reference_placement(manifest.version) &&
+         !emit_token_block(out, manifest.token_block, true)) ||
         !emit_generation_record(out, manifest.generation) ||
         !out.digest(manifest.capture_generation_id) ||
         !emit_consistency(out, manifest.consistency) ||
@@ -901,6 +981,16 @@ bool emit_manifest_body(
     for (const auto & policy : manifest.controller_policy) {
         if (!emit_controller_policy(out, policy)) {
             return false;
+        }
+    }
+    if (artifact_has_reference_placement(manifest.version)) {
+        if (!out.u32(uint32_t(manifest.stream_placements.size()))) {
+            return false;
+        }
+        for (const auto & placement : manifest.stream_placements) {
+            if (!emit_stream_placement(out, placement)) {
+                return false;
+            }
         }
     }
     if (!out.u32(uint32_t(manifest.unit_references.size()))) {
@@ -972,6 +1062,97 @@ bool identity_valid(
            (identity.execution_identity.size() <= limits->max_string_bytes &&
             identity.adapter_config_identity.size() <= limits->max_string_bytes &&
             identity.media_content_identity.size() <= limits->max_string_bytes);
+}
+
+bool token_block_valid(
+        const vbr_artifact_identity_block & identity,
+        const std::array<uint8_t, 32> & identity_policy_order_digest,
+        const vbr_artifact_token_block & block,
+        const vbr_artifact_decode_limits * limits) {
+    if (block.codec_version != VBR_ARTIFACT_TOKEN_BLOCK_CODEC_VERSION ||
+        block.tokens.size() != size_t(identity.token_count) ||
+        (limits && block.tokens.size() > limits->max_token_ids) ||
+        !block.digest.valid()) {
+        return false;
+    }
+    auto canonical = block;
+    return prepare_token_block(
+               identity, identity_policy_order_digest, canonical) &&
+           canonical.digest == block.digest;
+}
+
+bool reference_metadata_absent(
+        const vbr_artifact_reference_manifest & manifest) {
+    return manifest.token_block.tokens.empty() &&
+           !manifest.token_block.digest.valid() &&
+           manifest.stream_placements.empty();
+}
+
+bool placement_valid(
+        const vbr_artifact_reference_manifest & manifest,
+        const vbr_artifact_decode_limits * limits) {
+    size_t expected_streams = 0;
+    uint64_t total_cells = 0;
+    for (const auto & controller : manifest.generation.controllers) {
+        if (controller.dependency_mode ==
+            checkpoint_child_dependency_mode::live_guarded) {
+            expected_streams += controller.streams.size();
+        }
+    }
+    if (manifest.stream_placements.size() != expected_streams ||
+        (limits && manifest.stream_placements.size() >
+                       limits->max_stream_placements)) {
+        return false;
+    }
+
+    size_t next = 0;
+    std::map<llama_seq_id, std::set<llama_pos>> logical_positions;
+    for (const auto & controller : manifest.generation.controllers) {
+        if (controller.dependency_mode !=
+            checkpoint_child_dependency_mode::live_guarded) {
+            continue;
+        }
+        for (const auto & stream : controller.streams) {
+            if (next >= manifest.stream_placements.size()) {
+                return false;
+            }
+            const auto & placement = manifest.stream_placements[next++];
+            if (placement.child_id != controller.child_id ||
+                placement.stream_index != stream.stream_index ||
+                placement.source_sequence != stream.dependency_seq_id ||
+                placement.computation_frontier !=
+                    stream.computation_frontier ||
+                placement.cells.size() !=
+                    stream.captured_dependency_count) {
+                return false;
+            }
+            if (!checked_add(total_cells, placement.cells.size(), total_cells) ||
+                (limits && total_cells > limits->max_placement_cells)) {
+                return false;
+            }
+
+            const auto expected_cells =
+                vbr_generation_production_covered_set(stream);
+            if (expected_cells.size() != placement.cells.size()) {
+                return false;
+            }
+            auto & source_positions =
+                logical_positions[placement.source_sequence];
+            for (size_t i = 0; i < placement.cells.size(); ++i) {
+                const auto & cell = placement.cells[i];
+                if (cell.physical_cell != expected_cells[i] ||
+                    cell.logical_position < 0 ||
+                    cell.logical_position >= placement.computation_frontier ||
+                    cell.logical_position >= manifest.identity.token_count ||
+                    (i != 0 && placement.cells[i - 1].physical_cell >=
+                                   cell.physical_cell) ||
+                    !source_positions.insert(cell.logical_position).second) {
+                    return false;
+                }
+            }
+        }
+    }
+    return next == manifest.stream_placements.size();
 }
 
 bool controller_policy_valid(
@@ -1126,7 +1307,8 @@ bool manifest_valid(
         const vbr_artifact_decode_limits * limits,
         bool require_sources) {
     const auto & manifest = package.manifest;
-    if (manifest.version != VBR_UNIT_ARTIFACT_FORMAT_VERSION ||
+    if (manifest.version != package.version ||
+        !artifact_version_supported(manifest.version) ||
         !digest_nonzero(manifest.identity_policy_order_digest) ||
         manifest.identity_policy_order_digest !=
             manifest.generation.identity_policy_order_digest ||
@@ -1146,6 +1328,17 @@ bool manifest_valid(
                         limits->max_companions ||
                     manifest.accounting.size() >
                         limits->max_accounting_rows))) {
+        return false;
+    }
+    if (artifact_has_reference_placement(manifest.version)) {
+        if (!token_block_valid(
+                manifest.identity,
+                manifest.identity_policy_order_digest,
+                manifest.token_block, limits) ||
+            !placement_valid(manifest, limits)) {
+            return false;
+        }
+    } else if (!reference_metadata_absent(manifest)) {
         return false;
     }
     for (uint32_t i = 0; i < manifest.controller_policy.size(); ++i) {
@@ -1323,7 +1516,7 @@ bool package_metadata_valid(
         const vbr_artifact_package & package,
         const vbr_artifact_decode_limits * limits,
         bool require_sources) {
-    if (package.version != VBR_UNIT_ARTIFACT_FORMAT_VERSION ||
+    if (!artifact_version_supported(package.version) ||
         package.flags != ARTIFACT_FLAGS_V1 ||
         package.topologies.empty() ||
         package.unit_blobs.empty() ||
@@ -1473,7 +1666,8 @@ bool emit_manifest_section(
 bool emit_unit_section_verified(
         emitter & out,
         const vbr_artifact_unit_blob & blob,
-        uint32_t object_index) {
+        uint32_t object_index,
+        uint32_t format_version) {
     const auto & descriptor = blob.descriptor;
     if (!out.digest(blob.unit_version_id) ||
         !out.digest(blob.payload_digest) ||
@@ -1490,9 +1684,10 @@ bool emit_unit_section_verified(
 
     llama_sha256_writer unit_hash;
     unit_hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
-    unit_hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    unit_hash.u64(descriptor.lineage_uuid.hi);
-    unit_hash.u64(descriptor.lineage_uuid.lo);
+    unit_hash.u32(format_version);
+    if (!hash_lineage(unit_hash, descriptor.lineage_uuid)) {
+        return false;
+    }
     unit_hash.u32(descriptor.logical_unit_id);
     unit_hash.u64(descriptor.repr_gen);
     if (!hash_sized_descriptor(unit_hash, descriptor)) {
@@ -1671,7 +1866,7 @@ bool emit_section_body_verified(
             return section.index < package.unit_blobs.size() &&
                    emit_unit_section_verified(
                        out, package.unit_blobs[section.index],
-                       section.index);
+                       section.index, package.version);
         case vbr_artifact_section_kind::companion_payload:
             return section.index < package.companions.size() &&
                    emit_companion_section_verified(
@@ -2318,9 +2513,10 @@ bool decode_unit_section(
 
     llama_sha256_writer unit_hash;
     unit_hash.string(DOMAIN_UNIT, sizeof(DOMAIN_UNIT) - 1);
-    unit_hash.u32(VBR_UNIT_ARTIFACT_FORMAT_VERSION);
-    unit_hash.u64(blob.descriptor.lineage_uuid.hi);
-    unit_hash.u64(blob.descriptor.lineage_uuid.lo);
+    unit_hash.u32(package.version);
+    if (!hash_lineage(unit_hash, blob.descriptor.lineage_uuid)) {
+        return false;
+    }
     unit_hash.u32(blob.descriptor.logical_unit_id);
     unit_hash.u64(blob.descriptor.repr_gen);
     if (!hash_sized_descriptor(unit_hash, blob.descriptor)) {
@@ -2482,6 +2678,54 @@ bool read_identity(
            in.i32(identity.next_position);
 }
 
+bool read_token_block(
+        bounded_reader & in,
+        const vbr_artifact_decode_limits & limits,
+        vbr_artifact_token_block & block) {
+    uint32_t count;
+    if (!in.u32(block.codec_version) || !in.u32(count) ||
+        count > limits.max_token_ids ||
+        !in.declared_count_fits(count, sizeof(uint32_t))) {
+        return false;
+    }
+    block.tokens.resize(count);
+    for (llama_token & token : block.tokens) {
+        if (!in.i32(token)) {
+            return false;
+        }
+    }
+    return in.typed_digest_value(block.digest);
+}
+
+bool read_stream_placement(
+        bounded_reader & in,
+        const vbr_artifact_decode_limits & limits,
+        vbr_artifact_stream_placement & placement,
+        uint64_t & total_cells) {
+    uint32_t count;
+    if (!in.u32(placement.child_id) ||
+        !in.u32(placement.stream_index) ||
+        !in.i32(placement.source_sequence) ||
+        !in.i32(placement.computation_frontier) ||
+        !in.u32(count) ||
+        count > limits.max_placement_cells ||
+        !checked_add(total_cells, count, total_cells) ||
+        total_cells > limits.max_placement_cells ||
+        !in.declared_count_fits(count, MIN_WIRE_CELL_PLACEMENT)) {
+        return false;
+    }
+    placement.cells.resize(count);
+    for (auto & cell : placement.cells) {
+        if (!in.u32(cell.physical_cell) ||
+            !in.i32(cell.logical_position) ||
+            !in.i32(cell.ext_x) ||
+            !in.i32(cell.ext_y)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool read_controller_policy(
         bounded_reader & in,
         vbr_artifact_controller_policy & policy) {
@@ -2639,8 +2883,12 @@ bool decode_manifest_section(
     uint32_t n_companions;
     uint32_t n_accounting;
     if (!in.u32(manifest.version) ||
+        manifest.version != package.version ||
+        !artifact_version_supported(manifest.version) ||
         !in.fixed_digest(manifest.identity_policy_order_digest) ||
         !read_identity(in, limits, manifest.identity) ||
+        (artifact_has_reference_placement(manifest.version) &&
+         !read_token_block(in, limits, manifest.token_block)) ||
         !read_generation_record(in, limits, manifest.generation) ||
         !in.typed_digest_value(manifest.capture_generation_id) ||
         !read_consistency(in, manifest.consistency) ||
@@ -2654,6 +2902,23 @@ bool decode_manifest_section(
     for (auto & policy : manifest.controller_policy) {
         if (!read_controller_policy(in, policy)) {
             return false;
+        }
+    }
+    if (artifact_has_reference_placement(manifest.version)) {
+        uint32_t n_placements;
+        if (!in.u32(n_placements) ||
+            n_placements > limits.max_stream_placements ||
+            !in.declared_count_fits(
+                n_placements, MIN_WIRE_STREAM_PLACEMENT)) {
+            return false;
+        }
+        manifest.stream_placements.resize(n_placements);
+        uint64_t total_cells = 0;
+        for (auto & placement : manifest.stream_placements) {
+            if (!read_stream_placement(
+                    in, limits, placement, total_cells)) {
+                return false;
+            }
         }
     }
     if (!in.u32(n_references) ||
@@ -2797,8 +3062,9 @@ std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
     llama_sha256_writer hash;
     static constexpr char domain[] = "buun.vbr.logical-unit";
     hash.string(domain, sizeof(domain) - 1);
-    hash.u64(descriptor.lineage_uuid.hi);
-    hash.u64(descriptor.lineage_uuid.lo);
+    if (!hash_lineage(hash, descriptor.lineage_uuid)) {
+        return {};
+    }
     hash.u32(descriptor.logical_unit_id);
     hash.u64(descriptor.repr_gen);
     return hash.finish();
@@ -2807,7 +3073,7 @@ std::array<uint8_t, 32> vbr_artifact_logical_unit_digest(
 vbr_artifact_status vbr_artifact_prepare(
         vbr_artifact_package & package) noexcept {
     try {
-        if (package.version != VBR_UNIT_ARTIFACT_FORMAT_VERSION ||
+        if (!artifact_version_supported(package.version) ||
             package.flags != ARTIFACT_FLAGS_V1 ||
             package.topologies.empty() ||
             package.unit_blobs.empty()) {
@@ -2846,7 +3112,7 @@ vbr_artifact_status vbr_artifact_prepare(
                 !prepare_stash_digest(blob) ||
                 !descriptor_metadata_valid(
                     blob.descriptor, package.topologies, true) ||
-                !prepare_unit_id(blob)) {
+                !prepare_unit_id(blob, package.version)) {
                 return vbr_artifact_status::content_id_mismatch;
             }
         }
@@ -2868,6 +3134,18 @@ vbr_artifact_status vbr_artifact_prepare(
                 capture;
             package.manifest.consistency.target_capture_generation_id = {};
             package.manifest.consistency.transition_lineage_id = {};
+        }
+
+        package.manifest.version = package.version;
+        if (artifact_has_reference_placement(package.version)) {
+            if (!prepare_token_block(
+                    package.manifest.identity,
+                    package.manifest.identity_policy_order_digest,
+                    package.manifest.token_block)) {
+                return vbr_artifact_status::malformed;
+            }
+        } else if (!reference_metadata_absent(package.manifest)) {
+            return vbr_artifact_status::malformed;
         }
 
         // Bind reference rows by their logical tuple; content IDs are computed from bytes and
@@ -3061,7 +3339,7 @@ vbr_artifact_status vbr_artifact_decode(
         if (magic != ARTIFACT_MAGIC) {
             return vbr_artifact_status::malformed;
         }
-        if (version != VBR_UNIT_ARTIFACT_FORMAT_VERSION) {
+        if (!artifact_version_supported(version)) {
             return vbr_artifact_status::unsupported_version;
         }
         const uint64_t max_sections =

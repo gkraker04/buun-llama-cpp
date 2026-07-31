@@ -29,6 +29,7 @@ class vbr_pinned_chunk_ring;
 struct vbr_capture_stream_stats;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
+struct vbr_artifact_stream_placement;
 
 //
 // llama_kv_cache
@@ -205,6 +206,7 @@ public:
             llama_seq_id seq_id,
             llama_pos computation_frontier,
             vbr_checkpoint_generation_controller & output,
+            vbr_artifact_stream_placement * placement = nullptr,
             vbr_explicit_generation_failure * failure = nullptr) const;
     bool vbr_generation_live_guarded_view(
             uint32_t child_id,
@@ -414,6 +416,7 @@ private:
         llama_seq_id sequence,
         llama_pos frontier,
         vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement = nullptr,
         vbr_explicit_generation_failure * failure = nullptr) const noexcept;
     bool vbr_capture_policy_snapshot(
         vbr_capture_stability_token & output) const noexcept;

@@ -339,6 +339,7 @@ public:
         std::vector<llama_kv_cache::vbr_capture_unit_plan> units;
         llama_kv_cache::vbr_capture_stability_token stability;
         vbr_checkpoint_generation_controller generation;
+        std::vector<vbr_artifact_stream_placement> placements;
     };
 
     static bool settle(llama_kv_cache & cache) {
@@ -421,14 +422,21 @@ public:
             failure = vbr_explicit_generation_failure::size_pass;
             return false;
         }
+        vbr_artifact_stream_placement placement;
+        auto * placement_out = mode ==
+                checkpoint_child_dependency_mode::live_guarded ?
+            &placement : nullptr;
         if (!cache.vbr_capture_generation_record(
                 child_id, mode, sequence, frontier,
-                output.generation, &failure)) {
+                output.generation, placement_out, &failure)) {
             if (failure == vbr_explicit_generation_failure::none) {
                 failure =
                     vbr_explicit_generation_failure::internal_error;
             }
             return false;
+        }
+        if (placement_out != nullptr) {
+            output.placements.push_back(std::move(placement));
         }
         if (!cache.vbr_capture_stability_matches(output.stability)) {
             failure =
@@ -500,6 +508,9 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         request.ring == nullptr || accounting.budget == nullptr ||
         request.topologies.empty() || request.pool_bindings.empty() ||
         request.representation_identity == nullptr ||
+        request.identity.token_count < 0 ||
+        request.token_block.size() !=
+            size_t(request.identity.token_count) ||
         request.identity.execution_identity.empty() ||
         request.identity.adapter_config_identity.empty() ||
         request.identity.media_content_identity.empty()) {
@@ -612,6 +623,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         vbr_artifact_package package;
         package.topologies = request.topologies;
         package.manifest.identity = request.identity;
+        package.manifest.token_block.tokens = request.token_block;
         package.manifest.identity_policy_order_digest =
             identity_policy_order_digest;
         package.manifest.generation.version = 1;
@@ -624,6 +636,9 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
         for (auto & child : children) {
             package.manifest.generation.controllers.push_back(
                 child.generation);
+            package.manifest.stream_placements.insert(
+                package.manifest.stream_placements.end(),
+                child.placements.begin(), child.placements.end());
             vbr_artifact_controller_policy policy;
             policy.child_id = child.child_id;
             policy.dependency_mode = child.dependency_mode;

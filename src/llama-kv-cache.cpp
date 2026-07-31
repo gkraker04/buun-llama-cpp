@@ -3900,6 +3900,7 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
         llama_seq_id seq_id,
         llama_pos computation_frontier,
         vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement,
         vbr_explicit_generation_failure * failure) const {
     if (failure != nullptr) {
         *failure = vbr_explicit_generation_failure::none;
@@ -3913,7 +3914,8 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     };
     if (other != nullptr) {
         return other->vbr_generation_capture_live_guarded(
-                child_id, seq_id, computation_frontier, output, failure);
+                child_id, seq_id, computation_frontier, output,
+                placement, failure);
     }
 
     const auto * tracker = vbr_generation_tracker_get();
@@ -3966,10 +3968,29 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     }
     std::vector<uint32_t> dependency_cells;
     dependency_cells.reserve(expected_rank);
+
+    vbr_artifact_stream_placement captured_placement;
+    captured_placement.child_id = child_id;
+    captured_placement.stream_index = stream;
+    captured_placement.source_sequence = seq_id;
+    captured_placement.computation_frontier = computation_frontier;
+    captured_placement.cells.reserve(expected_rank);
     for (uint32_t cell : owned_cells) {
-        if (cells.pos_get(cell) < computation_frontier) {
-            dependency_cells.push_back(cell);
+        const auto position = cells.pos_get(cell);
+        if (position >= computation_frontier) {
+            continue;
         }
+        // Shift is intentionally absent from artifact v2. A shifted source
+        // cannot be represented exactly and therefore fails capture closed.
+        if (cells.get_shift(cell) != 0) {
+            return fail(
+                vbr_explicit_generation_failure::stream_capture_failed);
+        }
+        const auto & ext = cells.ext_get(cell);
+        dependency_cells.push_back(cell);
+        captured_placement.cells.push_back({
+            cell, position, ext.x, ext.y,
+        });
     }
     if (dependency_cells.size() != expected_rank) {
         return fail(
@@ -3994,6 +4015,9 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
                 output)) {
         return fail(
             vbr_explicit_generation_failure::controller_capture_failed);
+    }
+    if (placement != nullptr) {
+        *placement = std::move(captured_placement);
     }
     return true;
 }
@@ -4479,8 +4503,12 @@ bool llama_kv_cache::vbr_capture_generation_record(
         llama_seq_id sequence,
         llama_pos frontier,
         vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement,
         vbr_explicit_generation_failure * failure) const noexcept {
     output = {};
+    if (placement != nullptr) {
+        *placement = {};
+    }
     if (failure != nullptr) {
         *failure = vbr_explicit_generation_failure::none;
     }
@@ -4488,7 +4516,7 @@ bool llama_kv_cache::vbr_capture_generation_record(
         if (other != nullptr) {
             return other->vbr_capture_generation_record(
                 child_id, dependency_mode, sequence, frontier, output,
-                failure);
+                placement, failure);
         }
         if (dependency_mode ==
                 checkpoint_child_dependency_mode::payload_complete) {
@@ -4525,7 +4553,7 @@ bool llama_kv_cache::vbr_capture_generation_record(
             return false;
         }
         if (!vbr_generation_capture_live_guarded(
-                child_id, sequence, frontier, output, failure)) {
+                child_id, sequence, frontier, output, placement, failure)) {
             return false;
         }
         output.dependency_mode = dependency_mode;

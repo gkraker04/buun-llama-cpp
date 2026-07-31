@@ -65,20 +65,6 @@ vbr_generation_oracle_baseline independently_reconstruct(
     return result;
 }
 
-std::vector<uint32_t> production_covered_set(const vbr_checkpoint_generation_stream & production_record) {
-    std::vector<uint32_t> result;
-    for (const auto & page : production_record.pages) {
-        const uint32_t base = page.page_index * VBR_GENERATION_PAGE_CELLS;
-        for (uint32_t offset = 0; offset < VBR_GENERATION_PAGE_CELLS; ++offset) {
-            if ((page.covered_mask[offset / 64] & (uint64_t(1) << (offset % 64))) != 0) {
-                result.push_back(base + offset);
-            }
-        }
-    }
-    std::sort(result.begin(), result.end());
-    return result;
-}
-
 }  // namespace
 
 bool vbr_generation_oracle_enabled() {
@@ -108,7 +94,8 @@ vbr_generation_oracle_result vbr_generation_oracle_audit(
     }
 
     const auto independent       = independently_reconstruct(computation_frontier, canonical_cells);
-    const auto covered           = production_covered_set(production_record);
+    const auto covered =
+        vbr_generation_production_covered_set(production_record);
     result.independent_count     = static_cast<uint32_t>(independent.dependency_cells.size());
     result.independent_byte_hash = independent.dependency_byte_hash;
     result.complete = independent.complete && baseline.complete;

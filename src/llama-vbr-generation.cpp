@@ -249,6 +249,28 @@ vbr_expected_tombstone_class classify_expected_tombstone(const std::vector<audit
 
 }  // namespace
 
+std::vector<uint32_t> vbr_generation_production_covered_set(
+        const vbr_checkpoint_generation_stream & production_record) {
+    std::vector<uint32_t> result;
+    result.reserve(production_record.captured_dependency_count);
+    for (const auto & page : production_record.pages) {
+        const uint64_t base =
+            uint64_t(page.page_index) * VBR_GENERATION_PAGE_CELLS;
+        for (uint32_t offset = 0;
+             offset < VBR_GENERATION_PAGE_CELLS; ++offset) {
+            if (mask_test(page.covered_mask, offset)) {
+                const uint64_t cell = base + offset;
+                if (cell > UINT32_MAX) {
+                    return {};
+                }
+                result.push_back(uint32_t(cell));
+            }
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
 vbr_generation_event::~vbr_generation_event() {
     if (owner_ != nullptr && !finish()) {
         std::abort();

@@ -3,15 +3,22 @@
 #include "llama-sha256.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 static int failures = 0;
+
+static_assert(!std::is_copy_constructible<vbr_artifact_package_view>::value);
+static_assert(!std::is_copy_assignable<vbr_artifact_package_view>::value);
+static_assert(std::is_nothrow_move_constructible<vbr_artifact_package_view>::value);
+static_assert(std::is_nothrow_move_assignable<vbr_artifact_package_view>::value);
 
 #define CHECK(cond) \
     do { \
@@ -277,6 +284,7 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     manifest.identity.sequence_epoch = 3;
     manifest.identity.token_count = 2;
     manifest.identity.next_position = 2;
+    manifest.token_block.tokens = { 101, 102 };
     manifest.generation.version = 1;
     manifest.generation.status =
         vbr_checkpoint_generation_status::complete;
@@ -322,6 +330,17 @@ static vbr_artifact_package make_package(fixture_storage & storage) {
     policy.current_type_vector_digest = marker(0x74);
     policy.completed_wave = true;
     manifest.controller_policy.push_back(policy);
+
+    vbr_artifact_stream_placement placement;
+    placement.child_id = 0;
+    placement.stream_index = 0;
+    placement.source_sequence = 0;
+    placement.computation_frontier = 2;
+    placement.cells = {
+        { 0, 0, 10, 20 },
+        { 1, 1, 11, 21 },
+    };
+    manifest.stream_placements.push_back(placement);
 
     vbr_artifact_unit_reference reference;
     reference.lineage_uuid = descriptor.lineage_uuid;
@@ -402,21 +421,23 @@ static void test_golden_and_native_lineage() {
     CHECK(package.topologies[0].digest ==
           llama_cache_acct_compute_topology_digest(package.topologies[0]));
     CHECK(hex(package.unit_blobs[0].unit_version_id.bytes()) ==
-          "44dcfd7b6235cae759e3570b2aed858103c08b9b3603c46cf62755686ab2401f");
+          "492279d0d4a8cbbba1cf997c706d077d1209fb720d52e4820788bbc9fccaccce");
     CHECK(hex(package.unit_blobs[0].payload_digest.bytes()) ==
           "8325d422f361b83e19f57dd0e6e566f330961cae4889c2f934bf94619316705f");
     CHECK(hex(package.unit_blobs[0].descriptor.clean_stash.payload_id.bytes()) ==
           "5c20925bd0120766c0a1db7995677754755488a70b3780dcd53e63ab1535cf18");
     CHECK(hex(package.manifest.capture_generation_id.bytes()) ==
           "7227e21ce3e7076d85d625a3e41baca0ebe3a8d078b44f16b97ca69f81a79407");
+    CHECK(hex(package.manifest.token_block.digest.bytes()) ==
+          "9635811050104e380f761c837ec49756986867248fab5e94877adbb7be90ad68");
     CHECK(hex(package.manifest.manifest_digest.bytes()) ==
-          "3d8267620a9c563a1e84c2a277fc58aabc6a081c794d947e8eee51e2a03fbf6e");
+          "6e7ac611f37686aa527bae124a115e58ca278a2122c76a336717b4f3b7637d4b");
     CHECK(hex(digest_of(encoded)) ==
-          "b8ba3cb1191ca5be00720d5ab77a2b8c49406b9c5957b39f52c932e2c6c68e8d");
-    CHECK(encoded.size() == 2254);
+          "085b609eb67c847f5086ccd8ae44c9a8cc0243d0ce279bee5c617c63298f03dd");
+    CHECK(encoded.size() == 2358);
     CHECK(encoded[0] == 0x56 && encoded[1] == 0x42 &&
           encoded[2] == 0x52 && encoded[3] == 0x32);
-    CHECK(encoded[4] == 1 && encoded[5] == 0 &&
+    CHECK(encoded[4] == 2 && encoded[5] == 0 &&
           encoded[6] == 0 && encoded[7] == 0);
 
     vbr_artifact_package decoded;
@@ -434,6 +455,33 @@ static void test_golden_and_native_lineage() {
           vbr_artifact_consistency_kind::capture_exact);
     CHECK(decoded.manifest.consistency.source_capture_generation_id ==
           decoded.manifest.capture_generation_id);
+    CHECK(decoded.manifest.token_block.tokens ==
+          package.manifest.token_block.tokens);
+    CHECK(decoded.manifest.token_block.digest ==
+          package.manifest.token_block.digest);
+    CHECK(decoded.manifest.stream_placements.size() == 1);
+    CHECK(decoded.manifest.stream_placements[0].cells[0].ext_x == 10);
+    CHECK(decoded.manifest.stream_placements[0].cells[1].ext_y == 21);
+}
+
+static void test_v1_decode_and_v2_restore_metadata() {
+    fixture_storage storage;
+    auto legacy = make_package(storage);
+    legacy.version = 1;
+    legacy.manifest.version = 1;
+    legacy.manifest.token_block = {};
+    legacy.manifest.stream_placements.clear();
+    std::vector<uint8_t> bytes;
+    CHECK(vbr_artifact_encode_vector(legacy, bytes, 1024*1024) ==
+          vbr_artifact_status::ok);
+    CHECK(bytes[4] == 1);
+    vbr_artifact_package decoded;
+    CHECK(vbr_artifact_decode_vector(bytes, limits(1024*1024), decoded) ==
+          vbr_artifact_status::ok);
+    CHECK(decoded.version == 1);
+    CHECK(decoded.manifest.stream_placements.empty());
+    CHECK(decoded.manifest.token_block.tokens.empty());
+    CHECK(!decoded.manifest.token_block.digest.valid());
 }
 
 static void test_identity_and_reference_separation() {
@@ -448,6 +496,7 @@ static void test_identity_and_reference_separation() {
         .pages[0].covered_mask[0] = 0x5;
     ownership_changed.manifest.generation.controllers[0].streams[0]
         .captured_dependency_count = 2;
+    ownership_changed.manifest.stream_placements[0].cells[1].physical_cell = 2;
     ownership_changed.manifest.unit_references[0].stash_reference
         .covered_sink_pages[0].covered_mask[0] = 0x5;
     CHECK(vbr_artifact_encode_vector(
@@ -457,6 +506,16 @@ static void test_identity_and_reference_separation() {
           first.unit_blobs[0].unit_version_id);
     CHECK(ownership_changed.manifest.manifest_digest !=
           first.manifest.manifest_digest);
+
+    auto token_changed = make_package(storage);
+    token_changed.manifest.token_block.tokens[1]++;
+    CHECK(vbr_artifact_encode_vector(
+              token_changed, bytes, 1024*1024) ==
+          vbr_artifact_status::ok);
+    CHECK(token_changed.unit_blobs[0].unit_version_id ==
+          first.unit_blobs[0].unit_version_id);
+    CHECK(token_changed.manifest.token_block.digest !=
+          first.manifest.token_block.digest);
 
     storage.payload0.bytes[0] ^= 1;
     auto payload_changed = make_package(storage);
@@ -567,6 +626,41 @@ static void test_fail_closed_decode() {
     CHECK(vbr_artifact_decode_vector(
               corrupt, limits(1024*1024), decoded) !=
           vbr_artifact_status::ok);
+
+    const std::vector<uint8_t> token_wire = {
+        1, 0, 0, 0, 2, 0, 0, 0,
+        101, 0, 0, 0, 102, 0, 0, 0,
+    };
+    const auto token_at = std::search(
+        encoded.begin(), encoded.end(),
+        token_wire.begin(), token_wire.end());
+    CHECK(token_at != encoded.end());
+    if (token_at != encoded.end()) {
+        auto token_corrupt = encoded;
+        token_corrupt[size_t(token_at - encoded.begin()) + 8] ^= 1;
+        CHECK(vbr_artifact_decode_vector(
+                  token_corrupt, limits(1024*1024), decoded) !=
+              vbr_artifact_status::ok);
+    }
+
+    const std::vector<uint8_t> placement_wire = {
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 2, 0, 0, 0,
+        2, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 10, 0, 0, 0,
+        20, 0, 0, 0,
+    };
+    const auto placement_at = std::search(
+        encoded.begin(), encoded.end(),
+        placement_wire.begin(), placement_wire.end());
+    CHECK(placement_at != encoded.end());
+    if (placement_at != encoded.end()) {
+        auto placement_corrupt = encoded;
+        placement_corrupt[size_t(placement_at - encoded.begin()) + 32] ^= 1;
+        CHECK(vbr_artifact_decode_vector(
+                  placement_corrupt, limits(1024*1024), decoded) !=
+              vbr_artifact_status::ok);
+    }
     CHECK(decoded.version == 0 && decoded.unit_blobs.empty());
 
     staged_consumer staged;
@@ -618,7 +712,7 @@ static void test_fail_closed_decode() {
           package.manifest.unit_references[0].repr_gen);
 
     auto bad_version = encoded;
-    bad_version[4] = 2;
+    bad_version[4] = 3;
     CHECK(vbr_artifact_decode_vector(
               bad_version, limits(1024*1024), decoded) ==
           vbr_artifact_status::unsupported_version);
@@ -756,6 +850,68 @@ static void test_validation_and_ordering() {
         vbr_artifact_consistency_kind::_count;
     CHECK(vbr_artifact_encode_vector(
               bad_consistency, encoded, 1024*1024) !=
+          vbr_artifact_status::ok);
+
+    auto bad_placement_set = package;
+    bad_placement_set.manifest.stream_placements[0].cells[1].physical_cell = 2;
+    CHECK(vbr_artifact_encode_vector(
+              bad_placement_set, encoded, 1024*1024) !=
+          vbr_artifact_status::ok);
+    auto duplicate_position = package;
+    duplicate_position.manifest.stream_placements[0].cells[1]
+        .logical_position = 0;
+    CHECK(vbr_artifact_encode_vector(
+              duplicate_position, encoded, 1024*1024) !=
+          vbr_artifact_status::ok);
+
+    // Logical positions are unique per source sequence across the complete
+    // reference, not merely within one stream. Two streams may cite distinct
+    // physical cells for the same sequence, but may not alias a logical token.
+    auto cross_stream = package;
+    auto & controller = cross_stream.manifest.generation.controllers[0];
+    auto second_stream = controller.streams[0];
+    second_stream.stream_index = 1;
+    second_stream.computation_frontier = 4;
+    second_stream.captured_dependency_count = 2;
+    second_stream.pages[0].covered_mask[0] = 0x0c;
+    controller.streams.push_back(second_stream);
+    cross_stream.unit_blobs[0].descriptor.n_stream = 2;
+    cross_stream.manifest.controller_policy[0].n_stream = 2;
+    cross_stream.manifest.identity.token_count = 4;
+    cross_stream.manifest.identity.next_position = 4;
+    cross_stream.manifest.token_block.tokens = { 101, 102, 103, 104 };
+    vbr_artifact_stream_placement second_placement;
+    second_placement.child_id = 0;
+    second_placement.stream_index = 1;
+    second_placement.source_sequence = 0;
+    second_placement.computation_frontier = 4;
+    second_placement.cells = {
+        { 2, 2, 12, 22 },
+        { 3, 3, 13, 23 },
+    };
+    cross_stream.manifest.stream_placements.push_back(second_placement);
+    cross_stream.manifest.unit_references[0].authorized_stream_refs = { 0, 1 };
+    CHECK(vbr_artifact_encode_vector(
+              cross_stream, encoded, 1024*1024) ==
+          vbr_artifact_status::ok);
+
+    auto cross_stream_duplicate_position = cross_stream;
+    cross_stream_duplicate_position.manifest.stream_placements[1]
+        .cells[0].logical_position = 1;
+    CHECK(vbr_artifact_encode_vector(
+              cross_stream_duplicate_position, encoded, 1024*1024) !=
+          vbr_artifact_status::ok);
+
+    auto beyond_frontier = package;
+    beyond_frontier.manifest.stream_placements[0].cells[1]
+        .logical_position = 2;
+    CHECK(vbr_artifact_encode_vector(
+              beyond_frontier, encoded, 1024*1024) !=
+          vbr_artifact_status::ok);
+    auto token_count_mismatch = package;
+    token_count_mismatch.manifest.token_block.tokens.pop_back();
+    CHECK(vbr_artifact_encode_vector(
+              token_count_mismatch, encoded, 1024*1024) !=
           vbr_artifact_status::ok);
 
     auto bad_stash_authorization = package;
@@ -1347,7 +1503,7 @@ static void test_catalog_multi_unit_atomic_publish() {
     CHECK(snapshot.stashes == 1);
     CHECK(snapshot.references == 1);
     build.reset();
-    CHECK(f.catalog->retire(published.reference_artifact));
+    CHECK(f.catalog->retire(published.reference_artifact) == vbr_artifact_retire_status::retired);
     CHECK(f.catalog->snapshot().blobs == 0);
     CHECK(f.catalog->snapshot().stashes == 0);
     CHECK(f.ledger.snapshot().live_ops == 0);
@@ -1418,7 +1574,7 @@ static void test_catalog_streaming_companion_lifetime() {
         f.host,
         llama_cache_acct_measure::resident_allocated).value ==
         f.storage.recurrent.bytes.size());
-    CHECK(f.catalog->retire(published.reference_artifact));
+    CHECK(f.catalog->retire(published.reference_artifact) == vbr_artifact_retire_status::retired);
     CHECK(f.ledger.snapshot().live_ops == 0);
 }
 
@@ -1488,7 +1644,7 @@ static void test_catalog_charge_once_and_retire() {
     CHECK(catalog_state.references == 2);
     CHECK(f.ledger.allocation_registry_size() > alloc_baseline);
 
-    CHECK(f.catalog->retire(first.reference_artifact));
+    CHECK(f.catalog->retire(first.reference_artifact) == vbr_artifact_retire_status::retired);
     CHECK(f.ledger.allocation_registry_size() > alloc_baseline);
     snapshot = f.ledger.snapshot();
     CHECK(catalog_cell(
@@ -1501,7 +1657,7 @@ static void test_catalog_charge_once_and_retire() {
         llama_cache_acct_category::artifact_reference_metadata,
         f.host,
         llama_cache_acct_measure::resident_allocated).value == 256);
-    CHECK(f.catalog->retire(second.reference_artifact));
+    CHECK(f.catalog->retire(second.reference_artifact) == vbr_artifact_retire_status::retired);
     CHECK(f.ledger.allocation_registry_size() == alloc_baseline);
     snapshot = f.ledger.snapshot();
     CHECK(snapshot.live_ops == 0);
@@ -1654,8 +1810,8 @@ static void test_catalog_dedup_race() {
     CHECK(state.blobs == 1 && state.stashes == 1 &&
           state.references == 2);
     CHECK(state.published == 1 && state.adopted == 1);
-    CHECK(f.catalog->retire(results[0].reference_artifact));
-    CHECK(f.catalog->retire(results[1].reference_artifact));
+    CHECK(f.catalog->retire(results[0].reference_artifact) == vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(results[1].reference_artifact) == vbr_artifact_retire_status::retired);
 }
 
 static void test_catalog_full_id_interning_and_stash_dedup() {
@@ -1691,8 +1847,8 @@ static void test_catalog_full_id_interning_and_stash_dedup() {
             binding.domain,
             llama_cache_acct_measure::resident_allocated).value == 8);
     }
-    CHECK(f.catalog->retire(first.reference_artifact));
-    CHECK(f.catalog->retire(second.reference_artifact));
+    CHECK(f.catalog->retire(first.reference_artifact) == vbr_artifact_retire_status::retired);
+    CHECK(f.catalog->retire(second.reference_artifact) == vbr_artifact_retire_status::retired);
 }
 
 static void test_catalog_capacity_sequential_and_temporaries() {
@@ -1751,11 +1907,95 @@ static void test_catalog_capacity_sequential_and_temporaries() {
     CHECK(blocked.status ==
           llama_cache_admission_status::exceeds_budget);
     CHECK(!blocked.claim.has_op());
-    CHECK(f.catalog->retire(first.reference_artifact));
+    CHECK(f.catalog->retire(first.reference_artifact) == vbr_artifact_retire_status::retired);
+}
+
+static void test_catalog_package_lease_and_reference_placement() {
+    catalog_fixture f;
+    const auto first = f.catalog->publish(
+        f.package, f.completions(), f.budget);
+    CHECK(first.status == llama_vbr_artifact_publish_status::published);
+
+    auto alternate = f.package;
+    alternate.manifest.generation.controllers[0].streams[0]
+        .pages[0].covered_mask[0] = 0x5;
+    alternate.manifest.stream_placements[0].cells[1].physical_cell = 2;
+    alternate.manifest.unit_references[0].stash_reference
+        .covered_sink_pages[0].covered_mask[0] = 0x5;
+    alternate.manifest.manifest_digest = {};
+    const auto second = f.catalog->publish(
+        alternate, f.completions(), f.budget);
+    CHECK(second.status == llama_vbr_artifact_publish_status::adopted);
+    CHECK(f.catalog->snapshot().blobs == 1);
+    CHECK(f.catalog->snapshot().references == 2);
+
+    vbr_artifact_package_view first_view;
+    vbr_artifact_package_view second_view;
+    CHECK(f.catalog->resolve_reference(first.reference_artifact, first_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(f.catalog->resolve_reference(second.reference_artifact, second_view) ==
+          vbr_artifact_resolve_status::ok);
+    CHECK(first_view.reference_artifact() == first.reference_artifact);
+    CHECK(first_view.units().size() == 1);
+    CHECK(first_view.units()[0].payload_shards.size() == 2);
+    CHECK(first_view.manifest().stream_placements[0].cells[1].physical_cell == 1);
+    CHECK(second_view.manifest().stream_placements[0].cells[1].physical_cell == 2);
+    CHECK(first_view.units()[0].unit_version_id ==
+          second_view.units()[0].unit_version_id);
+    const auto live_before_busy = f.ledger.snapshot().live_ops;
+    CHECK(f.catalog->retire(first.reference_artifact) ==
+          vbr_artifact_retire_status::busy);
+    CHECK(f.ledger.snapshot().live_ops == live_before_busy);
+
+    vbr_artifact_package_view moved = std::move(first_view);
+    CHECK(!first_view);
+    CHECK(moved);
+    moved.reset();
+    CHECK(f.catalog->retire(first.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+    second_view.reset();
+    CHECK(f.catalog->retire(second.reference_artifact) ==
+          vbr_artifact_retire_status::retired);
+
+    catalog_fixture raced;
+    const auto published = raced.catalog->publish(
+        raced.package, raced.completions(), raced.budget);
+    CHECK(published.status == llama_vbr_artifact_publish_status::published);
+    std::atomic<bool> go { false };
+    std::atomic<bool> release_view { false };
+    vbr_artifact_resolve_status resolve_status =
+        vbr_artifact_resolve_status::internal_error;
+    vbr_artifact_retire_status retire_status =
+        vbr_artifact_retire_status::internal_error;
+    std::thread resolver([&] {
+        while (!go.load(std::memory_order_acquire)) {}
+        vbr_artifact_package_view view;
+        resolve_status = raced.catalog->resolve_reference(
+            published.reference_artifact, view);
+        while (view && !release_view.load(std::memory_order_acquire)) {}
+    });
+    std::thread retiree([&] {
+        while (!go.load(std::memory_order_acquire)) {}
+        retire_status = raced.catalog->retire(
+            published.reference_artifact);
+    });
+    go.store(true, std::memory_order_release);
+    retiree.join();
+    release_view.store(true, std::memory_order_release);
+    resolver.join();
+    CHECK((resolve_status == vbr_artifact_resolve_status::ok &&
+           retire_status == vbr_artifact_retire_status::busy) ||
+          (resolve_status == vbr_artifact_resolve_status::not_found &&
+           retire_status == vbr_artifact_retire_status::retired));
+    if (retire_status == vbr_artifact_retire_status::busy) {
+        CHECK(raced.catalog->retire(published.reference_artifact) ==
+              vbr_artifact_retire_status::retired);
+    }
 }
 
 int main() {
     test_golden_and_native_lineage();
+    test_v1_decode_and_v2_restore_metadata();
     test_identity_and_reference_separation();
     test_fail_closed_decode();
     test_encoder_rejects_source_mutation();
@@ -1771,6 +2011,7 @@ int main() {
     test_catalog_dedup_race();
     test_catalog_full_id_interning_and_stash_dedup();
     test_catalog_capacity_sequential_and_temporaries();
+    test_catalog_package_lease_and_reference_placement();
     if (failures != 0) {
         fprintf(stderr, "%d VBR artifact test(s) failed\n", failures);
         return 1;

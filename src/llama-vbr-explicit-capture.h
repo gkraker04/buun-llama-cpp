@@ -213,6 +213,7 @@ struct vbr_explicit_capture_request {
     llama_seq_id sequence = -1;
     vbr_checkpoint_frontier_fields frontier;
     vbr_artifact_identity_block identity;
+    std::vector<llama_token> token_block;
     // Optional expected canonical digest. Zero asks the library to derive it
     // from frontier + ordered memory-tree child policy; a nonzero value must
     // match exactly.
