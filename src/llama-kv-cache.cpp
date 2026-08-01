@@ -581,10 +581,15 @@ static std::vector<ggml_backend_buffer_t> kv_phys_buffers(ggml_backend_buffer_t 
     return phys;
 }
 
-// fixed VA slot of a cache tensor: every extent reserves its F16-max footprint so tier flips
-// never move data pointers — this expression is the single encoding of that sizing rule
+// Logical bytes in a cache tensor's fixed VA slot. Physical mapping and tail release must use
+// the page-padded span: the VMM backend maps intersecting chunks but unmaps only fully-contained
+// chunks, so an interval ending at this raw length cannot release a terminal partial page.
 static size_t vbr_slot_bytes(const ggml_tensor * t) {
     return (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
+}
+
+static size_t vbr_slot_span(const ggml_tensor * t, size_t gran) {
+    return GGML_PAD(vbr_slot_bytes(t), gran);
 }
 
 // byte spans of one (pool, extent) unit at tier type_B: how much must stay resident (keep),
@@ -595,10 +600,11 @@ struct vbr_span {
 };
 static vbr_span vbr_span_of(const ggml_tensor * t, ggml_type type_B, int64_t n_cells,
                             uint32_t wm_next, size_t gran) {
-    const size_t rB   = ggml_row_size(type_B, t->ne[0]);
-    const size_t slot = vbr_slot_bytes(t);
+    const size_t rB           = ggml_row_size(type_B, t->ne[0]);
+    const size_t logical_slot = vbr_slot_bytes(t);
+    const size_t slot         = vbr_slot_span(t, gran);
     const size_t keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
-    const size_t keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
+    const size_t keep_live = std::min(logical_slot, std::max(keep, rB * (size_t) wm_next));
     const size_t keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, gran));
     return { slot, keep, keep_live, keep_pad };
 }
@@ -1034,7 +1040,7 @@ llama_kv_cache::llama_kv_cache(
                 GGML_ASSERT(!is_cache || ggml_row_size(t->type, t->ne[0]) <= ggml_row_size(GGML_TYPE_F16, t->ne[0]));
                 off = GGML_PAD(off, gran);
                 places.push_back({ t, off });
-                off += slot;
+                off += GGML_PAD(slot, gran);
             }
             const size_t va_size = GGML_PAD(off, gran);
 
@@ -3135,7 +3141,7 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
                 continue;
             }
             const size_t need = (size_t) ggml_row_size(t->type, t->ne[0]) * wm_cells;
-            total += GGML_PAD(need, p.gran);
+            total += std::min(vbr_slot_span(t, p.gran), (size_t) GGML_PAD(need, p.gran));
         }
     }
     return total;
@@ -3727,7 +3733,7 @@ void llama_kv_cache::vbr_full_reset() {
                 }
                 e.stash_valid  = 0;
                 e.promote_hops = 0; // fresh hop budget — the reset epoch starts clean
-                const size_t slot = vbr_slot_bytes(e.t);
+                const size_t slot = vbr_slot_span(e.t, pool.gran);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
         }
@@ -3768,7 +3774,7 @@ void llama_kv_cache::vbr_shrink_watermark() {
                     continue;
                 }
                 const size_t keep = ggml_row_size(t->type, t->ne[0]) * (size_t) wm_now;
-                const size_t slot = vbr_slot_bytes(t);
+                const size_t slot = vbr_slot_span(t, pool.gran);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
             }
         }
