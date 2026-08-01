@@ -85,6 +85,9 @@ struct ggml_vbr_backend_iface {
     void   (*vmm_pool_free)  (struct ggml_vbr_vmm_pool * pool);
     void * (*vmm_pool_base)  (struct ggml_vbr_vmm_pool * pool);
     size_t (*vmm_pool_mapped)(struct ggml_vbr_vmm_pool * pool);       // mapped-physical bytes
+    // Exact resident bytes in a page-aligned subrange. The range must be contained in the
+    // reservation and aligned to vmm_granularity() at both ends. Read-only: never maps/unmaps.
+    size_t (*vmm_pool_mapped_in_range)(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
     // ensure [off, off+len) is backed by physical pages (rounded out to granularity; new pages
     // zeroed). false = physical memory exhausted (caller degrades or aborts); driver errors
     // beyond OOM are fatal inside the backend.

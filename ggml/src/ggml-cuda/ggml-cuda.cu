@@ -5446,6 +5446,7 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
         /* .vmm_pool_free     = */ ggml_backend_cuda_vmm_pool_free,
         /* .vmm_pool_base     = */ ggml_backend_cuda_vmm_pool_base,
         /* .vmm_pool_mapped   = */ ggml_backend_cuda_vmm_pool_mapped,
+        /* .vmm_pool_mapped_in_range = */ ggml_backend_cuda_vmm_pool_mapped_in_range,
         /* .vmm_pool_map      = */ ggml_backend_cuda_vmm_pool_map,
         /* .vmm_pool_unmap    = */ ggml_backend_cuda_vmm_pool_unmap,
         /* .vmm_pool_clear    = */ ggml_backend_cuda_vmm_pool_clear,

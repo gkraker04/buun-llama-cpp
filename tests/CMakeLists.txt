@@ -265,6 +265,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-vbr-vmm.cpp)
+    target_link_libraries(test-vbr-vmm PRIVATE ggml-cuda)
+    llama_test(test-vbr-vmm LABEL "backend")
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

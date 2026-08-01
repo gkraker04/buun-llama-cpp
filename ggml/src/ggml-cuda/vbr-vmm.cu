@@ -58,6 +58,22 @@ size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool * pool) {
     return pool->chunks.size() * pool->gran;
 }
 
+size_t ggml_backend_cuda_vmm_pool_mapped_in_range(
+        ggml_vbr_vmm_pool * pool, size_t off, size_t len) {
+    const size_t g = pool->gran;
+    GGML_ASSERT(off % g == 0);
+    GGML_ASSERT(len % g == 0);
+    GGML_ASSERT(off <= pool->va_size && len <= pool->va_size - off);
+
+    size_t chunks = 0;
+    const size_t end = off + len;
+    for (auto it = pool->chunks.lower_bound(off); it != pool->chunks.end() && *it < end; ++it) {
+        chunks++;
+    }
+    GGML_ASSERT(chunks <= SIZE_MAX / g);
+    return chunks * g;
+}
+
 bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t len) {
     if (len == 0) {
         return true;
@@ -81,6 +97,12 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         prop.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         CUmemGenericAllocationHandle handle;
         if (cuMemCreate(&handle, g, &prop, 0) != CUDA_SUCCESS) {
+            // Earlier chunks in this same call were zeroed on the legacy stream. A recoverable
+            // partial failure retains them, so settle their initialization before exposing them
+            // through mapped()/mapped_in_range() or a later idempotent retry.
+            if (zeroed) {
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
+            }
             return false; // physical exhausted — caller decides (degrade / abort)
         }
         const CUdeviceptr ptr = (CUdeviceptr)((char *) pool->base + c);
@@ -157,6 +179,7 @@ size_t ggml_backend_cuda_vmm_granularity(int)                                { r
 ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int, size_t)            { return nullptr; }
 void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool *)                 { return nullptr; }
 size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool *)               { return 0;       }
+size_t ggml_backend_cuda_vmm_pool_mapped_in_range(ggml_vbr_vmm_pool *, size_t, size_t) { return 0; }
 bool   ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool *, size_t, size_t)  { return false;   }
 bool   ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool *, size_t, size_t){ return false;   }
 void   ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool *)                {                 }
