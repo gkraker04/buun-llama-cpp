@@ -5086,6 +5086,7 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
 llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
                                          const std::vector<llama_vram_peer_claim> & claims,
                                          const std::vector<llama_vram_peer_marker> & peers,
+                                         const std::set<std::string> & announced,
                                          uint64_t now, uint32_t wm_next) {
     vbr_demand_service_result result;
     // ---- demand service: rank-0 shed sizing ----
@@ -5127,8 +5128,15 @@ llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
         if (our_offer + sib_offer == 0) {
             continue;
         }
+        const auto own_ts = vbr_marker_created_ts_.find(c.busid);
+        if (announced.count(c.busid) != 0 || own_ts == vbr_marker_created_ts_.end() || own_ts->second == 0) {
+            // A newly announced donor waits one scan so every contender ranks against a
+            // pre-existing offer set. Failed/unknown publication can never imply rank zero.
+            continue;
+        }
+        const uint64_t self_created_ts = own_ts->second;
         // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
-        // our created_ts is the marker's first-publish time; peers' come from the scan
+        // both sides use the marker registry's preserved first-publish timestamp
         bool rank0 = true;
         for (const auto & m : peers) {
             if (m.busid != c.busid || m.fields.shed_available == 0) {
@@ -5140,11 +5148,8 @@ llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
                     >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
                 continue; // stale offer — not a competitor
             }
-            // peers' created_ts vs ours: ours is unknowable from our own map (publish
-            // stamps it internally) — use pid as the deterministic total order fallback
-            // when created_ts ties are possible; the ledger's created_ts is authoritative
-            if (m.created_ts_ns < vbr_marker_created_ts_ ||
-                (m.created_ts_ns == vbr_marker_created_ts_ && m.pid < llama_vram_ledger_self_pid())) {
+            if (m.created_ts_ns < self_created_ts ||
+                (m.created_ts_ns == self_created_ts && m.pid < llama_vram_ledger_self_pid())) {
                 rank0 = false;
                 break;
             }
@@ -5293,7 +5298,7 @@ void llama_kv_cache::vbr_grant_pending_clear() {
 
 }
 
-void llama_kv_cache::vbr_markers_publish(uint64_t now) {
+void llama_kv_cache::vbr_markers_publish(std::set<std::string> * changed) {
     // ---- marker publish / beat (write discipline: rename only on field change) ----
     for (auto & p : vbr_pools_) {
         if (p.vmm == nullptr) {
@@ -5317,10 +5322,12 @@ void llama_kv_cache::vbr_markers_publish(uint64_t now) {
             f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
             f.shed_available = offer;
             f.grant_pending  = pending;
-            if (llama_vram_marker_publish(busid, f)) {
+            uint64_t created_ts = 0;
+            if (llama_vram_marker_publish(busid, f, &created_ts)) {
                 vbr_marker_pub_[busid] = { offer, pending };
-                if (vbr_marker_created_ts_ == 0) {
-                    vbr_marker_created_ts_ = now;
+                vbr_marker_created_ts_[busid] = created_ts;
+                if (changed != nullptr) {
+                    changed->insert(busid);
                 }
                 // our own rename: re-adopt the dir mtime so we don't trip our own pre-check
                 vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
@@ -5340,11 +5347,19 @@ bool llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     vbr_ledger_force_ = false;
     vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
 
+    const uint64_t now = vbr_last_scan_ns_;
+
+    // The boundary/tick already flushed the preceding wave. Retire its pending bridge,
+    // then announce the current offer before taking the rank snapshot. A changed advert
+    // waits one scan; the post-service publish below exposes the handoff immediately.
+    vbr_grant_pending_clear();
+    std::set<std::string> announced;
+    vbr_markers_publish(&announced);
+
     std::vector<llama_vram_peer_claim> claims;
     llama_vram_ledger_scan(claims);
     std::vector<llama_vram_peer_marker> peers;
     llama_vram_ledger_scan_markers(peers);
-    const uint64_t now = vbr_last_scan_ns_;
 
     vbr_presence_census(peers);
     bool grants_changed = vbr_grants_upkeep(claims, now);
@@ -5356,13 +5371,13 @@ bool llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
         vbr_ledger_sibling_->vbr_grant_pending_clear();
     }
-    const vbr_demand_service_result serviced = vbr_service_demands(claims, peers, now, wm_next);
+    const vbr_demand_service_result serviced =
+            vbr_service_demands(claims, peers, announced, now, wm_next);
     grants_changed = serviced.grants_changed || grants_changed;
     if (grants_changed) {
         vbr_apply_grant_decrements();
     }
-    vbr_grant_pending_clear();
-    vbr_markers_publish(now);
+    vbr_markers_publish();
     return serviced.reserve_failed;
 }
 

@@ -518,10 +518,9 @@ private:
     bool     vbr_ledger_force_  = false; // pre-check hit: run the full controller path
     // last published marker fields per busid (republish = rename only on change)
     std::map<std::string, std::pair<uint64_t, uint64_t>> vbr_marker_pub_; // {shed_avail, grant_pending}
-    // our marker's created_ts (donor-rank input; 0 until first publish) and the per-device
-    // granted-but-not-yet-flushed bytes (set at shed commit, cleared at the first scan
-    // event after that wave's deferred unmaps flush)
-    uint64_t vbr_marker_created_ts_ = 0;
+    // Authoritative first-publish timestamps returned by successful marker publications,
+    // plus per-device granted-but-not-yet-flushed bytes.
+    std::map<std::string, uint64_t> vbr_marker_created_ts_;
     std::map<std::string, uint64_t> vbr_grant_pending_;
 
     // ---- P3 presence census ----
@@ -558,9 +557,10 @@ private:
     vbr_demand_service_result vbr_service_demands(
                                const std::vector<llama_vram_peer_claim> & claims,
                                const std::vector<llama_vram_peer_marker> & peers,
+                               const std::set<std::string> & announced,
                                uint64_t now, uint32_t wm_next);
     void   vbr_grant_pending_clear();
-    void   vbr_markers_publish(uint64_t now);
+    void   vbr_markers_publish(std::set<std::string> * changed = nullptr);
     void   vbr_maybe_promote(uint32_t wm_next); // gated promote step (boundary + tick)
     void   vbr_arm_wave_fences();               // arm fences for queued transcode waves
     vbr_pool * vbr_find_pool(const std::string & busid);
