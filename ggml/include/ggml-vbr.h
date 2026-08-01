@@ -114,6 +114,13 @@ struct ggml_vbr_backend_iface {
     // recoverably, instead of aborting mid-decode. false = physical memory exhausted (the
     // caller flushes its deferred unmaps and retries once before failing the batch).
     bool (*kv_dequant_scratch_reserve)(ggml_backend_t backend, size_t k_bytes, size_t v_bytes);
+    // Read-only physical-memory projection for the same reserve. `physical_now` is the
+    // backend context's currently resident K+V scratch. `physical_if_reserved` is a
+    // conservative upper bound after a successful reserve to k_bytes/v_bytes, including
+    // VMM allocation-granularity rounding and the cudaMalloc next-power-of-two fallback.
+    // This never allocates, frees, maps, unmaps, migrates, or changes the scratch epoch.
+    void (*kv_dequant_scratch_memory)(ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
+                                      size_t * physical_now, size_t * physical_if_reserved);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address

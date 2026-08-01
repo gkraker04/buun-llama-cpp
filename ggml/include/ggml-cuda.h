@@ -71,6 +71,9 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 // (ggml-vbr.h vtable slot)
 GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(
         ggml_backend_t backend, size_t k_bytes, size_t v_bytes);
+GGML_BACKEND_API void ggml_backend_cuda_kv_dequant_scratch_memory(
+        ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
+        size_t * physical_now, size_t * physical_if_reserved);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

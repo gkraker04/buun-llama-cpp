@@ -1431,6 +1431,83 @@ bool ggml_backend_cuda_kv_dequant_scratch_reserve(
     return true;
 }
 
+static size_t kv_dequant_scratch_side_physical_now(const ggml_cuda_fattn_scratch_side & side) {
+    // The allocator normally owns exactly one representation. Sum both so the query remains
+    // physically exact even if it observes a fallback-to-VMM transition between state updates.
+    return side.cuda_size + (side.vmm != nullptr ? ggml_backend_cuda_vmm_pool_mapped(side.vmm) : 0);
+}
+
+static size_t kv_dequant_scratch_round_up(size_t bytes, size_t granularity) {
+    GGML_ASSERT(granularity > 0);
+    GGML_ASSERT(bytes <= SIZE_MAX - (granularity - 1));
+    return ((bytes + granularity - 1) / granularity) * granularity;
+}
+
+static size_t kv_dequant_scratch_next_pow2(size_t bytes) {
+    if (bytes == 0) {
+        return 0;
+    }
+    size_t result = 1;
+    while (result < bytes) {
+        GGML_ASSERT(result <= SIZE_MAX / 2);
+        result *= 2;
+    }
+    return result;
+}
+
+static size_t kv_dequant_scratch_side_physical_if_reserved(
+        const ggml_backend_cuda_context & ctx,
+        size_t need_bytes,
+        const ggml_cuda_fattn_scratch_side & side) {
+    const size_t physical_now = kv_dequant_scratch_side_physical_now(side);
+    if (need_bytes == 0) {
+        return physical_now;
+    }
+
+    const size_t fallback_size = kv_dequant_scratch_next_pow2(need_bytes);
+    if (!ggml_backend_cuda_vmm_available(ctx.device)) {
+        return std::max(physical_now, fallback_size);
+    }
+
+    const size_t granularity = ggml_backend_cuda_vmm_granularity(ctx.device);
+    GGML_ASSERT(granularity > 0);
+    const size_t vmm_size = kv_dequant_scratch_round_up(need_bytes, granularity);
+
+    if (side.vmm != nullptr && need_bytes <= side.vmm_va) {
+        // The existing reservation fixes the representation: a successful reserve maps only
+        // the missing VMM chunks. Never project a shrink from an anomalous overlapping fallback.
+        return std::max(physical_now, vmm_size);
+    }
+
+    // No representation has been selected yet, a prior VA reservation left a fallback, or the
+    // existing VMM VA must be replaced. The next reserve can land on either path. Do not let an
+    // offer depend on the smaller path succeeding or on a fallback-to-VMM migration shrinking
+    // physical occupancy.
+    return std::max({ physical_now, vmm_size, fallback_size });
+}
+
+void ggml_backend_cuda_kv_dequant_scratch_memory(
+        ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
+        size_t * physical_now, size_t * physical_if_reserved) {
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    GGML_ASSERT(physical_now != nullptr);
+    GGML_ASSERT(physical_if_reserved != nullptr);
+
+    const auto & ctx = *(const ggml_backend_cuda_context *) backend->context;
+    const size_t k_now = kv_dequant_scratch_side_physical_now(ctx.fattn_scratch.k);
+    const size_t v_now = kv_dequant_scratch_side_physical_now(ctx.fattn_scratch.v);
+    const size_t k_projected = kv_dequant_scratch_side_physical_if_reserved(
+            ctx, k_bytes, ctx.fattn_scratch.k);
+    const size_t v_projected = kv_dequant_scratch_side_physical_if_reserved(
+            ctx, v_bytes, ctx.fattn_scratch.v);
+
+    GGML_ASSERT(k_now <= SIZE_MAX - v_now);
+    GGML_ASSERT(k_projected <= SIZE_MAX - v_projected);
+    *physical_now = k_now + v_now;
+    *physical_if_reserved = k_projected + v_projected;
+}
+
 void ggml_cuda_fattn_scratch_free(ggml_backend_cuda_context & ctx) {
     ggml_cuda_set_device(ctx.device);
     ggml_cuda_fattn_scratch & scratch = ctx.fattn_scratch;
