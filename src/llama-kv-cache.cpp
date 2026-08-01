@@ -3136,6 +3136,18 @@ void llama_kv_cache::vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran)
         root->vbr_runtime_wm_ = root->vbr_watermark_cells(n_tokens);
         root->vbr_runtime_demand_update(root->vbr_runtime_wm_, false);
     }
+
+    // A child rejected a component reserve before its tier mutation.  Do not let finalization
+    // consume the forced scan edge or service another donation from either child while this batch
+    // is already returning failure.  Preserve the retry route and fence any earlier successful
+    // steps from this boundary; the next boundary will re-run the full tree after memory changes.
+    if (root->vbr_reserve_failed_ ||
+        (root->vbr_ledger_sibling_ != nullptr && root->vbr_ledger_sibling_->vbr_reserve_failed_)) {
+        root->vbr_ledger_force_ = true;
+        root->vbr_arm_wave_fences();
+        return;
+    }
+
     if (root->vbr_tree_forced() ||
         (root->vbr_boundary_count_ % 8 == 0 &&
          llama_vram_ledger_now_ns() - root->vbr_last_scan_ns_ >= 1000000000ull)) {
@@ -4521,6 +4533,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     // Restore the exact call-entry cursor so rejection is observationally atomic:
                     // even skipped no-op order entries are reconsidered with the retried step.
                     vbr_degrade_cursor_ = cursor_entry;
+                    vbr_reserve_failed_ = true;
                     LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
                             "mutation; leaving %s at %s\n", __func__, pending.pool->device,
                             pending.extent->t->name, ggml_type_name(pending.extent->t->type));
