@@ -420,9 +420,12 @@ private:
         ggml_backend_t backend      = nullptr;
         bool           wave_pending = false;      // async GPU work enqueued, fence not yet armed
         std::vector<std::pair<size_t, size_t>> unmap_deferred; // {pool byte_off, len}
-        // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): pristine first-degrade snapshot of the
-        // first N rows per tensor — permanently-hot sink rows re-encode from it at every hop
-        ggml_backend_buffer_t stash_buf = nullptr;
+        // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): one fixed-VA slab per KV pool. Extent
+        // offsets are assigned once at construction; physical pages are mapped grow-only when an
+        // extent first captures usable tapped-domain rows. This keeps allocation failure outside
+        // tier mutation and makes current/projected physical occupancy exactly queryable.
+        struct ggml_vbr_vmm_pool * stash_vmm = nullptr;
+        size_t                     stash_size = 0;       // page-padded VA reservation size
     };
     // A share-linked cache aliases another context's K/V tensors but executes attention on
     // this context's compute backends. Since fattn scratch is backend-context-owned, each
@@ -624,6 +627,10 @@ private:
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    // A recoverable pre-mutation component reserve failed during this boundary/tick. prepare()
+    // fails the batch instead of executing over budget; idle breathe() retains the exact cursor
+    // and retries on a later tick after physical capacity changes.
+    bool   vbr_reserve_failed_ = false;
     // prepare() boundaries since the last applied degrade step — promote cooldown basis
     // (deterministic, unlike wall time); promotes wait for a quiet window after any degrade
     uint32_t vbr_quiet_boundaries_ = 0;
@@ -659,7 +666,18 @@ private:
     // Pure, allocator-blind child stream for a future tree transaction.  It derives real steps
     // only through vbr_sim_step(), and is intentionally not wired into the live executor yet.
     llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
-    char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
+    struct vbr_stash_request {
+        const vbr_extent * extent = nullptr;
+        uint32_t           rows   = 0;
+    };
+    // Pure physical projection for any set of captures in one pool. The first usable capture
+    // requires the complete tightly-packed slab, matching the old allocation's fidelity lifetime;
+    // current occupancy includes pages retained by earlier failed maps.
+    bool     vbr_stash_memory(const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+                              size_t & physical_now, size_t & physical_if_reserved) const;
+    // Idempotently reserve/map the same request set. false is recoverable and changes no tier or
+    // stash-valid metadata; a partial VMM map may remain resident and is visible to the query.
+    bool     vbr_stash_reserve(vbr_pool & p, const std::vector<vbr_stash_request> & requests);
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;

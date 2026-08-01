@@ -1570,6 +1570,38 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_stash_rows_ > 0) {
                 LLAMA_LOG_INFO("%s: VBR f16 sink-stash: %u rows per (layer,side)\n",
                         __func__, vbr_stash_rows_);
+                // Assign stable offsets now, while the pool/extent topology is immutable. The
+                // reservation itself stays lazy: cuMemAddressReserve can fail at runtime, and that
+                // failure must surface at the pre-mutation reserve boundary rather than model load.
+                for (auto & p : vbr_pools_) {
+                    if (p.vmm == nullptr) {
+                        continue;
+                    }
+                    size_t total = 0;
+                    for (size_t j = 0; j < layers.size(); ++j) {
+                        for (int side = 0; side < 2; ++side) {
+                            vbr_extent & e = side ? p.v[j] : p.k[j];
+                            if (e.t == nullptr) {
+                                continue;
+                            }
+                            e.stash_off = total;
+                            const size_t ne0 = (size_t) e.t->ne[0];
+                            if (ne0 > SIZE_MAX / sizeof(uint16_t) ||
+                                (size_t) vbr_stash_rows_ > SIZE_MAX / (ne0 * sizeof(uint16_t))) {
+                                throw std::runtime_error("VBR sink-stash size overflow");
+                            }
+                            const size_t bytes = (size_t) vbr_stash_rows_ * ne0 * sizeof(uint16_t);
+                            if (total > SIZE_MAX - bytes) {
+                                throw std::runtime_error("VBR sink-stash size overflow");
+                            }
+                            total += bytes;
+                        }
+                    }
+                    if (total > SIZE_MAX - (p.gran - 1)) {
+                        throw std::runtime_error("VBR sink-stash page padding overflow");
+                    }
+                    p.stash_size = GGML_PAD(total, p.gran);
+                }
             }
         }
     }
@@ -1689,9 +1721,11 @@ llama_kv_cache::~llama_kv_cache() {
             ggml_backend_synchronize(p.backend);
             p.unmap_deferred.clear();
         }
-        if (p.stash_buf != nullptr) {
-            ggml_backend_buffer_free(p.stash_buf);
-            p.stash_buf = nullptr;
+        if (p.stash_vmm != nullptr) {
+            // The side-stream synchronize above retires capture/transcode readers before the
+            // stash VA disappears. vmm_pool_free adds a device-wide fence as a final backend guard.
+            p.be->vmm_pool_free(p.stash_vmm);
+            p.stash_vmm = nullptr;
         }
         if (p.backend != nullptr) {
             ggml_backend_free(p.backend);
@@ -2289,6 +2323,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     // check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers so it
     // never overruns the budget mid-flight.
     if (vbr_vmm_active()) {
+        // Reserve failures are boundary-local. The exact step remains at the cursor and may be
+        // retried after another process releases capacity.
+        llama_kv_cache * root = vbr_tree_root();
+        root->vbr_reserve_failed_ = false;
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            root->vbr_ledger_sibling_->vbr_reserve_failed_ = false;
+        }
         // S5: release the tail pages queued by the PREVIOUS wave first — their transcodes are long
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
@@ -3485,6 +3526,11 @@ void llama_kv_cache::breathe() {
     if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
         return;
     }
+    llama_kv_cache * root = vbr_tree_root();
+    root->vbr_reserve_failed_ = false;
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        root->vbr_ledger_sibling_->vbr_reserve_failed_ = false;
+    }
     if (vbr_stash_dirty_) {
         for (auto & p : vbr_pools_) {
             for (size_t j = 0; j < layers.size(); ++j) {
@@ -4089,31 +4135,86 @@ static void vbr_set_tensor_type(ggml_tensor * t, std::vector<ggml_tensor *> & vi
     }
 }
 
-// lazily size + allocate one pool's f16 sink-stash buffer (one slab per pool on that pool's
-// device, per-extent offsets); returns its base. Requires the pool's side-stream backend.
-char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
-    if (p.stash_buf == nullptr) {
-        size_t total = 0;
-        for (size_t j = 0; j < layers.size(); ++j) {
-            for (int side = 0; side < 2; ++side) {
-                vbr_extent        & ex = side ? p.v[j] : p.k[j];
-                const ggml_tensor * tt = ex.t; // pool-local instance (shard under -sm tensor)
-                if (tt == nullptr) {
-                    continue;
-                }
-                ex.stash_off = total;
-                total += (size_t) vbr_stash_rows_ * tt->ne[0] * sizeof(uint16_t);
-            }
-        }
-        GGML_ASSERT(p.backend != nullptr);
-        p.stash_buf = ggml_backend_buft_alloc_buffer(
-                ggml_backend_get_default_buffer_type(p.backend), total);
-        if (p.stash_buf == nullptr) {
-            return nullptr;
-        }
-        LLAMA_LOG_INFO("%s: VBR sink-stash buffer (device %d): %.2f MiB\n", __func__, p.device, total/1024.0/1024.0);
+bool llama_kv_cache::vbr_stash_memory(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        size_t & physical_now, size_t & physical_if_reserved) const {
+    physical_now = p.stash_vmm != nullptr ? p.be->vmm_pool_mapped(p.stash_vmm) : 0;
+    physical_if_reserved = physical_now;
+    if (requests.empty()) {
+        return true;
     }
-    return (char *) ggml_backend_buffer_get_base(p.stash_buf);
+    if (p.stash_size == 0 || p.gran == 0) {
+        return false;
+    }
+
+    bool needs_mapping = false;
+    for (const auto & request : requests) {
+        const vbr_extent * e = request.extent;
+        if (e == nullptr || e->t == nullptr || request.rows > vbr_stash_rows_) {
+            return false;
+        }
+        const bool owned = std::any_of(p.k.begin(), p.k.end(),
+                    [&](const vbr_extent & candidate) { return &candidate == e; }) ||
+                std::any_of(p.v.begin(), p.v.end(),
+                    [&](const vbr_extent & candidate) { return &candidate == e; });
+        if (!owned) {
+            return false;
+        }
+        const size_t ne0 = (size_t) e->t->ne[0];
+        if (ne0 > SIZE_MAX / sizeof(uint16_t) ||
+            (size_t) request.rows > SIZE_MAX / (ne0 * sizeof(uint16_t))) {
+            return false;
+        }
+        const size_t bytes = (size_t) request.rows * ne0 * sizeof(uint16_t);
+        if (bytes == 0) {
+            continue;
+        }
+        needs_mapping = true;
+        if (e->stash_off > p.stash_size || bytes > p.stash_size - e->stash_off) {
+            return false;
+        }
+    }
+    // One capture pins the slab for the cache lifetime, just as the prior cudaMalloc did. Keeping
+    // this a complete page-padded endpoint makes a transaction's stash price independent of which
+    // extent happens to be the first capture and avoids page-union arithmetic in the policy layer.
+    if (needs_mapping) {
+        physical_if_reserved = std::max(physical_now, p.stash_size);
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_stash_reserve(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests) {
+    size_t physical_now = 0;
+    size_t physical_if_reserved = 0;
+    if (!vbr_stash_memory(p, requests, physical_now, physical_if_reserved)) {
+        return false;
+    }
+    if (physical_if_reserved == physical_now) {
+        return true;
+    }
+    if (p.stash_vmm == nullptr) {
+        p.stash_vmm = p.be->vmm_pool_init(p.device, p.stash_size);
+        if (p.stash_vmm == nullptr) {
+            return false;
+        }
+    }
+
+    // The complete slab is one deterministic transaction endpoint. vmm_pool_map is idempotent and
+    // retains a settled prefix on failure, so retry grows only the missing pages.
+    if (!p.be->vmm_pool_map(p.stash_vmm, 0, p.stash_size)) {
+        const size_t physical_after = p.be->vmm_pool_mapped(p.stash_vmm);
+        LLAMA_LOG_WARN("%s: VBR sink-stash reserve failed on device %d after mapping %.2f "
+                "MiB / projected %.2f MiB (%.2f MiB VA); retry is idempotent\n",
+                __func__, p.device, physical_after/1048576.0,
+                physical_if_reserved/1048576.0, p.stash_size/1048576.0);
+        return false;
+    }
+    const size_t physical_after = p.be->vmm_pool_mapped(p.stash_vmm);
+    GGML_ASSERT(physical_after >= physical_if_reserved);
+    LLAMA_LOG_INFO("%s: VBR sink-stash reserve (device %d): %.2f MiB mapped / %.2f MiB VA\n",
+            __func__, p.device, physical_after/1048576.0, p.stash_size/1048576.0);
+    return true;
 }
 
 // The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS — unlike
@@ -4322,8 +4423,8 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 // would lock in the DEGRADED recon as the reference
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
-                if (vbr_stash_rows_ > 0 && e.stash_valid > 0 && pp->stash_buf != nullptr) {
-                    stash_ptr  = (char *) ggml_backend_buffer_get_base(pp->stash_buf) + e.stash_off;
+                if (vbr_stash_rows_ > 0 && e.stash_valid > 0 && pp->stash_vmm != nullptr) {
+                    stash_ptr  = (char *) pp->be->vmm_pool_base(pp->stash_vmm) + e.stash_off;
                     stash_rows = e.stash_valid;
                 }
                 const ggml_vbr_transcode_params tp = {
@@ -4388,28 +4489,41 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
             }
         }
 
-        // When configured, the stash's first allocation must succeed before this step queues
-        // a transcode, defers an unmap, or flips tier metadata.  A nullable backend allocation
-        // therefore rejects the entire step at this boundary; retry it after pressure clears.
+        // Determine and land every stash page this unit can touch before starting any side stream,
+        // capture, transcode, metadata flip, or deferred unmap. Tensor-split units reserve on all
+        // devices first; a failure may retain initialized VMM pages but cannot leave mixed tiers.
+        struct pending_stash {
+            vbr_pool *   pool;
+            vbr_extent * extent;
+            uint32_t     rows;
+            bool         capture;
+        };
+        std::vector<pending_stash> pending_stashes;
+        pending_stashes.reserve(units.size());
         if (vbr_stash_rows_ > 0) {
             for (auto & [pp, ep] : units) {
-                GGML_UNUSED(ep);
-                if (pp->wm_cells == 0) {
+                const int64_t n_cells = pp->wm_cells;
+                if (n_cells <= 0) {
                     continue;
                 }
-                if (pp->backend == nullptr) {
-                    pp->backend = pp->be->backend_init(pp->device);
-                    GGML_ASSERT(pp->backend != nullptr);
+                const bool capture = ep->stash_valid == 0 &&
+                        ggml_is_turbo_kv_type(ep->t->type) && ep->t->type != GGML_TYPE_TURBO8_0;
+                const uint32_t rows = capture
+                        ? (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells)
+                        : ep->stash_valid;
+                if (rows > 0) {
+                    pending_stashes.push_back({ pp, ep, rows, capture });
                 }
-                if (vbr_stash_ensure(*pp) == nullptr) {
-                    // Restore the call-entry cursor so retry observes the same logical ladder
-                    // operation, including any no-op entries skipped while finding this step.
-                    // Stash buffers allocated successfully for earlier pools stay cached for retry.
+            }
+            for (const auto & pending : pending_stashes) {
+                const std::vector<vbr_stash_request> request = {{ pending.extent, pending.rows }};
+                if (!vbr_stash_reserve(*pending.pool, request)) {
+                    // Restore the exact call-entry cursor so rejection is observationally atomic:
+                    // even skipped no-op order entries are reconsidered with the retried step.
                     vbr_degrade_cursor_ = cursor_entry;
                     LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
-                            "mutation; leaving %s at %s\n", __func__, pp->device,
-                            ep->t->name, ggml_type_name(ep->t->type));
-                    vbr_arm_wave_fences();
+                            "mutation; leaving %s at %s\n", __func__, pending.pool->device,
+                            pending.extent->t->name, ggml_type_name(pending.extent->t->type));
                     return vbr_degrade_result::reserve_failed;
                 }
             }
@@ -4449,25 +4563,27 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     pp->be->sync_device(pp->device);
                 }
 
-                // f16 sink-stash: capture rows [0, stash_rows) from the tier-A recon at the FIRST
-                // degrade (≈pristine when A is high), then every hop re-encodes those rows from the
-                // stash — the sink is the only region both permanently hot and permanently old
+                // f16 sink-stash: capture rows [0, stash_rows) from the first tapped-domain tier-A
+                // recon, then every later hop re-encodes those rows from the stash — the sink is
+                // the only region both permanently hot and permanently old
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
                 if (vbr_stash_rows_ > 0) {
-                    char * sbase = (char *) ggml_backend_buffer_get_base(pp->stash_buf);
-                    // the stash is injected into TAPPED-tier encodes with the tap suppressed, so it
-                    // must hold tapped-domain rows (V - mu_V). t8 and f16 store FULL-domain — defer
-                    // capture until the source is a tapped tier (t4 or lower); the first tapped hop's
-                    // recon is the earliest domain-correct snapshot.
-                    if (e.stash_valid == 0 && ggml_is_turbo_kv_type(e.t->type) &&
-                        e.t->type != GGML_TYPE_TURBO8_0) {
-                        e.stash_valid = (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells);
-                        pp->be->kv_stash_capture(pp->backend, e.t, sbase + e.stash_off,
-                                                           e.stash_valid, st.is_v != 0);
+                    const auto pending = std::find_if(pending_stashes.begin(), pending_stashes.end(),
+                            [&](const pending_stash & s) { return s.pool == pp && s.extent == &e; });
+                    if (pending != pending_stashes.end()) {
+                        GGML_ASSERT(pp->stash_vmm != nullptr);
+                        char * sbase = (char *) pp->be->vmm_pool_base(pp->stash_vmm);
+                        // Only tapped tiers provide the domain the suppressed encode tap consumes.
+                        // f16/t8 hops neither allocate nor capture an unusable full-domain stash.
+                        if (pending->capture) {
+                            pp->be->kv_stash_capture(pp->backend, e.t, sbase + e.stash_off,
+                                                    pending->rows, st.is_v != 0);
+                            e.stash_valid = pending->rows;
+                        }
+                        stash_ptr  = sbase + e.stash_off;
+                        stash_rows = e.stash_valid;
                     }
-                    stash_ptr  = sbase + e.stash_off;
-                    stash_rows = e.stash_valid;
                 }
 
                 // S5: transcode + scrub run ASYNC on the side stream; the fence armed at end-of-wave
