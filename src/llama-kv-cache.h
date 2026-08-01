@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-vbr-policy.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
@@ -567,6 +568,9 @@ private:
     void     vbr_floor_clamp_order();
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(size_t flat_cells);  // #88: boundary-time f16 dequant scratch grow
+    // Pure, allocator-blind child stream for a future tree transaction.  It derives real steps
+    // only through vbr_sim_step(), and is intentionally not wired into the live executor yet.
+    llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)

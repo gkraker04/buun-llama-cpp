@@ -3053,8 +3053,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             }
             b.rows_epoch = owner_epoch;
         }
-        const size_t k_bytes = b.k_row * wm_cells;
-        const size_t v_bytes = b.v_row * wm_cells;
+        const size_t k_bytes = b.k_row * flat_cells;
+        const size_t v_bytes = b.v_row * flat_cells;
         if ((k_bytes != 0 || v_bytes != 0) &&
             !b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
             // The owner's tier flip may still have old-tier tails queued for release. They
@@ -3488,6 +3488,103 @@ bool llama_kv_cache::vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
         return false; // same no-op rule as vbr_degrade_next
     }
     return true;
+}
+
+// Page-padded LOGICAL endpoint bytes for policy ordering.  This intentionally has no VMM pool or
+// residency query: partial mappings and allocator history are physical-pricing inputs, never
+// permission to change which measured layer loses quality next.
+static uint64_t vbr_policy_endpoint_bytes(
+        const ggml_tensor * t, ggml_type type, uint32_t wm, size_t gran) {
+    GGML_ASSERT(t != nullptr && gran > 0);
+    const uint64_t slot = vbr_slot_span(t, gran);
+    const uint64_t row  = ggml_row_size(type, t->ne[0]);
+    uint64_t result = 0;
+    if (!llama_vbr_policy::logical_endpoint_bytes(row, wm, slot, gran, result)) {
+        GGML_ABORT("VBR policy endpoint overflow or invalid geometry");
+    }
+    return result;
+}
+
+static void vbr_policy_add_checked(int64_t & total, int64_t delta) {
+    int64_t next = 0;
+    if (!llama_vbr_policy::checked_add(total, delta, next)) {
+        GGML_ABORT("VBR policy progress overflow");
+    }
+    total = next;
+}
+
+llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
+        int demanded_device, uint32_t wm_next) const {
+    llama_vbr_policy::child out;
+    std::vector<ggml_type> sim;
+    vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                 nullptr, nullptr, nullptr);
+
+    // Incoming watermark growth is part of the logical baseline-to-prefix delta.  It can make
+    // initial progress negative; the interleaver clamps only for its ratio comparison.
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm == nullptr || p.device != demanded_device) {
+            continue;
+        }
+        const uint32_t terminal_wm = std::max(p.wm_cells, wm_next);
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const vbr_extent & e = side ? p.v[ikv] : p.k[ikv];
+                if (e.t == nullptr) {
+                    continue;
+                }
+                const size_t slot = ikv*2 + (side ? 1 : 0);
+                const ggml_type type = sim[slot] != GGML_TYPE_COUNT ? sim[slot] : e.t->type;
+                const uint64_t before = vbr_policy_endpoint_bytes(e.t, type, p.wm_cells, p.gran);
+                const uint64_t after  = vbr_policy_endpoint_bytes(e.t, type, terminal_wm, p.gran);
+                GGML_ASSERT(before <= (uint64_t) INT64_MAX && after <= (uint64_t) INT64_MAX);
+                vbr_policy_add_checked(out.initial_progress,
+                        (int64_t) before - (int64_t) after);
+            }
+        }
+    }
+
+    int64_t terminal = out.initial_progress;
+    const size_t limit = vbr_demand_limit();
+    for (size_t i = vbr_degrade_cursor_; i < limit; ++i) {
+        size_t slot = 0;
+        const ggml_tensor * canonical = nullptr;
+        ggml_type type_b = GGML_TYPE_COUNT;
+        // Authoritative unknown-layer, absent, pinned, same-type and no-gain skip rules.
+        if (!vbr_sim_step(sim, i, slot, canonical, type_b)) {
+            continue;
+        }
+
+        const auto & order_step = vbr_degrade_order_[i];
+        const size_t ikv = slot / 2;
+        int64_t gain = 0;
+        for (const auto & p : vbr_pools_) {
+            if (p.vmm == nullptr || p.device != demanded_device) {
+                continue;
+            }
+            const vbr_extent & e = order_step.is_v ? p.v[ikv] : p.k[ikv];
+            if (e.t == nullptr) {
+                continue;
+            }
+            const uint32_t terminal_wm = std::max(p.wm_cells, wm_next);
+            const uint64_t before = vbr_policy_endpoint_bytes(e.t, sim[slot], terminal_wm, p.gran);
+            const uint64_t after  = vbr_policy_endpoint_bytes(e.t, type_b,    terminal_wm, p.gran);
+            GGML_ASSERT(before >= after && before - after <= (uint64_t) INT64_MAX);
+            vbr_policy_add_checked(gain, (int64_t) (before - after));
+        }
+
+        out.steps.push_back({
+            /*.order_index =*/ i,
+            /*.slot        =*/ slot,
+            /*.type_a      =*/ (int32_t) sim[slot],
+            /*.type_b      =*/ (int32_t) type_b,
+            /*.logical_gain=*/ gain,
+        });
+        vbr_policy_add_checked(terminal, gain);
+        sim[slot] = type_b;
+    }
+    out.terminal_progress = terminal;
+    return out;
 }
 
 llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
