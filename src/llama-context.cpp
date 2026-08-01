@@ -4187,7 +4187,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // intermediate prefill chunks run n_outputs == 0 and warmup decodes are not requests
     // (warmup's tiny batch does not grow the compute pools, so the memory claim is NOT
     // complete after it). Unlinking the satisfied claim is the donors' lift signal.
-    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_pending_complete()) {
+    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_auto_complete_pending()) {
         llama_vram_demand_complete();
     }
 
@@ -6322,6 +6322,22 @@ void llama_memory_breathe(llama_memory_t mem) {
 
 void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
     llama_vram_plan_hint_set(device_id, bytes);
+}
+
+void llama_vram_load_begin(bool application_owned_completion) {
+    llama_vram_load_begin_internal(application_owned_completion);
+}
+
+void llama_vram_load_end(bool success) {
+    llama_vram_load_end_internal(success);
+}
+
+void llama_vram_plan_aux(const char * device_id, uint64_t bytes) {
+    llama_vram_plan_aux_add_internal(device_id, bytes);
+}
+
+void llama_vram_load_complete(void) {
+    llama_vram_demand_complete();
 }
 
 void llama_vram_mark_serviced(void) {

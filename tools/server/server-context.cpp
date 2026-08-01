@@ -1373,6 +1373,16 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // One server load includes the target, linked draft/MTP, multimodal,
+        // slot, tape and compatibility allocations below. The target/common
+        // loader nests inside this scope but cannot finish the process claim.
+        llama_vram_load_begin(has_spec);
+        bool load_succeeded = false;
+        struct load_scope {
+            bool & succeeded;
+            ~load_scope() { llama_vram_load_end(succeeded); }
+        } load_guard { load_succeeded };
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1469,6 +1479,13 @@ private:
                     for (size_t j = 0; j < devs.size(); ++j) {
                         const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
                         total += bytes;
+                        if (bytes > 0 && ggml_backend_dev_type(devs[j]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            ggml_backend_dev_props props;
+                            ggml_backend_dev_get_props(devs[j], &props);
+                            if (props.device_id != nullptr) {
+                                llama_vram_plan_aux(props.device_id, bytes);
+                            }
+                        }
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == devs[j]) {
                                 if (bytes > params_base.fit_params_target[i]) {
@@ -2238,14 +2255,15 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            load_succeeded = init();
+        } else {
+            if (callback_state) {
+                callback_state(SERVER_STATE_READY, {});
+            }
+            load_succeeded = true;
         }
 
-        if (callback_state) {
-            callback_state(SERVER_STATE_READY, {});
-        }
-
-        return true;
+        return load_succeeded;
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -3822,6 +3840,8 @@ private:
     int64_t t_verify_total  = 0;
     int64_t t_accept_total  = 0;
     int     n_slots_drafted = 0;
+    bool    cycle_has_output = false;
+    bool    cycle_failed = false;
 
     // TG tokens in the current batch — pure-verify batches allow multi-seq batching
     int32_t n_tg_tokens = 0;
@@ -3897,6 +3917,7 @@ private:
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
+            cycle_failed = true;
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
         }
@@ -3964,6 +3985,7 @@ private:
                     continue;
                 }
             } catch (const std::exception & e) {
+                cycle_failed = true;
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3973,6 +3995,7 @@ private:
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
+                cycle_failed = true;
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3984,6 +4007,7 @@ private:
         try {
             post_cycle();
         } catch (const std::exception & e) {
+            cycle_failed = true;
             SRV_ERR("post_cycle() failed: %s\n", e.what());
             abort_all_slots("post_cycle() failed: " + std::string(e.what()));
         }
@@ -4071,6 +4095,8 @@ private:
         t_verify_total  = 0;
         t_accept_total  = 0;
         n_slots_drafted = 0;
+        cycle_has_output = false;
+        cycle_failed = false;
 
         std::vector<llama_tokens> batched_drafts(slots.size());
         if (ctx_dft_shared) {
@@ -4960,6 +4986,12 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        if (batch_view.logits != nullptr) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                cycle_has_output |= batch_view.logits[i] != 0;
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -5756,6 +5788,17 @@ private:
         // restore force_split_seq for the next cycle (prompt batches need it)
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, true);
+        }
+
+        // The generic target-output hook is intentionally disabled for a
+        // composite speculative load: the drafter can allocate after that
+        // target output. Complete only after a successful cycle crossed the
+        // draft path. If speculative initialization fell back to target-only,
+        // preserve the direct first-output behavior.
+        const bool any_spec_context = std::any_of(slots.begin(), slots.end(),
+                [](const server_slot & slot) { return slot.can_speculate(); });
+        if (!cycle_failed && (n_slots_drafted > 0 || (cycle_has_output && !any_spec_context))) {
+            llama_vram_load_complete();
         }
 
         SRV_DBG("%s", "run slots completed\n");
