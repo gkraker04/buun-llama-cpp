@@ -535,7 +535,7 @@ private:
         uint64_t    ver;
         size_t      pool_idx;
         uint64_t    bytes;
-        uint64_t    bytes_now_at_grant;
+        uint64_t    bytes_now_at_grant; // staggered threshold: aggregate landed bytes consume rows once
         bool        collateral;
     };
     std::vector<vbr_grant_row> vbr_grants_;

@@ -5739,6 +5739,29 @@ llama_kv_cache::vbr_shed_result llama_kv_cache::vbr_execute_shed(
                        - vbr_vmm_projected_bytes(*demanded_pool, wm_next);
     }
     bool changed = false;
+
+    // A tree wave can create several non-collateral rows for one demanded device (multiple
+    // pools, or base + SWA).  Stagger their bytes_now baselines by the live credit already ahead
+    // of them so one landed byte amortizes the aggregate liability exactly once, not once per row.
+    uint64_t prior_credit = 0;
+    const auto saturating_add = [](uint64_t a, uint64_t b) {
+        return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+    };
+    llama_kv_cache * root = vbr_tree_root();
+    auto add_existing_credit = [&](const llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
+        }
+        for (const auto & g : child->vbr_grants_) {
+            if (!g.collateral && g.busid == c.busid && g.pid == c.pid &&
+                g.starttime == c.starttime && g.ver == c.fields.ver) {
+                prior_credit = saturating_add(prior_credit, g.bytes);
+            }
+        }
+    };
+    add_existing_credit(root);
+    add_existing_credit(root->vbr_ledger_sibling_);
+
     for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
         auto & p = vbr_pools_[pi];
         if (p.vmm == nullptr) {
@@ -5756,8 +5779,12 @@ llama_kv_cache::vbr_shed_result llama_kv_cache::vbr_execute_shed(
         g.ver                = c.fields.ver;
         g.pool_idx           = pi;
         g.bytes              = freed;
-        g.bytes_now_at_grant = c.bytes_now;
         g.collateral         = vbr_pool_busid(p) != c.busid;
+        g.bytes_now_at_grant = g.collateral ? c.bytes_now
+                                             : saturating_add(c.bytes_now, prior_credit);
+        if (!g.collateral) {
+            prior_credit = saturating_add(prior_credit, freed);
+        }
         vbr_grants_.push_back(std::move(g));
         changed = true;
         vbr_grant_pending_[vbr_pool_busid(p)] += freed;
