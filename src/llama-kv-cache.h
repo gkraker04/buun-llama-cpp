@@ -391,6 +391,22 @@ private:
         // first N rows per tensor — permanently-hot sink rows re-encode from it at every hop
         ggml_backend_buffer_t stash_buf = nullptr;
     };
+    // A share-linked cache aliases another context's K/V tensors but executes attention on
+    // this context's compute backends. Since fattn scratch is backend-context-owned, each
+    // device needs scratch-only metadata here even though the drafter intentionally owns no
+    // VMM pool or VBR controller. Tensor pointers are non-owning aliases whose live types are
+    // authoritative; row maxima are recomputed only when the delegated owner epoch changes.
+    struct vbr_shared_scratch_binding {
+        ggml_backend_buffer_t buf = nullptr;
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        std::vector<ggml_tensor *> k;
+        std::vector<ggml_tensor *> v;
+        uint64_t rows_epoch = ~0ull;
+        size_t k_row = 0;
+        size_t v_row = 0;
+    };
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
@@ -633,6 +649,9 @@ private:
     // Dynamic VBR shared KV pools (M2 bookkeeping; M3 transcode/relocate) — one per KV buffer
     // (per device under -sm layer; exactly one on a single GPU)
     std::vector<vbr_pool> vbr_pools_;
+    // Scratch bindings for shared-KV aliases. Deliberately separate from vbr_pools_: a
+    // controller-less drafter must not appear to own VMM, budget, ledger, or degrade state.
+    std::vector<vbr_shared_scratch_binding> vbr_shared_scratch_bindings_;
     // [ikv*2 + is_v] -> (pool, extent) units; built once at ctor end, immutable after
     std::vector<std::vector<std::pair<vbr_pool *, vbr_extent *>>> vbr_units_tab_;
 

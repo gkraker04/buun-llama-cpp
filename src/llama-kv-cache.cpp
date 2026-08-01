@@ -726,6 +726,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    // Kept parallel to layers[] so scratch registration can select only tensors actually
+    // aliased from mem_other. Local f16 tensors must remain zero-cost.
+    std::vector<bool> layer_is_shared;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -762,6 +765,7 @@ llama_kv_cache::llama_kv_cache(
 
                 layers.push_back(layer_share);
                 layers.back().il = il;
+                layer_is_shared.push_back(true);
 
                 continue;
             }
@@ -904,6 +908,7 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream });
+        layer_is_shared.push_back(false);
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -1192,6 +1197,75 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
         }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    GGML_ASSERT(layer_is_shared.size() == layers.size());
+
+    // A shared-KV cache executes attention using this context's backend objects while its
+    // layer entries alias tensors owned (and tier-mutated) by another context. Register those
+    // aliases as scratch-only bindings. This restores the boundary-reserve invariant without
+    // creating a drafter-side VMM pool/controller/ledger participant.
+    if (other && !hparams.no_alloc) {
+        auto find_binding = [&](ggml_backend_buffer_t buf) -> vbr_shared_scratch_binding * {
+            for (auto & b : vbr_shared_scratch_bindings_) {
+                if (b.buf == buf) {
+                    return &b;
+                }
+            }
+            return nullptr;
+        };
+
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if (!layer_is_shared[ikv]) {
+                continue;
+            }
+            for (int side = 0; side < 2; ++side) {
+                ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+                if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+                    continue;
+                }
+                // Tensor-split shared KV is rejected above, so aliases are simple device
+                // buffers. Keep this assertion beside the registration contract so future
+                // relaxation cannot silently bind a meta tensor to the wrong backend.
+                GGML_ASSERT(!ggml_backend_buffer_is_meta(t->buffer));
+
+                vbr_shared_scratch_binding * b = find_binding(t->buffer);
+                if (b == nullptr) {
+                    const auto devs = llama_vbr_backend_devs_for_buft(
+                            ggml_backend_buffer_get_type(t->buffer));
+                    if (devs.empty()) {
+                        // CPU/non-Turbo aliases have no dequant scratch backend and cannot
+                        // activate the CUDA TurboQuant materialization path.
+                        continue;
+                    }
+                    GGML_ASSERT(devs.size() == 1);
+                    vbr_shared_scratch_binding fresh;
+                    fresh.buf    = t->buffer;
+                    fresh.be     = devs[0].be;
+                    fresh.device = devs[0].device;
+                    fresh.compute_backend = vbr_params_.compute_backend_for_buft
+                            ? vbr_params_.compute_backend_for_buft(
+                                    ggml_backend_buffer_get_type(t->buffer))
+                            : nullptr;
+                    if (fresh.compute_backend == nullptr) {
+                        throw std::runtime_error(format(
+                                "shared-KV scratch could not bind tensor buffer type %s to this context's compute backend",
+                                ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer))));
+                    }
+                    fresh.k.assign(layers.size(), nullptr);
+                    fresh.v.assign(layers.size(), nullptr);
+                    vbr_shared_scratch_bindings_.push_back(std::move(fresh));
+                    b = &vbr_shared_scratch_bindings_.back();
+                }
+                (side ? b->v : b->k)[ikv] = t;
+            }
+        }
+
+        for (size_t i = 0; i < vbr_shared_scratch_bindings_.size(); ++i) {
+            const auto & b = vbr_shared_scratch_bindings_[i];
+            LLAMA_LOG_INFO("%s: shared-KV scratch binding #%zu (device %d, backend %s)\n",
+                    __func__, i, b.device, ggml_backend_name(b.compute_backend));
+        }
     }
 
     // Dynamic VBR (M2): record per-(layer,side) descriptors over the just-placed KV tensors.
@@ -2200,7 +2274,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     // the sides that are dequant-active after the wave above — see vbr_scratch_reserve. Runs for
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
-    if (!vbr_pools_.empty()) {
+    if (!vbr_pools_.empty() || !vbr_shared_scratch_bindings_.empty()) {
         size_t scratch_cells = vbr_watermark_cells(n_tokens);
         if (n_stream > 1) {
             // A non-unified graph views K/V as [head_dim, heads, n_kv, stream_span], and the
@@ -2943,6 +3017,49 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
             vbr_flush_deferred_unmaps();
             if (!p.be->kv_dequant_scratch_reserve(p.compute_backend, k_bytes, v_bytes)) {
+                return false;
+            }
+        }
+    }
+    // Shared aliases are deliberately absent from vbr_pools_. Their live tensor types follow
+    // the owner, so use the delegated epoch and reserve against this context's compute backend.
+    // Multiple iSWA children call this serially on the same backend; the grow-only backend
+    // scratch therefore lands at the per-side maximum rather than the sum.
+    const uint64_t owner_epoch = vbr_tier_epoch();
+    for (auto & b : vbr_shared_scratch_bindings_) {
+        GGML_ASSERT(b.be != nullptr && b.compute_backend != nullptr && b.device >= 0);
+        if (b.rows_epoch != owner_epoch) {
+            b.k_row = 0;
+            b.v_row = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const ggml_tensor * tk = b.k[ikv];
+                const ggml_tensor * tv = b.v[ikv];
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
+                if (need_k && tk) {
+                    b.k_row = std::max(b.k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv) {
+                    b.v_row = std::max(b.v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
+            }
+            b.rows_epoch = owner_epoch;
+        }
+        const size_t k_bytes = b.k_row * wm_cells;
+        const size_t v_bytes = b.v_row * wm_cells;
+        if ((k_bytes != 0 || v_bytes != 0) &&
+            !b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
+            // The owner's tier flip may still have old-tier tails queued for release. They
+            // belong to the aliased tensors and are safe to reclaim with the same synchronized
+            // flush used by the owner's own reserve path. Retry once before failing this draft
+            // boundary recoverably.
+            LLAMA_LOG_WARN("%s: shared-KV f16 dequant scratch reserve of %.1f + %.1f MiB failed "
+                    "on device %d — flushing owner deferred unmaps and retrying\n",
+                    __func__, k_bytes/1048576.0, v_bytes/1048576.0, b.device);
+            other->vbr_flush_deferred_unmaps();
+            if (!b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
                 return false;
             }
         }
