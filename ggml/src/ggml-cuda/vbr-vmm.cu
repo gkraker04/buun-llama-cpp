@@ -22,6 +22,7 @@ struct ggml_vbr_vmm_pool {
     CUdeviceptr base    = 0;
     size_t      va_size = 0;
     size_t      gran    = 0;
+    uint64_t    residency_epoch = 0;
     std::set<size_t> chunks; // mapped chunk offsets (each gran bytes)
 };
 
@@ -56,6 +57,10 @@ void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool * pool) {
 
 size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool * pool) {
     return pool->chunks.size() * pool->gran;
+}
+
+uint64_t ggml_backend_cuda_vmm_pool_residency_epoch(ggml_vbr_vmm_pool * pool) {
+    return pool->residency_epoch;
 }
 
 size_t ggml_backend_cuda_vmm_pool_mapped_in_range(
@@ -102,6 +107,8 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
             // through mapped()/mapped_in_range() or a later idempotent retry.
             if (zeroed) {
                 CUDA_CHECK(cudaStreamSynchronize(nullptr));
+                GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
+                pool->residency_epoch++;
             }
             return false; // physical exhausted — caller decides (degrade / abort)
         }
@@ -123,6 +130,8 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         // them against the compute/side streams that write these pages next — settle them here
         // (rare: only on watermark growth, and the pages are new)
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
+        pool->residency_epoch++;
     }
     return true;
 }
@@ -133,6 +142,7 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
     const size_t g  = pool->gran;
     const size_t c0 = GGML_PAD(off, g);
     const size_t c1 = ((off + len) / g) * g;
+    bool changed = false;
     for (size_t c = c0; c < c1; c += g) {
         auto it = pool->chunks.find(c);
         if (it == pool->chunks.end()) {
@@ -140,6 +150,11 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
         }
         CU_CHECK(cuMemUnmap((CUdeviceptr)((char *) pool->base + c), g));
         pool->chunks.erase(it);
+        changed = true;
+    }
+    if (changed) {
+        GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
+        pool->residency_epoch++;
     }
     return true;
 }
@@ -179,6 +194,7 @@ size_t ggml_backend_cuda_vmm_granularity(int)                                { r
 ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int, size_t)            { return nullptr; }
 void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool *)                 { return nullptr; }
 size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool *)               { return 0;       }
+uint64_t ggml_backend_cuda_vmm_pool_residency_epoch(ggml_vbr_vmm_pool *)    { return 0;       }
 size_t ggml_backend_cuda_vmm_pool_mapped_in_range(ggml_vbr_vmm_pool *, size_t, size_t) { return 0; }
 bool   ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool *, size_t, size_t)  { return false;   }
 bool   ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool *, size_t, size_t){ return false;   }
