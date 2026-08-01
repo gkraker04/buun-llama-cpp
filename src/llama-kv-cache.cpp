@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-vbr-physical.h"
 #include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
 
@@ -4745,6 +4746,140 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
     return st;
+}
+
+// Exact cache-local KV endpoint for one VMM pool.  The baseline is the page set that
+// physically exists now, except that releases already queued by an older transcode wave are
+// treated as settled.  This is only a projector: it does not flush, map, unmap, transcode,
+// reserve scratch, publish an offer, or mutate a grant.
+llama_kv_cache::vbr_shed_pool_projection llama_kv_cache::vbr_project_pool(
+        size_t pool_idx,
+        const std::vector<ggml_type> & terminal_types,
+        uint32_t terminal_wm) const {
+    GGML_ASSERT(pool_idx < vbr_pools_.size());
+    const auto & p = vbr_pools_[pool_idx];
+    GGML_ASSERT(p.vmm != nullptr && p.be != nullptr && p.gran > 0);
+    GGML_ASSERT(p.be->vmm_pool_mapped_in_range != nullptr);
+
+    vbr_shed_pool_projection out;
+    out.pool_idx = pool_idx;
+    out.device   = p.device;
+
+    std::vector<llama_vbr_physical::interval> deferred;
+    if (!llama_vbr_physical::normalize_deferred(p.unmap_deferred, p.gran, deferred)) {
+        GGML_ABORT("VBR physical projection: invalid deferred-unmap geometry");
+    }
+    const auto query = [&](size_t off, size_t len) {
+        return p.be->vmm_pool_mapped_in_range(p.vmm, off, len);
+    };
+
+    llama_vbr_physical::projection total;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (int side = 0; side < 2; ++side) {
+            const vbr_extent & e = side ? p.v[ikv] : p.k[ikv];
+            if (e.t == nullptr) {
+                continue;
+            }
+            const size_t sim_slot = ikv*2 + (side ? 1 : 0);
+            GGML_ASSERT(sim_slot < terminal_types.size());
+            const ggml_type terminal_type = terminal_types[sim_slot] != GGML_TYPE_COUNT
+                    ? terminal_types[sim_slot] : e.t->type;
+            const size_t slot_span = vbr_slot_span(e.t, p.gran);
+            uint64_t final_bytes_u64 = 0;
+            if (!llama_vbr_physical::endpoint_bytes(
+                        ggml_row_size(terminal_type, e.t->ne[0]), terminal_wm,
+                        slot_span, p.gran, final_bytes_u64)) {
+                GGML_ABORT("VBR physical projection: endpoint arithmetic overflow");
+            }
+            if (final_bytes_u64 > SIZE_MAX) {
+                GGML_ABORT("VBR physical projection: endpoint exceeds host size_t");
+            }
+            const size_t final_bytes = (size_t) final_bytes_u64;
+
+            size_t current_total = 0;
+            size_t current_inside = 0;
+            if (!llama_vbr_physical::mapped_after_deferred(
+                        e.byte_off, slot_span, p.gran, deferred, query, current_total) ||
+                !llama_vbr_physical::mapped_after_deferred(
+                        e.byte_off, final_bytes, p.gran, deferred, query, current_inside) ||
+                !llama_vbr_physical::add_endpoint(
+                        total, current_total, current_inside, final_bytes)) {
+                GGML_ABORT("VBR physical projection: inconsistent VMM endpoint state");
+            }
+        }
+    }
+
+    out.kv_delta   = total.delta;
+    out.kv_release = total.release;
+    out.kv_growth  = total.growth;
+    return out;
+}
+
+// Memoized terminal projection for this cache's remaining consent window.  A total-mapped-byte
+// key is insufficient: a map/unmap redistribution can preserve the total while changing which
+// endpoint ranges are resident.  The VMM residency epoch identifies the page set instead.
+const std::vector<llama_kv_cache::vbr_shed_pool_projection> &
+llama_kv_cache::vbr_shed_project(uint32_t requested_wm) const {
+    bool retained_match =
+            vbr_shed_projection_.retained_pool_wm.size() == vbr_pools_.size();
+    bool residency_match =
+            vbr_shed_projection_.residency_epoch.size() == vbr_pools_.size();
+    for (size_t pi = 0; retained_match && pi < vbr_pools_.size(); ++pi) {
+        retained_match =
+                vbr_shed_projection_.retained_pool_wm[pi] == vbr_pools_[pi].wm_cells;
+    }
+    for (size_t pi = 0; residency_match && pi < vbr_pools_.size(); ++pi) {
+        const auto & p = vbr_pools_[pi];
+        GGML_ASSERT(p.vmm == nullptr ||
+                    (p.be != nullptr && p.be->vmm_pool_residency_epoch != nullptr));
+        const uint64_t epoch = p.vmm != nullptr
+                ? p.be->vmm_pool_residency_epoch(p.vmm) : 0;
+        residency_match = vbr_shed_projection_.residency_epoch[pi] == epoch;
+    }
+    if (vbr_shed_projection_.tier_epoch == vbr_tier_epoch_ &&
+        vbr_shed_projection_.requested_wm == requested_wm &&
+        retained_match && residency_match) {
+        return vbr_shed_projection_.pools;
+    }
+
+    std::vector<ggml_type> terminal_types;
+    vbr_sim_seed(terminal_types, /*pooled_only=*/true,
+                 GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
+    const size_t demand_limit = vbr_demand_limit();
+    for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
+        size_t slot = 0;
+        const ggml_tensor * tensor = nullptr;
+        ggml_type type_b = GGML_TYPE_COUNT;
+        if (vbr_sim_step(terminal_types, i, slot, tensor, type_b)) {
+            terminal_types[slot] = type_b;
+        }
+    }
+
+    auto & out = vbr_shed_projection_.pools;
+    out.clear();
+    out.reserve(vbr_pools_.size());
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        const auto & p = vbr_pools_[pi];
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        out.push_back(vbr_project_pool(
+                pi, terminal_types, std::max(p.wm_cells, requested_wm)));
+    }
+
+    vbr_shed_projection_.tier_epoch   = vbr_tier_epoch_;
+    vbr_shed_projection_.requested_wm = requested_wm;
+    vbr_shed_projection_.retained_pool_wm.resize(vbr_pools_.size());
+    vbr_shed_projection_.residency_epoch.resize(vbr_pools_.size());
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        const auto & p = vbr_pools_[pi];
+        vbr_shed_projection_.retained_pool_wm[pi] = p.wm_cells;
+        GGML_ASSERT(p.vmm == nullptr ||
+                    (p.be != nullptr && p.be->vmm_pool_residency_epoch != nullptr));
+        vbr_shed_projection_.residency_epoch[pi] = p.vmm != nullptr
+                ? p.be->vmm_pool_residency_epoch(p.vmm) : 0;
+    }
+    return out;
 }
 
 // co-tenancy: the marker-published donation offer. Walks the REMAINING consent window

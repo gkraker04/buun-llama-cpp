@@ -486,6 +486,25 @@ private:
                                 : std::min(vbr_degrade_limit_, t8_band_end_);
     }
     bool vbr_floor_typed_ = false;
+    // Exact physical endpoint of the remaining consent window for one VMM pool.
+    // These are KV pages only: scratch, stash, shared-drafter preflight, grant credit,
+    // and composite/iSWA policy belong to later transaction layers.
+    struct vbr_shed_pool_projection {
+        size_t   pool_idx  = 0;
+        int      device    = -1;
+        int64_t  kv_delta  = 0; // signed current -> endpoint: release - growth
+        uint64_t kv_release = 0;
+        uint64_t kv_growth  = 0;
+    };
+    struct vbr_shed_projection_cache {
+        uint64_t tier_epoch   = ~0ull;
+        uint32_t requested_wm = 0;
+        std::vector<uint32_t> retained_pool_wm;
+        std::vector<uint64_t> residency_epoch;
+        std::vector<vbr_shed_pool_projection> pools;
+    };
+    mutable vbr_shed_projection_cache vbr_shed_projection_;
+
     // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
     // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
     mutable uint64_t            shed_avail_epoch_ = ~0ull;
@@ -613,6 +632,11 @@ private:
     void     vbr_floor_clamp_order();
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(size_t flat_cells);  // #88: boundary-time f16 dequant scratch grow
+    vbr_shed_pool_projection vbr_project_pool(
+            size_t pool_idx,
+            const std::vector<ggml_type> & terminal_types,
+            uint32_t terminal_wm) const;
+    const std::vector<vbr_shed_pool_projection> & vbr_shed_project(uint32_t requested_wm) const;
     // Pure, allocator-blind child stream for a future tree transaction.  It derives real steps
     // only through vbr_sim_step(), and is intentionally not wired into the live executor yet.
     llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
