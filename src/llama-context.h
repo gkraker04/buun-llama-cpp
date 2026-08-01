@@ -549,6 +549,13 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // `memory` is declared before `backends`, so ordinary member destruction would tear the
+    // compute backends down first. Shared-KV reverse registrations must detach earlier.
+    struct vbr_shared_scratch_detach_guard {
+        llama_memory_i * memory = nullptr;
+        ~vbr_shared_scratch_detach_guard();
+    } vbr_shared_scratch_detach_guard_;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

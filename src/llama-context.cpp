@@ -58,6 +58,12 @@ static bool turbo_vbr_layer_schedule_enabled() {
 // disarmed before memory construction and do not acquire this slot.
 static std::atomic<bool> g_vbr_ledger_tree_owned { false };
 
+llama_context::vbr_shared_scratch_detach_guard::~vbr_shared_scratch_detach_guard() {
+    if (memory != nullptr) {
+        memory->vbr_shared_scratch_detach();
+    }
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -497,6 +503,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        // Arm immediately after create_memory returns: if any later constructor step throws,
+        // this member is destroyed before `backends` and unregisters their raw handles safely.
+        vbr_shared_scratch_detach_guard_.memory = memory.get();
     }
 
     // init backends

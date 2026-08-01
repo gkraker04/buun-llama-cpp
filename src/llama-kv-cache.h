@@ -10,6 +10,7 @@
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -199,6 +200,29 @@ public:
     bool vbr_ledger_tree_active() const override {
         return vbr_ledger_owner_ && vbr_vmm_active();
     }
+
+    // A share-linked drafter consumes f16 dequant scratch on its own compute backend while
+    // reading this cache's tensors. The owner-side donation planner needs the terminal
+    // requirement for every DISTINCT registered backend, not merely its own backend.
+    struct vbr_shared_scratch_plan {
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        size_t k_bytes = 0;
+        size_t v_bytes = 0;
+    };
+    using vbr_shared_scratch_visitor = std::function<void(const vbr_shared_scratch_plan &)>;
+
+    // Visit one plan per distinct live consumer compute backend. `terminal_types` is indexed
+    // like vbr_floor_sim_result::end_types; an empty vector (or GGML_TYPE_COUNT slot) uses the
+    // tensor's live type. The registry lock remains held through each callback, so a drafter's
+    // context-teardown detach cannot return and free the backend while it is being queried.
+    void vbr_shared_scratch_visit(
+            const std::vector<ggml_type> & terminal_types,
+            uint32_t watermark_cells,
+            const vbr_shared_scratch_visitor & visitor) const;
+
+    void vbr_shared_scratch_detach() override;
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
@@ -408,6 +432,27 @@ private:
         size_t k_row = 0;
         size_t v_row = 0;
     };
+
+    struct vbr_shared_scratch_registry;
+    struct vbr_shared_scratch_registration {
+        std::weak_ptr<vbr_shared_scratch_registry> registry;
+        uint64_t id = 0;
+
+        vbr_shared_scratch_registration() = default;
+        vbr_shared_scratch_registration(
+                const std::shared_ptr<vbr_shared_scratch_registry> & registry,
+                uint64_t id);
+        ~vbr_shared_scratch_registration();
+
+        vbr_shared_scratch_registration(const vbr_shared_scratch_registration &) = delete;
+        vbr_shared_scratch_registration & operator=(const vbr_shared_scratch_registration &) = delete;
+        vbr_shared_scratch_registration(vbr_shared_scratch_registration && other) noexcept;
+        vbr_shared_scratch_registration & operator=(vbr_shared_scratch_registration && other) noexcept;
+
+        void reset();
+    };
+    vbr_shared_scratch_registration vbr_shared_scratch_register(
+            const vbr_shared_scratch_binding & binding);
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
@@ -656,6 +701,10 @@ private:
     // Scratch bindings for shared-KV aliases. Deliberately separate from vbr_pools_: a
     // controller-less drafter must not appear to own VMM, budget, ledger, or degrade state.
     std::vector<vbr_shared_scratch_binding> vbr_shared_scratch_bindings_;
+    // Owner-side reverse registry plus drafter-side RAII registrations. Registration
+    // records never own either context; weak registry links make target-first teardown safe.
+    std::shared_ptr<vbr_shared_scratch_registry> vbr_shared_scratch_registry_;
+    std::vector<vbr_shared_scratch_registration> vbr_shared_scratch_registrations_;
     // [ikv*2 + is_v] -> (pool, extent) units; built once at ctor end, immutable after
     std::vector<std::vector<std::pair<vbr_pool *, vbr_extent *>>> vbr_units_tab_;
 

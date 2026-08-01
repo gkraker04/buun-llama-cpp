@@ -18,6 +18,7 @@
 #include <set>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,70 @@ static ggml_type vbr_tier_type(uint8_t tier) {
         case VBR_TIER_T1_TCQ: return GGML_TYPE_TURBO1_TCQ;
         default:              GGML_ABORT("invalid vbr tier %d", (int) tier);
     }
+}
+
+struct llama_kv_cache::vbr_shared_scratch_registry {
+    static constexpr size_t no_slot = (size_t) -1;
+
+    struct layer_slots {
+        size_t k = no_slot;
+        size_t v = no_slot;
+    };
+
+    struct consumer {
+        uint64_t id = 0;
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        std::vector<layer_slots> layers;
+    };
+
+    std::mutex mutex;
+    uint64_t next_id = 1;
+    std::vector<consumer> consumers;
+};
+
+llama_kv_cache::vbr_shared_scratch_registration::vbr_shared_scratch_registration(
+        const std::shared_ptr<vbr_shared_scratch_registry> & registry,
+        uint64_t id) : registry(registry), id(id) {
+}
+
+llama_kv_cache::vbr_shared_scratch_registration::~vbr_shared_scratch_registration() {
+    reset();
+}
+
+llama_kv_cache::vbr_shared_scratch_registration::vbr_shared_scratch_registration(
+        vbr_shared_scratch_registration && other) noexcept :
+    registry(std::move(other.registry)), id(other.id) {
+    other.id = 0;
+}
+
+llama_kv_cache::vbr_shared_scratch_registration &
+llama_kv_cache::vbr_shared_scratch_registration::operator=(
+        vbr_shared_scratch_registration && other) noexcept {
+    if (this != &other) {
+        reset();
+        registry = std::move(other.registry);
+        id = other.id;
+        other.id = 0;
+    }
+    return *this;
+}
+
+void llama_kv_cache::vbr_shared_scratch_registration::reset() {
+    if (id == 0) {
+        return;
+    }
+    if (const auto owner = registry.lock()) {
+        std::lock_guard<std::mutex> lock(owner->mutex);
+        const auto it = std::find_if(owner->consumers.begin(), owner->consumers.end(),
+                [&](const vbr_shared_scratch_registry::consumer & c) { return c.id == id; });
+        if (it != owner->consumers.end()) {
+            owner->consumers.erase(it);
+        }
+    }
+    registry.reset();
+    id = 0;
 }
 
 #include "llama-vbr-degrade-orders.inc"  // arch-keyed registry (matrix v3, 2026-07-05)
@@ -633,6 +698,10 @@ llama_kv_cache::llama_kv_cache(
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : kv_cells_make(unified ? 1 : n_seq_max, kv_size)),
     v_cells(*v_cells_impl) {
+
+    // Construct eagerly so multiple share-linked contexts can register without racing a lazy
+    // owner-side pointer initialization. The registry itself stays empty for ordinary caches.
+    vbr_shared_scratch_registry_ = std::make_shared<vbr_shared_scratch_registry>();
 
     // A share-linked cache follows the OWNER's dynamic VBR: tier flips mutate the owner's
     // tensors in place (which this cache's layer entries alias) and graph reuse fences on
@@ -1271,6 +1340,7 @@ llama_kv_cache::llama_kv_cache(
             const auto & b = vbr_shared_scratch_bindings_[i];
             LLAMA_LOG_INFO("%s: shared-KV scratch binding #%zu (device %d, backend %s)\n",
                     __func__, i, b.device, ggml_backend_name(b.compute_backend));
+            vbr_shared_scratch_registrations_.push_back(other->vbr_shared_scratch_register(b));
         }
     }
 
@@ -1604,6 +1674,11 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    // Normally the enclosing llama_context's detach guard clears these while this context's
+    // compute backends are still alive. Keep RAII cleanup for direct construction and for a
+    // cache constructor that throws after registering with its owner.
+    vbr_shared_scratch_detach();
+
     for (auto & p : vbr_pools_) {
         if (p.backend != nullptr) {
             // S5: a degrade wave may still be in flight on the side stream — it must finish before
@@ -1629,6 +1704,131 @@ llama_kv_cache::~llama_kv_cache() {
             p.vmm = nullptr;
         }
     }
+}
+
+llama_kv_cache::vbr_shared_scratch_registration llama_kv_cache::vbr_shared_scratch_register(
+        const vbr_shared_scratch_binding & binding) {
+    if (binding.be == nullptr || binding.compute_backend == nullptr || binding.device < 0) {
+        throw std::runtime_error("internal: incomplete shared-KV scratch consumer registration");
+    }
+
+    vbr_shared_scratch_registry::consumer consumer;
+    consumer.be = binding.be;
+    consumer.compute_backend = binding.compute_backend;
+    consumer.device = binding.device;
+
+    const auto tensor_slot = [&](const ggml_tensor * tensor, bool is_v) -> size_t {
+        if (tensor == nullptr) {
+            return vbr_shared_scratch_registry::no_slot;
+        }
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if ((is_v ? layers[ikv].v : layers[ikv].k) == tensor) {
+                return ikv*2 + (is_v ? 1 : 0);
+            }
+        }
+        throw std::runtime_error("internal: shared-KV scratch alias is absent from its target owner");
+    };
+
+    GGML_ASSERT(binding.k.size() == binding.v.size());
+    for (size_t ikv = 0; ikv < binding.k.size(); ++ikv) {
+        vbr_shared_scratch_registry::layer_slots slots;
+        slots.k = tensor_slot(binding.k[ikv], false);
+        slots.v = tensor_slot(binding.v[ikv], true);
+        if (slots.k != vbr_shared_scratch_registry::no_slot ||
+            slots.v != vbr_shared_scratch_registry::no_slot) {
+            consumer.layers.push_back(slots);
+        }
+    }
+    if (consumer.layers.empty()) {
+        throw std::runtime_error("internal: empty shared-KV scratch consumer registration");
+    }
+
+    const auto registry = vbr_shared_scratch_registry_;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    consumer.id = registry->next_id++;
+    const uint64_t id = consumer.id;
+    registry->consumers.push_back(std::move(consumer));
+    return vbr_shared_scratch_registration(registry, id);
+}
+
+void llama_kv_cache::vbr_shared_scratch_visit(
+        const std::vector<ggml_type> & terminal_types,
+        uint32_t watermark_cells,
+        const vbr_shared_scratch_visitor & visitor) const {
+    if (!visitor) {
+        return;
+    }
+    if (!terminal_types.empty() && terminal_types.size() != layers.size()*2) {
+        throw std::invalid_argument("shared-KV scratch terminal type vector has the wrong size");
+    }
+    const auto registry = vbr_shared_scratch_registry_;
+    if (!registry) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    std::vector<vbr_shared_scratch_plan> plans;
+    plans.reserve(registry->consumers.size());
+
+    const auto tensor_and_type = [&](size_t slot) {
+        const size_t ikv = slot/2;
+        const bool is_v = (slot & 1) != 0;
+        const ggml_tensor * tensor = is_v ? layers[ikv].v : layers[ikv].k;
+        GGML_ASSERT(tensor != nullptr);
+        ggml_type type = tensor->type;
+        if (!terminal_types.empty() && terminal_types[slot] != GGML_TYPE_COUNT) {
+            type = terminal_types[slot];
+        }
+        return std::make_pair(tensor, type);
+    };
+
+    for (const auto & consumer : registry->consumers) {
+        auto it = std::find_if(plans.begin(), plans.end(), [&](const vbr_shared_scratch_plan & p) {
+            return p.compute_backend == consumer.compute_backend;
+        });
+        if (it == plans.end()) {
+            plans.push_back({ consumer.be, consumer.compute_backend, consumer.device, 0, 0 });
+            it = std::prev(plans.end());
+        } else if (it->be != consumer.be || it->device != consumer.device) {
+            throw std::runtime_error("internal: one shared-KV compute backend has inconsistent device metadata");
+        }
+
+        size_t k_row = 0;
+        size_t v_row = 0;
+        for (const auto & slots : consumer.layers) {
+            const ggml_tensor * tk = nullptr;
+            const ggml_tensor * tv = nullptr;
+            ggml_type type_k = GGML_TYPE_F16;
+            ggml_type type_v = GGML_TYPE_F16;
+            if (slots.k != vbr_shared_scratch_registry::no_slot) {
+                std::tie(tk, type_k) = tensor_and_type(slots.k);
+            }
+            if (slots.v != vbr_shared_scratch_registry::no_slot) {
+                std::tie(tv, type_v) = tensor_and_type(slots.v);
+            }
+            bool need_k = false;
+            bool need_v = false;
+            ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
+            if (need_k && tk != nullptr) {
+                k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+            }
+            if (need_v && tv != nullptr) {
+                v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+            }
+        }
+        it->k_bytes = std::max(it->k_bytes, k_row*(size_t) watermark_cells);
+        it->v_bytes = std::max(it->v_bytes, v_row*(size_t) watermark_cells);
+    }
+
+    // Keep the registry locked through the callback: llama_context's detach guard acquires the
+    // same lock before it allows the consumer backend-owning members to be destroyed.
+    for (const auto & plan : plans) {
+        visitor(plan);
+    }
+}
+
+void llama_kv_cache::vbr_shared_scratch_detach() {
+    vbr_shared_scratch_registrations_.clear();
 }
 
 void llama_kv_cache::clear(bool data) {

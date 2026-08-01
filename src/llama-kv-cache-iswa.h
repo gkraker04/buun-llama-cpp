@@ -100,6 +100,11 @@ public:
         return kv_base->vbr_ledger_tree_active();
     }
 
+    void vbr_shared_scratch_detach() override {
+        kv_base->vbr_shared_scratch_detach();
+        kv_swa ->vbr_shared_scratch_detach();
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

@@ -180,6 +180,11 @@ struct llama_memory_i {
     // Composite memories forward this once for the whole tree.
     virtual bool vbr_ledger_tree_active() const { return false; }
 
+    // Drop any non-owning registrations that refer to compute backends owned by the
+    // enclosing llama_context. llama_context calls this before those backends are
+    // destroyed; memory implementations without shared-KV consumers have nothing to do.
+    virtual void vbr_shared_scratch_detach() {}
+
     //
     // ops
     //
