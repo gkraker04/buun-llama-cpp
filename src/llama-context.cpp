@@ -20,6 +20,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -50,6 +51,12 @@ static bool turbo_vbr_layer_schedule_enabled() {
     const char * e = getenv("VBR_LAYER_SCHEDULE");
     return e && e[0];
 }
+
+// The on-disk marker identity is one (busid,pid) row, so independent controller
+// trees in one process cannot publish or service demands correctly. iSWA is one
+// tree (its composite memory reports only the base owner); shared-KV drafters are
+// disarmed before memory construction and do not acquire this slot.
+static std::atomic<bool> g_vbr_ledger_tree_owned { false };
 
 struct llm_fused_op_probe {
     llm_fused_op op;
@@ -615,6 +622,16 @@ llama_context::llama_context(
             }
         }
     }
+
+    if (memory != nullptr && memory->vbr_ledger_tree_active() && llama_vram_ledger_armed()) {
+        bool expected = false;
+        if (!g_vbr_ledger_tree_owned.compare_exchange_strong(expected, true)) {
+            throw std::runtime_error(
+                    "multiple independent dynamic-VBR contexts in one process are unsupported: "
+                    "the co-tenancy ledger has one marker identity per process");
+        }
+        vram_ledger_tree_owned_ = true;
+    }
 }
 
 llama_context::~llama_context() {
@@ -635,6 +652,9 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    if (vram_ledger_tree_owned_) {
+        g_vbr_ledger_tree_owned.store(false);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {

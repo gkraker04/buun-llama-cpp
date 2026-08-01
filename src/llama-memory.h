@@ -176,6 +176,10 @@ struct llama_memory_i {
     virtual void vbr_cotenancy_accum(uint64_t & /*decrement*/, uint32_t & /*grants*/,
                                      uint64_t & /*offer*/, uint64_t & /*pending*/) const {}
 
+    // True for the single root that owns a live dynamic-VBR ledger controller.
+    // Composite memories forward this once for the whole tree.
+    virtual bool vbr_ledger_tree_active() const { return false; }
+
     //
     // ops
     //

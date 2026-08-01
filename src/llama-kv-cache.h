@@ -195,6 +195,10 @@ public:
     void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
                              uint64_t & offer, uint64_t & pending) const override;
 
+    bool vbr_ledger_tree_active() const override {
+        return vbr_ledger_owner_ && vbr_vmm_active();
+    }
+
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 

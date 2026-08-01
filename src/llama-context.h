@@ -578,6 +578,7 @@ private:
     bool warned_logits_all     = false;
     // co-tenancy: this context's device bus ids (presence-marker beat targets)
     std::vector<std::string> vram_marker_busids_;
+    bool vram_ledger_tree_owned_ = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

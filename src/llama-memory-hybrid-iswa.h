@@ -73,6 +73,10 @@ public:
         mem_attn->vbr_cotenancy_accum(d, g, o, p);
     }
 
+    bool vbr_ledger_tree_active() const override {
+        return mem_attn->vbr_ledger_tree_active();
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
