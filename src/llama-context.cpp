@@ -4518,17 +4518,56 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else {
+        // A multi-backend reserve can allocate buffers on earlier devices and
+        // then fail on a later one. Report each physical increase even when
+        // the aggregate reserve fails, otherwise a plan-hinted demand counts
+        // those already-resident buffers as part of its remaining ask.
+        auto reserve_with_landed = [&](ggml_cgraph * graph) {
+            std::vector<size_t> before(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                before[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            }
+
+            const bool ok = ggml_backend_sched_reserve(sched.get(), graph);
+
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_t backend = backend_ptrs[i];
+                const size_t after = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                if (after > before[i]) {
+                    llama_vram_demand_alloc_landed(
+                            ggml_backend_get_device(backend), after - before[i]);
+                }
+            }
+            // reserve() resets the scheduler only on success. Its failed path
+            // leaves the split/hash state live, so calling it again without a
+            // reset builds a different, ever-growing allocation graph.
+            if (!ok) {
+                ggml_backend_sched_reset(sched.get());
+            }
+            return ok;
+        };
+
+        if (reserve_with_landed(gf)) {
+            return gf;
+        }
         GGML_ASSERT(!sizes);
         // co-tenancy: before the FIRST real decode (i.e. any init-time reserve — several
         // run during context setup), a resident donor may free room within the ledger's
-        // bounded patience. The ask is nominal (est_partial — the sched spans devices and
-        // its sizes are internal); post-first-decode re-reserves keep the fast-fail wall.
+        // bounded patience. A plan-hinted load already knows every device's remaining
+        // allocation; without a hint, retain the nominal single-device fallback.
+        // Post-first-decode re-reserves keep the fast-fail wall.
         bool held = false;
         if (!has_evaluated_once && !model.devices.empty() && !model.devices[0].is_meta) {
             constexpr size_t NOMINAL_COMPUTE_ASK = (size_t) LLAMA_VRAM_LEDGER_NOMINAL_ASK;
-            while (!held && llama_vram_demand_hold(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
-                held = ggml_backend_sched_reserve(sched.get(), gf);
+            while (!held && llama_vram_demand_hold_plan_or(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
+                // split_graph() mutates its input graph by inserting backend
+                // copies. A failed reserve cannot safely reuse that graph;
+                // rebuild the same measurement graph for every allocation
+                // retry after donors have had a chance to make progress.
+                res->reset();
+                gf = model.build_graph(gparams);
+                held = reserve_with_landed(gf);
             }
         }
         if (!held) {

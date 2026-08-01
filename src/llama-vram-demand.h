@@ -45,6 +45,12 @@ ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(struct ggml_context * ct
 // (claims already unlinked, terminal reason logged).
 bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes);
 
+// Hold against the remaining multi-device plan when one exists. This is for
+// aggregate allocations (such as a scheduler reserve) whose API reports only
+// success/failure, not the device or exact allocation that failed. With no
+// usable plan, falls back to the ordinary single-device hold above.
+bool llama_vram_demand_hold_plan_or(ggml_backend_dev_t fallback_dev, size_t fallback_bytes);
+
 // the load finished successfully with a live claim → flip it to phase=satisfied (the
 // writer thread keeps beating; donors keep their grants armed until claim-complete)
 void llama_vram_demand_satisfied();
