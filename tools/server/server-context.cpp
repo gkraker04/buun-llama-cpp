@@ -3840,6 +3840,7 @@ private:
     int64_t t_verify_total  = 0;
     int64_t t_accept_total  = 0;
     int     n_slots_drafted = 0;
+    int     n_slots_draft_decode_succeeded = 0;
     bool    cycle_has_output = false;
     bool    cycle_failed = false;
 
@@ -4095,10 +4096,12 @@ private:
         t_verify_total  = 0;
         t_accept_total  = 0;
         n_slots_drafted = 0;
+        n_slots_draft_decode_succeeded = 0;
         cycle_has_output = false;
         cycle_failed = false;
 
         std::vector<llama_tokens> batched_drafts(slots.size());
+        std::vector<bool> batched_draft_decode_succeeded(slots.size(), false);
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (const auto & slot : slots) {
@@ -4129,6 +4132,8 @@ private:
                 t_draft_total = ggml_time_us() - t_batch_start;
 
                 for (size_t i = 0; i < batch_slot_ids.size(); i++) {
+                    batched_draft_decode_succeeded[batch_slot_ids[i]] =
+                            common_speculative_last_draft_model_decode_succeeded(batch_specs[i]);
                     batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
                 }
             }
@@ -4163,6 +4168,10 @@ private:
                     const auto & params_spec = slot.task->params.speculative;
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
                     draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
+                }
+                if (batched_draft_decode_succeeded[slot.id] ||
+                    common_speculative_last_draft_model_decode_succeeded(slot.get_spec())) {
+                    n_slots_draft_decode_succeeded++;
                 }
 
                 if (draft.size() > (size_t) n_draft_max) {
@@ -5797,7 +5806,7 @@ private:
         // preserve the direct first-output behavior.
         const bool any_spec_context = std::any_of(slots.begin(), slots.end(),
                 [](const server_slot & slot) { return slot.can_speculate(); });
-        if (!cycle_failed && (n_slots_drafted > 0 || (cycle_has_output && !any_spec_context))) {
+        if (!cycle_failed && (n_slots_draft_decode_succeeded > 0 || (cycle_has_output && !any_spec_context))) {
             llama_vram_load_complete();
         }
 

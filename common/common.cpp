@@ -1355,8 +1355,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     bool load_succeeded = false;
     struct load_scope {
         bool & succeeded;
-        ~load_scope() { llama_vram_load_end(succeeded); }
-    } load_guard { load_succeeded };
+        bool complete_without_decode;
+        ~load_scope() {
+            llama_vram_load_end(succeeded);
+            if (succeeded && complete_without_decode) {
+                llama_vram_load_complete();
+            }
+        }
+    } load_guard { load_succeeded, model_only };
 
     common_init_result_ptr res(new common_init_result(params, model_only));
 

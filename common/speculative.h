@@ -127,6 +127,10 @@ void common_speculative_draft_batch(
         const std::vector<llama_token>    & id_last_per_spec,
         std::vector<llama_tokens>         & result_per_spec);
 
+// True only when the immediately preceding single/batched draft call completed
+// at least one decode on a linked draft-model context.
+bool common_speculative_last_draft_model_decode_succeeded(const common_speculative * spec);
+
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 void   common_speculative_flush_prefill(common_speculative * spec);
