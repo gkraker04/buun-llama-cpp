@@ -9,6 +9,7 @@
 #endif
 #include "ggml-common.h"
 #include "ggml-turbo-meansub.h"
+#include <atomic>
 #include <mutex>
 
 // === InnerQ per-channel equalization ===
@@ -247,13 +248,32 @@ static void turbo_pfhead_start() {
 // Channels from layers with cnt<100 get mu=0 (no-op). V is NOT subtracted (V means survive the
 // weighted sum and would need a decode add-back).
 static float * h_kmean_dev[16] = {};
-static bool    h_kmean_checked[16] = {};
+static std::atomic<bool> h_kmean_checked[16] = {};
+// The source slab expanded by ggml_turbo_meansub_active() is process-global, so initialization
+// must also serialize across devices rather than only across callers targeting the same device.
+static std::mutex h_kmean_mutex;
 static float * h_vmean_dev[16] = {};
-static bool    h_vmean_checked[16] = {};
+static std::atomic<bool> h_vmean_checked[16] = {};
+static std::mutex h_vmean_mutex;
+
+static float * turbo_meansub_upload(int device, cudaStream_t stream, const float * host, size_t bytes) {
+    ggml_cuda_set_device(device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    GGML_ASSERT(capture_status == cudaStreamCaptureStatusNone);
+#endif
+
+    float * dev = nullptr;
+    CUDA_CHECK(cudaMalloc(&dev, bytes));
+    CUDA_CHECK(cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return dev;
+}
 
 // Shared PFH1 mean-table loader. kvsel: 0 = K slab (TURBO_KMEAN_SUB), 1 = V slab
 // (TURBO_VMEAN_SUB; encode half of the V tap — the graph-level add restores mu_V at decode).
-static float * turbo_meansub_load(int device, int kvsel, const char * env_name) {
+static float * turbo_meansub_load(int device, cudaStream_t stream, int kvsel, const char * env_name) {
     if (getenv("TURBO_MEANSUB_OFF")) return nullptr;   // explicit disable (A/B + opt-out)
     const char * path = getenv(env_name);
     if (!path || !path[0]) {
@@ -262,9 +282,7 @@ static float * turbo_meansub_load(int device, int kvsel, const char * env_name) 
         const float * baked = ggml_turbo_meansub_active(kvsel, &bL, &bC, &blive);
         if (baked && bL == PFHEAD_MAX_L && bC == PFHEAD_MAX_C && blive > 0) {
             const size_t nk = (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C;
-            float * dev = nullptr;
-            cudaMalloc(&dev, nk * sizeof(float));
-            cudaMemcpy(dev, baked, nk * sizeof(float), cudaMemcpyHostToDevice);
+            float * dev = turbo_meansub_upload(device, stream, baked, nk * sizeof(float));
             fprintf(stderr, "TURBO meansub (device %d): %s-mean BAKED table (%d live layers)\n",
                     device, kvsel == 0 ? "K" : "V", blive);
             return dev;
@@ -299,9 +317,7 @@ static float * turbo_meansub_load(int device, int kvsel, const char * env_name) 
         }
     }
     free(sums); free(cnts);
-    float * dev = nullptr;
-    cudaMalloc(&dev, nk * sizeof(float));
-    cudaMemcpy(dev, mu, nk * sizeof(float), cudaMemcpyHostToDevice);
+    float * dev = turbo_meansub_upload(device, stream, mu, nk * sizeof(float));
     free(mu);
     fprintf(stderr, "%s (device %d): %s-mean table loaded from %s (%d live layers)\n",
             env_name, device, kvsel == 0 ? "K" : "V", path, layers_live);
@@ -313,21 +329,27 @@ static float * turbo_meansub_load(int device, int kvsel, const char * env_name) 
 // it. Defined in set-rows.cu; shared so the choke-point lookups below see it across TUs.
 extern bool g_turbo_meansub_suppress;
 
-static float * turbo_kmean_table(int device) {
+static float * turbo_kmean_table(int device, cudaStream_t stream) {
     if (g_turbo_meansub_suppress) return nullptr;
     if (device < 0 || device >= 16) return nullptr;
-    if (h_kmean_checked[device]) return h_kmean_dev[device];
-    h_kmean_checked[device] = true;
-    h_kmean_dev[device] = turbo_meansub_load(device, 0, "TURBO_KMEAN_SUB");
+    if (h_kmean_checked[device].load(std::memory_order_acquire)) return h_kmean_dev[device];
+    std::lock_guard<std::mutex> lock(h_kmean_mutex);
+    if (!h_kmean_checked[device].load(std::memory_order_relaxed)) {
+        h_kmean_dev[device] = turbo_meansub_load(device, stream, 0, "TURBO_KMEAN_SUB");
+        h_kmean_checked[device].store(true, std::memory_order_release);
+    }
     return h_kmean_dev[device];
 }
 
-static float * turbo_vmean_table_enc(int device) {
+static float * turbo_vmean_table_enc(int device, cudaStream_t stream) {
     if (g_turbo_meansub_suppress) return nullptr;
     if (device < 0 || device >= 16) return nullptr;
-    if (h_vmean_checked[device]) return h_vmean_dev[device];
-    h_vmean_checked[device] = true;
-    h_vmean_dev[device] = turbo_meansub_load(device, 1, "TURBO_VMEAN_SUB");
+    if (h_vmean_checked[device].load(std::memory_order_acquire)) return h_vmean_dev[device];
+    std::lock_guard<std::mutex> lock(h_vmean_mutex);
+    if (!h_vmean_checked[device].load(std::memory_order_relaxed)) {
+        h_vmean_dev[device] = turbo_meansub_load(device, stream, 1, "TURBO_VMEAN_SUB");
+        h_vmean_checked[device].store(true, std::memory_order_release);
+    }
     return h_vmean_dev[device];
 }
 
