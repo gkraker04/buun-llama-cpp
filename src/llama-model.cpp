@@ -2108,6 +2108,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         /*.device_share          =*/ 1.0,
         /*.pin_k                 =*/ cparams.vbr_pin_k,
         /*.pin_v                 =*/ cparams.vbr_pin_v,
+        /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
     };
 
     switch (arch) {

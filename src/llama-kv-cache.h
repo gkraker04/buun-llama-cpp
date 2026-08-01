@@ -342,6 +342,12 @@ private:
         // backend VBR vtable that owns this pool's device (resolved from the buffer type's
         // registry at init; a pool only exists if the backend exports it)
         const ggml_vbr_backend_iface * be = nullptr;
+        // non-owning main compute backend whose context owns the fattn Q/K/V scratch. This is
+        // intentionally distinct from `backend` below, which is a dedicated transcode stream.
+        // Valid only while llama_context::backends is alive. llama_context declares `memory`
+        // before `backends`, so backends are destroyed first: KV teardown must never dereference
+        // this handle (runtime reserve calls happen while the complete context is alive).
+        ggml_backend_t compute_backend = nullptr;
         // S2 (option C): VMM-backed pool — per-tensor fixed VA slots, physical pages mapped on
         // demand. When set, `size` is the VA reservation (not physical); each extent's byte_off is
         // page-aligned so tensor-tail unmaps never straddle a neighbor's pages.

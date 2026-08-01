@@ -987,11 +987,31 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // Resolve every simple KV device to this context's already-existing compute backend
+        // before entering the meta allocator's C callback. A missing binding is a construction
+        // error, but throwing it through that callback would bypass the meta allocator's NULL
+        // failure path and its rollback of already-installed device buffers.
+        std::vector<ggml_backend_t> compute_backends(devs.size(), nullptr);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            compute_backends[i] = vbr_params_.compute_backend_for_buft
+                    ? vbr_params_.compute_backend_for_buft(devs[i].buft)
+                    : nullptr;
+            if (compute_backends[i] == nullptr) {
+                throw std::runtime_error(format(
+                        "VBR could not bind KV buffer type %s to this context's compute backend",
+                        ggml_backend_buft_name(devs[i].buft)));
+            }
+        }
+        // Keep all potentially-throwing vector growth outside the C callback and before any
+        // device pool/buffer has been acquired.
+        vbr_pools_.reserve(vbr_pools_.size() + devs.size());
+
         // lay out + place ONE device's tensors into a fresh VMM pool. `cc` holds either the KV
         // context itself (plain device buft) or one device's shard tensors (meta buft under
         // -sm tensor) — the walk is identical: every non-view tensor gets a page-aligned VA
         // slot; cache tensors are sized for the max tier so a later tier change never moves them.
-        auto vmm_alloc_ctx = [&](const llama_vbr_dev & d, ggml_context * cc) -> ggml_backend_buffer_t {
+        auto vmm_alloc_ctx = [&](size_t idev, ggml_context * cc) -> ggml_backend_buffer_t {
+            const llama_vbr_dev & d = devs[idev];
             const ggml_vbr_backend_iface * be = d.be;
             const int device = d.device;
             const size_t gran = be->vmm_granularity(device);
@@ -1011,6 +1031,16 @@ llama_kv_cache::llama_kv_cache(
                 off += slot;
             }
             const size_t va_size = GGML_PAD(off, gran);
+
+            // Resolve/copy metadata while no device resource needs exception cleanup.
+            std::string busid = "-";
+            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(d.buft)) {
+                ggml_backend_dev_props bprops;
+                ggml_backend_dev_get_props(bdev, &bprops);
+                if (bprops.device_id != nullptr) {
+                    busid = bprops.device_id;
+                }
+            }
 
             ggml_vbr_vmm_pool * pool = be->vmm_pool_init(device, va_size);
             if (pool == nullptr) {
@@ -1047,20 +1077,14 @@ llama_kv_cache::llama_kv_cache(
             p.base        = base;
             p.size        = va_size;
             p.be          = be;
+            p.compute_backend = compute_backends[idev];
             p.vmm         = pool;
             p.device      = device;
             p.gran        = gran;
             p.mapped_base = be->vmm_pool_mapped(pool);
             // co-tenancy: resolve the PCI bus id eagerly — p.backend stays null until the
             // first degrade wave arms the side stream, far too late for marker publication
-            p.busid = "-";
-            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b))) {
-                ggml_backend_dev_props bprops;
-                ggml_backend_dev_get_props(bdev, &bprops);
-                if (bprops.device_id != nullptr) {
-                    p.busid = bprops.device_id;
-                }
-            }
+            p.busid = std::move(busid);
             vbr_pools_.push_back(std::move(p));
             LLAMA_LOG_INFO("%s: VBR VMM pool #%zu: %.2f MiB VA reserved (device %d, %zu KiB pages), %.2f MiB mapped up front\n",
                     __func__, vbr_pools_.size() - 1, va_size/1024.0/1024.0, device, gran/1024,
@@ -1069,7 +1093,7 @@ llama_kv_cache::llama_kv_cache(
         };
 
         if (!ggml_backend_buft_is_meta(bft)) {
-            return vmm_alloc_ctx(devs[0], c);
+            return vmm_alloc_ctx(0, c);
         }
 
         // -sm tensor: the meta backend shards every KV tensor per device (axis-0, head-aligned —
@@ -1078,12 +1102,19 @@ llama_kv_cache::llama_kv_cache(
         // per-device pool buffers so graph building sees ordinary meta tensors.
         const size_t pools_before = vbr_pools_.size();
         // std::function bridges the capturing lambda across the C callback (alive only for this call)
-        const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> alloc_one =
-            [&](size_t i, ggml_context * sctx) { return vmm_alloc_ctx(devs[i], sctx); };
+        std::function<ggml_backend_buffer_t(size_t, ggml_context *)> alloc_one =
+            [&](size_t i, ggml_context * sctx) { return vmm_alloc_ctx(i, sctx); };
         ggml_backend_buffer_t buf = ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(c, bft,
             [](size_t i, ggml_backend_buffer_type_t /*simple_buft*/, ggml_context * sctx, void * u) -> ggml_backend_buffer_t {
-                return (*(const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> *) u)(i, sctx);
-            }, (void *) &alloc_one);
+                // Never unwind C-style allocator frames with a C++ exception. Returning NULL
+                // makes the meta allocator free all simple buffers installed by earlier calls;
+                // the VMM-pool rollback immediately below then releases their VA reservations.
+                try {
+                    return (*(std::function<ggml_backend_buffer_t(size_t, ggml_context *)> *) u)(i, sctx);
+                } catch (...) {
+                    return nullptr;
+                }
+            }, &alloc_one);
         if (buf == nullptr) {
             // unwind pools created for devices that DID succeed: their buffers were already freed
             // by the meta teardown; the VA reservations are ours to release
@@ -1207,6 +1238,15 @@ llama_kv_cache::llama_kv_cache(
                         if (!pdevs.empty()) {
                             p.be     = pdevs[0].be;
                             p.device = pdevs[0].device;
+                            p.compute_backend = vbr_params_.compute_backend_for_buft
+                                    ? vbr_params_.compute_backend_for_buft(
+                                            ggml_backend_buffer_get_type(inst->buffer))
+                                    : nullptr;
+                            if (p.compute_backend == nullptr) {
+                                throw std::runtime_error(format(
+                                        "VBR could not bind KV buffer type %s to this context's compute backend",
+                                        ggml_backend_buft_name(ggml_backend_buffer_get_type(inst->buffer))));
+                            }
                         }
                         vbr_pools_.push_back(std::move(p));
                     }
@@ -2759,6 +2799,7 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
         if (p.be == nullptr || p.device < 0) {
             continue;
         }
+        GGML_ASSERT(p.compute_backend != nullptr);
         // active-side row maxima change only on a tier flip — memoize on the tier epoch so the
         // per-boundary cost is two multiplies (static caches compute this exactly once)
         if (p.scratch_rows_epoch != vbr_tier_epoch_) {
@@ -2785,7 +2826,7 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
-        if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+        if (!p.be->kv_dequant_scratch_reserve(p.compute_backend, k_bytes, v_bytes)) {
             // First-activation transient: the wave that just took this side off f16 queued its
             // freed tier-A tail pages as deferred unmaps (released at the NEXT boundary), so the
             // bytes the wave freed are physically unavailable to the very reserve it triggered.
@@ -2794,7 +2835,7 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
                     "flushing deferred unmaps and retrying\n",
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
             vbr_flush_deferred_unmaps();
-            if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+            if (!p.be->kv_dequant_scratch_reserve(p.compute_backend, k_bytes, v_bytes)) {
                 return false;
             }
         }

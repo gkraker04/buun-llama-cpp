@@ -25,6 +25,10 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Resolve a simple KV buffer type to this llama_context's main compute backend instance.
+    // VBR uses the exact instance to reserve backend-context-owned flash-attention scratch.
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 // TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
@@ -49,6 +53,8 @@ struct llama_memory_vbr_params {
     // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
     bool     pin_v = false;
+
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 enum llama_memory_status {

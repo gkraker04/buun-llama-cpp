@@ -712,6 +712,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // Persistent fattn scratch is context-owned and can be referenced by queued kernels without
+    // appearing in a graph node's src[]. Drain every live context stream before releasing it.
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (streams[i][j] != nullptr) {
+                ggml_cuda_set_device(i);
+                CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+            }
+        }
+    }
+    ggml_cuda_fattn_scratch_free(*this);
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2575,11 +2587,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    // fattn's persistent scratch buffers can move without touching any node's src[] (doc:
-    // ggml_cuda_fattn_scratch_epoch, fattn.cuh). Check the epoch FIRST and unconditionally — the
+    // This context's fattn scratch buffers can move without touching any node's src[]. Check the
+    // context-local epoch FIRST and unconditionally — the
     // cgraph->uid fast path right below returns early without walking nodes, and a stale-address
     // graph replayed through it is exactly the hazard this fences.
-    const unsigned long long scratch_epoch_now = ggml_cuda_fattn_scratch_epoch(cuda_ctx->device);
+    const unsigned long long scratch_epoch_now = cuda_ctx->fattn_scratch.epoch;
     if (scratch_epoch_now != graph->fattn_scratch_epoch_at_capture) {
         graph->fattn_scratch_epoch_at_capture = scratch_epoch_now;
         res = true;
