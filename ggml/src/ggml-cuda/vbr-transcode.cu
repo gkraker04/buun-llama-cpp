@@ -6,6 +6,7 @@
 #include "vbr-transcode.cuh"
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <vector>
@@ -21,6 +22,287 @@ static __global__ void k_vbr_iota_i32(int32_t * __restrict__ dst, int64_t n) {
     }
 }
 
+namespace {
+
+constexpr size_t VBR_WORKSPACE_ALIGNMENT = 128;
+
+struct vbr_workspace_layout {
+    size_t f16_off = 0;
+    size_t f32_off = 0;
+    size_t idx_off = 0;
+    size_t bytes   = 0;
+};
+
+static bool vbr_workspace_add_plane(size_t count, size_t element_size, size_t & off, size_t & plane_off) {
+    if (count > SIZE_MAX / element_size) {
+        return false;
+    }
+    const size_t raw = count * element_size;
+    if (raw > SIZE_MAX - (VBR_WORKSPACE_ALIGNMENT - 1)) {
+        return false;
+    }
+    const size_t padded = ((raw + VBR_WORKSPACE_ALIGNMENT - 1) / VBR_WORKSPACE_ALIGNMENT)
+                        * VBR_WORKSPACE_ALIGNMENT;
+    if (off > SIZE_MAX - padded) {
+        return false;
+    }
+    plane_off = off;
+    off += padded;
+    return true;
+}
+
+static bool vbr_workspace_layout_for(int64_t rows, int64_t ne0, bool with_indices,
+                                     vbr_workspace_layout & layout) {
+    layout = {};
+    if (rows < 0 || ne0 <= 0) {
+        return false;
+    }
+    if (rows == 0) {
+        return true;
+    }
+    if ((uint64_t) rows > SIZE_MAX / (uint64_t) ne0) {
+        return false;
+    }
+    const size_t elements = (size_t) rows * (size_t) ne0;
+    size_t off = 0;
+    if (!vbr_workspace_add_plane(elements, sizeof(half),  off, layout.f16_off) ||
+        !vbr_workspace_add_plane(elements, sizeof(float), off, layout.f32_off)) {
+        return false;
+    }
+    if (with_indices &&
+        !vbr_workspace_add_plane((size_t) rows, sizeof(int32_t), off, layout.idx_off)) {
+        return false;
+    }
+    layout.bytes = off;
+    return true;
+}
+
+static bool vbr_workspace_required(int64_t n_cells, int64_t ne0, int64_t stash_rows,
+                                   size_t & required) {
+    if (n_cells < 0 || stash_rows < 0) {
+        return false;
+    }
+    if (n_cells == 0 && stash_rows == 0) {
+        required = 0;
+        return true;
+    }
+    if (ne0 <= 0) {
+        return false;
+    }
+
+    const int64_t transcode_rows = n_cells > 0
+                                 ? (getenv("VBR_TRANSCODE_NOTILE") ? n_cells : 256)
+                                 : 0;
+    vbr_workspace_layout transcode;
+    vbr_workspace_layout stash;
+    if (!vbr_workspace_layout_for(transcode_rows, ne0, true, transcode) ||
+        !vbr_workspace_layout_for(stash_rows, ne0, false, stash)) {
+        return false;
+    }
+    required = std::max(transcode.bytes, stash.bytes);
+
+    // Fidelity mode dequantizes all rows in fixed 256-row tiles before and after the transcode.
+    // The operations are stream-ordered, so only their maximum simultaneous layout is resident.
+    if (getenv("VBR_TRANSCODE_FIDELITY") != nullptr) {
+        vbr_workspace_layout fidelity;
+        if (!vbr_workspace_layout_for(256, ne0, false, fidelity)) {
+            return false;
+        }
+        required = std::max(required, fidelity.bytes);
+    }
+    return true;
+}
+
+static bool vbr_workspace_next_pow2(size_t bytes, size_t & result) {
+    result = 1;
+    while (result < bytes) {
+        if (result > SIZE_MAX / 2) {
+            return false;
+        }
+        result *= 2;
+    }
+    return true;
+}
+
+static bool vbr_workspace_round_up(size_t bytes, size_t granularity, size_t & result) {
+    if (granularity == 0 || bytes > SIZE_MAX - (granularity - 1)) {
+        return false;
+    }
+    result = ((bytes + granularity - 1) / granularity) * granularity;
+    return true;
+}
+
+static size_t vbr_workspace_physical_now(const ggml_cuda_vbr_transcode_workspace & workspace) {
+    const size_t vmm = workspace.vmm != nullptr
+                     ? ggml_backend_cuda_vmm_pool_mapped(workspace.vmm) : 0;
+    GGML_ASSERT(workspace.cuda_size <= SIZE_MAX - vmm);
+    return workspace.cuda_size + vmm;
+}
+
+static uint8_t * vbr_workspace_try(ggml_backend_cuda_context & ctx, size_t need_bytes) {
+    GGML_ASSERT(ctx.curr_stream_no == 0 && "VBR transcode workspace is owned by the side backend main stream");
+    auto & workspace = ctx.vbr_transcode_workspace;
+    if (need_bytes == 0) {
+        return workspace.vmm != nullptr
+             ? (uint8_t *) ggml_backend_cuda_vmm_pool_base(workspace.vmm)
+             : workspace.cuda_buf;
+    }
+    if (workspace.vmm != nullptr && need_bytes <= workspace.vmm_hw) {
+        return (uint8_t *) ggml_backend_cuda_vmm_pool_base(workspace.vmm);
+    }
+
+    ggml_cuda_set_device(ctx.device);
+    // Once VA reservation falls back to cudaMalloc, keep that representation for the context's
+    // lifetime. Migrating it later to a smaller VMM mapping would violate grow-only accounting.
+    if (workspace.cuda_buf == nullptr && ggml_backend_cuda_vmm_available(ctx.device)) {
+        if (workspace.vmm == nullptr || need_bytes > workspace.vmm_va) {
+            if (workspace.vmm != nullptr) {
+                ggml_backend_cuda_vmm_pool_free(workspace.vmm);
+                workspace.vmm    = nullptr;
+                workspace.vmm_va = 0;
+                workspace.vmm_hw = 0;
+            }
+            size_t va = 0;
+            if (!vbr_workspace_next_pow2(need_bytes, va)) {
+                return nullptr;
+            }
+            workspace.vmm = ggml_backend_cuda_vmm_pool_init(ctx.device, va);
+            if (workspace.vmm != nullptr) {
+                workspace.vmm_va = va;
+            }
+        }
+        if (workspace.vmm != nullptr) {
+            const size_t mapped_before = ggml_backend_cuda_vmm_pool_mapped(workspace.vmm);
+            if (!ggml_backend_cuda_vmm_pool_map(workspace.vmm, 0, need_bytes)) {
+                // vmm_pool_map may have landed and zeroed some chunks before the failing chunk.
+                // Its early return does not settle those legacy-stream memsets.
+                if (ggml_backend_cuda_vmm_pool_mapped(workspace.vmm) > mapped_before) {
+                    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+                }
+                return nullptr;
+            }
+            workspace.vmm_hw = std::max(workspace.vmm_hw, need_bytes);
+            return (uint8_t *) ggml_backend_cuda_vmm_pool_base(workspace.vmm);
+        }
+    }
+
+    size_t alloc = 0;
+    if (!vbr_workspace_next_pow2(need_bytes, alloc)) {
+        return nullptr;
+    }
+    if (alloc > workspace.cuda_size) {
+        if (workspace.cuda_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            CUDA_CHECK(cudaFree(workspace.cuda_buf));
+            workspace.cuda_buf  = nullptr;
+            workspace.cuda_size = 0;
+        }
+        uint8_t * ptr = nullptr;
+        if (cudaMalloc(&ptr, alloc) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        workspace.cuda_buf  = ptr;
+        workspace.cuda_size = alloc;
+    }
+    return workspace.cuda_buf;
+}
+
+static uint8_t * vbr_workspace_get(ggml_backend_cuda_context & ctx, size_t need_bytes) {
+    uint8_t * base = vbr_workspace_try(ctx, need_bytes);
+    if (base == nullptr && need_bytes > 0) {
+        GGML_ABORT("VBR transcode workspace: physical memory exhausted growing to %.1f MiB on "
+                   "device %d (boundary reserve missed)", need_bytes / 1048576.0, ctx.device);
+    }
+    return base;
+}
+
+} // namespace
+
+extern "C" bool ggml_backend_cuda_kv_transcode_workspace_memory(
+        ggml_backend_t backend_or_null, int device,
+        int64_t n_cells, int64_t ne0, int64_t stash_rows,
+        size_t * physical_now, size_t * physical_if_reserved) {
+    GGML_ASSERT(physical_now != nullptr);
+    GGML_ASSERT(physical_if_reserved != nullptr);
+    *physical_now = 0;
+    *physical_if_reserved = 0;
+
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return false;
+    }
+    const ggml_cuda_vbr_transcode_workspace * workspace = nullptr;
+    if (backend_or_null != nullptr) {
+        GGML_ASSERT(ggml_backend_is_cuda(backend_or_null));
+        const auto & ctx = *(const ggml_backend_cuda_context *) backend_or_null->context;
+        GGML_ASSERT(ctx.device == device);
+        workspace = &ctx.vbr_transcode_workspace;
+        *physical_now = vbr_workspace_physical_now(*workspace);
+    }
+
+    size_t need_bytes = 0;
+    if (!vbr_workspace_required(n_cells, ne0, stash_rows, need_bytes)) {
+        return false;
+    }
+    if (need_bytes == 0) {
+        *physical_if_reserved = *physical_now;
+        return true;
+    }
+
+    size_t fallback = 0;
+    if (!vbr_workspace_next_pow2(need_bytes, fallback)) {
+        return false;
+    }
+    if (!ggml_backend_cuda_vmm_available(device)) {
+        *physical_if_reserved = std::max(*physical_now, fallback);
+        return true;
+    }
+
+    size_t vmm = 0;
+    if (!vbr_workspace_round_up(need_bytes, ggml_backend_cuda_vmm_granularity(device), vmm)) {
+        return false;
+    }
+    if (workspace != nullptr && workspace->cuda_buf != nullptr) {
+        // Fallback is sticky once selected, preserving grow-only physical accounting.
+        *physical_if_reserved = std::max(*physical_now, fallback);
+    } else if (workspace != nullptr && workspace->vmm != nullptr && need_bytes <= workspace->vmm_va) {
+        *physical_if_reserved = std::max(*physical_now, vmm);
+    } else {
+        // The cold/re-reservation path can land on VMM or cudaMalloc fallback. Offers must not
+        // rely on the physically smaller path succeeding or predict a grow-only shrink.
+        *physical_if_reserved = std::max({ *physical_now, vmm, fallback });
+    }
+    return true;
+}
+
+extern "C" bool ggml_backend_cuda_kv_transcode_workspace_reserve(
+        ggml_backend_t backend, int64_t n_cells, int64_t ne0, int64_t stash_rows) {
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    auto & ctx = *(ggml_backend_cuda_context *) backend->context;
+    size_t need_bytes = 0;
+    if (!vbr_workspace_required(n_cells, ne0, stash_rows, need_bytes)) {
+        return false;
+    }
+    return need_bytes == 0 || vbr_workspace_try(ctx, need_bytes) != nullptr;
+}
+
+void ggml_cuda_vbr_transcode_workspace_free(ggml_backend_cuda_context & ctx) {
+    auto & workspace = ctx.vbr_transcode_workspace;
+    ggml_cuda_set_device(ctx.device);
+    if (workspace.vmm != nullptr) {
+        ggml_backend_cuda_vmm_pool_free(workspace.vmm);
+        workspace.vmm    = nullptr;
+        workspace.vmm_va = 0;
+        workspace.vmm_hw = 0;
+    }
+    if (workspace.cuda_buf != nullptr) {
+        CUDA_CHECK(cudaFree(workspace.cuda_buf));
+        workspace.cuda_buf  = nullptr;
+        workspace.cuda_size = 0;
+    }
+}
+
 // f16<->f32 plane moves use the stock convert helpers (ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda)
 
 // VBR_TRANSCODE_FIDELITY=1 debug: dequant every row of a tensor to host f32 (original domain).
@@ -29,13 +311,16 @@ static void vbr_fidelity_dequant_all(ggml_backend_cuda_context & ctx, const char
                                      cudaStream_t stream, std::vector<float> & out) {
     const int64_t TILE = 256;
     out.resize((size_t) n_cells * ne0);
-    ggml_cuda_pool_alloc<half>  s16(ctx.pool(), (size_t) TILE * ne0);
-    ggml_cuda_pool_alloc<float> s32(ctx.pool(), (size_t) TILE * ne0);
+    vbr_workspace_layout layout;
+    GGML_ASSERT(vbr_workspace_layout_for(TILE, ne0, false, layout));
+    uint8_t * workspace = vbr_workspace_get(ctx, layout.bytes);
+    half *  s16 = (half *)  (workspace + layout.f16_off);
+    float * s32 = (float *) (workspace + layout.f32_off);
     for (int64_t c = 0; c < n_cells; c += TILE) {
         const int64_t Te = std::min<int64_t>(TILE, n_cells - c);
         vbr_dequant_turbo_to_f32(data + (size_t) c * rowbytes, type, type,
-                                 s16.get(), s32.get(), Te, ne0, rowbytes, is_v, ctx.device, stream);
-        CUDA_CHECK(cudaMemcpyAsync(out.data() + (size_t) c * ne0, s32.get(),
+                                 s16, s32, Te, ne0, rowbytes, is_v, ctx.device, stream);
+        CUDA_CHECK(cudaMemcpyAsync(out.data() + (size_t) c * ne0, s32,
                                    (size_t) Te * ne0 * sizeof(float), cudaMemcpyDeviceToHost, stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -99,9 +384,9 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 //     writes, and both are ordered on the same stream. Promotion requires the caller to have
 //     MAPPED the grown extent first. (Promotion re-encodes the tier-A recon — it restores no
 //     information; it exists so FUTURE rows encode at the higher tier.)
-// ASYNC (S5): no end-of-call sync — everything is stream-ordered on ctx.stream(). The pool-alloc
-// scratch returns to the per-context pool at scope exit; reuse by the NEXT transcode on the same
-// stream is ordered behind this one's kernels, so that is safe by construction.
+// ASYNC (S5): no end-of-call sync — everything is stream-ordered on ctx.stream(). The persistent
+// context-owned workspace is reused by the NEXT transcode on the same stream, whose kernels are
+// ordered behind this one's kernels by construction.
 // NOTE: assumes decode-side InnerQ (d_innerq_channel_scale_inv_fattn) is already identity/calibrated
 // from prior decode (true in the live decode-time path).
 void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
@@ -131,13 +416,16 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
     // VBR_TRANSCODE_NOTILE (debug): one tile = whole tensor = the old non-tiled behavior, to isolate
     // tiling bugs from source-state issues in the anchor.
     const int64_t TILE = (getenv("VBR_TRANSCODE_NOTILE") && n_cells > 0) ? n_cells : 256;
-    ggml_cuda_pool_alloc<half>    scratch_f16(ctx.pool(), (size_t) TILE * ne0);
-    ggml_cuda_pool_alloc<float>   scratch_f32(ctx.pool(), (size_t) TILE * ne0);
-    ggml_cuda_pool_alloc<int32_t> idx_buf    (ctx.pool(), (size_t) TILE);
+    vbr_workspace_layout layout;
+    GGML_ASSERT(vbr_workspace_layout_for(TILE, ne0, true, layout));
+    uint8_t * workspace = vbr_workspace_get(ctx, layout.bytes);
+    half *    scratch_f16 = (half *)    (workspace + layout.f16_off);
+    float *   scratch_f32 = (float *)   (workspace + layout.f32_off);
+    int32_t * idx_buf     = (int32_t *) (workspace + layout.idx_off);
     {
         const int64_t threads = 256;
         const int64_t blocks  = (TILE + threads - 1) / threads;
-        k_vbr_iota_i32<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(idx_buf.get(), TILE);
+        k_vbr_iota_i32<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(idx_buf, TILE);
     }
 
     // Stage-2 scaffolding built ONCE (not per tile — a 32k-cell tensor has 128 tiles and per-tile
@@ -147,9 +435,9 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
     ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * tctx = ggml_init(ip);
     ggml_tensor * src0 = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, ne0, TILE);
-    src0->data = scratch_f32.get(); src0->buffer = pool_buf;
+    src0->data = scratch_f32; src0->buffer = pool_buf;
     ggml_tensor * src1 = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, TILE);
-    src1->data = idx_buf.get();     src1->buffer = pool_buf;   // iota [0,Te) -> dst rows [0,Te) of the tile
+    src1->data = idx_buf;     src1->buffer = pool_buf;   // iota [0,Te) -> dst rows [0,Te) of the tile
     ggml_tensor * dstB = ggml_new_tensor_2d(tctx, type_B, ne0, TILE);
     dstB->buffer = pool_buf;
     ggml_set_name(dstB, dst_name);
@@ -169,7 +457,7 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
 
         // Stage 1: dequant cells [c, c+Te) of src_A -> original-domain f32 [Te, ne0]
         vbr_dequant_turbo_to_f32((const char *) src_A->data + (size_t) c * rA, src_A->type, type_B,
-                                 scratch_f16.get(), scratch_f32.get(),
+                                 scratch_f16, scratch_f32,
                                  Te, ne0, rA, is_v, ctx.device, stream);
         // f16 sink-stash: rows below stash_rows re-encode from the pristine stash captured at the
         // tensor's FIRST degrade, not from the tier-A recon — sink rows are permanently hot AND
@@ -180,7 +468,7 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
         if (stash_f16 != nullptr && c < stash_rows && !stash_capture_only) {
             const int64_t overlap = std::min<int64_t>(Te, stash_rows - c);
             ggml_get_to_fp32_cuda(GGML_TYPE_F16)(
-                (const half *) stash_f16 + (size_t) c * ne0, scratch_f32.get(), overlap * ne0, stream);
+                (const half *) stash_f16 + (size_t) c * ne0, scratch_f32, overlap * ne0, stream);
         }
 
         // Stage 2: re-encode f32 -> turbo B into dst_B_data + c*rB via the set_rows path
@@ -243,11 +531,14 @@ extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const
     ggml_cuda_set_device(ctx.device);
     cudaStream_t stream = ctx.stream();
     const int64_t ne0 = src->ne[0];
-    ggml_cuda_pool_alloc<half>  s16(ctx.pool(), (size_t) n_rows * ne0);
-    ggml_cuda_pool_alloc<float> s32(ctx.pool(), (size_t) n_rows * ne0);
+    vbr_workspace_layout layout;
+    GGML_ASSERT(vbr_workspace_layout_for(n_rows, ne0, false, layout));
+    uint8_t * workspace = vbr_workspace_get(ctx, layout.bytes);
+    half *  s16 = (half *)  (workspace + layout.f16_off);
+    float * s32 = (float *) (workspace + layout.f32_off);
     vbr_dequant_turbo_to_f32((const char *) src->data, src->type, src->type,
-                             s16.get(), s32.get(), n_rows, ne0, src->nb[1], is_v, ctx.device, stream);
-    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(s32.get(), (half *) stash_f16, n_rows * ne0, stream);
+                             s16, s32, n_rows, ne0, src->nb[1], is_v, ctx.device, stream);
+    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(s32, (half *) stash_f16, n_rows * ne0, stream);
 }
 
 // Host-facing wrapper (callable from llama-kv-cache under GGML_USE_CUDA). extern "C" to match the

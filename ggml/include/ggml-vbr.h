@@ -121,6 +121,18 @@ struct ggml_vbr_backend_iface {
     // This never allocates, frees, maps, unmaps, migrates, or changes the scratch epoch.
     void (*kv_dequant_scratch_memory)(ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
                                       size_t * physical_now, size_t * physical_if_reserved);
+    // Persistent workspace used by both KV transcode and sink-stash capture. Projection accepts
+    // a null backend before the lazy side backend exists; in that case `device` selects the
+    // allocator policy and physical_now is zero. n_cells covers the transcode (including the
+    // live VBR_TRANSCODE_NOTILE policy), while stash_rows covers a capture immediately before it.
+    // false means invalid/overflowing dimensions. Neither callback mutates a tier.
+    bool (*kv_transcode_workspace_memory)(ggml_backend_t backend_or_null, int device,
+                                           int64_t n_cells, int64_t ne0, int64_t stash_rows,
+                                           size_t * physical_now, size_t * physical_if_reserved);
+    // Materialize the projected workspace on an existing side backend. Physical exhaustion is
+    // recoverable and returns false, allowing the caller to reclaim/retry before tier mutation.
+    bool (*kv_transcode_workspace_reserve)(ggml_backend_t backend,
+                                            int64_t n_cells, int64_t ne0, int64_t stash_rows);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address

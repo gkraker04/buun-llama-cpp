@@ -712,8 +712,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-    // Persistent fattn scratch is context-owned and can be referenced by queued kernels without
-    // appearing in a graph node's src[]. Drain every live context stream before releasing it.
+    // Persistent backend workspaces are context-owned and can be referenced by queued kernels
+    // without appearing in a graph node's src[]. Drain every live stream before releasing them.
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -723,6 +723,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     }
     ggml_cuda_fattn_scratch_free(*this);
+    ggml_cuda_vbr_transcode_workspace_free(*this);
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -5454,6 +5455,8 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
         /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
         /* .kv_dequant_scratch_reserve = */ ggml_backend_cuda_kv_dequant_scratch_reserve,
         /* .kv_dequant_scratch_memory  = */ ggml_backend_cuda_kv_dequant_scratch_memory,
+        /* .kv_transcode_workspace_memory  = */ ggml_backend_cuda_kv_transcode_workspace_memory,
+        /* .kv_transcode_workspace_reserve = */ ggml_backend_cuda_kv_transcode_workspace_reserve,
     };
     return &iface;
 }

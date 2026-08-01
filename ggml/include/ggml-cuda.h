@@ -74,6 +74,12 @@ GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(
 GGML_BACKEND_API void ggml_backend_cuda_kv_dequant_scratch_memory(
         ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
         size_t * physical_now, size_t * physical_if_reserved);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_memory(
+        ggml_backend_t backend_or_null, int device,
+        int64_t n_cells, int64_t ne0, int64_t stash_rows,
+        size_t * physical_now, size_t * physical_if_reserved);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_reserve(
+        ggml_backend_t backend, int64_t n_cells, int64_t ne0, int64_t stash_rows);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
