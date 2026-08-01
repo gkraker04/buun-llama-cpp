@@ -201,6 +201,14 @@ public:
         return vbr_ledger_owner_ && vbr_vmm_active();
     }
 
+    // Composite-cache ledger topology. A standalone cache is its own implicit root.
+    // iSWA attaches both children after their pools exist so ownership follows the
+    // actually active controller and the last child in parent execution order is root.
+    bool vbr_controller_active() const { return vbr_vmm_active(); }
+    void vbr_attach_ledger_tree(llama_kv_cache * root, llama_kv_cache * peer, double device_share);
+    void vbr_finalize_ledger_tree();
+    void vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran);
+
     // A share-linked drafter consumes f16 dequant scratch on its own compute backend while
     // reading this cache's tensors. The owner-side donation planner needs the terminal
     // requirement for every DISTINCT registered backend, not merely its own backend.
@@ -563,10 +571,12 @@ private:
     uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
     std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
     std::vector<size_t> vbr_pre_deficit_;    // per-pool pre-own-loop deficit (the honest ask)
+    bool     vbr_runtime_was_over_ = false;  // current boundary's child-local pressure sample
+    uint32_t vbr_runtime_wm_       = 0;
     void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
-    bool   vbr_ledger_scan_service(uint32_t wm_next); // true = component reserve failed
+    bool   vbr_ledger_scan_service(uint32_t n_tokens); // true = component reserve failed
     void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
     bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
     struct vbr_demand_service_result {
@@ -577,7 +587,7 @@ private:
                                const std::vector<llama_vram_peer_claim> & claims,
                                const std::vector<llama_vram_peer_marker> & peers,
                                const std::set<std::string> & announced,
-                               uint64_t now, uint32_t wm_next);
+                               uint64_t now, uint32_t n_tokens);
     void   vbr_grant_pending_clear();
     void   vbr_markers_publish(std::set<std::string> * changed = nullptr);
     void   vbr_maybe_promote(uint32_t wm_next); // gated promote step (boundary + tick)
@@ -588,13 +598,6 @@ private:
     const std::string & vbr_pool_busid(vbr_pool & p) const;
 
 public:
-    // co-tenancy: exactly one cache per memory tree runs the ledger protocol; composite
-    // parents (iSWA) demote all but one child and hand the owner a sibling pointer so the
-    // tree's offer is the SUM and demand targets split by offer weight. Non-owners keep
-    // every local mechanism (budget, band, waves, grants on their own pools) but never
-    // scan, serve, or publish themselves.
-    void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
-    void vbr_set_ledger_sibling(llama_kv_cache * sib) { vbr_ledger_sibling_ = sib; }
     struct vbr_shed_result {
         size_t freed          = 0;
         bool   reserve_failed = false;
@@ -602,7 +605,22 @@ public:
     vbr_shed_result vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
 private:
     bool vbr_ledger_owner_ = true;
-    llama_kv_cache * vbr_ledger_sibling_ = nullptr;
+    llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
+    llama_kv_cache * vbr_ledger_sibling_ = nullptr; // symmetric peer backlink in a composite
+    double vbr_tree_device_share_ = 1.0;            // parent share before child normalization
+    llama_kv_cache *       vbr_tree_root();
+    const llama_kv_cache * vbr_tree_root() const;
+    bool   vbr_tree_forced() const;
+    void   vbr_tree_force();
+    bool   vbr_tree_budget_explicit() const;
+    size_t vbr_tree_total_grant_decrement() const;
+    struct vbr_tree_pool_ref {
+        llama_kv_cache * child = nullptr;
+        vbr_pool * pool = nullptr;
+    };
+    vbr_tree_pool_ref vbr_tree_find_pool(const std::string & busid);
+    size_t vbr_child_offer(const llama_kv_cache * child, const std::string & busid) const;
+    bool   vbr_tree_has_grant(const llama_vram_peer_claim & c) const;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
@@ -615,6 +633,7 @@ private:
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
     bool     vbr_budget_explicit_  = false;
+    bool     vbr_budget_from_scalar_ = false;
     // what this pool's device can give it right now: device_share x (mapped + free - headroom),
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.

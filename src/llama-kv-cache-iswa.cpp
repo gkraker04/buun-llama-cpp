@@ -139,14 +139,33 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, vbr_swa);
 
-    // co-tenancy: the ledger protocol (scan, demand service, marker publication) runs
-    // ONCE per memory tree — two children independently serving the same claim would
-    // double-shed and fight over the shared per-process marker file. The base cache owns
-    // the protocol with the SWA child as its sibling: the published offer is the SUM of
-    // both children and demand targets split by offer weight, each child shedding its own
-    // portion on its own pools (the design's parent-level servicing; P4 cell 13).
-    kv_swa->vbr_set_ledger_owner(false);
-    kv_base->vbr_set_ledger_sibling(kv_swa.get());
+    // Run the process-external protocol once per composite. Choose the last active child
+    // in the parent's fixed base->SWA execution order so the root can finalize both samples
+    // and fence either child's service wave before graph launch.
+    kv_vbr_root = kv_swa->vbr_controller_active() ? kv_swa.get()
+                : kv_base->vbr_controller_active() ? kv_base.get()
+                : nullptr;
+    if (kv_vbr_root != nullptr) {
+        llama_kv_cache * peer = kv_vbr_root == kv_swa.get() ? kv_base.get() : kv_swa.get();
+        kv_vbr_root->vbr_attach_ledger_tree(kv_vbr_root, peer, vbr.device_share);
+        peer       ->vbr_attach_ledger_tree(kv_vbr_root, kv_vbr_root, vbr.device_share);
+        kv_vbr_root->vbr_finalize_ledger_tree();
+    }
+}
+
+void llama_kv_cache_iswa::vbr_finalize_prepare_failure(
+        llama_kv_cache * child, const std::vector<llama_ubatch> & ubatches) {
+    if (kv_vbr_root == nullptr) {
+        return;
+    }
+    uint32_t n_tokens = 0;
+    for (const auto & ubatch : ubatches) {
+        n_tokens += ubatch.n_tokens;
+    }
+    // Base runs before SWA. A failed SWA therefore follows a root run even when the only
+    // active controller (and thus root) is base; a failed root recorded its own sample.
+    const bool root_ran = child == kv_vbr_root || child == kv_swa.get();
+    kv_vbr_root->vbr_finalize_failed_child(n_tokens, root_ran);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -230,6 +249,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto sinfos_base = kv_base->plan_slots(ubatches);
         if (sinfos_base.empty()) {
+            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 
@@ -245,6 +265,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         sinfos_swa = kv_swa->prepare_with_slots(ubatches, std::move(sinfos_swa));
         if (sinfos_swa.empty()) {
+            vbr_finalize_prepare_failure(kv_swa.get(), ubatches);
             break;
         }
 
@@ -276,6 +297,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto sinfos_base = kv_base->plan_slots(ubatches);
         if (sinfos_base.empty()) {
+            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 
@@ -291,6 +313,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         sinfos_swa = kv_swa->prepare_with_slots(ubatches, std::move(sinfos_swa));
         if (sinfos_swa.empty()) {
+            vbr_finalize_prepare_failure(kv_swa.get(), ubatches);
             break;
         }
 

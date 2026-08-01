@@ -97,7 +97,7 @@ public:
     }
 
     bool vbr_ledger_tree_active() const override {
-        return kv_base->vbr_ledger_tree_active();
+        return kv_vbr_root != nullptr && kv_vbr_root->vbr_ledger_tree_active();
     }
 
     void vbr_shared_scratch_detach() override {
@@ -131,10 +131,14 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    void vbr_finalize_prepare_failure(llama_kv_cache * child,
+            const std::vector<llama_ubatch> & ubatches);
+
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+    llama_kv_cache * kv_vbr_root = nullptr;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {
