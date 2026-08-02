@@ -2024,13 +2024,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
         // a peer's rename (new claim, offer change) forces the full controller path
         vbr_ledger_precheck();
+        // Compare predicted padded watermarks, not just total occupancy. A high-tail trim can make
+        // shrink or promotion work possible while changing fewer than VBR_USED_DELTA cells (or no
+        // cells at all after sequence redistribution). Consume each decrease exactly once: using a
+        // pool's grow-only wm_cells here would keep the full path hot until the 25% shrink threshold.
+        const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+        const bool wm_receded = wm_next < vbr_last_wm_;
+        const bool reset_due = vbr_degrade_cursor_ > 0 && used_now == 0;
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
+                           !wm_receded && !reset_due &&
                            !vbr_ledger_force_);
 
-        // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
-        uint32_t wm_next = 0;
         if (!vbr_stable) {
             // auto budgets track reality: throttle re-derive from live free VRAM — during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
@@ -2055,7 +2061,6 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             if (vbr_degrade_cursor_ > 0 && used_now == 0) {
                 vbr_full_reset();
             }
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
 
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
@@ -2132,7 +2137,6 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
             // stable threshold.
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_quiet_boundaries_++;
         }
         // Eager physical backing to the predicted watermark, for BOTH paths: map failures surface HERE,
@@ -2157,6 +2161,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // which path ran, so the %8 cadence is real wall-boundary time.
         vbr_boundary_count_++;
         vbr_last_used_ = used_now;
+        vbr_last_wm_ = wm_next;
     }
 
     // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
