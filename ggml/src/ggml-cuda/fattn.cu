@@ -119,35 +119,35 @@ void turbo_q_calibrate_finalize() {
     q_calibrate_state = 2;
 }
 
-template <int DKQ, int DV, int ncols2>
+template <int DKQ, int DV, int ncols2, bool V_is_K_view = (DKQ == 576)>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, V_is_K_view>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, V_is_K_view>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, V_is_K_view>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, V_is_K_view>(ctx, dst);
 }
 
-template <int DKQ, int DV>
+template <int DKQ, int DV, bool V_is_K_view = (DKQ == 576)>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -180,22 +180,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, V_is_K_view>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, V_is_K_view>(ctx, dst);
             return;
         }
 
         if constexpr (DKQ <= 256) {
             if (use_gqa_opt && gqa_ratio % 2 == 0) {
-                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, V_is_K_view>(ctx, dst);
                 return;
             }
 
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, V_is_K_view>(ctx, dst);
             return;
         } else {
             GGML_ABORT("fatal error");
@@ -203,22 +203,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, V_is_K_view>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, V_is_K_view>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, V_is_K_view>(ctx, dst);
         return;
     }
 
     if constexpr (DKQ <= 256) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, V_is_K_view>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
     }
@@ -363,7 +363,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
+            if (ggml_cuda_fattn_V_is_K_view(K, V)) {
+                // V is K (e.g. DeepSeek V4 Flash, K-only attention): reuse K data in the PV phase.
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, true>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, false>(ctx, dst);
+            }
             break;
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.

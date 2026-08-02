@@ -425,6 +425,25 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// Whether V can be read through K's data pointer with K's strides.
+// True when V is a view of K (or both are views of the same source at the same
+// offset) with an identical layout, i.e. the PV phase can reuse the K shared
+// tile for V (K-only attention such as DeepSeek V4 Flash passes V == K, MLA
+// models pass V as a narrower prefix view of K). Requires the same strides and
+// offsets, so same-source views with different permutations are rejected.
+static inline bool ggml_cuda_fattn_V_is_K_view(const ggml_tensor * K, const ggml_tensor * V) {
+    return K && V
+        && (V->view_src == K ? V->view_offs == 0
+                             : (V->view_src && V->view_src == K->view_src && V->view_offs == K->view_offs))
+        && V->ne[0] <= K->ne[0]
+        && V->ne[1] == K->ne[1]
+        && V->ne[2] == K->ne[2]
+        && V->ne[3] == K->ne[3]
+        && V->nb[1] == K->nb[1]
+        && V->nb[2] == K->nb[2]
+        && V->nb[3] == K->nb[3];
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -435,7 +454,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(K, V);
 
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
@@ -1898,7 +1917,7 @@ void launch_fattn(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(K, V);
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];

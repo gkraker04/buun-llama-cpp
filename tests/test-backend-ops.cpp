@@ -6919,8 +6919,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
 
+    const bool v_is_k_view; // V is a view of K (K-only attention, e.g. DeepSeek V4 Flash)
+
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, v_is_k_view);
     }
 
     double max_nmse_err() override {
@@ -6936,9 +6938,10 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        bool v_is_k_view = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), v_is_k_view(v_is_k_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6970,7 +6973,11 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
+        if (v_is_k_view) {
+            // V is K (K-only attention, e.g. DeepSeek V4 Flash): V aliases K entirely.
+            GGML_ASSERT(type_K == type_V && hsk_padded == hsv_padded);
+            v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+        } else if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
             // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
 
             // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
@@ -9717,6 +9724,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+
+    // DSV4-style: DKQ = DV = 512, V == K (K-only attention), GQA ratio 16 -> ncols2 = 8.
+    // One case per ncols1 instantiation of the V-is-K-view kernel variants.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512,   2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512,   4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
+    // permuted variant (the DSV4 graph permutes K and V identically before the op)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,2,1,3}, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

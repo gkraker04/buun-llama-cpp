@@ -2276,7 +2276,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2>
+template <int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view = (DKQ == 576)>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -2299,10 +2299,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
-    constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
@@ -2351,9 +2348,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 }
 
 
-#define DECL_FATTN_MMA_F16_CASE(DKQ, DV, ncols1, ncols2)                          \
+#define DECL_FATTN_MMA_F16_CASE_VKV(DKQ, DV, ncols1, ncols2, VKV)                 \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                           \
-    <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+    <DKQ, DV, ncols1, ncols2, VKV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_MMA_F16_CASE(DKQ, DV, ncols1, ncols2) \
+    DECL_FATTN_MMA_F16_CASE_VKV(DKQ, DV, ncols1, ncols2, (DKQ == 576))
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
@@ -2402,6 +2402,21 @@ extern DECL_FATTN_MMA_F16_CASE(512, 512,  1,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  8);
+
+// DSV4: V == K (K-only attention, DeepSeek V4 Flash), K data reuse in the PV phase.
+// Instantiated for every (ncols1, ncols2) combo that the DKQ = 512 dispatch can reach.
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  1,  8, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  2,  8, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  4,  8, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  8,  8, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  2,  4, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  4,  4, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  8,  4, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512, 16,  4, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  4,  2, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512,  8,  2, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512, 16,  2, true);
+extern DECL_FATTN_MMA_F16_CASE_VKV(512, 512, 32,  2, true);
 
 // The number of viable configurations for Deepseek is very limited:
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
