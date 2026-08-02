@@ -291,6 +291,15 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // Side-effect-free admission preflight.  iSWA uses this to prove that both
+    // child caches can place the whole batch before either child enters prepare().
+    slot_info_vec_t plan_slots(const std::vector<llama_ubatch> & ubatches);
+
+    // Complete preparation using a slot plan produced by plan_slots().
+    slot_info_vec_t prepare_with_slots(
+            const std::vector<llama_ubatch> & ubatches,
+            slot_info_vec_t                   sinfos);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -299,7 +308,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // commit=false is used only by plan_slots() to suppress non-metadata side effects
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
 
     //
     // input API
@@ -719,6 +729,7 @@ private:
     size_t   vbr_pool_reach(const vbr_pool & p) const;
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
+    uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
     void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
@@ -729,7 +740,7 @@ private:
     void     vbr_floor_clamp_order();
     bool     vbr_retire_pending_before_unmap(const std::string & busid);
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
-    bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
+    bool     vbr_scratch_reserve(size_t flat_cells);  // #88: boundary-time f16 dequant scratch grow
     // Pure, allocator-blind child stream used by the tree transaction. It derives real steps only
     // through vbr_sim_step(); physical pricing and preflight remain separate.
     llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
@@ -763,7 +774,8 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
+    enum class vbr_degrade_result { applied, exhausted, reserve_failed };
+    vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)
 

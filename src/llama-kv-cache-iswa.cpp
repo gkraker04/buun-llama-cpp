@@ -249,7 +249,6 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto sinfos_base = kv_base->plan_slots(ubatches);
         if (sinfos_base.empty()) {
-            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 
@@ -260,6 +259,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         sinfos_base = kv_base->prepare_with_slots(ubatches, std::move(sinfos_base));
         if (sinfos_base.empty()) {
+            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 
@@ -297,7 +297,6 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         auto sinfos_base = kv_base->plan_slots(ubatches);
         if (sinfos_base.empty()) {
-            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 
@@ -308,6 +307,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         sinfos_base = kv_base->prepare_with_slots(ubatches, std::move(sinfos_base));
         if (sinfos_base.empty()) {
+            vbr_finalize_prepare_failure(kv_base.get(), ubatches);
             break;
         }
 

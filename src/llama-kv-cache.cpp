@@ -9,6 +9,7 @@
 #include "llama-vram-ledger.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -2099,6 +2100,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            if (i < vbr_stash_rows_) {
+                vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
+            }
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -2310,15 +2314,28 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    auto sinfos = plan_slots(ubatches);
+    if (sinfos.empty()) {
+        return {};
+    }
+
+    return prepare_with_slots(ubatches, std::move(sinfos));
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
+        const std::vector<llama_ubatch> & ubatches,
+        slot_info_vec_t                   sinfos) {
+    GGML_ASSERT(sinfos.size() == ubatches.size());
+
     vbr_runtime_was_over_ = false;
     // VBR S4 degrade trigger — MUST run at the llama_decode boundary, before any of this batch's
-    // cells are positioned. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
+    // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
     // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
-    // rows as zeros and races graphs built against the old tier. Here the previous batch's writes
-    // are complete/visible and no built-but-unexecuted graphs exist. prepare() is the choke point
-    // BOTH paths use (kv_cache::init_batch and llama_memory_hybrid::init_batch call it directly).
-    // The check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers
-    // so it never overruns the budget mid-flight.
+    // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
+    // the previous batch's writes are visible, and no built-but-unexecuted graphs exist.
+    // prepare_with_slots() is the post-admission choke point both ordinary and iSWA paths use. The
+    // check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers so it
+    // never overruns the budget mid-flight.
     if (vbr_vmm_active()) {
         // Reserve failures are boundary-local. The exact step remains at the cursor and may be
         // retried after another process releases capacity.
@@ -2334,7 +2351,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // P3 idleness input: a boundary IS decode activity; ticks never write this
         vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
-    // one ubatch token sum serves both the budget block and the scratch reserve below
+    // one ubatch token sum serves the budget block and the unified scratch projection below;
+    // non-unified scratch uses the planned physical views because their stream span also matters
     uint32_t n_tokens = 0;
     for (const auto & ub : ubatches) {
         n_tokens += ub.n_tokens;
@@ -2363,13 +2381,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
         // a peer's rename (new claim, offer change) forces the full controller path
         vbr_ledger_precheck();
+        // Compare predicted padded watermarks, not just total occupancy. A high-tail trim can make
+        // shrink or promotion work possible while changing fewer than VBR_USED_DELTA cells (or no
+        // cells at all after sequence redistribution). Consume each decrease exactly once: using a
+        // pool's grow-only wm_cells here would keep the full path hot until the 25% shrink threshold.
+        const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+        const bool wm_receded = wm_next < vbr_last_wm_;
+        const bool reset_due = vbr_degrade_cursor_ > 0 && used_now == 0;
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
+                           !wm_receded && !reset_due &&
                            !vbr_tree_forced());
 
-        // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
-        uint32_t wm_next = 0;
         if (!vbr_stable) {
             // auto budgets track reality: throttle re-derive from live free VRAM — during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
@@ -2394,7 +2418,6 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             if (vbr_degrade_cursor_ > 0 && used_now == 0) {
                 vbr_full_reset();
             }
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
 
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
@@ -2425,16 +2448,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             }
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                if (!vbr_degrade_next(wm_next)) {
-                    if (vbr_reserve_failed_) {
-                        LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
-                                "failing this batch recoverably\n", __func__);
-                        // Earlier successful steps in this boundary remain committed until the
-                        // transaction planner replaces this executor. Fence any such side-stream
-                        // waves before returning without a graph to carry the normal fence wait.
-                        vbr_tree_root()->vbr_arm_wave_fences();
-                        return {};
-                    }
+                const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
+                if (degrade == vbr_degrade_result::reserve_failed) {
+                    LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
+                            "failing this batch recoverably\n", __func__);
+                    // Earlier successful steps in this boundary remain committed. Fence their
+                    // side-stream waves before returning without a graph to carry the normal wait.
+                    vbr_tree_force();
+                    vbr_arm_wave_fences();
+                    return {};
+                }
+                if (degrade == vbr_degrade_result::exhausted) {
                     if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
                         vbr_budget_warned_ = true;
                         size_t projected_total = 0;
@@ -2486,7 +2510,6 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
             // stable threshold.
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_quiet_boundaries_++;
         }
         // Every child records at the common post-policy point. Non-roots leave their sample
@@ -2514,6 +2537,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // which path ran, so the %8 cadence is real wall-boundary time.
         vbr_boundary_count_++;
         vbr_last_used_ = used_now;
+        vbr_last_wm_ = wm_next;
     }
 
     // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
@@ -2521,7 +2545,34 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
     if (!vbr_pools_.empty() || !vbr_shared_scratch_bindings_.empty()) {
-        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
+        size_t scratch_cells = vbr_watermark_cells(n_tokens);
+        if (n_stream > 1) {
+            // A non-unified graph views K/V as [head_dim, heads, n_kv, stream_span], and the
+            // CUDA materializer flattens all four dimensions into one shared f16 scratch. Predict
+            // the largest flattened view in this batch from the already-planned physical slots.
+            // Keep prior ubatch inserts in the prediction; ignoring a later purge can only make
+            // this an upper bound. Dynamic VBR is forced unified and retains the original path.
+            std::array<uint32_t, LLAMA_MAX_SEQ> used_max_p1 = {};
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                used_max_p1[s] = v_cells[s].used_max_p1();
+            }
+            scratch_cells = 0;
+            const uint32_t n_pad_cur = std::max(n_pad, 256u);
+            for (const auto & sinfo : sinfos) {
+                uint32_t n_kv = 0;
+                for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+                    const uint32_t stream = sinfo.strm[s];
+                    for (const uint32_t idx : sinfo.idxs[s]) {
+                        used_max_p1[stream] = std::max(used_max_p1[stream], idx + 1);
+                    }
+                    n_kv = std::max(n_kv,
+                            std::min(v_cells[stream].size(), GGML_PAD(used_max_p1[stream], n_pad_cur)));
+                }
+                const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
+                scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
+            }
+        }
+        if (!vbr_scratch_reserve(scratch_cells)) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
             vbr_tree_force(); // same routing as the try_map failure above
@@ -2529,18 +2580,26 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
     }
 
+    return sinfos;
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    // Slot selection for later ubatches must observe the metadata changes made by
+    // earlier ones (notably SWA eviction and its contiguous-prefix purge).  Apply
+    // those changes speculatively, journal every cell they can touch, then restore
+    // the exact original metadata before returning the plan.  commit=false keeps
+    // VMM growth and the optional transcode self-test out of this transaction.
     struct state_t {
-        slot_info sinfo; // slot info for the ubatch
-
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
-
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<uint32_t> streams;
+        std::vector<std::vector<uint32_t>> idxs;
+        std::vector<llama_kv_cells> cells;
     };
 
-    // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+    const bool stash_dirty_old = vbr_stash_dirty_;
 
     bool success = true;
 
@@ -2555,37 +2614,71 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // remember the position that we found
         res.push_back(sinfo_new);
 
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
+        state_t state;
+        state.v_heads_old = v_heads;
 
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
+        // Start with the selected cells themselves.
+        std::map<uint32_t, std::vector<uint32_t>> touched;
+        llama_pos seq_pos_max_rm[LLAMA_MAX_SEQ];
+        std::fill(std::begin(seq_pos_max_rm), std::end(seq_pos_max_rm), -1);
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+        for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+            const uint32_t stream = sinfo_new.strm[s];
+            auto & idxs = touched[stream];
+            idxs.insert(idxs.end(), sinfo_new.idxs[s].begin(), sinfo_new.idxs[s].end());
+
+            const auto & cells = v_cells[stream];
+            for (const uint32_t idx : sinfo_new.idxs[s]) {
+                if (!cells.is_empty(idx)) {
+                    GGML_ASSERT(cells.seq_count(idx) == 1);
+                    const llama_seq_id seq_id = cells.seq_get(idx);
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
+                }
             }
-
-            states.push_back(std::move(state));
         }
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // apply_ubatch() also purges an evicted SWA sequence's older prefix.
+        // Include those cells in the journal even when they are outside sinfo.
+        for (uint32_t seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+            if (seq_pos_max_rm[seq_id] < 0) {
+                continue;
+            }
+
+            GGML_ASSERT(seq_id < seq_to_stream.size());
+            const uint32_t stream = seq_to_stream[seq_id];
+            const auto & cells = v_cells[stream];
+            auto & idxs = touched[stream];
+            for (uint32_t idx = 0; idx < cells.size(); ++idx) {
+                if (cells.pos_in(idx, 0, seq_pos_max_rm[seq_id] + 1) && cells.seq_has(idx, seq_id)) {
+                    idxs.push_back(idx);
+                }
+            }
+        }
+
+        for (auto & entry : touched) {
+            auto & idxs = entry.second;
+            std::sort(idxs.begin(), idxs.end());
+            idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+            state.streams.push_back(entry.first);
+            state.idxs.push_back(idxs);
+            state.cells.push_back(v_cells[entry.first].cp(idxs));
+        }
+
+        states.push_back(std::move(state));
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = it->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+        for (size_t i = 0; i < it->streams.size(); ++i) {
+            v_cells[it->streams[i]].set(it->idxs[i], it->cells[i]);
         }
+        v_heads = it->v_heads_old;
     }
+    vbr_stash_dirty_ = stash_dirty_old;
 
     if (!success) {
         return {};
@@ -2874,7 +2967,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2953,14 +3046,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
     // grow the physical backing first (no-op unless the watermark advanced past a page)
-    if (vbr_vmm_active()) {
+    if (commit && vbr_vmm_active()) {
         vbr_vmm_ensure_mapped();
     }
 
     // Dynamic VBR M3 anchor self-test (env-gated, runs once). Fires from the 2nd apply_ubatch call so
     // a prior attention has identity-init'd the decode-side InnerQ scales the dequant relies on.
     static const bool vbr_test_env = getenv("VBR_TRANSCODE_TEST") != nullptr; // once, not per ubatch
-    if (vbr_test_env) {
+    if (commit && vbr_test_env) {
         static bool vbr_test_armed = false;
         static bool vbr_test_done  = false;
         // apply_ubatch only POSITIONS cells; the K/V write happens in the following graph compute.
@@ -3269,15 +3362,16 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
 }
 
 // #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
-// per-(device, side) f16 scratch to the attended width implicitly, mid-graph — a context-linear
-// consumer the budget doesn't own, and one that can JUMP from zero to watermark width in a
+// per-(device, side) f16 scratch to the flattened attended view implicitly, mid-graph: a
+// context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
+// does not own it, and it can JUMP from zero to watermark width in a
 // single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
 // with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
 // that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
 // symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
 // turbo pools too (bookkeeping-only pools resolve their vtable at init).
-bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
+bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
     for (auto & p : vbr_pools_) {
         if (p.be == nullptr || p.device < 0) {
             continue;
@@ -3304,8 +3398,8 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
             }
             p.scratch_rows_epoch = vbr_tier_epoch_;
         }
-        const size_t k_bytes = p.scratch_k_row * wm_cells;
-        const size_t v_bytes = p.scratch_v_row * wm_cells;
+        const size_t k_bytes = p.scratch_k_row * flat_cells;
+        const size_t v_bytes = p.scratch_v_row * flat_cells;
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
@@ -3349,8 +3443,8 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
             }
             b.rows_epoch = owner_epoch;
         }
-        const size_t k_bytes = b.k_row * wm_cells;
-        const size_t v_bytes = b.v_row * wm_cells;
+        const size_t k_bytes = b.k_row * flat_cells;
+        const size_t v_bytes = b.v_row * flat_cells;
         if ((k_bytes != 0 || v_bytes != 0) &&
             !b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
             // The owner's tier flip may still have old-tier tails queued for release. They
@@ -4494,7 +4588,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
     return false;
 }
 
-bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
     const size_t cursor_entry = vbr_degrade_cursor_;
     while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
@@ -4561,7 +4655,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                     LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
                             "mutation; leaving %s at %s\n", __func__, pending.pool->device,
                             pending.extent->t->name, ggml_type_name(pending.extent->t->type));
-                    return false;
+                    return vbr_degrade_result::reserve_failed;
                 }
             }
         }
@@ -4659,9 +4753,9 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        return true;
+        return vbr_degrade_result::applied;
     }
-    return false;
+    return vbr_degrade_result::exhausted;
 }
 
 // Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED —
