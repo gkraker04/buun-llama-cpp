@@ -3509,7 +3509,9 @@ char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
         GGML_ASSERT(p.backend != nullptr);
         p.stash_buf = ggml_backend_buft_alloc_buffer(
                 ggml_backend_get_default_buffer_type(p.backend), total);
-        GGML_ASSERT(p.stash_buf != nullptr);
+        if (p.stash_buf == nullptr) {
+            return nullptr;
+        }
         LLAMA_LOG_INFO("%s: VBR sink-stash buffer (device %d): %.2f MiB\n", __func__, p.device, total/1024.0/1024.0);
     }
     return (char *) ggml_backend_buffer_get_base(p.stash_buf);
@@ -3758,6 +3760,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
 
 bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
     while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
+        const size_t step_cursor = vbr_degrade_cursor_;
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
 
         const auto it = map_layer_ids.find(st.il);
@@ -3783,6 +3786,27 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             const size_t rB = ggml_row_size(type_B,  t->ne[0]);
             if (t->type == type_B || rB >= rA) {
                 continue; // not a real degrade from the current tier (e.g. F16 band on a t8 static start)
+            }
+        }
+
+        // The stash is optional, but its first allocation must succeed before this step queues
+        // a transcode, defers an unmap, or flips tier metadata.  A nullable backend allocation
+        // therefore rejects the entire step at this boundary; retry it after pressure clears.
+        if (vbr_stash_rows_ > 0) {
+            for (auto & [pp, ep] : units) {
+                GGML_UNUSED(ep);
+                if (pp->wm_cells == 0) {
+                    continue;
+                }
+                if (pp->backend == nullptr) {
+                    pp->backend = pp->be->backend_init(pp->device);
+                    GGML_ASSERT(pp->backend != nullptr);
+                }
+                if (vbr_stash_ensure(*pp) == nullptr) {
+                    vbr_degrade_cursor_ = step_cursor;
+                    vbr_arm_wave_fences();
+                    return false;
+                }
             }
         }
 
@@ -3826,7 +3850,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
                 if (vbr_stash_rows_ > 0) {
-                    char * sbase = vbr_stash_ensure(*pp);
+                    char * sbase = (char *) ggml_backend_buffer_get_base(pp->stash_buf);
                     // the stash is injected into TAPPED-tier encodes with the tap suppressed, so it
                     // must hold tapped-domain rows (V - mu_V). t8 and f16 store FULL-domain — defer
                     // capture until the source is a tapped tier (t4 or lower); the first tapped hop's
