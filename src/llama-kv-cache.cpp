@@ -5023,234 +5023,6 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     return st;
 }
 
-// Exact cache-local KV endpoint for one VMM pool.  The baseline is the page set that
-// physically exists now, except that releases already queued by an older transcode wave are
-// treated as settled.  This is only a projector: it does not flush, map, unmap, transcode,
-// reserve scratch, publish an offer, or mutate a grant.
-llama_kv_cache::vbr_shed_pool_projection llama_kv_cache::vbr_project_pool(
-        size_t pool_idx,
-        const std::vector<ggml_type> & terminal_types,
-        uint32_t terminal_wm) const {
-    GGML_ASSERT(pool_idx < vbr_pools_.size());
-    const auto & p = vbr_pools_[pool_idx];
-    GGML_ASSERT(p.vmm != nullptr && p.be != nullptr && p.gran > 0);
-    GGML_ASSERT(p.be->vmm_pool_mapped_in_range != nullptr);
-
-    vbr_shed_pool_projection out;
-    out.pool_idx = pool_idx;
-    out.device   = p.device;
-
-    std::vector<llama_vbr_physical::interval> deferred;
-    if (!llama_vbr_physical::normalize_deferred(p.unmap_deferred, p.gran, deferred)) {
-        GGML_ABORT("VBR physical projection: invalid deferred-unmap geometry");
-    }
-    const auto query = [&](size_t off, size_t len) {
-        return p.be->vmm_pool_mapped_in_range(p.vmm, off, len);
-    };
-
-    llama_vbr_physical::projection total;
-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-        for (int side = 0; side < 2; ++side) {
-            const vbr_extent & e = side ? p.v[ikv] : p.k[ikv];
-            if (e.t == nullptr) {
-                continue;
-            }
-            const size_t sim_slot = ikv*2 + (side ? 1 : 0);
-            GGML_ASSERT(sim_slot < terminal_types.size());
-            const ggml_type terminal_type = terminal_types[sim_slot] != GGML_TYPE_COUNT
-                    ? terminal_types[sim_slot] : e.t->type;
-            const size_t slot_span = vbr_slot_span(e.t, p.gran);
-            uint64_t final_bytes_u64 = 0;
-            if (!llama_vbr_physical::endpoint_bytes(
-                        ggml_row_size(terminal_type, e.t->ne[0]), terminal_wm,
-                        slot_span, p.gran, final_bytes_u64)) {
-                GGML_ABORT("VBR physical projection: endpoint arithmetic overflow");
-            }
-            if (final_bytes_u64 > SIZE_MAX) {
-                GGML_ABORT("VBR physical projection: endpoint exceeds host size_t");
-            }
-            const size_t final_bytes = (size_t) final_bytes_u64;
-
-            size_t current_total = 0;
-            size_t current_inside = 0;
-            if (!llama_vbr_physical::mapped_after_deferred(
-                        e.byte_off, slot_span, p.gran, deferred, query, current_total) ||
-                !llama_vbr_physical::mapped_after_deferred(
-                        e.byte_off, final_bytes, p.gran, deferred, query, current_inside) ||
-                !llama_vbr_physical::add_endpoint(
-                        total, current_total, current_inside, final_bytes)) {
-                GGML_ABORT("VBR physical projection: inconsistent VMM endpoint state");
-            }
-        }
-    }
-
-    out.kv_delta   = total.delta;
-    out.kv_release = total.release;
-    out.kv_growth  = total.growth;
-    return out;
-}
-
-// Memoized terminal projection for this cache's remaining consent window.  A total-mapped-byte
-// key is insufficient: a map/unmap redistribution can preserve the total while changing which
-// endpoint ranges are resident.  The VMM residency epoch identifies the page set instead.
-const std::vector<llama_kv_cache::vbr_shed_pool_projection> &
-llama_kv_cache::vbr_shed_project(uint32_t requested_wm) const {
-    bool retained_match =
-            vbr_shed_projection_.retained_pool_wm.size() == vbr_pools_.size();
-    bool residency_match =
-            vbr_shed_projection_.residency_epoch.size() == vbr_pools_.size();
-    for (size_t pi = 0; retained_match && pi < vbr_pools_.size(); ++pi) {
-        retained_match =
-                vbr_shed_projection_.retained_pool_wm[pi] == vbr_pools_[pi].wm_cells;
-    }
-    for (size_t pi = 0; residency_match && pi < vbr_pools_.size(); ++pi) {
-        const auto & p = vbr_pools_[pi];
-        GGML_ASSERT(p.vmm == nullptr ||
-                    (p.be != nullptr && p.be->vmm_pool_residency_epoch != nullptr));
-        const uint64_t epoch = p.vmm != nullptr
-                ? p.be->vmm_pool_residency_epoch(p.vmm) : 0;
-        residency_match = vbr_shed_projection_.residency_epoch[pi] == epoch;
-    }
-    if (vbr_shed_projection_.tier_epoch == vbr_tier_epoch_ &&
-        vbr_shed_projection_.requested_wm == requested_wm &&
-        retained_match && residency_match) {
-        return vbr_shed_projection_.pools;
-    }
-
-    std::vector<ggml_type> terminal_types;
-    vbr_sim_seed(terminal_types, /*pooled_only=*/true,
-                 GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
-    const size_t demand_limit = vbr_demand_limit();
-    for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
-        size_t slot = 0;
-        const ggml_tensor * tensor = nullptr;
-        ggml_type type_b = GGML_TYPE_COUNT;
-        if (vbr_sim_step(terminal_types, i, slot, tensor, type_b)) {
-            terminal_types[slot] = type_b;
-        }
-    }
-
-    auto & out = vbr_shed_projection_.pools;
-    out.clear();
-    out.reserve(vbr_pools_.size());
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        const auto & p = vbr_pools_[pi];
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        out.push_back(vbr_project_pool(
-                pi, terminal_types, std::max(p.wm_cells, requested_wm)));
-    }
-
-    vbr_shed_projection_.tier_epoch   = vbr_tier_epoch_;
-    vbr_shed_projection_.requested_wm = requested_wm;
-    vbr_shed_projection_.retained_pool_wm.resize(vbr_pools_.size());
-    vbr_shed_projection_.residency_epoch.resize(vbr_pools_.size());
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        const auto & p = vbr_pools_[pi];
-        vbr_shed_projection_.retained_pool_wm[pi] = p.wm_cells;
-        GGML_ASSERT(p.vmm == nullptr ||
-                    (p.be != nullptr && p.be->vmm_pool_residency_epoch != nullptr));
-        vbr_shed_projection_.residency_epoch[pi] = p.vmm != nullptr
-                ? p.be->vmm_pool_residency_epoch(p.vmm) : 0;
-    }
-    return out;
-}
-
-// co-tenancy: the marker-published donation offer. Walks the REMAINING consent window
-// [cursor, vbr_demand_limit()) — the f16->t8 band, or down to a TYPED floor — with the
-// same skip rules as vbr_degrade_next and sums,
-// per pool, the page-padded bytes the full band would free at the current watermark — then
-// subtracts the projected GROWTH of the #88 f16 dequant scratch those sheds would cost.
-// The scratch projection uses the max-row shape of vbr_scratch_reserve (the widest
-// dequant-active row per side), NOT a per-(layer,side) sum — summing would overstate the
-// cost by ~n_layers and zero every offer. The budget is deliberately not an input: an offer
-// says what shedding COULD free, the grant math decides what it does free.
-size_t llama_kv_cache::vbr_shed_available(int device) const {
-    if (!vbr_vmm_active() || vbr_demand_limit() == 0) {
-        return 0;
-    }
-    uint32_t wm_max = 0;
-    for (const auto & p : vbr_pools_) {
-        if (p.vmm != nullptr) {
-            wm_max = std::max(wm_max, p.wm_cells);
-        }
-    }
-    const uint32_t wm_key = GGML_PAD(wm_max, 256);
-    if (shed_avail_epoch_ != vbr_tier_epoch_ || shed_avail_wm_ != wm_key) {
-        shed_avail_pool_.assign(vbr_pools_.size(), 0);
-
-        std::vector<ggml_type> sim;
-        vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
-                     nullptr, nullptr, nullptr);
-        std::vector<int64_t> freed(vbr_pools_.size(), 0);
-        const size_t demand_limit = vbr_demand_limit();
-        for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
-            size_t slot; const ggml_tensor * t; ggml_type type_B;
-            if (!vbr_sim_step(sim, i, slot, t, type_B)) {
-                continue;
-            }
-            const auto & stp = vbr_degrade_order_[i];
-            const size_t ikv = slot / 2;
-            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-                const auto & p = vbr_pools_[pi];
-                if (p.vmm == nullptr) {
-                    continue;
-                }
-                const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
-                if (e.t == nullptr) {
-                    continue;
-                }
-                freed[pi] += (int64_t) GGML_PAD(ggml_row_size(sim[slot], e.t->ne[0]) * p.wm_cells, p.gran)
-                           - (int64_t) GGML_PAD(ggml_row_size(type_B,    e.t->ne[0]) * p.wm_cells, p.gran);
-            }
-            sim[slot] = type_B;
-        }
-        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-            const auto & p = vbr_pools_[pi];
-            if (p.vmm == nullptr) {
-                continue;
-            }
-            // scratch growth: widest dequant-active f16 row per side, before vs after the sim
-            size_t cur_k = 0, cur_v = 0, end_k = 0, end_v = 0;
-            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                const ggml_tensor * tk = p.k[ikv].t;
-                const ggml_tensor * tv = p.v[ikv].t;
-                bool need_k = false, need_v = false;
-                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
-                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
-                if (need_k && tk) { cur_k = std::max(cur_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
-                if (need_v && tv) { cur_v = std::max(cur_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
-                const ggml_type sk = sim[ikv*2 + 0] != GGML_TYPE_COUNT ? sim[ikv*2 + 0] : (tk ? tk->type : GGML_TYPE_F16);
-                const ggml_type sv = sim[ikv*2 + 1] != GGML_TYPE_COUNT ? sim[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
-                ggml_vbr_kv_dequant_sides(sk, sv, &need_k, &need_v);
-                if (need_k && tk) { end_k = std::max(end_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
-                if (need_v && tv) { end_v = std::max(end_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
-            }
-            const int64_t scratch_proj =
-                (int64_t) ((end_k > cur_k ? end_k - cur_k : 0) +
-                           (end_v > cur_v ? end_v - cur_v : 0)) * (int64_t) p.wm_cells;
-            shed_avail_pool_[pi] = (size_t) std::max<int64_t>(0, freed[pi] - scratch_proj);
-        }
-        shed_avail_epoch_ = vbr_tier_epoch_;
-        shed_avail_wm_    = wm_key;
-        size_t dbg_total = 0;
-        for (const size_t s : shed_avail_pool_) {
-            dbg_total += s;
-        }
-        LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
-                __func__, vbr_degrade_cursor_, demand_limit,
-                wm_key, dbg_total/1048576.0);
-    }
-    size_t total = 0;
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        if (vbr_pools_[pi].vmm != nullptr && vbr_pools_[pi].device == device) {
-            total += shed_avail_pool_[pi];
-        }
-    }
-    return total;
-}
-
 // ---- co-tenancy donor side (P2) ----
 
 const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
@@ -5307,7 +5079,6 @@ size_t llama_kv_cache::vbr_tree_offer(const std::string & busid) const {
     }
 
     vbr_shed_tx tx;
-    tx.demanded_busid = busid;
     tx.demanded_device = demanded.pool->device;
     auto append_child = [&](llama_kv_cache * child) {
         if (child == nullptr || !child->vbr_vmm_active()) {
@@ -5805,18 +5576,13 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
                     }
 
                     vbr_tx_endpoint endpoint;
-                    endpoint.key             = key;
-                    endpoint.child           = child;
                     endpoint.pool            = &p;
                     endpoint.extent          = &e;
-                    endpoint.device          = p.device;
-                    endpoint.busid           = child->vbr_pool_busid(p);
                     endpoint.final_span      = final_span;
                     endpoint.slot_span       = slot_span;
                     endpoint.baseline_total  = baseline_total;
                     endpoint.baseline_inside = baseline_inside;
                     endpoint.gross_release   = gross_release;
-                    endpoint.growth          = final_span_u64 - baseline_inside;
                     endpoint.live            = p.wm_cells > 0;
                     tx.endpoints.emplace(key, std::move(endpoint));
                     virtual_stash_valid[key] = e.stash_valid;
@@ -5856,7 +5622,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
                     ? std::min(child->vbr_stash_rows_, pp->wm_cells) : 0;
             const vbr_tx_pool_key pkey { step.child_idx, pi };
             auto & workspace = tx.workspaces[pkey];
-            workspace.key     = pkey;
             workspace.be      = pp->be;
             workspace.backend = pp->backend;
             workspace.device  = pp->device;
@@ -5864,7 +5629,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
                     (int64_t) pp->wm_cells, ep->t->ne[0], (int64_t) capture_rows });
             if (capture_rows > 0) {
                 auto & stash = tx.stashes[pkey];
-                stash.key = pkey;
                 stash.device = pp->device;
                 stash.requests.push_back({ ep, capture_rows });
                 virtual_stash_valid[ekey] = capture_rows;
@@ -5880,7 +5644,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         if (tx.workspaces.count(key) == 0) {
             auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
             auto & group = tx.workspaces[key];
-            group.key = key;
             group.be = pool.be;
             group.backend = pool.backend;
             group.device = pool.device;
@@ -5891,7 +5654,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         if (tx.stashes.count(key) == 0) {
             auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
             auto & group = tx.stashes[key];
-            group.key = key;
             group.device = pool.device;
         }
     }
@@ -5935,8 +5697,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         if (endpoint < baseline->second) {
             return false;
         }
-        group.physical_now = physical_now;
-        group.physical_projected = endpoint;
         if (!llama_vbr_transaction::add_u64(
                     tx.devices[group.device].workspace_growth, endpoint - baseline->second)) {
             return false;
@@ -5963,8 +5723,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         if (endpoint < baseline->second) {
             return false;
         }
-        group.physical_now = physical_now;
-        group.physical_projected = endpoint;
         if (!llama_vbr_transaction::add_u64(
                     tx.devices[group.device].stash_growth, endpoint - baseline->second)) {
             return false;
@@ -5988,7 +5746,6 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         if (endpoint < baseline->second) {
             return false;
         }
-        group.physical_now = physical_now;
         group.physical_projected = endpoint;
         return true;
     };
@@ -6315,8 +6072,6 @@ void llama_kv_cache::vbr_tx_suppress(const std::string & busid) {
         if (child == nullptr) {
             return;
         }
-        child->shed_avail_epoch_ = ~0ull;
-        child->vbr_shed_projection_.tier_epoch = ~0ull;
         for (auto & p : child->vbr_pools_) {
             p.budget_eff_stamp = ~0ull;
         }
@@ -6373,8 +6128,7 @@ bool llama_kv_cache::vbr_tx_publish_zero_intent(const vbr_shed_tx & tx) {
     return true;
 }
 
-void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
-    GGML_UNUSED(c);
+void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx) {
     for (const auto & state : tx.children) {
         GGML_ASSERT(state.cache->vbr_degrade_cursor_ == state.start_cursor);
         GGML_ASSERT(state.cache->vbr_tier_epoch_ == state.start_epoch);
@@ -6494,8 +6248,6 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, const llama_vram_peer_claim 
                 p.scratch_rows_epoch = ~0ull;
             }
         }
-        child->shed_avail_epoch_ = ~0ull;
-        child->vbr_shed_projection_.tier_epoch = ~0ull;
     }
 
     for (auto & plan : tx.planned_grants) {
@@ -6535,7 +6287,6 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
     }
 
     vbr_shed_tx tx;
-    tx.demanded_busid = c.busid;
     tx.demanded_device = demanded.pool->device;
     tx.target = target;
     auto append_child = [&](llama_kv_cache * child) {
@@ -6646,7 +6397,7 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
     GGML_ASSERT(demanded_cost != tx.devices.end() && demanded_cost->second.capacity_signed >= 0);
     result.credited = std::min<uint64_t>(
             tx.target, (uint64_t) demanded_cost->second.capacity_signed);
-    root->vbr_tx_apply(tx, c);
+    root->vbr_tx_apply(tx);
     root->vbr_offer_suppressed_until_.erase(c.busid);
     result.status = vbr_tx_status::committed;
     return result;
@@ -6752,8 +6503,9 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             // flushed before another claim is sized from free memory and exact residency.
             break;
         } else if (shed.status == vbr_tx_status::retryable_no_tier_mutation) {
-            // Donation is optional.  Its bool-returning reserve failure withdrew this donor's
-            // offer without changing tiers; it must not fail the resident's otherwise-valid batch.
+            // Donation is optional. A retryable planning, reservation, mapping, preparation, or
+            // publication failure withdrew this donor's offer without changing tiers; it must not
+            // fail the resident's otherwise-valid batch.
             break;
         }
     }

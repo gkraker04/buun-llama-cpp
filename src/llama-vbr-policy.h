@@ -6,9 +6,9 @@
 #include <utility>
 #include <vector>
 
-// Pure policy ordering for a future VBR tree-shed transaction.  This layer knows nothing about
-// VMM residency or allocator state: cache adapters provide page-padded LOGICAL progress for each
-// real ladder step, and a later physical planner prices each yielded prefix independently.
+// Pure policy ordering for the VBR tree-shed transaction. This layer knows nothing about VMM
+// residency or allocator state: cache adapters provide page-padded LOGICAL progress for each real
+// ladder step, and the physical planner prices each yielded prefix independently.
 namespace llama_vbr_policy {
 
 struct step {

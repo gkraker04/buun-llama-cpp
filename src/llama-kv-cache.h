@@ -190,12 +190,6 @@ public:
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
-    // co-tenancy: bytes a demand-driven shed could free on `device` — max shed over the
-    // remaining f16->t8 band, net of the projected dequant-scratch growth it would cost.
-    // 0 when the band is spent/absent, the order is a custom override, or no VMM pool
-    // lives on the device. Memoized; safe to call between boundaries (marker writes).
-    size_t vbr_shed_available(int device) const;
-
     void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
                              uint64_t & offer, uint64_t & pending) const override;
 
@@ -492,31 +486,6 @@ private:
                                 : std::min(vbr_degrade_limit_, t8_band_end_);
     }
     bool vbr_floor_typed_ = false;
-    // Exact physical endpoint of the remaining consent window for one VMM pool.
-    // These are KV pages only: scratch, stash, shared-drafter preflight, grant credit,
-    // and composite/iSWA policy belong to later transaction layers.
-    struct vbr_shed_pool_projection {
-        size_t   pool_idx  = 0;
-        int      device    = -1;
-        int64_t  kv_delta  = 0; // signed current -> endpoint: release - growth
-        uint64_t kv_release = 0;
-        uint64_t kv_growth  = 0;
-    };
-    struct vbr_shed_projection_cache {
-        uint64_t tier_epoch   = ~0ull;
-        uint32_t requested_wm = 0;
-        std::vector<uint32_t> retained_pool_wm;
-        std::vector<uint64_t> residency_epoch;
-        std::vector<vbr_shed_pool_projection> pools;
-    };
-    mutable vbr_shed_projection_cache vbr_shed_projection_;
-
-    // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
-    // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
-    mutable uint64_t            shed_avail_epoch_ = ~0ull;
-    mutable uint32_t            shed_avail_wm_    = 0;
-    mutable std::vector<size_t> shed_avail_pool_;
-
     // ---- co-tenancy donor state (P2) ----
     // grant rows: private in-memory liabilities recording a demand-shed's decrement,
     // keyed (pid, starttime, ver) with the demanded device's busid; one row per pool the
@@ -590,7 +559,6 @@ private:
     size_t vbr_total_grant_decrement() const;     // promote freeze gate
     const std::string & vbr_pool_busid(vbr_pool & p) const;
 
-public:
     enum class vbr_tx_status {
         no_capacity,
         retryable_no_tier_mutation,
@@ -600,7 +568,6 @@ public:
         vbr_tx_status status = vbr_tx_status::no_capacity;
         uint64_t credited = 0;
     };
-private:
     bool vbr_ledger_owner_ = true;
     llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
     llama_kv_cache * vbr_ledger_sibling_ = nullptr; // symmetric peer backlink in a composite
@@ -660,36 +627,25 @@ private:
         ggml_type type_b = GGML_TYPE_COUNT;
     };
     struct vbr_tx_endpoint {
-        vbr_tx_extent_key key;
-        llama_kv_cache * child = nullptr;
         vbr_pool * pool = nullptr;
         vbr_extent * extent = nullptr;
-        int device = -1;
-        std::string busid;
         size_t final_span = 0;
         size_t slot_span = 0;
         uint64_t baseline_total = 0;
         uint64_t baseline_inside = 0;
         uint64_t gross_release = 0;
-        uint64_t growth = 0;
         bool touched = false;
         bool live = false;
     };
     struct vbr_tx_workspace_group {
-        vbr_tx_pool_key key;
         const ggml_vbr_backend_iface * be = nullptr;
         ggml_backend_t backend = nullptr;
         int device = -1;
         std::vector<llama_vbr_transaction::workspace_request> requests;
-        uint64_t physical_now = 0;
-        uint64_t physical_projected = 0;
     };
     struct vbr_tx_stash_group {
-        vbr_tx_pool_key key;
         int device = -1;
         std::vector<vbr_stash_request> requests;
-        uint64_t physical_now = 0;
-        uint64_t physical_projected = 0;
     };
     struct vbr_tx_scratch_group {
         const ggml_vbr_backend_iface * be = nullptr;
@@ -697,7 +653,6 @@ private:
         int device = -1;
         size_t k_need = 0;
         size_t v_need = 0;
-        uint64_t physical_now = 0;
         uint64_t physical_projected = 0;
         bool owner_backend = false;
     };
@@ -706,7 +661,6 @@ private:
         vbr_grant_row row;
     };
     struct vbr_shed_tx {
-        std::string demanded_busid;
         int demanded_device = -1;
         uint64_t target = 0;
         std::vector<vbr_tx_child> children;
@@ -733,21 +687,21 @@ private:
     bool vbr_tx_map_endpoints(vbr_shed_tx & tx);
     bool vbr_tx_prepare_commit(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
     bool vbr_tx_publish_zero_intent(const vbr_shed_tx & tx);
-    void vbr_tx_apply(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
+    void vbr_tx_apply(vbr_shed_tx & tx);
     void vbr_tx_suppress(const std::string & busid);
     vbr_tx_result vbr_execute_tree_shed(
             const llama_vram_peer_claim & c, uint64_t target, uint32_t n_tokens);
 
-    // A failed bool-returning reserve temporarily withdraws this device's offer.  The bound is
-    // short enough to retry after another donor releases pages, but prevents every scan from
-    // selecting the same allocator-constrained resident first.
+    // A retryable transaction failure temporarily withdraws this device's offer. The bound is
+    // short enough to retry after physical capacity or marker state changes, but prevents every
+    // scan from immediately selecting the same resident again.
     mutable std::map<std::string, uint64_t> vbr_offer_suppressed_until_;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
-    // A recoverable pre-mutation component reserve failed during this boundary/tick. prepare()
-    // fails the batch instead of executing over budget; idle breathe() retains the exact cursor
-    // and retries on a later tick after physical capacity changes.
+    // A recoverable ordinary boundary reserve failed during this boundary/tick. prepare() fails the
+    // batch instead of executing over budget; idle breathe() retains the exact cursor and retries
+    // on a later tick after physical capacity changes. Transaction retry suppression is separate.
     bool   vbr_reserve_failed_ = false;
     // prepare() boundaries since the last applied degrade step — promote cooldown basis
     // (deterministic, unlike wall time); promotes wait for a quiet window after any degrade
@@ -776,13 +730,8 @@ private:
     bool     vbr_retire_pending_before_unmap(const std::string & busid);
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
-    vbr_shed_pool_projection vbr_project_pool(
-            size_t pool_idx,
-            const std::vector<ggml_type> & terminal_types,
-            uint32_t terminal_wm) const;
-    const std::vector<vbr_shed_pool_projection> & vbr_shed_project(uint32_t requested_wm) const;
-    // Pure, allocator-blind child stream for a future tree transaction.  It derives real steps
-    // only through vbr_sim_step(), and is intentionally not wired into the live executor yet.
+    // Pure, allocator-blind child stream used by the tree transaction. It derives real steps only
+    // through vbr_sim_step(); physical pricing and preflight remain separate.
     llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
     // Pure physical projection for any set of captures in one pool. The first usable capture
     // requires the complete tightly-packed slab, matching the old allocation's fidelity lifetime;
