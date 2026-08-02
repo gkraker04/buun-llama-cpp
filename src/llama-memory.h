@@ -44,8 +44,8 @@ struct llama_memory_vbr_params {
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
     // (an auto budget floats within [floor-layout cost, live reach] at decode boundaries)
     bool     budget_explicit = false;
-    // free-VRAM headroom kept when re-deriving an auto budget (0 = 1 GiB default; the fit
-    // passes its --fit-target so startup and runtime encode the same worst case)
+    // free-VRAM headroom kept while growing a VBR pool (0 = 1 GiB default; the fit passes its
+    // --fit-target so startup and runtime encode the same worst case)
     uint64_t growth_headroom_bytes = 0;
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent splits by entry-tier footprint so the children never double-claim the same free)

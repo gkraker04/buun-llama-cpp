@@ -3233,11 +3233,15 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // VRAM at all. Clamp each pool's target by what its device can actually map right now
 // (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
 // ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+// Auto budgets already preserve vbr_growth_headroom_ when periodically re-derived. Explicit
+// budgets never re-derive—the typed value is a hard cap—so their live clamp must preserve that
+// same fit headroom instead of only the smaller co-tenancy reserve. This tightens the effective
+// per-device decision limit without changing or growing the user's configured cap.
 // Shared by the degrade trigger AND the promote hysteresis: gating the two on different
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
 // then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
-    const size_t headroom = llama_vram_headroom_bytes();
+    const size_t ledger_headroom = llama_vram_headroom_bytes();
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
     // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
@@ -3249,13 +3253,17 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     size_t free_b = 0, total_b = 0;
     p.be->get_device_memory(p.device, &free_b, &total_b);
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    // P3 fairness: headroom scales with the presence census (every live fork process has
-    // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
+    // P3 fairness: reserve the ordinary ledger headroom for every live peer. An explicit
+    // budget's own process instead reserves the (usually larger) fit growth target because it
+    // has no auto re-derivation path. At N_live > 1 the budget base also relaxes to a
     // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
     // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
     // single-tenant behavior; the quantization alone would cost up to 64 MiB).
     const uint32_t n_live = vbr_pool_n_live(p);
-    const size_t headroom_eff = headroom * n_live;
+    const size_t own_headroom = vbr_budget_explicit_
+            ? std::max(vbr_growth_headroom_, ledger_headroom) : ledger_headroom;
+    const size_t headroom_eff = own_headroom
+                              + ledger_headroom * (n_live - 1);
     if (n_live > 1) {
         constexpr size_t quantum = 64ull * 1024 * 1024;
         size_t va_total = 0;
