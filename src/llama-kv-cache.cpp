@@ -9,7 +9,6 @@
 #include "llama-vram-ledger.h"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -1789,7 +1788,7 @@ llama_kv_cache::vbr_shared_scratch_registration llama_kv_cache::vbr_shared_scrat
 
 void llama_kv_cache::vbr_shared_scratch_visit(
         const std::vector<ggml_type> & terminal_types,
-        uint32_t watermark_cells,
+        const vbr_device_watermarks & terminal_watermarks,
         const vbr_shared_scratch_visitor & visitor) const {
     if (!visitor) {
         return;
@@ -1819,6 +1818,12 @@ void llama_kv_cache::vbr_shared_scratch_visit(
     };
 
     for (const auto & consumer : registry->consumers) {
+        const auto wm = terminal_watermarks.find(consumer.device);
+        if (wm == terminal_watermarks.end()) {
+            throw std::invalid_argument(format(
+                    "shared-KV scratch terminal watermark is missing device %d",
+                    consumer.device));
+        }
         auto it = std::find_if(plans.begin(), plans.end(), [&](const vbr_shared_scratch_plan & p) {
             return p.compute_backend == consumer.compute_backend;
         });
@@ -1852,8 +1857,16 @@ void llama_kv_cache::vbr_shared_scratch_visit(
                 v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
             }
         }
-        it->k_bytes = std::max(it->k_bytes, k_row*(size_t) watermark_cells);
-        it->v_bytes = std::max(it->v_bytes, v_row*(size_t) watermark_cells);
+        const auto scale_row = [&](size_t row) {
+            if (wm->second != 0 && row > SIZE_MAX/(size_t) wm->second) {
+                throw std::overflow_error(format(
+                        "shared-KV scratch terminal size overflows on device %d",
+                        consumer.device));
+            }
+            return row*(size_t) wm->second;
+        };
+        it->k_bytes = std::max(it->k_bytes, scale_row(k_row));
+        it->v_bytes = std::max(it->v_bytes, scale_row(v_row));
     }
 
     // Keep the registry locked through the callback: llama_context's detach guard acquires the
@@ -2086,9 +2099,6 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
-            if (i < vbr_stash_rows_) {
-                vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
-            }
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -2300,28 +2310,15 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
-    auto sinfos = plan_slots(ubatches);
-    if (sinfos.empty()) {
-        return {};
-    }
-
-    return prepare_with_slots(ubatches, std::move(sinfos));
-}
-
-llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
-        const std::vector<llama_ubatch> & ubatches,
-        slot_info_vec_t                   sinfos) {
-    GGML_ASSERT(sinfos.size() == ubatches.size());
-
     vbr_runtime_was_over_ = false;
     // VBR S4 degrade trigger — MUST run at the llama_decode boundary, before any of this batch's
-    // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
+    // cells are positioned. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
     // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
-    // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
-    // the previous batch's writes are visible, and no built-but-unexecuted graphs exist.
-    // prepare_with_slots() is the post-admission choke point both ordinary and iSWA paths use. The
-    // check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers so it
-    // never overruns the budget mid-flight.
+    // rows as zeros and races graphs built against the old tier. Here the previous batch's writes
+    // are complete/visible and no built-but-unexecuted graphs exist. prepare() is the choke point
+    // BOTH paths use (kv_cache::init_batch and llama_memory_hybrid::init_batch call it directly).
+    // The check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers
+    // so it never overruns the budget mid-flight.
     if (vbr_vmm_active()) {
         // Reserve failures are boundary-local. The exact step remains at the cursor and may be
         // retried after another process releases capacity.
@@ -2337,8 +2334,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // P3 idleness input: a boundary IS decode activity; ticks never write this
         vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
-    // one ubatch token sum serves the budget block and the unified scratch projection below;
-    // non-unified scratch uses the planned physical views because their stream span also matters
+    // one ubatch token sum serves both the budget block and the scratch reserve below
     uint32_t n_tokens = 0;
     for (const auto & ub : ubatches) {
         n_tokens += ub.n_tokens;
@@ -2367,19 +2363,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
         // a peer's rename (new claim, offer change) forces the full controller path
         vbr_ledger_precheck();
-        // Compare predicted padded watermarks, not just total occupancy. A high-tail trim can make
-        // shrink or promotion work possible while changing fewer than VBR_USED_DELTA cells (or no
-        // cells at all after sequence redistribution). Consume each decrease exactly once: using a
-        // pool's grow-only wm_cells here would keep the full path hot until the 25% shrink threshold.
-        const uint32_t wm_next = vbr_watermark_cells(n_tokens);
-        const bool wm_receded = wm_next < vbr_last_wm_;
-        const bool reset_due = vbr_degrade_cursor_ > 0 && used_now == 0;
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
-                           !wm_receded && !reset_due &&
                            !vbr_tree_forced());
 
+        // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
+        uint32_t wm_next = 0;
         if (!vbr_stable) {
             // auto budgets track reality: throttle re-derive from live free VRAM — during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
@@ -2404,6 +2394,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             if (vbr_degrade_cursor_ > 0 && used_now == 0) {
                 vbr_full_reset();
             }
+            wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
 
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
@@ -2434,12 +2425,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             }
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                const auto degrade = vbr_degrade_next(wm_next);
-                if (degrade == vbr_degrade_result::reserve_failed) {
-                    vbr_ledger_force_ = true;
-                    return {};
-                }
-                if (degrade == vbr_degrade_result::exhausted) {
+                if (!vbr_degrade_next(wm_next)) {
+                    if (vbr_reserve_failed_) {
+                        LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
+                                "failing this batch recoverably\n", __func__);
+                        // Earlier successful steps in this boundary remain committed until the
+                        // transaction planner replaces this executor. Fence any such side-stream
+                        // waves before returning without a graph to carry the normal fence wait.
+                        vbr_tree_root()->vbr_arm_wave_fences();
+                        return {};
+                    }
                     if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
                         vbr_budget_warned_ = true;
                         size_t projected_total = 0;
@@ -2475,14 +2470,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             if (vbr_tree_forced() ||
                 (vbr_boundary_count_ % 8 == 0 &&
                  llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
-                if (vbr_ledger_scan_service(n_tokens)) {
-                    LLAMA_LOG_ERROR("%s: VBR demand-shed component reserve failed before tier mutation - "
+                vbr_ledger_scan_service(n_tokens);
+                if (vbr_tree_root()->vbr_reserve_failed_) {
+                    LLAMA_LOG_ERROR("%s: VBR demand-shed reserve failed before its tier mutation — "
                             "failing this batch recoverably\n", __func__);
-                    vbr_tree_force();
-                    vbr_arm_wave_fences();
-                    if (vbr_ledger_sibling_ != nullptr) {
-                        vbr_ledger_sibling_->vbr_arm_wave_fences();
-                    }
+                    vbr_tree_root()->vbr_arm_wave_fences();
                     return {};
                 }
             }
@@ -2494,6 +2486,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
             // stable threshold.
+            wm_next = vbr_watermark_cells(n_tokens);
             vbr_quiet_boundaries_++;
         }
         // Every child records at the common post-policy point. Non-roots leave their sample
@@ -2521,7 +2514,6 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // which path ran, so the %8 cadence is real wall-boundary time.
         vbr_boundary_count_++;
         vbr_last_used_ = used_now;
-        vbr_last_wm_ = wm_next;
     }
 
     // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
@@ -2529,34 +2521,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
     if (!vbr_pools_.empty() || !vbr_shared_scratch_bindings_.empty()) {
-        size_t scratch_cells = vbr_watermark_cells(n_tokens);
-        if (n_stream > 1) {
-            // A non-unified graph views K/V as [head_dim, heads, n_kv, stream_span], and the
-            // CUDA materializer flattens all four dimensions into one shared f16 scratch. Predict
-            // the largest flattened view in this batch from the already-planned physical slots.
-            // Keep prior ubatch inserts in the prediction; ignoring a later purge can only make
-            // this an upper bound. Dynamic VBR is forced unified and retains the original path.
-            std::array<uint32_t, LLAMA_MAX_SEQ> used_max_p1 = {};
-            for (uint32_t s = 0; s < n_stream; ++s) {
-                used_max_p1[s] = v_cells[s].used_max_p1();
-            }
-            scratch_cells = 0;
-            const uint32_t n_pad_cur = std::max(n_pad, 256u);
-            for (const auto & sinfo : sinfos) {
-                uint32_t n_kv = 0;
-                for (size_t s = 0; s < sinfo.n_stream(); ++s) {
-                    const uint32_t stream = sinfo.strm[s];
-                    for (const uint32_t idx : sinfo.idxs[s]) {
-                        used_max_p1[stream] = std::max(used_max_p1[stream], idx + 1);
-                    }
-                    n_kv = std::max(n_kv,
-                            std::min(v_cells[stream].size(), GGML_PAD(used_max_p1[stream], n_pad_cur)));
-                }
-                const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
-                scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
-            }
-        }
-        if (!vbr_scratch_reserve(scratch_cells)) {
+        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
             vbr_tree_force(); // same routing as the try_map failure above
@@ -2564,26 +2529,18 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         }
     }
 
-    return sinfos;
-}
-
-llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
-    // Slot selection for later ubatches must observe the metadata changes made by
-    // earlier ones (notably SWA eviction and its contiguous-prefix purge).  Apply
-    // those changes speculatively, journal every cell they can touch, then restore
-    // the exact original metadata before returning the plan.  commit=false keeps
-    // VMM growth and the optional transcode self-test out of this transaction.
     struct state_t {
+        slot_info sinfo; // slot info for the ubatch
+
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
-        std::vector<uint32_t> streams;
-        std::vector<std::vector<uint32_t>> idxs;
-        std::vector<llama_kv_cells> cells;
+
+        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
     };
 
+    // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
-    const bool stash_dirty_old = vbr_stash_dirty_;
 
     bool success = true;
 
@@ -2598,71 +2555,37 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
         // remember the position that we found
         res.push_back(sinfo_new);
 
-        state_t state;
-        state.v_heads_old = v_heads;
+        // store the old state of the cells in the recovery stack
+        {
+            state_t state = { sinfo_new, v_heads, {} };
 
-        // Start with the selected cells themselves.
-        std::map<uint32_t, std::vector<uint32_t>> touched;
-        llama_pos seq_pos_max_rm[LLAMA_MAX_SEQ];
-        std::fill(std::begin(seq_pos_max_rm), std::end(seq_pos_max_rm), -1);
+            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                auto & cells = v_cells[sinfo_new.strm[s]];
 
-        for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-            const uint32_t stream = sinfo_new.strm[s];
-            auto & idxs = touched[stream];
-            idxs.insert(idxs.end(), sinfo_new.idxs[s].begin(), sinfo_new.idxs[s].end());
-
-            const auto & cells = v_cells[stream];
-            for (const uint32_t idx : sinfo_new.idxs[s]) {
-                if (!cells.is_empty(idx)) {
-                    GGML_ASSERT(cells.seq_count(idx) == 1);
-                    const llama_seq_id seq_id = cells.seq_get(idx);
-                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
-                }
-            }
-        }
-
-        // apply_ubatch() also purges an evicted SWA sequence's older prefix.
-        // Include those cells in the journal even when they are outside sinfo.
-        for (uint32_t seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
-            if (seq_pos_max_rm[seq_id] < 0) {
-                continue;
+                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
             }
 
-            GGML_ASSERT(seq_id < seq_to_stream.size());
-            const uint32_t stream = seq_to_stream[seq_id];
-            const auto & cells = v_cells[stream];
-            auto & idxs = touched[stream];
-            for (uint32_t idx = 0; idx < cells.size(); ++idx) {
-                if (cells.pos_in(idx, 0, seq_pos_max_rm[seq_id] + 1) && cells.seq_has(idx, seq_id)) {
-                    idxs.push_back(idx);
-                }
-            }
+            states.push_back(std::move(state));
         }
 
-        for (auto & entry : touched) {
-            auto & idxs = entry.second;
-            std::sort(idxs.begin(), idxs.end());
-            idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
-
-            state.streams.push_back(entry.first);
-            state.idxs.push_back(idxs);
-            state.cells.push_back(v_cells[entry.first].cp(idxs));
-        }
-
-        states.push_back(std::move(state));
-        apply_ubatch(sinfo_new, ubatch, false);
+        // now emplace the ubatch
+        apply_ubatch(sinfo_new, ubatch);
     }
 
     GGML_ASSERT(!states.empty() || !success);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        for (size_t i = 0; i < it->streams.size(); ++i) {
-            v_cells[it->streams[i]].set(it->idxs[i], it->cells[i]);
+        const auto & sinfo = it->sinfo;
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            auto & cells = v_cells[sinfo.strm[s]];
+            auto & head  = v_heads[sinfo.strm[s]];
+
+            cells.set(sinfo.idxs[s], it->v_cells[s]);
+            head = it->v_heads_old[s];
         }
-        v_heads = it->v_heads_old;
     }
-    vbr_stash_dirty_ = stash_dirty_old;
 
     if (!success) {
         return {};
@@ -2951,7 +2874,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -3030,14 +2953,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
     // grow the physical backing first (no-op unless the watermark advanced past a page)
-    if (commit && vbr_vmm_active()) {
+    if (vbr_vmm_active()) {
         vbr_vmm_ensure_mapped();
     }
 
     // Dynamic VBR M3 anchor self-test (env-gated, runs once). Fires from the 2nd apply_ubatch call so
     // a prior attention has identity-init'd the decode-side InnerQ scales the dequant relies on.
     static const bool vbr_test_env = getenv("VBR_TRANSCODE_TEST") != nullptr; // once, not per ubatch
-    if (commit && vbr_test_env) {
+    if (vbr_test_env) {
         static bool vbr_test_armed = false;
         static bool vbr_test_done  = false;
         // apply_ubatch only POSITIONS cells; the K/V write happens in the following graph compute.
@@ -3346,16 +3269,15 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
 }
 
 // #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
-// per-(device, side) f16 scratch to the flattened attended view implicitly, mid-graph: a
-// context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
-// does not own it, and it can JUMP from zero to watermark width in a
+// per-(device, side) f16 scratch to the attended width implicitly, mid-graph — a context-linear
+// consumer the budget doesn't own, and one that can JUMP from zero to watermark width in a
 // single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
 // with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
 // that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
 // symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
 // turbo pools too (bookkeeping-only pools resolve their vtable at init).
-bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
+bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
     for (auto & p : vbr_pools_) {
         if (p.be == nullptr || p.device < 0) {
             continue;
@@ -3382,8 +3304,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             }
             p.scratch_rows_epoch = vbr_tier_epoch_;
         }
-        const size_t k_bytes = p.scratch_k_row * flat_cells;
-        const size_t v_bytes = p.scratch_v_row * flat_cells;
+        const size_t k_bytes = p.scratch_k_row * wm_cells;
+        const size_t v_bytes = p.scratch_v_row * wm_cells;
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
@@ -3427,8 +3349,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             }
             b.rows_epoch = owner_epoch;
         }
-        const size_t k_bytes = b.k_row * flat_cells;
-        const size_t v_bytes = b.v_row * flat_cells;
+        const size_t k_bytes = b.k_row * wm_cells;
+        const size_t v_bytes = b.v_row * wm_cells;
         if ((k_bytes != 0 || v_bytes != 0) &&
             !b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
             // The owner's tier flip may still have old-tier tails queued for release. They
@@ -3568,16 +3490,14 @@ void llama_kv_cache::breathe() {
     vbr_ledger_precheck();
     if (vbr_tree_forced() ||
         llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
-        if (vbr_ledger_scan_service(0)) { // demand waves run band-capped inside
-            // An idle tick has no error return. Preserve the rejected cursor for a later retry,
-            // fence any earlier steps from this pass, and do not promote after a failed reserve.
-            vbr_tree_force();
-            vbr_arm_wave_fences();
-            if (vbr_ledger_sibling_ != nullptr) {
-                vbr_ledger_sibling_->vbr_arm_wave_fences();
-            }
-            return;
-        }
+        vbr_ledger_scan_service(0); // demand waves run band-capped inside
+    }
+    if (root->vbr_reserve_failed_) {
+        // Idle ticks have no error return. Keep the rejected step at its exact cursor and retry on
+        // a future tick; do not promote after a failed reserve. Demand service has already finalized
+        // any grants for earlier committed steps, so arm those steps' waves before returning.
+        root->vbr_arm_wave_fences();
+        return;
     }
     vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
@@ -4147,6 +4067,40 @@ static void vbr_set_tensor_type(ggml_tensor * t, std::vector<ggml_tensor *> & vi
     }
 }
 
+// Transaction apply has crossed its recoverable-preflight boundary.  Update the same canonical,
+// stream-view and tensor-split metadata without constructing the temporary shard-view vector used
+// by the ordinary path.
+static void vbr_set_tensor_type_noalloc(
+        ggml_tensor * t, std::vector<ggml_tensor *> & views, ggml_type type) {
+    vbr_set_tensor_type_impl(t, views, type);
+    if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+        return;
+    }
+    const size_t n = ggml_backend_meta_buffer_n_bufs(t->buffer);
+    for (size_t i = 0; i < n; ++i) {
+        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, i);
+        if (shard == nullptr) {
+            continue;
+        }
+        shard->type  = type;
+        shard->nb[0] = ggml_type_size(type);
+        shard->nb[1] = ggml_row_size(type, shard->ne[0]);
+        shard->nb[2] = shard->nb[1]*shard->ne[1];
+        shard->nb[3] = shard->nb[2]*shard->ne[2];
+        for (ggml_tensor * view : views) {
+            ggml_tensor * shard_view = view != nullptr
+                    ? ggml_backend_meta_buffer_simple_tensor(view, i) : nullptr;
+            if (shard_view != nullptr) {
+                shard_view->type  = type;
+                shard_view->nb[0] = shard->nb[0];
+                shard_view->nb[1] = shard->nb[1];
+                shard_view->nb[2] = shard->nb[2];
+                shard_view->nb[3] = shard->nb[3];
+            }
+        }
+    }
+}
+
 bool llama_kv_cache::vbr_stash_memory(
         const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
         size_t & physical_now, size_t & physical_if_reserved) const {
@@ -4470,7 +4424,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
     return false;
 }
 
-llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
     const size_t cursor_entry = vbr_degrade_cursor_;
     while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
@@ -4537,7 +4491,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
                             "mutation; leaving %s at %s\n", __func__, pending.pool->device,
                             pending.extent->t->name, ggml_type_name(pending.extent->t->type));
-                    return vbr_degrade_result::reserve_failed;
+                    return false;
                 }
             }
         }
@@ -4635,9 +4589,9 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         // are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        return vbr_degrade_result::applied;
+        return true;
     }
-    return vbr_degrade_result::exhausted;
+    return false;
 }
 
 // Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED —
@@ -5262,15 +5216,86 @@ llama_kv_cache::vbr_tree_pool_ref llama_kv_cache::vbr_tree_find_pool(const std::
 
 size_t llama_kv_cache::vbr_child_offer(
         const llama_kv_cache * child, const std::string & busid) const {
-    if (child == nullptr) {
+    const llama_kv_cache * root = vbr_tree_root();
+    if (child == nullptr || child != root) {
         return 0;
     }
-    for (const auto & p : child->vbr_pools_) {
-        if (p.vmm != nullptr && p.busid == busid) {
-            return child->vbr_shed_available(p.device);
-        }
+    return root->vbr_tree_offer(busid);
+}
+
+size_t llama_kv_cache::vbr_tree_offer(const std::string & busid) const {
+    const llama_kv_cache * root_const = vbr_tree_root();
+    const auto suppressed = root_const->vbr_offer_suppressed_until_.find(busid);
+    if (suppressed != root_const->vbr_offer_suppressed_until_.end() &&
+        llama_vram_ledger_now_ns() < suppressed->second) {
+        return 0;
     }
-    return 0;
+    llama_kv_cache * root = const_cast<llama_kv_cache *>(root_const);
+    const auto demanded = root->vbr_tree_find_pool(busid);
+    if (demanded.pool == nullptr) {
+        return 0;
+    }
+
+    vbr_shed_tx tx;
+    tx.demanded_busid = busid;
+    tx.demanded_device = demanded.pool->device;
+    auto append_child = [&](llama_kv_cache * child) {
+        if (child == nullptr || !child->vbr_vmm_active()) {
+            return;
+        }
+        vbr_tx_child state;
+        state.cache = child;
+        state.incoming_wm = child->vbr_watermark_cells(0);
+        state.start_cursor = child->vbr_degrade_cursor_;
+        state.final_cursor = state.start_cursor;
+        state.start_epoch = child->vbr_tier_epoch_;
+        child->vbr_sim_seed(state.types_before, /* pooled_only = */ true,
+                GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
+        state.types_after = state.types_before;
+        tx.children.push_back(std::move(state));
+    };
+    append_child(root);
+    append_child(root->vbr_ledger_sibling_);
+
+    std::vector<llama_vbr_policy::child> policy_children;
+    for (const auto & state : tx.children) {
+        policy_children.push_back(state.cache->vbr_policy_child_stream(
+                tx.demanded_device, state.incoming_wm));
+    }
+    llama_vbr_policy::shortest_prefix_stream stream(std::move(policy_children));
+    uint64_t best = 0;
+    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+        return 0;
+    }
+    const auto note_feasible = [&]() {
+        const auto demanded_cost = tx.devices.find(tx.demanded_device);
+        if (demanded_cost == tx.devices.end() || demanded_cost->second.capacity_signed <= 0) {
+            return;
+        }
+        for (const auto & [device, cost] : tx.devices) {
+            if (device != tx.demanded_device && cost.capacity_signed < 0) {
+                return;
+            }
+        }
+        best = std::max(best, (uint64_t) demanded_cost->second.capacity_signed);
+    };
+    note_feasible();
+    llama_vbr_policy::selection selected;
+    for (;;) {
+        const auto status = stream.next(selected);
+        if (status == llama_vbr_policy::result::exhausted) {
+            break;
+        }
+        if (status != llama_vbr_policy::result::selected) {
+            return 0;
+        }
+        tx.policy_prefix.push_back(selected);
+        if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+            return 0;
+        }
+        note_feasible();
+    }
+    return best > SIZE_MAX ? SIZE_MAX : (size_t) best;
 }
 
 uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
@@ -5579,12 +5604,986 @@ bool llama_kv_cache::vbr_tree_has_grant(const llama_vram_peer_claim & c) const {
     return child_has(root) || child_has(root->vbr_ledger_sibling_);
 }
 
-llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
-                                         const std::vector<llama_vram_peer_claim> & claims,
+bool llama_kv_cache::vbr_tx_settle_tree() {
+    llama_kv_cache * root = vbr_tree_root();
+    auto settle_child = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
+        }
+        child->vbr_flush_deferred_unmaps();
+        for (auto & p : child->vbr_pools_) {
+            if (p.wave_pending) {
+                GGML_ASSERT(p.backend != nullptr);
+                ggml_backend_synchronize(p.backend);
+                p.wave_pending = false;
+            }
+            GGML_ASSERT(p.unmap_deferred.empty());
+        }
+    };
+    settle_child(root);
+    settle_child(root->vbr_ledger_sibling_);
+    root->vbr_grant_pending_clear();
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        root->vbr_ledger_sibling_->vbr_grant_pending_clear();
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
+    tx.steps.clear();
+    tx.endpoints.clear();
+    tx.workspaces.clear();
+    tx.stashes.clear();
+    tx.scratches.clear();
+    tx.devices.clear();
+
+    for (auto & child : tx.children) {
+        child.types_after = child.types_before;
+        child.final_cursor = child.start_cursor;
+    }
+    for (const auto & selected : tx.policy_prefix) {
+        if (selected.child_index >= tx.children.size()) {
+            return false;
+        }
+        auto & child = tx.children[selected.child_index];
+        const auto & policy = selected.value;
+        if (policy.slot >= child.types_after.size() ||
+            child.types_after[policy.slot] != (ggml_type) policy.type_a) {
+            return false;
+        }
+        vbr_tx_step step;
+        step.child_idx = selected.child_index;
+        step.order_idx = policy.order_index;
+        step.slot      = policy.slot;
+        step.ikv       = policy.slot/2;
+        step.is_v      = (policy.slot & 1) != 0;
+        step.type_a    = (ggml_type) policy.type_a;
+        step.type_b    = (ggml_type) policy.type_b;
+        tx.steps.push_back(step);
+        child.types_after[step.slot] = step.type_b;
+        child.final_cursor = step.order_idx + 1;
+    }
+
+    std::map<vbr_tx_extent_key, uint32_t> virtual_stash_valid;
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        for (size_t pi = 0; pi < child->vbr_pools_.size(); ++pi) {
+            auto & p = child->vbr_pools_[pi];
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            const uint32_t terminal_wm = std::max(p.wm_cells, state.incoming_wm);
+            for (size_t ikv = 0; ikv < child->layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    auto & e = side ? p.v[ikv] : p.k[ikv];
+                    if (e.t == nullptr) {
+                        continue;
+                    }
+                    const vbr_tx_extent_key key { ci, pi, ikv, side != 0 };
+                    const size_t slot = ikv*2 + side;
+                    const ggml_type type = state.types_after[slot] != GGML_TYPE_COUNT
+                            ? state.types_after[slot] : e.t->type;
+                    const size_t slot_span = vbr_slot_span(e.t, p.gran);
+                    uint64_t final_span_u64 = 0;
+                    if (!llama_vbr_physical::endpoint_bytes(
+                                ggml_row_size(type, e.t->ne[0]), terminal_wm,
+                                slot_span, p.gran, final_span_u64) || final_span_u64 > SIZE_MAX) {
+                        return false;
+                    }
+                    const size_t final_span = (size_t) final_span_u64;
+
+                    auto baseline_total_it = tx.endpoint_baseline_total.find(key);
+                    if (baseline_total_it == tx.endpoint_baseline_total.end()) {
+                        if (!tx.snapshot_open) {
+                            return false;
+                        }
+                        const uint64_t total = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, slot_span);
+                        baseline_total_it = tx.endpoint_baseline_total.emplace(key, total).first;
+                    }
+                    auto & by_span = tx.endpoint_baseline_inside[key];
+                    auto baseline_inside_it = by_span.find(final_span);
+                    if (baseline_inside_it == by_span.end()) {
+                        if (!tx.snapshot_open) {
+                            return false;
+                        }
+                        const uint64_t inside = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, final_span);
+                        baseline_inside_it = by_span.emplace(final_span, inside).first;
+                    }
+                    const uint64_t baseline_total  = baseline_total_it->second;
+                    const uint64_t baseline_inside = baseline_inside_it->second;
+                    if (baseline_inside > baseline_total || baseline_inside > final_span_u64) {
+                        return false;
+                    }
+
+                    uint64_t gross_release = baseline_total - baseline_inside;
+                    if (actual) {
+                        const uint64_t current_total = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, slot_span);
+                        const uint64_t current_inside = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, final_span);
+                        if (current_inside != final_span_u64 || current_inside > current_total) {
+                            return false;
+                        }
+                        gross_release = current_total - current_inside;
+                    }
+
+                    vbr_tx_endpoint endpoint;
+                    endpoint.key             = key;
+                    endpoint.child           = child;
+                    endpoint.pool            = &p;
+                    endpoint.extent          = &e;
+                    endpoint.device          = p.device;
+                    endpoint.busid           = child->vbr_pool_busid(p);
+                    endpoint.final_span      = final_span;
+                    endpoint.slot_span       = slot_span;
+                    endpoint.baseline_total  = baseline_total;
+                    endpoint.baseline_inside = baseline_inside;
+                    endpoint.gross_release   = gross_release;
+                    endpoint.growth          = final_span_u64 - baseline_inside;
+                    endpoint.live            = p.wm_cells > 0;
+                    tx.endpoints.emplace(key, std::move(endpoint));
+                    virtual_stash_valid[key] = e.stash_valid;
+
+                    auto & cost = tx.devices[p.device];
+                    if (!llama_vbr_transaction::add_u64(
+                                cost.release, baseline_total - baseline_inside) ||
+                        !llama_vbr_transaction::add_u64(
+                                cost.kv_growth, final_span_u64 - baseline_inside)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    for (const auto & step : tx.steps) {
+        llama_kv_cache * child = tx.children[step.child_idx].cache;
+        const auto & units = child->vbr_units_of(step.ikv, step.is_v);
+        for (auto & [pp, ep] : units) {
+            const size_t pi = (size_t) (pp - child->vbr_pools_.data());
+            const vbr_tx_extent_key ekey { step.child_idx, pi, step.ikv, step.is_v };
+            auto endpoint = tx.endpoints.find(ekey);
+            if (endpoint == tx.endpoints.end()) {
+                return false;
+            }
+            endpoint->second.touched = true;
+            if (pp->wm_cells == 0) {
+                continue;
+            }
+
+            const bool capture = child->vbr_stash_rows_ > 0 &&
+                    virtual_stash_valid[ekey] == 0 &&
+                    ggml_is_turbo_kv_type(step.type_a) &&
+                    step.type_a != GGML_TYPE_TURBO8_0;
+            const uint32_t capture_rows = capture
+                    ? std::min(child->vbr_stash_rows_, pp->wm_cells) : 0;
+            const vbr_tx_pool_key pkey { step.child_idx, pi };
+            auto & workspace = tx.workspaces[pkey];
+            workspace.key     = pkey;
+            workspace.be      = pp->be;
+            workspace.backend = pp->backend;
+            workspace.device  = pp->device;
+            workspace.requests.push_back({
+                    (int64_t) pp->wm_cells, ep->t->ne[0], (int64_t) capture_rows });
+            if (capture_rows > 0) {
+                auto & stash = tx.stashes[pkey];
+                stash.key = pkey;
+                stash.device = pp->device;
+                stash.requests.push_back({ ep, capture_rows });
+                virtual_stash_valid[ekey] = capture_rows;
+            }
+        }
+    }
+
+    // Once preflight has landed a persistent component, trimming away the step that requested it
+    // does not return those bytes. Keep every snapshotted group in the actual price and query its
+    // current occupancy even when the candidate prefix now has no request for it.
+    for (const auto & [key, baseline] : tx.workspace_baseline) {
+        GGML_UNUSED(baseline);
+        if (tx.workspaces.count(key) == 0) {
+            auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+            auto & group = tx.workspaces[key];
+            group.key = key;
+            group.be = pool.be;
+            group.backend = pool.backend;
+            group.device = pool.device;
+        }
+    }
+    for (const auto & [key, baseline] : tx.stash_baseline) {
+        GGML_UNUSED(baseline);
+        if (tx.stashes.count(key) == 0) {
+            auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+            auto & group = tx.stashes[key];
+            group.key = key;
+            group.device = pool.device;
+        }
+    }
+
+    for (auto & [key, group] : tx.workspaces) {
+        uint64_t physical_now = 0;
+        uint64_t physical_if_reserved = 0;
+        const auto project = [&](const llama_vbr_transaction::workspace_request & request,
+                                 uint64_t & now, uint64_t & projected) {
+                    size_t now_st = 0;
+                    size_t projected_st = 0;
+                    if (!group.be->kv_transcode_workspace_memory(
+                                group.backend, group.device,
+                                request.n_cells, request.ne0, request.stash_rows,
+                                &now_st, &projected_st)) {
+                        return false;
+                    }
+                    now = now_st;
+                    projected = projected_st;
+                    return true;
+                };
+        bool ok = true;
+        if (group.requests.empty()) {
+            // Zero work is the backend's read-only occupancy query.
+            ok = project({ 0, 1, 0 }, physical_now, physical_if_reserved);
+        } else {
+            ok = llama_vbr_transaction::workspace_endpoint(
+                    group.requests, project, physical_now, physical_if_reserved);
+        }
+        if (!ok) {
+            return false;
+        }
+        auto baseline = tx.workspace_baseline.find(key);
+        if (baseline == tx.workspace_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.workspace_baseline.emplace(key, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        group.physical_now = physical_now;
+        group.physical_projected = endpoint;
+        if (!llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].workspace_growth, endpoint - baseline->second)) {
+            return false;
+        }
+    }
+
+    for (auto & [key, group] : tx.stashes) {
+        auto & child = tx.children[key.child_idx];
+        auto & pool = child.cache->vbr_pools_[key.pool_idx];
+        size_t physical_now = 0;
+        size_t physical_if_reserved = 0;
+        if (!child.cache->vbr_stash_memory(
+                    pool, group.requests, physical_now, physical_if_reserved)) {
+            return false;
+        }
+        auto baseline = tx.stash_baseline.find(key);
+        if (baseline == tx.stash_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.stash_baseline.emplace(key, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        group.physical_now = physical_now;
+        group.physical_projected = endpoint;
+        if (!llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].stash_growth, endpoint - baseline->second)) {
+            return false;
+        }
+    }
+
+    auto query_scratch = [&](vbr_tx_scratch_group & group) {
+        size_t physical_now = 0;
+        size_t physical_if_reserved = 0;
+        group.be->kv_dequant_scratch_memory(
+                group.backend, group.k_need, group.v_need,
+                &physical_now, &physical_if_reserved);
+        auto baseline = tx.scratch_baseline.find(group.backend);
+        if (baseline == tx.scratch_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.scratch_baseline.emplace(group.backend, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        group.physical_now = physical_now;
+        group.physical_projected = endpoint;
+        return true;
+    };
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        for (auto & p : child->vbr_pools_) {
+            if (p.be == nullptr || p.compute_backend == nullptr || p.device < 0) {
+                continue;
+            }
+            size_t k_row = 0;
+            size_t v_row = 0;
+            for (size_t ikv = 0; ikv < child->layers.size(); ++ikv) {
+                const ggml_tensor * tk = p.k[ikv].t;
+                const ggml_tensor * tv = p.v[ikv].t;
+                const ggml_type type_k = state.types_after[ikv*2] != GGML_TYPE_COUNT
+                        ? state.types_after[ikv*2] : (tk ? tk->type : GGML_TYPE_F16);
+                const ggml_type type_v = state.types_after[ikv*2 + 1] != GGML_TYPE_COUNT
+                        ? state.types_after[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
+                if (need_k && tk != nullptr) {
+                    k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv != nullptr) {
+                    v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
+            }
+            const uint32_t terminal_wm = std::max(p.wm_cells, state.incoming_wm);
+            if ((terminal_wm != 0 && k_row > SIZE_MAX/(size_t) terminal_wm) ||
+                (terminal_wm != 0 && v_row > SIZE_MAX/(size_t) terminal_wm)) {
+                return false;
+            }
+            auto & group = tx.scratches[p.compute_backend];
+            if (group.backend == nullptr) {
+                group.be = p.be;
+                group.backend = p.compute_backend;
+                group.device = p.device;
+            } else if (group.be != p.be || group.device != p.device) {
+                return false;
+            }
+            group.k_need = std::max(group.k_need, k_row*(size_t) terminal_wm);
+            group.v_need = std::max(group.v_need, v_row*(size_t) terminal_wm);
+            group.owner_backend = true;
+        }
+    }
+
+    for (auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        if (!query_scratch(group)) {
+            return false;
+        }
+    }
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        vbr_device_watermarks watermarks;
+        for (const auto & p : child->vbr_pools_) {
+            if (p.device >= 0) {
+                auto & wm = watermarks[p.device];
+                wm = std::max(wm, std::max(p.wm_cells, state.incoming_wm));
+            }
+        }
+        bool reverse_ok = true;
+        child->vbr_shared_scratch_visit(
+                state.types_after, watermarks,
+                [&](const vbr_shared_scratch_plan & plan) {
+                    auto & group = tx.scratches[plan.compute_backend];
+                    if (group.backend == nullptr) {
+                        group.be = plan.be;
+                        group.backend = plan.compute_backend;
+                        group.device = plan.device;
+                    } else if (group.be != plan.be || group.device != plan.device) {
+                        reverse_ok = false;
+                        return;
+                    }
+                    group.k_need = std::max(group.k_need, plan.k_bytes);
+                    group.v_need = std::max(group.v_need, plan.v_bytes);
+                    if (!query_scratch(group)) {
+                        reverse_ok = false;
+                    }
+                });
+        if (!reverse_ok) {
+            return false;
+        }
+    }
+
+    for (const auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        const auto baseline = tx.scratch_baseline.find(group.backend);
+        if (baseline == tx.scratch_baseline.end() || group.physical_projected < baseline->second ||
+            !llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].scratch_growth,
+                    group.physical_projected - baseline->second)) {
+            return false;
+        }
+    }
+
+    for (auto & [device, cost] : tx.devices) {
+        GGML_UNUSED(device);
+        if (!llama_vbr_transaction::finalize(cost)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_map_endpoints(vbr_shed_tx & tx) {
+    for (auto & [key, endpoint] : tx.endpoints) {
+        GGML_UNUSED(key);
+        if (endpoint.final_span > 0 &&
+            !endpoint.pool->be->vmm_pool_map(
+                    endpoint.pool->vmm, endpoint.extent->byte_off, endpoint.final_span)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_preflight(vbr_shed_tx & tx) {
+    tx.snapshot_open = false;
+    for (auto & [key, group] : tx.workspaces) {
+        auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+        if (pool.backend == nullptr) {
+            pool.backend = pool.be->backend_init(pool.device);
+            if (pool.backend == nullptr) {
+                return false;
+            }
+        }
+        group.backend = pool.backend;
+    }
+    for (auto & [key, group] : tx.workspaces) {
+        GGML_UNUSED(key);
+        for (const auto & request : group.requests) {
+            if (!group.be->kv_transcode_workspace_reserve(
+                        group.backend, request.n_cells, request.ne0, request.stash_rows)) {
+                return false;
+            }
+        }
+    }
+    for (auto & [key, group] : tx.stashes) {
+        auto & child = tx.children[key.child_idx];
+        auto & pool = child.cache->vbr_pools_[key.pool_idx];
+        if (!child.cache->vbr_stash_reserve(pool, group.requests)) {
+            return false;
+        }
+    }
+
+    for (auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        if (group.owner_backend &&
+            !group.be->kv_dequant_scratch_reserve(
+                    group.backend, group.k_need, group.v_need)) {
+            return false;
+        }
+    }
+    for (auto & state : tx.children) {
+        vbr_device_watermarks watermarks;
+        for (const auto & p : state.cache->vbr_pools_) {
+            if (p.device >= 0) {
+                auto & wm = watermarks[p.device];
+                wm = std::max(wm, std::max(p.wm_cells, state.incoming_wm));
+            }
+        }
+        bool reserved = true;
+        state.cache->vbr_shared_scratch_visit(
+                state.types_after, watermarks,
+                [&](const vbr_shared_scratch_plan & plan) {
+                    if (reserved && !plan.be->kv_dequant_scratch_reserve(
+                                plan.compute_backend, plan.k_bytes, plan.v_bytes)) {
+                        reserved = false;
+                    }
+                });
+        if (!reserved) {
+            return false;
+        }
+    }
+    if (!vbr_tx_map_endpoints(tx)) {
+        return false;
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_prepare_commit(
+        vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
+    tx.gross_by_pool.clear();
+    tx.deferred_by_pool.clear();
+    tx.planned_grants.clear();
+    tx.planned_grants.reserve(tx.endpoints.size());
+    std::map<vbr_tx_pool_key, size_t> tail_counts;
+
+    for (const auto & [key, endpoint] : tx.endpoints) {
+        const vbr_tx_pool_key pkey { key.child_idx, key.pool_idx };
+        const uint64_t baseline_release = endpoint.baseline_total - endpoint.baseline_inside;
+        if (!llama_vbr_transaction::add_u64(tx.gross_by_pool[pkey], baseline_release)) {
+            return false;
+        }
+        if (endpoint.gross_release > 0 && endpoint.final_span < endpoint.slot_span &&
+            endpoint.touched && endpoint.live) {
+            tail_counts[pkey]++;
+            if (!llama_vbr_transaction::add_u64(
+                        tx.deferred_by_pool[pkey], endpoint.gross_release)) {
+                return false;
+            }
+        }
+    }
+    for (const auto & [pkey, count] : tail_counts) {
+        auto & pool = tx.children[pkey.child_idx].cache->vbr_pools_[pkey.pool_idx];
+        if (count > SIZE_MAX - pool.unmap_deferred.size()) {
+            return false;
+        }
+        pool.unmap_deferred.reserve(pool.unmap_deferred.size() + count);
+    }
+
+    uint64_t prior_credit = 0;
+    for (const auto & child : tx.children) {
+        for (const auto & row : child.cache->vbr_grants_) {
+            if (!row.collateral && row.busid == c.busid && row.pid == c.pid &&
+                row.starttime == c.starttime && row.ver == c.fields.ver &&
+                !llama_vbr_transaction::add_u64(prior_credit, row.bytes)) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<size_t> grant_counts(tx.children.size(), 0);
+    for (const auto & [device, cost] : tx.devices) {
+        if (cost.capacity_signed < 0) {
+            return false;
+        }
+        uint64_t credit = (uint64_t) cost.capacity_signed;
+        if (device == tx.demanded_device) {
+            credit = std::min(credit, tx.target);
+        }
+        if (credit == 0) {
+            continue;
+        }
+
+        uint64_t gross_device = 0;
+        std::vector<std::pair<vbr_tx_pool_key, uint64_t>> releasing;
+        releasing.reserve(tx.gross_by_pool.size());
+        for (const auto & [pkey, gross] : tx.gross_by_pool) {
+            auto & pool = tx.children[pkey.child_idx].cache->vbr_pools_[pkey.pool_idx];
+            if (pool.device == device && gross > 0) {
+                releasing.push_back({ pkey, gross });
+                if (!llama_vbr_transaction::add_u64(gross_device, gross)) {
+                    return false;
+                }
+            }
+        }
+        if (gross_device == 0) {
+            return false;
+        }
+
+        uint64_t assigned = 0;
+        for (size_t i = 0; i < releasing.size(); ++i) {
+            const auto [pkey, gross] = releasing[i];
+            uint64_t share = 0;
+            if (i + 1 == releasing.size()) {
+                share = credit - assigned;
+            } else {
+#ifdef _MSC_VER
+                share = (uint64_t) ((double) credit * gross / gross_device);
+#else
+                share = (uint64_t) ((__uint128_t) credit * gross / gross_device);
+#endif
+            }
+            assigned += share;
+            if (share == 0) {
+                continue;
+            }
+            llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+            auto & pool = child->vbr_pools_[pkey.pool_idx];
+            vbr_tx_grant_plan plan;
+            plan.child_idx = pkey.child_idx;
+            plan.row.busid              = c.busid;
+            plan.row.pid                = c.pid;
+            plan.row.starttime          = c.starttime;
+            plan.row.ver                = c.fields.ver;
+            plan.row.pool_idx           = pkey.pool_idx;
+            plan.row.bytes              = share;
+            plan.row.collateral         = child->vbr_pool_busid(pool) != c.busid;
+            plan.row.bytes_now_at_grant = c.bytes_now;
+            if (!plan.row.collateral) {
+                if (!llama_vbr_transaction::grant_threshold(
+                            c.bytes_now, prior_credit, plan.row.bytes_now_at_grant) ||
+                    !llama_vbr_transaction::add_u64(prior_credit, share)) {
+                    return false;
+                }
+            }
+            tx.planned_grants.push_back(std::move(plan));
+            grant_counts[pkey.child_idx]++;
+        }
+        if (assigned != credit) {
+            return false;
+        }
+    }
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & grants = tx.children[ci].cache->vbr_grants_;
+        if (grant_counts[ci] > SIZE_MAX - grants.size()) {
+            return false;
+        }
+        grants.reserve(grants.size() + grant_counts[ci]);
+    }
+    for (const auto & [pkey, pending] : tx.deferred_by_pool) {
+        llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+        auto & pool = child->vbr_pools_[pkey.pool_idx];
+        uint64_t & current = child->vbr_grant_pending_[child->vbr_pool_busid(pool)];
+        if (pending > UINT64_MAX - current) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_tx_suppress(const std::string & busid) {
+    llama_kv_cache * root = vbr_tree_root();
+    constexpr uint64_t retry_ns = 1000000000ull;
+    root->vbr_offer_suppressed_until_[busid] = llama_vram_ledger_now_ns() + retry_ns;
+    auto invalidate = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
+        }
+        child->shed_avail_epoch_ = ~0ull;
+        child->vbr_shed_projection_.tier_epoch = ~0ull;
+        for (auto & p : child->vbr_pools_) {
+            p.budget_eff_stamp = ~0ull;
+        }
+    };
+    invalidate(root);
+    invalidate(root->vbr_ledger_sibling_);
+    root->vbr_ledger_force_ = true;
+}
+
+bool llama_kv_cache::vbr_tx_publish_zero_intent(const vbr_shed_tx & tx) {
+    llama_kv_cache * root = vbr_tree_root();
+    std::set<std::string> busids;
+    for (const auto & [device, cost] : tx.devices) {
+        GGML_UNUSED(cost);
+        for (auto & child : tx.children) {
+            for (auto & p : child.cache->vbr_pools_) {
+                if (p.vmm != nullptr && p.device == device &&
+                    child.cache->vbr_pool_busid(p) != "-") {
+                    busids.insert(p.busid);
+                }
+            }
+        }
+    }
+    for (const auto & busid : busids) {
+        uint64_t pending = root->vbr_grant_pending_[busid];
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            if (UINT64_MAX - pending < root->vbr_ledger_sibling_->vbr_grant_pending_[busid]) {
+                return false;
+            }
+            pending += root->vbr_ledger_sibling_->vbr_grant_pending_[busid];
+        }
+        llama_vram_marker_fields f = {};
+        f.vbr = 1;
+        f.serviced = llama_vram_marker_serviced_flag() ? 1u : 0u;
+        f.shed_available = 0;
+        // Withdraw only the new offer.  A prior committed wave may still own a bridge until its
+        // deferred tails flush; replacing that with zero would let another donor under-shed.
+        f.grant_pending = pending;
+        uint64_t created_ts = 0;
+        if (!llama_vram_marker_publish(busid, f, &created_ts)) {
+            // The substrate may have completed the rename and then failed to reopen the new path.
+            // Forget every affected cache entry so the next pass republishes instead of beating a
+            // stale/unlinked descriptor; earlier successful zero-intent writes remain safe.
+            for (const auto & affected : busids) {
+                root->vbr_marker_pub_.erase(affected);
+                root->vbr_tx_suppress(affected);
+            }
+            return false;
+        }
+        root->vbr_marker_pub_[busid] = { 0, pending };
+        root->vbr_marker_created_ts_[busid] = created_ts;
+        root->vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
+    GGML_UNUSED(c);
+    for (const auto & state : tx.children) {
+        GGML_ASSERT(state.cache->vbr_degrade_cursor_ == state.start_cursor);
+        GGML_ASSERT(state.cache->vbr_tier_epoch_ == state.start_epoch);
+        for (size_t ikv = 0; ikv < state.cache->layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const ggml_type expected = state.types_before[ikv*2 + side];
+                const ggml_tensor * tensor = side
+                        ? state.cache->layers[ikv].v : state.cache->layers[ikv].k;
+                if (expected != GGML_TYPE_COUNT) {
+                    GGML_ASSERT(tensor != nullptr && tensor->type == expected);
+                }
+            }
+        }
+    }
+    for (const auto & step : tx.steps) {
+        auto & child_state = tx.children[step.child_idx];
+        llama_kv_cache * child = child_state.cache;
+        GGML_ASSERT(step.ikv < child->layers.size());
+        ggml_tensor * canonical = step.is_v
+                ? child->layers[step.ikv].v : child->layers[step.ikv].k;
+        GGML_ASSERT(canonical != nullptr && canonical->type == step.type_a);
+
+        const auto & units = child->vbr_units_of(step.ikv, step.is_v);
+        for (auto & [pp, ep] : units) {
+            const size_t pi = (size_t) (pp - child->vbr_pools_.data());
+            const vbr_tx_extent_key key { step.child_idx, pi, step.ikv, step.is_v };
+            const auto endpoint = tx.endpoints.find(key);
+            GGML_ASSERT(endpoint != tx.endpoints.end());
+            GGML_ASSERT(pp->be->vmm_pool_mapped_in_range(
+                    pp->vmm, ep->byte_off, endpoint->second.final_span) ==
+                    endpoint->second.final_span);
+
+            const int64_t n_cells = pp->wm_cells;
+            if (n_cells <= 0) {
+                continue;
+            }
+            GGML_ASSERT(pp->backend != nullptr);
+            if (!pp->wave_pending) {
+                pp->be->sync_device(pp->device);
+            }
+
+            const bool capture = child->vbr_stash_rows_ > 0 && ep->stash_valid == 0 &&
+                    ggml_is_turbo_kv_type(step.type_a) &&
+                    step.type_a != GGML_TYPE_TURBO8_0;
+            const uint32_t capture_rows = capture
+                    ? std::min(child->vbr_stash_rows_, pp->wm_cells) : 0;
+            const void * stash_ptr = nullptr;
+            int64_t stash_rows = 0;
+            if (capture_rows > 0) {
+                GGML_ASSERT(pp->stash_vmm != nullptr);
+                char * base = (char *) pp->be->vmm_pool_base(pp->stash_vmm);
+                pp->be->kv_stash_capture(
+                        pp->backend, ep->t, base + ep->stash_off,
+                        capture_rows, step.is_v);
+                ep->stash_valid = capture_rows;
+            }
+            if (ep->stash_valid > 0 && pp->stash_vmm != nullptr) {
+                stash_ptr = (char *) pp->be->vmm_pool_base(pp->stash_vmm) + ep->stash_off;
+                stash_rows = ep->stash_valid;
+            }
+
+            const vbr_span span = vbr_span_of(
+                    ep->t, step.type_b, n_cells,
+                    std::max(pp->wm_cells, child_state.incoming_wm), pp->gran);
+            const size_t r_a = ggml_row_size(step.type_a, ep->t->ne[0]);
+            const size_t mapped_hi = std::min(
+                    span.slot, (size_t) GGML_PAD(r_a*(size_t) n_cells, pp->gran));
+            const size_t scrub_end = std::min(
+                    mapped_hi, (size_t) GGML_PAD(span.keep_live, pp->gran));
+            GGML_ASSERT(scrub_end >= span.keep);
+            const ggml_vbr_transcode_params params = {
+                /* .src         =*/ ep->t,
+                /* .type_B      =*/ step.type_b,
+                /* .dst         =*/ ep->t->data,
+                /* .pool_buf    =*/ pp->buf,
+                /* .n_cells     =*/ n_cells,
+                /* .is_v        =*/ step.is_v,
+                /* .stash_f16   =*/ stash_ptr,
+                /* .stash_rows  =*/ stash_rows,
+                /* .scrub_bytes =*/ scrub_end - span.keep,
+            };
+            pp->be->kv_transcode(pp->backend, &params);
+            pp->wave_pending = true;
+        }
+
+        vbr_set_tensor_type_noalloc(
+                canonical,
+                step.is_v ? child->layers[step.ikv].v_stream
+                          : child->layers[step.ikv].k_stream,
+                step.type_b);
+        child->vbr_degrade_cursor_ = step.order_idx + 1;
+        child->vbr_tier_epoch_++;
+        child->vbr_quiet_boundaries_ = 0;
+    }
+
+    for (auto & [key, endpoint] : tx.endpoints) {
+        GGML_UNUSED(key);
+        if (endpoint.gross_release == 0 || endpoint.final_span >= endpoint.slot_span) {
+            continue;
+        }
+        const size_t off = endpoint.extent->byte_off + endpoint.final_span;
+        const size_t len = endpoint.slot_span - endpoint.final_span;
+        if (endpoint.touched && endpoint.live) {
+            endpoint.pool->unmap_deferred.push_back({ off, len });
+        } else {
+            endpoint.pool->be->vmm_pool_unmap(endpoint.pool->vmm, off, len);
+        }
+    }
+
+    for (auto & state : tx.children) {
+        llama_kv_cache * child = state.cache;
+        child->vbr_degrade_cursor_ = state.final_cursor;
+        for (auto & p : child->vbr_pools_) {
+            if (p.vmm != nullptr) {
+                p.wm_cells = std::max(p.wm_cells, state.incoming_wm);
+                p.budget_eff_stamp = ~0ull;
+                p.scratch_rows_epoch = ~0ull;
+            }
+        }
+        child->shed_avail_epoch_ = ~0ull;
+        child->vbr_shed_projection_.tier_epoch = ~0ull;
+    }
+
+    for (auto & plan : tx.planned_grants) {
+        tx.children[plan.child_idx].cache->vbr_grants_.push_back(std::move(plan.row));
+    }
+
+    for (const auto & [pkey, pending] : tx.deferred_by_pool) {
+        if (pending == 0) {
+            continue;
+        }
+        llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+        auto & pool = child->vbr_pools_[pkey.pool_idx];
+        uint64_t & current = child->vbr_grant_pending_[child->vbr_pool_busid(pool)];
+        GGML_ASSERT(pending <= UINT64_MAX - current);
+        current += pending;
+    }
+    for (auto & state : tx.children) {
+        state.cache->vbr_apply_grant_decrements();
+    }
+}
+
+llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
+        const llama_vram_peer_claim & c, uint64_t target, uint32_t n_tokens) {
+    vbr_tx_result result;
+    if (target == 0) {
+        return result;
+    }
+    llama_kv_cache * root = vbr_tree_root();
+    const auto demanded = root->vbr_tree_find_pool(c.busid);
+    if (demanded.pool == nullptr) {
+        return result;
+    }
+    if (!root->vbr_tx_settle_tree()) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+
+    vbr_shed_tx tx;
+    tx.demanded_busid = c.busid;
+    tx.demanded_device = demanded.pool->device;
+    tx.target = target;
+    auto append_child = [&](llama_kv_cache * child) {
+        if (child == nullptr || !child->vbr_vmm_active()) {
+            return;
+        }
+        vbr_tx_child state;
+        state.cache = child;
+        state.incoming_wm = child->vbr_watermark_cells(n_tokens);
+        state.start_cursor = child->vbr_degrade_cursor_;
+        state.final_cursor = state.start_cursor;
+        state.start_epoch = child->vbr_tier_epoch_;
+        child->vbr_sim_seed(state.types_before, /* pooled_only = */ true,
+                GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
+        state.types_after = state.types_before;
+        tx.children.push_back(std::move(state));
+    };
+    append_child(root);
+    append_child(root->vbr_ledger_sibling_);
+    if (tx.children.empty()) {
+        return result;
+    }
+
+    std::vector<llama_vbr_policy::child> policy_children;
+    policy_children.reserve(tx.children.size());
+    for (const auto & state : tx.children) {
+        policy_children.push_back(state.cache->vbr_policy_child_stream(
+                tx.demanded_device, state.incoming_wm));
+    }
+
+    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    bool planned = llama_vbr_transaction::prefix_feasible(
+            tx.devices, tx.demanded_device, tx.target);
+    if (!planned) {
+        llama_vbr_policy::shortest_prefix_stream stream(std::move(policy_children));
+        std::vector<llama_vbr_policy::selection> prefix;
+        const auto selected = stream.shortest_prefix(
+                [&](const std::vector<llama_vbr_policy::selection> & candidate) {
+                    tx.policy_prefix = candidate;
+                    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+                        return false;
+                    }
+                    return llama_vbr_transaction::prefix_feasible(
+                            tx.devices, tx.demanded_device, tx.target);
+                }, prefix);
+        if (selected != llama_vbr_policy::result::selected) {
+            return result;
+        }
+        tx.policy_prefix = std::move(prefix);
+        planned = true;
+    }
+    GGML_ASSERT(planned);
+
+    if (!root->vbr_tx_preflight(tx) ||
+        !root->vbr_tx_reprice(tx, /* actual = */ true) ||
+        !llama_vbr_transaction::prefix_feasible(
+                tx.devices, tx.demanded_device, tx.target)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+
+    while (!tx.policy_prefix.empty()) {
+        const auto removed = tx.policy_prefix.back();
+        tx.policy_prefix.pop_back();
+        if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+            tx.policy_prefix.push_back(removed);
+            GGML_ASSERT(root->vbr_tx_reprice(tx, /* actual = */ true));
+            break;
+        }
+        if (!root->vbr_tx_map_endpoints(tx)) {
+            tx.policy_prefix.push_back(removed);
+            if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+                !llama_vbr_transaction::prefix_feasible(
+                        tx.devices, tx.demanded_device, tx.target)) {
+                root->vbr_tx_suppress(c.busid);
+                result.status = vbr_tx_status::retryable_no_tier_mutation;
+                return result;
+            }
+            break;
+        }
+        if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+            !llama_vbr_transaction::prefix_feasible(
+                    tx.devices, tx.demanded_device, tx.target)) {
+            tx.policy_prefix.push_back(removed);
+            if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+                !llama_vbr_transaction::prefix_feasible(
+                        tx.devices, tx.demanded_device, tx.target)) {
+                root->vbr_tx_suppress(c.busid);
+                result.status = vbr_tx_status::retryable_no_tier_mutation;
+                return result;
+            }
+            break;
+        }
+    }
+
+    if (!root->vbr_tx_prepare_commit(tx, c) ||
+        !root->vbr_tx_publish_zero_intent(tx)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    const auto demanded_cost = tx.devices.find(tx.demanded_device);
+    GGML_ASSERT(demanded_cost != tx.devices.end() && demanded_cost->second.capacity_signed >= 0);
+    result.credited = std::min<uint64_t>(
+            tx.target, (uint64_t) demanded_cost->second.capacity_signed);
+    root->vbr_tx_apply(tx, c);
+    root->vbr_offer_suppressed_until_.erase(c.busid);
+    result.status = vbr_tx_status::committed;
+    return result;
+}
+
+bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
                                          const std::vector<llama_vram_peer_marker> & peers,
                                          const std::set<std::string> & announced,
                                          uint64_t now, uint32_t n_tokens) {
-    vbr_demand_service_result result;
+    bool grants_changed = false;
     // ---- demand service: rank-0 shed sizing ----
     // one band per donor per session-generation is enforced by the band cursor itself
     // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
@@ -5669,134 +6668,23 @@ llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
         const uint64_t shortfall = c.fields.bytes_total_remaining_est - covered;
         const uint64_t target    = std::min<uint64_t>(our_offer + sib_offer, shortfall);
 
-        // parent-level iSWA servicing: the SUM of both children's offers backed the
-        // sufficiency above; split the target by offer weight (footprint-proportional —
-        // the offer IS the freeable footprint) and let each child shed its own portion
-        // with its own grants, decrements and pending. Non-iSWA: sibling is null and the
-        // whole target is ours.
-        // (our_offer + sib_offer > 0 guaranteed by the continue above)
-#ifdef _MSC_VER
-        const uint64_t own_target = (uint64_t) ((double) target * our_offer / (our_offer + sib_offer));
-#else
-        const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
-#endif
-        const vbr_shed_result own = root->vbr_execute_shed(
-                c, own_target, root->vbr_watermark_cells(n_tokens));
-        result.grants_changed = result.grants_changed || own.freed > 0;
-        if (own.reserve_failed) {
-            result.reserve_failed = true;
+        // One root-owned transaction interleaves the children by the existing pure quality
+        // policy, then prices every physical device before changing either child's tier state.
+        const vbr_tx_result shed = root->vbr_execute_tree_shed(c, target, n_tokens);
+        if (shed.status == vbr_tx_status::committed) {
+            grants_changed = true;
+            LLAMA_LOG_INFO("%s: atomic VBR tree shed for pid %d on %s: %.1f MiB net credit\n",
+                    __func__, c.pid, c.busid.c_str(), shed.credited/1048576.0);
+            // One physical wave per scan.  Its pending bridge must be published and its tails
+            // flushed before another claim is sized from free memory and exact residency.
+            break;
+        } else if (shed.status == vbr_tx_status::retryable_no_tier_mutation) {
+            // Donation is optional.  Its bool-returning reserve failure withdrew this donor's
+            // offer without changing tiers; it must not fail the resident's otherwise-valid batch.
             break;
         }
-        if (root->vbr_ledger_sibling_ != nullptr && own.freed < target) {
-            const vbr_shed_result sibling =
-                    root->vbr_ledger_sibling_->vbr_execute_shed(
-                            c, target - own.freed,
-                            root->vbr_ledger_sibling_->vbr_watermark_cells(n_tokens));
-            if (sibling.reserve_failed) {
-                result.reserve_failed = true;
-                break;
-            }
-            result.grants_changed = result.grants_changed || sibling.freed > 0;
-        }
     }
-    return result;
-}
-
-// execute a demand shed of up to `target` bytes for claim c: band/consent-capped degrade
-// waves, one grant row per pool the wave freed bytes in (collateral on non-demanded
-// devices), grant_pending on each affected device's marker. Runs after the pool's own
-// degrade loop at a boundary; the caller's fence-arm covers the queued waves. Returns
-// the bytes freed on the DEMANDED device plus whether a required component reserve rejected a step.
-llama_kv_cache::vbr_shed_result llama_kv_cache::vbr_execute_shed(
-        const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
-    vbr_shed_result result;
-    if (target == 0) {
-        return result;
-    }
-    vbr_pool * demanded_pool = vbr_find_pool(c.busid);
-    if (demanded_pool == nullptr) {
-        return result;
-    }
-    std::vector<size_t> proj_before(vbr_pools_.size(), 0);
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        if (vbr_pools_[pi].vmm != nullptr) {
-            proj_before[pi] = vbr_vmm_projected_bytes(vbr_pools_[pi], wm_next);
-        }
-    }
-    const size_t band_limit = vbr_demand_limit();
-    size_t freed_demanded = 0;
-    while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
-        const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
-        if (degrade == vbr_degrade_result::reserve_failed) {
-            result.reserve_failed = true;
-            break;
-        }
-        if (degrade == vbr_degrade_result::exhausted) {
-            break;
-        }
-        vbr_quiet_boundaries_ = 0;
-        freed_demanded = proj_before[demanded_pool - vbr_pools_.data()]
-                       - vbr_vmm_projected_bytes(*demanded_pool, wm_next);
-    }
-    bool changed = false;
-
-    // A tree wave can create several non-collateral rows for one demanded device (multiple
-    // pools, or base + SWA).  Stagger their bytes_now baselines by the live credit already ahead
-    // of them so one landed byte amortizes the aggregate liability exactly once, not once per row.
-    uint64_t prior_credit = 0;
-    const auto saturating_add = [](uint64_t a, uint64_t b) {
-        return b > UINT64_MAX - a ? UINT64_MAX : a + b;
-    };
-    llama_kv_cache * root = vbr_tree_root();
-    auto add_existing_credit = [&](const llama_kv_cache * child) {
-        if (child == nullptr) {
-            return;
-        }
-        for (const auto & g : child->vbr_grants_) {
-            if (!g.collateral && g.busid == c.busid && g.pid == c.pid &&
-                g.starttime == c.starttime && g.ver == c.fields.ver) {
-                prior_credit = saturating_add(prior_credit, g.bytes);
-            }
-        }
-    };
-    add_existing_credit(root);
-    add_existing_credit(root->vbr_ledger_sibling_);
-
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        auto & p = vbr_pools_[pi];
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        const size_t proj_now = vbr_vmm_projected_bytes(p, wm_next);
-        if (proj_now >= proj_before[pi]) {
-            continue;
-        }
-        const uint64_t freed = proj_before[pi] - proj_now;
-        vbr_grant_row g;
-        g.busid              = c.busid;
-        g.pid                = c.pid;
-        g.starttime          = c.starttime;
-        g.ver                = c.fields.ver;
-        g.pool_idx           = pi;
-        g.bytes              = freed;
-        g.collateral         = vbr_pool_busid(p) != c.busid;
-        g.bytes_now_at_grant = g.collateral ? c.bytes_now
-                                             : saturating_add(c.bytes_now, prior_credit);
-        if (!g.collateral) {
-            prior_credit = saturating_add(prior_credit, freed);
-        }
-        vbr_grants_.push_back(std::move(g));
-        changed = true;
-        vbr_grant_pending_[vbr_pool_busid(p)] += freed;
-        LLAMA_LOG_INFO("%s: co-tenancy shed for pid %d on %s: %.1f MiB freed from pool #%zu%s\n",
-                __func__, c.pid, c.busid.c_str(), freed/1048576.0, pi,
-                g.collateral ? " (collateral)" : "");
-    }
-    if (changed) {
-        vbr_apply_grant_decrements(); // sibling-hosted grants decrement sibling budgets
-    }
-    result.freed = freed_demanded;
-    return result;
+    return grants_changed;
 }
 
 void llama_kv_cache::vbr_grant_pending_clear() {
@@ -5835,14 +6723,27 @@ void llama_kv_cache::vbr_markers_publish(std::set<std::string> * changed) {
     collect_child(this);
     collect_child(vbr_ledger_sibling_);
     for (const auto & busid : busids) {
-        uint64_t offer = 0;
-        if (!vbr_tree_budget_explicit()) {
-            offer = (uint64_t) vbr_child_offer(this, busid) +
-                    (uint64_t) vbr_child_offer(vbr_ledger_sibling_, busid);
-        }
         uint64_t pending = vbr_grant_pending_[busid];
         if (vbr_ledger_sibling_ != nullptr) {
             pending += vbr_ledger_sibling_->vbr_grant_pending_[busid];
+        }
+        const auto child_busy = [&](const llama_kv_cache * child) {
+            if (child == nullptr) {
+                return false;
+            }
+            for (const auto & p : child->vbr_pools_) {
+                if (p.vmm != nullptr && p.busid == busid &&
+                    (p.wave_pending || !p.unmap_deferred.empty())) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool tree_busy = child_busy(this) || child_busy(vbr_ledger_sibling_);
+        uint64_t offer = 0;
+        if (!vbr_tree_budget_explicit() && pending == 0 && !tree_busy) {
+            offer = (uint64_t) vbr_child_offer(this, busid) +
+                    (uint64_t) vbr_child_offer(vbr_ledger_sibling_, busid);
         }
         auto pub = vbr_marker_pub_.find(busid);
         if (pub == vbr_marker_pub_.end() || pub->second.first != offer || pub->second.second != pending) {
@@ -5867,20 +6768,23 @@ void llama_kv_cache::vbr_markers_publish(std::set<std::string> * changed) {
     }
 }
 
-bool llama_kv_cache::vbr_ledger_scan_service(uint32_t n_tokens) {
+void llama_kv_cache::vbr_ledger_scan_service(uint32_t n_tokens) {
     // explicit budgets still run the pass — they publish markers (shed_available = 0,
     // demand service skipped) so the demander's presence census stays complete
     if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
-        return false;
+        return;
     }
     vbr_ledger_force_ = false;
     vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
 
     const uint64_t now = vbr_last_scan_ns_;
 
-    // The boundary/tick already flushed the preceding wave. Retire its pending bridge,
-    // then announce the current offer before taking the rank snapshot. A changed advert
-    // waits one scan; the post-service publish below exposes the handoff immediately.
+    // The root-owned offer is page-exact only against a settled tree.  A current boundary may
+    // already have queued an ordinary budget wave on either child, so retire both children before
+    // querying ranges or publishing capacity.  This rare scan path deliberately pays the sync.
+    vbr_tx_settle_tree();
+    // Retire the pending bridge, then announce the current offer before taking the rank snapshot.
+    // A changed advert waits one scan; the post-service publish exposes the handoff immediately.
     vbr_grant_pending_clear();
     std::set<std::string> announced;
     vbr_markers_publish(&announced);
@@ -5900,14 +6804,11 @@ bool llama_kv_cache::vbr_ledger_scan_service(uint32_t n_tokens) {
         }
         vbr_ledger_sibling_->vbr_grant_pending_clear();
     }
-    const vbr_demand_service_result serviced =
-            vbr_service_demands(claims, peers, announced, now, n_tokens);
-    grants_changed = serviced.grants_changed || grants_changed;
+    grants_changed = vbr_service_demands(claims, peers, announced, now, n_tokens) || grants_changed;
     if (grants_changed) {
         vbr_apply_grant_decrements();
     }
     vbr_markers_publish();
-    return serviced.reserve_failed;
 }
 
 void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,

@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 #include "llama-vbr-policy.h"
+#include "llama-vbr-transaction.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
@@ -12,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -220,14 +222,17 @@ public:
         size_t v_bytes = 0;
     };
     using vbr_shared_scratch_visitor = std::function<void(const vbr_shared_scratch_plan &)>;
+    using vbr_device_watermarks = std::map<int, uint32_t>;
 
     // Visit one plan per distinct live consumer compute backend. `terminal_types` is indexed
     // like vbr_floor_sim_result::end_types; an empty vector (or GGML_TYPE_COUNT slot) uses the
-    // tensor's live type. The registry lock remains held through each callback, so a drafter's
-    // context-teardown detach cannot return and free the backend while it is being queried.
+    // tensor's live type. `terminal_watermarks` must name every registered consumer device;
+    // device-local endpoints may differ after partial pool growth. The registry lock remains held
+    // through each callback, so a drafter's context-teardown detach cannot return and free the
+    // backend while it is being queried.
     void vbr_shared_scratch_visit(
             const std::vector<ggml_type> & terminal_types,
-            uint32_t watermark_cells,
+            const vbr_device_watermarks & terminal_watermarks,
             const vbr_shared_scratch_visitor & visitor) const;
 
     void vbr_shared_scratch_detach() override;
@@ -292,15 +297,6 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    // Side-effect-free admission preflight.  iSWA uses this to prove that both
-    // child caches can place the whole batch before either child enters prepare().
-    slot_info_vec_t plan_slots(const std::vector<llama_ubatch> & ubatches);
-
-    // Complete preparation using a slot plan produced by plan_slots().
-    slot_info_vec_t prepare_with_slots(
-            const std::vector<llama_ubatch> & ubatches,
-            slot_info_vec_t                   sinfos);
-
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -309,8 +305,7 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    // commit=false is used only by plan_slots() to suppress non-metadata side effects
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
     //
     // input API
@@ -579,15 +574,10 @@ private:
     void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
-    bool   vbr_ledger_scan_service(uint32_t n_tokens); // true = component reserve failed
+    void   vbr_ledger_scan_service(uint32_t n_tokens); // composes the four phases below
     void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
     bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
-    struct vbr_demand_service_result {
-        bool grants_changed = false;
-        bool reserve_failed = false;
-    };
-    vbr_demand_service_result vbr_service_demands(
-                               const std::vector<llama_vram_peer_claim> & claims,
+    bool   vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
                                const std::vector<llama_vram_peer_marker> & peers,
                                const std::set<std::string> & announced,
                                uint64_t now, uint32_t n_tokens);
@@ -601,11 +591,15 @@ private:
     const std::string & vbr_pool_busid(vbr_pool & p) const;
 
 public:
-    struct vbr_shed_result {
-        size_t freed          = 0;
-        bool   reserve_failed = false;
+    enum class vbr_tx_status {
+        no_capacity,
+        retryable_no_tier_mutation,
+        committed,
     };
-    vbr_shed_result vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
+    struct vbr_tx_result {
+        vbr_tx_status status = vbr_tx_status::no_capacity;
+        uint64_t credited = 0;
+    };
 private:
     bool vbr_ledger_owner_ = true;
     llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
@@ -623,7 +617,131 @@ private:
     };
     vbr_tree_pool_ref vbr_tree_find_pool(const std::string & busid);
     size_t vbr_child_offer(const llama_kv_cache * child, const std::string & busid) const;
+    size_t vbr_tree_offer(const std::string & busid) const;
     bool   vbr_tree_has_grant(const llama_vram_peer_claim & c) const;
+    struct vbr_stash_request {
+        const vbr_extent * extent = nullptr;
+        uint32_t           rows   = 0;
+    };
+
+    struct vbr_tx_extent_key {
+        size_t child_idx = 0;
+        size_t pool_idx  = 0;
+        size_t ikv       = 0;
+        bool   is_v      = false;
+        bool operator<(const vbr_tx_extent_key & other) const {
+            return std::tie(child_idx, pool_idx, ikv, is_v) <
+                   std::tie(other.child_idx, other.pool_idx, other.ikv, other.is_v);
+        }
+    };
+    struct vbr_tx_pool_key {
+        size_t child_idx = 0;
+        size_t pool_idx  = 0;
+        bool operator<(const vbr_tx_pool_key & other) const {
+            return std::tie(child_idx, pool_idx) < std::tie(other.child_idx, other.pool_idx);
+        }
+    };
+    struct vbr_tx_child {
+        llama_kv_cache * cache = nullptr;
+        uint32_t incoming_wm = 0;
+        size_t start_cursor = 0;
+        size_t final_cursor = 0;
+        uint64_t start_epoch = 0;
+        std::vector<ggml_type> types_before;
+        std::vector<ggml_type> types_after;
+    };
+    struct vbr_tx_step {
+        size_t child_idx = 0;
+        size_t order_idx = 0;
+        size_t slot = 0;
+        size_t ikv = 0;
+        bool is_v = false;
+        ggml_type type_a = GGML_TYPE_COUNT;
+        ggml_type type_b = GGML_TYPE_COUNT;
+    };
+    struct vbr_tx_endpoint {
+        vbr_tx_extent_key key;
+        llama_kv_cache * child = nullptr;
+        vbr_pool * pool = nullptr;
+        vbr_extent * extent = nullptr;
+        int device = -1;
+        std::string busid;
+        size_t final_span = 0;
+        size_t slot_span = 0;
+        uint64_t baseline_total = 0;
+        uint64_t baseline_inside = 0;
+        uint64_t gross_release = 0;
+        uint64_t growth = 0;
+        bool touched = false;
+        bool live = false;
+    };
+    struct vbr_tx_workspace_group {
+        vbr_tx_pool_key key;
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t backend = nullptr;
+        int device = -1;
+        std::vector<llama_vbr_transaction::workspace_request> requests;
+        uint64_t physical_now = 0;
+        uint64_t physical_projected = 0;
+    };
+    struct vbr_tx_stash_group {
+        vbr_tx_pool_key key;
+        int device = -1;
+        std::vector<vbr_stash_request> requests;
+        uint64_t physical_now = 0;
+        uint64_t physical_projected = 0;
+    };
+    struct vbr_tx_scratch_group {
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t backend = nullptr;
+        int device = -1;
+        size_t k_need = 0;
+        size_t v_need = 0;
+        uint64_t physical_now = 0;
+        uint64_t physical_projected = 0;
+        bool owner_backend = false;
+    };
+    struct vbr_tx_grant_plan {
+        size_t child_idx = 0;
+        vbr_grant_row row;
+    };
+    struct vbr_shed_tx {
+        std::string demanded_busid;
+        int demanded_device = -1;
+        uint64_t target = 0;
+        std::vector<vbr_tx_child> children;
+        std::vector<llama_vbr_policy::selection> policy_prefix;
+        std::vector<vbr_tx_step> steps;
+        std::map<vbr_tx_extent_key, vbr_tx_endpoint> endpoints;
+        std::map<vbr_tx_pool_key, vbr_tx_workspace_group> workspaces;
+        std::map<vbr_tx_pool_key, vbr_tx_stash_group> stashes;
+        std::map<ggml_backend_t, vbr_tx_scratch_group> scratches;
+        std::map<int, llama_vbr_transaction::device_cost> devices;
+        std::map<vbr_tx_extent_key, uint64_t> endpoint_baseline_total;
+        std::map<vbr_tx_extent_key, std::map<size_t, uint64_t>> endpoint_baseline_inside;
+        std::map<vbr_tx_pool_key, uint64_t> workspace_baseline;
+        std::map<vbr_tx_pool_key, uint64_t> stash_baseline;
+        std::map<ggml_backend_t, uint64_t> scratch_baseline;
+        std::map<vbr_tx_pool_key, uint64_t> gross_by_pool;
+        std::map<vbr_tx_pool_key, uint64_t> deferred_by_pool;
+        std::vector<vbr_tx_grant_plan> planned_grants;
+        bool snapshot_open = true;
+    };
+    bool vbr_tx_settle_tree();
+    bool vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const;
+    bool vbr_tx_preflight(vbr_shed_tx & tx);
+    bool vbr_tx_map_endpoints(vbr_shed_tx & tx);
+    bool vbr_tx_prepare_commit(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
+    bool vbr_tx_publish_zero_intent(const vbr_shed_tx & tx);
+    void vbr_tx_apply(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
+    void vbr_tx_suppress(const std::string & busid);
+    vbr_tx_result vbr_execute_tree_shed(
+            const llama_vram_peer_claim & c, uint64_t target, uint32_t n_tokens);
+
+    // A failed bool-returning reserve temporarily withdraws this device's offer.  The bound is
+    // short enough to retry after another donor releases pages, but prevents every scan from
+    // selecting the same allocator-constrained resident first.
+    mutable std::map<std::string, uint64_t> vbr_offer_suppressed_until_;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
@@ -647,7 +765,6 @@ private:
     size_t   vbr_pool_reach(const vbr_pool & p) const;
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
-    uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
     void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
@@ -657,7 +774,7 @@ private:
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
-    bool     vbr_scratch_reserve(size_t flat_cells);  // #88: boundary-time f16 dequant scratch grow
+    bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     vbr_shed_pool_projection vbr_project_pool(
             size_t pool_idx,
             const std::vector<ggml_type> & terminal_types,
@@ -666,10 +783,6 @@ private:
     // Pure, allocator-blind child stream for a future tree transaction.  It derives real steps
     // only through vbr_sim_step(), and is intentionally not wired into the live executor yet.
     llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
-    struct vbr_stash_request {
-        const vbr_extent * extent = nullptr;
-        uint32_t           rows   = 0;
-    };
     // Pure physical projection for any set of captures in one pool. The first usable capture
     // requires the complete tightly-packed slab, matching the old allocation's fidelity lifetime;
     // current occupancy includes pages retained by earlier failed maps.
@@ -700,8 +813,7 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    enum class vbr_degrade_result { applied, exhausted, reserve_failed };
-    vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
+    bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)
 
