@@ -1769,6 +1769,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            if (i < vbr_stash_rows_) {
+                vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
+            }
             if (new_head == cells.size()) {
                 new_head = i;
             }
