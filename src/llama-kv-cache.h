@@ -482,10 +482,15 @@ private:
     void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
-    void   vbr_ledger_scan_service(uint32_t wm_next); // composes the four phases below
+    bool   vbr_ledger_scan_service(uint32_t wm_next); // true = component reserve failed
     void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
     bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
-    bool   vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+    struct vbr_demand_service_result {
+        bool grants_changed = false;
+        bool reserve_failed = false;
+    };
+    vbr_demand_service_result vbr_service_demands(
+                               const std::vector<llama_vram_peer_claim> & claims,
                                const std::vector<llama_vram_peer_marker> & peers,
                                uint64_t now, uint32_t wm_next);
     void   vbr_grant_pending_clear();
@@ -505,7 +510,11 @@ public:
     // scan, serve, or publish themselves.
     void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
     void vbr_set_ledger_sibling(llama_kv_cache * sib) { vbr_ledger_sibling_ = sib; }
-    size_t vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
+    struct vbr_shed_result {
+        size_t freed          = 0;
+        bool   reserve_failed = false;
+    };
+    vbr_shed_result vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
 private:
     bool vbr_ledger_owner_ = true;
     llama_kv_cache * vbr_ledger_sibling_ = nullptr;
@@ -561,7 +570,8 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
+    enum class vbr_degrade_result { applied, exhausted, reserve_failed };
+    vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)
 

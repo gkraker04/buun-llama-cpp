@@ -2108,7 +2108,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             }
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                if (!vbr_degrade_next(wm_next)) {
+                const auto degrade = vbr_degrade_next(wm_next);
+                if (degrade == vbr_degrade_result::reserve_failed) {
+                    vbr_ledger_force_ = true;
+                    return {};
+                }
+                if (degrade == vbr_degrade_result::exhausted) {
                     if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
                         vbr_budget_warned_ = true;
                         size_t projected_total = 0;
@@ -2145,7 +2150,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             if (vbr_ledger_force_ ||
                 (vbr_boundary_count_ % 8 == 0 &&
                  llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
-                vbr_ledger_scan_service(wm_next);
+                if (vbr_ledger_scan_service(wm_next)) {
+                    LLAMA_LOG_ERROR("%s: VBR demand-shed component reserve failed before tier mutation - "
+                            "failing this batch recoverably\n", __func__);
+                    vbr_ledger_force_ = true;
+                    vbr_arm_wave_fences();
+                    if (vbr_ledger_sibling_ != nullptr) {
+                        vbr_ledger_sibling_->vbr_arm_wave_fences();
+                    }
+                    return {};
+                }
             }
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
@@ -3050,7 +3064,16 @@ void llama_kv_cache::breathe() {
     vbr_ledger_precheck();
     if (vbr_ledger_force_ ||
         llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
-        vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+        if (vbr_ledger_scan_service(wm_next)) { // demand waves run band-capped inside
+            // An idle tick has no error return. Preserve the rejected cursor for a later retry,
+            // fence any earlier steps from this pass, and do not promote after a failed reserve.
+            vbr_ledger_force_ = true;
+            vbr_arm_wave_fences();
+            if (vbr_ledger_sibling_ != nullptr) {
+                vbr_ledger_sibling_->vbr_arm_wave_fences();
+            }
+            return;
+        }
     }
     vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
@@ -3791,9 +3814,9 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
     return false;
 }
 
-bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+    const size_t cursor_entry = vbr_degrade_cursor_;
     while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
-        const size_t step_cursor = vbr_degrade_cursor_;
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
 
         const auto it = map_layer_ids.find(st.il);
@@ -3822,7 +3845,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             }
         }
 
-        // The stash is optional, but its first allocation must succeed before this step queues
+        // When configured, the stash's first allocation must succeed before this step queues
         // a transcode, defers an unmap, or flips tier metadata.  A nullable backend allocation
         // therefore rejects the entire step at this boundary; retry it after pressure clears.
         if (vbr_stash_rows_ > 0) {
@@ -3836,9 +3859,15 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                     GGML_ASSERT(pp->backend != nullptr);
                 }
                 if (vbr_stash_ensure(*pp) == nullptr) {
-                    vbr_degrade_cursor_ = step_cursor;
+                    // Restore the call-entry cursor so retry observes the same logical ladder
+                    // operation, including any no-op entries skipped while finding this step.
+                    // Stash buffers allocated successfully for earlier pools stay cached for retry.
+                    vbr_degrade_cursor_ = cursor_entry;
+                    LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
+                            "mutation; leaving %s at %s\n", __func__, pp->device,
+                            ep->t->name, ggml_type_name(ep->t->type));
                     vbr_arm_wave_fences();
-                    return false;
+                    return vbr_degrade_result::reserve_failed;
                 }
             }
         }
@@ -3934,9 +3963,9 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        return true;
+        return vbr_degrade_result::applied;
     }
-    return false;
+    return vbr_degrade_result::exhausted;
 }
 
 // Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED —
@@ -4634,10 +4663,11 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
     return grants_changed;
 }
 
-bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+llama_kv_cache::vbr_demand_service_result llama_kv_cache::vbr_service_demands(
+                                         const std::vector<llama_vram_peer_claim> & claims,
                                          const std::vector<llama_vram_peer_marker> & peers,
                                          uint64_t now, uint32_t wm_next) {
-    bool grants_changed = false;
+    vbr_demand_service_result result;
     // ---- demand service: rank-0 shed sizing ----
     // one band per donor per session-generation is enforced by the band cursor itself
     // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
@@ -4735,27 +4765,38 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
 #else
         const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
 #endif
-        size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
-        grants_changed = grants_changed || freed_own > 0;
-        if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
-            vbr_ledger_sibling_->vbr_execute_shed(c, target - freed_own, wm_next);
+        const vbr_shed_result own = vbr_execute_shed(c, own_target, wm_next);
+        result.grants_changed = result.grants_changed || own.freed > 0;
+        if (own.reserve_failed) {
+            result.reserve_failed = true;
+            break;
+        }
+        if (vbr_ledger_sibling_ != nullptr && own.freed < target) {
+            const vbr_shed_result sibling =
+                    vbr_ledger_sibling_->vbr_execute_shed(c, target - own.freed, wm_next);
+            if (sibling.reserve_failed) {
+                result.reserve_failed = true;
+                break;
+            }
         }
     }
-    return grants_changed;
+    return result;
 }
 
 // execute a demand shed of up to `target` bytes for claim c: band/consent-capped degrade
 // waves, one grant row per pool the wave freed bytes in (collateral on non-demanded
 // devices), grant_pending on each affected device's marker. Runs after the pool's own
 // degrade loop at a boundary; the caller's fence-arm covers the queued waves. Returns
-// the bytes freed on the DEMANDED device.
-size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
+// the bytes freed on the DEMANDED device plus whether a required component reserve rejected a step.
+llama_kv_cache::vbr_shed_result llama_kv_cache::vbr_execute_shed(
+        const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
+    vbr_shed_result result;
     if (target == 0) {
-        return 0;
+        return result;
     }
     vbr_pool * demanded_pool = vbr_find_pool(c.busid);
     if (demanded_pool == nullptr) {
-        return 0;
+        return result;
     }
     std::vector<size_t> proj_before(vbr_pools_.size(), 0);
     for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
@@ -4766,7 +4807,12 @@ size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_
     const size_t band_limit = vbr_demand_limit();
     size_t freed_demanded = 0;
     while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
-        if (!vbr_degrade_next(wm_next)) {
+        const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
+        if (degrade == vbr_degrade_result::reserve_failed) {
+            result.reserve_failed = true;
+            break;
+        }
+        if (degrade == vbr_degrade_result::exhausted) {
             break;
         }
         vbr_quiet_boundaries_ = 0;
@@ -4803,7 +4849,8 @@ size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_
     if (changed) {
         vbr_apply_grant_decrements(); // sibling-hosted grants decrement sibling budgets
     }
-    return freed_demanded;
+    result.freed = freed_demanded;
+    return result;
 }
 
 void llama_kv_cache::vbr_grant_pending_clear() {
@@ -4864,11 +4911,11 @@ void llama_kv_cache::vbr_markers_publish(uint64_t now) {
     }
 }
 
-void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
+bool llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     // explicit budgets still run the pass — they publish markers (shed_available = 0,
     // demand service skipped) so the demander's presence census stays complete
     if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
-        return;
+        return false;
     }
     vbr_ledger_force_ = false;
     vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
@@ -4889,12 +4936,14 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
         vbr_ledger_sibling_->vbr_grant_pending_clear();
     }
-    grants_changed = vbr_service_demands(claims, peers, now, wm_next) || grants_changed;
+    const vbr_demand_service_result serviced = vbr_service_demands(claims, peers, now, wm_next);
+    grants_changed = serviced.grants_changed || grants_changed;
     if (grants_changed) {
         vbr_apply_grant_decrements();
     }
     vbr_grant_pending_clear();
     vbr_markers_publish(now);
+    return serviced.reserve_failed;
 }
 
 void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
