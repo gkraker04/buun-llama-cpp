@@ -377,8 +377,8 @@ private:
         char *                base    = nullptr; // ggml_backend_buffer_get_base(buf)
         size_t                size    = 0;        // total pool bytes
         size_t                used    = 0;        // high-water of placed extents (log-only)
-        size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
-        size_t                budget_base = 0;      // init-armed/fallback share: the re-derivation floor
+        size_t                budget  = 0;         // current per-pool mapped-physical budget
+        size_t                budget_base = 0;      // explicit arm or floor-layout share: re-derivation floor
         // vbr_budget_eff memo: one live free-VRAM query per pool per boundary (the degrade loop
         // and promote hysteresis both consult it repeatedly within one boundary)
         mutable uint64_t      budget_eff_stamp = ~0ull;

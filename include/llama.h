@@ -372,7 +372,7 @@ extern "C" {
         double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps when re-deriving
-                                          // an AUTO budget upward at decode boundaries (0 = 1 GiB default)
+                                          // an AUTO budget at decode boundaries (0 = 1 GiB default)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

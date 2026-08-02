@@ -42,7 +42,7 @@ struct llama_memory_vbr_params {
     // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
     bool     min_bits_explicit = false;
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
-    // (an auto budget floats within [armed value, live reach] at decode boundaries)
+    // (an auto budget floats within [floor-layout cost, live reach] at decode boundaries)
     bool     budget_explicit = false;
     // free-VRAM headroom kept when re-deriving an auto budget (0 = 1 GiB default; the fit
     // passes its --fit-target so startup and runtime encode the same worst case)

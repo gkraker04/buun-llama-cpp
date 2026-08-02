@@ -1539,11 +1539,16 @@ llama_kv_cache::llama_kv_cache(
                     const auto share_of = [&](size_t total) {
                         return n_vmm == 1 ? total : (size_t) ((double) total * ((double) p.size / (double) total_va));
                     };
+                    const size_t floor_share = share_of(vbr_floor_cost_bytes_);
                     if (budget_fit_armed) {
-                        p.budget      = share_of(vbr_budget_bytes_);
-                        p.budget_base = p.budget; // re-derivation floor: never below the armed value
+                        p.budget = share_of(vbr_budget_bytes_);
+                        // An explicit scalar is a hard per-pool cap after proportional splitting.
+                        // An auto scalar only proves aggregate capacity: fit sums device-local
+                        // allowances, while VA-proportional splitting can move that capacity onto
+                        // another device. Let live per-device re-derivation correct that split, but
+                        // never below the pool's share of the advertised floor-layout cost.
+                        p.budget_base = vbr_budget_explicit_ ? p.budget : floor_share;
                     } else {
-                        const size_t floor_share = share_of(vbr_floor_cost_bytes_);
                         p.budget      = std::max(vbr_pool_reach(p), floor_share);
                         p.budget_base = floor_share;
                         derived_total += p.budget;
@@ -3288,8 +3293,9 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 // gigabytes free. Once per boundary, re-derive each pool's budget from what its device can
 // actually give it: share x (mapped + free − growth_headroom), quantized to 64 MiB so driver
 // jitter cannot move a tier decision between identical runs, RE-DERIVED not max-ratcheted (a
-// sawtooth co-tenant's trough must not be captured as permanent), floored at the init-armed
-// value (never stingier than startup), and never touched at all for explicit budgets. Throttled
+// sawtooth co-tenant's trough must not be captured as permanent), floored at the pool's
+// floor-layout cost for auto budgets (or the init-armed value for explicit budgets), and never
+// touched at all for explicit budgets. Throttled
 // by the caller (see prepare()); vbr_boundary_count_ is advanced there, not here.
 size_t llama_kv_cache::vbr_pool_reach(const vbr_pool & p) const {
     constexpr size_t quantum = 64ull * 1024 * 1024;
