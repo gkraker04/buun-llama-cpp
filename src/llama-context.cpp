@@ -644,6 +644,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // Context teardown is a terminal lifecycle boundary. Drain pending decode work while both the
+    // scheduler and memory tree are still alive, so deferred VBR work reaches its normal fence.
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
