@@ -773,6 +773,7 @@ private:
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
+    bool     vbr_retire_pending_before_unmap(const std::string & busid);
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     vbr_shed_pool_projection vbr_project_pool(

@@ -3514,14 +3514,84 @@ void llama_kv_cache::breathe() {
 // finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
+bool llama_kv_cache::vbr_retire_pending_before_unmap(const std::string & busid) {
+    auto pending_it = vbr_grant_pending_.find(busid);
+    if (pending_it == vbr_grant_pending_.end() || pending_it->second == 0) {
+        return true;
+    }
+
+    // A pending grant bridges the interval between committing a shed and making its deferred
+    // pages visible in cudaMemGetInfo(). Retire the bridge while those pages are still mapped;
+    // doing this after the unmap lets a peer count the same bytes once as free and once as pending.
+    // If publication fails, retain both the pages and the local liability for a forced retry.
+    if (!llama_vram_ledger_armed() || busid == "-") {
+        pending_it->second = 0;
+        return true;
+    }
+
+    llama_kv_cache * root = vbr_tree_root();
+    uint64_t remaining = 0;
+    const auto add_child = [&](const llama_kv_cache * child) {
+        if (child == nullptr || child == this) {
+            return;
+        }
+        const auto it = child->vbr_grant_pending_.find(busid);
+        if (it != child->vbr_grant_pending_.end()) {
+            GGML_ASSERT(it->second <= UINT64_MAX - remaining);
+            remaining += it->second;
+        }
+    };
+    add_child(root);
+    add_child(root->vbr_ledger_sibling_);
+
+    llama_vram_marker_fields f = {};
+    f.vbr            = 1;
+    f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
+    f.shed_available = 0;
+    f.grant_pending  = remaining;
+    uint64_t created_ts = 0;
+    if (!llama_vram_marker_publish(busid, f, &created_ts)) {
+        // A rename may have succeeded before reopening the replacement failed and unlinked it.
+        // Forget the cached publication so the forced retry recreates a truthful marker rather
+        // than heartbeat-writing the old, now unlinked descriptor.
+        root->vbr_marker_pub_.erase(busid);
+        root->vbr_tx_suppress(busid);
+        return false;
+    }
+
+    pending_it->second = 0;
+    root->vbr_marker_pub_[busid] = { 0, remaining };
+    root->vbr_marker_created_ts_[busid] = created_ts;
+    root->vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+    return true;
+}
+
 size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
     size_t flushed = 0;
+
+    // Synchronize every affected side stream before withdrawing any bridge. Once a marker says
+    // the bytes are no longer pending, keep the publication-to-unmap interval host-local and
+    // contain no further GPU waits.
     for (auto & p : vbr_pools_) {
         if (p.unmap_deferred.empty()) {
             continue;
         }
         GGML_ASSERT(p.backend != nullptr); // entries are only queued after async work on it
         ggml_backend_synchronize(p.backend);
+    }
+
+    std::set<std::string> blocked;
+    for (auto & p : vbr_pools_) {
+        if (!p.unmap_deferred.empty() && blocked.count(vbr_pool_busid(p)) == 0 &&
+            !vbr_retire_pending_before_unmap(vbr_pool_busid(p))) {
+            blocked.insert(vbr_pool_busid(p));
+        }
+    }
+
+    for (auto & p : vbr_pools_) {
+        if (p.unmap_deferred.empty() || blocked.count(vbr_pool_busid(p)) != 0) {
+            continue;
+        }
         for (const auto & [off, len] : p.unmap_deferred) {
             p.be->vmm_pool_unmap(p.vmm, off, len);
         }
@@ -5608,7 +5678,7 @@ bool llama_kv_cache::vbr_tx_settle_tree() {
     llama_kv_cache * root = vbr_tree_root();
     auto settle_child = [](llama_kv_cache * child) {
         if (child == nullptr) {
-            return;
+            return true;
         }
         child->vbr_flush_deferred_unmaps();
         for (auto & p : child->vbr_pools_) {
@@ -5617,16 +5687,19 @@ bool llama_kv_cache::vbr_tx_settle_tree() {
                 ggml_backend_synchronize(p.backend);
                 p.wave_pending = false;
             }
-            GGML_ASSERT(p.unmap_deferred.empty());
+            if (!p.unmap_deferred.empty()) {
+                return false;
+            }
         }
+        return true;
     };
-    settle_child(root);
-    settle_child(root->vbr_ledger_sibling_);
+    const bool root_settled = settle_child(root);
+    const bool sibling_settled = settle_child(root->vbr_ledger_sibling_);
     root->vbr_grant_pending_clear();
     if (root->vbr_ledger_sibling_ != nullptr) {
         root->vbr_ledger_sibling_->vbr_grant_pending_clear();
     }
-    return true;
+    return root_settled && sibling_settled;
 }
 
 bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
