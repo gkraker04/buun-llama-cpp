@@ -20,6 +20,14 @@ typedef struct {
     const float * vval;   // [v_live * max_c]
 } ggml_meansub_entry;
 
+// Before adding a baked affine-tap table, verify that the model has no learned attention sinks.
+// K centering shifts only real-token logits, while a learned sink logit is inserted separately;
+// V restoration likewise assumes the real-token attention weights sum to one. Supporting sinks
+// requires an explicit sink-aware attention contract, not merely another calibrated mean table.
+// Also verify the V-mean coordinate contract when head_dim is not a multiple of 128 and there is
+// more than one KV head: encode calibration uses padded per-head rows, while graph restoration
+// currently expands the table with compact kv_head*head_dim coordinates. The baked models below
+// have aligned head dimensions; a padded-head model needs that mismatch fixed before adding it.
 #include "ggml-turbo-meansub-data.inc"   // defines g_meansub_table[] + g_meansub_count
 
 static char g_arch[64] = {0};
