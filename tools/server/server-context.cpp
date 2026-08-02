@@ -1094,6 +1094,10 @@ private:
 
     llama_context * create_mtp_context() {
         auto cparams = common_context_params_to_llama(params_base);
+        // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
+        // realized target width here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
+        // when the fitted target is much smaller.
+        cparams.n_ctx         = llama_n_ctx_seq(ctx_tgt);
         cparams.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k        = params_base.speculative.draft.cache_type_k;
         cparams.type_v        = params_base.speculative.draft.cache_type_v;
