@@ -8,6 +8,7 @@
 #include "llama-vram-ledger.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -2012,7 +2013,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // P3 idleness input: a boundary IS decode activity; ticks never write this
         vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
-    // one ubatch token sum serves both the budget block and the scratch reserve below
+    // one ubatch token sum serves the budget block and the unified scratch projection below;
+    // non-unified scratch uses the planned physical views because their stream span also matters
     uint32_t n_tokens = 0;
     for (const auto & ub : ubatches) {
         n_tokens += ub.n_tokens;
@@ -2185,7 +2187,34 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
     if (!vbr_pools_.empty()) {
-        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
+        size_t scratch_cells = vbr_watermark_cells(n_tokens);
+        if (n_stream > 1) {
+            // A non-unified graph views K/V as [head_dim, heads, n_kv, stream_span], and the
+            // CUDA materializer flattens all four dimensions into one shared f16 scratch. Predict
+            // the largest flattened view in this batch from the already-planned physical slots.
+            // Keep prior ubatch inserts in the prediction; ignoring a later purge can only make
+            // this an upper bound. Dynamic VBR is forced unified and retains the original path.
+            std::array<uint32_t, LLAMA_MAX_SEQ> used_max_p1 = {};
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                used_max_p1[s] = v_cells[s].used_max_p1();
+            }
+            scratch_cells = 0;
+            const uint32_t n_pad_cur = std::max(n_pad, 256u);
+            for (const auto & sinfo : sinfos) {
+                uint32_t n_kv = 0;
+                for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+                    const uint32_t stream = sinfo.strm[s];
+                    for (const uint32_t idx : sinfo.idxs[s]) {
+                        used_max_p1[stream] = std::max(used_max_p1[stream], idx + 1);
+                    }
+                    n_kv = std::max(n_kv,
+                            std::min(v_cells[stream].size(), GGML_PAD(used_max_p1[stream], n_pad_cur)));
+                }
+                const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
+                scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
+            }
+        }
+        if (!vbr_scratch_reserve(scratch_cells)) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
             vbr_ledger_force_ = true; // same routing as the try_map failure above
@@ -2849,15 +2878,16 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
 }
 
 // #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
-// per-(device, side) f16 scratch to the attended width implicitly, mid-graph — a context-linear
-// consumer the budget doesn't own, and one that can JUMP from zero to watermark width in a
+// per-(device, side) f16 scratch to the flattened attended view implicitly, mid-graph: a
+// context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
+// does not own it, and it can JUMP from zero to watermark width in a
 // single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
 // with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
 // that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
 // symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
 // turbo pools too (bookkeeping-only pools resolve their vtable at init).
-bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
+bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
     for (auto & p : vbr_pools_) {
         if (p.be == nullptr || p.device < 0) {
             continue;
@@ -2884,8 +2914,8 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
             }
             p.scratch_rows_epoch = vbr_tier_epoch_;
         }
-        const size_t k_bytes = p.scratch_k_row * wm_cells;
-        const size_t v_bytes = p.scratch_v_row * wm_cells;
+        const size_t k_bytes = p.scratch_k_row * flat_cells;
+        const size_t v_bytes = p.scratch_v_row * flat_cells;
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
