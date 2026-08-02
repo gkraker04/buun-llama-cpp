@@ -255,6 +255,15 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // Side-effect-free admission preflight.  iSWA uses this to prove that both
+    // child caches can place the whole batch before either child enters prepare().
+    slot_info_vec_t plan_slots(const std::vector<llama_ubatch> & ubatches);
+
+    // Complete preparation using a slot plan produced by plan_slots().
+    slot_info_vec_t prepare_with_slots(
+            const std::vector<llama_ubatch> & ubatches,
+            slot_info_vec_t                   sinfos);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -263,7 +272,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // commit=false is used only by plan_slots() to suppress non-metadata side effects
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
 
     //
     // input API

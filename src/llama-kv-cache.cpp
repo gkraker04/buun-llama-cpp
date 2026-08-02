@@ -1980,14 +1980,27 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    auto sinfos = plan_slots(ubatches);
+    if (sinfos.empty()) {
+        return {};
+    }
+
+    return prepare_with_slots(ubatches, std::move(sinfos));
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
+        const std::vector<llama_ubatch> & ubatches,
+        slot_info_vec_t                   sinfos) {
+    GGML_ASSERT(sinfos.size() == ubatches.size());
+
     // VBR S4 degrade trigger — MUST run at the llama_decode boundary, before any of this batch's
-    // cells are positioned. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
+    // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
     // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
-    // rows as zeros and races graphs built against the old tier. Here the previous batch's writes
-    // are complete/visible and no built-but-unexecuted graphs exist. prepare() is the choke point
-    // BOTH paths use (kv_cache::init_batch and llama_memory_hybrid::init_batch call it directly).
-    // The check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers
-    // so it never overruns the budget mid-flight.
+    // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
+    // the previous batch's writes are visible, and no built-but-unexecuted graphs exist.
+    // prepare_with_slots() is the post-admission choke point both ordinary and iSWA paths use. The
+    // check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers so it
+    // never overruns the budget mid-flight.
     if (vbr_vmm_active()) {
         // S5: release the tail pages queued by the PREVIOUS wave first — their transcodes are long
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
@@ -2177,18 +2190,26 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
     }
 
+    return sinfos;
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    // Slot selection for later ubatches must observe the metadata changes made by
+    // earlier ones (notably SWA eviction and its contiguous-prefix purge).  Apply
+    // those changes speculatively, journal every cell they can touch, then restore
+    // the exact original metadata before returning the plan.  commit=false keeps
+    // VMM growth and the optional transcode self-test out of this transaction.
     struct state_t {
-        slot_info sinfo; // slot info for the ubatch
-
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
-
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<uint32_t> streams;
+        std::vector<std::vector<uint32_t>> idxs;
+        std::vector<llama_kv_cells> cells;
     };
 
-    // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+    const bool stash_dirty_old = vbr_stash_dirty_;
 
     bool success = true;
 
@@ -2203,37 +2224,71 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // remember the position that we found
         res.push_back(sinfo_new);
 
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
+        state_t state;
+        state.v_heads_old = v_heads;
 
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
+        // Start with the selected cells themselves.
+        std::map<uint32_t, std::vector<uint32_t>> touched;
+        llama_pos seq_pos_max_rm[LLAMA_MAX_SEQ];
+        std::fill(std::begin(seq_pos_max_rm), std::end(seq_pos_max_rm), -1);
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+        for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+            const uint32_t stream = sinfo_new.strm[s];
+            auto & idxs = touched[stream];
+            idxs.insert(idxs.end(), sinfo_new.idxs[s].begin(), sinfo_new.idxs[s].end());
+
+            const auto & cells = v_cells[stream];
+            for (const uint32_t idx : sinfo_new.idxs[s]) {
+                if (!cells.is_empty(idx)) {
+                    GGML_ASSERT(cells.seq_count(idx) == 1);
+                    const llama_seq_id seq_id = cells.seq_get(idx);
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
+                }
             }
-
-            states.push_back(std::move(state));
         }
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // apply_ubatch() also purges an evicted SWA sequence's older prefix.
+        // Include those cells in the journal even when they are outside sinfo.
+        for (uint32_t seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+            if (seq_pos_max_rm[seq_id] < 0) {
+                continue;
+            }
+
+            GGML_ASSERT(seq_id < seq_to_stream.size());
+            const uint32_t stream = seq_to_stream[seq_id];
+            const auto & cells = v_cells[stream];
+            auto & idxs = touched[stream];
+            for (uint32_t idx = 0; idx < cells.size(); ++idx) {
+                if (cells.pos_in(idx, 0, seq_pos_max_rm[seq_id] + 1) && cells.seq_has(idx, seq_id)) {
+                    idxs.push_back(idx);
+                }
+            }
+        }
+
+        for (auto & entry : touched) {
+            auto & idxs = entry.second;
+            std::sort(idxs.begin(), idxs.end());
+            idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+            state.streams.push_back(entry.first);
+            state.idxs.push_back(idxs);
+            state.cells.push_back(v_cells[entry.first].cp(idxs));
+        }
+
+        states.push_back(std::move(state));
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = it->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+        for (size_t i = 0; i < it->streams.size(); ++i) {
+            v_cells[it->streams[i]].set(it->idxs[i], it->cells[i]);
         }
+        v_heads = it->v_heads_old;
     }
+    vbr_stash_dirty_ = stash_dirty_old;
 
     if (!success) {
         return {};
@@ -2522,7 +2577,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2601,14 +2656,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
     // grow the physical backing first (no-op unless the watermark advanced past a page)
-    if (vbr_vmm_active()) {
+    if (commit && vbr_vmm_active()) {
         vbr_vmm_ensure_mapped();
     }
 
     // Dynamic VBR M3 anchor self-test (env-gated, runs once). Fires from the 2nd apply_ubatch call so
     // a prior attention has identity-init'd the decode-side InnerQ scales the dequant relies on.
     static const bool vbr_test_env = getenv("VBR_TRANSCODE_TEST") != nullptr; // once, not per ubatch
-    if (vbr_test_env) {
+    if (commit && vbr_test_env) {
         static bool vbr_test_armed = false;
         static bool vbr_test_done  = false;
         // apply_ubatch only POSITIONS cells; the K/V write happens in the following graph compute.
