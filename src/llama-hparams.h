@@ -27,6 +27,13 @@ enum llama_swa_type {
 // forward declaration; full definition in llama-graph.h
 enum llm_ffn_op_type : int;
 
+// Identifies the calibrated V-mean row that corresponds to one logical model layer. Shared-KV
+// drafters can map a draft layer to a differently numbered layer owned by the target model.
+struct llama_turbo_meansub_ref {
+    int model_id = 0;
+    int layer    = -1;
+};
+
 struct llama_hparams_posnet {
     uint32_t n_embd;
     uint32_t n_layer;
@@ -52,6 +59,9 @@ struct llama_hparams {
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
+
+    // Registry key for the baked KV affine means. Zero means this model has no calibrated table.
+    int turbo_meansub_id = 0;
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_rel_attn_bkts = 0;

@@ -107,6 +107,15 @@ public:
         kv_swa ->vbr_cotenancy_accum(d, g, o, p);
     }
 
+    bool vbr_ledger_tree_active() const override {
+        return kv_vbr_root != nullptr && kv_vbr_root->vbr_ledger_tree_active();
+    }
+
+    void vbr_shared_scratch_detach() override {
+        kv_base->vbr_shared_scratch_detach();
+        kv_swa ->vbr_shared_scratch_detach();
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -140,6 +149,9 @@ private:
     };
     static constexpr size_t VBR_RETIER_FREEZE_MAX_DEPTH = 64;
 
+    void vbr_finalize_prepare_failure(llama_kv_cache * child,
+            const std::vector<llama_ubatch> & ubatches);
+
     const bool swa_full;
     const bool unified;
 
@@ -150,6 +162,7 @@ private:
     // renegotiation may change vbr_operation_armed() while a nested scope is live.
     std::array<vbr_retier_freeze_children, VBR_RETIER_FREEZE_MAX_DEPTH> vbr_retier_freeze_stack_ = {};
     uint32_t vbr_retier_freeze_depth_ = 0;
+    llama_kv_cache * kv_vbr_root = nullptr;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {

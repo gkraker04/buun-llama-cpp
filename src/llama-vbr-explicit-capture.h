@@ -174,6 +174,9 @@ struct vbr_explicit_representation_identity {
 struct vbr_explicit_representation_policy {
     const char * build_identity = nullptr;
     size_t build_identity_len = 0;
+    // Baked-mean registry ID of the capturing model (hparams.turbo_meansub_id) since the
+    // per-model mean-table isolation; 0 = no baked table (digest records "inactive").
+    int turbo_meansub_id = 0;
 };
 
 bool vbr_explicit_capture_representation_identity(

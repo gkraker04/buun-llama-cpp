@@ -120,6 +120,7 @@ struct server_vbr_artifact_store::impl {
     std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
     void * budget_context = nullptr;
     server_vbr_artifact_store_config::sample_budget_fn sample_budget = nullptr;
+    int turbo_meansub_id = 0;
     server_vbr_artifact_store_counters counters;
     uint64_t nonce = 0;
     uint64_t next_reference = 1;
@@ -413,6 +414,7 @@ server_vbr_artifact_store::create(
         state->pool_bindings = config.pool_bindings;
         state->budget_context = config.budget_context;
         state->sample_budget = config.sample_budget;
+        state->turbo_meansub_id = config.turbo_meansub_id;
         state->n_attention_children = config.attention_children;
         std::random_device random;
         state->nonce = (uint64_t(random()) << 32) ^ random();
@@ -513,6 +515,7 @@ server_vbr_artifact_capture_output server_vbr_artifact_store::capture(
         const char * build_identity = llama_commit();
         const vbr_explicit_representation_policy representation_policy {
             build_identity, strlen(build_identity),
+            impl_->turbo_meansub_id,
         };
         request.representation_context = &representation_policy;
         request.representation_identity =

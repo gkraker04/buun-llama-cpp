@@ -352,7 +352,7 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
-    bool                             vbr;        // arm dynamic VBR (F16 entry + decode-time degrade controller)
+    bool                             vbr = false; // arm dynamic VBR (F16 entry + decode-time degrade controller)
     std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
     std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
     ggml_numa_strategy               numa;
@@ -551,6 +551,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.vbr                  = cmd_params_defaults.vbr;
+    params.vbr_floor            = cmd_params_defaults.vbr_floor;
+    params.vbr_vram             = cmd_params_defaults.vbr_vram;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;

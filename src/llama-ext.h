@@ -134,6 +134,13 @@ LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
 // per-failure asks (est_partial).
 LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
 
+// Composite application-load transaction. Nested component loaders cannot
+// publish SATISFIED or abandon an outer load. The outermost end owns that result.
+LLAMA_API void llama_vram_load_begin(bool application_owned_completion);
+LLAMA_API void llama_vram_load_end(bool success);
+LLAMA_API void llama_vram_plan_aux(const char * device_id, uint64_t bytes);
+LLAMA_API void llama_vram_load_complete(void);
+
 // co-tenancy: declare this process serviced (runs an idle tick — llama-server). Presence
 // markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
 LLAMA_API void llama_vram_mark_serviced(void);

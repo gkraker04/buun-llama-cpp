@@ -172,9 +172,9 @@ static __global__ void argmax_f32(
             int32_t prob_bits;
             memcpy(&prob_bits, &log_prob, sizeof(float));
             dst[nrows + row] = prob_bits;
-        } else {
-            dst[nrows + row] = 0;  // unused but zero-fill for consistency
         }
+        // NOTE: no else-branch store. Plain ggml_argmax allocates dst with exactly nrows
+        // elements, so writing dst[nrows + row] there is out of bounds.
     }
 }
 
@@ -442,7 +442,10 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K <= 0) K = 1;
 
     const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
-    const bool output_logprob = true; // always output log-probs (needed for p_min early stopping + DDTree)
+    // ggml_argmax_ext() allocates 2*nrows (argmax row + packed log-prob row); plain
+    // ggml_argmax() allocates only nrows. Deriving the flag from the real dst extent keeps
+    // the log-prob store (needed for p_min early stopping + DDTree) in bounds for both.
+    const bool output_logprob = ggml_nelements(dst) >= 2*nrows;
 
     const int64_t num_blocks = nrows;
     const int64_t num_threads = std::min<int64_t>(1024, (ne00 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);

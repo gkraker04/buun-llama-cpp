@@ -729,6 +729,13 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // `memory` is declared before `backends`, so ordinary member destruction would tear the
+    // compute backends down first. Shared-KV reverse registrations must detach earlier.
+    struct vbr_shared_scratch_detach_guard {
+        llama_memory_i * memory = nullptr;
+        ~vbr_shared_scratch_detach_guard();
+    } vbr_shared_scratch_detach_guard_;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
@@ -758,6 +765,7 @@ private:
     bool warned_logits_all     = false;
     // co-tenancy: this context's device bus ids (presence-marker beat targets)
     std::vector<std::string> vram_marker_busids_;
+    bool vram_ledger_tree_owned_ = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

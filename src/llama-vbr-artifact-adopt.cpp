@@ -236,11 +236,6 @@ class vbr_kv_import_session {
         llama_kv_cache::vbr_extent * extent = nullptr;
         uint64_t row_bytes = 0;
     };
-    struct stash_pool {
-        llama_kv_cache::vbr_pool * pool = nullptr;
-        ggml_backend_buffer_t buffer = nullptr;
-        std::map<uint32_t, size_t> offsets;
-    };
     struct final_unit_metadata {
         uint32_t logical_unit = UINT32_MAX;
         uint32_t stash_valid = 0;
@@ -257,14 +252,6 @@ class vbr_kv_import_session {
     ~vbr_kv_import_session() {
         if (!published_) {
             rollback(false);
-        }
-        if (test_seam_) {
-            return;
-        }
-        for (auto & stash : private_stash_) {
-            if (stash.buffer != nullptr) {
-                ggml_backend_buffer_free(stash.buffer);
-            }
         }
     }
 
@@ -488,7 +475,7 @@ class vbr_kv_import_session {
         ggml_tensor * destination = extent->t;
         uint64_t destination_offset = read.source_offset;
         if (read.kind == vbr_staged_read_kind::clean_stash) {
-            destination = stash_alias(read.logical_unit_id, *pool, read.size);
+            destination = stash_alias(*pool, *extent, read.size);
             destination_offset = 0;
             if (!destination) {
                 return false;
@@ -692,20 +679,9 @@ class vbr_kv_import_session {
         for (size_t i = 0; i < final_watermarks_.size(); ++i) {
             cache_->vbr_pools_[i].wm_cells = final_watermarks_[i];
         }
-        for (auto & stash : private_stash_) {
-            std::swap(stash.pool->stash_buf, stash.buffer);
-            for (const auto & entry : stash.offsets) {
-                const size_t ikv = entry.first/2;
-                const bool is_v = (entry.first & 1u) != 0;
-                const auto & units = cache_->vbr_units_of(ikv, is_v);
-                const auto found = std::find_if(
-                    units.begin(), units.end(),
-                    [&](const auto & value) { return value.first == stash.pool; });
-                if (found != units.end()) {
-                    found->second->stash_off = entry.second;
-                }
-            }
-        }
+        // Clean-stash bytes were written directly into each pool's fixed-VA stash slab at the
+        // extents' construction-assigned offsets during staging; publishing stash_valid below
+        // is what makes them visible.
         for (const auto & metadata : final_units_) {
             const size_t ikv = metadata.logical_unit/2;
             const bool is_v = (metadata.logical_unit & 1u) != 0;
@@ -800,50 +776,33 @@ class vbr_kv_import_session {
     }
 
   private:
-    ggml_tensor * stash_alias(uint32_t logical_unit,
-                              llama_kv_cache::vbr_pool & pool,
+    // The pool's f16 sink stash is a fixed-VA VMM slab with construction-assigned extent
+    // offsets (recoverable-stash rework). Import writes the clean stash DIRECTLY into the
+    // destination extent's slot: the adopt target is construction-empty and readers ignore
+    // stash content until phase-12 publishes stash_valid, so a failed import leaves only
+    // ignored bytes behind. Mapping goes through the pool's idempotent grow-only reserve,
+    // keeping allocation failure recoverable and outside the no-fail boundary.
+    ggml_tensor * stash_alias(llama_kv_cache::vbr_pool & pool,
+                              llama_kv_cache::vbr_extent & extent,
                               uint64_t bytes) noexcept {
         try {
-            auto found = std::find_if(
-                private_stash_.begin(), private_stash_.end(),
-                [&](const stash_pool & value) { return value.pool == &pool; });
-            if (found == private_stash_.end()) {
-                stash_pool created;
-                created.pool = &pool;
-                size_t total = 0;
-                for (size_t ikv = 0; ikv < cache_->layers.size(); ++ikv) {
-                    for (uint32_t side = 0; side < 2; ++side) {
-                        const auto & units = cache_->vbr_units_of(ikv, side != 0);
-                        const auto unit = std::find_if(
-                            units.begin(), units.end(),
-                            [&](const auto & value) { return value.first == &pool; });
-                        if (unit == units.end() || !unit->second || !unit->second->t) {
-                            continue;
-                        }
-                        created.offsets[uint32_t(ikv*2+side)] = total;
-                        const size_t add = size_t(cache_->vbr_stash_rows_) *
-                            size_t(unit->second->t->ne[0]) * sizeof(uint16_t);
-                        if (add > std::numeric_limits<size_t>::max()-total) {
-                            return nullptr;
-                        }
-                        total += add;
-                    }
-                }
-                if (total == 0) {
-                    return nullptr;
-                }
-                created.buffer = ggml_backend_buft_alloc_buffer(
-                    ggml_backend_get_default_buffer_type(pool.backend), total);
-                if (!created.buffer) {
-                    return nullptr;
-                }
-                private_stash_.push_back(std::move(created));
-                found = std::prev(private_stash_.end());
+            if (extent.t == nullptr || bytes == 0 ||
+                bytes > std::numeric_limits<size_t>::max()) {
+                return nullptr;
             }
-            const auto offset = found->offsets.find(logical_unit);
-            if (offset == found->offsets.end() ||
-                offset->second > ggml_backend_buffer_get_size(found->buffer) ||
-                bytes > ggml_backend_buffer_get_size(found->buffer)-offset->second) {
+            const size_t row_bytes =
+                size_t(extent.t->ne[0]) * sizeof(uint16_t);
+            if (row_bytes == 0 || bytes % row_bytes != 0 ||
+                bytes / row_bytes > cache_->vbr_stash_rows_) {
+                return nullptr;
+            }
+            const std::vector<llama_kv_cache::vbr_stash_request> requests = {
+                { &extent, uint32_t(bytes / row_bytes) },
+            };
+            if (!cache_->vbr_stash_reserve(pool, requests) ||
+                pool.stash_vmm == nullptr ||
+                extent.stash_off > pool.stash_size ||
+                bytes > pool.stash_size - extent.stash_off) {
                 return nullptr;
             }
             ggml_init_params params = {
@@ -855,9 +814,11 @@ class vbr_kv_import_session {
             }
             ggml_tensor * alias = ggml_new_tensor_1d(
                 context.get(), GGML_TYPE_I8, int64_t(bytes));
-            alias->buffer = found->buffer;
+            // Borrow the extent's pool buffer for the backend same-device buft assert;
+            // the H2D copy writes through alias->data directly.
+            alias->buffer = extent.t->buffer;
             alias->data = static_cast<char *>(
-                ggml_backend_buffer_get_base(found->buffer)) + offset->second;
+                pool.be->vmm_pool_base(pool.stash_vmm)) + extent.stash_off;
             stash_contexts_.push_back(std::move(context));
             return alias;
         } catch (...) {
@@ -874,7 +835,6 @@ class vbr_kv_import_session {
     bool published_ = false;
     std::vector<mapped_range> mapped_;
     std::vector<extent_prefix> extent_prefixes_;
-    std::vector<stash_pool> private_stash_;
     std::vector<ggml_context_ptr> stash_contexts_;
     std::vector<bool> unit_complete_;
     std::vector<final_unit_metadata> final_units_;

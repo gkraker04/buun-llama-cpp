@@ -1124,9 +1124,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
 
-    // Record model identity for the binary-baked KV affine-tap means (arch-keyed, tap default-on).
+    // Resolve model identity for the binary-baked KV affine-tap means (arch-keyed, tap default-on).
     // MUST be here, before load_arch_hparams() repurposes hparams.n_embd for the qwen35 hybrid.
-    ggml_turbo_meansub_set_model(arch_name().c_str(), (int) hparams.n_layer_all, (int) hparams.n_embd);
+    hparams.turbo_meansub_id = ggml_turbo_meansub_model_id(
+            arch_name().c_str(), (int) hparams.n_layer_all, (int) hparams.n_embd);
 
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
@@ -2108,6 +2109,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         /*.device_share          =*/ 1.0,
         /*.pin_k                 =*/ cparams.vbr_pin_k,
         /*.pin_v                 =*/ cparams.vbr_pin_v,
+        /*.trace_label           =*/ nullptr,
+        /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
     };
 
     switch (arch) {

@@ -110,7 +110,7 @@ endif()
 foreach(server_codec_token IN ITEMS
         "GGML_TYPE_"
         "TURBO_ROTATION_R"
-        "ggml_turbo_meansub_active"
+        "ggml_turbo_meansub_table"
         "resolve_reference")
     string(FIND "${store_header}${store_source}"
         "${server_codec_token}" codec_token_found)

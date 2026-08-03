@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1354,6 +1355,19 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    llama_vram_load_begin(false);
+    bool load_succeeded = false;
+    struct load_scope {
+        bool & succeeded;
+        bool complete_without_decode;
+        ~load_scope() {
+            llama_vram_load_end(succeeded);
+            if (succeeded && complete_without_decode) {
+                llama_vram_load_complete();
+            }
+        }
+    } load_guard { load_succeeded, model_only };
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1363,6 +1377,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (model_only) {
+        load_succeeded = true;
         return res;
     }
 
@@ -1471,6 +1486,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
+    load_succeeded = true;
     return res;
 }
 

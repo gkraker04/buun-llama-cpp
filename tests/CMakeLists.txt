@@ -440,12 +440,30 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-vbr-policy.cpp)
+llama_build_and_test(test-vbr-physical.cpp)
+llama_build_and_test(test-vbr-transaction.cpp)
+if (MSVC)
+    target_compile_options(test-vbr-policy PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-physical PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-vbr-policy PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-physical PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
+endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-vbr-vmm.cpp)
+    target_link_libraries(test-vbr-vmm PRIVATE ggml-cuda)
+    llama_test(test-vbr-vmm LABEL "backend")
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

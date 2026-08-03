@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-vram-demand.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -398,6 +399,10 @@ static struct llama_model * llama_model_load_from_file_impl(
         if (model) {
             llama_model_free(model);
         }
+        // Direct API fallback: there may be no common/server scope to close a
+        // failed load. Inside an explicit outer transaction this is a no-op;
+        // the application owns the final result.
+        llama_vram_demand_abandon();
         return nullptr;
     }
 
@@ -578,4 +583,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

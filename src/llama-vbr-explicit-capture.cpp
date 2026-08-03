@@ -138,8 +138,8 @@ std::array<uint8_t, 32> representation_meansub_identity(
     int max_layers = 0;
     int max_channels = 0;
     int live_layers = 0;
-    const float * active = ggml_turbo_meansub_active(
-        value_side ? 1 : 0,
+    const float * active = ggml_turbo_meansub_table(
+        policy.turbo_meansub_id, value_side ? 1 : 0,
         &max_layers, &max_channels, &live_layers);
     if (active == nullptr || max_layers <= 0 ||
         max_channels <= 0 || live_layers <= 0) {

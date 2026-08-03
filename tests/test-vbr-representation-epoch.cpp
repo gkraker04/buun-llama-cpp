@@ -156,7 +156,8 @@ struct llama_kv_cache_vbr_epoch_test {
         const size_t saved_limit = kv->vbr_degrade_limit_;
         kv->vbr_degrade_limit_ = kv->vbr_degrade_order_.size();
         const bool changed =
-            kv->vbr_degrade_next(kv->vbr_watermark_cells(0));
+            kv->vbr_degrade_next(kv->vbr_watermark_cells(0)) ==
+            llama_kv_cache::vbr_degrade_result::applied;
         kv->vbr_degrade_limit_ = saved_limit;
         return changed;
     }

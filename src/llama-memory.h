@@ -26,6 +26,10 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Resolve a simple KV buffer type to this llama_context's main compute backend instance.
+    // VBR uses the exact instance to reserve backend-context-owned flash-attention scratch.
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 // TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
@@ -39,10 +43,10 @@ struct llama_memory_vbr_params {
     // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
     bool     min_bits_explicit = false;
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
-    // (an auto budget floats within [armed value, live reach] at decode boundaries)
+    // (an auto budget floats within [floor-layout cost, live reach] at decode boundaries)
     bool     budget_explicit = false;
-    // free-VRAM headroom kept when re-deriving an auto budget (0 = 1 GiB default; the fit
-    // passes its --fit-target so startup and runtime encode the same worst case)
+    // free-VRAM headroom kept while growing a VBR pool (0 = 1 GiB default; the fit passes its
+    // --fit-target so startup and runtime encode the same worst case)
     uint64_t growth_headroom_bytes = 0;
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent splits by entry-tier footprint so the children never double-claim the same free)
@@ -53,6 +57,8 @@ struct llama_memory_vbr_params {
     // WS-0 (P1) trace: VBR_TRACE path suffix so iSWA base/SWA children write to DISTINCT files
     // instead of both truncating the same path (Sol review F2). nullptr for a standalone cache.
     const char * trace_label = nullptr;
+
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 enum llama_memory_status {
@@ -199,6 +205,15 @@ struct llama_memory_i {
     // grant decrement bytes, live grant rows, current donation offer, unflushed pending
     virtual void vbr_cotenancy_accum(uint64_t & /*decrement*/, uint32_t & /*grants*/,
                                      uint64_t & /*offer*/, uint64_t & /*pending*/) const {}
+
+    // True for the single root that owns a live dynamic-VBR ledger controller.
+    // Composite memories forward this once for the whole tree.
+    virtual bool vbr_ledger_tree_active() const { return false; }
+
+    // Drop any non-owning registrations that refer to compute backends owned by the
+    // enclosing llama_context. llama_context calls this before those backends are
+    // destroyed; memory implementations without shared-KV consumers have nothing to do.
+    virtual void vbr_shared_scratch_detach() {}
 
     //
     // ops

@@ -20,6 +20,7 @@
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "../../src/llama-context.h"
+#include "../../src/llama-model.h" // hparams.turbo_meansub_id for the capture identity digest
 #include "../../src/llama-sha256.h"
 #include "log.h"
 #include "sampling.h"
@@ -3156,6 +3157,10 @@ private:
 
     llama_context * create_mtp_context() {
         auto cparams = common_context_params_to_llama(params_base);
+        // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
+        // realized target width here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
+        // when the fitted target is much smaller.
+        cparams.n_ctx         = llama_n_ctx_seq(ctx_tgt);
         cparams.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k        = params_base.speculative.draft.cache_type_k;
         cparams.type_v        = params_base.speculative.draft.cache_type_v;
@@ -3442,6 +3447,16 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
+        // One server load includes the target, linked draft/MTP, multimodal,
+        // slot, tape and compatibility allocations below. The target/common
+        // loader nests inside this scope but cannot finish the process claim.
+        llama_vram_load_begin(has_spec);
+        bool load_succeeded = false;
+        struct load_scope {
+            bool & succeeded;
+            ~load_scope() { llama_vram_load_end(succeeded); }
+        } load_guard { load_succeeded };
+
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -3499,7 +3514,10 @@ private:
         recurrent_expanded = true;
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
-            if (has_spec) {
+            // Native MTP is context-sized by the target fit, so its reservation is solved after
+            // the speculative n_parallel expansion below.  A separate draft model has no such
+            // dependency and keeps the one-pass measurement here.
+            if (has_draft) {
                 // MTP draft context lives on the target model, only context+compute are new
                 bool measure_model_bytes = has_draft;
 
@@ -3535,6 +3553,13 @@ private:
                     for (size_t j = 0; j < devs.size(); ++j) {
                         const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
                         total += bytes;
+                        if (bytes > 0 && ggml_backend_dev_type(devs[j]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            ggml_backend_dev_props props;
+                            ggml_backend_dev_get_props(devs[j], &props);
+                            if (props.device_id != nullptr) {
+                                llama_vram_plan_aux(props.device_id, bytes);
+                            }
+                        }
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == devs[j]) {
                                 if (bytes > params_base.fit_params_target[i]) {
@@ -3656,6 +3681,149 @@ private:
             const int32_t dflash_verify_floor = std::min<int32_t>(
                 (int32_t) params_base.n_batch, (int32_t) n_seq_max_full * DFLASH_VERIFY_OUTPUTS_PER_SEQ);
             params_base.n_outputs_max = std::max<int32_t>(params_base.n_outputs_max, dflash_verify_floor);
+        }
+
+        // Native MTP contributes a context-dependent KV cache plus compute buffers after the
+        // target fit.  Solve that dependency instead of measuring MTP at n_ctx_train and treating
+        // the result as a fixed margin: the latter grossly over-reserves small fitted contexts,
+        // while max(margin, MTP) spends the caller's safety margin on MTP itself.
+        if (spec_mtp && !has_draft && params_base.fit_params) {
+            const std::vector<size_t> margins_base = params_base.fit_params_target;
+            std::vector<size_t> margins_trial = margins_base;
+            std::vector<ggml_backend_dev_t> tgt_devices = params_base.devices;
+            if (tgt_devices.empty()) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    tgt_devices.push_back(ggml_backend_dev_get(i));
+                }
+            }
+
+            auto fit_mtp_step = [&](const std::vector<size_t> & margins,
+                                    std::vector<size_t>       & margins_needed,
+                                    uint32_t                  & n_ctx_fit,
+                                    size_t                    & total_mtp) {
+                std::vector<size_t> margins_work = margins;
+                common_params params_trial = params_base;
+                auto mparams_trial = common_model_params_to_llama(params_trial);
+                auto cparams_trial = common_context_params_to_llama(params_trial);
+
+                const auto fit_status = common_fit_params(
+                        params_trial.model.path.c_str(), &mparams_trial, &cparams_trial,
+                        params_trial.tensor_split,
+                        params_trial.tensor_buft_overrides.data(),
+                        margins_work.data(),
+                        params_trial.fit_params_min_ctx,
+                        params_trial.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_trial.n_ctx == 0) {
+                    return false;
+                }
+
+                common_params params_mtp = params_base;
+                params_mtp.n_parallel = n_parallel_user;
+                params_mtp.n_ctx = cparams_trial.n_ctx;
+                params_mtp.cache_type_k = params_base.speculative.draft.cache_type_k;
+                params_mtp.cache_type_v = params_base.speculative.draft.cache_type_v;
+
+                auto cparams_mtp = common_context_params_to_llama(params_mtp);
+                cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams_mtp.n_rs_seq = 0;
+                cparams_mtp.n_outputs_max = n_parallel_user;
+
+                std::vector<ggml_backend_dev_t> devs_mtp;
+                uint32_t hp_ngl_mtp = 0;
+                uint32_t hp_nct_mtp = 0;
+                uint32_t hp_nex_mtp = 0;
+                const auto dmd_mtp = common_get_device_memory_data(
+                        params_mtp.model.path.c_str(), &mparams_trial, &cparams_mtp,
+                        devs_mtp, hp_ngl_mtp, hp_nct_mtp, hp_nex_mtp, GGML_LOG_LEVEL_ERROR);
+
+                margins_needed = margins_base;
+                total_mtp = 0;
+                for (size_t j = 0; j < devs_mtp.size(); ++j) {
+                    const size_t bytes = dmd_mtp[j].context + dmd_mtp[j].compute;
+                    total_mtp += bytes;
+                    for (size_t i = 0; i < tgt_devices.size() && i < margins_needed.size(); ++i) {
+                        if (tgt_devices[i] == devs_mtp[j]) {
+                            margins_needed[i] += bytes;
+                            break;
+                        }
+                    }
+                }
+                n_ctx_fit = cparams_trial.n_ctx;
+                return true;
+            };
+
+            uint32_t n_ctx_prev = 0;
+            bool converged = false;
+
+            constexpr int MTP_FIT_MAX_ITERS = 8;
+            for (int iter = 0; iter < MTP_FIT_MAX_ITERS; ++iter) {
+                std::vector<size_t> margins_next;
+                uint32_t n_ctx_fit = 0;
+                size_t total_mtp = 0;
+                if (!fit_mtp_step(margins_trial, margins_next, n_ctx_fit, total_mtp)) {
+                    SRV_WRN("[spec] MTP fit solve stopped at iteration %d: target fit failed\n", iter + 1);
+                    break;
+                }
+
+                SRV_DBG("[spec] MTP fit solve %d: n_ctx=%u, MTP context+compute=%.2f MiB\n",
+                        iter + 1, n_ctx_fit, total_mtp / (1024.0 * 1024.0));
+
+                if (margins_next == margins_trial) {
+                    converged = true;
+                    break;
+                }
+
+                // A repeated context means the discrete fit result is stable even if a backend's
+                // byte estimate jitters slightly.  Keep the larger component so the final real fit
+                // cannot spend bytes that MTP needs.
+                if (n_ctx_fit == n_ctx_prev) {
+                    for (size_t i = 0; i < margins_trial.size(); ++i) {
+                        margins_trial[i] = std::max(margins_trial[i], margins_next[i]);
+                    }
+                    converged = true;
+                    break;
+                }
+
+                n_ctx_prev = n_ctx_fit;
+                margins_trial = std::move(margins_next);
+            }
+
+            // Discrete layer/context choices can oscillate around the fixed point.  Validate the
+            // selected side explicitly: the final target fit must leave at least base margin plus
+            // the MTP bytes measured at that fit's own context.  Grow only deficient components.
+            bool validated = false;
+            constexpr int MTP_FIT_VALIDATE_ITERS = 4;
+            for (int iter = 0; iter < MTP_FIT_VALIDATE_ITERS; ++iter) {
+                std::vector<size_t> margins_needed;
+                uint32_t n_ctx_fit = 0;
+                size_t total_mtp = 0;
+                if (!fit_mtp_step(margins_trial, margins_needed, n_ctx_fit, total_mtp)) {
+                    break;
+                }
+                validated = true;
+                for (size_t i = 0; i < margins_trial.size(); ++i) {
+                    if (margins_trial[i] < margins_needed[i]) {
+                        margins_trial[i] = margins_needed[i];
+                        validated = false;
+                    }
+                }
+                SRV_DBG("[spec] MTP fit validation %d: n_ctx=%u, MTP context+compute=%.2f MiB%s\n",
+                        iter + 1, n_ctx_fit, total_mtp / (1024.0 * 1024.0),
+                        validated ? " (covered)" : " (margin raised)");
+                if (validated) {
+                    break;
+                }
+            }
+
+            if (!validated) {
+                SRV_ERR("%s", "[spec] could not find a safe target/MTP fit\n");
+                return false;
+            }
+
+            params_base.fit_params_target = std::move(margins_trial);
+            SRV_INF("[spec] MTP fit solve %s and validated; device 0 target margin is %.2f MiB\n",
+                    converged ? "converged" : "bounded",
+                    params_base.fit_params_target[0] / (1024.0 * 1024.0));
         }
 
         // attach a progress callback
@@ -4622,6 +4790,8 @@ private:
                     VBR_CAPTURE_PINNED_RING_MAX_BYTES,
                     std::max<uint64_t>(RING_FLOOR, lane_floor));
                 config.chunk_bytes = RING_CHUNK;
+                config.turbo_meansub_id =
+                    ctx_tgt->get_model().hparams.turbo_meansub_id;
                 config.budget_context = cache_authority.get();
                 config.sample_budget = [](
                         void * context,
@@ -4756,14 +4926,15 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            load_succeeded = init();
+        } else {
+            if (callback_state) {
+                callback_state(SERVER_STATE_READY, {});
+            }
+            load_succeeded = true;
         }
 
-        if (callback_state) {
-            callback_state(SERVER_STATE_READY, {});
-        }
-
-        return true;
+        return load_succeeded;
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -6975,6 +7146,9 @@ private:
     int64_t t_verify_total  = 0;
     int64_t t_accept_total  = 0;
     int     n_slots_drafted = 0;
+    int     n_slots_draft_decode_succeeded = 0;
+    bool    cycle_has_output = false;
+    bool    cycle_failed = false;
 
     // TG tokens in the current batch — pure-verify batches allow multi-seq batching
     int32_t n_tg_tokens = 0;
@@ -7050,6 +7224,7 @@ private:
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
+            cycle_failed = true;
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
         }
@@ -7117,6 +7292,7 @@ private:
                     continue;
                 }
             } catch (const std::exception & e) {
+                cycle_failed = true;
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -7126,6 +7302,7 @@ private:
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
+                cycle_failed = true;
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -7137,6 +7314,7 @@ private:
         try {
             post_cycle();
         } catch (const std::exception & e) {
+            cycle_failed = true;
             SRV_ERR("post_cycle() failed: %s\n", e.what());
             abort_all_slots("post_cycle() failed: " + std::string(e.what()));
         }
@@ -7237,8 +7415,12 @@ private:
         t_verify_total  = 0;
         t_accept_total  = 0;
         n_slots_drafted = 0;
+        n_slots_draft_decode_succeeded = 0;
+        cycle_has_output = false;
+        cycle_failed = false;
 
         std::vector<llama_tokens> batched_drafts(slots.size());
+        std::vector<bool> batched_draft_decode_succeeded(slots.size(), false);
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (const auto & slot : slots) {
@@ -7269,6 +7451,8 @@ private:
                 t_draft_total = ggml_time_us() - t_batch_start;
 
                 for (size_t i = 0; i < batch_slot_ids.size(); i++) {
+                    batched_draft_decode_succeeded[batch_slot_ids[i]] =
+                            common_speculative_last_draft_model_decode_succeeded(batch_specs[i]);
                     batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
                 }
             }
@@ -7303,6 +7487,10 @@ private:
                     const auto & params_spec = slot.task->params.speculative;
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
                     draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
+                }
+                if (batched_draft_decode_succeeded[slot.id] ||
+                    common_speculative_last_draft_model_decode_succeeded(slot.get_spec())) {
+                    n_slots_draft_decode_succeeded++;
                 }
 
                 if (draft.size() > (size_t) n_draft_max) {
@@ -9606,6 +9794,12 @@ private:
             }
         }
 
+        if (batch_view.logits != nullptr) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                cycle_has_output |= batch_view.logits[i] != 0;
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -10514,6 +10708,17 @@ private:
         // restore force_split_seq for the next cycle (prompt batches need it)
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, true);
+        }
+
+        // The generic target-output hook is intentionally disabled for a
+        // composite speculative load: the drafter can allocate after that
+        // target output. Complete only after a successful cycle crossed the
+        // draft path. If speculative initialization fell back to target-only,
+        // preserve the direct first-output behavior.
+        const bool any_spec_context = std::any_of(slots.begin(), slots.end(),
+                [](const server_slot & slot) { return slot.can_speculate(); });
+        if (!cycle_failed && (n_slots_draft_decode_succeeded > 0 || (cycle_has_output && !any_spec_context))) {
+            llama_vram_load_complete();
         }
 
         SRV_DBG("%s", "run slots completed\n");

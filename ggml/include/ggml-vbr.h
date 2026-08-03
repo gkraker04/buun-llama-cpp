@@ -46,7 +46,7 @@ static inline void ggml_vbr_kv_dequant_sides(enum ggml_type tk, enum ggml_type t
 
 // Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
 // (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
-// degrade). src->name must be the cache tensor name (cache_k_l<L> / cache_v_l<L>) so the encoder
+// degrade). src->name must be the cache tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) so the encoder
 // picks the right K/V codebook. stash_f16/stash_rows (nullable/0): f16 sink-stash — rows
 // [0, stash_rows) re-encode from this pristine snapshot instead of the tier-A recon, capping the
 // permanently-hot sink rows at single-hop error across any number of degrades; capture it at the
@@ -85,6 +85,12 @@ struct ggml_vbr_backend_iface {
     void   (*vmm_pool_free)  (struct ggml_vbr_vmm_pool * pool);
     void * (*vmm_pool_base)  (struct ggml_vbr_vmm_pool * pool);
     size_t (*vmm_pool_mapped)(struct ggml_vbr_vmm_pool * pool);       // mapped-physical bytes
+    // Monotonic identity of the resident page set. Increments once per map/unmap call iff the
+    // set changes, including a partially successful map that returns false.
+    uint64_t (*vmm_pool_residency_epoch)(struct ggml_vbr_vmm_pool * pool);
+    // Exact resident bytes in a page-aligned subrange. The range must be contained in the
+    // reservation and aligned to vmm_granularity() at both ends. Read-only: never maps/unmaps.
+    size_t (*vmm_pool_mapped_in_range)(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
     // ensure [off, off+len) is backed by physical pages (rounded out to granularity; new pages
     // zeroed). false = physical memory exhausted (caller degrades or aborts); driver errors
     // beyond OOM are fatal inside the backend.
@@ -107,12 +113,32 @@ struct ggml_vbr_backend_iface {
     // per-device fence; the device's next graph_compute inserts a GPU-side wait on it, so
     // the decode graph waits for the degrade wave WITHOUT blocking the host.
     void (*fence_arm)(ggml_backend_t backend);
-    // #88: grow the per-device f16 dequant scratch (the buffer the flash-attention prefill /
+    // #88: grow the owning compute backend context's f16 dequant scratch (the buffer the
+    // flash-attention prefill /
     // materialize paths grow implicitly to the attended width) to hold >= k_bytes / v_bytes,
     // OUTSIDE any graph. Called at the decode boundary so physical exhaustion fails HERE,
     // recoverably, instead of aborting mid-decode. false = physical memory exhausted (the
     // caller flushes its deferred unmaps and retries once before failing the batch).
-    bool (*kv_dequant_scratch_reserve)(int device, size_t k_bytes, size_t v_bytes);
+    bool (*kv_dequant_scratch_reserve)(ggml_backend_t backend, size_t k_bytes, size_t v_bytes);
+    // Read-only physical-memory projection for the same reserve. `physical_now` is the
+    // backend context's currently resident K+V scratch. `physical_if_reserved` is a
+    // conservative upper bound after a successful reserve to k_bytes/v_bytes, including
+    // VMM allocation-granularity rounding and the cudaMalloc next-power-of-two fallback.
+    // This never allocates, frees, maps, unmaps, migrates, or changes the scratch epoch.
+    void (*kv_dequant_scratch_memory)(ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
+                                      size_t * physical_now, size_t * physical_if_reserved);
+    // Persistent workspace used by both KV transcode and sink-stash capture. Projection accepts
+    // a null backend before the lazy side backend exists; in that case `device` selects the
+    // allocator policy and physical_now is zero. n_cells covers the transcode (including the
+    // live VBR_TRANSCODE_NOTILE policy), while stash_rows covers a capture immediately before it.
+    // false means invalid/overflowing dimensions. Neither callback mutates a tier.
+    bool (*kv_transcode_workspace_memory)(ggml_backend_t backend_or_null, int device,
+                                           int64_t n_cells, int64_t ne0, int64_t stash_rows,
+                                           size_t * physical_now, size_t * physical_if_reserved);
+    // Materialize the projected workspace on an existing side backend. Physical exhaustion is
+    // recoverable and returns false, allowing the caller to reclaim/retry before tier mutation.
+    bool (*kv_transcode_workspace_reserve)(ggml_backend_t backend,
+                                            int64_t n_cells, int64_t ne0, int64_t stash_rows);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address

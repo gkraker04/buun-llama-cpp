@@ -56,6 +56,18 @@ static bool turbo_vbr_layer_schedule_enabled() {
     return e && e[0];
 }
 
+// The on-disk marker identity is one (busid,pid) row, so independent controller
+// trees in one process cannot publish or service demands correctly. iSWA is one
+// tree (its composite memory reports only the base owner); shared-KV drafters are
+// disarmed before memory construction and do not acquire this slot.
+static std::atomic<bool> g_vbr_ledger_tree_owned { false };
+
+llama_context::vbr_shared_scratch_detach_guard::~vbr_shared_scratch_detach_guard() {
+    if (memory != nullptr) {
+        memory->vbr_shared_scratch_detach();
+    }
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -463,9 +475,42 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.compute_backend_for_buft =*/ [this](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev == nullptr) {
+                    return nullptr;
+                }
+
+                // Under tensor split the context owns one meta backend; the KV allocator hands
+                // us each simple child buft. Descend the meta backend to return the child backend
+                // whose context actually owns that device's fattn scratch.
+                std::function<ggml_backend_t(ggml_backend_t)> find_backend =
+                        [&](ggml_backend_t backend) -> ggml_backend_t {
+                    if (ggml_backend_is_meta(backend)) {
+                        const size_t n = ggml_backend_meta_n_backends(backend);
+                        for (size_t i = 0; i < n; ++i) {
+                            if (ggml_backend_t found = find_backend(
+                                        ggml_backend_meta_simple_backend(backend, i))) {
+                                return found;
+                            }
+                        }
+                        return nullptr;
+                    }
+                    return ggml_backend_get_device(backend) == dev ? backend : nullptr;
+                };
+                for (const auto & backend : backends) {
+                    if (ggml_backend_t found = find_backend(backend.get())) {
+                        return found;
+                    }
+                }
+                return nullptr;
+            },
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        // Arm immediately after create_memory returns: if any later constructor step throws,
+        // this member is destroyed before `backends` and unregisters their raw handles safely.
+        vbr_shared_scratch_detach_guard_.memory = memory.get();
     }
 
     // init backends
@@ -591,16 +636,21 @@ llama_context::llama_context(
             }
         }
     }
+
+    if (memory != nullptr && memory->vbr_ledger_tree_active() && llama_vram_ledger_armed()) {
+        bool expected = false;
+        if (!g_vbr_ledger_tree_owned.compare_exchange_strong(expected, true)) {
+            throw std::runtime_error(
+                    "multiple independent dynamic-VBR contexts in one process are unsupported: "
+                    "the co-tenancy ledger has one marker identity per process");
+        }
+        vram_ledger_tree_owned_ = true;
+    }
 }
 
 llama_context::~llama_context() {
-    // A decode operation owns its VBR registry entry until the scheduler fence
-    // promotes the submitted extents and delivers the terminal result.  Most
-    // callers reach that fence while consuming outputs, but context teardown is
-    // also a terminal lifecycle boundary (including server shutdown between
-    // decode and sampling).  Drain it while both the scheduler and the memory
-    // tree are still alive; the VBR tracker destructor must never inherit a
-    // live deferred-decode operation.
+    // Context teardown is a terminal lifecycle boundary. Drain pending decode work while both the
+    // scheduler and memory tree are still alive, so deferred VBR work reaches its normal fence.
     synchronize();
 
     if (!model.hparams.no_alloc) {
@@ -620,6 +670,9 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    if (vram_ledger_tree_owned_) {
+        g_vbr_ledger_tree_owned.store(false);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -6991,7 +7044,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // intermediate prefill chunks run n_outputs == 0 and warmup decodes are not requests
     // (warmup's tiny batch does not grow the compute pools, so the memory claim is NOT
     // complete after it). Unlinking the satisfied claim is the donors' lift signal.
-    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_pending_complete()) {
+    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_auto_complete_pending()) {
         llama_vram_demand_complete();
     }
 
@@ -7358,17 +7411,56 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else {
+        // A multi-backend reserve can allocate buffers on earlier devices and
+        // then fail on a later one. Report each physical increase even when
+        // the aggregate reserve fails, otherwise a plan-hinted demand counts
+        // those already-resident buffers as part of its remaining ask.
+        auto reserve_with_landed = [&](ggml_cgraph * graph) {
+            std::vector<size_t> before(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                before[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            }
+
+            const bool ok = ggml_backend_sched_reserve(sched.get(), graph);
+
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_t backend = backend_ptrs[i];
+                const size_t after = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                if (after > before[i]) {
+                    llama_vram_demand_alloc_landed(
+                            ggml_backend_get_device(backend), after - before[i]);
+                }
+            }
+            // reserve() resets the scheduler only on success. Its failed path
+            // leaves the split/hash state live, so calling it again without a
+            // reset builds a different, ever-growing allocation graph.
+            if (!ok) {
+                ggml_backend_sched_reset(sched.get());
+            }
+            return ok;
+        };
+
+        if (reserve_with_landed(gf)) {
+            return gf;
+        }
         GGML_ASSERT(!sizes);
         // co-tenancy: before the FIRST real decode (i.e. any init-time reserve — several
         // run during context setup), a resident donor may free room within the ledger's
-        // bounded patience. The ask is nominal (est_partial — the sched spans devices and
-        // its sizes are internal); post-first-decode re-reserves keep the fast-fail wall.
+        // bounded patience. A plan-hinted load already knows every device's remaining
+        // allocation; without a hint, retain the nominal single-device fallback.
+        // Post-first-decode re-reserves keep the fast-fail wall.
         bool held = false;
         if (!has_evaluated_once && !model.devices.empty() && !model.devices[0].is_meta) {
             constexpr size_t NOMINAL_COMPUTE_ASK = (size_t) LLAMA_VRAM_LEDGER_NOMINAL_ASK;
-            while (!held && llama_vram_demand_hold(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
-                held = ggml_backend_sched_reserve(sched.get(), gf);
+            while (!held && llama_vram_demand_hold_plan_or(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
+                // split_graph() mutates its input graph by inserting backend
+                // copies. A failed reserve cannot safely reuse that graph;
+                // rebuild the same measurement graph for every allocation
+                // retry after donors have had a chance to make progress.
+                res->reset();
+                gf = model.build_graph(gparams);
+                held = reserve_with_landed(gf);
             }
         }
         if (!held) {
@@ -9496,6 +9588,22 @@ bool llama_memory_can_seq_rm_partial(llama_memory_t mem) {
 
 void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
     llama_vram_plan_hint_set(device_id, bytes);
+}
+
+void llama_vram_load_begin(bool application_owned_completion) {
+    llama_vram_load_begin_internal(application_owned_completion);
+}
+
+void llama_vram_load_end(bool success) {
+    llama_vram_load_end_internal(success);
+}
+
+void llama_vram_plan_aux(const char * device_id, uint64_t bytes) {
+    llama_vram_plan_aux_add_internal(device_id, bytes);
+}
+
+void llama_vram_load_complete(void) {
+    llama_vram_demand_complete();
 }
 
 void llama_vram_mark_serviced(void) {
