@@ -2395,6 +2395,7 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo1_tcq(
     const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
     const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
     const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
     const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
     block_turbo1_tcq * dst_blk = (block_turbo1_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
                                + (i00 / QK_TURBO1_TCQ);
