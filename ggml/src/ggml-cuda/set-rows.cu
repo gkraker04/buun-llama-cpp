@@ -278,6 +278,11 @@ static void set_rows_cuda_quant(
 // Affine-tap mean vector for a turbo4/turbo8 set_rows dst (per-layer slice of the K or V mean
 // table, selected by cache_k_/cache_v_ name). Returns nullptr (no tap) unless the dst is a
 // cache_{k,v}_l<N> tensor within table bounds AND a mean table is loaded (TURBO_KMEAN/VMEAN_SUB).
+static inline int turbo_meansub_id_from_name(const char * name) {
+    const char * marker = strstr(name, "_ms");
+    return marker ? atoi(marker + 3) : 0;
+}
+
 static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t ne00) {
     // Tap tier gate: no mean-sub at 8-bit — measured zero median gain and +9.5% mean KLD cost
     // (native flat A/B, q27 16k×8ch, 2026-07-05). Tap stays on for t4 and coarser (t4 median
@@ -287,7 +292,9 @@ static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const 
     const int pf_layer = atoi(dst->name + 9);
     if (pf_layer < 0 || pf_layer >= PFHEAD_MAX_L || ne00 > PFHEAD_MAX_C) return nullptr;
     const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
-    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, ctx.stream()) : turbo_vmean_table_enc(ctx.device, ctx.stream());
+    const int model_id = turbo_meansub_id_from_name(dst->name);
+    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, ctx.stream(), model_id)
+                                : turbo_vmean_table_enc(ctx.device, ctx.stream(), model_id);
     return tbl ? tbl + (size_t) pf_layer * PFHEAD_MAX_C : nullptr;
 }
 
@@ -1295,7 +1302,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 const int ragged_v_rotated = (!rg_is_k && ragged_v_rotated_enabled()) ? 1 : 0;
                 const float * kvmean_mu = nullptr;
                 if (rg_layer >= 0 && rg_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = rg_is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = rg_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) rg_layer * PFHEAD_MAX_C;
                 }
                 k_set_rows_ragged_roundtrip<src_t, idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
@@ -1496,7 +1505,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 const bool is_k = strncmp(dst->name, "cache_k_l", 9) == 0;
                 const bool is_v = strncmp(dst->name, "cache_v_l", 9) == 0;
                 if (is_k || is_v) {
-                    const float * tbl = is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                            : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     const int kl = atoi(dst->name + 9);
                     if (tbl && kl >= 0 && kl < PFHEAD_MAX_L) kmean_mu = tbl + (size_t) kl * PFHEAD_MAX_C;
                 }
@@ -1526,7 +1537,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             }
             const float * kmean_mu = nullptr;
             if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                const int model_id = turbo_meansub_id_from_name(dst->name);
+                const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                           : turbo_vmean_table_enc(ctx.device, stream, model_id);
                 if (tbl) kmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
             }
             k_set_rows_turbo3<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
@@ -1640,7 +1653,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }
@@ -1703,7 +1718,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }
@@ -1758,7 +1775,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream) : turbo_vmean_table_enc(ctx.device, stream);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }

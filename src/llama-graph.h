@@ -376,6 +376,7 @@ public:
     // once after the inverse WHT (attention weights sum to 1, so the mean re-enters as a
     // constant vector). Loaded from TURBO_VMEAN_SUB; nullptr when the tap is off.
     ggml_tensor * self_vmean = nullptr;
+    const std::vector<float> * turbo_vmean_data = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -500,6 +501,7 @@ public:
 
     // TurboQuant V-mean tap (see llm_graph_input_attn_kv::self_vmean)
     ggml_tensor * self_vmean = nullptr;
+    const std::vector<float> * turbo_vmean_data = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;

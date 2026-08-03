@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -32,113 +34,152 @@
 // of centered V reconstructions equals (output - mu_V) — ONE broadcast add after the graph's
 // inverse WHT restores exactness. This builds the GQA-expanded, head-padded host table
 // [pdim, n_layer] once; layers with insufficient calibration rows stay zero (no-op).
-static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparams, int64_t & pdim_out) {
-    static std::vector<float> tab;
-    static int64_t pdim = 0;
-    static int state = 0; // 0 = uninit, 1 = loaded, -1 = absent/failed
-    if (state == 0) {
-        state = -1;
+static const std::vector<float> * turbo_vmean_table(
+        const llama_hparams & hparams,
+        const std::vector<llama_turbo_meansub_ref> & refs,
+        int64_t & pdim_out) {
+    struct cache_key {
+        std::vector<int64_t> fields;
+        bool operator<(const cache_key & other) const { return fields < other.fields; }
+    };
+    struct cache_entry {
+        std::vector<float> tab;
+        int64_t pdim = 0;
+        int state = 0; // 0 = uninit, 1 = loaded, -1 = absent/failed
+    };
+    cache_key key;
+    key.fields.reserve((size_t) hparams.n_layer_all * 5);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        const llama_turbo_meansub_ref ref = il < refs.size() ? refs[il] : llama_turbo_meansub_ref{};
+        key.fields.push_back(ref.model_id);
+        key.fields.push_back(ref.layer);
+        key.fields.push_back(hparams.n_embd_head_v(il));
+        key.fields.push_back(hparams.n_head(il));
+        key.fields.push_back(hparams.n_head_kv(il));
+    }
 
-        // Source the dense V-slab means (mu, dead layers zeroed): TURBO_VMEAN_SUB file override
-        // first (experiments), else the binary-baked per-architecture table (tap default-on).
-        std::vector<float> mu;        // [max_l * max_c], V slab, dead layers = 0
-        size_t max_l = 0, max_c = 0;
+    static std::map<cache_key, cache_entry> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache_entry & entry = cache[key];
+
+    if (entry.state == 0) {
+        entry.state = -1;
+
+        // TURBO_VMEAN_SUB is one dense experimental slab. Without it, each logical layer resolves
+        // its immutable baked slab independently; a shared-KV drafter can therefore restore the
+        // target-owned row while leaving its own local rows tied to the draft model.
+        std::vector<float> override_mu; // [override_l * override_c], dead layers = 0
+        size_t override_l = 0, override_c = 0;
 
         if (getenv("TURBO_MEANSUB_OFF")) {   // explicit disable (A/B + opt-out)
-            pdim_out = pdim;
+            pdim_out = entry.pdim;
             return nullptr;
         }
         const char * path = getenv("TURBO_VMEAN_SUB");
-        if (path && path[0]) {
+        const bool override_requested = path && path[0];
+        if (override_requested) {
             FILE * f = fopen(path, "rb");
             if (!f) {
                 fprintf(stderr, "VMEAN tap: cannot open %s\n", path);
             } else {
                 int32_t hdr[4] = {0, 0, 0, 0};
-                bool ok = fread(hdr, sizeof(int32_t), 4, f) == 4 && hdr[0] == 0x50464831 && hdr[1] == 2;
-                max_l = ok ? (size_t) hdr[2] : 0;
-                max_c = ok ? (size_t) hdr[3] : 0;
-                const size_t nk = max_l * max_c;
+                bool ok = fread(hdr, sizeof(int32_t), 4, f) == 4 &&
+                        hdr[0] == 0x50464831 && hdr[1] == 2 &&
+                        hdr[2] == GGML_TURBO_MEANSUB_MAX_L &&
+                        hdr[3] == GGML_TURBO_MEANSUB_MAX_C;
+                override_l = ok ? (size_t) hdr[2] : 0;
+                override_c = ok ? (size_t) hdr[3] : 0;
+                const size_t nk = override_l * override_c;
                 std::vector<float>   sums(nk);
-                std::vector<int32_t> cnts(2 * max_l);
+                std::vector<int32_t> cnts(2 * override_l);
                 // file layout: hdr | sums[2][L][C] | sqs[2][L][C] | cnts[2][L]; V slab = second
                 ok = ok && nk > 0 &&
                      fseek(f, (long) (16 + nk * sizeof(float)), SEEK_SET) == 0 &&
                      fread(sums.data(), sizeof(float), nk, f) == nk &&
                      fseek(f, (long) (16 + 4 * nk * sizeof(float)), SEEK_SET) == 0 &&
-                     fread(cnts.data(), sizeof(int32_t), 2 * max_l, f) == 2 * max_l;
+                     fread(cnts.data(), sizeof(int32_t), 2 * override_l, f) == 2 * override_l;
                 fclose(f);
                 if (!ok) {
                     fprintf(stderr, "VMEAN tap: bad/short PFH1 file %s\n", path);
-                    max_l = max_c = 0;
+                    override_l = override_c = 0;
                 } else {
-                    mu.assign(nk, 0.0f);
-                    for (size_t l = 0; l < max_l; l++) {
-                        const int32_t c = cnts[max_l + l];   // V slab counts
+                    override_mu.assign(nk, 0.0f);
+                    for (size_t l = 0; l < override_l; l++) {
+                        const int32_t c = cnts[override_l + l];   // V slab counts
                         if (c < 100) continue;
-                        for (size_t j = 0; j < max_c; j++) mu[l * max_c + j] = sums[l * max_c + j] / c;
-                    }
-                }
-            }
-        } else {
-            int bL = 0, bC = 0, blive = 0;
-            const float * baked = ggml_turbo_meansub_active(1, &bL, &bC, &blive);   // V slab
-            if (baked && blive > 0) {
-                max_l = (size_t) bL;
-                max_c = (size_t) bC;
-                mu.assign(baked, baked + (size_t) bL * bC);
-            }
-        }
-
-        if (!mu.empty()) {
-            int64_t w = 0;
-            for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
-                const int64_t hd = hparams.n_embd_head_v(il);
-                const int64_t nh = hparams.n_head(il);
-                if (hd <= 0 || nh <= 0) continue;
-                const int64_t cand = GGML_PAD(hd, 128) * nh;
-                if (cand > w) w = cand;
-            }
-            int live = 0;
-            if (w > 0) {
-                tab.assign((size_t) w * hparams.n_layer_all, 0.0f);
-                for (uint32_t il = 0; il < hparams.n_layer_all && il < max_l; il++) {
-                    const int64_t hd  = hparams.n_embd_head_v(il);
-                    const int64_t nh  = hparams.n_head(il);
-                    const int64_t nkv = hparams.n_head_kv(il);
-                    if (hd <= 0 || nh <= 0 || nkv <= 0) continue;
-                    // Narrower layers (e.g. gemma4 SWA vs global widths) occupy a prefix of the
-                    // pdim-wide row; requiring == w armed ZERO layers on heterogeneous geometry
-                    // while the encode side still subtracted -> V shifted by -mu, never restored.
-                    if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh > w) continue;
-                    bool any = false;   // skip dead (all-zero) layers
-                    for (int64_t j = 0; j < nkv * hd && !any; j++) {
-                        if (mu[(size_t) il * max_c + j] != 0.0f) any = true;
-                    }
-                    if (!any) continue;
-                    const int64_t phd = GGML_PAD(hd, 128);
-                    live++;
-                    for (int64_t qh = 0; qh < nh; qh++) {
-                        const int64_t kvh = qh / (nh / nkv);
-                        for (int64_t d = 0; d < hd; d++) {
-                            tab[(size_t) il * w + qh * phd + d] =
-                                mu[(size_t) il * max_c + kvh * hd + d];
+                        for (size_t j = 0; j < override_c; j++) {
+                            override_mu[l * override_c + j] = sums[l * override_c + j] / c;
                         }
                     }
                 }
             }
-            if (live > 0) {
-                pdim = w;
-                state = 1;
-                fprintf(stderr, "VMEAN tap: graph add armed, %d live layers (pdim %lld)\n",
-                        live, (long long) w);
-            } else {
-                fprintf(stderr, "VMEAN tap: no live V layers — add disabled\n");
+        }
+
+        int64_t w = 0;
+        for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+            const int64_t hd = hparams.n_embd_head_v(il);
+            const int64_t nh = hparams.n_head(il);
+            if (hd <= 0 || nh <= 0) continue;
+            const int64_t cand = GGML_PAD(hd, 128) * nh;
+            if (cand > w) w = cand;
+        }
+        int live = 0;
+        if (w > 0) {
+            entry.tab.assign((size_t) w * hparams.n_layer_all, 0.0f);
+            for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+                const llama_turbo_meansub_ref ref = il < refs.size() ? refs[il] : llama_turbo_meansub_ref{};
+                if (ref.layer < 0) continue;
+
+                const float * mu = nullptr;
+                size_t max_l = 0, max_c = 0;
+                if (override_requested) {
+                    if (override_mu.empty()) continue;
+                    mu = override_mu.data();
+                    max_l = override_l;
+                    max_c = override_c;
+                } else {
+                    int bL = 0, bC = 0, blive = 0;
+                    mu = ggml_turbo_meansub_table(ref.model_id, 1, &bL, &bC, &blive);
+                    if (!mu || blive <= 0) continue;
+                    max_l = (size_t) bL;
+                    max_c = (size_t) bC;
+                }
+                if ((size_t) ref.layer >= max_l) continue;
+
+                const int64_t hd  = hparams.n_embd_head_v(il);
+                const int64_t nh  = hparams.n_head(il);
+                const int64_t nkv = hparams.n_head_kv(il);
+                if (hd <= 0 || nh <= 0 || nkv <= 0 || nh % nkv != 0) continue;
+                // Narrower layers (e.g. SWA vs global widths) occupy a prefix of the pdim-wide row.
+                if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh > w) continue;
+                const float * src = mu + (size_t) ref.layer * max_c;
+                bool any = false;
+                for (int64_t j = 0; j < nkv * hd && !any; j++) {
+                    if (src[j] != 0.0f) any = true;
+                }
+                if (!any) continue;
+                const int64_t phd = GGML_PAD(hd, 128);
+                live++;
+                for (int64_t qh = 0; qh < nh; qh++) {
+                    const int64_t kvh = qh / (nh / nkv);
+                    for (int64_t d = 0; d < hd; d++) {
+                        entry.tab[(size_t) il * w + qh * phd + d] = src[kvh * hd + d];
+                    }
+                }
             }
         }
+        if (live > 0) {
+            entry.pdim = w;
+            entry.state = 1;
+            fprintf(stderr, "VMEAN tap: graph add armed, %d live layers (pdim %lld)\n",
+                    live, (long long) w);
+        } else {
+            fprintf(stderr, "VMEAN tap: no live V layers — add disabled\n");
+        }
     }
-    pdim_out = pdim;
-    return state == 1 ? &tab : nullptr;
+    pdim_out = entry.pdim;
+    return entry.state == 1 ? &entry.tab : nullptr;
 }
 
 static bool turbo_ragged_v_rotated_enabled() {
@@ -153,17 +194,35 @@ static bool turbo_ragged_v_rotated_enabled() {
 // Fill the self_vmean input tensor. MUST be called from EVERY set_input path that owns an
 // attention input — including the mem-hybrid wrappers, which forward aux fields manually
 // and do NOT call the inner attention input's set_input.
-static void turbo_vmean_fill(ggml_tensor * t, const llama_hparams & hparams) {
-    if (!t || !t->buffer) {
-        return;
-    }
-    int64_t vm_pdim = 0;
-    const auto * vm = turbo_vmean_table(hparams, vm_pdim);
-    if (!vm) {
+static void turbo_vmean_fill(ggml_tensor * t, const std::vector<float> * data) {
+    if (!t || !t->buffer || !data) {
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
-    memcpy(t->data, vm->data(), ggml_nbytes(t));
+    memcpy(t->data, data->data(), ggml_nbytes(t));
+}
+
+static std::vector<llama_turbo_meansub_ref> turbo_vmean_refs(
+        const llama_hparams & hparams,
+        const llama_kv_cache_context * mctx) {
+    std::vector<llama_turbo_meansub_ref> refs(hparams.n_layer_all);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        refs[il] = mctx->get_turbo_meansub_ref(il);
+    }
+    return refs;
+}
+
+static std::vector<llama_turbo_meansub_ref> turbo_vmean_refs(
+        const llama_hparams & hparams,
+        const llama_kv_cache_iswa_context * mctx) {
+    std::vector<llama_turbo_meansub_ref> refs(hparams.n_layer_all);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        refs[il] = mctx->get_base()->get_turbo_meansub_ref(il);
+        if (refs[il].layer < 0) {
+            refs[il] = mctx->get_swa()->get_turbo_meansub_ref(il);
+        }
+    }
+    return refs;
 }
 
 // dedup helpers
@@ -657,7 +716,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    turbo_vmean_fill(self_vmean, hparams);
+    turbo_vmean_fill(self_vmean, turbo_vmean_data);
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -765,7 +824,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
 
-    turbo_vmean_fill(self_vmean, hparams);
+    turbo_vmean_fill(self_vmean, turbo_vmean_data);
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -1146,7 +1205,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->hparams);
+    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->turbo_vmean_data);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1266,7 +1325,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
-    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->hparams);
+    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->turbo_vmean_data);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2846,10 +2905,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    const auto meansub_refs = turbo_vmean_refs(hparams, mctx_cur);
 
     {
         int64_t vm_pdim = 0;
-        if (turbo_vmean_table(hparams, vm_pdim)) {
+        inp->turbo_vmean_data = turbo_vmean_table(hparams, meansub_refs, vm_pdim);
+        if (inp->turbo_vmean_data) {
             inp->self_vmean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vm_pdim, hparams.n_layer_all);
             ggml_set_input(inp->self_vmean);
         }
@@ -3368,10 +3429,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+    const auto meansub_refs = turbo_vmean_refs(hparams, mctx_cur);
 
     {
         int64_t vm_pdim = 0;
-        if (turbo_vmean_table(hparams, vm_pdim)) {
+        inp->turbo_vmean_data = turbo_vmean_table(hparams, meansub_refs, vm_pdim);
+        if (inp->turbo_vmean_data) {
             inp->self_vmean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vm_pdim, hparams.n_layer_all);
             ggml_set_input(inp->self_vmean);
         }

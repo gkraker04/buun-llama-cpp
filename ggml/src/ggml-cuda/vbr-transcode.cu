@@ -372,7 +372,8 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 
 // Transcode the first n_cells rows of p->src (turbo type A) into p->dst as turbo type B.
 // p->dst points into the KV pool at the destination region. p->src->name MUST be the real cache
-// tensor name (cache_k_l<L> / cache_v_l<L>) — the encoder keys its K/V codebook + kmean tap off it.
+// tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) — the encoder keys its K/V codebook,
+// affine-table identity, and kmean tap off it.
 //
 // STREAMING + IN-PLACE (VBR design decisions #2/#3): processed one TILE of cells at a time, so the
 // f32/f16 scratch is bounded (~few MB, independent of n_cells) — NOT the whole-tensor f32 buffer.

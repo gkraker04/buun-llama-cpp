@@ -261,6 +261,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    llama_turbo_meansub_ref get_turbo_meansub_ref(int32_t il) const;
 
     //
     // graph_build API
@@ -346,6 +347,8 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        llama_turbo_meansub_ref turbo_meansub_ref;
     };
 
     // Dynamic VBR (M2): per-(layer,side) descriptor over the shared KV pool buffer. Tier is NOT
@@ -940,6 +943,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    llama_turbo_meansub_ref get_turbo_meansub_ref(int32_t il) const;
 
 
     // TurboQuant rotation accessors

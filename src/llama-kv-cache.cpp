@@ -970,8 +970,8 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_alloc, kv_size, n_stream) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
-        has_v && ggml_format_name(v, "cache_v_l%d", il);
+        has_k && ggml_format_name(k, "cache_k_l%d_ms%d", il, hparams.turbo_meansub_id);
+        has_v && ggml_format_name(v, "cache_v_l%d_ms%d", il, hparams.turbo_meansub_id);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -983,7 +983,8 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream });
+        layers.push_back({ il, k, v, k_stream, v_stream,
+                { hparams.turbo_meansub_id, (int) il } });
         layer_is_shared.push_back(false);
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
@@ -6823,6 +6824,14 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+llama_turbo_meansub_ref llama_kv_cache::get_turbo_meansub_ref(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return {};
+    }
+    return layers.at(it->second).turbo_meansub_ref;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -8293,6 +8302,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+llama_turbo_meansub_ref llama_kv_cache_context::get_turbo_meansub_ref(int32_t il) const {
+    return kv->get_turbo_meansub_ref(il);
 }
 
 

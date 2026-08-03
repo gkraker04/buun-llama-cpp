@@ -46,7 +46,7 @@ static inline void ggml_vbr_kv_dequant_sides(enum ggml_type tk, enum ggml_type t
 
 // Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
 // (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
-// degrade). src->name must be the cache tensor name (cache_k_l<L> / cache_v_l<L>) so the encoder
+// degrade). src->name must be the cache tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) so the encoder
 // picks the right K/V codebook. stash_f16/stash_rows (nullable/0): f16 sink-stash — rows
 // [0, stash_rows) re-encode from this pristine snapshot instead of the tier-A recon, capping the
 // permanently-hot sink rows at single-hop error across any number of degrades; capture it at the
