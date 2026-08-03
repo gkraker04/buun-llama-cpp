@@ -3315,6 +3315,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 if (decode_armed && vbr_ownership_) {
                     vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
                 }
+                if (idx < vbr_stash_rows_) {
+                    vbr_stash_dirty_ = true; // the SWA slot is about to hold a different token
+                }
                 cells.rm(idx);
             }
 

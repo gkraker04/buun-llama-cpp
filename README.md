@@ -21,30 +21,54 @@ down to turbo1_tcq; for Gemma4-31B (60 layers), **600** — the finest-grained q
 you at every moment of a session.
 
 And because VBR always draws from the best codecs on the ladder, **you never have to track KV formats
-again**: new codecs and research roll straight into VBR, so `-ct vbr` will always hand you the best
-possible cache.
+again**: new codecs and research roll straight into VBR, so the default cache will always use the best
+available ladder.
 
 ### Recommended usage
 
 On a dedicated GPU, just run:
 
 ```sh
+llama-server -m model.gguf
+```
+
+VBR is the default cache, with a **turbo4 quality floor**. It derives a KV VRAM budget from whatever is
+left after weights and compute, advertises the largest context that fits without going below turbo4
+(capped at the model's training length), and degrades tiers on the fly as context fills. The cache is
+still FP16 until memory pressure actually requires compression.
+
+For maximum context, explicitly use `-ct vbr`. That deliberate opt-in opens the complete ladder down to
+turbo1_tcq unless you also set `--vbr-floor`:
+
+```sh
 llama-server -m model.gguf -ct vbr
 ```
 
-That single flag is the whole product: it derives a KV VRAM budget from whatever is left after weights
-and compute, advertises the largest context that fits at the floor tier (capped at the model's training
-length), and degrades tiers on the fly as context fills. No context length to guess, no codec to pick.
 Run with `-v` to watch the `VBR degrade #…` steps fire.
+
+### Choose the two things you know
+
+VBR balances three quantities: **context length**, **KV VRAM**, and **minimum quality**. Usually specify
+at most two and let VBR solve the third:
+
+| You know | Use | VBR determines |
+|---|---|---|
+| How many tokens you need and how much KV VRAM you can spare | `-ct vbr -c N --vbr-vram SIZE` | The highest-quality terminal layer mixture that fits. Explicit `-ct vbr` leaves the full ladder available. |
+| How many tokens you need and the lowest quality you will accept | `-c N --vbr-floor TIER` | The safe KV VRAM budget available on the machine. |
+| How much KV VRAM you can spare and the lowest quality you will accept | `--vbr-vram SIZE --vbr-floor TIER` | The largest fillable context. |
+
+Setting all three usually just over-constrains the same calculation. Pick the two requirements you
+actually know; VBR can then optimize the remaining dimension instead of receiving three potentially
+contradictory answers.
 
 ### Settings
 
 | flag | meaning |
 |---|---|
-| `-ct vbr` (or `-ctk vbr` / `-ctv vbr`) | Enable VBR. A one-sided selection implies VBR on the other side too; explicitly pinning a side (`-ctv q8_0`) holds it at fixed bits and never degrades it. |
+| `-ct vbr` (or `-ctk vbr` / `-ctv vbr`) | VBR is already enabled by default. Explicitly selecting it opens the full ladder to t1 when no `--vbr-floor` is supplied. Explicitly pinning a side (`-ctv q8_0`) holds it at fixed bits and never degrades it. Use `-ct f16` or another concrete type to opt out of VBR. |
 | `-c <N>` | Cap the context at N tokens; VBR then spends your whole VRAM budget running *that* window at the highest quality it can, instead of advertising the max floor-tier capacity. E.g. `-c 30000` = the best-quality cache that fits a 30k window. |
 | `--vbr-vram <SIZE>` | Explicit KV VRAM budget (e.g. `8G`). Default `auto` = whatever VRAM is left after weights and compute. |
-| `--vbr-floor <bits\|tier>` | Literal aggregate bits/value floor for dynamic mode (default t1 = 1.25). Degrades stop at the last step still ≥ the floor. |
+| `--vbr-floor <bits\|tier>` | Literal aggregate bits/value floor for dynamic mode. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). Degrades stop at the last step still ≥ the floor. |
 | `--vbr-budget <tier\|number>` | Default `dynamic` (runtime controller). A tier (`t8/t4/t3/t2/t1`) or a number instead selects a **fixed** static tier — no runtime degrades. |
 
 **Requirements:** a CUDA or ROCm backend (turbo-typed KV needs the TurboQuant interface; layers whose KV
@@ -179,13 +203,15 @@ Test on ROCm 7.13 + AMD Radeon AI PRO R9700
 
 ## Recommended configurations
 
-**For most use, just use VBR** — it picks the best codec per layer automatically and spends all your spare VRAM on quality:
+**For most use, VBR needs no cache flags** — it picks the best codec per layer automatically, spends
+all your spare VRAM on quality, and keeps a t4 quality floor:
 
 ```sh
-./build/bin/llama-server -m model.gguf -ngl 99 -ct vbr
+./build/bin/llama-server -m model.gguf -ngl 99
 ```
 
-The fixed-tier codecs below are for pinning a specific tier — benchmarking, a fixed budget, or a backend without VBR support.
+Use explicit `-ct vbr` to open the complete ladder to t1 for maximum context. The fixed-tier codecs
+below are for pinning a specific tier — benchmarking, a fixed budget, or a backend without VBR support.
 
 ### turbo4 (4.125 bpv) -- low divergence, great compression
 

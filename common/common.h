@@ -685,8 +685,13 @@ struct common_params {
     bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided
     bool vbr_vram_budget_explicit = false; // whether --vbr-vram/--vbr-vram-budget was provided
     bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
-    bool vbr_cache_type_k = false;      // whether K was selected via the VBR cache-type alias
-    bool vbr_cache_type_v = false;      // whether V was selected via the VBR cache-type alias
+    // Common CLI default: dynamic VBR on both sides. The underlying entry tensors remain F16;
+    // postprocessing supplies the friendly implicit t4 floor. Explicit `-ct vbr` is tracked
+    // separately and deliberately retains the full t1 ladder when no floor was typed.
+    bool vbr_cache_type_k = true;
+    bool vbr_cache_type_v = true;
+    bool vbr_cache_type_k_explicit = false;
+    bool vbr_cache_type_v_explicit = false;
     // dynamic VBR server policy: clear idle slots' KV before a degrade wave would land the
     // aggregate BELOW this bits/value. 8.125 = protect the f16/t8 near-lossless band (above it,
     // degrading beats destroying another client's re-prefillable cache); 0 = never reclaim;
