@@ -2252,10 +2252,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                                     (Q->ne[0] == 128 || Q->ne[0] == 256) && t1_fused_ok;
     // Asymmetric fused pairs, D=256 only (dense Qwen geometry). Both sides stay WHT-rotated like
     // the matched path (Q pre-rotated below, V un-rotated at graph level). The set = the q6 sweet
-    // spot (t8k/t4v) + every ADJACENT-TIER pair the dynamic VBR degrade ladder can create: the
-    // controller moves K and V of a layer independently but bands complete in order, so a live
-    // mixed layer only ever holds adjacent tiers. Uncovered pairs fall to the materialize path
-    // (measured -13-15% tg32 @ d8192), which band transits would sit in for thousands of tokens.
+    // spot (t8k/t4v) + the ADJACENT-TIER pairs of the dynamic VBR degrade ladder. NOTE the priced
+    // degrade orders are NOT banded: K and V of a layer move independently and can straddle up to
+    // 4 rungs (q27: K=t8:V=t3; g31: K=t8:V=t1 across long cursor ranges), so non-adjacent mixed
+    // layers DO occur live and fall to the materialize path (measured -13-15% tg32 @ d8192) for
+    // as long as the cursor sits in that range. Widening the fused set costs compile time.
     auto turbo_fused_asym_pair = [](ggml_type k, ggml_type v) {
         return (k == GGML_TYPE_TURBO8_0   && v == GGML_TYPE_TURBO4_0)   ||
                (k == GGML_TYPE_TURBO4_0   && v == GGML_TYPE_TURBO8_0)   ||

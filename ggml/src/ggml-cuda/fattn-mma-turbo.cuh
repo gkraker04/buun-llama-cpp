@@ -211,11 +211,11 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
 // Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only.
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO4_0)
-// Asymmetric ADJACENT-TIER pairs for the dynamic VBR degrade ladder, D=256 only. The controller
-// moves K and V of a layer independently, but bands complete before the next begins, so a live
-// mixed layer only ever holds an adjacent-tier pair (t8/t4, t4/t3, t3/t2, t2/t1 — either side).
-// Without a fused instance those layers fall to the materialize path for the whole band transit
-// (measured -13-15% tg32 @ d8192 when uniform).
+// Asymmetric pairs for the dynamic VBR degrade ladder, D=256 only. The priced degrade orders
+// move K and V of a layer independently and are NOT banded — a live mixed layer can straddle up
+// to 4 rungs (q27 holds K=t8:V=t3 across a multi-step cursor range; g31 holds K=t8:V=t1 across
+// long ranges). Only the ADJACENT-tier subset gets fused instances (compile-time budget); wider
+// straddles fall to the materialize path (measured -13-15% tg32 @ d8192 when uniform).
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0)
