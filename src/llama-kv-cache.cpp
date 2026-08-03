@@ -3004,6 +3004,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                if (idx < vbr_stash_rows_) {
+                    vbr_stash_dirty_ = true; // the SWA slot is about to hold a different token
+                }
                 cells.rm(idx);
             }
 
