@@ -4,6 +4,8 @@
 #include "llama-vbr-checkpoint-types.h"
 #include "llama-vbr-generation-types.h"
 
+#include "ggml.h"
+
 #include <array>
 #include <vector>
 
@@ -16,6 +18,24 @@ struct vbr_identity_policy_digest_row {
         checkpoint_child_dependency_mode::absent;
     vbr_lineage_uuid lineage_uuid = {};
 };
+
+// Canonical capture/controller type-vector identity. One shared recipe so F3
+// capture, downward validation, and phase-10 rechecks cannot drift.
+inline std::array<uint8_t, 32> vbr_type_vector_digest(
+        const ggml_type * types, size_t count) {
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] = "buun.vbr.capture/type-vector";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    for (size_t i = 0; i < count; ++i) {
+        writer.u32(static_cast<uint32_t>(types[i]));
+    }
+    return writer.finish();
+}
+
+inline std::array<uint8_t, 32> vbr_type_vector_digest(
+        const std::vector<ggml_type> & types) {
+    return vbr_type_vector_digest(types.data(), types.size());
+}
 
 inline std::array<uint8_t, 32> vbr_identity_policy_digest(
         const vbr_checkpoint_frontier_fields & frontier,

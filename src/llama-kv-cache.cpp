@@ -7759,6 +7759,8 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         child.types_after = child.types_before;
         child.final_cursor = child.start_cursor;
     }
+    // Selection-coherence rule mirrors the downward projection's apply in
+    // vbr_downward_project_policy_prefix — keep the two in sync.
     for (const auto & selected : tx.policy_prefix) {
         if (selected.child_index >= tx.children.size()) {
             return false;

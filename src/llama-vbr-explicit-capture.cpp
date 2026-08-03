@@ -652,16 +652,14 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             policy.n_stream = child.units.front().n_stream;
             policy.unified = child.units.front().unified;
             policy.wm_cells = child.units.front().wm_cells;
-            llama_sha256_writer types;
-            static constexpr char TYPE_VECTOR_DOMAIN[] =
-                "buun.vbr.capture/type-vector";
-            types.string(
-                TYPE_VECTOR_DOMAIN,
-                sizeof(TYPE_VECTOR_DOMAIN) - 1);
+            std::vector<ggml_type> current_types;
+            current_types.reserve(child.units.size());
             for (const auto & unit : child.units) {
-                types.u32(uint32_t(unit.generation.current_type));
+                current_types.push_back(
+                    static_cast<ggml_type>(unit.generation.current_type));
             }
-            policy.current_type_vector_digest = types.finish();
+            policy.current_type_vector_digest =
+                vbr_type_vector_digest(current_types);
             policy.completed_wave = child.stability.completed_wave;
             package.manifest.controller_policy.push_back(policy);
 
