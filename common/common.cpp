@@ -395,6 +395,46 @@ void common_init() {
     llama_log_set(common_log_default_callback, NULL);
 }
 
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+        common_params & params, bool has_gpu) {
+    if (!params.vbr_enabled() ||
+        (has_gpu && params.n_gpu_layers != 0 && !params.no_kv_offload)) {
+        return common_vbr_cpu_fallback_result::not_needed;
+    }
+
+    // Only the untouched common default may fall back. Every explicit VBR
+    // selector remains armed so the core emits its existing hard refusal.
+    const bool explicit_vbr =
+        params.vbr_cache_type_k_explicit ||
+        params.vbr_cache_type_v_explicit ||
+        params.vbr_budget_explicit ||
+        params.vbr_min_bits_explicit ||
+        params.vbr_vram_budget_explicit ||
+        params.vbr_policy_explicit;
+    if (explicit_vbr) {
+        return common_vbr_cpu_fallback_result::explicit_vbr;
+    }
+
+    // Reset ONLY the sides the implicit vbr alias holds. A side the user set to
+    // an explicit non-VBR type (e.g. -ctk q8_0) carries no vbr flag and must
+    // keep its type — arg.cpp's intent-preservation rule.
+    if (params.vbr_cache_type_k) {
+        params.vbr_cache_type_k = false;
+        params.cache_type_k = GGML_TYPE_F16;
+    }
+    if (params.vbr_cache_type_v) {
+        params.vbr_cache_type_v = false;
+        params.cache_type_v = GGML_TYPE_F16;
+    }
+    // Drop the derived t4 floor that was attached to the implicit aliases.
+    // It is not marked explicit, but common_context_params_to_llama transports
+    // the scalar independently and would otherwise re-arm VBR.
+    params.vbr_min_bits = "auto";
+    params.vbr_min_bits_value = 0.0;
+    params.vbr_capacity_bits = 0.0;
+    return common_vbr_cpu_fallback_result::applied;
+}
+
 void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";
@@ -1233,6 +1273,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
         // effective value, never the unresolved -1 sentinel
         params.n_gpu_layers = mparams.n_gpu_layers;
+        if (common_params_apply_vbr_cpu_fallback(params, true) ==
+                common_vbr_cpu_fallback_result::applied) {
+            COM_WRN("%s", "implicit VBR auto-fit resolved to CPU KV placement; using static f16 KV cache\n");
+            cparams = common_context_params_to_llama(params);
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1355,6 +1400,25 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    bool has_gpu = false;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    }
+    const auto vbr_fallback = model_only
+        ? common_vbr_cpu_fallback_result::not_needed
+        : common_params_apply_vbr_cpu_fallback(params, has_gpu);
+    if (vbr_fallback == common_vbr_cpu_fallback_result::applied) {
+        COM_WRN("%s", "implicit VBR requires GPU KV placement; using static f16 KV cache\n");
+    }
     llama_vram_load_begin(false);
     bool load_succeeded = false;
     struct load_scope {

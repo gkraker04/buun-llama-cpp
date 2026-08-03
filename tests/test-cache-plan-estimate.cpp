@@ -258,6 +258,10 @@ static void test_vbr_file_override_identity() {
     // successful tokens have census order; a later unreadable file latches refusal without
     // erasing either earlier or later successfully represented tokens.
     common_params params;
+    // This estimator fixture tests the unarmed/static regime independent of
+    // the common CLI's ambient cache default.
+    params.vbr_cache_type_k = false;
+    params.vbr_cache_type_v = false;
     int getenv_calls = 0;
     const auto no_env = [&](const char *) -> const char * {
         getenv_calls++;

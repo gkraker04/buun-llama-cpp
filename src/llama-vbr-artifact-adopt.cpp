@@ -81,6 +81,9 @@ const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept {
         case vbr_adopt_status::invalid_capability_pair: return "invalid_capability_pair";
         case vbr_adopt_status::unsupported_decision: return "unsupported_decision";
         case vbr_adopt_status::downward_deferred: return "downward_deferred";
+        case vbr_adopt_status::downward_recipe_invalid: return "downward_recipe_invalid";
+        case vbr_adopt_status::downward_transform_failed: return "downward_transform_failed";
+        case vbr_adopt_status::downward_stash_unavailable: return "downward_stash_unavailable";
         case vbr_adopt_status::target_drift: return "target_drift";
         case vbr_adopt_status::operation_unavailable: return "operation_unavailable";
         case vbr_adopt_status::recovery_unavailable: return "recovery_unavailable";
@@ -234,12 +237,17 @@ class vbr_kv_import_session {
     struct extent_prefix {
         llama_kv_cache::vbr_pool * pool = nullptr;
         llama_kv_cache::vbr_extent * extent = nullptr;
-        uint64_t row_bytes = 0;
+        // Downward adoption must first map enough private backing for the
+        // source-tier H2D image.  The phase-12 invariant is the (possibly
+        // smaller) target-tier prefix left after the fallible transform.
+        uint64_t mapped_row_bytes = 0;
+        uint64_t final_row_bytes = 0;
     };
     struct final_unit_metadata {
         uint32_t logical_unit = UINT32_MAX;
         uint32_t stash_valid = 0;
         uint8_t promote_hops = 0;
+        ggml_type target_type = GGML_TYPE_COUNT;
     };
 
     vbr_kv_import_session(llama_kv_cache & cache, uint32_t child_id,
@@ -317,8 +325,16 @@ class vbr_kv_import_session {
         try {
             unit_complete_.assign(cache_->vbr_generation_tracker_get()->unit_count(), false);
             final_watermarks_.assign(cache_->vbr_pools_.size(), 0);
+            pool_indices_.clear();
+            unit_by_pool_.clear();
+            final_unit_indices_.clear();
+            for (size_t i = 0; i < cache_->vbr_pools_.size(); ++i) {
+                pool_indices_[&cache_->vbr_pools_[i]] = i;
+            }
+            // derived per call; never read outside prepare_backing
+            std::vector<uint32_t> backing_watermarks(cache_->vbr_pools_.size(), 0);
             for (const auto * plan : plans) {
-                if (!plan || plan->child_id != child_id_ || plan->downward ||
+                if (!plan || plan->child_id != child_id_ ||
                     plan->logical_unit_id >= unit_complete_.size()) {
                     return false;
                 }
@@ -329,13 +345,30 @@ class vbr_kv_import_session {
                         ? uint32_t(plan->descriptor.clean_stash.valid_rows)
                         : 0,
                     plan->descriptor.promote_hops,
+                    static_cast<ggml_type>(plan->selected_target_type),
                 });
+                final_unit_indices_[plan->logical_unit_id] =
+                    final_units_.size()-1;
+                if (plan->downward) {
+                    const auto inserted = source_types_.emplace(
+                        plan->logical_unit_id,
+                        plan->transcode_recipe.source_type);
+                    if (!inserted.second &&
+                        inserted.first->second !=
+                            plan->transcode_recipe.source_type) {
+                        return false;
+                    }
+                }
                 const size_t ikv = plan->logical_unit_id/2;
                 const bool is_v = (plan->logical_unit_id & 1u) != 0;
                 if (ikv >= cache_->layers.size() ||
                     plan->shards.size() !=
                         cache_->vbr_units_of(ikv, is_v).size()) {
                     return false;
+                }
+                for (const auto & unit : cache_->vbr_units_of(ikv, is_v)) {
+                    unit_by_pool_[{ plan->logical_unit_id, unit.first }] =
+                        unit.second;
                 }
                 for (const auto & shard : plan->shards) {
                     auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
@@ -356,8 +389,16 @@ class vbr_kv_import_session {
                     if (unit_it == units.end() || !unit_it->second ||
                         unit_it->second->t == nullptr || pool->vmm == nullptr ||
                         pool->be == nullptr || pool->backend == nullptr ||
-                        uint64_t(ggml_row_size(unit_it->second->t->type,
-                                               unit_it->second->t->ne[0])) != shard.row_bytes) {
+                        uint64_t(ggml_row_size(
+                            plan->downward
+                                ? plan->transcode_recipe.source_type
+                                : unit_it->second->t->type,
+                            unit_it->second->t->ne[0])) != shard.row_bytes ||
+                        (plan->downward &&
+                         uint64_t(ggml_row_size(
+                            unit_it->second->t->type,
+                            unit_it->second->t->ne[0])) !=
+                            shard.target_row_bytes)) {
                         return false;
                     }
                     if (std::none_of(extent_prefixes_.begin(), extent_prefixes_.end(),
@@ -366,8 +407,21 @@ class vbr_kv_import_session {
                                        value.extent == unit_it->second;
                             })) {
                         extent_prefixes_.push_back({
-                            pool, unit_it->second, shard.row_bytes,
+                            pool, unit_it->second,
+                            shard.row_bytes,
+                            plan->downward ? shard.target_row_bytes
+                                           : shard.row_bytes,
                         });
+                    }
+                    const size_t pool_index = size_t(
+                        pool_it-cache_->vbr_pools_.begin());
+                    if (plan->downward) {
+                        if (plan->descriptor.wm_cells > UINT32_MAX) {
+                            return false;
+                        }
+                        backing_watermarks[pool_index] = std::max(
+                            backing_watermarks[pool_index],
+                            uint32_t(plan->descriptor.wm_cells));
                     }
                     for (const auto & run : plan->authorized_runs) {
                         if (run.cell_count == 0 ||
@@ -396,6 +450,10 @@ class vbr_kv_import_session {
                     }
                 }
             }
+            for (size_t i = 0; i < final_watermarks_.size(); ++i) {
+                backing_watermarks[i] = std::max(
+                    backing_watermarks[i], final_watermarks_[i]);
+            }
             // H1: mapping is an extent-prefix invariant, not merely the union
             // of authorized copy runs.  Foreign rows remain untouched, but
             // every extent is backed over [0, final_watermark) before publish.
@@ -406,16 +464,18 @@ class vbr_kv_import_session {
                         return &value == prefix.pool;
                     });
                 if (pool_it == cache_->vbr_pools_.end() ||
-                    !prefix.extent || prefix.row_bytes == 0 ||
+                    !prefix.extent || prefix.mapped_row_bytes == 0 ||
+                    prefix.final_row_bytes == 0 ||
                     prefix.pool->gran == 0) {
                     return false;
                 }
-                const uint64_t watermark = final_watermarks_[
+                const uint64_t watermark = backing_watermarks[
                     size_t(pool_it-cache_->vbr_pools_.begin())];
-                if (watermark == 0 || watermark > UINT64_MAX/prefix.row_bytes) {
+                if (watermark == 0 ||
+                    watermark > UINT64_MAX/prefix.mapped_row_bytes) {
                     return false;
                 }
-                const uint64_t bytes64 = watermark*prefix.row_bytes;
+                const uint64_t bytes64 = watermark*prefix.mapped_row_bytes;
                 if (prefix.extent->byte_off > prefix.pool->size ||
                     bytes64 > prefix.pool->size-prefix.extent->byte_off ||
                     bytes64 > std::numeric_limits<size_t>::max()) {
@@ -472,7 +532,16 @@ class vbr_kv_import_session {
             read.lane == UINT32_MAX) {
             return false;
         }
+        ggml_tensor source_alias;
         ggml_tensor * destination = extent->t;
+        const auto source_type = source_types_.find(read.logical_unit_id);
+        if (source_type != source_types_.end()) {
+            if (!cache_->vbr_import_source_alias(
+                    *extent->t, source_type->second, source_alias)) {
+                return false;
+            }
+            destination = &source_alias;
+        }
         uint64_t destination_offset = read.source_offset;
         if (read.kind == vbr_staged_read_kind::clean_stash) {
             destination = stash_alias(*pool, *extent, read.size);
@@ -508,6 +577,167 @@ class vbr_kv_import_session {
             return false;
         }
         unit_complete_[unit] = true;
+        return true;
+    }
+
+    bool initialize_downward_backing(
+            const vbr_validated_child_plan & plan) noexcept {
+        if (test_seam_) {
+            return armed_ && plan.downward &&
+                test_seam_->session_initialize_downward_backing(
+                    child_id_, plan);
+        }
+        if (!armed_ || !plan.downward ||
+            plan.logical_unit_id/2 >= cache_->layers.size()) {
+            return false;
+        }
+        // The live CUDA edge kernels operate on a dense prefix. Initialize
+        // that private backing to zero before overlaying only the authorized
+        // reference rows; zeroed foreign positions are transformed but never
+        // published, owned, or exposed by the imported reference.
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            auto * extent = unit_for_pool(plan.logical_unit_id, pool);
+            if (!pool || !extent || !extent->t ||
+                !pool->backend || pool->device < 0 ||
+                !pool->be || !pool->be->tensor_memset_async ||
+                shard.row_bytes == 0 ||
+                plan.descriptor.wm_cells > UINT64_MAX/shard.row_bytes) {
+                return false;
+            }
+            const uint64_t bytes =
+                plan.descriptor.wm_cells*shard.row_bytes;
+            ggml_tensor source_alias;
+            if (bytes == 0 || bytes > SIZE_MAX ||
+                !cache_->vbr_import_source_alias(
+                    *extent->t, plan.transcode_recipe.source_type,
+                    source_alias)) {
+                return false;
+            }
+            // Same side-backend stream as the following H2D and transcode
+            // submissions: the clear is ordered before authorized row overlays.
+            pool->be->tensor_memset_async(
+                pool->backend, &source_alias, 0, size_t(bytes));
+        }
+        return true;
+    }
+
+    vbr_downward_transform_status transform_downward(
+            const vbr_validated_child_plan & plan,
+            bool stashless, uint32_t fail_edge, bool fail_stash,
+            uint32_t & stash_valid, uint32_t & edge_reached) noexcept {
+        edge_reached = UINT32_MAX;
+        if (test_seam_) {
+            return test_seam_->session_transform_downward(
+                child_id_, plan, stashless, fail_edge, fail_stash,
+                stash_valid, edge_reached);
+        }
+        if (!armed_ || !plan.downward || fail_stash) {
+            return fail_stash
+                ? vbr_downward_transform_status::stash_unavailable
+                : vbr_downward_transform_status::invalid_recipe;
+        }
+        if (fail_edge < plan.transcode_recipe.n_edges) {
+            edge_reached = fail_edge;
+            return vbr_downward_transform_status::transform_failed;
+        }
+        return cache_->vbr_downward_transform_import(
+            plan, stashless, stash_valid, edge_reached);
+    }
+
+    bool synchronize_downward(
+            const std::vector<const vbr_validated_child_plan *> & plans) noexcept {
+        if (test_seam_) {
+            return test_seam_->session_synchronize_downward(child_id_, plans);
+        }
+        try {
+            std::set<ggml_backend_t> backends;
+            for (const auto * plan : plans) {
+                if (!plan || !plan->downward) {
+                    return false;
+                }
+                for (const auto & shard : plan->shards) {
+                    auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
+                        const_cast<void *>(shard.target_pool_cookie));
+                    if (!pool || !pool->backend) {
+                        return false;
+                    }
+                    backends.insert(pool->backend);
+                }
+            }
+            for (ggml_backend_t backend : backends) {
+                ggml_backend_synchronize(backend);
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool trim_source_tier_tail(
+            const vbr_validated_child_plan & plan,
+            uint32_t stash_valid) noexcept {
+        if (test_seam_) {
+            return test_seam_->session_trim_downward(
+                child_id_, plan, stash_valid);
+        }
+        if (!armed_ || !plan.downward) {
+            return false;
+        }
+        // Trim the source-tier tail after the side stream has completed. Keep
+        // the rollback journal's physical-range image exact so rollback unmaps
+        // only the surviving target prefix rather than relying on double-unmap
+        // tolerance from a backend.
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<llama_kv_cache::vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            auto * extent = unit_for_pool(plan.logical_unit_id, pool);
+            const size_t pool_index = pool_index_of(pool);
+            if (!extent || pool_index == SIZE_MAX ||
+                pool->gran == 0) {
+                return false;
+            }
+            const uint64_t watermark = final_watermarks_[
+                pool_index];
+            if (shard.target_row_bytes == 0 ||
+                watermark > SIZE_MAX/shard.target_row_bytes) {
+                return false;
+            }
+            const size_t bytes =
+                size_t(watermark*shard.target_row_bytes);
+            const size_t absolute = extent->byte_off;
+            const size_t first = (absolute/pool->gran)*pool->gran;
+            if (absolute > SIZE_MAX-bytes ||
+                absolute+bytes > SIZE_MAX-(pool->gran-1)) {
+                return false;
+            }
+            const size_t last =
+                ((absolute+bytes+pool->gran-1)/pool->gran)*pool->gran;
+            const auto range = std::find_if(
+                mapped_.begin(), mapped_.end(),
+                [&](const mapped_range & value) {
+                    return value.pool == pool && value.offset == first;
+                });
+            if (range == mapped_.end() || last < first ||
+                last-first > range->size) {
+                return false;
+            }
+            const size_t final_size = last-first;
+            if (range->size > final_size &&
+                !pool->be->vmm_pool_unmap(
+                    pool->vmm, range->offset+final_size,
+                    range->size-final_size)) {
+                return false;
+            }
+            range->size = final_size;
+        }
+        const auto metadata = final_unit_indices_.find(plan.logical_unit_id);
+        if (metadata == final_unit_indices_.end()) {
+            return false;
+        }
+        final_units_[metadata->second].stash_valid = stash_valid;
+        final_units_[metadata->second].promote_hops = 0;
         return true;
     }
 
@@ -582,9 +812,14 @@ class vbr_kv_import_session {
                     tracker_image_)) {
                 return false;
             }
-            final_cursor_ = plans.front()->controller_policy.cursor;
+            final_cursor_ = plans.front()->downward
+                ? plans.front()->target_controller_cursor
+                : plans.front()->controller_policy.cursor;
             for (const auto * plan : plans) {
-                if (plan->controller_policy.cursor != final_cursor_) {
+                const uint64_t cursor = plan->downward
+                    ? plan->target_controller_cursor
+                    : plan->controller_policy.cursor;
+                if (cursor != final_cursor_) {
                     return false;
                 }
             }
@@ -621,7 +856,7 @@ class vbr_kv_import_session {
             return test_seam_->session_mapped_prefixes_complete(child_id_);
         }
         for (const auto & prefix : extent_prefixes_) {
-            if (!prefix.pool || !prefix.extent || prefix.row_bytes == 0) {
+            if (!prefix.pool || !prefix.extent || prefix.final_row_bytes == 0) {
                 return false;
             }
             const auto pool_it = std::find_if(
@@ -634,10 +869,11 @@ class vbr_kv_import_session {
             }
             const uint64_t watermark = final_watermarks_[
                 size_t(pool_it-cache_->vbr_pools_.begin())];
-            if (watermark == 0 || watermark > UINT64_MAX/prefix.row_bytes) {
+            if (watermark == 0 ||
+                watermark > UINT64_MAX/prefix.final_row_bytes) {
                 return false;
             }
-            const uint64_t bytes64 = watermark*prefix.row_bytes;
+            const uint64_t bytes64 = watermark*prefix.final_row_bytes;
             if (bytes64 > std::numeric_limits<size_t>::max()) {
                 return false;
             }
@@ -689,6 +925,8 @@ class vbr_kv_import_session {
                 unit.second->stash_valid = metadata.stash_valid;
                 unit.second->promote_hops = metadata.promote_hops;
             }
+            cache_->vbr_import_set_unit_type_noalloc(
+                metadata.logical_unit, metadata.target_type);
         }
         cache_->vbr_degrade_cursor_ = size_t(final_cursor_);
         if (cache_->vbr_representation_epoch_ != UINT64_MAX) {
@@ -826,6 +1064,18 @@ class vbr_kv_import_session {
         }
     }
 
+    llama_kv_cache::vbr_extent * unit_for_pool(
+            uint32_t logical_unit, llama_kv_cache::vbr_pool * pool) const noexcept {
+        const auto it = unit_by_pool_.find({ logical_unit, pool });
+        return it == unit_by_pool_.end() ? nullptr : it->second;
+    }
+
+    size_t pool_index_of(
+            llama_kv_cache::vbr_pool * pool) const noexcept {
+        const auto it = pool_indices_.find(pool);
+        return it == pool_indices_.end() ? SIZE_MAX : it->second;
+    }
+
     llama_kv_cache * cache_ = nullptr;
     uint32_t child_id_ = UINT32_MAX;
     llama_seq_id destination_ = -1;
@@ -838,6 +1088,11 @@ class vbr_kv_import_session {
     std::vector<ggml_context_ptr> stash_contexts_;
     std::vector<bool> unit_complete_;
     std::vector<final_unit_metadata> final_units_;
+    std::map<llama_kv_cache::vbr_pool *, size_t> pool_indices_;
+    std::map<std::pair<uint32_t, llama_kv_cache::vbr_pool *>,
+             llama_kv_cache::vbr_extent *> unit_by_pool_;
+    std::map<uint32_t, size_t> final_unit_indices_;
+    std::map<uint32_t, ggml_type> source_types_;
     std::vector<uint32_t> final_watermarks_;
     std::vector<llama_kv_cells> final_cells_;
     std::vector<uint32_t> final_heads_;
@@ -1081,6 +1336,88 @@ vbr_adopt_status transaction_status(
     return vbr_adopt_status::accounting_unavailable;
 }
 
+vbr_adopt_status downward_source_h2d(
+        std::map<uint32_t, vbr_adopt_child_work> & children,
+        const vbr_validated_manifest & manifest) noexcept {
+    for (const auto & plan : manifest.children()) {
+        const auto child = children.find(plan.child_id);
+        if (!plan.downward || child == children.end() ||
+            !child->second.session->initialize_downward_backing(plan)) {
+            return vbr_adopt_status::transfer_failed;
+        }
+    }
+    return vbr_adopt_status::adopted;
+}
+
+vbr_adopt_status downward_transform_all(
+        std::map<uint32_t, vbr_adopt_child_work> & children,
+        const vbr_validated_manifest & manifest,
+        const vbr_staged_payloads & staged,
+        const vbr_composite_publish_hooks & hooks,
+        vbr_adopt_result & out) noexcept {
+    const std::set<uint64_t> stashless(
+        staged.downward_stashless_units().begin(),
+        staged.downward_stashless_units().end());
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> stash_valid;
+    for (const auto & plan : manifest.children()) {
+        if (!plan.downward) {
+            return vbr_adopt_status::downward_recipe_invalid;
+        }
+        const auto child = children.find(plan.child_id);
+        if (child == children.end()) {
+            return vbr_adopt_status::downward_recipe_invalid;
+        }
+        const bool omit_stash = stashless.count(vbr_downward_unit_key(
+            plan.child_id, plan.logical_unit_id)) != 0;
+        uint32_t valid = 0;
+        uint32_t edge = UINT32_MAX;
+        out.downward_subphase = vbr_downward_adopt_subphase::edge_transcode;
+        const auto status = child->second.session->transform_downward(
+            plan, omit_stash,
+            hooks.test ? hooks.test->fault.fail_downward_edge : UINT32_MAX,
+            hooks.test && hooks.test->fault.fail_downward_stash,
+            valid, edge);
+        out.downward_edge = edge;
+        switch (status) {
+            case vbr_downward_transform_status::transformed:
+                stash_valid[{ plan.child_id, plan.logical_unit_id }] = valid;
+                break;
+            case vbr_downward_transform_status::invalid_recipe:
+                return vbr_adopt_status::downward_recipe_invalid;
+            case vbr_downward_transform_status::stash_unavailable:
+                out.downward_subphase =
+                    vbr_downward_adopt_subphase::edge_stash_capture;
+                return vbr_adopt_status::downward_stash_unavailable;
+            case vbr_downward_transform_status::transform_failed:
+            case vbr_downward_transform_status::internal_error:
+            case vbr_downward_transform_status::_count:
+                return vbr_adopt_status::downward_transform_failed;
+        }
+    }
+    // Every edge is now enqueued. Synchronize each distinct side backend once
+    // before the completion fault seam or any destructive tail trim.
+    for (auto & child : children) {
+        if (!child.second.session->synchronize_downward(child.second.plans)) {
+            return vbr_adopt_status::downward_transform_failed;
+        }
+    }
+    out.downward_subphase = vbr_downward_adopt_subphase::edge_completion;
+    if (hooks.test && hooks.test->fault.fail_downward_completion) {
+        return vbr_adopt_status::downward_transform_failed;
+    }
+    for (const auto & plan : manifest.children()) {
+        const auto child = children.find(plan.child_id);
+        const auto valid = stash_valid.find({
+            plan.child_id, plan.logical_unit_id });
+        if (child == children.end() || valid == stash_valid.end() ||
+            !child->second.session->trim_source_tier_tail(
+                plan, valid->second)) {
+            return vbr_adopt_status::downward_transform_failed;
+        }
+    }
+    return vbr_adopt_status::adopted;
+}
+
 } // namespace
 
 vbr_adopt_result vbr_adopt_empty_manifest(
@@ -1161,12 +1498,14 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         out.consistency = manifest->decision() == vbr_import_decision::native_import
             ? vbr_artifact_consistency_kind::capture_exact
             : vbr_artifact_consistency_kind::live_rebased;
-        if (out.decision == vbr_import_decision::downward_rebase) {
-            return fail(vbr_adopt_status::downward_deferred);
-        }
         if (out.decision != vbr_import_decision::native_import &&
-            out.decision != vbr_import_decision::live_rebased) {
+            out.decision != vbr_import_decision::live_rebased &&
+            out.decision != vbr_import_decision::downward_rebase) {
             return fail(vbr_adopt_status::unsupported_decision);
+        }
+        if (out.decision == vbr_import_decision::downward_rebase &&
+            !staged->downward_resources_ready()) {
+            return fail(vbr_adopt_status::accounting_unavailable);
         }
         if (fault_after(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::internal_error);
@@ -1295,12 +1634,22 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
 
         out.phase = vbr_adopt_phase::unit_h2d;
+        if (out.decision == vbr_import_decision::downward_rebase) {
+            out.downward_subphase =
+                vbr_downward_adopt_subphase::source_h2d;
+        }
         if (fault_before(server_hooks, out.phase) ||
             (!test_target(server_hooks) && !staged->adoption_ring())) {
             return fail(vbr_adopt_status::transfer_failed);
         }
         std::map<std::pair<uint32_t, uint32_t>, uint32_t> transferred_units;
         uint64_t completion = 0;
+        if (out.decision == vbr_import_decision::downward_rebase) {
+            const auto status = downward_source_h2d(children, *manifest);
+            if (status != vbr_adopt_status::adopted) {
+                return fail(status);
+            }
+        }
         for (const auto & read : staged->reads()) {
             if (read.kind != vbr_staged_read_kind::unit_payload) {
                 continue;
@@ -1327,6 +1676,13 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             out.h2d_chunks += stats.chunks;
             ++transferred_units[std::make_pair(
                 read.child_id, read.logical_unit_id)];
+        }
+        if (out.decision == vbr_import_decision::downward_rebase) {
+            const auto status = downward_transform_all(
+                children, *manifest, *staged, server_hooks, out);
+            if (status != vbr_adopt_status::adopted) {
+                return fail(status);
+            }
         }
         if (fault_after(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::transfer_failed);
@@ -1432,16 +1788,32 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         }
 
         out.phase = vbr_adopt_phase::complete_tree_barrier;
+        if (fault_before(server_hooks, out.phase)) {
+            return fail(vbr_adopt_status::barrier_failed);
+        }
         auto barrier_fingerprint = manifest->target();
         barrier_fingerprint.accounting_serial = post_commit_serial;
-        if (fault_before(server_hooks, out.phase) ||
-            accounting.snapshot().serial != post_commit_serial ||
+        std::array<uint8_t, 32> downward_tree_digest = {};
+        const bool downward_projection_stable =
+            out.decision != vbr_import_decision::downward_rebase ||
+            (manifest->read_downward_tree_digest_ != nullptr &&
+             manifest->read_downward_tree_digest_(
+                manifest->recheck_context_, downward_tree_digest) &&
+             std::all_of(
+                manifest->children().begin(), manifest->children().end(),
+                [&](const vbr_validated_child_plan & plan) {
+                    return !plan.downward ||
+                           plan.transcode_tree_digest ==
+                               downward_tree_digest;
+                }));
+        if (accounting.snapshot().serial != post_commit_serial ||
             !manifest->recheck_target_empty_(
                 manifest->recheck_context_, barrier_fingerprint) ||
             manifest->read_accounting_serial_(manifest->recheck_context_) !=
                 post_commit_serial ||
             manifest->read_policy_epoch_(manifest->recheck_context_) !=
                 manifest->target().policy_epoch ||
+            !downward_projection_stable ||
             !operation_quiescent(operation, server_hooks) ||
             manifest->source_package().validate() != vbr_artifact_status::ok) {
             return fail(vbr_adopt_status::barrier_failed);

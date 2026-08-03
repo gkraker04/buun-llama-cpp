@@ -13,6 +13,9 @@
 #include <vector>
 
 constexpr uint32_t VBR_DOWNWARD_RECIPE_VERSION = 1;
+// Recipe FAMILY id ("PQ2=A adjacent-chain recipe-v1"); distinct from the
+// serialization version above. Proofs carry both.
+constexpr uint32_t VBR_DOWNWARD_RECIPE_ID = 1;
 
 enum class vbr_downward_recipe_status : uint8_t {
     resolved = 0,
@@ -33,6 +36,14 @@ struct vbr_downward_edge {
     vbr_repr_domain source_domain = vbr_repr_domain::full;
     vbr_repr_domain target_domain = vbr_repr_domain::full;
     bool capture_stash_before = false;
+
+    bool operator==(const vbr_downward_edge & other) const noexcept {
+        return source_type == other.source_type &&
+               target_type == other.target_type &&
+               source_domain == other.source_domain &&
+               target_domain == other.target_domain &&
+               capture_stash_before == other.capture_stash_before;
+    }
 };
 
 struct vbr_downward_recipe {
@@ -41,7 +52,35 @@ struct vbr_downward_recipe {
     ggml_type target_type = GGML_TYPE_COUNT;
     std::array<vbr_downward_edge, 5> edges = {};
     size_t n_edges = 0;
+
+    bool operator==(const vbr_downward_recipe & other) const noexcept {
+        if (version != other.version || source_type != other.source_type ||
+            target_type != other.target_type || n_edges != other.n_edges ||
+            n_edges > edges.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < n_edges; ++i) {
+            if (!(edges[i] == other.edges[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
+
+// The stash-boundary rule is downward-owned; callers must not re-derive it.
+inline bool vbr_downward_recipe_needs_stash(const vbr_downward_recipe & recipe) noexcept {
+    for (size_t i = 0; i < recipe.n_edges && i < recipe.edges.size(); ++i) {
+        if (recipe.edges[i].capture_stash_before) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Canonical tier-domain rule (F16/T8 = full, else tapped), proof-relevant in
+// both the cache snapshot and the validator.
+vbr_repr_domain vbr_downward_tier_domain(ggml_type type) noexcept;
 
 vbr_downward_recipe_status vbr_downward_resolve_recipe(
         ggml_type source_type,
@@ -49,6 +88,13 @@ vbr_downward_recipe_status vbr_downward_resolve_recipe(
         ggml_type floor_type,
         bool movable,
         vbr_downward_recipe & out) noexcept;
+
+std::array<uint8_t, 32> vbr_downward_build_identity(
+        const vbr_downward_recipe & recipe,
+        int32_t meansub_model_id,
+        const std::array<uint8_t, 32> & meansub_digest,
+        const std::array<uint8_t, 32> & policy_digest,
+        const std::array<uint8_t, 32> & tree_digest) noexcept;
 
 enum class vbr_downward_policy_status : uint8_t {
     coherent = 0,
@@ -68,12 +114,14 @@ struct vbr_downward_policy_child {
     llama_vbr_policy::child policy;
     std::vector<ggml_type> initial_types;
     std::vector<ggml_type> target_types;
+    uint64_t initial_cursor = 0;
 };
 
 struct vbr_downward_policy_projection {
     vbr_downward_policy_status status = vbr_downward_policy_status::invalid;
     std::vector<llama_vbr_policy::selection> prefix;
     std::vector<std::vector<ggml_type>> final_types;
+    std::vector<uint64_t> final_cursors;
     std::vector<std::array<uint8_t, 32>> child_type_digests;
     std::array<uint8_t, 32> tree_digest = {};
 };
@@ -128,6 +176,19 @@ struct vbr_downward_reserve_result {
     uint64_t stash_growth = 0;
     std::vector<uint64_t> stashless_units;
 };
+
+struct vbr_downward_stage_reservation {
+    vbr_downward_reserve_status status =
+        vbr_downward_reserve_status::internal_error;
+    std::vector<uint64_t> stashless_units;
+};
+
+inline uint64_t vbr_downward_unit_key(
+        uint32_t child_id, uint32_t logical_unit_id) noexcept {
+    // Zero is the closed endpoint API's invalid sentinel. The all-ones tuple
+    // therefore fails closed to zero instead of aliasing a live unit.
+    return ((uint64_t(child_id) << 32) | logical_unit_id) + 1;
+}
 
 // Owns the C references for persistent endpoints. The resource allocation and
 // its accounting receipt intentionally have the same side-backend/pool
@@ -194,6 +255,22 @@ struct vbr_downward_transform_result {
     std::vector<uint8_t> stash;
     bool stash_regenerated = false;
 };
+
+// The single canonical recipe walk.  CPU byte fixtures and the live KV
+// importer adapt their representation-specific state to these two doors; the
+// chain validation, stash boundary and edge order live here exactly once.
+struct vbr_downward_edge_driver {
+    void * context = nullptr;
+    bool (*stash_available)(void *) noexcept = nullptr;
+    bool (*capture_stash)(void *, const vbr_downward_edge &) noexcept = nullptr;
+    bool (*transcode)(void *, const vbr_downward_edge &) noexcept = nullptr;
+};
+
+vbr_downward_transform_status vbr_downward_execute_edges(
+        const vbr_downward_recipe & recipe,
+        const vbr_downward_edge_driver & driver,
+        bool & stash_regenerated,
+        uint32_t * edge_reached = nullptr) noexcept;
 
 // Injected CPU door used by the edge oracle now and by the live kernel adapter
 // in F4.2b-2. Intermediate recipe tiers are never published.

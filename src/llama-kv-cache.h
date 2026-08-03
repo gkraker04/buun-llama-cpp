@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 #include "llama-vbr-generation.h"
+#include "llama-vbr-downward.h"
 #include "llama-vbr-policy.h"
 #include "llama-vbr-transaction.h"
 
@@ -30,6 +31,8 @@ struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
 class vbr_kv_import_session;
+struct vbr_validated_child_plan;
+struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
 struct vbr_capture_stream_stats;
 enum class vbr_explicit_generation_failure : uint8_t;
@@ -468,6 +471,37 @@ private:
         vbr_explicit_generation_failure * failure = nullptr) const noexcept;
     bool vbr_capture_policy_snapshot(
         vbr_capture_stability_token & output) const noexcept;
+    bool vbr_downward_reserve_import(
+        const std::vector<const vbr_validated_child_plan *> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept;
+    bool vbr_downward_policy_input(
+        const std::vector<ggml_type> & source_types,
+        uint64_t source_cursor,
+        uint32_t projected_wm_cells,
+        int demanded_device,
+        vbr_downward_policy_child & output) const noexcept;
+    bool vbr_policy_priced_steps(
+        std::vector<ggml_type> & sim, size_t start_cursor,
+        int demanded_device, uint32_t watermark, bool fixed_watermark,
+        bool fail_closed, llama_vbr_policy::child & output) const;
+    bool vbr_downward_bind_target_unit(
+        ggml_type source_type,
+        const vbr_downward_policy_projection & projection,
+        uint32_t projection_child,
+        vbr_target_unit_snapshot & output) const noexcept;
+    vbr_downward_transform_status vbr_downward_transform_import(
+        const vbr_validated_child_plan & plan,
+        bool stashless,
+        uint32_t & stash_valid,
+        uint32_t & edge_reached) noexcept;
+    bool vbr_import_source_alias(
+        const ggml_tensor & destination,
+        ggml_type source_type,
+        ggml_tensor & output) const noexcept;
+    void vbr_import_set_unit_type_noalloc(
+        uint32_t logical_unit, ggml_type type) noexcept;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -565,6 +599,10 @@ private:
         // tier mutation and makes current/projected physical occupancy exactly queryable.
         struct ggml_vbr_vmm_pool * stash_vmm = nullptr;
         size_t                     stash_size = 0;       // page-padded VA reservation size
+        // F4.2b persistent workspace/stash receipts have exactly the owning
+        // pool/side-backend lifetime.  The ledger remains the charge-once
+        // authority; this holder owns only the committed C references.
+        std::unique_ptr<vbr_downward_resource_receipts> downward_receipts;
     };
     // A share-linked cache aliases another context's K/V tensors but executes attention on
     // this context's compute backends. Since fattn scratch is backend-context-owned, each

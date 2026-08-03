@@ -3,6 +3,7 @@
 #include "llama-vbr-generation-oracle.h"
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
+#include "llama-vbr-artifact-validate.h"
 #include "llama-vbr-config.h"
 
 #include "llama-impl.h"
@@ -10,6 +11,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-sha256.h"
+#include "llama-vbr-identity-digest.h"
 #include "llama-vbr-physical.h"
 #include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
@@ -2194,11 +2196,11 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     bool is_full = true;
 
-    if (p0 > 0 && p0 + 1 < (int) get_size()) {
+    if (p0 > 0 && p0 < (int) get_size() - 1) {
         is_full = false;
     }
 
-    if (p1 > 0 && p1 + 1 < (int) get_size()) {
+    if (p1 > 0 && p1 < (int) get_size() - 1) {
         is_full = false;
     }
 
@@ -4423,24 +4425,85 @@ bool llama_kv_cache::vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
 // Page-padded LOGICAL endpoint bytes for policy ordering.  This intentionally has no VMM pool or
 // residency query: partial mappings and allocator history are physical-pricing inputs, never
 // permission to change which measured layer loses quality next.
-static uint64_t vbr_policy_endpoint_bytes(
-        const ggml_tensor * t, ggml_type type, uint32_t wm, size_t gran) {
-    GGML_ASSERT(t != nullptr && gran > 0);
+static bool vbr_policy_endpoint_bytes_checked(
+        const ggml_tensor * t, ggml_type type, uint32_t wm,
+        size_t gran, uint64_t & result) {
+    if (t == nullptr || gran == 0) {
+        return false;
+    }
     const uint64_t slot = vbr_slot_span(t, gran);
     const uint64_t row  = ggml_row_size(type, t->ne[0]);
+    return llama_vbr_policy::logical_endpoint_bytes(
+        row, wm, slot, gran, result);
+}
+
+static uint64_t vbr_policy_endpoint_bytes(
+        const ggml_tensor * t, ggml_type type, uint32_t wm, size_t gran) {
     uint64_t result = 0;
-    if (!llama_vbr_policy::logical_endpoint_bytes(row, wm, slot, gran, result)) {
+    if (!vbr_policy_endpoint_bytes_checked(t, type, wm, gran, result)) {
         GGML_ABORT("VBR policy endpoint overflow or invalid geometry");
     }
     return result;
 }
 
-static void vbr_policy_add_checked(int64_t & total, int64_t delta) {
-    int64_t next = 0;
-    if (!llama_vbr_policy::checked_add(total, delta, next)) {
-        GGML_ABORT("VBR policy progress overflow");
+bool llama_kv_cache::vbr_policy_priced_steps(
+        std::vector<ggml_type> & sim, size_t start_cursor,
+        int demanded_device, uint32_t watermark, bool fixed_watermark,
+        bool fail_closed, llama_vbr_policy::child & out) const {
+    int64_t terminal = out.initial_progress;
+    for (size_t i = start_cursor; i < vbr_demand_limit(); ++i) {
+        size_t slot = 0;
+        const ggml_tensor * canonical = nullptr;
+        ggml_type type_b = GGML_TYPE_COUNT;
+        if (!vbr_sim_step(sim, i, slot, canonical, type_b)) {
+            continue;
+        }
+        const auto & order = vbr_degrade_order_[i];
+        const size_t ikv = slot/2;
+        int64_t gain = 0;
+        bool valid = true;
+        for (const auto & pool : vbr_pools_) {
+            if (!pool.vmm || pool.device != demanded_device) {
+                continue;
+            }
+            const auto & extent = order.is_v ? pool.v[ikv] : pool.k[ikv];
+            if (!extent.t) {
+                continue;
+            }
+            const uint32_t wm = fixed_watermark
+                ? watermark : std::max(pool.wm_cells, watermark);
+            uint64_t before = 0;
+            uint64_t after = 0;
+            int64_t next = 0;
+            valid = vbr_policy_endpoint_bytes_checked(
+                        extent.t, sim[slot], wm, pool.gran, before) &&
+                    vbr_policy_endpoint_bytes_checked(
+                        extent.t, type_b, wm, pool.gran, after) &&
+                    before >= after && before-after <= uint64_t(INT64_MAX) &&
+                    llama_vbr_policy::checked_add(
+                        gain, int64_t(before-after), next);
+            if (!valid) {
+                break;
+            }
+            gain = next;
+        }
+        int64_t next_terminal = 0;
+        valid = valid && llama_vbr_policy::checked_add(
+            terminal, gain, next_terminal);
+        if (!valid) {
+            if (fail_closed) {
+                return false;
+            }
+            GGML_ABORT("VBR policy progress overflow or invalid geometry");
+        }
+        out.steps.push_back({
+            i, slot, int32_t(sim[slot]), int32_t(type_b), gain,
+        });
+        terminal = next_terminal;
+        sim[slot] = type_b;
     }
-    total = next;
+    out.terminal_progress = terminal;
+    return true;
 }
 
 llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
@@ -4468,52 +4531,20 @@ llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
                 const uint64_t before = vbr_policy_endpoint_bytes(e.t, type, p.wm_cells, p.gran);
                 const uint64_t after  = vbr_policy_endpoint_bytes(e.t, type, terminal_wm, p.gran);
                 GGML_ASSERT(before <= (uint64_t) INT64_MAX && after <= (uint64_t) INT64_MAX);
-                vbr_policy_add_checked(out.initial_progress,
-                        (int64_t) before - (int64_t) after);
+                int64_t next = 0;
+                if (!llama_vbr_policy::checked_add(
+                        out.initial_progress,
+                        (int64_t) before - (int64_t) after, next)) {
+                    GGML_ABORT("VBR policy progress overflow");
+                }
+                out.initial_progress = next;
             }
         }
     }
 
-    int64_t terminal = out.initial_progress;
-    const size_t limit = vbr_demand_limit();
-    for (size_t i = vbr_degrade_cursor_; i < limit; ++i) {
-        size_t slot = 0;
-        const ggml_tensor * canonical = nullptr;
-        ggml_type type_b = GGML_TYPE_COUNT;
-        // Authoritative unknown-layer, absent, pinned, same-type and no-gain skip rules.
-        if (!vbr_sim_step(sim, i, slot, canonical, type_b)) {
-            continue;
-        }
-
-        const auto & order_step = vbr_degrade_order_[i];
-        const size_t ikv = slot / 2;
-        int64_t gain = 0;
-        for (const auto & p : vbr_pools_) {
-            if (p.vmm == nullptr || p.device != demanded_device) {
-                continue;
-            }
-            const vbr_extent & e = order_step.is_v ? p.v[ikv] : p.k[ikv];
-            if (e.t == nullptr) {
-                continue;
-            }
-            const uint32_t terminal_wm = std::max(p.wm_cells, wm_next);
-            const uint64_t before = vbr_policy_endpoint_bytes(e.t, sim[slot], terminal_wm, p.gran);
-            const uint64_t after  = vbr_policy_endpoint_bytes(e.t, type_b,    terminal_wm, p.gran);
-            GGML_ASSERT(before >= after && before - after <= (uint64_t) INT64_MAX);
-            vbr_policy_add_checked(gain, (int64_t) (before - after));
-        }
-
-        out.steps.push_back({
-            /*.order_index =*/ i,
-            /*.slot        =*/ slot,
-            /*.type_a      =*/ (int32_t) sim[slot],
-            /*.type_b      =*/ (int32_t) type_b,
-            /*.logical_gain=*/ gain,
-        });
-        vbr_policy_add_checked(terminal, gain);
-        sim[slot] = type_b;
-    }
-    out.terminal_progress = terminal;
+    GGML_ASSERT(vbr_policy_priced_steps(
+        sim, vbr_degrade_cursor_, demanded_device, wm_next,
+        false, false, out));
     return out;
 }
 
@@ -4810,6 +4841,449 @@ bool llama_kv_cache::vbr_stash_reserve(
     LLAMA_LOG_INFO("%s: VBR sink-stash reserve (device %d): %.2f MiB mapped / %.2f MiB VA\n",
             __func__, p.device, physical_after/1048576.0, p.stash_size/1048576.0);
     return true;
+}
+
+bool llama_kv_cache::vbr_downward_reserve_import(
+        const std::vector<const vbr_validated_child_plan *> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept {
+    output = {};
+    struct stash_context {
+        llama_kv_cache * cache = nullptr;
+        vbr_pool * pool = nullptr;
+        std::vector<vbr_stash_request> requests;
+        std::vector<uint64_t> unit_ids;
+    };
+    try {
+        if (plans.empty()) {
+            output.status = vbr_downward_reserve_status::projection_unavailable;
+            return false;
+        }
+        output.status = vbr_downward_reserve_status::reserved;
+        for (auto & pool : vbr_pools_) {
+            std::vector<vbr_downward_workspace_endpoint> workspaces;
+            std::vector<vbr_downward_stash_endpoint> stashes;
+            stash_context stash_projection;
+            stash_projection.cache = this;
+            stash_projection.pool = &pool;
+            vbr_downward_workspace_endpoint workspace;
+            workspace.owner = &pool;
+            workspace.iface = pool.be;
+            workspace.backend = pool.backend;
+            workspace.device = pool.device;
+            llama_cache_acct_resource_domain pool_domain;
+            bool have_domain = false;
+
+            for (const auto * plan : plans) {
+                if (!plan || !plan->downward) {
+                    continue;
+                }
+                const size_t ikv = plan->logical_unit_id/2;
+                const bool is_v = (plan->logical_unit_id & 1u) != 0;
+                if (ikv >= layers.size()) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                const auto & units = vbr_units_of(ikv, is_v);
+                const auto shard = std::find_if(
+                    plan->shards.begin(), plan->shards.end(),
+                    [&](const vbr_validated_shard_plan & value) {
+                        return value.target_pool_cookie == &pool;
+                    });
+                if (shard == plan->shards.end()) {
+                    continue;
+                }
+                const auto unit = std::find_if(
+                    units.begin(), units.end(),
+                    [&](const auto & value) { return value.first == &pool; });
+                if (unit == units.end() || !unit->second ||
+                    !unit->second->t || pool.be == nullptr ||
+                    pool.be->kv_transcode_workspace_memory == nullptr ||
+                    pool.be->kv_transcode_workspace_reserve == nullptr) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                if (!have_domain) {
+                    pool_domain = shard->domain;
+                    workspace.domain = shard->domain;
+                    have_domain = true;
+                } else if (pool_domain != shard->domain) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                uint32_t stash_rows = 0;
+                const bool needs_stash =
+                    vbr_downward_recipe_needs_stash(plan->transcode_recipe);
+                if (needs_stash && vbr_stash_rows_ > 0) {
+                    stash_rows = std::min<uint64_t>(
+                        vbr_stash_rows_, plan->descriptor.wm_cells);
+                }
+                workspace.requests.push_back({
+                    int64_t(plan->descriptor.wm_cells),
+                    unit->second->t->ne[0], int64_t(stash_rows),
+                });
+                if (stash_rows > 0) {
+                    stash_projection.requests.push_back({
+                        unit->second, stash_rows,
+                    });
+                    stash_projection.unit_ids.push_back(
+                        vbr_downward_unit_key(
+                            plan->child_id, plan->logical_unit_id));
+                }
+            }
+            if (workspace.requests.empty()) {
+                continue;
+            }
+            if (pool.backend == nullptr) {
+                pool.backend = pool.be->backend_init(pool.device);
+                if (pool.backend == nullptr) {
+                    output.status =
+                        vbr_downward_reserve_status::workspace_reserve_failed;
+                    return true;
+                }
+                workspace.backend = pool.backend;
+            }
+            workspaces.push_back(std::move(workspace));
+            if (!stash_projection.requests.empty()) {
+                vbr_downward_stash_endpoint endpoint;
+                endpoint.owner = &pool;
+                endpoint.unit_ids = std::move(stash_projection.unit_ids);
+                endpoint.domain = pool_domain;
+                endpoint.context = &stash_projection;
+                endpoint.memory = [](void * opaque, uint64_t & now,
+                                     uint64_t & reserved) {
+                    auto & value = *static_cast<stash_context *>(opaque);
+                    size_t a = 0;
+                    size_t b = 0;
+                    if (!value.cache->vbr_stash_memory(
+                            *value.pool, value.requests, a, b)) {
+                        return false;
+                    }
+                    now = a;
+                    reserved = b;
+                    return true;
+                };
+                endpoint.reserve = [](void * opaque) {
+                    auto & value = *static_cast<stash_context *>(opaque);
+                    return value.cache->vbr_stash_reserve(
+                        *value.pool, value.requests);
+                };
+                stashes.push_back(std::move(endpoint));
+            }
+            if (!pool.downward_receipts) {
+                pool.downward_receipts =
+                    std::make_unique<vbr_downward_resource_receipts>(ledger);
+            }
+            const auto reserved = pool.downward_receipts->reserve_resources(
+                budget, workspaces, stashes);
+            if (reserved.status != vbr_downward_reserve_status::reserved &&
+                reserved.status !=
+                    vbr_downward_reserve_status::reserved_stashless) {
+                output.status = reserved.status;
+                return true;
+            }
+            output.stashless_units.insert(
+                output.stashless_units.end(),
+                reserved.stashless_units.begin(),
+                reserved.stashless_units.end());
+            if (!reserved.stashless_units.empty()) {
+                output.status =
+                    vbr_downward_reserve_status::reserved_stashless;
+            }
+        }
+        return true;
+    } catch (...) {
+        output.status = vbr_downward_reserve_status::internal_error;
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_downward_policy_input(
+        const std::vector<ggml_type> & source_types,
+        uint64_t source_cursor,
+        uint32_t projected_wm_cells,
+        int demanded_device,
+        vbr_downward_policy_child & output) const noexcept {
+    output = {};
+    try {
+        if (source_types.size() != layers.size()*2 ||
+            projected_wm_cells == 0 ||
+            source_cursor > vbr_demand_limit()) {
+            return false;
+        }
+        output.initial_types = source_types;
+        output.target_types.resize(source_types.size(), GGML_TYPE_COUNT);
+        output.initial_cursor = source_cursor;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            output.target_types[ikv*2] =
+                layers[ikv].k ? layers[ikv].k->type : GGML_TYPE_COUNT;
+            output.target_types[ikv*2 + 1] =
+                layers[ikv].v ? layers[ikv].v->type : GGML_TYPE_COUNT;
+        }
+        auto sim = source_types;
+        if (!vbr_policy_priced_steps(
+                sim, size_t(source_cursor), demanded_device,
+                projected_wm_cells, true, true, output.policy)) {
+            return false;
+        }
+        return output.policy.terminal_progress > 0 ||
+            output.initial_types == output.target_types;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_downward_bind_target_unit(
+        ggml_type source_type,
+        const vbr_downward_policy_projection & projection,
+        uint32_t projection_child,
+        vbr_target_unit_snapshot & output) const noexcept {
+    try {
+        const size_t ikv = output.logical_unit_id/2;
+        const bool is_v = (output.logical_unit_id & 1u) != 0;
+        if (ikv >= layers.size() || projection.status !=
+                vbr_downward_policy_status::coherent ||
+            projection_child >= projection.final_types.size() ||
+            projection_child >= projection.child_type_digests.size() ||
+            output.logical_unit_id >=
+                projection.final_types[projection_child].size()) {
+            return false;
+        }
+        const ggml_tensor * canonical = is_v ? layers[ikv].v : layers[ikv].k;
+        if (!canonical || projection.final_types[projection_child]
+                [output.logical_unit_id] != canonical->type) {
+            return false;
+        }
+        vbr_capture_stability_token policy;
+        if (!vbr_capture_policy_snapshot(policy)) {
+            return false;
+        }
+        vbr_downward_recipe recipe;
+        const bool movable = vbr_unit_movable(source_type, is_v);
+        if (vbr_downward_resolve_recipe(
+                source_type, canonical->type,
+                static_cast<ggml_type>(policy.floor_type),
+                movable, recipe) != vbr_downward_recipe_status::resolved) {
+            return false;
+        }
+        const auto & units = vbr_units_of(ikv, is_v);
+        if (units.empty() || units.size() != output.shards.size()) {
+            return false;
+        }
+        uint64_t mapped = 0;
+        uint64_t transfer = 0;
+        uint64_t workspace = 0;
+        const int64_t stash_rows = vbr_downward_recipe_needs_stash(recipe)
+            ? std::min<uint64_t>(vbr_stash_rows_, output.wm_cells)
+            : 0;
+        for (size_t i = 0; i < units.size(); ++i) {
+            const auto * pool = units[i].first;
+            const auto * extent = units[i].second;
+            if (!pool || !extent || !extent->t || !pool->be ||
+                !pool->be->kv_transcode_workspace_memory) {
+                return false;
+            }
+            const uint64_t target_row = ggml_row_size(
+                canonical->type, extent->t->ne[0]);
+            const uint64_t source_row = ggml_row_size(
+                source_type, extent->t->ne[0]);
+            if (target_row == 0 || source_row == 0 ||
+                output.wm_cells > uint64_t(INT64_MAX) ||
+                output.wm_cells > UINT64_MAX/target_row ||
+                output.wm_cells > UINT64_MAX/source_row) {
+                return false;
+            }
+            const uint64_t target_bytes = output.wm_cells*target_row;
+            const uint64_t source_bytes = output.wm_cells*source_row;
+            if (mapped > UINT64_MAX-target_bytes ||
+                transfer > UINT64_MAX-source_bytes) {
+                return false;
+            }
+            mapped += target_bytes;
+            transfer += source_bytes;
+            size_t now = 0;
+            size_t endpoint = 0;
+            if (!pool->be->kv_transcode_workspace_memory(
+                    pool->backend, pool->device,
+                    int64_t(output.wm_cells), extent->t->ne[0],
+                    stash_rows, &now, &endpoint) ||
+                endpoint > UINT64_MAX-workspace) {
+                return false;
+            }
+            workspace += endpoint;
+            output.shards[i].row_bytes = target_row;
+            output.shards[i].mapped_bytes = target_bytes;
+        }
+        output.downward_supported = true;
+        output.downward_movable = movable;
+        output.controller_floor_type = policy.floor_type;
+        output.downward_type = canonical->type;
+        output.downward_domain = vbr_downward_tier_domain(canonical->type);
+        output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
+        output.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
+        output.downward_recipe = recipe;
+        output.downward_meansub_model_id = hparams.turbo_meansub_id;
+        output.downward_row_bytes = output.shards.front().row_bytes;
+        output.downward_mapped_bytes = mapped;
+        output.downward_transfer_bytes = transfer;
+        output.downward_codec_workspace_bytes = workspace;
+        output.downward_build_identity_digest = vbr_downward_build_identity(
+            recipe, output.downward_meansub_model_id,
+            output.meansub_digest,
+            projection.child_type_digests[projection_child],
+            projection.tree_digest);
+        return vbr_digest_nonzero(output.downward_build_identity_digest);
+    } catch (...) {
+        return false;
+    }
+}
+
+vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
+        const vbr_validated_child_plan & plan,
+        bool stashless,
+        uint32_t & stash_valid,
+        uint32_t & edge_reached) noexcept {
+    stash_valid = 0;
+    edge_reached = UINT32_MAX;
+    try {
+        if (!plan.downward || plan.logical_unit_id/2 >= layers.size() ||
+            plan.transcode_recipe.n_edges == 0) {
+            return vbr_downward_transform_status::invalid_recipe;
+        }
+        const size_t ikv = plan.logical_unit_id/2;
+        const bool is_v = (plan.logical_unit_id & 1u) != 0;
+        const auto & units = vbr_units_of(ikv, is_v);
+        if (units.size() != plan.shards.size()) {
+            return vbr_downward_transform_status::invalid_recipe;
+        }
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            const auto unit = std::find_if(
+                units.begin(), units.end(),
+                [&](const auto & value) { return value.first == pool; });
+            if (unit == units.end() || !pool || !unit->second ||
+                !unit->second->t || !pool->be || !pool->backend ||
+                pool->be->kv_transcode == nullptr ||
+                pool->be->kv_stash_capture == nullptr) {
+                return vbr_downward_transform_status::transform_failed;
+            }
+            auto & extent = *unit->second;
+            ggml_tensor source;
+            if (!vbr_import_source_alias(
+                    *extent.t, plan.transcode_recipe.source_type, source)) {
+                return vbr_downward_transform_status::transform_failed;
+            }
+
+            struct live_state {
+                vbr_pool * pool = nullptr;
+                vbr_extent * extent = nullptr;
+                ggml_tensor * source = nullptr;
+                bool is_v = false;
+                bool stashless = false;
+                uint32_t requested_stash = 0;
+                uint32_t captured_stash = 0;
+                uint32_t wm_cells = 0;
+            } state;
+            state.pool = pool;
+            state.extent = &extent;
+            state.source = &source;
+            state.is_v = is_v;
+            state.stashless = stashless;
+            state.wm_cells = plan.descriptor.wm_cells;
+            state.requested_stash = std::min<uint64_t>(
+                vbr_stash_rows_, plan.descriptor.wm_cells);
+
+            vbr_downward_edge_driver driver;
+            driver.context = &state;
+            driver.stash_available = [](void * opaque) noexcept {
+                const auto & value = *static_cast<live_state *>(opaque);
+                return value.stashless || value.captured_stash != 0;
+            };
+            driver.capture_stash = [](void * opaque,
+                                      const vbr_downward_edge &) noexcept {
+                auto & value = *static_cast<live_state *>(opaque);
+                if (value.requested_stash == 0 ||
+                    value.pool->stash_vmm == nullptr) {
+                    return false;
+                }
+                char * base = static_cast<char *>(
+                    value.pool->be->vmm_pool_base(value.pool->stash_vmm));
+                value.pool->be->kv_stash_capture(
+                    value.pool->backend, value.source,
+                    base + value.extent->stash_off,
+                    value.requested_stash, value.is_v);
+                value.captured_stash = value.requested_stash;
+                return true;
+            };
+            driver.transcode = [](void * opaque,
+                                  const vbr_downward_edge & edge) noexcept {
+                auto & value = *static_cast<live_state *>(opaque);
+                const void * stash = nullptr;
+                int64_t stash_rows = 0;
+                if (!value.stashless && value.captured_stash > 0 &&
+                    value.pool->stash_vmm != nullptr) {
+                    stash = static_cast<char *>(
+                        value.pool->be->vmm_pool_base(value.pool->stash_vmm)) +
+                        value.extent->stash_off;
+                    stash_rows = value.captured_stash;
+                }
+                const ggml_vbr_transcode_params params = {
+                    value.source, edge.target_type, value.extent->t->data,
+                    value.pool->buf, int64_t(value.wm_cells), value.is_v,
+                    stash, stash_rows, 0,
+                };
+                value.pool->be->kv_transcode(value.pool->backend, &params);
+                const std::vector<ggml_tensor *> no_views;
+                vbr_set_tensor_type_impl(
+                    value.source, no_views, edge.target_type);
+                return true;
+            };
+            bool regenerated = false;
+            const auto status = vbr_downward_execute_edges(
+                plan.transcode_recipe, driver, regenerated, &edge_reached);
+            if (status != vbr_downward_transform_status::transformed) {
+                return status;
+            }
+            if (regenerated) {
+                stash_valid = state.captured_stash;
+            }
+        }
+        return vbr_downward_transform_status::transformed;
+    } catch (...) {
+        return vbr_downward_transform_status::internal_error;
+    }
+}
+
+bool llama_kv_cache::vbr_import_source_alias(
+        const ggml_tensor & destination,
+        ggml_type source_type,
+        ggml_tensor & output) const noexcept {
+    if (source_type == GGML_TYPE_COUNT) {
+        return false;
+    }
+    output = destination;
+    const std::vector<ggml_tensor *> no_views;
+    vbr_set_tensor_type_impl(&output, no_views, source_type);
+    output.data = destination.data;
+    return true;
+}
+
+void llama_kv_cache::vbr_import_set_unit_type_noalloc(
+        uint32_t logical_unit, ggml_type type) noexcept {
+    const size_t ikv = logical_unit/2;
+    const bool is_v = (logical_unit & 1u) != 0;
+    GGML_ASSERT(ikv < layers.size() && type != GGML_TYPE_COUNT);
+    ggml_tensor * canonical = is_v ? layers[ikv].v : layers[ikv].k;
+    GGML_ASSERT(canonical != nullptr);
+    vbr_set_tensor_type_noalloc(
+        canonical, is_v ? layers[ikv].v_stream : layers[ikv].k_stream,
+        type);
 }
 
 void llama_kv_cache::vbr_representation_changed() {

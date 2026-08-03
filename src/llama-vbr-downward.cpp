@@ -24,11 +24,6 @@ int tier_rank(ggml_type type) noexcept {
     return it == TIERS.end() ? -1 : int(it - TIERS.begin());
 }
 
-vbr_repr_domain tier_domain(ggml_type type) noexcept {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_TURBO8_0
-        ? vbr_repr_domain::full : vbr_repr_domain::tapped;
-}
-
 std::array<uint8_t, 32> tree_digest(
         const std::vector<std::array<uint8_t, 32>> & children) {
     llama_sha256_writer writer;
@@ -43,6 +38,11 @@ std::array<uint8_t, 32> tree_digest(
 }
 
 } // namespace
+
+vbr_repr_domain vbr_downward_tier_domain(ggml_type type) noexcept {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_TURBO8_0
+        ? vbr_repr_domain::full : vbr_repr_domain::tapped;
+}
 
 const char * vbr_downward_recipe_status_name(vbr_downward_recipe_status status) noexcept {
     switch (status) {
@@ -88,10 +88,47 @@ vbr_downward_recipe_status vbr_downward_resolve_recipe(
     for (int i = source; i < target; ++i) {
         const ggml_type a = TIERS[size_t(i)];
         const ggml_type b = TIERS[size_t(i + 1)];
-        out.edges[out.n_edges++] = { a, b, tier_domain(a), tier_domain(b),
-            tier_domain(a) == vbr_repr_domain::tapped };
+        out.edges[out.n_edges++] = { a, b, vbr_downward_tier_domain(a), vbr_downward_tier_domain(b),
+            vbr_downward_tier_domain(a) == vbr_repr_domain::tapped };
     }
     return vbr_downward_recipe_status::resolved;
+}
+
+std::array<uint8_t, 32> vbr_downward_build_identity(
+        const vbr_downward_recipe & recipe,
+        int32_t meansub_model_id,
+        const std::array<uint8_t, 32> & meansub_digest,
+        const std::array<uint8_t, 32> & policy_digest,
+        const std::array<uint8_t, 32> & tree_policy_digest) noexcept {
+    try {
+        if (meansub_model_id < 0 || recipe.n_edges == 0 ||
+            recipe.n_edges > recipe.edges.size()) {
+            return {};
+        }
+        llama_sha256_writer writer;
+        static constexpr char DOMAIN[] =
+            "buun.vbr.downward/build-identity/v1";
+        writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+        writer.u32(recipe.version);
+        writer.u32(uint32_t(recipe.source_type));
+        writer.u32(uint32_t(recipe.target_type));
+        writer.u64(recipe.n_edges);
+        for (size_t i = 0; i < recipe.n_edges; ++i) {
+            const auto & edge = recipe.edges[i];
+            writer.u32(uint32_t(edge.source_type));
+            writer.u32(uint32_t(edge.target_type));
+            writer.u32(uint32_t(edge.source_domain));
+            writer.u32(uint32_t(edge.target_domain));
+            writer.u32(edge.capture_stash_before);
+        }
+        writer.u32(uint32_t(meansub_model_id));
+        writer.bytes(meansub_digest.data(), meansub_digest.size());
+        writer.bytes(policy_digest.data(), policy_digest.size());
+        writer.bytes(tree_policy_digest.data(), tree_policy_digest.size());
+        return writer.finish();
+    } catch (...) {
+        return {};
+    }
 }
 
 const char * vbr_downward_policy_status_name(vbr_downward_policy_status status) noexcept {
@@ -115,12 +152,14 @@ vbr_downward_policy_projection vbr_downward_project_policy_prefix(
         }
         size_t mismatch_count = 0;
         out.final_types.reserve(children.size());
+        out.final_cursors.reserve(children.size());
         for (const auto & child : children) {
             if (child.initial_types.empty() ||
                 child.initial_types.size() != child.target_types.size()) {
                 return out;
             }
             out.final_types.push_back(child.initial_types);
+            out.final_cursors.push_back(child.initial_cursor);
             mismatch_count += std::inner_product(
                 child.initial_types.begin(), child.initial_types.end(),
                 child.target_types.begin(), size_t(0), std::plus<size_t>(),
@@ -147,6 +186,14 @@ vbr_downward_policy_projection vbr_downward_project_policy_prefix(
                     return true;
                 }
                 auto & current = out.final_types[selected.child_index][selected.value.slot];
+                if (selected.value.order_index == SIZE_MAX) {
+                    incoherent = true;
+                    return true;
+                }
+                out.final_cursors[selected.child_index] =
+                    std::max<uint64_t>(
+                        out.final_cursors[selected.child_index],
+                        selected.value.order_index + 1);
                 const auto target = children[selected.child_index].target_types[selected.value.slot];
                 const bool matched_before = current == target;
                 current = static_cast<ggml_type>(selected.value.type_b);
@@ -425,59 +472,113 @@ vbr_downward_reserve_result vbr_downward_resource_receipts::reserve_resources(
     }
 }
 
-vbr_downward_transform_result vbr_downward_execute_recipe(
+vbr_downward_transform_status vbr_downward_execute_edges(
         const vbr_downward_recipe & recipe,
-        const std::vector<uint8_t> & source,
-        const std::vector<uint8_t> * authorized_stash,
-        const vbr_downward_transform_iface & iface) noexcept {
-    vbr_downward_transform_result out;
+        const vbr_downward_edge_driver & driver,
+        bool & stash_regenerated,
+        uint32_t * edge_reached) noexcept {
+    stash_regenerated = false;
+    if (edge_reached) {
+        *edge_reached = UINT32_MAX;
+    }
     try {
         if (recipe.version != VBR_DOWNWARD_RECIPE_VERSION || recipe.n_edges == 0 ||
             recipe.n_edges > recipe.edges.size() ||
             recipe.edges[0].source_type != recipe.source_type ||
             recipe.edges[recipe.n_edges - 1].target_type != recipe.target_type ||
-            iface.transcode == nullptr || source.empty()) {
-            out.status = vbr_downward_transform_status::invalid_recipe;
-            return out;
+            driver.transcode == nullptr) {
+            return vbr_downward_transform_status::invalid_recipe;
         }
-        std::vector<uint8_t> current = source;
-        if (authorized_stash != nullptr) {
-            out.stash = *authorized_stash;
-        }
-        std::vector<uint8_t> next;
         for (size_t i = 0; i < recipe.n_edges; ++i) {
             const auto & edge = recipe.edges[i];
+            if (edge_reached) {
+                *edge_reached = uint32_t(i);
+            }
             // Re-derive the domain/stash fields instead of trusting them: a recipe
             // value with a valid type chain but lying capture_stash_before would
             // otherwise run tapped edges stashless through a permissive adapter.
             if ((i > 0 && recipe.edges[i - 1].target_type != edge.source_type) ||
                 tier_rank(edge.source_type) < 0 ||
                 tier_rank(edge.target_type) != tier_rank(edge.source_type) + 1 ||
-                edge.source_domain != tier_domain(edge.source_type) ||
-                edge.target_domain != tier_domain(edge.target_type) ||
+                edge.source_domain != vbr_downward_tier_domain(edge.source_type) ||
+                edge.target_domain != vbr_downward_tier_domain(edge.target_type) ||
                 edge.capture_stash_before !=
-                    (tier_domain(edge.source_type) == vbr_repr_domain::tapped)) {
-                out.status = vbr_downward_transform_status::invalid_recipe;
-                return out;
+                    (vbr_downward_tier_domain(edge.source_type) == vbr_repr_domain::tapped)) {
+                return vbr_downward_transform_status::invalid_recipe;
             }
-            if (edge.capture_stash_before && out.stash.empty()) {
-                if (iface.capture_stash == nullptr ||
-                    !iface.capture_stash(iface.context, edge.source_type, current, out.stash)) {
-                    out.status = vbr_downward_transform_status::stash_unavailable;
-                    return out;
+            const bool stash_available = driver.stash_available != nullptr &&
+                driver.stash_available(driver.context);
+            if (edge.capture_stash_before && !stash_available) {
+                if (driver.capture_stash == nullptr ||
+                    !driver.capture_stash(driver.context, edge)) {
+                    return vbr_downward_transform_status::stash_unavailable;
                 }
-                out.stash_regenerated = true;
+                stash_regenerated = true;
             }
-            next.clear();
-            const std::vector<uint8_t> * stash = out.stash.empty() ? nullptr : &out.stash;
-            if (!iface.transcode(iface.context, edge, current, stash, next) || next.empty()) {
-                out.status = vbr_downward_transform_status::transform_failed;
-                return out;
+            if (!driver.transcode(driver.context, edge)) {
+                return vbr_downward_transform_status::transform_failed;
             }
-            current.swap(next);
         }
-        out.bytes = std::move(current);
-        out.status = vbr_downward_transform_status::transformed;
+        return vbr_downward_transform_status::transformed;
+    } catch (...) {
+        return vbr_downward_transform_status::internal_error;
+    }
+}
+
+vbr_downward_transform_result vbr_downward_execute_recipe(
+        const vbr_downward_recipe & recipe,
+        const std::vector<uint8_t> & source,
+        const std::vector<uint8_t> * authorized_stash,
+        const vbr_downward_transform_iface & iface) noexcept {
+    vbr_downward_transform_result out;
+    struct byte_state {
+        const vbr_downward_transform_iface * iface = nullptr;
+        std::vector<uint8_t> current;
+        std::vector<uint8_t> next;
+        std::vector<uint8_t> stash;
+    } state;
+    try {
+        if (source.empty() || iface.transcode == nullptr) {
+            out.status = vbr_downward_transform_status::invalid_recipe;
+            return out;
+        }
+        state.iface = &iface;
+        state.current = source;
+        if (authorized_stash != nullptr) {
+            state.stash = *authorized_stash;
+        }
+        vbr_downward_edge_driver driver;
+        driver.context = &state;
+        driver.stash_available = [](void * context) noexcept {
+            return !static_cast<byte_state *>(context)->stash.empty();
+        };
+        driver.capture_stash = [](void * context,
+                                  const vbr_downward_edge & edge) noexcept {
+            auto & value = *static_cast<byte_state *>(context);
+            return value.iface->capture_stash != nullptr &&
+                value.iface->capture_stash(
+                    value.iface->context, edge.source_type,
+                    value.current, value.stash);
+        };
+        driver.transcode = [](void * context,
+                              const vbr_downward_edge & edge) noexcept {
+            auto & value = *static_cast<byte_state *>(context);
+            value.next.clear();
+            const auto * stash = value.stash.empty() ? nullptr : &value.stash;
+            if (!value.iface->transcode(
+                    value.iface->context, edge, value.current,
+                    stash, value.next) || value.next.empty()) {
+                return false;
+            }
+            value.current.swap(value.next);
+            return true;
+        };
+        out.status = vbr_downward_execute_edges(
+            recipe, driver, out.stash_regenerated);
+        if (out.status == vbr_downward_transform_status::transformed) {
+            out.bytes = std::move(state.current);
+            out.stash = std::move(state.stash);
+        }
         return out;
     } catch (...) {
         out.status = vbr_downward_transform_status::internal_error;

@@ -247,17 +247,27 @@ bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
 }
 
 bool downward_recipe_complete(
+        const vbr_artifact_unit_descriptor & source,
         vbr_repr_domain source_domain,
         const vbr_target_unit_snapshot & target) {
+    vbr_downward_recipe resolved;
+    const auto status = vbr_downward_resolve_recipe(
+        static_cast<ggml_type>(source.current_type),
+        static_cast<ggml_type>(target.current_type),
+        static_cast<ggml_type>(target.controller_floor_type),
+        target.downward_movable, resolved);
     return target.downward_supported &&
            target.downward_type == target.current_type &&
-           target.downward_recipe_id != 0 &&
-           target.downward_recipe_version != 0 &&
+           target.downward_recipe_id == VBR_DOWNWARD_RECIPE_ID &&
+           target.downward_recipe_version == VBR_DOWNWARD_RECIPE_VERSION &&
+           status == vbr_downward_recipe_status::resolved &&
+           resolved == target.downward_recipe &&
            digest_nonzero(target.downward_build_identity_digest) &&
            target.downward_row_bytes != 0 &&
            target.downward_mapped_bytes != 0 &&
            target.downward_transfer_bytes != 0 &&
            target.downward_codec_workspace_bytes != 0 &&
+           target.downward_meansub_model_id >= 0 &&
            !(source_domain == vbr_repr_domain::tapped &&
              target.downward_domain == vbr_repr_domain::full);
 }
@@ -624,6 +634,16 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             }
             const auto & controller_policy =
                 manifest.controller_policy[controller.child_id];
+            const bool projected_policy = policy.allow_downward &&
+                policy.downward_projection != nullptr &&
+                policy.downward_projection->status ==
+                    vbr_downward_policy_status::coherent &&
+                controller_index <
+                    policy.downward_projection->child_type_digests.size() &&
+                controller_index <
+                    policy.downward_projection->final_types.size() &&
+                target_child->controller_policy.current_type_vector_digest ==
+                    policy.downward_projection->child_type_digests[controller_index];
             if (controller_policy.child_id != controller.child_id ||
                 controller_policy.dependency_mode !=
                     controller.dependency_mode ||
@@ -631,8 +651,6 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     controller_policy.degrade_order_digest ||
                 target_child->controller_policy.policy_digest !=
                     controller_policy.policy_digest ||
-                target_child->controller_policy.cursor !=
-                    controller_policy.cursor ||
                 target_child->controller_policy.floor_type !=
                     controller_policy.floor_type ||
                 target_child->controller_policy.pressure_independent_settings !=
@@ -643,8 +661,11 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     controller_policy.unified ||
                 target_child->controller_policy.wm_cells !=
                     controller_policy.wm_cells ||
-                target_child->controller_policy.current_type_vector_digest !=
-                    controller_policy.current_type_vector_digest ||
+                (!projected_policy &&
+                 (target_child->controller_policy.cursor !=
+                      controller_policy.cursor ||
+                  target_child->controller_policy.current_type_vector_digest !=
+                      controller_policy.current_type_vector_digest)) ||
                 target_child->controller_policy.completed_wave !=
                     controller_policy.completed_wave) {
                 return terminal_result(
@@ -739,8 +760,11 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                         vbr_manifest_validation_status::representation_mismatch);
                 }
                 if (!policy.allow_downward ||
+                    descriptor.codebook_digest != target_unit->codebook_digest ||
+                    descriptor.rotation_digest != target_unit->rotation_digest ||
+                    descriptor.meansub_digest != target_unit->meansub_digest ||
                     !downward_recipe_complete(
-                        source_domain, *target_unit)) {
+                        descriptor, source_domain, *target_unit)) {
                     return terminal_result(
                         vbr_manifest_validation_status::representation_mismatch);
                 }
@@ -837,8 +861,51 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.transcode_build_identity_digest = downward ?
                 target_unit->downward_build_identity_digest :
                 std::array<uint8_t, 32> {};
+            if (downward) {
+                if (policy.downward_projection == nullptr ||
+                    descriptor.child_id >=
+                        policy.downward_projection->final_types.size() ||
+                    descriptor.child_id >=
+                        policy.downward_projection->child_type_digests.size() ||
+                    descriptor.logical_unit_id >=
+                        policy.downward_projection->final_types[descriptor.child_id].size() ||
+                    policy.downward_projection->final_types[descriptor.child_id]
+                        [descriptor.logical_unit_id] !=
+                            static_cast<ggml_type>(target_unit->current_type) ||
+                    !digest_nonzero(policy.downward_projection->tree_digest)) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::policy_mismatch);
+                }
+                plan.transcode_recipe = target_unit->downward_recipe;
+                plan.transcode_policy_digest =
+                    policy.downward_projection->child_type_digests[
+                        descriptor.child_id];
+                plan.transcode_tree_digest =
+                    policy.downward_projection->tree_digest;
+                plan.transcode_meansub_model_id =
+                    target_unit->downward_meansub_model_id;
+                const auto build_identity = vbr_downward_build_identity(
+                    target_unit->downward_recipe,
+                    target_unit->downward_meansub_model_id,
+                    target_unit->meansub_digest,
+                    plan.transcode_policy_digest,
+                    plan.transcode_tree_digest);
+                if (!digest_nonzero(build_identity) ||
+                    build_identity !=
+                        target_unit->downward_build_identity_digest) {
+                    return terminal_result(
+                        vbr_manifest_validation_status::codebook_mismatch);
+                }
+                plan.target_controller_cursor =
+                    target_child->controller_policy.cursor;
+            }
             plan.downward = downward;
-            plan.stash_action = stash_action;
+            // Downward import regenerates the target-tier sink stash before
+            // the canonical outgoing tapped edge. A source-tier stash is not a
+            // target-tier byte image and must never be copied as if exact.
+            plan.stash_action = downward
+                ? vbr_validated_stash_action::omit_live_rebased
+                : stash_action;
             plan.target_row_bytes = downward ?
                 target_unit->downward_row_bytes :
                 target_unit->shards[0].row_bytes;
@@ -887,6 +954,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     descriptor.shards[i].logical_offset;
                 shard.row_count = descriptor.shards[i].row_count;
                 shard.row_bytes = descriptor.shards[i].row_bytes;
+                shard.target_row_bytes = target_unit->shards[i].row_bytes;
+                shard.target_mapped_bytes = target_unit->shards[i].mapped_bytes;
                 shard.payload_bytes =
                     descriptor.shards[i].payload_bytes;
                 shard.source = unit.payload_shards[i];
@@ -970,16 +1039,24 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 vbr_manifest_validation_status::budget_unavailable);
         }
         if (needs_downward) {
-            if (policy.downward_budget_plan == nullptr) {
+            if (policy.downward_budget_plan == nullptr ||
+                policy.downward_projection == nullptr ||
+                policy.read_downward_tree_digest == nullptr ||
+                !digest_nonzero(policy.downward_projection->tree_digest)) {
                 return terminal_result(
                     vbr_manifest_validation_status::budget_unavailable);
             }
-            llama_cache_budget_fit_state downward_fit;
+            // An empty downward projection is only acceptable through the
+            // already-priced native plan. It is conservative (source bytes
+            // are never smaller than the declared downward target) and keeps
+            // an empty caller projection from making admission vacuous.
+            llama_cache_budget_fit_state downward_fit = native_fit;
             if (policy.downward_budget_plan->accounting_serial !=
                     target.accounting_serial ||
-                !price_plan(
-                    *policy.accounting_snapshot, *policy.budget_config,
-                    *policy.downward_budget_plan, downward_fit) ||
+                (!policy.downward_budget_plan->entries.empty() &&
+                 !price_plan(
+                     *policy.accounting_snapshot, *policy.budget_config,
+                     *policy.downward_budget_plan, downward_fit)) ||
                 downward_fit ==
                     llama_cache_budget_fit_state::unavailable) {
                 return terminal_result(
@@ -1108,6 +1185,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         proof->recheck_target_empty_ = policy.recheck_target_empty;
         proof->read_accounting_serial_ = policy.read_accounting_serial;
         proof->read_policy_epoch_ = policy.read_policy_epoch;
+        proof->read_downward_tree_digest_ =
+            policy.read_downward_tree_digest;
 
         vbr_manifest_validation_result result;
         result.status = vbr_manifest_validation_status::validated;

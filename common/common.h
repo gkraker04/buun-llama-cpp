@@ -886,6 +886,17 @@ struct common_params {
     bool no_alloc = false; // Don't allocate model buffers
 };
 
+enum class common_vbr_cpu_fallback_result {
+    not_needed,
+    applied,
+    explicit_vbr,
+};
+
+// Common-layer policy seam for the implicit dynamic-VBR default. `has_gpu`
+// describes the resolved placement inventory; explicit VBR is never rewritten.
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+    common_params & params, bool has_gpu);
+
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();

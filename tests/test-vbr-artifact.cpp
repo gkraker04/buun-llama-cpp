@@ -2070,6 +2070,7 @@ struct validator_serials {
     uint64_t accounting = 0;
     uint64_t policy = 0;
     bool target_stable = true;
+    std::array<uint8_t, 32> downward_tree_digest = {};
 
     static uint64_t read_accounting(const void * context) noexcept {
         return static_cast<const validator_serials *>(context)->accounting;
@@ -2081,6 +2082,14 @@ struct validator_serials {
             const void * context,
             const vbr_target_empty_fingerprint &) noexcept {
         return static_cast<const validator_serials *>(context)->target_stable;
+    }
+    static bool read_downward_tree(
+            const void * context,
+            std::array<uint8_t, 32> & output) noexcept {
+        output = static_cast<const validator_serials *>(context)
+            ->downward_tree_digest;
+        return std::any_of(output.begin(), output.end(),
+            [](uint8_t value) { return value != 0; });
     }
     static bool parse_companion(
             const void *,
@@ -2466,20 +2475,60 @@ static void test_manifest_validator_matrix() {
     auto & downward_unit = downward_target.children[0].units[0];
     downward_unit.current_type = GGML_TYPE_TURBO3_TCQ;
     downward_unit.downward_supported = true;
+    downward_unit.downward_movable = true;
+    downward_unit.controller_floor_type = GGML_TYPE_TURBO1_TCQ;
     downward_unit.downward_type = downward_unit.current_type;
     downward_unit.downward_domain = vbr_repr_domain::tapped;
     downward_unit.downward_recipe_id = 1;
     downward_unit.downward_recipe_version = 1;
-    downward_unit.downward_build_identity_digest = marker(0xd1);
     downward_unit.downward_row_bytes = 2;
     downward_unit.downward_mapped_bytes = 2;
     downward_unit.downward_transfer_bytes = 4;
     downward_unit.downward_codec_workspace_bytes = 4;
+    downward_unit.downward_meansub_model_id = 7;
+    CHECK(vbr_downward_resolve_recipe(
+        static_cast<ggml_type>(f.view.units()[0].descriptor.current_type),
+        static_cast<ggml_type>(downward_unit.current_type),
+        GGML_TYPE_TURBO1_TCQ, true,
+        downward_unit.downward_recipe) ==
+        vbr_downward_recipe_status::resolved);
+    vbr_downward_policy_child projected_child;
+    projected_child.initial_types = {
+        static_cast<ggml_type>(f.view.units()[0].descriptor.current_type),
+    };
+    projected_child.target_types = {
+        static_cast<ggml_type>(downward_unit.current_type),
+    };
+    for (size_t i = 0; i < downward_unit.downward_recipe.n_edges; ++i) {
+        const auto & edge = downward_unit.downward_recipe.edges[i];
+        projected_child.policy.steps.push_back({
+            i, 0, int32_t(edge.source_type), int32_t(edge.target_type), 1,
+        });
+    }
+    projected_child.policy.terminal_progress =
+        int64_t(projected_child.policy.steps.size());
+    const auto projection =
+        vbr_downward_project_policy_prefix({ projected_child });
+    CHECK(projection.status == vbr_downward_policy_status::coherent);
+    downward_target.children[0].controller_policy.current_type_vector_digest =
+        projection.child_type_digests[0];
+    downward_target.children[0].controller_policy.cursor +=
+        projection.prefix.size();
+    downward_unit.downward_build_identity_digest =
+        vbr_downward_build_identity(
+            downward_unit.downward_recipe,
+            downward_unit.downward_meansub_model_id,
+            downward_unit.meansub_digest,
+            projection.child_type_digests[0], projection.tree_digest);
     llama_cache_budget_plan downward_plan;
     downward_plan.accounting_serial = f.accounting.serial;
     auto downward_policy = f.policy;
     downward_policy.adoption_nonce = first_nonce + 4;
     downward_policy.downward_budget_plan = &downward_plan;
+    downward_policy.downward_projection = &projection;
+    f.serials.downward_tree_digest = projection.tree_digest;
+    downward_policy.read_downward_tree_digest =
+        validator_serials::read_downward_tree;
     auto downward = validate(f, downward_target, downward_policy);
     CHECK(downward.status == vbr_manifest_validation_status::validated);
     CHECK(downward.decision == vbr_import_decision::downward_rebase);

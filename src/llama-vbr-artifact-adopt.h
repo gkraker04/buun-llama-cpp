@@ -34,7 +34,11 @@ enum class vbr_adopt_status : uint8_t {
     adopted = 0,
     invalid_capability_pair,
     unsupported_decision,
+    // Retired: downward imports are now executed; retained for status ABI stability.
     downward_deferred,
+    downward_recipe_invalid,
+    downward_transform_failed,
+    downward_stash_unavailable,
     target_drift,
     operation_unavailable,
     recovery_unavailable,
@@ -53,7 +57,16 @@ enum class vbr_adopt_status : uint8_t {
     internal_error,
     _count,
 };
-static_assert(uint8_t(vbr_adopt_status::_count) == 20);
+static_assert(uint8_t(vbr_adopt_status::_count) == 23);
+
+enum class vbr_downward_adopt_subphase : uint8_t {
+    none = 0,
+    source_h2d,
+    edge_stash_capture,
+    edge_transcode,
+    edge_completion,
+    _count,
+};
 
 const char * vbr_adopt_phase_name(vbr_adopt_phase phase) noexcept;
 const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept;
@@ -104,6 +117,9 @@ struct vbr_adopt_fault {
     uint32_t fail_unit = UINT32_MAX;
     uint32_t fail_shard = UINT32_MAX;
     uint64_t fail_h2d_completion = UINT64_MAX;
+    uint32_t fail_downward_edge = UINT32_MAX;
+    bool fail_downward_stash = false;
+    bool fail_downward_completion = false;
     bool fail_rollback = false;
 };
 
@@ -150,6 +166,26 @@ class vbr_adopt_test_seam {
         uint64_t fail_completion, vbr_h2d_stats & stats) noexcept = 0;
     virtual bool session_mark_complete(
         uint32_t child_id, uint32_t logical_unit) noexcept = 0;
+    virtual bool session_initialize_downward_backing(
+        uint32_t, const vbr_validated_child_plan &) noexcept {
+        return true;
+    }
+    virtual vbr_downward_transform_status session_transform_downward(
+        uint32_t, const vbr_validated_child_plan &, bool,
+        uint32_t, bool, uint32_t & stash_valid,
+        uint32_t & edge_reached) noexcept {
+        stash_valid = 0;
+        edge_reached = UINT32_MAX;
+        return vbr_downward_transform_status::transformed;
+    }
+    virtual bool session_synchronize_downward(
+        uint32_t, const std::vector<const vbr_validated_child_plan *> &) noexcept {
+        return true;
+    }
+    virtual bool session_trim_downward(
+        uint32_t, const vbr_validated_child_plan &, uint32_t) noexcept {
+        return true;
+    }
     virtual bool session_build_live_image(
         uint32_t child_id,
         const std::vector<const vbr_validated_child_plan *> & plans,
@@ -236,6 +272,9 @@ struct vbr_adopt_result {
     uint64_t rollback_count = 0;
     llama_cache_transaction_status accounting_status =
         llama_cache_transaction_status::internal_fault;
+    vbr_downward_adopt_subphase downward_subphase =
+        vbr_downward_adopt_subphase::none;
+    uint32_t downward_edge = UINT32_MAX;
 };
 
 vbr_adopt_result vbr_adopt_empty_manifest(

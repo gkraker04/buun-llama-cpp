@@ -66,6 +66,7 @@ static void test_policy_projection_tree_and_ordinary() {
     assert(one.status == vbr_downward_policy_status::coherent);
     assert(one.prefix.size() == 2);
     assert(one.final_types[0] == ordinary.target_types);
+    assert(one.final_cursors[0] == 2);
 
     vbr_downward_policy_child peer;
     peer.initial_types = { GGML_TYPE_TURBO4_0 };
@@ -78,7 +79,25 @@ static void test_policy_projection_tree_and_ordinary() {
     assert(tree.prefix.size() == 3);
     assert(tree.final_types[0] == ordinary.target_types);
     assert(tree.final_types[1] == peer.target_types);
+    assert(tree.final_cursors[0] == 2);
+    assert(tree.final_cursors[1] == 1);
     assert(tree.tree_digest != one.tree_digest);
+
+    // Cursor publication follows the absolute degrade-order index, not the
+    // number of selected steps: skipped/non-applicable entries are normal in
+    // straddled K/V schedules.
+    vbr_downward_policy_child skipped;
+    skipped.initial_types = { GGML_TYPE_F16 };
+    skipped.target_types = { GGML_TYPE_TURBO8_0 };
+    skipped.initial_cursor = 4;
+    skipped.policy = policy_child({
+        { 9, 0, GGML_TYPE_F16, GGML_TYPE_TURBO8_0, 10 },
+    });
+    const auto skipped_projection =
+        vbr_downward_project_policy_prefix({ skipped });
+    assert(skipped_projection.status ==
+           vbr_downward_policy_status::coherent);
+    assert(skipped_projection.final_cursors[0] == 10);
 
     peer.target_types = { GGML_TYPE_TURBO2_TCQ };
     const auto impossible = vbr_downward_project_policy_prefix({ ordinary, peer });
@@ -93,6 +112,7 @@ static void test_policy_projection_tree_and_ordinary() {
     const auto already_coherent = vbr_downward_project_policy_prefix({ at_target });
     assert(already_coherent.status == vbr_downward_policy_status::coherent);
     assert(already_coherent.prefix.empty());
+    assert(already_coherent.final_cursors[0] == 0);
 
     vbr_downward_policy_child bad_source;
     bad_source.initial_types = { GGML_TYPE_F16 };

@@ -19,6 +19,15 @@ struct vbr_identity_policy_digest_row {
     vbr_lineage_uuid lineage_uuid = {};
 };
 
+inline bool vbr_digest_nonzero(const std::array<uint8_t, 32> & digest) {
+    for (const uint8_t value : digest) {
+        if (value != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Canonical capture/controller type-vector identity. One shared recipe so F3
 // capture, downward validation, and phase-10 rechecks cannot drift.
 inline std::array<uint8_t, 32> vbr_type_vector_digest(

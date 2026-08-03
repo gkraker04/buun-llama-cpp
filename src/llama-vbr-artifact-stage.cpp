@@ -31,6 +31,8 @@ const char * vbr_adopt_stage_status_name(
         case vbr_adopt_stage_status::accounting_unavailable: return "accounting_unavailable";
         case vbr_adopt_stage_status::admission_refused: return "admission_refused";
         case vbr_adopt_stage_status::ring_unavailable: return "ring_unavailable";
+        case vbr_adopt_stage_status::downward_projection_unavailable: return "downward_projection_unavailable";
+        case vbr_adopt_stage_status::downward_reserve_failed: return "downward_reserve_failed";
         case vbr_adopt_stage_status::internal_error: return "internal_error";
         case vbr_adopt_stage_status::_count: break;
     }
@@ -294,6 +296,8 @@ struct vbr_staged_payloads::impl {
     std::vector<llama_cache_acct_alloc_id> allocations;
     llama_cache_prepared_claim_group prepared;
     std::unique_ptr<vbr_h2d_chunk_ring> ring;
+    std::vector<uint64_t> downward_stashless;
+    bool downward_resources = false;
 };
 
 vbr_staged_payloads::vbr_staged_payloads(
@@ -339,6 +343,14 @@ uint64_t vbr_staged_payloads::ring_capacity_bytes() const noexcept {
 }
 bool vbr_staged_payloads::claims_ready() const noexcept {
     return impl_ && impl_->prepared.ready();
+}
+const std::vector<uint64_t> &
+vbr_staged_payloads::downward_stashless_units() const noexcept {
+    static const std::vector<uint64_t> empty;
+    return impl_ ? impl_->downward_stashless : empty;
+}
+bool vbr_staged_payloads::downward_resources_ready() const noexcept {
+    return impl_ && impl_->downward_resources;
 }
 
 llama_cache_transaction_result
@@ -482,7 +494,8 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             return out;
         }
         if (out.manifest->decision() != vbr_import_decision::native_import &&
-            out.manifest->decision() != vbr_import_decision::live_rebased) {
+            out.manifest->decision() != vbr_import_decision::live_rebased &&
+            out.manifest->decision() != vbr_import_decision::downward_rebase) {
             out.status = vbr_adopt_stage_status::unsupported_decision;
             return out;
         }
@@ -516,6 +529,33 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
         state->manifest = out.manifest->manifest_digest();
         state->target = out.manifest->target();
         state->import_decision = out.manifest->decision();
+
+        if (state->import_decision == vbr_import_decision::downward_rebase) {
+            if (policy.reserve_downward == nullptr) {
+                out.status =
+                    vbr_adopt_stage_status::downward_projection_unavailable;
+                return out;
+            }
+            vbr_downward_stage_reservation reservation;
+            const bool projected = policy.reserve_downward(
+                    policy.downward_context, out.manifest->children(),
+                    *policy.ledger, *policy.budget, reservation);
+            out.downward_status = reservation.status;
+            if (!projected) {
+                out.status =
+                    vbr_adopt_stage_status::downward_projection_unavailable;
+                return out;
+            }
+            if (reservation.status != vbr_downward_reserve_status::reserved &&
+                reservation.status !=
+                    vbr_downward_reserve_status::reserved_stashless) {
+                out.status = vbr_adopt_stage_status::downward_reserve_failed;
+                return out;
+            }
+            state->downward_stashless =
+                std::move(reservation.stashless_units);
+            state->downward_resources = true;
+        }
 
         uint32_t source_index = 0;
         const auto append_read = [&](vbr_staged_read_descriptor read) {

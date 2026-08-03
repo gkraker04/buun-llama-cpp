@@ -7,6 +7,7 @@
 #include "llama-memory-tree.h"
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-explicit-capture.h"
+#include "llama-vbr-identity-digest.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -54,6 +56,7 @@ struct llama_kv_cache_vbr_epoch_test {
             const vbr_artifact_package_view & package,
             const std::vector<llama_vbr_artifact_domain_binding> & bindings,
             bool previously_observed,
+            bool allow_downward,
             uint64_t policy_epoch,
             vbr_target_child_snapshot & output) noexcept {
         auto * cache = tree_child.attention;
@@ -109,15 +112,17 @@ struct llama_kv_cache_vbr_epoch_test {
             const auto & extents = cache->vbr_units_of(ikv, is_v);
             ggml_tensor * tensor = is_v
                 ? cache->layers[ikv].v : cache->layers[ikv].k;
-            if (!tensor || int32_t(tensor->type) != descriptor.current_type ||
+            if (!tensor ||
+                (!allow_downward &&
+                 int32_t(tensor->type) != descriptor.current_type) ||
                 extents.size() != descriptor.shards.size()) {
                 return false;
             }
             vbr_target_unit_snapshot target;
             target.child_id = descriptor.child_id;
             target.logical_unit_id = descriptor.logical_unit_id;
-            target.current_type = descriptor.current_type;
-            target.last_source_type = descriptor.last_source_type;
+            target.current_type = tensor->type;
+            target.last_source_type = tensor->type;
             target.promote_hops = descriptor.promote_hops;
             target.last_transition = descriptor.last_transition;
             target.representation_kind = descriptor.representation.kind;
@@ -170,6 +175,108 @@ struct llama_kv_cache_vbr_epoch_test {
             output.units.push_back(std::move(target));
         }
         return !output.units.empty();
+    }
+
+    static bool bind_downward_projection(
+            const std::vector<llama_memory_tree_child> & tree,
+            const vbr_artifact_package_view & package,
+            vbr_target_validation_snapshot & output,
+            vbr_downward_policy_projection & projection) noexcept {
+        std::vector<vbr_downward_policy_child> policy_children;
+        policy_children.reserve(output.children.size());
+        for (size_t child_index = 0; child_index < output.children.size();
+             ++child_index) {
+            auto & target_child = output.children[child_index];
+            const auto live = std::find_if(
+                tree.begin(), tree.end(),
+                [&](const llama_memory_tree_child & value) {
+                    return value.child_id == target_child.child_id;
+                });
+            if (live == tree.end() || !live->attention ||
+                live->attention->vbr_pools_.empty()) {
+                return false;
+            }
+            std::vector<ggml_type> source_types(
+                live->attention->layers.size()*2, GGML_TYPE_COUNT);
+            for (const auto & unit : package.units()) {
+                if (unit.descriptor.child_id != target_child.child_id ||
+                    unit.descriptor.logical_unit_id >= source_types.size()) {
+                    continue;
+                }
+                source_types[unit.descriptor.logical_unit_id] =
+                    static_cast<ggml_type>(unit.descriptor.current_type);
+            }
+            const auto & source_policy =
+                package.manifest().controller_policy[target_child.child_id];
+            if (source_policy.wm_cells > UINT32_MAX ||
+                std::any_of(
+                    source_types.begin(), source_types.end(),
+                    [](ggml_type type) { return type == GGML_TYPE_COUNT; }) ||
+                !live->attention->vbr_downward_policy_input(
+                    source_types, source_policy.cursor,
+                    uint32_t(source_policy.wm_cells),
+                    live->attention->vbr_pools_.front().device,
+                    policy_children.emplace_back())) {
+                return false;
+            }
+        }
+        projection = vbr_downward_project_policy_prefix(policy_children);
+        if (projection.status != vbr_downward_policy_status::coherent) {
+            return false;
+        }
+        for (size_t child_index = 0; child_index < output.children.size();
+             ++child_index) {
+            auto & target_child = output.children[child_index];
+            const auto live = std::find_if(
+                tree.begin(), tree.end(),
+                [&](const llama_memory_tree_child & value) {
+                    return value.child_id == target_child.child_id;
+                });
+            if (live == tree.end() || !live->attention) {
+                return false;
+            }
+            for (auto & unit : target_child.units) {
+                const auto source = std::find_if(
+                    package.units().begin(), package.units().end(),
+                    [&](const vbr_artifact_unit_view & value) {
+                        return value.descriptor.child_id ==
+                                   target_child.child_id &&
+                               value.descriptor.logical_unit_id ==
+                                   unit.logical_unit_id;
+                    });
+                if (source == package.units().end() ||
+                    !live->attention->vbr_downward_bind_target_unit(
+                        static_cast<ggml_type>(
+                            source->descriptor.current_type),
+                        projection, uint32_t(child_index), unit)) {
+                    return false;
+                }
+            }
+            target_child.controller_policy.current_type_vector_digest =
+                projection.child_type_digests[child_index];
+            target_child.controller_policy.cursor =
+                projection.final_cursors[child_index];
+        }
+        return true;
+    }
+
+    static bool reserve_downward(
+            void * context,
+            const std::vector<vbr_validated_child_plan> & plans,
+            llama_cache_acct_ledger & ledger,
+            const llama_cache_budget_config & budget,
+            vbr_downward_stage_reservation & output) noexcept {
+        auto * cache = static_cast<llama_kv_cache *>(context);
+        if (!cache) {
+            return false;
+        }
+        std::vector<const vbr_validated_child_plan *> selected;
+        selected.reserve(plans.size());
+        for (const auto & plan : plans) {
+            selected.push_back(&plan);
+        }
+        return cache->vbr_downward_reserve_import(
+            selected, ledger, budget, output);
     }
 
     static bool adopted_matches(
@@ -283,12 +390,114 @@ struct llama_kv_cache_vbr_epoch_test {
         return tracker ? tracker->teardown_state()
                        : vbr_generation_teardown_state::instance_owner_mismatch;
     }
+
+    static bool representation_types(
+            const llama_kv_cache * cache,
+            const std::vector<ggml_type> & expected) noexcept {
+        if (!cache || expected.size() != cache->layers.size()*2) {
+            return false;
+        }
+        for (size_t layer = 0; layer < cache->layers.size(); ++layer) {
+            if (!cache->layers[layer].k || !cache->layers[layer].v ||
+                cache->layers[layer].k->type != expected[layer*2] ||
+                cache->layers[layer].v->type != expected[layer*2+1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool representation_bytes_equal(
+            const llama_kv_cache * lhs,
+            const llama_kv_cache * rhs,
+            const vbr_artifact_reference_manifest & manifest) {
+        if (!lhs || !rhs || lhs->layers.size() != rhs->layers.size()) {
+            return false;
+        }
+        const auto placement = std::find_if(
+            manifest.stream_placements.begin(),
+            manifest.stream_placements.end(),
+            [](const vbr_artifact_stream_placement & value) {
+                return value.child_id == 0;
+            });
+        if (placement == manifest.stream_placements.end() ||
+            placement->cells.empty()) {
+            return false;
+        }
+        for (size_t layer = 0; layer < lhs->layers.size(); ++layer) {
+            for (bool is_v : { false, true }) {
+                const auto * a = is_v ? lhs->layers[layer].v :
+                                       lhs->layers[layer].k;
+                const auto * b = is_v ? rhs->layers[layer].v :
+                                       rhs->layers[layer].k;
+                if (!a || !b || a->type != b->type ||
+                    a->ne[0] != b->ne[0]) {
+                    return false;
+                }
+                const size_t row_bytes = ggml_row_size(a->type, a->ne[0]);
+                std::vector<uint8_t> a_row(row_bytes);
+                std::vector<uint8_t> b_row(row_bytes);
+                for (const auto & cell : placement->cells) {
+                    if (cell.physical_cell >= uint64_t(a->ne[1]) ||
+                        cell.physical_cell >= uint64_t(b->ne[1]) ||
+                        cell.physical_cell > SIZE_MAX/a->nb[1] ||
+                        cell.physical_cell > SIZE_MAX/b->nb[1]) {
+                        return false;
+                    }
+                    ggml_backend_tensor_get(
+                        a, a_row.data(), cell.physical_cell*a->nb[1],
+                        row_bytes);
+                    ggml_backend_tensor_get(
+                        b, b_row.data(), cell.physical_cell*b->nb[1],
+                        row_bytes);
+                    if (a_row != b_row) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    static bool degrade_to(
+            llama_kv_cache * cache, ggml_type target) noexcept {
+        if (!cache || cache->layers.empty()) {
+            return false;
+        }
+        const auto at_target = [&]() {
+            return std::all_of(
+                cache->layers.begin(), cache->layers.end(),
+                [&](const auto & layer) {
+                    return layer.k && layer.v &&
+                           layer.k->type == target &&
+                           layer.v->type == target;
+                });
+        };
+        for (size_t i = 0; i <= cache->vbr_degrade_order_.size(); ++i) {
+            if (at_target()) {
+                return cache->vbr_capture_settle();
+            }
+            uint32_t watermark = 0;
+            for (const auto & pool : cache->vbr_pools_) {
+                watermark = std::max(watermark, pool.wm_cells);
+            }
+            if (watermark == 0 ||
+                cache->vbr_degrade_next(watermark) !=
+                    llama_kv_cache::vbr_degrade_result::applied) {
+                return false;
+            }
+        }
+        return false;
+    }
 };
 
 struct f42a_harness_target {
     llama_memory_i * memory = nullptr;
     llama_cache_acct_ledger * ledger = nullptr;
     uint64_t policy_epoch = 1;
+    std::array<uint8_t, 32> downward_tree_digest = {};
+    const vbr_artifact_package_view * package = nullptr;
+    const vbr_target_validation_snapshot * target_snapshot = nullptr;
 
     static uint64_t accounting_serial(const void * context) noexcept {
         const auto * self = static_cast<const f42a_harness_target *>(context);
@@ -297,6 +506,25 @@ struct f42a_harness_target {
     static uint64_t policy_serial(const void * context) noexcept {
         const auto * self = static_cast<const f42a_harness_target *>(context);
         return self ? self->policy_epoch : 0;
+    }
+    static bool downward_tree(
+            const void * context,
+            std::array<uint8_t, 32> & output) noexcept {
+        const auto * self = static_cast<const f42a_harness_target *>(context);
+        if (!self || !self->memory || !self->package ||
+            !self->target_snapshot) {
+            return false;
+        }
+        std::vector<llama_memory_tree_child> tree;
+        auto snapshot = *self->target_snapshot;
+        vbr_downward_policy_projection projection;
+        if (!llama_memory_tree_collect(self->memory, tree) ||
+            !llama_kv_cache_vbr_epoch_test::bind_downward_projection(
+                tree, *self->package, snapshot, projection)) {
+            return false;
+        }
+        output = projection.tree_digest;
+        return output == self->downward_tree_digest;
     }
     static bool recheck(
             const void * context,
@@ -423,9 +651,11 @@ static bool f42a_target_snapshot(
         const vbr_artifact_package_view & package,
         const std::vector<llama_vbr_artifact_domain_binding> & bindings,
         bool previously_observed,
+        bool downward,
         uint64_t accounting_serial,
         uint64_t policy_epoch,
-        vbr_target_validation_snapshot & output) {
+        vbr_target_validation_snapshot & output,
+        vbr_downward_policy_projection * downward_projection = nullptr) {
     output = {};
     std::vector<llama_memory_tree_child> tree;
     if (!llama_memory_tree_collect(&memory, tree)) {
@@ -451,15 +681,22 @@ static bool f42a_target_snapshot(
         vbr_target_child_snapshot snapshot;
         if (!llama_kv_cache_vbr_epoch_test::fill_target_child(
                 child, package, bindings, previously_observed,
-                policy_epoch, snapshot)) {
+                downward, policy_epoch, snapshot)) {
             return false;
         }
         output.target_state_serial += snapshot.state_serial;
         output.children.push_back(std::move(snapshot));
     }
-    return !output.children.empty() &&
-           output.children.size() ==
-               package.manifest().generation.controllers.size();
+    if (output.children.empty() || output.children.size() !=
+            package.manifest().generation.controllers.size()) {
+        return false;
+    }
+    if (!downward) {
+        return true;
+    }
+    return downward_projection &&
+           llama_kv_cache_vbr_epoch_test::bind_downward_projection(
+               tree, package, output, *downward_projection);
 }
 
 static vbr_checkpoint_generation_controller source_controller(
@@ -1069,7 +1306,9 @@ struct seam final : vbr_adopt_test_seam {
     bool add_recurrent_at_barrier = false;
     bool drift_serial_at_phase3 = false;
     bool drift_serial_at_phase10 = false;
+    bool drift_downward_at_phase10 = false;
     uint64_t * observed_serial = nullptr;
+    std::array<uint8_t, 32> * observed_downward_tree = nullptr;
     bool operation_opened = false;
     bool recovery_reserved = false;
     uint32_t events = 0;
@@ -1077,6 +1316,11 @@ struct seam final : vbr_adopt_test_seam {
     uint32_t map_calls = 0;
     uint32_t transfer_calls = 0;
     uint32_t mark_calls = 0;
+    uint32_t downward_zero_inits = 0;
+    uint32_t downward_edges = 0;
+    uint32_t downward_stashes = 0;
+    uint32_t downward_syncs = 0;
+    bool downward_synced = false;
 
     seam() {
         for (uint32_t i = 0; i < children.size(); ++i) {
@@ -1098,6 +1342,9 @@ struct seam final : vbr_adopt_test_seam {
         if (!after && phase == vbr_adopt_phase::complete_tree_barrier) {
             if (drift_serial_at_phase10 && observed_serial) {
                 ++*observed_serial;
+            }
+            if (drift_downward_at_phase10 && observed_downward_tree) {
+                (*observed_downward_tree)[0] ^= 0xff;
             }
             if (drift_recurrent_at_barrier) {
                 recurrent.report_nonempty = true;
@@ -1231,6 +1478,88 @@ struct seam final : vbr_adopt_test_seam {
         return true;
     }
 
+    vbr_downward_transform_status session_transform_downward(
+            uint32_t child_id, const vbr_validated_child_plan & plan,
+            bool stashless, uint32_t fail_edge, bool fail_stash,
+            uint32_t & stash_valid, uint32_t & edge_reached) noexcept override {
+        stash_valid = 0;
+        edge_reached = UINT32_MAX;
+        if (child_id >= children.size() || !children[child_id].armed ||
+            !plan.downward || plan.transcode_recipe.n_edges == 0) {
+            return vbr_downward_transform_status::invalid_recipe;
+        }
+        struct driver_state {
+            seam * owner = nullptr;
+            uint32_t edge = 0;
+            uint32_t fail_edge = UINT32_MAX;
+            bool fail_stash = false;
+            bool stashless = false;
+            bool captured = false;
+        } state { this, 0, fail_edge, fail_stash, stashless, false };
+        vbr_downward_edge_driver driver;
+        driver.context = &state;
+        driver.stash_available = [](void * opaque) noexcept {
+            const auto & value = *static_cast<driver_state *>(opaque);
+            return value.stashless || value.captured;
+        };
+        driver.capture_stash = [](void * opaque,
+                                  const vbr_downward_edge &) noexcept {
+            auto & value = *static_cast<driver_state *>(opaque);
+            if (value.fail_stash) {
+                return false;
+            }
+            value.captured = true;
+            ++value.owner->downward_stashes;
+            return true;
+        };
+        driver.transcode = [](void * opaque,
+                              const vbr_downward_edge &) noexcept {
+            auto & value = *static_cast<driver_state *>(opaque);
+            const uint32_t edge = value.edge++;
+            if (edge == value.fail_edge) {
+                return false;
+            }
+            ++value.owner->downward_edges;
+            return true;
+        };
+        bool regenerated = false;
+        const auto status = vbr_downward_execute_edges(
+            plan.transcode_recipe, driver, regenerated, &edge_reached);
+        if (status == vbr_downward_transform_status::transformed &&
+            regenerated) {
+            stash_valid = plan.descriptor.wm_cells;
+        }
+        return status;
+    }
+
+    bool session_initialize_downward_backing(
+            uint32_t child_id,
+            const vbr_validated_child_plan & plan) noexcept override {
+        if (child_id >= children.size() || !children[child_id].armed ||
+            !plan.downward || plan.descriptor.wm_cells == 0) {
+            return false;
+        }
+        ++downward_zero_inits;
+        return true;
+    }
+
+    bool session_synchronize_downward(
+            uint32_t child_id,
+            const std::vector<const vbr_validated_child_plan *> & plans) noexcept override {
+        if (child_id >= children.size() || plans.empty()) {
+            return false;
+        }
+        ++downward_syncs;
+        downward_synced = true;
+        return true;
+    }
+
+    bool session_trim_downward(
+            uint32_t child_id, const vbr_validated_child_plan & plan,
+            uint32_t) noexcept override {
+        return downward_synced && child_id < children.size() && plan.downward;
+    }
+
     bool session_build_live_image(uint32_t child_id,
             const std::vector<const vbr_validated_child_plan *> & plans,
             const vbr_tracker_install_child &,
@@ -1294,11 +1623,19 @@ struct seam final : vbr_adopt_test_seam {
         child.receipts = false;
         child.armed = false;
         events = 0;
+        downward_zero_inits = 0;
+        downward_edges = 0;
+        downward_stashes = 0;
+        downward_syncs = 0;
+        downward_synced = false;
         return !inject_failure;
     }
 
     bool construction_empty() const noexcept {
         return !operation_opened && !recovery_reserved && events == 0 &&
+               downward_zero_inits == 0 && downward_edges == 0 &&
+               downward_stashes == 0 &&
+               downward_syncs == 0 && !downward_synced &&
                publish_calls == 0 &&
                std::all_of(children.begin(), children.end(),
                    [](const child_state & child) {
@@ -1321,6 +1658,7 @@ struct validation_context {
     llama_cache_acct_ledger * ledger = nullptr;
     uint64_t serial_bias = 0;
     uint64_t policy_epoch = 0;
+    std::array<uint8_t, 32> downward_tree_digest = {};
 
     static uint64_t read_accounting(const void * context) noexcept {
         const auto * self = static_cast<const validation_context *>(context);
@@ -1332,6 +1670,17 @@ struct validation_context {
     static uint64_t read_policy(const void * context) noexcept {
         const auto * self = static_cast<const validation_context *>(context);
         return self ? self->policy_epoch : 0;
+    }
+
+    static bool read_downward_tree(
+            const void * context,
+            std::array<uint8_t, 32> & output) noexcept {
+        const auto * self = static_cast<const validation_context *>(context);
+        if (!self || !vbr_digest_nonzero(self->downward_tree_digest)) {
+            return false;
+        }
+        output = self->downward_tree_digest;
+        return true;
     }
 
     static bool recheck(const void * context,
@@ -1456,10 +1805,20 @@ struct fixture {
     vbr_adopt_policy policy;
     uint64_t catalog_live_ops = 0;
     bool with_companion = false;
+    bool downward = false;
+    vbr_downward_policy_projection downward_projection;
+    llama_cache_budget_plan downward_plan;
+    vbr_downward_reserve_status downward_reserve_status =
+        vbr_downward_reserve_status::reserved;
 
-    explicit fixture(bool companion = false)
+    explicit fixture(bool companion = false, bool downward_import = false)
         : source(package(bytes, companion)), catalog(ledger),
-          with_companion(companion) {
+          with_companion(companion), downward(downward_import) {
+        if (downward) {
+            for (auto & controller : source.manifest.controller_policy) {
+                controller.floor_type = GGML_TYPE_TURBO1_TCQ;
+            }
+        }
         const auto prepared = vbr_artifact_prepare(source);
         if (prepared != vbr_artifact_status::ok) {
             std::fprintf(stderr, "G2 prepare status=%s\n",
@@ -1580,6 +1939,8 @@ struct fixture {
         validation.ledger = &ledger;
         validation.policy_epoch = 91;
         target.observed_serial = &validation.serial_bias;
+        target.observed_downward_tree =
+            &validation.downward_tree_digest;
         fill_snapshot();
         fill_policy();
     }
@@ -1669,6 +2030,72 @@ struct fixture {
             child.units.push_back(std::move(unit));
             snapshot.children.push_back(std::move(child));
         }
+        if (downward) {
+            std::vector<vbr_downward_policy_child> projected;
+            projected.reserve(snapshot.children.size());
+            for (auto & child : snapshot.children) {
+                CHECK(child.units.size() == 1);
+                auto & unit = child.units[0];
+                const auto source_type = static_cast<ggml_type>(
+                    view.units()[child.child_id].descriptor.current_type);
+                const auto target_type = GGML_TYPE_TURBO3_TCQ;
+                unit.current_type = target_type;
+                unit.current_domain = vbr_repr_domain::tapped;
+                unit.downward_supported = true;
+                unit.downward_movable = true;
+                unit.controller_floor_type = GGML_TYPE_TURBO1_TCQ;
+                unit.downward_type = target_type;
+                unit.downward_domain = vbr_repr_domain::tapped;
+                unit.downward_recipe_id = 1;
+                unit.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
+                unit.downward_meansub_model_id = 7;
+                CHECK(vbr_downward_resolve_recipe(
+                    source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
+                    unit.downward_recipe) ==
+                    vbr_downward_recipe_status::resolved);
+                unit.downward_row_bytes = unit.shards[0].row_bytes;
+                unit.downward_mapped_bytes = unit.shards[0].mapped_bytes;
+                unit.downward_transfer_bytes =
+                    view.units()[child.child_id].descriptor.shards[0].payload_bytes;
+                unit.downward_codec_workspace_bytes = 64;
+
+                vbr_downward_policy_child policy_child;
+                policy_child.initial_types = { source_type };
+                policy_child.target_types = { target_type };
+                policy_child.initial_cursor =
+                    view.manifest().controller_policy[child.child_id].cursor;
+                for (size_t edge = 0;
+                     edge < unit.downward_recipe.n_edges; ++edge) {
+                    const auto & item = unit.downward_recipe.edges[edge];
+                    policy_child.policy.steps.push_back({
+                        edge, 0, int32_t(item.source_type),
+                        int32_t(item.target_type), 1,
+                    });
+                }
+                policy_child.policy.terminal_progress =
+                    int64_t(policy_child.policy.steps.size());
+                projected.push_back(std::move(policy_child));
+            }
+            downward_projection =
+                vbr_downward_project_policy_prefix(projected);
+            CHECK(downward_projection.status ==
+                  vbr_downward_policy_status::coherent);
+            for (auto & child : snapshot.children) {
+                child.controller_policy.current_type_vector_digest =
+                    downward_projection.child_type_digests[child.child_id];
+                child.controller_policy.cursor =
+                    downward_projection.final_cursors[child.child_id];
+                auto & unit = child.units[0];
+                unit.downward_build_identity_digest =
+                    vbr_downward_build_identity(
+                        unit.downward_recipe,
+                        unit.downward_meansub_model_id,
+                        unit.meansub_digest,
+                        downward_projection.child_type_digests[child.child_id],
+                        downward_projection.tree_digest);
+            }
+            validation.downward_tree_digest = downward_projection.tree_digest;
+        }
         if (with_companion) {
             const auto & descriptor = view.companions()[0].descriptor;
             snapshot.companions.push_back({
@@ -1708,6 +2135,13 @@ struct fixture {
         policy.recheck_target_empty = validation_context::recheck;
         policy.read_accounting_serial = validation_context::read_accounting;
         policy.read_policy_epoch = validation_context::read_policy;
+        if (downward) {
+            downward_plan.accounting_serial = snapshot_accounting.serial;
+            policy.downward_budget_plan = &downward_plan;
+            policy.downward_projection = &downward_projection;
+            policy.read_downward_tree_digest =
+                validation_context::read_downward_tree;
+        }
     }
 
     llama_cache_acct_snapshot snapshot_accounting;
@@ -1716,6 +2150,9 @@ struct fixture {
         snapshot_accounting = ledger.snapshot();
         snapshot.accounting_serial = snapshot_accounting.serial;
         policy.accounting_snapshot = &snapshot_accounting;
+        if (downward) {
+            downward_plan.accounting_serial = snapshot_accounting.serial;
+        }
     }
 
     vbr_adopt_stage_result stage(
@@ -1737,6 +2174,34 @@ struct fixture {
             stage_policy.lanes.push_back({
                 binding.domain, nullptr, nullptr, false,
             });
+        }
+        if (downward) {
+            stage_policy.downward_context = this;
+            stage_policy.reserve_downward = [](
+                    void * context,
+                    const std::vector<vbr_validated_child_plan> & plans,
+                    llama_cache_acct_ledger &,
+                    const llama_cache_budget_config &,
+                    vbr_downward_stage_reservation & output) noexcept {
+                auto & self = *static_cast<fixture *>(context);
+                if (plans.empty() || std::any_of(
+                        plans.begin(), plans.end(),
+                        [](const vbr_validated_child_plan & plan) {
+                            return !plan.downward ||
+                                   plan.transcode_recipe.n_edges == 0;
+                        })) {
+                    return false;
+                }
+                output.status = self.downward_reserve_status;
+                if (output.status ==
+                        vbr_downward_reserve_status::reserved_stashless) {
+                    output.stashless_units.push_back(
+                        vbr_downward_unit_key(
+                            plans.front().child_id,
+                            plans.front().logical_unit_id));
+                }
+                return true;
+            };
         }
         stage_policy.fault = fault;
         return vbr_stage_validated_manifest(
@@ -1990,6 +2455,101 @@ static void test_g2_serial_and_admission_faults() {
     }
 }
 
+static void test_g2_downward_subphase_matrix() {
+    {
+        fixture f(false, true);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.decision == vbr_import_decision::downward_rebase);
+        CHECK(result.consistency ==
+              vbr_artifact_consistency_kind::live_rebased);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_completion);
+        CHECK(f.target.downward_zero_inits == f.view.units().size());
+        CHECK(f.target.downward_edges != 0);
+        CHECK(f.target.downward_syncs == 2);
+        // The fake reserve makes only child 0 stashless. Child 1 proves that
+        // the first outgoing tapped edge regenerates a clean stash and that
+        // stashless evidence is keyed by (child,unit), not a colliding unit id.
+        CHECK(f.target.downward_stashes ==
+              f.view.units()[1].descriptor.shards.size());
+    }
+
+    vbr_downward_recipe recipe;
+    CHECK(vbr_downward_resolve_recipe(
+        GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO3_TCQ,
+        GGML_TYPE_TURBO1_TCQ, true, recipe) ==
+        vbr_downward_recipe_status::resolved);
+    for (uint32_t edge = 0; edge < recipe.n_edges; ++edge) {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_edge = edge;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_transform_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_transcode);
+        CHECK(result.downward_edge == edge);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        f.target.drift_downward_at_phase10 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::barrier_failed);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        f.target.fail_transfer_child = 0;
+        f.target.fail_transfer_shard = 0;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::source_h2d);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_stash = true;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_stash_unavailable);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_stash_capture);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_completion = true;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_transform_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_completion);
+        check_failed_transaction(f, result);
+    }
+    for (const auto status : {
+            vbr_downward_reserve_status::projection_unavailable,
+            vbr_downward_reserve_status::accounting_refused,
+            vbr_downward_reserve_status::workspace_reserve_failed,
+            vbr_downward_reserve_status::internal_error }) {
+        fixture f(false, true);
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        f.downward_reserve_status = status;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::downward_reserve_failed);
+        CHECK(staged.downward_status == status);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+}
+
 } // namespace g2
 
 static void test_cuda_h2d_adapter() {
@@ -2064,11 +2624,14 @@ static void test_cuda_h2d_adapter() {
     ggml_backend_free(backend);
 }
 
-static bool f42a_model_backed_adoption(const char * model_path) {
+static bool f42a_model_backed_adoption(
+        const char * model_path, bool downward_mode,
+        ggml_type source_type = GGML_TYPE_F16,
+        ggml_type target_type = GGML_TYPE_F16) {
     ggml_backend_load_all();
     setenv("VBR_FORCE_GENERIC", "1", 1);
     setenv("VBR_PROMOTE", "0", 1);
-    setenv("VBR_STASH_ROWS", "0", 1);
+    setenv("VBR_STASH_ROWS", downward_mode ? "64" : "0", 1);
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 99;
@@ -2091,11 +2654,18 @@ static bool f42a_model_backed_adoption(const char * model_path) {
     context_params.vbr_dynamic = true;
     context_params.vbr_budget_explicit = true;
     context_params.vbr_vram_budget_bytes = 4ull*1024*1024*1024;
+    if (downward_mode) {
+        context_params.vbr_min_bits = 1.0;
+        context_params.vbr_min_bits_explicit = true;
+    }
 
-    auto make_context = [&]() {
-        return llama_context_ptr(llama_init_from_model(model.get(), context_params));
+    auto make_context = [&](ggml_type entry_type) {
+        auto params = context_params;
+        params.type_k = entry_type;
+        params.type_v = entry_type;
+        return llama_context_ptr(llama_init_from_model(model.get(), params));
     };
-    auto source = make_context();
+    auto source = make_context(source_type);
     CHECK(source != nullptr);
     if (!source) {
         return false;
@@ -2226,6 +2796,13 @@ static bool f42a_model_backed_adoption(const char * model_path) {
     CHECK(catalog.resolve_reference(reference, package) ==
           vbr_artifact_resolve_status::ok);
     CHECK(package && package.validate() == vbr_artifact_status::ok);
+    if (downward_mode) {
+        CHECK(std::all_of(
+            package.units().begin(), package.units().end(),
+            [&](const vbr_artifact_unit_view & unit) {
+                return unit.descriptor.current_type == int32_t(source_type);
+            }));
+    }
     const auto source_instance = source_pools.front().instance_id;
 
     const llama_token continuation = tokens.back();
@@ -2246,12 +2823,57 @@ static bool f42a_model_backed_adoption(const char * model_path) {
     source.reset();
     capture_ring.reset();
 
+    // P3 two-standard oracle: the ordinary F4.2a cell remains byte-exact to
+    // its F16 source. Downward compares encoded rows against the shipped live
+    // degrade path and continuation against a separate context that encoded
+    // the same tokens natively at the declared final tier.
+    std::vector<float> expected_logits = source_logits;
+    llama_context_ptr live_degrade_reference;
+    const llama_kv_cache * live_degrade_cache = nullptr;
+    if (downward_mode) {
+        live_degrade_reference = make_context(source_type);
+        CHECK(live_degrade_reference != nullptr);
+        std::vector<llama_memory_tree_child> degrade_tree;
+        if (!live_degrade_reference ||
+            !f42a_decode(live_degrade_reference.get(), tokens, 0)) {
+            return false;
+        }
+        llama_synchronize(live_degrade_reference.get());
+        if (!llama_memory_tree_collect(
+                llama_get_memory(live_degrade_reference.get()),
+                degrade_tree) ||
+            degrade_tree.size() != 1 || !degrade_tree[0].attention ||
+            !llama_kv_cache_vbr_epoch_test::degrade_to(
+                degrade_tree[0].attention, target_type)) {
+            return false;
+        }
+        live_degrade_cache = degrade_tree[0].attention;
+
+        auto same_tier = make_context(target_type);
+        CHECK(same_tier != nullptr);
+        if (!same_tier || !f42a_decode(same_tier.get(), tokens, 0) ||
+            !f42a_decode(same_tier.get(), { continuation },
+                         llama_pos(tokens.size()))) {
+            return false;
+        }
+        float * same_tier_logits =
+            llama_get_logits_ith(same_tier.get(), -1);
+        CHECK(same_tier_logits != nullptr);
+        if (!same_tier_logits) {
+            return false;
+        }
+        expected_logits.assign(
+            same_tier_logits, same_tier_logits+vocab_size);
+        llama_synchronize(same_tier.get());
+    }
+
     const auto run_import = [&](bool previously_observed,
                                 vbr_import_decision expected_decision,
                                 vbr_adopt_phase fail_before_phase =
                                     vbr_adopt_phase::_count) {
         const uint64_t baseline_live_ops = ledger.snapshot().live_ops;
-        auto target_context = make_context();
+        auto target_context = make_context(
+            downward_mode ? target_type : GGML_TYPE_F16);
         CHECK(target_context != nullptr);
         if (!target_context) {
             return false;
@@ -2268,9 +2890,11 @@ static bool f42a_model_backed_adoption(const char * model_path) {
 
         const auto accounting_snapshot = ledger.snapshot();
         vbr_target_validation_snapshot target_snapshot;
+        vbr_downward_policy_projection downward_projection;
         CHECK(f42a_target_snapshot(
             *target_memory, package, bindings, previously_observed,
-            accounting_snapshot.serial, 1, target_snapshot));
+            downward_mode, accounting_snapshot.serial, 1, target_snapshot,
+            downward_mode ? &downward_projection : nullptr));
         if (target_snapshot.children.empty()) {
             return false;
         }
@@ -2280,6 +2904,12 @@ static bool f42a_model_backed_adoption(const char * model_path) {
         f42a_harness_target target_owner {
             target_memory, &ledger, 1,
         };
+        if (downward_mode) {
+            target_owner.downward_tree_digest =
+                downward_projection.tree_digest;
+            target_owner.package = &package;
+            target_owner.target_snapshot = &target_snapshot;
+        }
         vbr_adopt_policy policy;
         policy.authorized = true;
         policy.identity = {
@@ -2302,6 +2932,15 @@ static bool f42a_model_backed_adoption(const char * model_path) {
         policy.read_accounting_serial =
             f42a_harness_target::accounting_serial;
         policy.read_policy_epoch = f42a_harness_target::policy_serial;
+        llama_cache_budget_plan downward_budget_plan;
+        if (downward_mode) {
+            downward_budget_plan.accounting_serial =
+                accounting_snapshot.serial;
+            policy.downward_budget_plan = &downward_budget_plan;
+            policy.downward_projection = &downward_projection;
+            policy.read_downward_tree_digest =
+                f42a_harness_target::downward_tree;
+        }
 
         auto validated = vbr_validate_unit_manifest_snapshot(
             target_snapshot, package, policy);
@@ -2324,6 +2963,14 @@ static bool f42a_model_backed_adoption(const char * model_path) {
             target_pools.front().backend,
             false,
         });
+        if (downward_mode) {
+            auto * target_cache = static_cast<llama_kv_cache *>(
+                const_cast<void *>(
+                    target_snapshot.children[0].memory_cookie));
+            stage_policy.downward_context = target_cache;
+            stage_policy.reserve_downward =
+                llama_kv_cache_vbr_epoch_test::reserve_downward;
+        }
         auto staged = vbr_stage_validated_manifest(
             std::move(validated.proof), stage_policy);
         CHECK(staged.status == vbr_adopt_stage_status::staged);
@@ -2389,16 +3036,54 @@ static bool f42a_model_backed_adoption(const char * model_path) {
             CHECK(adopted_generation == 1);
             CHECK(adopted_transition == vbr_repr_transition::whole_import);
         }
+        if (downward_mode) {
+            CHECK(expected_decision ==
+                  vbr_import_decision::downward_rebase);
+            CHECK(adopted.consistency ==
+                  vbr_artifact_consistency_kind::live_rebased);
+            CHECK(!downward_projection.final_types.empty());
+            CHECK(llama_kv_cache_vbr_epoch_test::representation_types(
+                adopted_cache, downward_projection.final_types[0]));
+            if (!live_degrade_cache ||
+                !llama_kv_cache_vbr_epoch_test::representation_bytes_equal(
+                    adopted_cache, live_degrade_cache,
+                    package.manifest())) {
+                CHECK(false &&
+                      "downward rows differ from shipped live-degrade oracle");
+                return false;
+            }
+        }
 
         CHECK(f42a_decode(target_context.get(),
                           { continuation }, llama_pos(tokens.size())));
         float * target_logits = llama_get_logits_ith(target_context.get(), -1);
         CHECK(target_logits != nullptr);
-        if (!target_logits || std::memcmp(
-                source_logits.data(), target_logits,
-                source_logits.size()*sizeof(float)) != 0) {
-            CHECK(false && "capture/adopt continuation logits differ");
+        if (!target_logits) {
             return false;
+        }
+        if (!downward_mode) {
+            if (std::memcmp(
+                    expected_logits.data(), target_logits,
+                    expected_logits.size()*sizeof(float)) != 0) {
+                CHECK(false && "capture/adopt continuation logits differ");
+                return false;
+            }
+        } else {
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected_logits.size(); ++i) {
+                max_abs = std::max(
+                    max_abs, std::abs(expected_logits[i]-target_logits[i]));
+            }
+            std::fprintf(stderr,
+                "F4.2b downward same-tier continuation max_abs=%g\n",
+                double(max_abs));
+            // The target representation is deterministic on pinned kernels;
+            // the retained 27B gate records this metric and applies the
+            // predeclared representation-level tolerance only here.
+            CHECK(max_abs <= 1.0e-4f);
+            if (max_abs > 1.0e-4f) {
+                return false;
+            }
         }
         CHECK(!vbr_recovery_pending_for(target_instance));
         llama_synchronize(target_context.get());
@@ -2413,13 +3098,17 @@ static bool f42a_model_backed_adoption(const char * model_path) {
     // pre-publication checkpoint is driven on a real target. A fail-before
     // at phase N is also the fail-after oracle for phase N-1. Composite
     // publication and close deliberately have no post-boundary fault seam.
-    for (uint8_t phase = uint8_t(vbr_adopt_phase::operation_open);
-         phase <= uint8_t(vbr_adopt_phase::composite_publish); ++phase) {
-        CHECK(run_import(false, vbr_import_decision::native_import,
-                         vbr_adopt_phase(phase)));
+    if (!downward_mode) {
+        for (uint8_t phase = uint8_t(vbr_adopt_phase::operation_open);
+             phase <= uint8_t(vbr_adopt_phase::composite_publish); ++phase) {
+            CHECK(run_import(false, vbr_import_decision::native_import,
+                             vbr_adopt_phase(phase)));
+        }
+        CHECK(run_import(false, vbr_import_decision::native_import));
+        CHECK(run_import(true, vbr_import_decision::live_rebased));
+    } else {
+        CHECK(run_import(false, vbr_import_decision::downward_rebase));
     }
-    CHECK(run_import(false, vbr_import_decision::native_import));
-    CHECK(run_import(true, vbr_import_decision::live_rebased));
     package.reset();
     CHECK(catalog.retire(reference) == vbr_artifact_retire_status::retired);
     CHECK(ledger.snapshot().live_ops == 0);
@@ -2456,6 +3145,25 @@ static void test_final_recheck_excludes_only_own_reservation() {
     operation.close(vbr_operation_outcome::aborted);
 }
 
+static bool f42b_parse_type(const std::string & name, ggml_type & output) {
+    if (name == "f16") {
+        output = GGML_TYPE_F16;
+    } else if (name == "t8") {
+        output = GGML_TYPE_TURBO8_0;
+    } else if (name == "t4") {
+        output = GGML_TYPE_TURBO4_0;
+    } else if (name == "t3") {
+        output = GGML_TYPE_TURBO3_TCQ;
+    } else if (name == "t2") {
+        output = GGML_TYPE_TURBO2_TCQ;
+    } else if (name == "t1") {
+        output = GGML_TYPE_TURBO1_TCQ;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();
@@ -2464,19 +3172,47 @@ int main(int argc, char ** argv) {
     g2::test_g2_shard_child_and_partial_map_matrix();
     g2::test_g2_complete_tree_barrier_matrix();
     g2::test_g2_serial_and_admission_faults();
+    g2::test_g2_downward_subphase_matrix();
     test_final_recheck_excludes_only_own_reservation();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();
     test_live_rebased_tracker_image_is_fresh();
     test_native_tracker_rejects_uncovered_cell_and_tuple_splice();
-    if (argc >= 2 && std::string(argv[1]) == "--f42a-cuda") {
-        if (argc != 3) {
-            std::fprintf(stderr, "usage: %s --f42a-cuda MODEL\n", argv[0]);
+    if (argc >= 2 &&
+        (std::string(argv[1]) == "--f42a-cuda" ||
+         std::string(argv[1]) == "--f42b-cuda")) {
+        const bool downward = std::string(argv[1]) == "--f42b-cuda";
+        if ((!downward && argc != 3) ||
+            (downward && argc != 3 && argc != 5)) {
+            std::fprintf(stderr,
+                "usage: %s --f42a-cuda MODEL\n"
+                "       %s --f42b-cuda MODEL [SOURCE TARGET]\n"
+                "tiers: f16 t8 t4 t3 t2 t1\n", argv[0], argv[0]);
+            return 2;
+        }
+        ggml_type source_type = GGML_TYPE_F16;
+        ggml_type target_type = downward ?
+            GGML_TYPE_TURBO3_TCQ : GGML_TYPE_F16;
+        if (argc == 5 &&
+            (!f42b_parse_type(argv[3], source_type) ||
+             !f42b_parse_type(argv[4], target_type))) {
+            std::fprintf(stderr, "invalid F4.2b tier pair: %s -> %s\n",
+                argv[3], argv[4]);
+            return 2;
+        }
+        vbr_downward_recipe requested_recipe;
+        if (downward && vbr_downward_resolve_recipe(
+                source_type, target_type, GGML_TYPE_TURBO1_TCQ, true,
+                requested_recipe) != vbr_downward_recipe_status::resolved) {
+            std::fprintf(stderr, "unsupported F4.2b tier pair: %s -> %s\n",
+                argc == 5 ? argv[3] : "f16",
+                argc == 5 ? argv[4] : "t3");
             return 2;
         }
         test_cuda_h2d_adapter();
         if (failures == 0) {
-            f42a_model_backed_adoption(argv[2]);
+            f42a_model_backed_adoption(
+                argv[2], downward, source_type, target_type);
         }
     }
     if (failures != 0) {

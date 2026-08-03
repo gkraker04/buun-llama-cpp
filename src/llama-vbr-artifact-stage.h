@@ -123,6 +123,8 @@ enum class vbr_adopt_stage_status : uint8_t {
     accounting_unavailable,
     admission_refused,
     ring_unavailable,
+    downward_projection_unavailable,
+    downward_reserve_failed,
     internal_error,
     _count,
 };
@@ -137,12 +139,20 @@ struct vbr_adopt_stage_fault {
 };
 
 struct vbr_adopt_stage_policy {
+    using reserve_downward_fn = bool (*)(
+        void * context,
+        const std::vector<vbr_validated_child_plan> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept;
     llama_cache_acct_ledger * ledger = nullptr;
     const llama_cache_budget_config * budget = nullptr;
     std::vector<vbr_h2d_lane_binding> lanes;
     llama_cache_acct_resource_domain pinned_domain;
     uint64_t pinned_ring_bytes = 0;
     size_t chunk_bytes = 0;
+    void * downward_context = nullptr;
+    reserve_downward_fn reserve_downward = nullptr;
     vbr_adopt_stage_fault fault;
 };
 
@@ -169,6 +179,8 @@ public:
     const std::vector<vbr_staged_read_descriptor> & reads() const noexcept;
     uint64_t ring_capacity_bytes() const noexcept;
     bool claims_ready() const noexcept;
+    const std::vector<uint64_t> & downward_stashless_units() const noexcept;
+    bool downward_resources_ready() const noexcept;
 
 private:
     llama_cache_transaction_result adoption_materialize_claims() noexcept;
@@ -193,6 +205,8 @@ private:
 struct vbr_adopt_stage_result {
     vbr_adopt_stage_status status =
         vbr_adopt_stage_status::internal_error;
+    vbr_downward_reserve_status downward_status =
+        vbr_downward_reserve_status::internal_error;
     std::unique_ptr<vbr_validated_manifest> manifest;
     std::unique_ptr<vbr_staged_payloads> staged;
 };

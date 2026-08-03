@@ -5436,6 +5436,17 @@ extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t,
 // TurboQuant/VBR KV-cache backend interface (ggml-vbr.h): every slot filled — libllama
 // resolves this vtable via GGML_VBR_BACKEND_IFACE_PROC instead of linking CUDA symbols.
 const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
+    static const auto tensor_memset_async = [](
+            ggml_backend_t backend, ggml_tensor * tensor,
+            size_t offset, size_t size) {
+        ggml_backend_cuda_context * cuda_ctx =
+            (ggml_backend_cuda_context *) backend->context;
+        ggml_backend_buffer_t buf = tensor->view_src
+            ? tensor->view_src->buffer : tensor->buffer;
+        GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+        CUDA_CHECK(cudaMemsetAsync(
+            (char *) tensor->data + offset, 0, size, cuda_ctx->stream()));
+    };
     static const ggml_vbr_backend_iface iface = {
         /* .get_device_count  = */ ggml_backend_cuda_get_device_count,
         /* .buffer_type       = */ ggml_backend_cuda_buffer_type,
@@ -5461,6 +5472,7 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
         /* .kv_dequant_scratch_memory  = */ ggml_backend_cuda_kv_dequant_scratch_memory,
         /* .kv_transcode_workspace_memory  = */ ggml_backend_cuda_kv_transcode_workspace_memory,
         /* .kv_transcode_workspace_reserve = */ ggml_backend_cuda_kv_transcode_workspace_reserve,
+        /* .tensor_memset_async = */ tensor_memset_async,
     };
     return &iface;
 }

@@ -9,6 +9,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 static llama_context_ptr make_ctx(const common_params & params, llama_model * model, uint32_t n_seq_max = 1) {
@@ -156,9 +157,25 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    std::vector<std::string> parser_args(argv, argv + argc);
+    parser_args.push_back("-ct");
+    parser_args.push_back("f16");
+    std::vector<char *> parser_argv;
+    parser_argv.reserve(parser_args.size());
+    for (auto & arg : parser_args) {
+        parser_argv.push_back(&arg[0]);
+    }
+    if (!common_params_parse(
+            int(parser_argv.size()), parser_argv.data(), params,
+            LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
+
+    // This rollback test is cache-representation agnostic and intentionally
+    // pins the static CPU-compatible cache rather than inheriting CLI defaults.
+    GGML_ASSERT(params.cache_type_k == GGML_TYPE_F16);
+    GGML_ASSERT(params.cache_type_v == GGML_TYPE_F16);
+    GGML_ASSERT(!params.vbr_enabled());
 
     ggml_backend_load_all();
 

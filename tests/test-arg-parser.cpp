@@ -193,6 +193,42 @@ static void test(void) {
         assert(vbr_default.vbr_min_bits_value == 4.125);
         assert(vbr_default.vbr_capacity_bits == 4.125);
 
+        common_params implicit_cpu = vbr_default;
+        assert(common_params_apply_vbr_cpu_fallback(implicit_cpu, false) ==
+               common_vbr_cpu_fallback_result::applied);
+        assert(!implicit_cpu.vbr_enabled());
+        assert(implicit_cpu.cache_type_k == GGML_TYPE_F16);
+        assert(implicit_cpu.cache_type_v == GGML_TYPE_F16);
+        assert(implicit_cpu.vbr_min_bits_value == 0.0);
+        assert(implicit_cpu.vbr_capacity_bits == 0.0);
+        const auto implicit_cpu_context =
+            common_context_params_to_llama(implicit_cpu);
+        assert(!implicit_cpu_context.vbr_dynamic);
+        assert(implicit_cpu_context.vbr_min_bits == 0.0);
+        common_params implicit_zero_layers = vbr_default;
+        implicit_zero_layers.n_gpu_layers = 0;
+        assert(common_params_apply_vbr_cpu_fallback(
+                   implicit_zero_layers, true) ==
+               common_vbr_cpu_fallback_result::applied);
+        common_params implicit_host_kv = vbr_default;
+        implicit_host_kv.no_kv_offload = true;
+        assert(common_params_apply_vbr_cpu_fallback(
+                   implicit_host_kv, true) ==
+               common_vbr_cpu_fallback_result::applied);
+
+        // A side the user set to an explicit non-VBR type keeps that type when
+        // the OTHER (implicit-vbr) side falls back — intent preservation.
+        common_params mixed_explicit_k;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mixed_explicit_k, LLAMA_EXAMPLE_COMMON));
+        assert(!mixed_explicit_k.vbr_cache_type_k);
+        assert(mixed_explicit_k.vbr_cache_type_v); // V still implicit vbr
+        assert(common_params_apply_vbr_cpu_fallback(mixed_explicit_k, false) ==
+               common_vbr_cpu_fallback_result::applied);
+        assert(mixed_explicit_k.cache_type_k == GGML_TYPE_Q8_0);
+        assert(mixed_explicit_k.cache_type_v == GGML_TYPE_F16);
+        assert(!mixed_explicit_k.vbr_enabled());
+
         // A concrete cache type opts out of the implicit VBR default.
         common_params vbr_opt_out;
         argv = {"binary_name", "-m", "model.gguf", "-ct", "f16"};
@@ -218,6 +254,12 @@ static void test(void) {
         assert(vbr_params.vbr_dynamic());
         assert(vbr_params.vbr_min_bits_value == 0.0);
         assert(vbr_params.vbr_capacity_bits == 1.25); // capacity advertised at the default t1 floor
+        common_params explicit_cpu = vbr_params;
+        assert(common_params_apply_vbr_cpu_fallback(explicit_cpu, false) ==
+               common_vbr_cpu_fallback_result::explicit_vbr);
+        assert(explicit_cpu.vbr_dynamic());
+        assert(explicit_cpu.vbr_cache_type_k_explicit);
+        assert(explicit_cpu.vbr_cache_type_v_explicit);
 #ifndef _WIN32
         assert(getenv("VBR_VMM") == nullptr);
         assert(getenv("VBR_MODE") == nullptr);

@@ -4,6 +4,7 @@
 #include "llama-memory-tree.h"
 #include "llama-vbr-artifact-catalog.h"
 #include "llama-vbr-operation.h"
+#include "llama-vbr-downward.h"
 
 #include <array>
 #include <cstdint>
@@ -116,6 +117,8 @@ struct vbr_target_unit_snapshot {
     uint64_t row_alignment = 0;
     std::vector<vbr_target_shard_snapshot> shards;
     bool downward_supported = false;
+    bool downward_movable = false;
+    int32_t controller_floor_type = -1;
     int32_t downward_type = -1;
     vbr_repr_domain downward_domain = vbr_repr_domain::full;
     uint32_t downward_recipe_id = 0;
@@ -125,6 +128,11 @@ struct vbr_target_unit_snapshot {
     uint64_t downward_mapped_bytes = 0;
     uint64_t downward_transfer_bytes = 0;
     uint64_t downward_codec_workspace_bytes = 0;
+    // F4.2b proof inputs.  The recipe is the unique recipe-v1 chain resolved
+    // against this exact unit; the projection digests are supplied by the one
+    // tree-policy simulator and checked as a complete-tree value below.
+    vbr_downward_recipe downward_recipe;
+    int32_t downward_meansub_model_id = -1;
 };
 
 struct vbr_target_child_snapshot {
@@ -200,6 +208,8 @@ struct vbr_adopt_policy {
         const std::vector<llama_memory_tree_child> & canonical_tree,
         vbr_target_validation_snapshot & output) noexcept;
     using serial_fn = uint64_t (*)(const void * context) noexcept;
+    using downward_digest_fn = bool (*)(
+        const void * context, std::array<uint8_t, 32> & output) noexcept;
     using target_recheck_fn = bool (*)(
         const void * context,
         const vbr_target_empty_fingerprint & expected) noexcept;
@@ -229,12 +239,14 @@ struct vbr_adopt_policy {
     const llama_cache_acct_snapshot * accounting_snapshot = nullptr;
     const llama_cache_budget_config * budget_config = nullptr;
     const llama_cache_budget_plan * downward_budget_plan = nullptr;
+    const vbr_downward_policy_projection * downward_projection = nullptr;
     const void * context = nullptr;
     inspect_target_fn inspect_target = nullptr;
     parse_companion_fn parse_companion = nullptr;
     target_recheck_fn recheck_target_empty = nullptr;
     serial_fn read_accounting_serial = nullptr;
     serial_fn read_policy_epoch = nullptr;
+    downward_digest_fn read_downward_tree_digest = nullptr;
 };
 
 struct vbr_child_empty_fingerprint {
@@ -273,6 +285,8 @@ struct vbr_validated_shard_plan {
     uint64_t logical_offset = 0;
     uint64_t row_count = 0;
     uint64_t row_bytes = 0;
+    uint64_t target_row_bytes = 0;
+    uint64_t target_mapped_bytes = 0;
     uint64_t payload_bytes = 0;
     std::shared_ptr<const artifact_segment_chain> source;
 };
@@ -293,6 +307,11 @@ struct vbr_validated_child_plan {
     uint32_t transcode_recipe_id = 0;
     uint32_t transcode_recipe_version = 0;
     std::array<uint8_t, 32> transcode_build_identity_digest = {};
+    vbr_downward_recipe transcode_recipe;
+    std::array<uint8_t, 32> transcode_policy_digest = {};
+    std::array<uint8_t, 32> transcode_tree_digest = {};
+    int32_t transcode_meansub_model_id = -1;
+    uint64_t target_controller_cursor = 0;
     bool downward = false;
     vbr_validated_stash_action stash_action =
         vbr_validated_stash_action::none_at_source;
@@ -393,6 +412,8 @@ private:
     vbr_adopt_policy::target_recheck_fn recheck_target_empty_ = nullptr;
     vbr_adopt_policy::serial_fn read_accounting_serial_ = nullptr;
     vbr_adopt_policy::serial_fn read_policy_epoch_ = nullptr;
+    vbr_adopt_policy::downward_digest_fn
+        read_downward_tree_digest_ = nullptr;
 
     friend struct vbr_manifest_validation_result;
     friend vbr_manifest_validation_result vbr_validate_unit_manifest(
