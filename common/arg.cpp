@@ -811,6 +811,17 @@ static void common_params_postprocess_vbr(common_params & params) {
         return;
     }
 
+    // The common CLI selects dynamic VBR implicitly with a conservative t4 quality floor.
+    // Typing a VBR cache alias is an intentional opt-in to the complete ladder, so preserve
+    // the historical bottom-tier (t1) floor unless --vbr-floor was also typed. Fixed-tier
+    // --vbr-budget modes do not inherit a dynamic floor at all.
+    if (!params.vbr_min_bits_explicit) {
+        const bool explicit_vbr_alias =
+            (params.vbr_cache_type_k && params.vbr_cache_type_k_explicit) ||
+            (params.vbr_cache_type_v && params.vbr_cache_type_v_explicit);
+        params.vbr_min_bits = params.vbr_dynamic() && !explicit_vbr_alias ? "t4" : "auto";
+    }
+
     if (!params.vbr_cache_type_k && !params.vbr_cache_type_v) {
         // --vbr-* without -ctk/-ctv vbr implies both sides — but never silently overwrite a cache
         // type the user explicitly set to something else (f16 counts as unset: it is the default)
@@ -879,7 +890,7 @@ static void common_params_postprocess_vbr(common_params & params) {
         //   --vbr-vram <SIZE>  explicit budget, armed here;
         //   --vbr-vram auto    (default) budget derived from remaining VRAM after model/overhead
         //                      by the fit pass (common_fit_params), which also advertises
-        //                      n_ctx = capacity of that budget at the --vbr-floor tier (t1 default)
+        //                      n_ctx = capacity of that budget at the selected --vbr-floor tier
         //                      when -c is unset.
         // --vbr-floor is a LITERAL aggregate bits/value floor enforced by the controller (the
         // degrade order stops at the last step whose aggregate stays >= the floor — e.g. 4.25 with
@@ -933,7 +944,7 @@ static void common_params_postprocess_vbr(common_params & params) {
             params.cache_type_v = GGML_TYPE_F16;
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
-        // computed at (explicit --vbr-floor, else the t1 floor tier)
+        // computed at (implicit CLI default t4; explicit -ct vbr without a floor uses t1)
         params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
             : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
@@ -3030,12 +3041,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for both K and V (shorthand for -ctk TYPE -ctv TYPE; a later\n"
             "-ctk/-ctv overrides its side)\n"
-            "allowed values: %s",
+            "allowed values: %s\n"
+            "(default: vbr with implicit t4 floor)",
             get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
             params.vbr_cache_type_k = common_vbr_is_alias(value);
             params.vbr_cache_type_v = params.vbr_cache_type_k;
+            params.vbr_cache_type_k_explicit = params.vbr_cache_type_k;
+            params.vbr_cache_type_v_explicit = params.vbr_cache_type_v;
             params.cache_type_k = kv_cache_type_from_str(value);
             params.cache_type_v = params.cache_type_k;
         }
@@ -3047,10 +3061,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_k)
+            params.vbr_cache_type_k ? "vbr (implicit t4 floor)" : ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             params.vbr_cache_type_k = common_vbr_is_alias(value);
+            params.vbr_cache_type_k_explicit = params.vbr_cache_type_k;
             params.cache_type_k = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
@@ -3061,10 +3076,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_v)
+            params.vbr_cache_type_v ? "vbr (implicit t4 floor)" : ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.vbr_cache_type_v = common_vbr_is_alias(value);
+            params.vbr_cache_type_v_explicit = params.vbr_cache_type_v;
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
@@ -3078,7 +3094,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_BUDGET").set_hidden());
     add_opt(common_arg(
         {"--vbr-floor", "--vbr-min-bits"}, "BITS",
-        "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and the advertised context capacity is computed at this floor (default: t1 = 1.25)",
+        "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. "
+        "Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate "
+        "stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and "
+        "the advertised context capacity is computed at this floor (implicit VBR default: t4 = 4.125; "
+        "explicit -ct vbr without this flag: t1 = 1.25)",
         [](common_params & params, const std::string & value) {
             params.vbr_min_bits = value;
             params.vbr_min_bits_explicit = true;

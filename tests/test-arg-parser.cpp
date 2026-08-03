@@ -178,7 +178,30 @@ static void test(void) {
     {
         printf("test-arg-parser: test VBR cache type and budget flags\n\n");
 
-        // dynamic mode (the default): the cache STARTS at the F16 entry tier (full quality
+        // The common CLI defaults to dynamic VBR with a t4 quality floor. Entry tensors still
+        // start at F16; the floor only limits how far pressure may degrade them.
+        common_params vbr_default;
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_default, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_default.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_default.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_default.vbr_cache_type_k);
+        assert(vbr_default.vbr_cache_type_v);
+        assert(!vbr_default.vbr_cache_type_k_explicit);
+        assert(!vbr_default.vbr_cache_type_v_explicit);
+        assert(vbr_default.vbr_dynamic());
+        assert(vbr_default.vbr_min_bits_value == 4.125);
+        assert(vbr_default.vbr_capacity_bits == 4.125);
+
+        // A concrete cache type opts out of the implicit VBR default.
+        common_params vbr_opt_out;
+        argv = {"binary_name", "-m", "model.gguf", "-ct", "f16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_opt_out, LLAMA_EXAMPLE_COMMON));
+        assert(!vbr_opt_out.vbr_cache_type_k);
+        assert(!vbr_opt_out.vbr_cache_type_v);
+        assert(!vbr_opt_out.vbr_enabled());
+
+        // Explicit VBR preserves the historical full ladder: the cache STARTS at F16 (full quality
         // until budget pressure; the measured fp16->t8 band degrades first) and the runtime
         // controller walks it toward the floor; the runtime channel is cparams
         // (llama_context_params), postprocess exports NO runtime env.
@@ -189,6 +212,8 @@ static void test(void) {
         assert(vbr_params.cache_type_v == GGML_TYPE_F16);
         assert(vbr_params.vbr_cache_type_k);
         assert(vbr_params.vbr_cache_type_v);
+        assert(vbr_params.vbr_cache_type_k_explicit);
+        assert(vbr_params.vbr_cache_type_v_explicit);
         assert(vbr_params.vbr_budget == "dynamic");
         assert(vbr_params.vbr_dynamic());
         assert(vbr_params.vbr_min_bits_value == 0.0);
@@ -239,8 +264,8 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_high_floor, LLAMA_EXAMPLE_COMMON));
         assert(vbr_high_floor.vbr_min_bits_value == 16.0); // f16 tops the ladder now (= never degrade)
 
-        // one-sided vbr in dynamic mode: an untouched (default f16) opposite side is implied
-        // vbr too; an explicitly non-default side stays pinned at its type
+        // one-sided explicit vbr in dynamic mode keeps the default-VBR opposite side active;
+        // an explicitly non-default side stays pinned at its type
         common_params vbr_imply_v;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_imply_v, LLAMA_EXAMPLE_COMMON));
@@ -265,6 +290,17 @@ static void test(void) {
         assert(vbr_vram_budget.vbr_vram_budget == "25769803776");
         assert(vbr_vram_budget.vbr_vram_budget_bytes == 25769803776ull);
         assert(vbr_vram_budget.vbr_dynamic());
+        assert(vbr_vram_budget.vbr_min_bits_value == 4.125);
+
+        // A fixed --vbr-budget is an explicit static codec choice and does not inherit the
+        // implicit dynamic t4 floor.
+        common_params vbr_fixed_default;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-budget", "t3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_fixed_default, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_fixed_default.cache_type_k == GGML_TYPE_TURBO3_TCQ);
+        assert(vbr_fixed_default.cache_type_v == GGML_TYPE_TURBO3_TCQ);
+        assert(vbr_fixed_default.vbr_min_bits_value == 0.0);
+        assert(!vbr_fixed_default.vbr_dynamic());
 
         // fixed mode: a tier budget selects the static cache type
         common_params vbr_k_only;
