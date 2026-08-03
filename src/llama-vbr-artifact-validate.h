@@ -69,7 +69,10 @@ struct vbr_import_identity {
     std::string media_content_identity;
     uint64_t sequence_epoch = 0;
     llama_pos requested_frontier = -1;
-    std::vector<llama_token> tokens;
+    // Borrowed from the package lease held for the whole validation call.
+    // The validated proof retains that lease, so this remains valid while the
+    // authenticated identity is observable from the proof.
+    const std::vector<llama_token> * tokens = nullptr;
 };
 
 struct vbr_target_shard_snapshot {

@@ -94,6 +94,20 @@ static std::string server_cache_capture_tenant_key(
     return output;
 }
 
+// ONE consistency derivation for both the import JSON result and the terminal
+// log line — a failed import is 'unavailable' on both surfaces, never a
+// fabricated live_rebased.
+static server_cache_import_consistency server_cache_import_route_consistency(
+        server_vbr_artifact_import_status status,
+        vbr_artifact_consistency_kind kind) {
+    if (status != server_vbr_artifact_import_status::ok) {
+        return server_cache_import_consistency::unavailable;
+    }
+    return kind == vbr_artifact_consistency_kind::capture_exact
+        ? server_cache_import_consistency::capture_exact
+        : server_cache_import_consistency::live_rebased;
+}
+
 static std::array<uint8_t, 32>
 server_cache_capture_build_digest(const char * domain) {
     llama_sha256_writer writer;
@@ -6328,6 +6342,16 @@ private:
     // The live capture path fills accel.ring only; accel.spec remains a stash slot
     // for spec impls that need it (e.g. eagle3), applied on restore when present.
 
+    void assert_vbr_artifact_scheduler_thread() {
+        const auto current = std::this_thread::get_id();
+        if (vbr_capture_scheduler_thread == std::thread::id{}) {
+            vbr_capture_scheduler_thread = current;
+        }
+        GGML_ASSERT(
+            vbr_capture_scheduler_thread == current &&
+            "VBR artifact work must run on scheduler thread");
+    }
+
     bool build_capture_request(
             server_slot & slot,
             vbr_explicit_capture_request & request,
@@ -6764,14 +6788,7 @@ private:
                         break;
                     }
                     try {
-                    const auto current_thread = std::this_thread::get_id();
-                    if (vbr_capture_scheduler_thread ==
-                            std::thread::id{}) {
-                        vbr_capture_scheduler_thread = current_thread;
-                    }
-                    GGML_ASSERT(
-                        vbr_capture_scheduler_thread == current_thread &&
-                        "VBR artifact capture must run on scheduler thread");
+                    assert_vbr_artifact_scheduler_thread();
 
                     server_slot * slot =
                         get_slot_by_id(task.cache_capture.id_slot);
@@ -6926,6 +6943,210 @@ private:
                         send_capture(
                             server_vbr_artifact_capture_status::
                                 internal_error);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_CACHE_IMPORT:
+                {
+                    const auto send_import = [&task, this](
+                            const server_vbr_artifact_import_output & imported) {
+                        auto res =
+                            std::make_unique<server_task_result_cache_import>();
+                        res->id = task.id;
+                        res->id_slot = task.cache_import.id_slot;
+                        res->status = imported.status;
+                        res->validation_status = imported.validation_status;
+                        res->stage_status = imported.stage_status;
+                        res->downward_reserve_status =
+                            imported.downward_reserve_status;
+                        res->adopt_status = imported.adopt_status;
+                        res->adopt_attempted = imported.adopt_attempted;
+                        res->phase = imported.phase;
+                        res->downward_subphase = imported.downward_subphase;
+                        res->downward_edge = imported.downward_edge;
+                        res->decision = imported.decision;
+                        res->consistency = server_cache_import_route_consistency(
+                            imported.status, imported.consistency);
+                        res->units = imported.units;
+                        res->companions = imported.companions;
+                        res->payload_bytes = imported.payload_bytes;
+                        res->companion_bytes = imported.companion_bytes;
+                        queue_results.send(std::move(res));
+                    };
+                    const auto terminal = [&](server_vbr_artifact_import_status status) {
+                        server_vbr_artifact_import_output output;
+                        output.status = status;
+                        send_import(output);
+                    };
+
+                    if (!vbr_artifact_store) {
+                        terminal(server_vbr_artifact_import_status::unsupported);
+                        break;
+                    }
+                    try {
+                        assert_vbr_artifact_scheduler_thread();
+
+                        server_slot * slot = get_slot_by_id(
+                            task.cache_import.id_slot);
+                        llama_memory_i * memory = llama_get_memory(ctx_tgt);
+                        const bool slot_empty = slot && memory &&
+                            slot->state == SLOT_STATE_IDLE &&
+                            slot->prompt.n_tokens() == 0 &&
+                            slot->prompt.checkpoints.empty() &&
+                            slot->prompt.sequence_epoch == 0 &&
+                            memory->seq_pos_min(slot->id) < 0 &&
+                            memory->seq_pos_max(slot->id) < 0;
+                        const auto precheck =
+                            server_vbr_artifact_import_route_precheck(
+                                vbr_artifact_store != nullptr, slot != nullptr,
+                                slot && slot->is_processing(), memory != nullptr,
+                                slot_empty);
+                        if (precheck ==
+                                server_vbr_artifact_import_status::slot_processing) {
+                            SRV_DBG(
+                                "requested import slot is processing; defer task, id_task = %d\n",
+                                task.id);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (precheck != server_vbr_artifact_import_status::ok) {
+                            terminal(precheck);
+                            break;
+                        }
+                        if (!cache_plan_observe_live_memory(false)) {
+                            terminal(server_vbr_artifact_import_status::unavailable);
+                            break;
+                        }
+
+                        struct import_publish_state {
+                            server_slot * slot = nullptr;
+                            server_prompt prompt;
+                            bool ready = false;
+                        } publish_state { slot, {}, false };
+                        server_vbr_artifact_import_request request;
+                        request.memory = memory;
+                        request.destination = slot->id;
+                        request.reference = task.cache_import.reference;
+                        request.tenant_key = task.cache_import.tenant_key;
+                        request.execution_identity = frontier_execution_identity;
+                        request.adapter_config_identity =
+                            lora_config_identity(slot->lora);
+                        // An erased construction-empty slot has no prior import
+                        // state to preserve. Normal decode history was removed by
+                        // the explicit erase and does not force a rebase.
+                        // F4 imports erase into a fresh logical target. F5's
+                        // persistent receipt/re-import seam will supply this
+                        // bit once prior-import evidence has durable authority.
+                        request.previously_observed = false;
+                        request.publish_context = &publish_state;
+                        request.prepare_publish = [](
+                                void * opaque,
+                                const std::vector<llama_token> & tokens,
+                                uint64_t sequence_epoch) noexcept {
+                            try {
+                                auto * state =
+                                    static_cast<import_publish_state *>(opaque);
+                                if (!state || !state->slot || state->ready ||
+                                    tokens.empty() || sequence_epoch == 0 ||
+                                    state->slot->prompt.n_tokens() != 0 ||
+                                    !state->slot->prompt.checkpoints.empty() ||
+                                    state->slot->prompt.sequence_epoch != 0) {
+                                    return false;
+                                }
+                                // Match SLOT_RESTORE's decode-side establishment:
+                                // populate the existing slot prompt rather than
+                                // replacing it with a default-constructed one.
+                                // In particular, has_mtmd is slot configuration,
+                                // not artifact payload. Prepare its value off-side
+                                // so the phase-12 publish remains allocation-free.
+                                state->prompt.tokens.has_mtmd =
+                                    state->slot->prompt.tokens.has_mtmd;
+                                state->prompt.tokens.insert(tokens);
+                                state->prompt.sequence_epoch = sequence_epoch;
+                                state->ready =
+                                    state->prompt.n_tokens() ==
+                                        int(tokens.size());
+                                return state->ready;
+                            } catch (...) {
+                                return false;
+                            }
+                        };
+                        request.publish = [](void * opaque) noexcept {
+                            auto * state =
+                                static_cast<import_publish_state *>(opaque);
+                            GGML_ASSERT(state && state->slot && state->ready);
+                            using std::swap;
+                            // SLOT_RESTORE installs its decoded token ledger into
+                            // the existing prompt object. Do the same here: a
+                            // whole-prompt swap would overwrite slot-owned decode
+                            // configuration with server_prompt defaults. The
+                            // target was proved empty before prepare_publish, so
+                            // checkpoints remain empty and these two no-throw
+                            // assignments are the complete publication surface.
+                            swap(state->slot->prompt.tokens,
+                                 state->prompt.tokens);
+                            state->slot->prompt.sequence_epoch =
+                                state->prompt.sequence_epoch;
+                            state->ready = false;
+                        };
+
+                        SRV_INF(
+                            "VBR_ARTIFACT_IMPORT begin task=%d slot=%d\n",
+                            task.id, slot->id);
+                        const int64_t started = ggml_time_us();
+                        const auto imported =
+                            vbr_artifact_store->import(std::move(request));
+                        const auto & totals = vbr_artifact_store->counters();
+                        const double duration_ms =
+                            (ggml_time_us() - started)/1000.0;
+                        const std::string edge_name =
+                            imported.downward_edge == UINT32_MAX
+                                ? "none"
+                                : std::to_string(imported.downward_edge);
+                        const char * phase_name = imported.adopt_attempted
+                            ? vbr_adopt_phase_name(imported.phase) : "none";
+                        const char * subphase_name = imported.adopt_attempted
+                            ? vbr_downward_adopt_subphase_name(
+                                  imported.downward_subphase)
+                            : "none";
+                        SRV_INF(
+                            "VBR_ARTIFACT_IMPORT end task=%d slot=%d status=%s "
+                            "validation=%s stage=%s downward_reserve=%s "
+                            "adopt=%s phase=%s subphase=%s edge=%s "
+                            "decision=%s consistency=%s units=%u companions=%u "
+                            "payload=%" PRIu64 " companion_bytes=%" PRIu64
+                            " duration_ms=%.3f total_requested=%" PRIu64
+                            " total_succeeded=%" PRIu64
+                            " total_report_only=%" PRIu64
+                            " total_not_found=%" PRIu64
+                            " total_refused=%" PRIu64
+                            " total_unavailable=%" PRIu64 "\n",
+                            task.id, slot->id,
+                            server_vbr_artifact_import_status_name(imported.status),
+                            vbr_manifest_validation_status_name(
+                                imported.validation_status),
+                            vbr_adopt_stage_status_name(imported.stage_status),
+                            vbr_downward_reserve_status_name(
+                                imported.downward_reserve_status),
+                            vbr_adopt_status_name(imported.adopt_status),
+                            phase_name, subphase_name,
+                            edge_name.c_str(),
+                            vbr_import_decision_name(imported.decision),
+                            server_cache_import_consistency_name(
+                                server_cache_import_route_consistency(
+                                    imported.status, imported.consistency)),
+                            imported.units, imported.companions,
+                            imported.payload_bytes,
+                            imported.companion_bytes, duration_ms,
+                            totals.imports_requested,
+                            totals.imports_succeeded,
+                            totals.imports_report_only,
+                            totals.imports_not_found,
+                            totals.imports_refused,
+                            totals.imports_unavailable);
+                        send_import(imported);
+                    } catch (...) {
+                        terminal(
+                            server_vbr_artifact_import_status::internal_error);
                     }
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -11317,6 +11538,18 @@ void server_routes::init_routes() {
         if (action == "capture") {
             return handle_slots_capture(req, id_slot);
         }
+        if (action == "import") {
+            return handle_slots_import(req, id_slot);
+        }
+        // Erase does no state-file IO (prompt clear + seq_rm only), so it is
+        // NOT gated on --slot-save-path. Dynamic VBR clears slot_save_path at
+        // startup (legacy state files cannot carry tier-typed KV), and import
+        // REQUIRES an explicit erase to produce its empty target — keeping
+        // erase behind the path gate made import's precondition unreachable
+        // on exactly the servers that support import.
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -11326,9 +11559,6 @@ void server_routes::init_routes() {
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -11998,6 +12228,47 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_capture(
         dynamic_cast<server_task_result_cache_capture *>(result.get());
     GGML_ASSERT(captured != nullptr);
     res->ok(captured->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_import(
+        const server_http_req & req,
+        int id_slot) {
+    auto res = create_response();
+    std::string reference;
+    try {
+        const json request_data = json::parse(req.body);
+        reference = request_data.at("reference").get<std::string>();
+    } catch (const std::exception &) {
+        res->error(format_error_response(
+            "Import requires a string reference",
+            ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_CACHE_IMPORT);
+        task.id = rd.get_new_id();
+        task.cache_import.id_slot = id_slot;
+        task.cache_import.tenant_key =
+            server_cache_capture_tenant_key(req);
+        task.cache_import.reference = std::move(reference);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    auto * imported =
+        dynamic_cast<server_task_result_cache_import *>(result.get());
+    GGML_ASSERT(imported != nullptr);
+    res->ok(imported->to_json());
     return res;
 }
 

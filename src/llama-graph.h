@@ -296,6 +296,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    uint64_t tensor_binding_epoch = 0;
 
     // set when build_rs_in baked a direct ggml_view_2d of the state slot (the contiguous-identity
     // fast-path) instead of a get_rows gather. On reuse the predicate must still hold, otherwise the

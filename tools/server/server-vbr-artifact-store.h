@@ -1,11 +1,13 @@
 #pragma once
 
 #include "../../src/llama-cache-authority.h"
+#include "../../src/llama-vbr-artifact-adopt.h"
 #include "../../src/llama-vbr-artifact-catalog.h"
 #include "../../src/llama-vbr-explicit-capture.h"
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +30,38 @@ enum class server_vbr_artifact_capture_status : uint8_t {
 
 const char * server_vbr_artifact_capture_status_name(
     server_vbr_artifact_capture_status status) noexcept;
+
+enum class server_vbr_artifact_import_status : uint8_t {
+    ok = 0,
+    unsupported,
+    not_found,
+    invalid_slot,
+    slot_processing,
+    slot_not_empty,
+    validation_failed,
+    report_only,
+    stage_failed,
+    adopt_failed,
+    unavailable,
+    internal_error,
+    _count,
+};
+
+const char * server_vbr_artifact_import_status_name(
+    server_vbr_artifact_import_status status) noexcept;
+
+// Pure route/validator classifiers shared with the scheduler and CPU tests.
+// `ok` means the caller may continue; no state is mutated here.
+server_vbr_artifact_import_status server_vbr_artifact_import_route_precheck(
+    bool store_available,
+    bool slot_exists,
+    bool slot_processing,
+    bool target_available,
+    bool slot_empty) noexcept;
+server_vbr_artifact_import_status
+server_vbr_artifact_import_validation_disposition(
+    vbr_manifest_validation_status status,
+    vbr_import_decision decision) noexcept;
 
 enum class server_vbr_artifact_store_create_failure : uint8_t {
     none = 0,
@@ -152,12 +186,87 @@ struct server_vbr_artifact_store_counters {
     uint64_t staging_overlap_refusals = 0;
     std::array<uint64_t,
         size_t(vbr_explicit_capture_status::_count)> capture_outcomes = {};
+    uint64_t imports_requested = 0;
+    uint64_t imports_succeeded = 0;
+    uint64_t imports_report_only = 0;
+    uint64_t imports_not_found = 0;
+    uint64_t imports_refused = 0;
+    uint64_t imports_unavailable = 0;
+    std::array<uint64_t, size_t(vbr_import_decision::_count)>
+        import_decisions = {};
+    std::array<uint64_t, size_t(vbr_manifest_validation_status::_count)>
+        validation_outcomes = {};
+};
+
+struct server_vbr_artifact_import_request {
+    using prepare_publish_fn = bool (*)(
+        void * context,
+        const std::vector<llama_token> & tokens,
+        uint64_t sequence_epoch) noexcept;
+    using publish_fn = void (*)(void * context) noexcept;
+
+    llama_memory_i * memory = nullptr;
+    llama_seq_id destination = -1;
+    std::string reference;
+    std::string tenant_key;
+    std::string execution_identity;
+    std::string adapter_config_identity;
+    bool previously_observed = false;
+    void * publish_context = nullptr;
+    prepare_publish_fn prepare_publish = nullptr;
+    publish_fn publish = nullptr;
+};
+
+struct server_vbr_artifact_import_output {
+    server_vbr_artifact_import_status status =
+        server_vbr_artifact_import_status::internal_error;
+    vbr_manifest_validation_status validation_status =
+        vbr_manifest_validation_status::internal_error;
+    vbr_adopt_stage_status stage_status =
+        vbr_adopt_stage_status::internal_error;
+    vbr_downward_reserve_status downward_reserve_status =
+        vbr_downward_reserve_status::internal_error;
+    vbr_adopt_status adopt_status = vbr_adopt_status::internal_error;
+    bool adopt_attempted = false;
+    vbr_adopt_phase phase = vbr_adopt_phase::consume_capabilities;
+    vbr_downward_adopt_subphase downward_subphase =
+        vbr_downward_adopt_subphase::none;
+    uint32_t downward_edge = UINT32_MAX;
+    vbr_import_decision decision = vbr_import_decision::reject;
+    vbr_artifact_consistency_kind consistency =
+        vbr_artifact_consistency_kind::live_rebased;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t companion_bytes = 0;
+};
+
+// Server-internal opaque-reference authorization index. It exposes only one
+// indistinguishable miss result; there is no enumeration or tenant-agnostic
+// lookup door.
+class server_vbr_artifact_reference_index {
+public:
+    bool publish(
+        std::string reference,
+        std::string tenant_key,
+        llama_cache_acct_artifact_id artifact) noexcept;
+    bool authorize(
+        const std::string & reference,
+        const std::string & tenant_key,
+        llama_cache_acct_artifact_id & artifact) const noexcept;
+
+private:
+    struct binding {
+        std::string tenant_key;
+        llama_cache_acct_artifact_id artifact;
+    };
+    std::map<std::string, binding> entries_;
 };
 
 // F3.3 server owner for the internal catalog/ring. The library capture is the
 // only producer of authorization masks and content identities; this layer
-// returns a tenant-bound opaque handle but intentionally exposes no resolution
-// surface until F4 supplies validated tenant authorization.
+// returns and resolves tenant-bound opaque handles only through the exact
+// capture-time tenant key. There is no enumeration or tenant-agnostic lookup.
 class server_vbr_artifact_store {
 public:
     static std::unique_ptr<server_vbr_artifact_store> create(
@@ -175,6 +284,9 @@ public:
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
         const std::string & tenant_key) noexcept;
+
+    server_vbr_artifact_import_output import(
+        server_vbr_artifact_import_request request) noexcept;
 
     const server_vbr_artifact_store_counters & counters() const noexcept;
     uint32_t attention_children() const noexcept;

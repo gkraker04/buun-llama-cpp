@@ -529,7 +529,8 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
         if (!identity_matches(manifest, policy)) {
             return terminal_result(vbr_manifest_validation_status::identity_mismatch);
         }
-        if (manifest.token_block.tokens != policy.identity.tokens ||
+        if (policy.identity.tokens == nullptr ||
+            manifest.token_block.tokens != *policy.identity.tokens ||
             manifest.token_block.tokens.size() !=
                 size_t(manifest.identity.token_count)) {
             return terminal_result(
@@ -1213,17 +1214,31 @@ vbr_manifest_validation_result vbr_validate_unit_manifest(
         }
         vbr_target_validation_snapshot snapshot;
         if (!policy.inspect_target(
-                policy.context, target, tree, snapshot) ||
-            snapshot.children.size() != tree.size()) {
+                policy.context, target, tree, snapshot)) {
             return terminal_result(vbr_manifest_validation_status::unavailable);
         }
-        for (size_t i = 0; i < tree.size(); ++i) {
-            if (tree[i].child_id != snapshot.children[i].child_id ||
-                tree[i].dependency_mode !=
-                    snapshot.children[i].dependency_mode) {
+        // The snapshot carries one child per ATTENTION tree child; recurrent
+        // children travel as companions (checked by the snapshot core against
+        // the manifest's companion set). Pairing against tree.size() would make
+        // every hybrid (attention+recurrent) import unsatisfiable: the snapshot
+        // core requires children == controllers == attention count.
+        size_t snapshot_index = 0;
+        for (const auto & child : tree) {
+            if (child.attention == nullptr) {
+                continue;
+            }
+            if (snapshot_index >= snapshot.children.size() ||
+                snapshot.children[snapshot_index].child_id != child.child_id ||
+                snapshot.children[snapshot_index].dependency_mode !=
+                    child.dependency_mode) {
                 return terminal_result(
                     vbr_manifest_validation_status::memory_tree_mismatch);
             }
+            ++snapshot_index;
+        }
+        if (snapshot_index != snapshot.children.size()) {
+            return terminal_result(
+                vbr_manifest_validation_status::memory_tree_mismatch);
         }
         return vbr_validate_unit_manifest_snapshot(
             snapshot, package, policy);

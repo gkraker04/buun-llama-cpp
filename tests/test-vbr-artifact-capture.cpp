@@ -648,6 +648,17 @@ static void test_server_capture_status_vocabulary() {
               server_vbr_artifact_capture_status::_count)) ==
           "_count");
     for (size_t i = 0;
+         i < size_t(server_vbr_artifact_import_status::_count);
+         ++i) {
+        const auto * name = server_vbr_artifact_import_status_name(
+            server_vbr_artifact_import_status(i));
+        CHECK(name != nullptr);
+        CHECK(std::string(name) != "_count");
+    }
+    CHECK(std::string(server_vbr_artifact_import_status_name(
+              server_vbr_artifact_import_status::_count)) ==
+          "_count");
+    for (size_t i = 0;
          i < size_t(vbr_explicit_capture_phase::_count);
          ++i) {
         const auto * name =
@@ -683,6 +694,70 @@ static void test_server_capture_status_vocabulary() {
         CHECK(name != nullptr);
         CHECK(std::string(name) != "invalid");
     }
+}
+
+static void test_server_reference_tenant_authorization() {
+    server_vbr_artifact_reference_index index;
+    const llama_cache_acct_artifact_id expected { 73 };
+    CHECK(index.publish("vbrref_alpha", "tenant-a", expected));
+    CHECK(!index.publish("vbrref_alpha", "tenant-a", expected));
+    CHECK(!index.publish("malformed", "tenant-a", expected));
+    CHECK(!index.publish("vbrref_zero", "tenant-a", {}));
+
+    llama_cache_acct_artifact_id resolved { 999 };
+    CHECK(index.authorize("vbrref_alpha", "tenant-a", resolved));
+    CHECK(resolved == expected);
+    for (const auto & denied : std::vector<std::pair<std::string, std::string>> {
+            { "vbrref_alpha", "tenant-b" },
+            { "vbrref_missing", "tenant-a" },
+            { "malformed", "tenant-a" },
+            { "vbrref_alpha", "" },
+        }) {
+        resolved = { 999 };
+        CHECK(!index.authorize(denied.first, denied.second, resolved));
+        // Wrong-tenant, nonexistent and malformed tokens expose the same
+        // closed miss shape and never return the underlying artifact id.
+        CHECK(resolved.v == 0);
+    }
+}
+
+static void test_server_import_route_classification() {
+    using status = server_vbr_artifact_import_status;
+    CHECK(server_vbr_artifact_import_route_precheck(
+              false, false, false, false, false) == status::unsupported);
+    CHECK(server_vbr_artifact_import_route_precheck(
+              true, false, false, true, true) == status::invalid_slot);
+    CHECK(server_vbr_artifact_import_route_precheck(
+              true, true, true, true, true) == status::slot_processing);
+    CHECK(server_vbr_artifact_import_route_precheck(
+              true, true, false, false, true) == status::unavailable);
+    CHECK(server_vbr_artifact_import_route_precheck(
+              true, true, false, true, false) == status::slot_not_empty);
+    CHECK(server_vbr_artifact_import_route_precheck(
+              true, true, false, true, true) == status::ok);
+
+    for (const auto decision : {
+            vbr_import_decision::native_import,
+            vbr_import_decision::live_rebased,
+            vbr_import_decision::downward_rebase }) {
+        CHECK(server_vbr_artifact_import_validation_disposition(
+                  vbr_manifest_validation_status::validated,
+                  decision) == status::ok);
+    }
+    for (const auto decision : {
+            vbr_import_decision::rebuild,
+            vbr_import_decision::cold }) {
+        CHECK(server_vbr_artifact_import_validation_disposition(
+                  vbr_manifest_validation_status::validated,
+                  decision) == status::report_only);
+    }
+    CHECK(server_vbr_artifact_import_validation_disposition(
+              vbr_manifest_validation_status::validated,
+              vbr_import_decision::reject) == status::validation_failed);
+    CHECK(server_vbr_artifact_import_validation_disposition(
+              vbr_manifest_validation_status::unavailable,
+              vbr_import_decision::native_import) ==
+          status::validation_failed);
 }
 
 static void test_fresh_f16_size_generation() {
@@ -839,6 +914,8 @@ int main(int argc, char ** argv) {
     test_capture_reservation_domain_preparation();
     test_server_store_construction_and_lifetime();
     test_server_capture_status_vocabulary();
+    test_server_reference_tenant_authorization();
+    test_server_import_route_classification();
     test_fresh_f16_size_generation();
     test_library_representation_identity();
     if (argc == 2 && std::string(argv[1]) == "--cuda") {

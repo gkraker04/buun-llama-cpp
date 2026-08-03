@@ -38,6 +38,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_CACHE_CAPTURE,
+    SERVER_TASK_TYPE_CACHE_IMPORT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -182,12 +183,19 @@ struct server_task {
     };
     slot_action slot_action;
 
-    // used by SERVER_TASK_TYPE_CACHE_CAPTURE
+    // used by SERVER_TASK_TYPE_CACHE_CAPTURE / SERVER_TASK_TYPE_CACHE_IMPORT
     struct cache_capture_action {
         int id_slot = -1;
         std::string tenant_key;
     };
     cache_capture_action cache_capture;
+
+    struct cache_import_action {
+        int id_slot = -1;
+        std::string tenant_key;
+        std::string reference;
+    };
+    cache_import_action cache_import;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -585,6 +593,14 @@ struct server_task_result_slot_erase : server_task_result {
 };
 
 enum class server_vbr_artifact_capture_status : uint8_t;
+enum class server_vbr_artifact_import_status : uint8_t;
+enum class vbr_manifest_validation_status : uint8_t;
+enum class vbr_adopt_stage_status : uint8_t;
+enum class vbr_downward_reserve_status : uint8_t;
+enum class vbr_adopt_status : uint8_t;
+enum class vbr_adopt_phase : uint8_t;
+enum class vbr_downward_adopt_subphase : uint8_t;
+enum class vbr_import_decision : uint8_t;
 
 enum class server_cache_capture_consistency : uint8_t {
     unavailable = 0,
@@ -608,6 +624,37 @@ struct server_task_result_cache_capture : server_task_result {
     uint64_t event_completions = 0;
     uint64_t synchronous_fallbacks = 0;
     bool dedup = false;
+
+    virtual json to_json() override;
+};
+
+enum class server_cache_import_consistency : uint8_t {
+    unavailable = 0,
+    capture_exact,
+    live_rebased,
+    _count,
+};
+
+const char * server_cache_import_consistency_name(
+    server_cache_import_consistency consistency) noexcept;
+
+struct server_task_result_cache_import : server_task_result {
+    server_vbr_artifact_import_status status {};
+    vbr_manifest_validation_status validation_status {};
+    vbr_adopt_stage_status stage_status {};
+    vbr_downward_reserve_status downward_reserve_status {};
+    vbr_adopt_status adopt_status {};
+    bool adopt_attempted = false;
+    vbr_adopt_phase phase {};
+    vbr_downward_adopt_subphase downward_subphase {};
+    uint32_t downward_edge = UINT32_MAX;
+    vbr_import_decision decision {};
+    server_cache_import_consistency consistency =
+        server_cache_import_consistency::unavailable;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t companion_bytes = 0;
 
     virtual json to_json() override;
 };

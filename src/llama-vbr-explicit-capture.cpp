@@ -1,5 +1,7 @@
 #include "llama-vbr-explicit-capture.h"
 
+#include "llama-vbr-artifact-adopt.h"
+#include "llama-vbr-artifact-validate.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
@@ -167,6 +169,18 @@ std::array<uint8_t, 32> representation_meansub_identity(
 bool digest_nonzero(const std::array<uint8_t, 32> & digest) {
     return std::any_of(digest.begin(), digest.end(),
         [](uint8_t value) { return value != 0; });
+}
+
+// Shared by the capture stamp and the import target check so the recurrent
+// companion identity cannot drift between the two.
+constexpr char VBR_RECURRENT_CODEC_DOMAIN[] = "buun.vbr.capture/recurrent-codec";
+
+// Nonzero head of a finished digest (0 is reserved as "absent").
+uint64_t digest_head_u64(llama_sha256_writer & writer) {
+    const auto digest = writer.finish();
+    uint64_t value = 0;
+    std::memcpy(&value, digest.data(), sizeof(value));
+    return value == 0 ? 1 : value;
 }
 
 std::array<uint8_t, 32> tagged_digest(
@@ -394,6 +408,291 @@ public:
         return true;
     }
 
+    static bool empty(const llama_kv_cache & cache) noexcept {
+        return cache.other == nullptr &&
+            std::all_of(cache.v_cells.begin(), cache.v_cells.end(),
+                [](const llama_kv_cells & cells) {
+                    return cells.get_used() == 0;
+                }) &&
+            std::all_of(cache.vbr_pools_.begin(), cache.vbr_pools_.end(),
+                [](const llama_kv_cache::vbr_pool & pool) {
+                    return pool.wm_cells == 0;
+                });
+    }
+
+    static bool append_policy_identity(
+            const llama_kv_cache & cache,
+            llama_sha256_writer & writer) noexcept {
+        llama_kv_cache::vbr_capture_stability_token token;
+        if (!cache.vbr_capture_policy_snapshot(token)) {
+            return false;
+        }
+        writer.u64(cache.vbr_representation_epoch());
+        writer.bytes(token.degrade_order_digest.data(),
+                     token.degrade_order_digest.size());
+        writer.bytes(token.policy_digest.data(),
+                     token.policy_digest.size());
+        writer.u64(token.degrade_cursor);
+        writer.u32(uint32_t(token.floor_type));
+        writer.u64(token.pressure_independent_settings);
+        return true;
+    }
+
+    static bool fill_import_child(
+            const llama_memory_tree_child & tree_child,
+            const vbr_artifact_package_view & package,
+            const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+            bool previously_observed,
+            uint64_t policy_epoch,
+            vbr_target_child_snapshot & output,
+            bool & type_mismatch) noexcept {
+        auto * cache = tree_child.attention;
+        if (!cache || !cache->vbr_operation_armed()) {
+            return false;
+        }
+        const auto * tracker = cache->vbr_generation_tracker_get();
+        llama_kv_cache::vbr_capture_stability_token live_policy;
+        if (!tracker || !tracker->active() || !tracker->stable() ||
+            !cache->vbr_capture_policy_snapshot(live_policy) ||
+            tree_child.child_id >=
+                package.manifest().controller_policy.size()) {
+            return false;
+        }
+        const auto & source_policy =
+            package.manifest().controller_policy[tree_child.child_id];
+        if (live_policy.degrade_order_digest !=
+                source_policy.degrade_order_digest ||
+            live_policy.floor_type != source_policy.floor_type ||
+            live_policy.pressure_independent_settings !=
+                source_policy.pressure_independent_settings ||
+            cache->n_stream != source_policy.n_stream ||
+            (cache->n_stream == 1) != source_policy.unified) {
+            return false;
+        }
+
+        output = {};
+        output.child_id = tree_child.child_id;
+        output.dependency_mode = tree_child.dependency_mode;
+        output.memory_cookie = cache;
+        output.empty = empty(*cache);
+        output.dedicated = cache->other == nullptr;
+        output.armed = true;
+        output.previously_observed = previously_observed;
+        output.lineage_uuid = tracker->lineage_identity();
+        output.instance_id = tracker->runtime_instance();
+        output.state_serial = cache->vbr_representation_epoch_;
+        output.policy_epoch = policy_epoch;
+        output.controller_policy = source_policy;
+
+        for (const auto & source_unit : package.units()) {
+            const auto & descriptor = source_unit.descriptor;
+            if (descriptor.child_id != tree_child.child_id) {
+                continue;
+            }
+            const size_t layer = descriptor.logical_unit_id/2;
+            const bool value_side =
+                (descriptor.logical_unit_id & 1u) != 0;
+            if (layer >= cache->layers.size()) {
+                return false;
+            }
+            const auto & extents =
+                cache->vbr_units_of(layer, value_side);
+            ggml_tensor * tensor = value_side
+                ? cache->layers[layer].v : cache->layers[layer].k;
+            if (!tensor ||
+                extents.size() != descriptor.shards.size()) {
+                return false;
+            }
+            type_mismatch = type_mismatch ||
+                int32_t(tensor->type) != descriptor.current_type;
+            vbr_target_unit_snapshot target;
+            target.child_id = descriptor.child_id;
+            target.logical_unit_id = descriptor.logical_unit_id;
+            target.current_type = tensor->type;
+            target.last_source_type = tensor->type;
+            target.promote_hops = descriptor.promote_hops;
+            target.last_transition = descriptor.last_transition;
+            target.representation_kind = descriptor.representation.kind;
+            target.codec_id = descriptor.representation.codec_id;
+            target.codec_version = descriptor.representation.codec_version;
+            target.representation_reference_digest =
+                descriptor.representation.reference_digest;
+            target.source_loss_history =
+                descriptor.representation.source_loss_history;
+            target.checkpoint_codec_hops =
+                descriptor.representation.checkpoint_codec_hops;
+            target.recoverability = descriptor.recoverability;
+            target.side = descriptor.side;
+            target.layout = descriptor.layout;
+            target.row_codec_version = descriptor.row_codec_version;
+            target.current_domain = tracker->unit_generation(
+                descriptor.logical_unit_id).domain;
+            target.codebook_digest = descriptor.codebook_digest;
+            target.rotation_digest = descriptor.rotation_digest;
+            target.meansub_digest = descriptor.meansub_digest;
+            target.n_stream = descriptor.n_stream;
+            target.unified = descriptor.unified;
+            target.v_trans = false;
+            target.wm_cells = descriptor.wm_cells;
+            target.rank = descriptor.rank;
+            target.dimensions = descriptor.dimensions;
+            target.row_alignment = descriptor.row_alignment;
+            for (size_t i = 0; i < extents.size(); ++i) {
+                const auto & source = descriptor.shards[i];
+                const auto binding = std::find_if(
+                    bindings.begin(), bindings.end(),
+                    [&](const llama_vbr_artifact_domain_binding & value) {
+                        return value.topology_index == source.topology_index &&
+                               value.device_ordinal == source.device_ordinal;
+                    });
+                if (binding == bindings.end() ||
+                    source.topology_index >= package.topologies().size() ||
+                    !extents[i].first || !extents[i].second ||
+                    !extents[i].second->t) {
+                    return false;
+                }
+                target.shards.push_back({
+                    uint32_t(i), extents[i].first, binding->domain,
+                    source.topology_index, source.device_ordinal,
+                    package.topologies()[source.topology_index].digest,
+                    source.logical_offset, source.row_count,
+                    uint64_t(ggml_row_size(
+                        extents[i].second->t->type,
+                        extents[i].second->t->ne[0])),
+                    uint64_t(ggml_nbytes(extents[i].second->t)),
+                });
+            }
+            output.units.push_back(std::move(target));
+        }
+        return !output.units.empty();
+    }
+
+    static bool recheck_import_child(
+            const llama_kv_cache & cache,
+            const vbr_child_empty_fingerprint & expected) noexcept {
+        const auto * tracker = cache.vbr_generation_tracker_get();
+        return expected.memory_cookie == &cache &&
+               expected.state_serial == cache.vbr_representation_epoch() &&
+               tracker &&
+               expected.instance_id == tracker->runtime_instance() &&
+               empty(cache);
+    }
+
+    static bool reserve_import_downward(
+            llama_kv_cache & cache,
+            const std::vector<const vbr_validated_child_plan *> & plans,
+            llama_cache_acct_ledger & ledger,
+            const llama_cache_budget_config & budget,
+            vbr_downward_stage_reservation & output) noexcept {
+        return cache.vbr_downward_reserve_import(
+            plans, ledger, budget, output);
+    }
+
+    static bool bind_import_downward(
+            const std::vector<llama_memory_tree_child> & tree,
+            const vbr_artifact_package_view & package,
+            vbr_target_validation_snapshot & output,
+            vbr_downward_policy_projection & projection) noexcept {
+        struct indexed_child {
+            llama_kv_cache * cache = nullptr;
+            vbr_target_child_snapshot * target = nullptr;
+            std::vector<const vbr_artifact_unit_view *> units;
+        };
+        const size_t n_controller =
+            package.manifest().controller_policy.size();
+        std::vector<const llama_memory_tree_child *> tree_index(
+            n_controller, nullptr);
+        for (const auto & child : tree) {
+            if (!child.attention) {
+                continue;
+            }
+            if (child.child_id >= tree_index.size() ||
+                tree_index[child.child_id] != nullptr) {
+                return false;
+            }
+            tree_index[child.child_id] = &child;
+        }
+        std::vector<size_t> child_position(n_controller, SIZE_MAX);
+        std::vector<indexed_child> indexed(output.children.size());
+        for (size_t i = 0; i < output.children.size(); ++i) {
+            auto & target = output.children[i];
+            if (target.child_id >= tree_index.size() ||
+                child_position[target.child_id] != SIZE_MAX) {
+                return false;
+            }
+            const auto * live = tree_index[target.child_id];
+            if (!live || !live->attention ||
+                live->attention->vbr_pools_.empty()) {
+                return false;
+            }
+            child_position[target.child_id] = i;
+            indexed[i].cache = live->attention;
+            indexed[i].target = &target;
+            indexed[i].units.resize(
+                live->attention->layers.size()*2, nullptr);
+        }
+        for (const auto & unit : package.units()) {
+            const auto child_id = unit.descriptor.child_id;
+            const auto unit_id = unit.descriptor.logical_unit_id;
+            if (child_id >= child_position.size() ||
+                child_position[child_id] == SIZE_MAX) {
+                return false;
+            }
+            auto & units = indexed[child_position[child_id]].units;
+            if (unit_id >= units.size() || units[unit_id] != nullptr) {
+                return false;
+            }
+            units[unit_id] = &unit;
+        }
+
+        std::vector<vbr_downward_policy_child> policy_children;
+        policy_children.reserve(indexed.size());
+        for (auto & child : indexed) {
+            std::vector<ggml_type> source_types;
+            source_types.reserve(child.units.size());
+            for (const auto * unit : child.units) {
+                if (!unit) {
+                    return false;
+                }
+                source_types.push_back(static_cast<ggml_type>(
+                    unit->descriptor.current_type));
+            }
+            const auto & source_policy = package.manifest().
+                controller_policy[child.target->child_id];
+            if (source_policy.wm_cells > UINT32_MAX ||
+                !child.cache->vbr_downward_policy_input(
+                    source_types, source_policy.cursor,
+                    uint32_t(source_policy.wm_cells),
+                    child.cache->vbr_pools_.front().device,
+                    policy_children.emplace_back())) {
+                return false;
+            }
+        }
+        projection = vbr_downward_project_policy_prefix(policy_children);
+        if (projection.status != vbr_downward_policy_status::coherent) {
+            return false;
+        }
+        for (size_t child_index = 0; child_index < indexed.size();
+             ++child_index) {
+            auto & child = indexed[child_index];
+            for (auto & unit : child.target->units) {
+                if (unit.logical_unit_id >= child.units.size() ||
+                    !child.units[unit.logical_unit_id] ||
+                    !child.cache->vbr_downward_bind_target_unit(
+                        static_cast<ggml_type>(child.units[
+                            unit.logical_unit_id]->descriptor.current_type),
+                        projection, uint32_t(child_index), unit)) {
+                    return false;
+                }
+            }
+            child.target->controller_policy.current_type_vector_digest =
+                projection.child_type_digests[child_index];
+            child.target->controller_policy.cursor =
+                projection.final_cursors[child_index];
+        }
+        return true;
+    }
+
     static bool capture_metadata(
             llama_kv_cache & cache,
             uint32_t child_id,
@@ -463,6 +762,67 @@ public:
     }
 };
 
+namespace {
+
+uint64_t import_tree_digest(
+        llama_memory_i & memory,
+        const std::vector<llama_memory_tree_child> & tree) {
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] = "buun.vbr.import-tree/v1";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.u64(uint64_t(reinterpret_cast<uintptr_t>(&memory)));
+    for (const auto & child : tree) {
+        writer.u32(child.child_id);
+        writer.u32(uint32_t(child.dependency_mode));
+        writer.u32(child.attention != nullptr);
+        writer.u32(child.recurrent != nullptr);
+        writer.u64(uint64_t(reinterpret_cast<uintptr_t>(
+            child.attention ? static_cast<void *>(child.attention) :
+            static_cast<void *>(child.recurrent))));
+    }
+    return digest_head_u64(writer);
+}
+
+uint64_t import_policy_epoch(
+        const std::vector<llama_memory_tree_child> & tree) {
+    llama_sha256_writer writer;
+    static constexpr char DOMAIN[] = "buun.vbr.import-policy/v1";
+    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    size_t n_attention = 0;
+    for (const auto & child : tree) {
+        if (!child.attention) {
+            continue;
+        }
+        writer.u32(child.child_id);
+        if (!vbr_live_capture_adapter::append_policy_identity(
+                *child.attention, writer)) {
+            return 0;
+        }
+        ++n_attention;
+    }
+    if (n_attention == 0) {
+        return 0;
+    }
+    return digest_head_u64(writer);
+}
+
+} // namespace
+
+namespace {
+
+bool recurrent_target_empty(
+        const llama_memory_tree_child & child) noexcept {
+    if (!child.recurrent || child.attention) {
+        return false;
+    }
+    const auto provider =
+        vbr_recurrent_companion_adoption_provider(*child.recurrent);
+    return provider.target_empty &&
+           provider.target_empty(provider.context);
+}
+
+} // namespace
+
 bool vbr_explicit_capture_runtime_pools(
         llama_memory_i & memory,
         std::vector<vbr_explicit_capture_runtime_pool> & pools,
@@ -490,6 +850,246 @@ bool vbr_explicit_capture_runtime_pools(
     } catch (...) {
         pools.clear();
         attention_children = 0;
+        return false;
+    }
+}
+
+uint64_t vbr_explicit_import_policy_epoch(
+        llama_memory_i & memory) noexcept {
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return 0;
+        }
+        return import_policy_epoch(tree);
+    } catch (...) {
+        return 0;
+    }
+}
+
+bool vbr_explicit_import_target_snapshot(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_artifact_package_view & package,
+        const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+        bool previously_observed,
+        uint64_t accounting_serial,
+        vbr_target_validation_snapshot & output,
+        vbr_downward_policy_projection * downward_projection,
+        bool * downward_required) noexcept {
+    output = {};
+    if (downward_projection) {
+        *downward_projection = {};
+    }
+    if (downward_required) {
+        *downward_required = false;
+    }
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (destination < 0 || !package ||
+            !llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        const uint64_t policy_epoch = import_policy_epoch(tree);
+        if (policy_epoch == 0) {
+            return false;
+        }
+        output.memory_instance_cookie =
+            uint64_t(reinterpret_cast<uintptr_t>(&memory));
+        output.accounting_serial = accounting_serial;
+        output.policy_epoch = policy_epoch;
+        // Idleness is a SCHEDULER-authority fact; the library cannot vouch for
+        // it. The route owner asserts it on the snapshot after this returns.
+        output.scheduler_idle = false;
+        output.destination_sequence_absent =
+            memory.seq_pos_min(destination) < 0 &&
+            memory.seq_pos_max(destination) < 0;
+        output.tree_shape_digest = import_tree_digest(memory, tree);
+        output.target_state_serial = 1;
+        size_t n_attention = 0;
+        size_t n_recurrent = 0;
+        bool type_mismatch = false;
+        for (const auto & child : tree) {
+            if (child.recurrent) {
+                if (n_recurrent != 0 || !recurrent_target_empty(child)) {
+                    output = {};
+                    return false;
+                }
+                output.companions.push_back({
+                    vbr_artifact_companion_kind::recurrent, 1,
+                    tagged_digest(
+                        VBR_RECURRENT_CODEC_DOMAIN, 1),
+                    true, child.recurrent,
+                });
+                ++n_recurrent;
+                continue;
+            }
+            if (!child.attention) {
+                output = {};
+                return false;
+            }
+            vbr_target_child_snapshot snapshot;
+            if (!vbr_live_capture_adapter::fill_import_child(
+                    child, package, bindings, previously_observed,
+                    policy_epoch, snapshot, type_mismatch)) {
+                output = {};
+                return false;
+            }
+            if (output.target_state_serial >
+                    UINT64_MAX - snapshot.state_serial) {
+                output = {};
+                return false;
+            }
+            output.target_state_serial += snapshot.state_serial;
+            output.children.push_back(std::move(snapshot));
+            ++n_attention;
+        }
+        if (output.children.empty() ||
+            n_attention != output.children.size() ||
+            output.children.size() !=
+                package.manifest().generation.controllers.size() ||
+            n_recurrent != size_t(std::count_if(
+                package.companions().begin(), package.companions().end(),
+                [](const vbr_artifact_companion_view & companion) {
+                    return companion.descriptor.kind ==
+                        vbr_artifact_companion_kind::recurrent;
+                }))) {
+            output = {};
+            return false;
+        }
+        // A projection pointer grants permission to classify a mismatch; it
+        // must not make an all-match/native import run the downward binder.
+        // The binder rewrites projected policy digests/cursors, so this branch
+        // is the semantic separation between native and downward snapshots.
+        if (type_mismatch) {
+            if (downward_projection == nullptr ||
+                !vbr_live_capture_adapter::bind_import_downward(
+                    tree, package, output, *downward_projection)) {
+                output = {};
+                if (downward_projection) {
+                    *downward_projection = {};
+                }
+                return false;
+            }
+            if (downward_required) {
+                *downward_required = true;
+            }
+        }
+        return true;
+    } catch (...) {
+        output = {};
+        if (downward_projection) {
+            *downward_projection = {};
+        }
+        return false;
+    }
+}
+
+bool vbr_explicit_import_target_recheck(
+        llama_memory_i & memory,
+        llama_seq_id destination,
+        const vbr_target_empty_fingerprint & expected) noexcept {
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (destination < 0 ||
+            expected.memory_instance_cookie !=
+                uint64_t(reinterpret_cast<uintptr_t>(&memory)) ||
+            !llama_memory_tree_collect(&memory, tree) ||
+            expected.tree_shape_digest != import_tree_digest(memory, tree) ||
+            expected.policy_epoch != import_policy_epoch(tree) ||
+            memory.seq_pos_min(destination) >= 0 ||
+            memory.seq_pos_max(destination) >= 0) {
+            return false;
+        }
+        size_t n_attention = 0;
+        size_t n_recurrent = 0;
+        for (const auto & child : tree) {
+            if (child.recurrent) {
+                if (n_recurrent != 0 || !recurrent_target_empty(child)) {
+                    return false;
+                }
+                ++n_recurrent;
+                continue;
+            }
+            if (!child.attention) {
+                return false;
+            }
+            ++n_attention;
+            const auto item = std::find_if(
+                expected.children.begin(), expected.children.end(),
+                [&](const vbr_child_empty_fingerprint & value) {
+                    return value.child_id == child.child_id;
+                });
+            if (item == expected.children.end() ||
+                !vbr_live_capture_adapter::recheck_import_child(
+                    *child.attention, *item)) {
+                return false;
+            }
+        }
+        return n_attention == expected.children.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+bool vbr_explicit_import_reserve_downward(
+        llama_memory_i & memory,
+        const std::vector<vbr_validated_child_plan> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept {
+    output = {};
+    try {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            return false;
+        }
+        output.status = vbr_downward_reserve_status::reserved;
+        bool any = false;
+        for (const auto & child : tree) {
+            if (!child.attention) {
+                continue;
+            }
+            std::vector<const vbr_validated_child_plan *> selected;
+            for (const auto & plan : plans) {
+                if (plan.child_id == child.child_id && plan.downward) {
+                    selected.push_back(&plan);
+                }
+            }
+            if (selected.empty()) {
+                continue;
+            }
+            any = true;
+            vbr_downward_stage_reservation one;
+            if (!vbr_live_capture_adapter::reserve_import_downward(
+                    *child.attention, selected, ledger, budget, one)) {
+                output = one;
+                return false;
+            }
+            if (one.status != vbr_downward_reserve_status::reserved &&
+                one.status !=
+                    vbr_downward_reserve_status::reserved_stashless) {
+                output = one;
+                return true;
+            }
+            output.stashless_units.insert(
+                output.stashless_units.end(),
+                one.stashless_units.begin(),
+                one.stashless_units.end());
+            if (!one.stashless_units.empty()) {
+                output.status =
+                    vbr_downward_reserve_status::reserved_stashless;
+            }
+        }
+        if (!any) {
+            output.status =
+                vbr_downward_reserve_status::projection_unavailable;
+            return false;
+        }
+        return true;
+    } catch (...) {
+        output = {};
+        output.status = vbr_downward_reserve_status::internal_error;
         return false;
     }
 }
@@ -890,7 +1490,7 @@ vbr_explicit_capture_result vbr_capture_explicit_manifest(
             companion.kind = vbr_artifact_companion_kind::recurrent;
             companion.format_version = 1;
             companion.build_identity_digest = tagged_digest(
-                "buun.vbr.capture/recurrent-codec", 1);
+                VBR_RECURRENT_CODEC_DOMAIN, 1);
             companion.domain = {
                 llama_cache_acct_residency::pageable_host,
                 llama_cache_acct_domain_kind::not_applicable,

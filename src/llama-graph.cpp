@@ -559,6 +559,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= tensor_binding_epoch == mctx->get_tensor_binding_epoch();
 
     // If this graph baked a direct state view (build_rs_in fast-path), it is only valid to reuse
     // while the new ubatch is still a contiguous-identity gather; otherwise the frozen view would
@@ -1239,6 +1240,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->tensor_binding_epoch ==
+        mctx->get_recr()->get_tensor_binding_epoch();
 
     return res;
 }
@@ -1282,6 +1285,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->tensor_binding_epoch ==
+        mctx->get_recr()->get_tensor_binding_epoch();
 
     return res;
 }
@@ -1372,6 +1377,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->tensor_binding_epoch ==
+        mctx->get_recr()->get_tensor_binding_epoch();
 
     return res;
 }
@@ -3524,6 +3531,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->tensor_binding_epoch = mctx_cur->get_tensor_binding_epoch();
 
     return inp;
 }

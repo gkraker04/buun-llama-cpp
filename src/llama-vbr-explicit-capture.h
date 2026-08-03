@@ -10,6 +10,11 @@
 #include <vector>
 
 class llama_memory_i;
+struct vbr_target_validation_snapshot;
+struct vbr_target_empty_fingerprint;
+struct vbr_downward_policy_projection;
+struct vbr_downward_stage_reservation;
+struct vbr_validated_child_plan;
 
 enum class vbr_explicit_capture_status : uint8_t {
     ok = 0,
@@ -159,6 +164,32 @@ bool vbr_explicit_capture_runtime_pools(
     llama_memory_i & memory,
     std::vector<vbr_explicit_capture_runtime_pool> & pools,
     uint32_t & attention_children) noexcept;
+
+// F4.3 live-import inspection doors. They share the capture adapter's private
+// KV geometry access but are read-only: validation/staging consume the values,
+// and only vbr_adopt_empty_manifest may mutate the target.
+uint64_t vbr_explicit_import_policy_epoch(
+    llama_memory_i & memory) noexcept;
+bool vbr_explicit_import_target_snapshot(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    bool previously_observed,
+    uint64_t accounting_serial,
+    vbr_target_validation_snapshot & output,
+    vbr_downward_policy_projection * downward_projection = nullptr,
+    bool * downward_required = nullptr) noexcept;
+bool vbr_explicit_import_target_recheck(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_target_empty_fingerprint & expected) noexcept;
+bool vbr_explicit_import_reserve_downward(
+    llama_memory_i & memory,
+    const std::vector<vbr_validated_child_plan> & plans,
+    llama_cache_acct_ledger & ledger,
+    const llama_cache_budget_config & budget,
+    vbr_downward_stage_reservation & output) noexcept;
 
 struct vbr_explicit_representation_identity {
     uint32_t codec_id = 0;

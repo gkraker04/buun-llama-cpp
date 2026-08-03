@@ -228,6 +228,7 @@ class vbr_recurrent_prepared_image final :
         target->r_l.swap(image.r_l);
         target->s_l.swap(image.s_l);
         target->ctxs_bufs.swap(image.ctxs_bufs);
+        target->bump_tensor_binding_epoch();
         image.target = nullptr;
         // END VBR_IMPORT_RECURRENT_METADATA_SWAP
     }
@@ -832,6 +833,12 @@ void llama_memory_recurrent::reset_rollback_state(llama_seq_id seq_id) {
 
     set_rs_idx(seq_id, 0);
     rollback_valid_depth[seq_id] = 0;
+}
+
+void llama_memory_recurrent::bump_tensor_binding_epoch() noexcept {
+    tensor_binding_epoch_ = tensor_binding_epoch_ == UINT64_MAX
+        ? 1
+        : tensor_binding_epoch_ + 1;
 }
 
 void llama_memory_recurrent::invalidate_rollback(const llama_ubatch & ubatch) {
@@ -1953,6 +1960,10 @@ uint32_t llama_memory_recurrent_context::get_head() const {
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
     return is_full ? 0 : mem->rs_z;
+}
+
+uint64_t llama_memory_recurrent_context::get_tensor_binding_epoch() const {
+    return mem->tensor_binding_epoch_;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {

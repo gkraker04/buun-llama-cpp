@@ -105,6 +105,22 @@ const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept {
     return "invalid";
 }
 
+const char * vbr_downward_adopt_subphase_name(
+        vbr_downward_adopt_subphase subphase) noexcept {
+    switch (subphase) {
+        case vbr_downward_adopt_subphase::none: return "none";
+        case vbr_downward_adopt_subphase::source_h2d: return "source_h2d";
+        case vbr_downward_adopt_subphase::edge_stash_capture:
+            return "edge_stash_capture";
+        case vbr_downward_adopt_subphase::edge_transcode:
+            return "edge_transcode";
+        case vbr_downward_adopt_subphase::edge_completion:
+            return "edge_completion";
+        case vbr_downward_adopt_subphase::_count: break;
+    }
+    return "_count";
+}
+
 vbr_prepared_companion_image::~vbr_prepared_companion_image() = default;
 
 vbr_adopt_status vbr_adopt_check_complete_tree(
@@ -950,7 +966,8 @@ class vbr_kv_import_session {
     bool prepare_receipts(
             const std::shared_ptr<vbr_import_receipt_group> & receipt) noexcept {
         if (test_seam_) {
-            return receipt && test_seam_->session_prepare_receipts(child_id_);
+            return receipt && test_seam_->session_prepare_receipts(
+                child_id_, receipt);
         }
         if (!receipt || cache_->vbr_import_receipt_ || receipt_) {
             return false;

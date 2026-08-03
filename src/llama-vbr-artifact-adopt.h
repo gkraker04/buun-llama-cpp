@@ -70,6 +70,8 @@ enum class vbr_downward_adopt_subphase : uint8_t {
 
 const char * vbr_adopt_phase_name(vbr_adopt_phase phase) noexcept;
 const char * vbr_adopt_status_name(vbr_adopt_status status) noexcept;
+const char * vbr_downward_adopt_subphase_name(
+    vbr_downward_adopt_subphase subphase) noexcept;
 
 class vbr_prepared_companion_image {
   public:
@@ -191,7 +193,11 @@ class vbr_adopt_test_seam {
         const std::vector<const vbr_validated_child_plan *> & plans,
         const vbr_tracker_install_child & tracker_plan,
         const vbr_checkpoint_generation_controller & source) noexcept = 0;
-    virtual bool session_prepare_receipts(uint32_t child_id) noexcept = 0;
+    // Test-only ownership mirror for the production shared receipt group. The
+    // opaque shared owner lets the model-free real phase driver retain claims
+    // across a successful adopt and release them at its simulated erase.
+    virtual bool session_prepare_receipts(
+        uint32_t child_id, std::shared_ptr<void> receipt_owner) noexcept = 0;
     virtual bool session_mapped_prefixes_complete(
         uint32_t child_id) const noexcept = 0;
     virtual bool session_barrier(

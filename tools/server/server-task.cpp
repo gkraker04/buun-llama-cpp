@@ -1654,6 +1654,45 @@ json server_task_result_cache_capture::to_json() {
     };
 }
 
+const char * server_cache_import_consistency_name(
+        server_cache_import_consistency consistency) noexcept {
+    switch (consistency) {
+        case server_cache_import_consistency::unavailable: return "unavailable";
+        case server_cache_import_consistency::capture_exact: return "capture_exact";
+        case server_cache_import_consistency::live_rebased: return "live_rebased";
+        case server_cache_import_consistency::_count: break;
+    }
+    return "_count";
+}
+
+json server_task_result_cache_import::to_json() {
+    const char * consistency_name =
+        server_cache_import_consistency_name(consistency);
+    return json {
+        { "status", server_vbr_artifact_import_status_name(status) },
+        { "validation_status",
+          vbr_manifest_validation_status_name(validation_status) },
+        { "stage_status", vbr_adopt_stage_status_name(stage_status) },
+        { "downward_reserve_status",
+          vbr_downward_reserve_status_name(downward_reserve_status) },
+        { "adopt_status", vbr_adopt_status_name(adopt_status) },
+        { "phase", adopt_attempted
+              ? json(vbr_adopt_phase_name(phase)) : json(nullptr) },
+        { "downward_subphase",
+          adopt_attempted
+              ? json(vbr_downward_adopt_subphase_name(downward_subphase))
+              : json(nullptr) },
+        { "downward_edge",
+          downward_edge == UINT32_MAX ? json(nullptr) : json(downward_edge) },
+        { "decision", vbr_import_decision_name(decision) },
+        { "consistency", consistency_name },
+        { "units", units },
+        { "companions", companions },
+        { "payload_bytes", payload_bytes },
+        { "companion_bytes", companion_bytes },
+    };
+}
+
 //
 // server_task_result_get_lora
 //

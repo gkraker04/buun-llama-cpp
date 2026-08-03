@@ -2025,6 +2025,24 @@ void llama_kv_cache::vbr_import_receipts_release() noexcept {
     vbr_import_receipt_.reset();
 }
 
+void llama_kv_cache::vbr_import_receipts_release_if_empty() noexcept {
+    if (!vbr_import_receipt_) {
+        return;
+    }
+    const bool empty = std::all_of(
+        v_cells.begin(), v_cells.end(),
+        [](const llama_kv_cells & cells) { return cells.get_used() == 0; });
+    if (empty) {
+        // seq_rm is the ordinary server erase path. Once the imported image has
+        // no live cell membership, retaining its conservative adoption claims
+        // would make a later import fail prepare_receipts despite the target
+        // being construction-empty. Every attention child owns one shared_ptr;
+        // the receipt group releases the ledger operations only after the last
+        // child reaches this boundary.
+        vbr_import_receipts_release();
+    }
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2130,6 +2148,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
     }
+
+    vbr_import_receipts_release_if_empty();
 
     return true;
 }

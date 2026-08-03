@@ -2341,7 +2341,7 @@ struct validator_fixture {
             manifest.identity.sequence_epoch;
         policy.identity.requested_frontier =
             manifest.identity.next_position;
-        policy.identity.tokens = manifest.token_block.tokens;
+        policy.identity.tokens = &manifest.token_block.tokens;
         policy.destination_sequence = 4;
         policy.domain_bindings = base.bindings;
         policy.domain_bindings.push_back({
@@ -2574,7 +2574,9 @@ static void test_manifest_validator_matrix() {
     policy.identity.execution_identity += ":wrong";
     check_status(vbr_manifest_validation_status::identity_mismatch, f.target, policy);
     policy = f.policy;
-    policy.identity.tokens[0]++;
+    auto mismatched_tokens = *policy.identity.tokens;
+    mismatched_tokens[0]++;
+    policy.identity.tokens = &mismatched_tokens;
     check_status(vbr_manifest_validation_status::token_block_mismatch, f.target, policy);
 
     auto target = f.target;

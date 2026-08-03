@@ -133,6 +133,15 @@ public:
 
 private:
     friend class vbr_recurrent_prepared_image;
+    friend class llama_memory_recurrent_context;
+
+    // Graphs retain the concrete recurrent tensor/buffer bindings used when
+    // they were built. Artifact adoption publishes an off-side companion by
+    // replacing those bindings, so otherwise shape-identical graphs must not
+    // be reused across that publication.
+    uint64_t tensor_binding_epoch_ = 0;
+
+    void bump_tensor_binding_epoch() noexcept;
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -188,6 +197,7 @@ public:
     uint32_t get_n_rs() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
+    uint64_t get_tensor_binding_epoch() const;
     uint32_t get_size() const;
 
     ggml_tensor * get_r_l(int32_t il) const;

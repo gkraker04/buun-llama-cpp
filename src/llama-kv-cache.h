@@ -673,6 +673,7 @@ private:
     bool vbr_import_in_progress_ = false;
     vbr_operation_id vbr_import_operation_ = {};
     void vbr_import_receipts_release() noexcept;
+    void vbr_import_receipts_release_if_empty() noexcept;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
