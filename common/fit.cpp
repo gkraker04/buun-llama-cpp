@@ -1262,7 +1262,7 @@ enum common_params_fit_status common_fit_params(
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic &&
             cparams->n_ctx != 0 && cparams->vbr_vram_budget_bytes != 0) {
         LOG_INF("%s: SPLIT_MODE_TENSOR: -c and --vbr-vram both explicit — nothing to fit, skipping\n", __func__);
-        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
     }
 
     // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the turbo8 entry
