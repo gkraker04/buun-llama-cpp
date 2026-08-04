@@ -1313,6 +1313,18 @@ struct common_computation_frontier {
     }
 };
 
+inline bool operator==(
+        const common_computation_frontier & a,
+        const common_computation_frontier & b) noexcept {
+    return a.version == b.version &&
+           a.sequence_epoch == b.sequence_epoch &&
+           a.token_count == b.token_count &&
+           a.next_position == b.next_position &&
+           a.execution_identity == b.execution_identity &&
+           a.adapter_config_identity == b.adapter_config_identity &&
+           a.media_content_identity == b.media_content_identity;
+}
+
 // §9 checkpoint shadow holder: opaque wrapper around the VBR generation record (D-A2-7). All
 // definitions that touch it live in the single bridge TU common/common-checkpoint-shadow.cpp.
 struct common_checkpoint_shadow;

@@ -75,6 +75,10 @@ enum class server_cache_destruction_execution : uint8_t {
     // prepared capability after the physical erase. Lease verdicts remain
     // pricing evidence here; host victim-selection authority lands in D-A3.
     prepared_release,
+    // D-A2: a host victim was erased only after all three payload planes were
+    // proved identical to a disjoint survivor and the survivor was pinned
+    // through the exact prepared-release commit.
+    redundant_host_eviction,
     _count,
 };
 
@@ -201,6 +205,10 @@ struct server_cache_destruction_observer {
     uint64_t host_restores_consumed = 0;
     uint64_t prepared_release_commits = 0;
     uint64_t prepared_release_fallbacks = 0;
+    uint64_t redundant_host_certified = 0;
+    uint64_t redundant_host_executed = 0;
+    uint64_t redundant_host_refused = 0;
+    uint64_t redundant_host_release_bytes = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
 
@@ -261,6 +269,22 @@ struct server_cache_destruction_observer {
         if (auto * event = event_for_sequence(sequence)) {
             event->execution =
                 server_cache_destruction_execution::prepared_release;
+        }
+    }
+
+    void note_redundant_host_refused(uint64_t) noexcept {
+        redundant_host_refused++;
+    }
+
+    void note_redundant_host_executed(
+            uint64_t sequence,
+            uint64_t released_bytes) noexcept {
+        redundant_host_certified++;
+        redundant_host_executed++;
+        redundant_host_release_bytes += released_bytes;
+        if (auto * event = event_for_sequence(sequence)) {
+            event->execution =
+                server_cache_destruction_execution::redundant_host_eviction;
         }
     }
 };

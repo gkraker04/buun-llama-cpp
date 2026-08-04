@@ -48,6 +48,18 @@ bool server_cache_destruction_quote_all(
     const server_cache_destruction_quote_options & options,
     common_cache_plan_destruction_counters & counters) noexcept;
 
+// D-A2's exact-redundancy quote for one host victim. This is the same
+// artifact classifier, canonical manifest digest, batch preview, and domain
+// projection used by the pre-minimization B-candidate quote path. The caller
+// supplies the separately-proved and pinned survivor at prepare time.
+common_cache_plan_destruction_quote
+server_cache_destruction_quote_redundant_host(
+    const server_cache_destruction_artifact & victim,
+    uint64_t accounting_serial,
+    uint64_t admission_sequence,
+    const server_cache_destruction_preview_callback & preview,
+    const server_cache_destruction_projection_callback & project) noexcept;
+
 void server_cache_destruction_select_quote(
     common_cache_plan_record & rec,
     common_cache_plan_destruction_counters & counters) noexcept;
@@ -66,6 +78,11 @@ common_cache_plan_destruction_effect_digest
 server_cache_destruction_union_effect_digest(
     const std::vector<llama_cache_acct_op_id> & ops,
     const llama_cache_acct_release_set_preview & release);
+
+common_cache_plan_destruction_recovery_digest
+server_cache_destruction_recovery_source_digest(
+    llama_cache_acct_artifact_id artifact,
+    const std::vector<llama_cache_acct_op_id> & ops);
 
 // Forward contract for D-A0b's mutation-boundary certify-time recheck. The
 // quote serial is evidence only; exact union/digest/domain equality decides.

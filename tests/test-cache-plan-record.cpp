@@ -411,6 +411,9 @@ static void test_json_serialization() {
         llama_cache_acct_value::measured(0),
         llama_cache_acct_value::measured(1794),
     });
+    // Synthetic serializer-coupled schema vector: production does not emit a
+    // refused receipt with a resolved concrete citation. Combining them here
+    // exercises both independent wire fields in the one schema-6 golden.
     rec.destruction.state = common_cache_plan_destruction_state::refused;
     rec.destruction.reason = common_cache_plan_destruction_reason::effect_drift;
     rec.destruction.effects = common_cache_plan_destruction_effect_bit(
@@ -428,6 +431,12 @@ static void test_json_serialization() {
     rec.destruction.union_effect_digest =
         common_cache_plan_destruction_effect_digest::from_sha256(
             std::array<uint8_t, 32>{ 2 });
+    rec.destruction.recovery_citation =
+        common_cache_plan_recovery_citation::resolved;
+    rec.destruction.recovery_source_artifact_id = { 21 };
+    rec.destruction.recovery_source_manifest_digest =
+        common_cache_plan_destruction_recovery_digest::from_sha256(
+            std::array<uint8_t, 32>{ 3 });
     common_cache_plan_finalize_shadow_authority(rec);
 
     const auto j = common_cache_plan_record_json(rec);
@@ -476,6 +485,10 @@ static void test_json_serialization() {
     CHECK(j["destruction"]["quote_duration_us"] == 37);
     CHECK(j["destruction"]["manifest_digest"] != "unavailable");
     CHECK(j["destruction"]["union_effect_digest"] != "unavailable");
+    CHECK(j["destruction"]["recovery_citation"] == "resolved");
+    CHECK(j["destruction"]["recovery_source"]["artifact_id"] == 21);
+    CHECK(j["destruction"]["recovery_source"]["manifest_digest"] ==
+          "0300000000000000000000000000000000000000000000000000000000000000");
     CHECK(j["destruction"]["selected"]["attention"].empty());
     CHECK(!j["destruction"].contains("projected_domains"));
     CHECK(j["inventory_states"]["host_cache_entry"] == "complete");

@@ -358,7 +358,7 @@ endif()
 function(da1_host_commit_gap_valid source output)
     contract_extract_region(
         "${source}"
-        "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+        "} else if (capability_ready) {"
         "const auto release_status = prepared.commit();"
         body found)
     if (NOT found)
@@ -388,27 +388,80 @@ da1_host_commit_gap_valid("${server_task}" host_commit_gap_valid)
 string(FIND "${server_task}"
     "GGML_ASSERT(scheduler_owner == std::this_thread::get_id());"
     da1_owner_assert)
+string(FIND "${server_task}"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    da1_raw_erase)
+string(FIND "${server_task}"
+    "} else if (capability_ready) {"
+    da1_capability_arm)
 if (NOT host_commit_gap_valid OR da1_owner_assert EQUAL -1)
     message(FATAL_ERROR
         "D-A1 host prepare-to-commit owner-thread/no-callback contract drifted")
 endif()
 string(REPLACE
-    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "auto next = server_prompt_cache_destroy_entry_impl(*this, it); acct->gauge_set();"
+    "} else if (capability_ready) {"
+    "} else if (capability_ready) { acct->gauge_set();"
     da1_gap_negative "${server_task}")
 da1_host_commit_gap_valid("${da1_gap_negative}" da1_gap_negative_valid)
 if (da1_gap_negative_valid)
     message(FATAL_ERROR "D-A1 host commit-gap negative control did not trip")
 endif()
 string(REPLACE
-    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "auto next = server_prompt_cache_destroy_entry_impl(*this, it); acct->release({});"
+    "} else if (capability_ready) {"
+    "} else if (capability_ready) { acct->release({});"
     da1_release_negative "${server_task}")
 da1_host_commit_gap_valid(
     "${da1_release_negative}" da1_release_negative_valid)
 if (da1_release_negative_valid)
     message(FATAL_ERROR
         "D-A1 host commit-gap release negative control did not trip")
+endif()
+
+# D-A2 opens only the exact host_dedup class. Its disjoint survivor pin is
+# acquired before the raw erase, and the alternate capability terminal is the
+# first operation after the erase on that control-flow arm. Every other reason
+# continues through D-A1's legacy/capability behavior.
+contract_extract_region(
+    "${server_task}"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    "const auto release_status =\n            redundant.capability.commit(redundant.pin);"
+    da2_commit_gap da2_commit_gap_found)
+contract_find_forbidden(
+    "${da2_commit_gap}" da2_gap_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+string(FIND "${server_task}"
+    "reason == server_cache_destruction_reason::host_dedup &&"
+    da2_reason_gate)
+string(FIND "${quote_source}"
+    "!recovery_pin.disjoint(victims, current_ops)" da2_prepare_disjoint)
+if (NOT da2_commit_gap_found OR da2_gap_forbidden OR
+    da2_reason_gate EQUAL -1 OR da2_prepare_disjoint EQUAL -1 OR
+    da1_raw_erase GREATER_EQUAL da1_capability_arm)
+    message(FATAL_ERROR
+        "D-A2 exact-host-only/disjoint-pin/commit-gap contract drifted")
+endif()
+string(REPLACE
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it); acct->release({});"
+    da2_gap_negative "${server_task}")
+contract_extract_region(
+    "${da2_gap_negative}"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    "const auto release_status =\n            redundant.capability.commit(redundant.pin);"
+    da2_negative_gap da2_negative_found)
+contract_find_forbidden(
+    "${da2_negative_gap}" da2_negative_forbidden "release(")
+if (NOT da2_negative_found OR NOT da2_negative_forbidden)
+    message(FATAL_ERROR "D-A2 commit-gap negative control did not trip")
 endif()
 
 # CACHE_HOST_LIFECYCLE is debug evidence, not an Observed-template signal:
@@ -434,6 +487,26 @@ if (da1_debug_wiring EQUAL -1 OR NOT da1_restore_commit_found OR
     message(FATAL_ERROR "D-A1 debug-only lifecycle evidence gate drifted")
 endif()
 
+# D-A2 maintenance receipts use the same explicit --cache-debug view. The
+# lifecycle/authority substrate remains active with debug off, but performs no
+# JSON construction and emits no CACHE_HOST_DESTRUCTION line.
+contract_extract_region(
+    "${server_task}"
+    "void server_prompt_cache_observe_host_destruction("
+    "redundant_host_certification certify_redundant_host("
+    da2_debug_emit_region da2_debug_emit_region_found)
+string(FIND "${da2_debug_emit_region}"
+    "if (!cache.debug_observability) {" da2_debug_emit_gate)
+string(FIND "${da2_debug_emit_region}"
+    "debug_destruction_emissions++;" da2_debug_emit_count)
+string(FIND "${da2_debug_emit_region}"
+    "CACHE_HOST_DESTRUCTION" da2_debug_emit)
+if (NOT da2_debug_emit_region_found OR da2_debug_emit_gate EQUAL -1 OR
+    da2_debug_emit_count LESS da2_debug_emit_gate OR
+    da2_debug_emit LESS da2_debug_emit_count)
+    message(FATAL_ERROR "D-A2 debug-only maintenance evidence gate drifted")
+endif()
+
 message(STATUS
     "D-S4 destruction inventory scan passed: 6 classes, ${admission_owner_count} admission owners, "
-    "raw-call + missing-class + D-A0b release-owner + D-A1 commit-gap/debug-emission negative controls")
+    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2 commit-gap/debug-emission negative controls")

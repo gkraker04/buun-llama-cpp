@@ -57,6 +57,12 @@ assert schema6[0]["destruction"]["quote_accounting_serial"] == \
        schema6[0]["accounting"]["serial"]
 assert schema6[0]["destruction"]["manifest_digest"] != "unavailable"
 assert schema6[0]["destruction"]["union_effect_digest"] != "unavailable"
+assert schema6[0]["destruction"]["recovery_citation"] == "resolved"
+assert schema6[0]["destruction"]["recovery_source"] == {
+    "artifact_id": 21,
+    "manifest_digest":
+        "0300000000000000000000000000000000000000000000000000000000000000",
+}
 assert schema6[0]["destruction"]["selected"] == {
     "attention": [],
     "recurrent": [],

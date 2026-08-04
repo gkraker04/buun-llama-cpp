@@ -120,6 +120,55 @@ bool server_cache_authority::sample_budget(
     }
 }
 
+bool server_cache_authority::project_release(
+        const llama_cache_acct_release_set_preview & release,
+        std::vector<common_cache_plan_yield_domain> & out) noexcept {
+    out.clear();
+    try {
+        llama_cache_budget_config config;
+        if (!sample_budget(config)) {
+            return false;
+        }
+        auto snapshot = ledger.snapshot();
+        if (snapshot.serial != release.accounting_serial) {
+            return false;
+        }
+        llama_cache_budget_coordinator coordinator;
+        if (!coordinator.reset(std::move(snapshot), config)) {
+            return false;
+        }
+        llama_cache_budget_plan plan;
+        if (!server_cache_yield_release_plan(
+                release, release.accounting_serial, plan)) {
+            return false;
+        }
+        const auto fit = coordinator.fits(plan);
+        if (fit.state != llama_cache_budget_fit_state::fits ||
+            fit.accounting_serial != release.accounting_serial) {
+            return false;
+        }
+        out.reserve(fit.domains.size());
+        for (const auto & row : fit.domains) {
+            if (std::none_of(
+                    release.rows.begin(), release.rows.end(),
+                    [&](const auto & released) {
+                        return released.domain == row.resource.domain;
+                    })) {
+                continue;
+            }
+            common_cache_plan_yield_domain lowered;
+            if (!server_cache_yield_lower_domain(row, lowered)) {
+                return false;
+            }
+            out.push_back(lowered);
+        }
+        return !out.empty();
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
 bool server_cache_authority::admit_host_entry(
         server_prompt_cache_state & entry) noexcept {
     if (!configured) {
@@ -240,4 +289,13 @@ bool server_cache_authority::admit_host_entry(
     }
     admission_commits++;
     return true;
+}
+
+void server_cache_authority::observe_host_destruction(
+        common_cache_plan_destruction_receipt receipt,
+        bool observe_classification) noexcept {
+    destruction_counters.observe(
+        common_cache_plan_selection::none, receipt, observe_classification);
+    destruction_counters.last_receipt = std::move(receipt);
+    destruction_counters.has_receipt = true;
 }

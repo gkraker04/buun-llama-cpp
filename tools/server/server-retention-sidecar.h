@@ -125,6 +125,9 @@ public:
     void retire_slot(int32_t owner_slot) noexcept;
     llama_cache_acct_artifact_id artifact_id(
         const server_retention_instance_key & key) const noexcept;
+    bool candidate_for_instance(
+        const server_retention_instance_key & key,
+        server_retention_candidate & out) const noexcept;
     std::vector<server_retention_candidate> candidate_snapshot() const noexcept;
 
     common_retention_sidecar_snapshot snapshot() const noexcept;

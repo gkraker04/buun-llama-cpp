@@ -391,6 +391,27 @@ foreach(authority_pin
     endif()
 endforeach()
 
+# Schema 6 froze only after D-A2 made resolved recovery citations durable:
+# the protected survivor identity and its exact C op set remain auditable
+# after the process-local pin closes.
+foreach(destruction_recovery_pin
+        "llama_cache_acct_artifact_id recovery_source_artifact_id;"
+        "common_cache_plan_destruction_recovery_digest recovery_source_manifest_digest;")
+    count_literal("${all_source}" "${destruction_recovery_pin}"
+        destruction_recovery_pin_count)
+    if (NOT destruction_recovery_pin_count EQUAL 1)
+        message(FATAL_ERROR
+            "schema-v6 recovery-source citation drifted: '${destruction_recovery_pin}'")
+    endif()
+endforeach()
+file(READ "${SOURCE_ROOT}/common/common-cache-plan.cpp" recovery_plan_source)
+count_literal("${recovery_plan_source}"
+    "{ \"recovery_source\", std::move(recovery_source) }"
+    recovery_source_json_count)
+if (NOT recovery_source_json_count EQUAL 1)
+    message(FATAL_ERROR "schema-v6 recovery-source JSON bridge drifted")
+endif()
+
 # --- name spellings are SINGULAR: every reason name is extracted mechanically from the
 # X-macro list (its one authoritative spelling) and any second quoted occurrence anywhere in
 # the tree is a shadow replica. "none" is excluded — it is a legitimate name in other closed

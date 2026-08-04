@@ -229,6 +229,32 @@ server_cache_destruction_union_effect_digest(
         hash.finish());
 }
 
+common_cache_plan_destruction_recovery_digest
+server_cache_destruction_recovery_source_digest(
+        llama_cache_acct_artifact_id artifact,
+        const std::vector<llama_cache_acct_op_id> & ops) {
+    if (artifact.v == 0 || ops.empty() ||
+        std::any_of(ops.begin(), ops.end(), [](const auto op) {
+            return !op;
+        })) {
+        return {};
+    }
+    auto canonical = ops;
+    std::sort(canonical.begin(), canonical.end());
+    canonical.erase(
+        std::unique(canonical.begin(), canonical.end()), canonical.end());
+    llama_sha256_writer hash;
+    static constexpr char tag[] = "cache-destruction-recovery-source-v1";
+    hash.string(tag, sizeof(tag) - 1);
+    hash.u64(artifact.v);
+    hash.u64(canonical.size());
+    for (const auto op : canonical) {
+        hash.u64(op.v);
+    }
+    return common_cache_plan_destruction_recovery_digest::from_sha256(
+        hash.finish());
+}
+
 server_cache_recovery_pin::~server_cache_recovery_pin() {
     reset();
 }
@@ -701,6 +727,71 @@ bool server_cache_destruction_quote_all(
         return fail_whole_pass(
             common_cache_plan_destruction_state::failed,
             common_cache_plan_destruction_reason::internal_fault);
+    }
+}
+
+common_cache_plan_destruction_quote
+server_cache_destruction_quote_redundant_host(
+        const server_cache_destruction_artifact & victim,
+        uint64_t accounting_serial,
+        uint64_t admission_sequence,
+        const server_cache_destruction_preview_callback & preview,
+        const server_cache_destruction_projection_callback & project) noexcept {
+    common_cache_plan_destruction_quote out;
+    auto & receipt = out.receipt;
+    receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::different_host_source_consumption);
+    receipt.plan_candidate = -1;
+    receipt.admission_sequence = admission_sequence;
+    receipt.quote_accounting_serial = accounting_serial;
+    try {
+        common_cache_plan_destruction_lease_verdict lease;
+        const auto reason = server_cache_destruction_artifact_refusal(
+            victim, false, lease);
+        receipt.lease_verdict = lease;
+        if (reason != common_cache_plan_destruction_reason::none) {
+            refuse(receipt, reason);
+            return out;
+        }
+
+        std::vector<const server_cache_destruction_artifact *> manifest = {
+            &victim,
+        };
+        receipt.manifest_digest = manifest_digest(manifest);
+        auto ops = victim.candidate.release_ops;
+        std::sort(ops.begin(), ops.end());
+        ops.erase(std::unique(ops.begin(), ops.end()), ops.end());
+        llama_cache_acct_release_set_preview release;
+        if (!preview || !preview(ops, accounting_serial, release)) {
+            refuse(
+                receipt,
+                common_cache_plan_destruction_reason::accounting_unavailable);
+            return out;
+        }
+        receipt.union_effect_digest =
+            server_cache_destruction_union_effect_digest(ops, release);
+        if (!project || !project(release, out.projected_domains)) {
+            refuse(
+                receipt,
+                common_cache_plan_destruction_reason::capacity_refused);
+            return out;
+        }
+        (victim.pool == common_retention_pool::attention
+             ? receipt.selected_attention
+             : receipt.selected_recurrent)
+            .push_back(victim.candidate.artifact_id);
+        receipt.state = common_cache_plan_destruction_state::quoted;
+        receipt.reason = common_cache_plan_destruction_reason::none;
+        return out;
+    } catch (...) {
+        out = {};
+        out.receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::different_host_source_consumption);
+        out.receipt.state = common_cache_plan_destruction_state::failed;
+        out.receipt.reason =
+            common_cache_plan_destruction_reason::internal_fault;
+        out.receipt.admission_sequence = admission_sequence;
+        return out;
     }
 }
 

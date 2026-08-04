@@ -1,5 +1,8 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
+#include "server-cache-destruction-quote.h"
+
+#include "../../common/common-cache-plan-estimate.h"
 
 #include "build-info.h"
 #include "server-cache-authority.h"
@@ -2125,12 +2128,430 @@ static void server_prompt_cache_retire_entry(
 static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
         server_prompt_cache & cache,
         server_prompt_cache::iterator it) {
+    GGML_ASSERT(it->recovery_pins == 0);
     return cache.states.erase(it);
 }
 
 server_prompt_cache::iterator server_prompt_cache::destroy_entry(
         iterator it,
         server_cache_destruction_reason reason) {
+    return destroy_entry_impl(it, reason, states.end());
+}
+
+namespace {
+
+bool checkpoint_payload_equal(
+        const common_prompt_checkpoint & a,
+        const common_prompt_checkpoint & b) noexcept {
+    return a.n_tokens == b.n_tokens &&
+           a.id_task == b.id_task &&
+           a.pos_min == b.pos_min &&
+           a.pos_max == b.pos_max &&
+           a.representation_epoch == b.representation_epoch &&
+           a.representation_epoch_swa == b.representation_epoch_swa &&
+           a.computation_frontier == b.computation_frontier &&
+           a.data_tgt == b.data_tgt &&
+           a.data_dft == b.data_dft &&
+           a.accel.ring == b.accel.ring &&
+           a.accel.spec == b.accel.spec &&
+           !a.shadow && !b.shadow;
+}
+
+bool build_host_destruction_artifact(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out) noexcept {
+    out = {};
+    try {
+        if (!cache.retention_obs || !cache.lease_obs ||
+            !cache.lease_execution_identity) {
+            return false;
+        }
+        server_retention_candidate catalog;
+        const auto key = server_retention_instance_key::for_host_entry(&state);
+        if (!cache.retention_obs->candidate_for_instance(key, catalog) ||
+            catalog.artifact_id.v == 0 ||
+            catalog.record.kind != common_retention_artifact_kind::host_entry) {
+            return false;
+        }
+        server_cache_lease_identity identity;
+        if (!server_cache_lease_build_identity(
+                *cache.lease_execution_identity,
+                state.adapter_config_key,
+                state.prompt.tokens,
+                state.prompt.n_tokens(),
+                identity)) {
+            return false;
+        }
+        out.candidate.artifact_id = catalog.artifact_id;
+        out.candidate.record = catalog.record;
+        out.candidate.availability = catalog.avail;
+        out.candidate.lease = cache.lease_obs->inspect(
+            catalog.artifact_id, identity);
+        out.candidate.identity_known = true;
+        out.candidate.release_ops.reserve(3);
+        for (const auto op : state.release_ops()) {
+            if (!op) {
+                return false;
+            }
+            out.candidate.release_ops.push_back(op);
+        }
+        out.kind = common_retention_artifact_kind::host_entry;
+        out.host_source_id = state.cache_plan_source_id;
+        out.pool = catalog.record.stamp.pool;
+        out.mandatory_anchor = catalog.record.stamp.mandatory_anchor;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+bool projected_release_bytes(
+        const std::vector<common_cache_plan_yield_domain> & domains,
+        uint64_t & total) noexcept {
+    total = 0;
+    for (const auto & row : domains) {
+        if (row.projected_release_bytes.state !=
+                llama_cache_acct_known::known ||
+            row.projected_release_bytes.value >
+                std::numeric_limits<uint64_t>::max() - total) {
+            total = 0;
+            return false;
+        }
+        total += row.projected_release_bytes.value;
+    }
+    return true;
+}
+
+void release_host_recovery_pin(void * context) noexcept {
+    auto * state = static_cast<server_prompt_cache_state *>(context);
+    GGML_ASSERT(state && state->recovery_pins > 0);
+    state->recovery_pins--;
+}
+
+bool build_host_recovery_source(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        std::vector<llama_cache_acct_artifact_id> & artifacts,
+        std::vector<llama_cache_acct_op_id> & ops) noexcept {
+    artifacts.clear();
+    ops.clear();
+    try {
+        if (!cache.retention_obs) {
+            return false;
+        }
+        server_retention_candidate catalog;
+        const auto key = server_retention_instance_key::for_host_entry(&state);
+        if (!cache.retention_obs->candidate_for_instance(key, catalog) ||
+            catalog.artifact_id.v == 0 ||
+            catalog.record.kind != common_retention_artifact_kind::host_entry ||
+            catalog.avail != server_retention_candidate_availability::available) {
+            return false;
+        }
+        artifacts.push_back(catalog.artifact_id);
+        ops.reserve(3);
+        for (const auto op : state.release_ops()) {
+            if (!op) {
+                return false;
+            }
+            ops.push_back(op);
+        }
+        std::sort(ops.begin(), ops.end());
+        ops.erase(std::unique(ops.begin(), ops.end()), ops.end());
+        return ops.size() == 3;
+    } catch (...) {
+        artifacts.clear();
+        ops.clear();
+        return false;
+    }
+}
+
+server_cache_recovery_pin acquire_host_recovery_pin(
+        server_prompt_cache_state & state,
+        std::vector<llama_cache_acct_artifact_id> artifacts,
+        std::vector<llama_cache_acct_op_id> ops) noexcept {
+    if (state.recovery_pins == std::numeric_limits<uint32_t>::max()) {
+        return {};
+    }
+    state.recovery_pins++;
+    auto pin = server_cache_recovery_pin::acquire(
+        &state,
+        release_host_recovery_pin,
+        std::move(artifacts),
+        std::move(ops));
+    if (!pin.valid()) {
+        state.recovery_pins--;
+    }
+    return pin;
+}
+
+struct redundant_host_certification {
+    bool ready = false;
+    server_cache_prepared_release_capability capability;
+    server_cache_recovery_pin pin;
+    common_cache_plan_destruction_quote quote;
+    uint64_t projected_bytes = 0;
+};
+
+void server_prompt_cache_observe_host_destruction(
+        server_prompt_cache & cache,
+        const common_cache_plan_destruction_receipt & receipt,
+        bool observe_classification,
+        uint64_t projected_bytes) noexcept {
+    cache.publish_authority->observe_host_destruction(
+        receipt, observe_classification);
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        json effects = json::array();
+        for (uint8_t raw =
+                 uint8_t(common_cache_plan_destruction_effect::none) + 1;
+             raw < uint8_t(common_cache_plan_destruction_effect::_count);
+             ++raw) {
+            const auto effect = common_cache_plan_destruction_effect(raw);
+            if (common_cache_plan_destruction_effect_has(
+                    receipt.effects, effect)) {
+                effects.push_back(
+                    common_cache_plan_destruction_effect_name(effect));
+            }
+        }
+        json victims = json::array();
+        for (const auto artifact : receipt.selected_attention) {
+            victims.push_back(artifact.v);
+        }
+        for (const auto artifact : receipt.selected_recurrent) {
+            victims.push_back(artifact.v);
+        }
+        json recovery_source = common_cache_acct_known_name(
+            llama_cache_acct_known::unavailable);
+        if (receipt.recovery_source_artifact_id.v != 0 &&
+            receipt.recovery_source_manifest_digest.valid()) {
+            recovery_source = json {
+                { "artifact_id", receipt.recovery_source_artifact_id.v },
+                { "manifest_digest", common_cache_plan_sha256_hex_digest(
+                      receipt.recovery_source_manifest_digest.bytes()) },
+            };
+        }
+        const json payload = {
+            { "state", common_cache_plan_destruction_state_name(
+                  receipt.state) },
+            { "reason", common_cache_plan_destruction_reason_name(
+                  receipt.reason) },
+            { "effects", std::move(effects) },
+            { "victim_ids", std::move(victims) },
+            { "recovery_source", std::move(recovery_source) },
+            { "projected_bytes", projected_bytes },
+        };
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb maintenance or destruction.
+    }
+}
+
+redundant_host_certification certify_redundant_host(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator victim_state,
+        server_prompt_cache::iterator survivor_state,
+        uint64_t admission_sequence,
+        bool retirement_ready) noexcept {
+    redundant_host_certification out;
+    auto & authority = *cache.publish_authority;
+
+    const auto refuse_initial = [&](common_cache_plan_destruction_reason reason) {
+        out.quote = {};
+        auto & receipt = out.quote.receipt;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+        receipt.state = common_cache_plan_destruction_state::refused;
+        receipt.reason = reason;
+        receipt.admission_sequence = admission_sequence;
+        server_prompt_cache_observe_host_destruction(
+            cache, receipt, true, 0);
+        if (cache.destruction_obs) {
+            cache.destruction_obs->note_redundant_host_refused(
+                admission_sequence);
+        }
+    };
+    const auto refuse_certified = [&](common_cache_plan_destruction_reason reason) {
+        auto & receipt = out.quote.receipt;
+        receipt.state = common_cache_plan_destruction_state::refused;
+        receipt.reason = reason;
+        server_prompt_cache_observe_host_destruction(
+            cache, receipt, true, 0);
+        if (cache.destruction_obs) {
+            cache.destruction_obs->note_redundant_host_refused(
+                admission_sequence);
+        }
+    };
+
+    server_cache_destruction_artifact victim;
+    std::vector<llama_cache_acct_artifact_id> survivor_ids;
+    std::vector<llama_cache_acct_op_id> survivor_ops;
+    if (!retirement_ready) {
+        refuse_initial(common_cache_plan_destruction_reason::manifest_incomplete);
+        return out;
+    }
+    if (!server_prompt_cache::exactly_redundant(
+            *victim_state, *survivor_state)) {
+        refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
+        return out;
+    }
+    if (!build_host_destruction_artifact(cache, *victim_state, victim)) {
+        // Every host-consumption/redundancy effect needs its own by-host
+        // catalog contribution. A partial displacement-only union is not
+        // certifiable.
+        refuse_initial(common_cache_plan_destruction_reason::manifest_incomplete);
+        return out;
+    }
+    if (!build_host_recovery_source(
+            cache, *survivor_state, survivor_ids, survivor_ops)) {
+        refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
+        return out;
+    }
+
+    try {
+        const auto recovery_artifact = survivor_ids.front();
+        auto recovery_ops = survivor_ops;
+        out.pin = acquire_host_recovery_pin(
+            *survivor_state,
+            std::move(survivor_ids),
+            std::move(survivor_ops));
+        if (!out.pin.valid()) {
+            refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
+            return out;
+        }
+
+        const server_cache_destruction_preview_callback preview =
+            [&](const auto & ops, uint64_t serial, auto & released) {
+                return cache.acct->preview_release_set(ops, serial, released);
+            };
+        const server_cache_destruction_projection_callback project =
+            [&](const auto & released, auto & domains) {
+                return authority.project_release(released, domains);
+            };
+        const auto snapshot = cache.acct->snapshot();
+        out.quote = server_cache_destruction_quote_redundant_host(
+            victim,
+            snapshot.serial,
+            admission_sequence,
+            preview,
+            project);
+        server_prompt_cache_observe_host_destruction(
+            cache,
+            out.quote.receipt,
+            out.quote.receipt.state !=
+                common_cache_plan_destruction_state::quoted,
+            0);
+        if (out.quote.receipt.state !=
+                common_cache_plan_destruction_state::quoted) {
+            if (cache.destruction_obs) {
+                cache.destruction_obs->note_redundant_host_refused(
+                    admission_sequence);
+            }
+            return out;
+        }
+
+        std::vector<server_cache_destruction_artifact> current = {
+            std::move(victim),
+        };
+        const auto fresh = cache.acct->snapshot();
+        auto prepared = server_cache_prepare_release_set(
+            out.quote,
+            current,
+            *cache.acct,
+            fresh.serial,
+            project,
+            std::move(out.pin));
+        if (prepared.status !=
+                server_cache_prepare_release_status::prepared) {
+            refuse_certified(prepared.reason);
+            return out;
+        }
+        if (!projected_release_bytes(
+                out.quote.projected_domains, out.projected_bytes)) {
+            refuse_certified(
+                common_cache_plan_destruction_reason::accounting_unavailable);
+            return out;
+        }
+
+        // The exact-duplicate fate and resolved citation become claims only
+        // after every refusal conjunct, fresh effect check, and disjoint pin
+        // has succeeded. Schema 6 retains the source identity after the pin
+        // itself closes.
+        out.quote.receipt.displaced_fate =
+            common_cache_plan_displaced_fate::exact_duplicate;
+        out.quote.receipt.recovery_citation =
+            common_cache_plan_recovery_citation::resolved;
+        out.quote.receipt.recovery_source_artifact_id = recovery_artifact;
+        out.quote.receipt.recovery_source_manifest_digest =
+            server_cache_destruction_recovery_source_digest(
+                recovery_artifact, recovery_ops);
+        out.quote.receipt.state =
+            common_cache_plan_destruction_state::certified;
+        server_prompt_cache_observe_host_destruction(
+            cache, out.quote.receipt, true, out.projected_bytes);
+        out.capability = std::move(prepared.capability);
+        out.ready = true;
+        return out;
+    } catch (...) {
+        out.pin = {};
+        if (out.quote.receipt.union_effect_digest.valid()) {
+            refuse_certified(common_cache_plan_destruction_reason::internal_fault);
+        } else {
+            refuse_initial(common_cache_plan_destruction_reason::internal_fault);
+        }
+        return out;
+    }
+}
+
+} // namespace
+
+bool server_prompt_cache::exactly_redundant(
+        const server_prompt_cache_state & victim,
+        const server_prompt_cache_state & survivor) noexcept {
+    try {
+        if (&victim == &survivor ||
+            victim.adapter_config_key != survivor.adapter_config_key ||
+            victim.prompt.sequence_epoch != survivor.prompt.sequence_epoch ||
+            victim.prompt.n_tokens() > survivor.prompt.n_tokens() ||
+            victim.prompt.tokens.get_common_prefix(survivor.prompt.tokens) !=
+                size_t(victim.prompt.n_tokens()) ||
+            victim.data.main != survivor.data.main ||
+            victim.data.drft != survivor.data.drft ||
+            victim.prompt.checkpoints.size() !=
+                survivor.prompt.checkpoints.size()) {
+            return false;
+        }
+        std::string victim_media;
+        std::string survivor_media;
+        if (!victim.prompt.tokens.media_content_identity(
+                victim.prompt.n_tokens(), victim_media) ||
+            !survivor.prompt.tokens.media_content_identity(
+                victim.prompt.n_tokens(), survivor_media) ||
+            victim_media != survivor_media) {
+            return false;
+        }
+        auto a = victim.prompt.checkpoints.begin();
+        auto b = survivor.prompt.checkpoints.begin();
+        for (; a != victim.prompt.checkpoints.end(); ++a, ++b) {
+            if (!checkpoint_payload_equal(*a, *b)) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
+        iterator it,
+        server_cache_destruction_reason reason,
+        iterator recovery) {
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     // Legacy pass-through owns exactly one accounting terminal outside the
     // raw physical primitive. Under D-A1 lifecycle mode, the existing legacy
@@ -2141,11 +2562,19 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
 
     llama_cache_prepared_release_set prepared;
     server_prompt_cache_retirement_manifest retirement;
+    const bool retirement_ready = publish_authority && acct &&
+        server_prompt_cache_capture_retirement(*this, it, retirement);
     bool capability_ready = false;
+    redundant_host_certification redundant;
+    if (publish_authority && acct &&
+        reason == server_cache_destruction_reason::host_dedup &&
+        recovery != states.end()) {
+        redundant = certify_redundant_host(
+            *this, it, recovery, admission.sequence, retirement_ready);
+    }
     if (publish_authority && acct) {
         std::vector<llama_cache_acct_op_id> ops;
-        bool setup_ok = server_prompt_cache_capture_retirement(
-            *this, it, retirement);
+        bool setup_ok = retirement_ready;
         try {
             ops.reserve(release_ops.size());
             for (const auto op : release_ops) {
@@ -2157,7 +2586,7 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
             setup_ok = false;
         }
 
-        if (setup_ok && !ops.empty()) {
+        if (!redundant.ready && setup_ok && !ops.empty()) {
             const uint64_t serial = acct->snapshot().serial;
             prepared = llama_cache_prepare_release_set(
                 *acct, ops, serial);
@@ -2165,11 +2594,38 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
         }
     }
 
-    if (!capability_ready) {
+    if (!capability_ready && !redundant.ready) {
         server_prompt_cache_retire_entry(*this, it);
     }
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
-    if (capability_ready) {
+    if (redundant.ready) {
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        // D-A2 certify→mutate→commit boundary. Like D-A1, publication and
+        // dedup run synchronously on update_slots. The physical list erase has
+        // no callback or C producer; the immediate capability commit is the
+        // only ledger terminal, so no ledger write can interleave. The
+        // recovery pin remains live across both operations and prevents the
+        // cited survivor from entering this raw primitive.
+        const auto release_status =
+            redundant.capability.commit(redundant.pin);
+        GGML_ASSERT(release_status ==
+                    common_cache_plan_destruction_reason::none);
+        server_prompt_cache_retire_manifest(*this, retirement);
+        redundant.quote.receipt.state =
+            common_cache_plan_destruction_state::executed;
+        redundant.quote.receipt.actual_accounting_serial =
+            acct->snapshot().serial;
+        server_prompt_cache_observe_host_destruction(
+            *this, redundant.quote.receipt, false,
+            redundant.projected_bytes);
+        if (destruction_obs) {
+            destruction_obs->note_redundant_host_executed(
+                admission.sequence, redundant.projected_bytes);
+        }
+        // The surviving host entry outlives the D-A commit; this local
+        // dedup dependency closes here, so its non-policy pin may now release.
+        redundant.pin = {};
+    } else if (capability_ready) {
         GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
         // D-A1 prepare→mutate→commit boundary. destroy_entry() is called
         // synchronously by update_slots-owned prompt-cache publication/load
@@ -2301,8 +2757,9 @@ bool server_prompt_cache::publish(
             const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
             if (len == (int) it->prompt.tokens.size()) {
                 SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-                it = destroy_entry(
-                    it, server_cache_destruction_reason::host_dedup);
+                it = destroy_entry_impl(
+                    it, server_cache_destruction_reason::host_dedup,
+                    self);
                 continue;
             }
         }

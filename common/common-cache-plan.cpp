@@ -270,7 +270,8 @@ const char * common_cache_plan_destruction_comparison_name(
 
 void common_cache_plan_destruction_counters::observe(
         common_cache_plan_selection tier,
-        const common_cache_plan_destruction_receipt & receipt) noexcept {
+        const common_cache_plan_destruction_receipt & receipt,
+        bool observe_classification) noexcept {
     // Unlike B-A's one-receipt observe(), D-A calls this once per candidate.
     // The server boundary publishes the selected/finalized receipt exactly once.
     const size_t t = size_t(tier);
@@ -305,13 +306,18 @@ void common_cache_plan_destruction_counters::observe(
             refused[t][r]++;
         }
     }
-    const size_t v = size_t(receipt.lease_verdict);
-    if (v < n_verdicts) {
-        lease_verdict[t][v]++;
-    }
-    const size_t f = size_t(receipt.displaced_fate);
-    if (f < n_fates) {
-        recovery_outcome[t][f]++;
+    // State transitions may publish the same candidate at quoted, certified,
+    // and executed. Lease and recovery classification are once-per-candidate,
+    // selected by the caller at the terminal evidence-bearing observation.
+    if (observe_classification) {
+        const size_t v = size_t(receipt.lease_verdict);
+        if (v < n_verdicts) {
+            lease_verdict[t][v]++;
+        }
+        const size_t f = size_t(receipt.displaced_fate);
+        if (f < n_fates) {
+            recovery_outcome[t][f]++;
+        }
     }
 }
 
@@ -745,6 +751,16 @@ static json cache_plan_destruction_json(
             : json(common_cache_acct_known_name(
                   llama_cache_acct_known::unavailable));
     };
+    json recovery_source = common_cache_acct_known_name(
+        llama_cache_acct_known::unavailable);
+    if (receipt.recovery_source_artifact_id.v != 0 &&
+        receipt.recovery_source_manifest_digest.valid()) {
+        recovery_source = json {
+            { "artifact_id", receipt.recovery_source_artifact_id.v },
+            { "manifest_digest", digest_json(
+                  receipt.recovery_source_manifest_digest) },
+        };
+    }
     return json {
         { "policy_version", receipt.policy_version },
         { "state", common_cache_plan_destruction_state_name(receipt.state) },
@@ -753,6 +769,7 @@ static json cache_plan_destruction_json(
         { "lease_verdict", common_cache_plan_destruction_lease_verdict_name(receipt.lease_verdict) },
         { "displaced_fate", common_cache_plan_displaced_fate_name(receipt.displaced_fate) },
         { "recovery_citation", common_cache_plan_recovery_citation_name(receipt.recovery_citation) },
+        { "recovery_source", std::move(recovery_source) },
         { "post_finalize_comparison", common_cache_plan_destruction_comparison_name(receipt.post_finalize_comparison) },
         { "plan_candidate", receipt.plan_candidate >= 0
               ? json(receipt.plan_candidate)

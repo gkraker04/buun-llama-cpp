@@ -1,4 +1,5 @@
 #include "server-cache-authority.h"
+#include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-task.h"
 
@@ -22,17 +23,27 @@ int failures = 0;
     }                                                                           \
 } while (0)
 
-void configure_host_accounting(server_cache_authority & authority) {
+void configure_host_accounting(
+        server_cache_authority & authority,
+        bool with_sidecar = false) {
     const auto host = llama_cache_acct_resource_domain::non_device(
         llama_cache_acct_residency::pageable_host);
-    const llama_cache_acct_completeness_requirement required = {
-        host, llama_cache_acct_producer::host_cache,
+    const llama_cache_acct_completeness_requirement required[] = {
+        { host, llama_cache_acct_producer::host_cache },
+        { host, llama_cache_acct_producer::retention_sidecar },
     };
-    CHECK(authority.ledger.configure_required_producers(&required, 1));
+    const size_t n_required = with_sidecar ? std::size(required) : 1;
+    CHECK(authority.ledger.configure_required_producers(
+        required, n_required));
     for (const auto category : {
             llama_cache_acct_category::full_snapshot_payload,
             llama_cache_acct_category::checkpoint_state_payload,
-            llama_cache_acct_category::typed_accelerator_payload }) {
+            llama_cache_acct_category::typed_accelerator_payload,
+            llama_cache_acct_category::artifact_descriptor_metadata }) {
+        if (!with_sidecar && category ==
+                llama_cache_acct_category::artifact_descriptor_metadata) {
+            continue;
+        }
         for (const auto measure : {
                 llama_cache_acct_measure::logical_payload,
                 llama_cache_acct_measure::resident_allocated,
@@ -42,6 +53,12 @@ void configure_host_accounting(server_cache_authority & authority) {
     }
     CHECK(authority.ledger.certify_complete(
         host, llama_cache_acct_producer::host_cache));
+    if (with_sidecar) {
+        CHECK(authority.ledger.certify_complete(
+            host, llama_cache_acct_producer::retention_sidecar));
+        authority.retention.configure(
+            &authority.ledger, host, &authority.leases);
+    }
 }
 
 std::list<server_prompt_cache_state> make_entry(
@@ -60,6 +77,22 @@ std::list<server_prompt_cache_state> make_prompt_entry(
     auto entry = make_entry(identity, 1);
     entry.front().prompt.tokens = server_tokens(
         llama_tokens(tokens), false);
+    return entry;
+}
+
+std::list<server_prompt_cache_state> make_redundant_entry() {
+    auto entry = make_prompt_entry("same", { 1, 2, 3 });
+    entry.front().data.main.assign(16, 7);
+    entry.front().data.drft.assign(4, 8);
+    entry.front().prompt.checkpoints.emplace_back();
+    auto & checkpoint = entry.front().prompt.checkpoints.back();
+    checkpoint.n_tokens = 2;
+    checkpoint.pos_min = 0;
+    checkpoint.pos_max = 1;
+    checkpoint.data_tgt.assign(8, 9);
+    checkpoint.data_dft.assign(3, 10);
+    checkpoint.accel.ring.assign(5, 11);
+    checkpoint.accel.spec.assign(2, 12);
     return entry;
 }
 
@@ -273,6 +306,137 @@ void test_authority_source_ids_survive_save_dedup() {
     CHECK(old_source == 2);
 }
 
+void test_exact_redundant_host_eviction() {
+    server_cache_authority authority;
+    const std::string execution_identity = "test-execution";
+    configure_host_accounting(authority, true);
+
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    cache.retention_obs = &authority.retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &execution_identity;
+
+    server_prompt source;
+    source.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, 1);
+    spans.add(COMMON_CHAT_ROLE_USER, 1, 1);
+    spans.add(COMMON_CHAT_ROLE_USER, 2, 1);
+    CHECK(authority.retention.publish(
+        server_retention_instance_key::for_slot(0),
+        common_retention_pool::attention,
+        spans,
+        true,
+        3,
+        1,
+        true));
+
+    auto first = make_redundant_entry();
+    CHECK(cache.publish(std::move(first), &source, 0));
+    CHECK(cache.states.size() == 1);
+    const auto live_ops_before = authority.ledger.snapshot().live_ops;
+
+    auto duplicate = make_redundant_entry();
+    CHECK(server_prompt_cache::exactly_redundant(
+        cache.states.front(), duplicate.front()));
+    CHECK(cache.publish(std::move(duplicate), &source, 0));
+
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().recovery_pins == 0);
+    CHECK(authority.ledger.snapshot().live_ops == live_ops_before);
+    CHECK(authority.destruction.redundant_host_certified == 1);
+    CHECK(authority.destruction.redundant_host_executed == 1);
+    CHECK(authority.destruction.redundant_host_refused == 0);
+    CHECK(authority.destruction.redundant_host_release_bytes == 38);
+    CHECK(authority.destruction.events[0].execution ==
+          server_cache_destruction_execution::redundant_host_eviction);
+    CHECK(authority.destruction_counters.has_receipt);
+    CHECK(authority.destruction_counters.last_receipt.state ==
+          common_cache_plan_destruction_state::executed);
+    CHECK(authority.destruction_counters.last_receipt.displaced_fate ==
+          common_cache_plan_displaced_fate::exact_duplicate);
+    CHECK(authority.destruction_counters.last_receipt.recovery_citation ==
+          common_cache_plan_recovery_citation::resolved);
+    const auto & recovery_receipt =
+        authority.destruction_counters.last_receipt;
+    CHECK(recovery_receipt.recovery_source_artifact_id.v != 0);
+    CHECK(recovery_receipt.recovery_source_artifact_id.v !=
+          recovery_receipt.selected_attention.front().v);
+    CHECK(recovery_receipt.recovery_source_manifest_digest.valid());
+    const auto survivor_ops = cache.states.front().release_ops();
+    const std::vector<llama_cache_acct_op_id> survivor_op_vector(
+        survivor_ops.begin(), survivor_ops.end());
+    CHECK(recovery_receipt.recovery_source_manifest_digest ==
+          server_cache_destruction_recovery_source_digest(
+              recovery_receipt.recovery_source_artifact_id,
+              survivor_op_vector));
+    CHECK(authority.destruction_counters.quoted
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_destruction_class::host_artifact_drop)] == 1);
+    CHECK(authority.destruction_counters.certified
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_destruction_class::host_artifact_drop)] == 1);
+    CHECK(authority.destruction_counters.executed
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_destruction_class::host_artifact_drop)] == 1);
+    CHECK(authority.destruction_counters.lease_verdict
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_destruction_lease_verdict::unleased)] == 1);
+    CHECK(authority.destruction_counters.recovery_outcome
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_displaced_fate::exact_duplicate)] == 1);
+    // Lifecycle + authority without --cache-debug must not emit maintenance
+    // evidence, even though the certified execution and process counters run.
+    CHECK(cache.debug_destruction_emissions == 0);
+
+    // Positive control for the same seam: explicit debug emits quoted,
+    // certified, and executed receipts exactly once each.
+    cache.debug_observability = true;
+    auto debug_duplicate = make_redundant_entry();
+    CHECK(cache.publish(std::move(debug_duplicate), &source, 0));
+    CHECK(cache.debug_destruction_emissions == 3);
+}
+
+void test_redundancy_payload_mismatch_and_missing_catalog() {
+    auto victim = make_prompt_entry("same", { 1, 2, 3 });
+    victim.front().data.main.assign(4, 1);
+    victim.front().prompt.checkpoints.emplace_back();
+    victim.front().prompt.checkpoints.back().n_tokens = 2;
+    victim.front().prompt.checkpoints.back().data_tgt.assign(2, 3);
+    auto survivor = make_prompt_entry("same", { 1, 2, 3 });
+    survivor.front().data.main.assign(4, 1);
+    survivor.front().prompt.checkpoints.emplace_back();
+    survivor.front().prompt.checkpoints.back().n_tokens = 2;
+    survivor.front().prompt.checkpoints.back().data_tgt.assign(2, 3);
+    survivor.front().prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4 }, false);
+    // Coverage superset is accepted only because all three physical payload
+    // planes are still byte-identical.
+    CHECK(server_prompt_cache::exactly_redundant(
+        victim.front(), survivor.front()));
+    survivor.front().prompt.checkpoints.back().data_tgt[1] = 4;
+    CHECK(!server_prompt_cache::exactly_redundant(
+        victim.front(), survivor.front()));
+
+    server_cache_authority authority;
+    configure_host_accounting(authority);
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3 })));
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3 })));
+    CHECK(cache.states.size() == 1);
+    CHECK(authority.destruction.redundant_host_executed == 0);
+    CHECK(authority.destruction.redundant_host_refused == 1);
+    CHECK(authority.destruction_counters.last_receipt.reason ==
+          common_cache_plan_destruction_reason::manifest_incomplete);
+    CHECK(authority.destruction.prepared_release_commits == 1);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -291,6 +455,8 @@ int main(int argc, char ** argv) {
     test_lifecycle_release_prepare_failure_keeps_legacy_bound();
     test_lifecycle_authority_without_debug_is_silent();
     test_authority_source_ids_survive_save_dedup();
+    test_exact_redundant_host_eviction();
+    test_redundancy_payload_mismatch_and_missing_catalog();
     llama_backend_free();
 
     if (failures != 0) {

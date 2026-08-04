@@ -291,7 +291,8 @@ struct common_cache_plan_authority_counters {
 
 // D-A schema-v6 destruction evidence. These are wire-layer mirrors of the
 // server-only lifecycle vocabulary; common/ must not depend on tools/server.
-// D-A0a quotes only: it never certifies or executes a mutation.
+// D-A0a established the quote shape; D-A2 freezes the resolved recovery-source
+// citation used by certified and executed redundant-host evictions.
 constexpr uint32_t COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION = 1;
 
 struct common_cache_plan_yield_domain;
@@ -329,6 +330,9 @@ enum class common_cache_plan_destruction_effect : uint8_t {
     cross_target_displacement,
     destructive_similarity_retarget,
     same_target_cold_replacement,
+    // Physical host-artifact retirement. A B restore uses the consumption
+    // spelling; D-A2's maintenance receipt distinguishes certified redundant
+    // eviction with displaced_fate=exact_duplicate and a resolved citation.
     different_host_source_consumption,
     _count,
 };
@@ -429,10 +433,13 @@ common_cache_plan_destruction_physical_reason_for_effect(
 
 struct common_cache_plan_destruction_manifest_digest_tag;
 struct common_cache_plan_destruction_effect_digest_tag;
+struct common_cache_plan_destruction_recovery_digest_tag;
 using common_cache_plan_destruction_manifest_digest =
     llama_cache_acct_digest<common_cache_plan_destruction_manifest_digest_tag>;
 using common_cache_plan_destruction_effect_digest =
     llama_cache_acct_digest<common_cache_plan_destruction_effect_digest_tag>;
+using common_cache_plan_destruction_recovery_digest =
+    llama_cache_acct_digest<common_cache_plan_destruction_recovery_digest_tag>;
 
 struct common_cache_plan_destruction_receipt {
     uint32_t policy_version = COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION;
@@ -463,6 +470,14 @@ struct common_cache_plan_destruction_receipt {
     common_cache_plan_destruction_effect_digest union_effect_digest;
     std::vector<llama_cache_acct_artifact_id> selected_attention;
     std::vector<llama_cache_acct_artifact_id> selected_recurrent;
+    // Schema-v6 recovery-source detail. A resolved citation is legal without
+    // these fields: B-path recovery can resolve a logical/durable source that
+    // has no D-A artifact pin. When D-A resolves a concrete protected source,
+    // the artifact plus a tagged digest over its canonical op set identifies
+    // that survivor without leaking process-local C handles onto the wire.
+    // Prospective and unavailable citations also leave both fields unavailable.
+    llama_cache_acct_artifact_id recovery_source_artifact_id;
+    common_cache_plan_destruction_recovery_digest recovery_source_manifest_digest;
 };
 
 // Process-local quote pre-image. Domain bytes are projected into the existing
@@ -495,7 +510,8 @@ struct common_cache_plan_destruction_counters {
     bool has_receipt = false;
 
     void observe(common_cache_plan_selection tier,
-                 const common_cache_plan_destruction_receipt & receipt) noexcept;
+                 const common_cache_plan_destruction_receipt & receipt,
+                 bool observe_classification = true) noexcept;
 };
 
 // Which authoritative shipped scan observed a candidate (bitmask on the row). A physical

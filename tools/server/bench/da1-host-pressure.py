@@ -62,11 +62,15 @@ def run_arm(args, lifecycle, port, log_path):
 					"prompt": f"Churn {cycle}-{c}. " + filler,
 					"n_predict": 8, "temperature": 0, "seed": 7,
 					"cache_prompt": True})
+			# history must grow STRICTLY (marker included) so each re-save is
+			# a token-prefix extension of the previous entry -- that is what
+			# lets host_dedup prune the predecessor (the D-A2 seam)
+			marker = f" Resume cycle {cycle}."
 			r = request(base, "/completion", {
-				"prompt": main + echo + f" Resume cycle {cycle}.",
+				"prompt": main + echo + marker,
 				"n_predict": 12, "temperature": 0, "seed": 7,
 				"cache_prompt": True})
-			echo += r.get("content") or ""
+			echo += marker + (r.get("content") or "")
 			transcript.append({
 				"content": r.get("content"),
 				"prompt_ms": (r.get("timings") or {}).get("prompt_ms"),
@@ -78,22 +82,24 @@ def run_arm(args, lifecycle, port, log_path):
 		except subprocess.TimeoutExpired:
 			proc.kill()
 
-	inventory_peak = 0
+	# host_entries from the lifecycle evidence is the honest growth metric
+	# (the earlier inventory_states proxy always read zero -- vacuous)
+	entries_peak = 0
 	retained_restores = 0
 	with open(log_path, errors="replace") as handle:
 		for line in handle:
-			match = re.search(r"CACHE_PLAN (\{.*)", line)
+			match = re.search(r"CACHE_HOST_LIFECYCLE (\{.*)", line)
 			if match:
 				try:
-					rec = json.loads(match.group(1))
+					evt = json.loads(match.group(1))
 				except ValueError:
 					continue
-				states = rec.get("inventory_states")
-				if isinstance(states, list):
-					inventory_peak = max(inventory_peak, len(states))
-			if "CACHE_HOST_LIFECYCLE" in line and '"non_consuming"' in line:
-				retained_restores += 1
-	return transcript, inventory_peak, retained_restores
+				if evt.get("mode") == "non_consuming":
+					retained_restores += 1
+				entries = evt.get("host_entries")
+				if isinstance(entries, int):
+					entries_peak = max(entries_peak, entries)
+	return transcript, entries_peak, retained_restores
 
 
 def main():
@@ -113,6 +119,10 @@ def main():
 		help="on-arm host inventory peak may exceed the off arm by at "
 		"most this many entries (retained-entry reuse, not duplication)")
 	parser.add_argument("--timing-max-regress", type=float, default=0.25)
+	parser.add_argument("--expect-da2-evidence", action="store_true",
+		help="the on arm must show D-A2 destruction receipts on grown-save "
+		"prunes: typed refusals (fail-closed conservatism) or certified "
+		"evictions, and zero internal_fault")
 	args = parser.parse_args()
 
 	off_t, off_peak, _ = run_arm(args, False, args.base_port,
@@ -120,17 +130,38 @@ def main():
 	on_t, on_peak, retained = run_arm(args, True, args.base_port + 1,
 		f"{args.workdir}/server-on.log")
 
+	da2_receipts, da2_faults = {}, 0
+	if args.expect_da2_evidence:
+		with open(f"{args.workdir}/server-on.log", errors="replace") as handle:
+			for line in handle:
+				match = re.search(r"CACHE_HOST_DESTRUCTION (\{.*)", line)
+				if not match:
+					continue
+				try:
+					destruction = json.loads(match.group(1))
+				except ValueError:
+					continue
+				state = destruction.get("state")
+				if state in ("refused", "certified", "executed", "quoted"):
+					key = f'{state}:{destruction.get("reason")}'
+					da2_receipts[key] = da2_receipts.get(key, 0) + 1
+				if destruction.get("reason") == "internal_fault":
+					da2_faults += 1
+
 	failures = []
 	for i, (off, on) in enumerate(zip(off_t, on_t)):
 		if off["content"] != on["content"]:
 			failures.append(f"cycle {i}: content diverged")
 	if retained == 0:
 		failures.append("on arm recorded no retained (non-consuming) restores")
-	if on_peak > off_peak + args.inventory_slack:
+	# off arm emits no lifecycle evidence; the growth bound is absolute:
+	# churn saves (2/cycle, distinct content) + main + one transient
+	# successor -- dedup pruning must keep the main line at ~1 live entry
+	entries_bound = args.cycles * 2 + 2 + args.inventory_slack
+	if on_peak > entries_bound:
 		failures.append(
-			f"host inventory grew: on-arm peak {on_peak} vs off-arm "
-			f"{off_peak} (+slack {args.inventory_slack}) -- non-consuming "
-			"restores must reuse the retained entry, not duplicate it")
+			f"host entries peaked at {on_peak} > bound {entries_bound} -- "
+			"grown-save pruning is not holding the main line to one entry")
 	off_ms = [t["prompt_ms"] for t in off_t if t["prompt_ms"]]
 	on_ms = [t["prompt_ms"] for t in on_t if t["prompt_ms"]]
 	timing = {}
@@ -144,11 +175,20 @@ def main():
 				f"resume timing regressed: {mean_on:.1f}ms vs "
 				f"{mean_off:.1f}ms (limit +{args.timing_max_regress:.0%})")
 
+	if args.expect_da2_evidence:
+		if not da2_receipts:
+			failures.append(
+				"no D-A2 destruction receipts on the on arm -- the "
+				"certification seam never engaged on grown-save prunes")
+		if da2_faults:
+			failures.append(f"{da2_faults} internal_fault destruction receipt(s)")
+
 	report = {
 		"cycles": len(on_t),
 		"off_inventory_peak": off_peak,
 		"on_inventory_peak": on_peak,
 		"retained_restores": retained,
+		"da2_receipts": da2_receipts,
 		"timing": timing,
 		"failures": failures,
 	}

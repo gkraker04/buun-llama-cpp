@@ -739,6 +739,11 @@ struct server_prompt_cache_state {
     llama_cache_acct_op_id acct_op_ckpt;
     llama_cache_acct_op_id acct_op_accel;
 
+    // D-A2's non-policy recovery guard. List nodes are stable; authoritative
+    // redundant eviction increments this before prepare and the raw eraser
+    // refuses to destroy the cited survivor until capability close.
+    uint32_t recovery_pins = 0;
+
     std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
         return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };
     }
@@ -850,6 +855,12 @@ struct server_prompt_cache {
             iterator it,
             server_cache_destruction_reason reason);
 
+    // Exact D-A2 proof over snapshot, checkpoint-ring, and typed accelerator
+    // payloads. Token coverage is necessary but never sufficient.
+    static bool exactly_redundant(
+            const server_prompt_cache_state & victim,
+            const server_prompt_cache_state & survivor) noexcept;
+
     // C0 ledger (nullptr = off). Debug-only retains shadow semantics; lifecycle publication
     // and explicit host erasure use its reservation/prepared-release authority. Every path
     // that removes an entry from `states` releases its ops, including whole-cache replacement,
@@ -866,6 +877,7 @@ struct server_prompt_cache {
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
     uint64_t debug_lifecycle_emissions = 0;
+    uint64_t debug_destruction_emissions = 0;
 
     ~server_prompt_cache() {
         clear_accounting();
@@ -883,6 +895,12 @@ struct server_prompt_cache {
     static bool payload_leaves(
             server_prompt_cache_state & st,
             std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
+
+private:
+    iterator destroy_entry_impl(
+            iterator it,
+            server_cache_destruction_reason reason,
+            iterator recovery);
 };
 
 // used exclusively by router mode

@@ -50,7 +50,19 @@ struct server_cache_authority {
             llama_cache_budget_config & config,
             uint64_t pending_host_bytes = 0) noexcept;
 
+    // Lower one exact accounting union into the capacity domains that its
+    // release would affect. D-A2+ share this one projection door.
+    bool project_release(
+            const llama_cache_acct_release_set_preview & release,
+            std::vector<common_cache_plan_yield_domain> & out) noexcept;
+
     // F0b's first authoritative producer: admit/stage/commit all host-entry payload leaves as one
     // all-or-nothing server transaction. Publication itself remains the caller's no-throw splice.
     bool admit_host_entry(server_prompt_cache_state & entry) noexcept;
+
+    // Bounded process-local D-A receipt publication for destruction work that
+    // occurs during host-cache maintenance rather than one B request record.
+    void observe_host_destruction(
+        common_cache_plan_destruction_receipt receipt,
+        bool observe_classification = true) noexcept;
 };

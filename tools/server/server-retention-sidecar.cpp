@@ -327,6 +327,31 @@ llama_cache_acct_artifact_id server_retention_sidecar_store::artifact_id(
     return it == associations.end() ? llama_cache_acct_artifact_id{} : it->second;
 }
 
+bool server_retention_sidecar_store::candidate_for_instance(
+        const server_retention_instance_key & key,
+        server_retention_candidate & out) const noexcept {
+    out = {};
+    try {
+        const auto association = associations.find(key);
+        if (association == associations.end()) {
+            return false;
+        }
+        const auto item = catalog.find(association->second.v);
+        if (item == catalog.end()) {
+            return false;
+        }
+        out.artifact_id = association->second;
+        out.instance_key = key;
+        out.record = item->second.record;
+        out.provenance_op = item->second.accounting_op;
+        out.avail = server_retention_candidate_availability::available;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
 std::vector<server_retention_candidate>
 server_retention_sidecar_store::candidate_snapshot() const noexcept {
     try {

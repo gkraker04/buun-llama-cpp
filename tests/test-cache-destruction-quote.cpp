@@ -625,6 +625,10 @@ static void release_pin(void * context) noexcept {
 }
 
 static void test_prepared_release_capability() {
+    CHECK(server_cache_destruction_recovery_source_digest(
+              { 7 }, { { 3 }, { 1 }, { 2 } }) ==
+          server_cache_destruction_recovery_source_digest(
+              { 7 }, { { 2 }, { 3 }, { 1 } }));
     llama_cache_acct_ledger ledger;
     const auto op = committed_release_op(ledger, 64);
     const auto quoted_snapshot = ledger.snapshot();
@@ -654,6 +658,19 @@ static void test_prepared_release_capability() {
     CHECK(project()(released, quote.projected_domains));
 
     uint64_t releases = 0;
+    auto missing_host_pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, {});
+    auto missing_host = server_cache_prepare_release_set(
+        quote, {}, ledger, quoted_snapshot.serial, project(),
+        std::move(missing_host_pin));
+    CHECK(missing_host.status ==
+          server_cache_prepare_release_status::invalid_quote);
+    CHECK(missing_host.reason ==
+          common_cache_plan_destruction_reason::manifest_incomplete);
+    missing_host_pin = {};
+    CHECK(releases == 1);
+    releases = 0;
+
     auto pin = server_cache_recovery_pin::acquire(
         &releases, release_pin, { { 99 } }, {});
     CHECK(pin.valid());
@@ -717,6 +734,10 @@ static void test_prepared_release_capability() {
     CHECK(project()(released, quote.projected_domains));
     auto overlapping = server_cache_recovery_pin::acquire(
         &releases, release_pin, { { 1 } }, {});
+    // D-A2 duplicate-pair guard: selecting both the victim and its cited
+    // survivor in one ladder union must fail the fourth conjunct before any
+    // physical mutation. D-S6 is otherwise allowed to select both members.
+    CHECK(!overlapping.disjoint({ { 1 }, { 2 } }, { op2 }));
     auto refused = server_cache_prepare_release_set(
         quote, { current }, second, serial2, project(), std::move(overlapping));
     CHECK(refused.status ==
