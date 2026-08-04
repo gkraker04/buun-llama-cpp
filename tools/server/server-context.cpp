@@ -1507,49 +1507,202 @@ private:
             }
         }
 
-        // When mmproj GPU swap is active, run fitter before n_parallel doubling.
-        // The doubled n_parallel inflates recurrent state estimates, causing the
-        // fitter to think even minimum context doesn't fit.
+        // When mmproj GPU swap is active, run the fitter before n_parallel doubling.  The MTP
+        // context and GPU mmproj are never resident together: the image path destroys MTP before
+        // loading mmproj, then unloads mmproj before recreating MTP.  Reserve the ordinary margin
+        // plus the larger of those two phase-local consumers, not their sum.  Native MTP is sized
+        // from the fitted context, so solve the resulting dependency to a fixed point.
+        //
+        // The doubled n_parallel used for speculative rollback would also make the dry target
+        // context carry decode-only recurrent backup cells during this prefill-oriented solve.
         const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         if (params_base.mmproj_gpu_swap && has_mtp && has_mmproj
                 && params_base.fit_params && params_base.n_ctx == 0) {
+            std::vector<size_t> margins_base = params_base.fit_params_target;
+            GGML_ASSERT(!margins_base.empty());
+
+            std::vector<ggml_backend_dev_t> tgt_devices = params_base.devices;
+            if (tgt_devices.empty()) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    tgt_devices.push_back(ggml_backend_dev_get(i));
+                }
+            }
+
+            // This special solve is the final context advert: unlike the ordinary VBR growth
+            // ceiling, it must be fillable from the memory that is actually available at
+            // startup.  Charge memory already unavailable on each target GPU (CUDA/driver
+            // residency, plus any non-cooperating process) instead of letting the total-based
+            // dry fit spend it a second time.
+            std::vector<size_t> startup_unavailable(margins_base.size(), 0);
+            for (size_t i = 0; i < tgt_devices.size() && i < margins_base.size(); ++i) {
+                if (ggml_backend_dev_type(tgt_devices[i]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                size_t free = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(tgt_devices[i], &free, &total);
+                startup_unavailable[i] = total > free ? total - free : 0;
+                margins_base[i] += startup_unavailable[i];
+            }
+
+            std::vector<size_t> mmproj_by_device(margins_base.size(), 0);
             auto mparams_gpu = make_mmproj_params(true);
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu);
-            size_t mmproj_gpu_estimate = 0;
             for (auto & [dev, size] : mmproj_mem) {
-                mmproj_gpu_estimate += size;
+                for (size_t i = 0; i < tgt_devices.size() && i < mmproj_by_device.size(); ++i) {
+                    if (tgt_devices[i] == dev) {
+                        mmproj_by_device[i] += size;
+                        break;
+                    }
+                }
             }
-            if (mmproj_gpu_estimate == 0) {
+
+            if (std::all_of(mmproj_by_device.begin(), mmproj_by_device.end(),
+                            [](size_t bytes) { return bytes == 0; })) {
                 std::error_code ec;
                 const auto fsize = std::filesystem::file_size(mmproj_path, ec);
                 if (!ec && fsize > 0) {
-                    mmproj_gpu_estimate = fsize + 256ull * 1024 * 1024;
+                    // The GPU backend chosen by mtmd is the first available GPU.  If its dry
+                    // measurement failed, conservatively charge the fallback to the first target
+                    // device rather than multiplying one projector across every split device.
+                    mmproj_by_device[0] = fsize + 256ull * 1024 * 1024;
                 }
             }
-            for (auto & margin : params_base.fit_params_target) {
-                if (margin < mmproj_gpu_estimate) {
-                    margin = mmproj_gpu_estimate;
+
+            auto fit_swap_step = [&](const std::vector<size_t> & margins,
+                                     std::vector<size_t>       & margins_needed,
+                                     uint32_t                  & n_ctx_fit,
+                                     size_t                    & total_mtp) {
+                std::vector<size_t> margins_work = margins;
+                auto mparams_fit = common_model_params_to_llama(params_base);
+                auto cparams_fit = common_context_params_to_llama(params_base);
+
+                const auto fit_status = common_fit_params(
+                        params_base.model.path.c_str(), &mparams_fit, &cparams_fit,
+                        params_base.tensor_split,
+                        params_base.tensor_buft_overrides.data(),
+                        margins_work.data(),
+                        params_base.fit_params_min_ctx,
+                        params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_fit.n_ctx == 0) {
+                    return false;
+                }
+
+                common_params params_mtp = params_base;
+                params_mtp.n_parallel = n_parallel_user;
+                params_mtp.n_ctx = cparams_fit.n_ctx;
+                params_mtp.cache_type_k = params_base.speculative.draft.cache_type_k;
+                params_mtp.cache_type_v = params_base.speculative.draft.cache_type_v;
+
+                auto cparams_mtp = common_context_params_to_llama(params_mtp);
+                cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams_mtp.n_rs_seq = 0;
+                cparams_mtp.n_outputs_max = n_parallel_user;
+
+                std::vector<ggml_backend_dev_t> devs_mtp;
+                uint32_t hp_ngl_mtp = 0;
+                uint32_t hp_nct_mtp = 0;
+                uint32_t hp_nex_mtp = 0;
+                const auto dmd_mtp = common_get_device_memory_data(
+                        params_mtp.model.path.c_str(), &mparams_fit, &cparams_mtp,
+                        devs_mtp, hp_ngl_mtp, hp_nct_mtp, hp_nex_mtp, GGML_LOG_LEVEL_ERROR);
+
+                std::vector<size_t> mtp_by_device(margins_base.size(), 0);
+                total_mtp = 0;
+                for (size_t j = 0; j < devs_mtp.size(); ++j) {
+                    const size_t bytes = dmd_mtp[j].context + dmd_mtp[j].compute;
+                    total_mtp += bytes;
+                    for (size_t i = 0; i < tgt_devices.size() && i < mtp_by_device.size(); ++i) {
+                        if (tgt_devices[i] == devs_mtp[j]) {
+                            mtp_by_device[i] += bytes;
+                            break;
+                        }
+                    }
+                }
+
+                margins_needed = margins_base;
+                for (size_t i = 0; i < margins_needed.size(); ++i) {
+                    margins_needed[i] += std::max(mtp_by_device[i], mmproj_by_device[i]);
+                }
+                n_ctx_fit = cparams_fit.n_ctx;
+                return true;
+            };
+
+            std::vector<size_t> margins_trial = margins_base;
+            uint32_t n_ctx_prev = 0;
+            uint32_t n_ctx_selected = 0;
+            bool converged = false;
+
+            constexpr int SWAP_FIT_MAX_ITERS = 8;
+            for (int iter = 0; iter < SWAP_FIT_MAX_ITERS; ++iter) {
+                std::vector<size_t> margins_next;
+                uint32_t n_ctx_fit = 0;
+                size_t total_mtp = 0;
+                if (!fit_swap_step(margins_trial, margins_next, n_ctx_fit, total_mtp)) {
+                    SRV_WRN("mmproj GPU swap fit stopped at iteration %d: target fit failed\n", iter + 1);
+                    break;
+                }
+
+                SRV_DBG("mmproj GPU swap fit %d: n_ctx=%u, MTP context+compute=%.2f MiB, "
+                        "device 0 margin=%.2f MiB\n",
+                        iter + 1, n_ctx_fit, total_mtp / (1024.0 * 1024.0),
+                        margins_next[0] / (1024.0 * 1024.0));
+
+                n_ctx_selected = n_ctx_fit;
+                if (margins_next == margins_trial) {
+                    converged = true;
+                    break;
+                }
+                if (n_ctx_fit == n_ctx_prev) {
+                    for (size_t i = 0; i < margins_trial.size(); ++i) {
+                        margins_trial[i] = std::max(margins_trial[i], margins_next[i]);
+                    }
+                    converged = true;
+                    break;
+                }
+
+                n_ctx_prev = n_ctx_fit;
+                margins_trial = std::move(margins_next);
+            }
+
+            bool validated = false;
+            constexpr int SWAP_FIT_VALIDATE_ITERS = 4;
+            for (int iter = 0; iter < SWAP_FIT_VALIDATE_ITERS; ++iter) {
+                std::vector<size_t> margins_needed;
+                uint32_t n_ctx_fit = 0;
+                size_t total_mtp = 0;
+                if (!fit_swap_step(margins_trial, margins_needed, n_ctx_fit, total_mtp)) {
+                    break;
+                }
+                validated = true;
+                for (size_t i = 0; i < margins_trial.size(); ++i) {
+                    if (margins_trial[i] < margins_needed[i]) {
+                        margins_trial[i] = margins_needed[i];
+                        validated = false;
+                    }
+                }
+                n_ctx_selected = n_ctx_fit;
+                SRV_DBG("mmproj GPU swap validation %d: n_ctx=%u, MTP context+compute=%.2f MiB%s\n",
+                        iter + 1, n_ctx_fit, total_mtp / (1024.0 * 1024.0),
+                        validated ? " (covered)" : " (margin raised)");
+                if (validated) {
+                    break;
                 }
             }
 
-            auto mparams_fit = common_model_params_to_llama(params_base);
-            auto cparams_fit = common_context_params_to_llama(params_base);
-
-            SRV_INF("mmproj GPU swap: running auto-fit with n_parallel=%d, margin=%zu MiB\n",
-                    params_base.n_parallel, params_base.fit_params_target[0] / (1024 * 1024));
-
-            common_fit_params(params_base.model.path.c_str(), &mparams_fit, &cparams_fit,
-                params_base.tensor_split,
-                params_base.tensor_buft_overrides.data(),
-                params_base.fit_params_target.data(),
-                params_base.fit_params_min_ctx,
-                params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-
-            if (cparams_fit.n_ctx > 0) {
-                params_base.n_ctx = cparams_fit.n_ctx;
-                SRV_INF("mmproj GPU swap: auto-fit chose n_ctx = %u\n", cparams_fit.n_ctx);
+            if (!validated || n_ctx_selected == 0) {
+                SRV_ERR("%s", "mmproj GPU swap: could not find a safe target/auxiliary fit\n");
+                return false;
             }
+
+            params_base.fit_params_target = std::move(margins_trial);
+            params_base.n_ctx = n_ctx_selected;
             params_base.fit_params = false;
+            SRV_INF("mmproj GPU swap fit %s and validated: n_ctx=%u, device 0 margin=%.2f MiB\n",
+                    converged ? "converged" : "bounded", params_base.n_ctx,
+                    params_base.fit_params_target[0] / (1024.0 * 1024.0));
+            SRV_INF("mmproj GPU swap fit: device 0 startup-unavailable charge=%.2f MiB\n",
+                    startup_unavailable[0] / (1024.0 * 1024.0));
         }
 
         // Always enable kv_unified for single-slot servers — simplifies CUDA graph topology,
