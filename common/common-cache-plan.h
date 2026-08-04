@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — P2 B0/B/D-S/B-A decision record, schema version 5.
+// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A decision record, schema version 6.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -34,14 +34,16 @@
 // artifacts and exact union-level projected domain values, plus an explicitly
 // not_observed actual-yield slot reserved for later D-A authority. v5 adds the
 // B-A authority receipt and target-qualified candidate identity without changing
-// the established meaning of `shadow_choice` (the planner counterfactual).
+// the established meaning of `shadow_choice` (the planner counterfactual). v6 adds
+// D-A's shadow destruction quote/receipt; accounting remains schema 2.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 5;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 6;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
-    return (record_schema == 3 || record_schema == 4 || record_schema == 5) ? 2 :
+    return (record_schema == 3 || record_schema == 4 || record_schema == 5 ||
+            record_schema == 6) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -245,6 +247,7 @@ enum class common_cache_plan_authority_fallback : uint8_t {
     stale_capability,
     destruction_authority_required,
     budget_or_lease_unavailable,
+    destruction_not_certified,
     internal_fault,
     _count,
 };
@@ -284,6 +287,215 @@ struct common_cache_plan_authority_counters {
     // observed/agreement remain indexed by the legacy tier.
     void observe(const common_cache_plan_authority_receipt & receipt,
                  bool qualified = false) noexcept;
+};
+
+// D-A schema-v6 destruction evidence. These are wire-layer mirrors of the
+// server-only lifecycle vocabulary; common/ must not depend on tools/server.
+// D-A0a quotes only: it never certifies or executes a mutation.
+constexpr uint32_t COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION = 1;
+
+struct common_cache_plan_yield_domain;
+
+enum class common_cache_plan_destruction_state : uint8_t {
+    not_required = 0,
+    quoted,
+    certified,
+    executed,
+    refused,
+    failed,
+    _count,
+};
+
+enum class common_cache_plan_destruction_reason : uint8_t {
+    none = 0,
+    lifecycle_disabled,
+    manifest_incomplete,
+    identity_unavailable,
+    mandatory_anchor,
+    lease_unavailable,
+    hard_lease_blocked,
+    accounting_unavailable,
+    effect_drift,
+    release_evidence_unavailable,
+    recovery_unavailable,
+    capacity_refused,
+    mutation_failed,
+    internal_fault,
+    _count,
+};
+
+enum class common_cache_plan_destruction_effect : uint8_t {
+    none = 0,
+    cross_target_displacement,
+    destructive_similarity_retarget,
+    same_target_cold_replacement,
+    different_host_source_consumption,
+    _count,
+};
+
+enum class common_cache_plan_destruction_class : uint8_t {
+    slot_drop = 0,
+    live_range_drop,
+    host_artifact_drop,
+    checkpoint_drop,
+    token_ledger_truncate,
+    mandatory_recovery_reset,
+    _count,
+};
+
+enum class common_cache_plan_destruction_physical_reason : uint8_t {
+    slot_rebind = 0,
+    idle_reclaim,
+    prompt_trim,
+    cache_capacity,
+    cache_update,
+    prompt_clear,
+    checkpoint_replace,
+    mandatory_recovery,
+    _count,
+};
+
+enum class common_cache_plan_destruction_lease_verdict : uint8_t {
+    unavailable = 0,
+    unleased,
+    soft_leased,
+    hard_leased,
+    mandatory_recovery,
+    _count,
+};
+
+enum class common_cache_plan_displaced_fate : uint8_t {
+    unavailable = 0,
+    retained_live,
+    retained_host,
+    retained_sealed_artifact,
+    exact_duplicate,
+    exact_replay_recipe,
+    destroyed_by_policy,
+    _count,
+};
+
+enum class common_cache_plan_recovery_citation : uint8_t {
+    unavailable = 0,
+    resolved,
+    prospective,
+    _count,
+};
+
+enum class common_cache_plan_destruction_comparison : uint8_t {
+    not_compared = 0,
+    matched,
+    differed,
+    ds6_insufficient_yield,
+    ds6_unsupported_required,
+    ds6_unavailable,
+    _count,
+};
+
+using common_cache_plan_destruction_effect_set = uint32_t;
+
+constexpr common_cache_plan_destruction_effect_set
+common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect effect) noexcept {
+    return effect > common_cache_plan_destruction_effect::none &&
+           effect < common_cache_plan_destruction_effect::_count
+        ? common_cache_plan_destruction_effect_set(1U) << uint8_t(effect)
+        : 0;
+}
+
+constexpr bool common_cache_plan_destruction_effect_has(
+        common_cache_plan_destruction_effect_set effects,
+        common_cache_plan_destruction_effect effect) noexcept {
+    return (effects & common_cache_plan_destruction_effect_bit(effect)) != 0;
+}
+
+constexpr common_cache_plan_destruction_class
+common_cache_plan_destruction_class_for_effect(
+        common_cache_plan_destruction_effect effect) noexcept {
+    return effect == common_cache_plan_destruction_effect::
+                         different_host_source_consumption
+        ? common_cache_plan_destruction_class::host_artifact_drop
+        : common_cache_plan_destruction_class::slot_drop;
+}
+
+constexpr common_cache_plan_destruction_physical_reason
+common_cache_plan_destruction_physical_reason_for_effect(
+        common_cache_plan_destruction_effect effect) noexcept {
+    return effect == common_cache_plan_destruction_effect::
+                         different_host_source_consumption
+        ? common_cache_plan_destruction_physical_reason::cache_update
+        : common_cache_plan_destruction_physical_reason::slot_rebind;
+}
+
+struct common_cache_plan_destruction_manifest_digest_tag;
+struct common_cache_plan_destruction_effect_digest_tag;
+using common_cache_plan_destruction_manifest_digest =
+    llama_cache_acct_digest<common_cache_plan_destruction_manifest_digest_tag>;
+using common_cache_plan_destruction_effect_digest =
+    llama_cache_acct_digest<common_cache_plan_destruction_effect_digest_tag>;
+
+struct common_cache_plan_destruction_receipt {
+    uint32_t policy_version = COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION;
+    common_cache_plan_destruction_state state =
+        common_cache_plan_destruction_state::not_required;
+    common_cache_plan_destruction_reason reason =
+        common_cache_plan_destruction_reason::none;
+    // A candidate may displace a live target and consume a distinct host
+    // artifact in the same execution. Every bit needs its own certificate;
+    // manifest/effect digests bind the merged physical union exactly once.
+    common_cache_plan_destruction_effect_set effects = 0;
+    common_cache_plan_destruction_lease_verdict lease_verdict =
+        common_cache_plan_destruction_lease_verdict::unavailable;
+    common_cache_plan_displaced_fate displaced_fate =
+        common_cache_plan_displaced_fate::unavailable;
+    common_cache_plan_recovery_citation recovery_citation =
+        common_cache_plan_recovery_citation::unavailable;
+    common_cache_plan_destruction_comparison post_finalize_comparison =
+        common_cache_plan_destruction_comparison::not_compared;
+    int32_t plan_candidate = -1;
+    uint64_t admission_sequence = 0;
+    uint64_t quote_duration_us = 0;
+    // Evidence serial sampled with the quote. The projected yield record stays
+    // joined to the final record's accounting serial instead of borrowing this.
+    uint64_t quote_accounting_serial = 0;
+    uint64_t actual_accounting_serial = 0;
+    common_cache_plan_destruction_manifest_digest manifest_digest;
+    common_cache_plan_destruction_effect_digest union_effect_digest;
+    std::vector<llama_cache_acct_artifact_id> selected_attention;
+    std::vector<llama_cache_acct_artifact_id> selected_recurrent;
+};
+
+// Process-local quote pre-image. Domain bytes are projected into the existing
+// schema-v4 yield table only for the selected destructive plan, so schema 6
+// does not grow a second predicted/actual byte vocabulary.
+struct common_cache_plan_destruction_quote {
+    common_cache_plan_destruction_receipt receipt;
+    std::vector<common_cache_plan_yield_domain> projected_domains;
+};
+
+struct common_cache_plan_destruction_counters {
+    static constexpr size_t n_tiers = size_t(common_cache_plan_selection::_count);
+    static constexpr size_t n_classes = size_t(common_cache_plan_destruction_class::_count);
+    static constexpr size_t n_reasons = size_t(common_cache_plan_destruction_reason::_count);
+    static constexpr size_t n_verdicts = size_t(common_cache_plan_destruction_lease_verdict::_count);
+    static constexpr size_t n_fates = size_t(common_cache_plan_displaced_fate::_count);
+    std::array<std::array<uint64_t, n_classes>, n_tiers> quoted{};
+    std::array<std::array<uint64_t, n_classes>, n_tiers> certified{};
+    std::array<std::array<uint64_t, n_classes>, n_tiers> executed{};
+    std::array<std::array<uint64_t, n_reasons>, n_tiers> refused{};
+    std::array<std::array<uint64_t, n_verdicts>, n_tiers> lease_verdict{};
+    std::array<std::array<uint64_t, n_classes>, n_tiers> actual_yield_unavailable{};
+    std::array<std::array<uint64_t, n_fates>, n_tiers> recovery_outcome{};
+    uint64_t quote_memo_hits = 0;
+    uint64_t quote_memo_misses = 0;
+    uint64_t quote_samples = 0;
+    uint64_t quote_duration_us_total = 0;
+    uint64_t quote_duration_us_max = 0;
+    common_cache_plan_destruction_receipt last_receipt;
+    bool has_receipt = false;
+
+    void observe(common_cache_plan_selection tier,
+                 const common_cache_plan_destruction_receipt & receipt) noexcept;
 };
 
 // Which authoritative shipped scan observed a candidate (bitmask on the row). A physical
@@ -612,6 +824,16 @@ struct common_cache_plan_record {
     // rather than silently extending the frozen vocabulary in B-A1.
     common_cache_plan_authority_receipt authority;
 
+    // Schema-v6 D-A receipt. `destruction_quotes` is process-local staging:
+    // every destructive B candidate is quoted before minimization, then the
+    // winning candidate's quote is projected into `destruction` for the wire.
+    common_cache_plan_destruction_receipt destruction;
+    std::vector<common_cache_plan_destruction_quote> destruction_quotes;
+    // Process-local selection join. Quotes exist only for destructive rows;
+    // this preserves the exact legacy reference needed to distinguish a
+    // non-destructive selected row from a missing destructive quote.
+    int32_t destruction_legacy_plan_candidate = -1;
+
     // Process-local B-A staging state; deliberately not serialized. A
     // precomputed planner result survives legacy mutation/finalization, while
     // the receipt remains the schema-v5 wire surface.
@@ -806,6 +1028,18 @@ common_cache_plan_authority_level common_cache_plan_authority_level_parse(
     const std::string & value);
 const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state);
 const char * common_cache_plan_authority_fallback_name(common_cache_plan_authority_fallback reason);
+const char * common_cache_plan_destruction_state_name(common_cache_plan_destruction_state state);
+const char * common_cache_plan_destruction_reason_name(common_cache_plan_destruction_reason reason);
+const char * common_cache_plan_destruction_effect_name(common_cache_plan_destruction_effect effect);
+const char * common_cache_plan_destruction_class_name(common_cache_plan_destruction_class action);
+const char * common_cache_plan_destruction_physical_reason_name(
+    common_cache_plan_destruction_physical_reason reason);
+const char * common_cache_plan_destruction_lease_verdict_name(
+    common_cache_plan_destruction_lease_verdict verdict);
+const char * common_cache_plan_displaced_fate_name(common_cache_plan_displaced_fate fate);
+const char * common_cache_plan_recovery_citation_name(common_cache_plan_recovery_citation citation);
+const char * common_cache_plan_destruction_comparison_name(
+    common_cache_plan_destruction_comparison comparison);
 // Populate the B-A0a shadow/off receipt after the planner attempt. This is observation
 // only: it does not alter selection, delivery, shadow choice, or any shipped state.
 void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept;

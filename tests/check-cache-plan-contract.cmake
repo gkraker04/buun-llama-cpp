@@ -21,6 +21,74 @@ foreach(path IN LISTS contract_files)
     string(APPEND all_source "${text}")
 endforeach()
 
+# D-A0a schema-v6 evidence moves atomically with the frozen-reader boundary.
+foreach(destruction_pin
+        "common_cache_plan_destruction_receipt destruction;"
+        "common_cache_plan_destruction_reason::effect_drift"
+        "uint64_t quote_duration_us = 0;"
+        "common_cache_plan_destruction_effect_set effects = 0;"
+        "common_cache_plan_destruction_effect_digest union_effect_digest;"
+        "common_cache_plan_destruction_comparison post_finalize_comparison"
+        "uint64_t quote_accounting_serial = 0;"
+        "ds6_insufficient_yield"
+        "ds6_unsupported_required"
+        "ds6_unavailable")
+    string(FIND "${all_source}" "${destruction_pin}" destruction_pin_pos)
+    if (destruction_pin_pos EQUAL -1)
+        message(FATAL_ERROR "schema-v6 destruction evidence drifted: '${destruction_pin}'")
+    endif()
+endforeach()
+file(READ "${SOURCE_ROOT}/tools/server/server-cache-destruction-quote.cpp" destruction_quote_source)
+foreach(quote_pin
+        "server_cache_destruction_quote_all("
+        "cache-destruction-manifest-v1"
+        "cache-destruction-union-effect-v1"
+        "quote_memo_hits++")
+    string(FIND "${destruction_quote_source}" "${quote_pin}" quote_pin_pos)
+    if (quote_pin_pos EQUAL -1)
+        message(FATAL_ERROR "D-A0a quote contract drifted: '${quote_pin}'")
+    endif()
+endforeach()
+file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" server_context_source)
+string(FIND "${server_context_source}"
+    "cache_plan_quote_destruction(" quote_call REVERSE)
+string(FIND "${server_context_source}" "cache_plan_authority->plan_before_mutation(" planner_call)
+if (quote_call EQUAL -1 OR planner_call EQUAL -1 OR NOT quote_call LESS planner_call)
+    message(FATAL_ERROR
+        "D-A quote must run before B minimizes at the pre-mutation boundary")
+endif()
+string(FIND "${server_context_source}"
+    "server_cache_destruction_has_effect(" effect_scan)
+string(FIND "${server_context_source}"
+    "if (!cache_authority->configured)" lifecycle_check)
+string(FIND "${server_context_source}"
+    "const auto snapshot = cache_authority->ledger.snapshot();" quote_snapshot)
+if (lifecycle_check EQUAL -1 OR effect_scan EQUAL -1 OR
+    quote_snapshot EQUAL -1 OR NOT lifecycle_check LESS effect_scan OR
+    NOT effect_scan LESS quote_snapshot)
+    message(FATAL_ERROR
+        "D-A0a lifecycle/effect early-out order drifted before snapshot/assembly")
+endif()
+string(FIND "${server_context_source}"
+    "llama_cache_budget_coordinator quote_budget;" local_quote_budget)
+if (local_quote_budget EQUAL -1)
+    message(FATAL_ERROR
+        "D-A0a quote must not perturb the shared D-S6 budget coordinator")
+endif()
+foreach(debug_guard
+        "if (cache_plan_obs) {\n                        const int64_t destruction_quote_started"
+        "if (cache_plan_obs) {\n                        server_cache_destruction_select_quote")
+    string(FIND "${server_context_source}" "${debug_guard}" debug_guard_pos)
+    if (debug_guard_pos EQUAL -1)
+        message(FATAL_ERROR "D-A0a debug-only work guard drifted: '${debug_guard}'")
+    endif()
+endforeach()
+string(FIND "${destruction_quote_source}" ".inspect(" quote_lease_mutation)
+if (NOT quote_lease_mutation EQUAL -1)
+    message(FATAL_ERROR
+        "D-A quote must consume one pre-inspected lease result per artifact")
+endif()
+
 # --- one closed reason enum, defined exactly once, in common/common-cache-plan.h ---
 count_literal("${all_source}" "enum common_cache_plan_reason : uint16_t" reason_defs)
 if (NOT reason_defs EQUAL 1)
@@ -39,6 +107,15 @@ foreach(def
         "enum class common_cache_plan_selection : uint8_t"
         "enum class common_cache_plan_inventory_state : uint8_t"
         "enum class common_cache_plan_planner_status : uint8_t"
+        "enum class common_cache_plan_destruction_state : uint8_t"
+        "enum class common_cache_plan_destruction_reason : uint8_t"
+        "enum class common_cache_plan_destruction_effect : uint8_t"
+        "enum class common_cache_plan_destruction_class : uint8_t"
+        "enum class common_cache_plan_destruction_physical_reason : uint8_t"
+        "enum class common_cache_plan_destruction_lease_verdict : uint8_t"
+        "enum class common_cache_plan_displaced_fate : uint8_t"
+        "enum class common_cache_plan_recovery_citation : uint8_t"
+        "enum class common_cache_plan_destruction_comparison : uint8_t"
         "enum class llama_cache_acct_category : uint8_t"
         "enum class llama_cache_acct_residency : uint8_t"
         "enum class llama_cache_acct_domain_kind : uint8_t"
@@ -282,10 +359,10 @@ foreach(retired_shape "llama_sha256 hash" "staged_now" "find_staged")
     endif()
 endforeach()
 
-# Record schema 5 embeds accounting schema 2. The compile-time table is the authority; these
+# Record schema 6 embeds accounting schema 2. The compile-time table is the authority; these
 # source pins ensure the JSON schema could not move while either side's version stayed put.
 foreach(schema_pin
-        "constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 5"
+        "constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 6"
         "common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION)"
         "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2")
     count_literal("${all_source}" "${schema_pin}" schema_pin_count)
@@ -294,9 +371,9 @@ foreach(schema_pin
     endif()
 endforeach()
 file(READ "${SOURCE_ROOT}/tools/server/bench/cache_plan_common.py" cache_plan_reader)
-string(FIND "${cache_plan_reader}" "SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5)" schema_reader_pin)
+string(FIND "${cache_plan_reader}" "SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6)" schema_reader_pin)
 if (schema_reader_pin EQUAL -1)
-    message(FATAL_ERROR "cache-plan reader does not explicitly accept v1/v2/v3/v4/v5")
+    message(FATAL_ERROR "cache-plan reader does not explicitly accept v1/v2/v3/v4/v5/v6")
 endif()
 
 # B-A0a schema-v5 evidence is atomic: every executable candidate is target-qualified,

@@ -1,4 +1,5 @@
 #include "server-cache-yield.h"
+#include "../../common/common-cache-plan.h"
 
 #include <algorithm>
 #include <limits>
@@ -25,10 +26,12 @@ bool op_union_add(
     return true;
 }
 
-bool release_plan(
+}
+
+bool server_cache_yield_release_plan(
         const llama_cache_acct_release_set_preview & release,
         uint64_t accounting_serial,
-        llama_cache_budget_plan & plan) {
+        llama_cache_budget_plan & plan) noexcept {
     if (release.accounting_serial != accounting_serial) {
         return false;
     }
@@ -48,6 +51,22 @@ bool release_plan(
     }
 }
 
+bool server_cache_yield_lower_domain(
+        const llama_cache_budget_row & row,
+        common_cache_plan_yield_domain & out) noexcept {
+    if (row.resource.kind !=
+            llama_cache_budget_resource_kind::accounting_domain) {
+        return false;
+    }
+    out = {
+        row.resource.domain,
+        row.current_resident,
+        row.before,
+        row.released,
+        row.reserved,
+        row.after,
+    };
+    return true;
 }
 
 const char * server_cache_yield_status_name(
@@ -222,7 +241,7 @@ server_cache_yield_result server_cache_yield_plan(
                 }
                 llama_cache_acct_release_set_preview released;
                 if (!preview(selected_ops, accounting_serial, released) ||
-                    !release_plan(
+                    !server_cache_yield_release_plan(
                         released, accounting_serial, budget_plan)) {
                     mark_unavailable();
                     return result;

@@ -148,7 +148,7 @@ count_literal("${artifact_header}" "VBR_UNIT_ARTIFACT_FORMAT_VERSION = 2" artifa
 count_literal("${accounting_header}"
     "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2" accounting_version)
 count_literal("${cache_plan_header}"
-    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 5" cache_plan_version)
+    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 6" cache_plan_version)
 if (NOT artifact_version EQUAL 1 OR NOT accounting_version EQUAL 1 OR
     NOT cache_plan_version EQUAL 1)
     message(FATAL_ERROR

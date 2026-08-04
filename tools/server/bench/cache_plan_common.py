@@ -10,7 +10,7 @@ import urllib.request
 _LINE_RE = re.compile(r"CACHE_PLAN (\{.*\})")
 
 # fail-closed schema set: an unknown version is an ERROR, never a silently-counted record
-SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5)
+SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6)
 
 
 class UnsupportedSchemaError(ValueError):

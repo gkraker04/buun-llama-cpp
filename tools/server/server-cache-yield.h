@@ -8,6 +8,8 @@
 #include <functional>
 #include <vector>
 
+struct common_cache_plan_yield_domain;
+
 constexpr uint32_t SERVER_CACHE_YIELD_POLICY_VERSION = 1;
 constexpr size_t SERVER_CACHE_YIELD_MAX_CANDIDATES = 8192;
 
@@ -59,6 +61,17 @@ using server_cache_yield_candidate_resolver = std::function<void(
     server_cache_yield_candidate &,
     server_cache_lease_identity &,
     bool & identity_known)>;
+
+// Shared lowering doors for D-S6 and D-A shadow projections. Release bytes
+// always come from the exact batch preview; coverage is never a byte estimate.
+bool server_cache_yield_release_plan(
+    const llama_cache_acct_release_set_preview & release,
+    uint64_t accounting_serial,
+    llama_cache_budget_plan & plan) noexcept;
+
+bool server_cache_yield_lower_domain(
+    const llama_cache_budget_row & row,
+    common_cache_plan_yield_domain & out) noexcept;
 
 // Impure server-side half: joins the catalog value with live backing/identity
 // through one injected resolver, then performs exactly one lease evaluation.

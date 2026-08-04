@@ -120,7 +120,7 @@ foreach(pin
         "server_cache_plan_disarm_unlaunched("
         "GGML_ASSERT(rec != nullptr || required_source_id < 0);"
         "int32_t cache_plan_source_id = -1;"
-        "COMMON_CACHE_PLAN_SCHEMA_VERSION = 5")
+        "COMMON_CACHE_PLAN_SCHEMA_VERSION = 6")
     string(FIND "${common_header}${plan_header}${server_source}${task_source}${task_header}${authority_header}" "${pin}" pin_pos)
     if (pin_pos EQUAL -1)
         message(FATAL_ERROR "B-A authority contract pin missing: ${pin}")

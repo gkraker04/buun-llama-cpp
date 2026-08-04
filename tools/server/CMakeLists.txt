@@ -11,6 +11,8 @@ add_library(${TARGET} STATIC
     server-task.h
     server-cache-authority.cpp
     server-cache-authority.h
+    server-cache-destruction-quote.cpp
+    server-cache-destruction-quote.h
     server-cache-plan-authority.cpp
     server-cache-plan-authority.h
     server-cache-lease.cpp

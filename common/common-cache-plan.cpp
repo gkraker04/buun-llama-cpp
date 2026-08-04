@@ -127,11 +127,192 @@ const char * common_cache_plan_authority_fallback_name(
             return "destruction_authority_required";
         case common_cache_plan_authority_fallback::budget_or_lease_unavailable:
             return "budget_or_lease_unavailable";
+        case common_cache_plan_authority_fallback::destruction_not_certified:
+            return "destruction_not_certified";
         case common_cache_plan_authority_fallback::internal_fault:
             return "internal_fault";
         case common_cache_plan_authority_fallback::_count: break;
     }
     return "invalid";
+}
+
+const char * common_cache_plan_destruction_state_name(
+        common_cache_plan_destruction_state state) {
+    switch (state) {
+        case common_cache_plan_destruction_state::not_required: return "not_required";
+        case common_cache_plan_destruction_state::quoted:       return "quoted";
+        case common_cache_plan_destruction_state::certified:    return "certified";
+        case common_cache_plan_destruction_state::executed:     return "executed";
+        case common_cache_plan_destruction_state::refused:      return "refused";
+        case common_cache_plan_destruction_state::failed:       return "failed";
+        case common_cache_plan_destruction_state::_count:       break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_reason_name(
+        common_cache_plan_destruction_reason reason) {
+    switch (reason) {
+        case common_cache_plan_destruction_reason::none: return "none";
+        case common_cache_plan_destruction_reason::lifecycle_disabled: return "lifecycle_disabled";
+        case common_cache_plan_destruction_reason::manifest_incomplete: return "manifest_incomplete";
+        case common_cache_plan_destruction_reason::identity_unavailable: return "identity_unavailable";
+        case common_cache_plan_destruction_reason::mandatory_anchor: return "mandatory_anchor";
+        case common_cache_plan_destruction_reason::lease_unavailable: return "lease_unavailable";
+        case common_cache_plan_destruction_reason::hard_lease_blocked: return "hard_lease_blocked";
+        case common_cache_plan_destruction_reason::accounting_unavailable: return "accounting_unavailable";
+        case common_cache_plan_destruction_reason::effect_drift: return "effect_drift";
+        case common_cache_plan_destruction_reason::release_evidence_unavailable: return "release_evidence_unavailable";
+        case common_cache_plan_destruction_reason::recovery_unavailable: return "recovery_unavailable";
+        case common_cache_plan_destruction_reason::capacity_refused: return "capacity_refused";
+        case common_cache_plan_destruction_reason::mutation_failed: return "mutation_failed";
+        case common_cache_plan_destruction_reason::internal_fault: return "internal_fault";
+        case common_cache_plan_destruction_reason::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_effect_name(
+        common_cache_plan_destruction_effect effect) {
+    switch (effect) {
+        case common_cache_plan_destruction_effect::none: return "none";
+        case common_cache_plan_destruction_effect::cross_target_displacement: return "cross_target_displacement";
+        case common_cache_plan_destruction_effect::destructive_similarity_retarget: return "destructive_similarity_retarget";
+        case common_cache_plan_destruction_effect::same_target_cold_replacement: return "same_target_cold_replacement";
+        case common_cache_plan_destruction_effect::different_host_source_consumption: return "different_host_source_consumption";
+        case common_cache_plan_destruction_effect::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_class_name(
+        common_cache_plan_destruction_class action) {
+    switch (action) {
+        case common_cache_plan_destruction_class::slot_drop: return "slot_drop";
+        case common_cache_plan_destruction_class::live_range_drop: return "live_range_drop";
+        case common_cache_plan_destruction_class::host_artifact_drop: return "host_artifact_drop";
+        case common_cache_plan_destruction_class::checkpoint_drop: return "checkpoint_drop";
+        case common_cache_plan_destruction_class::token_ledger_truncate: return "token_ledger_truncate";
+        case common_cache_plan_destruction_class::mandatory_recovery_reset: return "mandatory_recovery_reset";
+        case common_cache_plan_destruction_class::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_physical_reason_name(
+        common_cache_plan_destruction_physical_reason reason) {
+    switch (reason) {
+        case common_cache_plan_destruction_physical_reason::slot_rebind: return "slot_rebind";
+        case common_cache_plan_destruction_physical_reason::idle_reclaim: return "idle_reclaim";
+        case common_cache_plan_destruction_physical_reason::prompt_trim: return "prompt_trim";
+        case common_cache_plan_destruction_physical_reason::cache_capacity: return "cache_capacity";
+        case common_cache_plan_destruction_physical_reason::cache_update: return "cache_update";
+        case common_cache_plan_destruction_physical_reason::prompt_clear: return "prompt_clear";
+        case common_cache_plan_destruction_physical_reason::checkpoint_replace: return "checkpoint_replace";
+        case common_cache_plan_destruction_physical_reason::mandatory_recovery: return "mandatory_recovery";
+        case common_cache_plan_destruction_physical_reason::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_lease_verdict_name(
+        common_cache_plan_destruction_lease_verdict verdict) {
+    switch (verdict) {
+        case common_cache_plan_destruction_lease_verdict::unavailable: return "unavailable";
+        case common_cache_plan_destruction_lease_verdict::unleased: return "unleased";
+        case common_cache_plan_destruction_lease_verdict::soft_leased: return "soft_leased";
+        case common_cache_plan_destruction_lease_verdict::hard_leased: return "hard_leased";
+        case common_cache_plan_destruction_lease_verdict::mandatory_recovery: return "mandatory_recovery";
+        case common_cache_plan_destruction_lease_verdict::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_displaced_fate_name(
+        common_cache_plan_displaced_fate fate) {
+    switch (fate) {
+        case common_cache_plan_displaced_fate::unavailable: return "unavailable";
+        case common_cache_plan_displaced_fate::retained_live: return "retained_live";
+        case common_cache_plan_displaced_fate::retained_host: return "retained_host";
+        case common_cache_plan_displaced_fate::retained_sealed_artifact: return "retained_sealed_artifact";
+        case common_cache_plan_displaced_fate::exact_duplicate: return "exact_duplicate";
+        case common_cache_plan_displaced_fate::exact_replay_recipe: return "exact_replay_recipe";
+        case common_cache_plan_displaced_fate::destroyed_by_policy: return "destroyed_by_policy";
+        case common_cache_plan_displaced_fate::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_recovery_citation_name(
+        common_cache_plan_recovery_citation citation) {
+    switch (citation) {
+        case common_cache_plan_recovery_citation::unavailable: return "unavailable";
+        case common_cache_plan_recovery_citation::resolved: return "resolved";
+        case common_cache_plan_recovery_citation::prospective: return "prospective";
+        case common_cache_plan_recovery_citation::_count: break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_destruction_comparison_name(
+        common_cache_plan_destruction_comparison comparison) {
+    switch (comparison) {
+        case common_cache_plan_destruction_comparison::not_compared: return "not_compared";
+        case common_cache_plan_destruction_comparison::matched: return "matched";
+        case common_cache_plan_destruction_comparison::differed: return "differed";
+        case common_cache_plan_destruction_comparison::ds6_insufficient_yield: return "ds6_insufficient_yield";
+        case common_cache_plan_destruction_comparison::ds6_unsupported_required: return "ds6_unsupported_required";
+        case common_cache_plan_destruction_comparison::ds6_unavailable: return "ds6_unavailable";
+        case common_cache_plan_destruction_comparison::_count: break;
+    }
+    return "invalid";
+}
+
+void common_cache_plan_destruction_counters::observe(
+        common_cache_plan_selection tier,
+        const common_cache_plan_destruction_receipt & receipt) noexcept {
+    // Unlike B-A's one-receipt observe(), D-A calls this once per candidate.
+    // The server boundary publishes the selected/finalized receipt exactly once.
+    const size_t t = size_t(tier);
+    if (t >= n_tiers) {
+        return;
+    }
+    for (uint8_t raw = uint8_t(common_cache_plan_destruction_effect::none) + 1;
+         raw < uint8_t(common_cache_plan_destruction_effect::_count); ++raw) {
+        const auto effect = common_cache_plan_destruction_effect(raw);
+        if (!common_cache_plan_destruction_effect_has(receipt.effects, effect)) {
+            continue;
+        }
+        const size_t c = size_t(common_cache_plan_destruction_class_for_effect(effect));
+        if (c >= n_classes) {
+            continue;
+        }
+        if (receipt.state == common_cache_plan_destruction_state::quoted) {
+            quoted[t][c]++;
+        } else if (receipt.state == common_cache_plan_destruction_state::certified) {
+            certified[t][c]++;
+        } else if (receipt.state == common_cache_plan_destruction_state::executed) {
+            executed[t][c]++;
+            if (receipt.actual_accounting_serial == 0) {
+                actual_yield_unavailable[t][c]++;
+            }
+        }
+    }
+    if (receipt.state == common_cache_plan_destruction_state::refused ||
+        receipt.state == common_cache_plan_destruction_state::failed) {
+        const size_t r = size_t(receipt.reason);
+        if (r < n_reasons) {
+            refused[t][r]++;
+        }
+    }
+    const size_t v = size_t(receipt.lease_verdict);
+    if (v < n_verdicts) {
+        lease_verdict[t][v]++;
+    }
+    const size_t f = size_t(receipt.displaced_fate);
+    if (f < n_fates) {
+        recovery_outcome[t][f]++;
+    }
 }
 
 static common_cache_plan_authority_fallback planner_fallback(
@@ -533,6 +714,63 @@ static json cache_plan_yield_json(const common_cache_plan_yield_record & yield) 
     };
 }
 
+static json cache_plan_destruction_json(
+        const common_cache_plan_destruction_receipt & receipt) {
+    json effects = json::array();
+    for (uint8_t raw = uint8_t(common_cache_plan_destruction_effect::none) + 1;
+         raw < uint8_t(common_cache_plan_destruction_effect::_count); ++raw) {
+        const auto effect = common_cache_plan_destruction_effect(raw);
+        if (!common_cache_plan_destruction_effect_has(receipt.effects, effect)) {
+            continue;
+        }
+        effects.push_back({
+            { "effect", common_cache_plan_destruction_effect_name(effect) },
+            { "action_class", common_cache_plan_destruction_class_name(
+                                  common_cache_plan_destruction_class_for_effect(effect)) },
+            { "physical_reason", common_cache_plan_destruction_physical_reason_name(
+                                      common_cache_plan_destruction_physical_reason_for_effect(effect)) },
+        });
+    }
+    json attention = json::array();
+    for (const auto artifact : receipt.selected_attention) {
+        attention.push_back(artifact.v);
+    }
+    json recurrent = json::array();
+    for (const auto artifact : receipt.selected_recurrent) {
+        recurrent.push_back(artifact.v);
+    }
+    const auto digest_json = [](const auto & digest) -> json {
+        return digest.valid()
+            ? json(common_cache_plan_sha256_hex_digest(digest.bytes()))
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+    };
+    return json {
+        { "policy_version", receipt.policy_version },
+        { "state", common_cache_plan_destruction_state_name(receipt.state) },
+        { "reason", common_cache_plan_destruction_reason_name(receipt.reason) },
+        { "effects", std::move(effects) },
+        { "lease_verdict", common_cache_plan_destruction_lease_verdict_name(receipt.lease_verdict) },
+        { "displaced_fate", common_cache_plan_displaced_fate_name(receipt.displaced_fate) },
+        { "recovery_citation", common_cache_plan_recovery_citation_name(receipt.recovery_citation) },
+        { "post_finalize_comparison", common_cache_plan_destruction_comparison_name(receipt.post_finalize_comparison) },
+        { "plan_candidate", receipt.plan_candidate >= 0
+              ? json(receipt.plan_candidate)
+              : json(common_cache_acct_known_name(
+                    llama_cache_acct_known::unavailable)) },
+        { "admission_sequence", receipt.admission_sequence },
+        { "quote_duration_us", receipt.quote_duration_us },
+        { "quote_accounting_serial", receipt.quote_accounting_serial },
+        { "actual_accounting_serial", receipt.actual_accounting_serial },
+        { "manifest_digest", digest_json(receipt.manifest_digest) },
+        { "union_effect_digest", digest_json(receipt.union_effect_digest) },
+        { "selected", json {
+            { "attention", std::move(attention) },
+            { "recurrent", std::move(recurrent) },
+        } },
+    };
+}
+
 // phase-bit spellings (single source; CI scans ban replicas like the other name tables)
 static json cache_plan_phases_json(uint8_t phases_seen) {
     static constexpr struct { uint8_t bit; const char * name; } bits[] = {
@@ -707,6 +945,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         }
         out["planner_status"] = common_cache_plan_planner_status_name(rec.planner_status);
         out["yield"] = cache_plan_yield_json(rec.yield);
+        out["destruction"] = cache_plan_destruction_json(rec.destruction);
     }
     out["authority"] = json {
         { "policy_version",          rec.authority.policy_version },

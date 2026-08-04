@@ -192,8 +192,8 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 5);
-    CHECK(common_cache_plan_accounting_schema(5) == 2);
+    CHECK(rec.schema_version == 6);
+    CHECK(common_cache_plan_accounting_schema(6) == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -212,6 +212,13 @@ static void test_record_defaults() {
     CHECK(rec.yield.actual_state ==
           common_cache_plan_yield_actual_state::not_observed);
     CHECK(rec.yield.actual_domains.empty());
+    CHECK(rec.destruction.policy_version ==
+          COMMON_CACHE_PLAN_DESTRUCTION_POLICY_VERSION);
+    CHECK(rec.destruction.state ==
+          common_cache_plan_destruction_state::not_required);
+    CHECK(rec.destruction.reason ==
+          common_cache_plan_destruction_reason::none);
+    CHECK(rec.destruction_quotes.empty());
 
     common_cache_plan_candidate c;
     bool seen[size_t(llama_cache_acct_cost_kind::_count)] = {};
@@ -259,6 +266,42 @@ static void test_name_tables() {
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_authority_fallback::_count); i++) {
         CHECK(strcmp(common_cache_plan_authority_fallback_name(
                          common_cache_plan_authority_fallback(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_state::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_state_name(
+                         common_cache_plan_destruction_state(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_reason::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_reason_name(
+                         common_cache_plan_destruction_reason(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_effect::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_effect_name(
+                         common_cache_plan_destruction_effect(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_class::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_class_name(
+                         common_cache_plan_destruction_class(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_physical_reason::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_physical_reason_name(
+                         common_cache_plan_destruction_physical_reason(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_lease_verdict::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_lease_verdict_name(
+                         common_cache_plan_destruction_lease_verdict(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_displaced_fate::_count); i++) {
+        CHECK(strcmp(common_cache_plan_displaced_fate_name(
+                         common_cache_plan_displaced_fate(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_recovery_citation::_count); i++) {
+        CHECK(strcmp(common_cache_plan_recovery_citation_name(
+                         common_cache_plan_recovery_citation(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_destruction_comparison::_count); i++) {
+        CHECK(strcmp(common_cache_plan_destruction_comparison_name(
+                         common_cache_plan_destruction_comparison(i)), "invalid") != 0);
     }
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_inventory_state::_count); i++) {
         CHECK(strcmp(common_cache_plan_inventory_state_name(common_cache_plan_inventory_state(i)), "invalid") != 0);
@@ -325,7 +368,7 @@ static void test_json_serialization() {
     host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
     host->predicted_total_us = llama_cache_acct_value::measured(50000);
 
-    // Record schema-v5 / accounting-v2 bridge: interned topology table plus per-domain
+    // Record schema-v6 / accounting-v2 bridge: interned topology table plus per-domain
     // producer completeness, with explicit not_applicable rather than fabricated zeroes.
     llama_cache_acct_ledger ledger;
     const auto domain = llama_cache_acct_resource_domain::non_device(
@@ -368,10 +411,32 @@ static void test_json_serialization() {
         llama_cache_acct_value::measured(0),
         llama_cache_acct_value::measured(1794),
     });
+    rec.destruction.state = common_cache_plan_destruction_state::refused;
+    rec.destruction.reason = common_cache_plan_destruction_reason::effect_drift;
+    rec.destruction.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::same_target_cold_replacement) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+    rec.destruction.plan_candidate = 2;
+    rec.destruction.admission_sequence = 12;
+    rec.destruction.quote_duration_us = 37;
+    rec.destruction.quote_accounting_serial = rec.acct.serial;
+    rec.destruction.manifest_digest =
+        common_cache_plan_destruction_manifest_digest::from_sha256(
+            std::array<uint8_t, 32>{ 1 });
+    rec.destruction.union_effect_digest =
+        common_cache_plan_destruction_effect_digest::from_sha256(
+            std::array<uint8_t, 32>{ 2 });
     common_cache_plan_finalize_shadow_authority(rec);
 
     const auto j = common_cache_plan_record_json(rec);
-    CHECK(j["schema_version"] == 5);
+    // Golden regeneration door: this deliberately exercises the production
+    // serializer instead of maintaining a hand-authored schema-6 facsimile.
+    if (std::getenv("CACHE_PLAN_PRINT_SCHEMA6_GOLDEN")) {
+        std::puts(j.dump().c_str());
+    }
+    CHECK(j["schema_version"] == 6);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
@@ -397,6 +462,22 @@ static void test_json_serialization() {
     CHECK(j["authority"]["executed_plan_candidate"] == 2);
     CHECK(j["authority"]["fallback_reason"] == "none");
     CHECK(!j["authority"]["disagreed"]);
+    CHECK(j["destruction"]["state"] == "refused");
+    CHECK(j["destruction"]["reason"] == "effect_drift");
+    CHECK(j["destruction"]["effects"].size() == 2);
+    CHECK(j["destruction"]["effects"][0]["effect"] ==
+          "same_target_cold_replacement");
+    CHECK(j["destruction"]["effects"][1]["effect"] ==
+          "different_host_source_consumption");
+    CHECK(j["destruction"]["effects"][1]["action_class"] ==
+          "host_artifact_drop");
+    CHECK(j["destruction"]["plan_candidate"] == 2);
+    CHECK(j["destruction"]["admission_sequence"] == 12);
+    CHECK(j["destruction"]["quote_duration_us"] == 37);
+    CHECK(j["destruction"]["manifest_digest"] != "unavailable");
+    CHECK(j["destruction"]["union_effect_digest"] != "unavailable");
+    CHECK(j["destruction"]["selected"]["attention"].empty());
+    CHECK(!j["destruction"].contains("projected_domains"));
     CHECK(j["inventory_states"]["host_cache_entry"] == "complete");
     CHECK(j["delivered_chain"] == nlohmann::ordered_json::array(
         {"host_cache_entry", "live_context_checkpoint"}));

@@ -1,4 +1,4 @@
-# B-6/D-S7/B-A0 golden-fixture gate [P2]: the replay tool must parse checked-in v1-v5 CACHE_PLAN
+# B-6/D-S7/B-A0/D-A0 golden-fixture gate [P2]: the replay tool must parse checked-in v1-v6 CACHE_PLAN
 # samples exactly and reproduce the pinned report values. A schema drift that breaks either
 # the emitted record shape or the tool's reading of it fails here, not in the field.
 #
@@ -23,12 +23,12 @@ if (NOT rc EQUAL 0)
     message(FATAL_ERROR "cache-plan-replay.py failed on the golden fixture (rc=${rc})")
 endif()
 
-# pinned values: 9 records (1x v1 + 3x v2 + 1x v3 + 2x v4 + 2x v5), including the composed
-# host→checkpoint chain and schema-v5 shadow/fallback authority exemplars
+# pinned values: 10 records (1x v1 + 3x v2 + 1x v3 + 2x v4 + 2x v5 + 1x v6), including
+# the composed host→checkpoint chain and authority/destruction exemplars
 foreach(expect
-        "\"records\": 9"
+        "\"records\": 10"
         "\"shadow_evaluated\": 5"
-        "\"shadow_unavailable\": 4"
+        "\"shadow_unavailable\": 5"
         "\"agreement_rate\": 0.6"
         "\"disagreements\": 2"
         "\"predicted_saving_us\": 49600"
@@ -41,8 +41,7 @@ foreach(expect
     endif()
 endforeach()
 
-# Schema-5 compatibility: the production reader accepts both authority shapes, while
-# the exact frozen v1/v2/v3/v4 supported set rejects the same fixture fail-closed.
+# Schema-6 compatibility: production accepts D-A evidence while a frozen v1..v5 reader rejects it.
 execute_process(
     COMMAND "${PYTHON3}" "${SOURCE_ROOT}/tests/check-cache-plan-schema-compat.py"
     OUTPUT_QUIET ERROR_VARIABLE compat_err RESULT_VARIABLE compat_rc

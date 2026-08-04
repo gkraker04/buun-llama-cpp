@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-cache-authority.h"
+#include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
@@ -45,6 +46,7 @@
 #include <string>
 #include <type_traits>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <fstream>
 
@@ -2270,14 +2272,10 @@ private:
         }
     }
 
-    void cache_plan_run_yield(
-            const llama_cache_acct_snapshot & snapshot,
-            std::vector<server_retention_candidate> catalog) noexcept {
-        if (!cache_plan_obs) {
-            return;
-        }
+    bool cache_plan_assemble_yield_candidates(
+            const std::vector<server_retention_candidate> & catalog,
+            std::vector<server_cache_yield_candidate> & candidates) noexcept {
         try {
-            std::vector<server_cache_yield_candidate> candidates;
             const auto resolve = [&](const server_retention_candidate & source,
                                      server_cache_yield_candidate & candidate,
                                      server_cache_lease_identity & identity,
@@ -2444,6 +2442,188 @@ private:
             };
             if (!server_cache_yield_assemble(
                     catalog, cache_authority->leases, resolve, candidates)) {
+                candidates.clear();
+                return false;
+            }
+
+            return true;
+        } catch (...) {
+            candidates.clear();
+            return false;
+        }
+    }
+
+    void cache_plan_quote_destruction(
+            const server_task & task,
+            int32_t legacy_target_slot,
+            bool host_lookup_enabled,
+            common_cache_plan_record & rec) noexcept {
+        if (!cache_plan_obs || !cache_authority) {
+            rec.destruction.state = common_cache_plan_destruction_state::refused;
+            rec.destruction.reason =
+                common_cache_plan_destruction_reason::lifecycle_disabled;
+            return;
+        }
+        try {
+            const auto fail_whole_pass = [&](
+                    common_cache_plan_destruction_state state,
+                    common_cache_plan_destruction_reason reason) {
+                rec.destruction.state = state;
+                rec.destruction.reason = reason;
+                cache_authority->destruction_counters.observe(
+                    rec.selection, rec.destruction);
+            };
+            const int32_t legacy_candidate =
+                server_cache_plan_legacy_candidate(
+                    rec, legacy_target_slot, host_lookup_enabled);
+            if (!cache_authority->configured) {
+                fail_whole_pass(
+                    common_cache_plan_destruction_state::refused,
+                    common_cache_plan_destruction_reason::lifecycle_disabled);
+                return;
+            }
+            if (legacy_candidate < 0 ||
+                uint32_t(legacy_candidate) >= rec.n_inventory ||
+                rec.inventory_saturated()) {
+                fail_whole_pass(
+                    common_cache_plan_destruction_state::refused,
+                    common_cache_plan_destruction_reason::manifest_incomplete);
+                return;
+            }
+            if (!server_cache_destruction_has_effect(
+                    rec, legacy_candidate)) {
+                return;
+            }
+
+            const auto snapshot = cache_authority->ledger.snapshot();
+            const auto catalog =
+                cache_authority->retention.candidate_snapshot();
+            std::vector<server_cache_yield_candidate> normalized;
+            if (!cache_plan_assemble_yield_candidates(catalog, normalized) ||
+                normalized.size() != catalog.size()) {
+                fail_whole_pass(
+                    common_cache_plan_destruction_state::refused,
+                    common_cache_plan_destruction_reason::manifest_incomplete);
+                return;
+            }
+
+            std::unordered_map<uintptr_t, int32_t> host_source_ids;
+            if (prompt_cache) {
+                host_source_ids.reserve(prompt_cache->states.size());
+                for (const auto & entry : prompt_cache->states) {
+                    host_source_ids.emplace(
+                        server_retention_instance_key::for_host_entry(
+                            &entry).instance,
+                        entry.cache_plan_source_id);
+                }
+            }
+            std::vector<server_cache_destruction_artifact> artifacts;
+            artifacts.reserve(catalog.size());
+            for (size_t i = 0; i < catalog.size(); ++i) {
+                server_cache_destruction_artifact artifact;
+                artifact.candidate = std::move(normalized[i]);
+                artifact.kind = catalog[i].instance_key.kind;
+                artifact.owner_slot = catalog[i].instance_key.owner_slot;
+                artifact.pool = catalog[i].record.stamp.pool;
+                artifact.mandatory_anchor =
+                    catalog[i].record.stamp.mandatory_anchor;
+                if (artifact.kind ==
+                        common_retention_artifact_kind::host_entry) {
+                    const auto backing = host_source_ids.find(
+                        catalog[i].instance_key.instance);
+                    if (backing != host_source_ids.end()) {
+                        artifact.host_source_id = backing->second;
+                    }
+                }
+                artifacts.push_back(std::move(artifact));
+            }
+
+            llama_cache_budget_config config;
+            llama_cache_budget_coordinator quote_budget;
+            const bool budget_ready =
+                cache_authority->sample_budget(config) &&
+                quote_budget.reset(snapshot, config);
+            const auto preview = [&](const auto & ops,
+                                     uint64_t serial,
+                                     auto & out) {
+                return cache_authority->ledger.preview_release_set(
+                    ops, serial, out);
+            };
+            const auto project = [&](
+                    const llama_cache_acct_release_set_preview & release,
+                    std::vector<common_cache_plan_yield_domain> & out) {
+                out.clear();
+                if (!budget_ready ||
+                    release.accounting_serial != snapshot.serial) {
+                    return false;
+                }
+                llama_cache_budget_plan plan;
+                if (!server_cache_yield_release_plan(
+                        release, snapshot.serial, plan)) {
+                    return false;
+                }
+                const auto fit = quote_budget.fits(plan);
+                if (fit.accounting_serial != snapshot.serial ||
+                    fit.state != llama_cache_budget_fit_state::fits) {
+                    return false;
+                }
+                out.reserve(fit.domains.size());
+                for (const auto & row : fit.domains) {
+                    common_cache_plan_yield_domain lowered;
+                    if (!server_cache_yield_lower_domain(row, lowered)) {
+                        out.clear();
+                        return false;
+                    }
+                    out.push_back(std::move(lowered));
+                }
+                return true;
+            };
+            if (cache_authority->destruction_quote_sequence == UINT64_MAX) {
+                fail_whole_pass(
+                    common_cache_plan_destruction_state::failed,
+                    common_cache_plan_destruction_reason::internal_fault);
+                return;
+            }
+            const server_cache_destruction_quote_options options {
+                true,
+                prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION
+                    ? common_cache_plan_recovery_citation::prospective
+                    : common_cache_plan_recovery_citation::unavailable,
+                ++cache_authority->destruction_quote_sequence,
+            };
+            if (!server_cache_destruction_quote_all(
+                    rec, legacy_candidate, artifacts, snapshot.serial,
+                    preview, project, options,
+                    cache_authority->destruction_counters)) {
+                if (rec.destruction.reason ==
+                    common_cache_plan_destruction_reason::none) {
+                    rec.destruction.state =
+                        common_cache_plan_destruction_state::failed;
+                    rec.destruction.reason =
+                        common_cache_plan_destruction_reason::internal_fault;
+                }
+            }
+        } catch (...) {
+            rec.destruction_quotes.clear();
+            rec.destruction.state = common_cache_plan_destruction_state::failed;
+            rec.destruction.reason =
+                common_cache_plan_destruction_reason::internal_fault;
+            if (cache_authority) {
+                cache_authority->destruction_counters.observe(
+                    rec.selection, rec.destruction);
+            }
+        }
+    }
+
+    void cache_plan_run_yield(
+            const llama_cache_acct_snapshot & snapshot,
+            std::vector<server_retention_candidate> catalog) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            std::vector<server_cache_yield_candidate> candidates;
+            if (!cache_plan_assemble_yield_candidates(catalog, candidates)) {
                 cache_authority->last_yield = {};
                 cache_authority->last_yield.accounting_serial =
                     snapshot.serial;
@@ -2570,20 +2750,13 @@ private:
                     projected.projected_domains.reserve(
                         result.projected_fit.domains.size());
                     for (const auto & row : result.projected_fit.domains) {
-                        if (row.resource.kind !=
-                                llama_cache_budget_resource_kind::
-                                    accounting_domain) {
+                        common_cache_plan_yield_domain lowered;
+                        if (!server_cache_yield_lower_domain(row, lowered)) {
                             throw std::runtime_error(
                                 "non-domain cache-yield projection row");
                         }
-                        projected.projected_domains.push_back({
-                            row.resource.domain,
-                            row.current_resident,
-                            row.before,
-                            row.released,
-                            row.reserved,
-                            row.after,
-                        });
+                        projected.projected_domains.push_back(
+                            std::move(lowered));
                     }
                 }
             } else {
@@ -2716,6 +2889,11 @@ private:
                 cache_plan_run_yield(
                     rec.acct, std::move(retention_candidates));
                 cache_plan_project_yield(rec, cache_authority->last_yield);
+                server_cache_destruction_finalize_projection(
+                    rec, cache_authority->last_yield);
+                cache_authority->destruction_counters.last_receipt =
+                    rec.destruction;
+                cache_authority->destruction_counters.has_receipt = true;
                 cache_plan_emit_yield(cache_authority->last_yield);
             }
 
@@ -5994,8 +6172,43 @@ private:
                         task, *ret, incoming_adapter, *plan_rec);
                     const uint64_t capability_after =
                         cache_plan_capability_snapshot(task);
+                    const bool host_lookup_enabled =
+                        update_cache && prompt_cache &&
+                        task.type == SERVER_TASK_TYPE_COMPLETION &&
+                        incoming_adapter_matches;
+                    if (cache_plan_obs) {
+                        const int64_t destruction_quote_started =
+                            ggml_time_us();
+                        cache_plan_quote_destruction(
+                            task, legacy_ret->id,
+                            host_lookup_enabled, *plan_rec);
+                        const uint64_t destruction_quote_duration = uint64_t(
+                            std::max<int64_t>(0,
+                                ggml_time_us() - destruction_quote_started));
+                        plan_rec->destruction.quote_duration_us =
+                            destruction_quote_duration;
+                        for (auto & quote : plan_rec->destruction_quotes) {
+                            quote.receipt.quote_duration_us =
+                                destruction_quote_duration;
+                        }
+                        if (cache_authority) {
+                            auto & counters =
+                                cache_authority->destruction_counters;
+                            counters.quote_samples++;
+                            counters.quote_duration_us_total +=
+                                destruction_quote_duration;
+                            counters.quote_duration_us_max = std::max(
+                                counters.quote_duration_us_max,
+                                destruction_quote_duration);
+                        }
+                    }
                     cache_plan_authority->plan_before_mutation(
                         *plan_rec, capability_before, capability_after);
+                    if (cache_plan_obs) {
+                        server_cache_destruction_select_quote(
+                            *plan_rec,
+                            cache_authority->destruction_counters);
+                    }
 
                     // B-A2 may choose another strict-similarity target, but
                     // only the authority layer interprets that choice. Lower
@@ -6020,9 +6233,7 @@ private:
                                    incoming_loras, planned_ret->lora));
                     auto execution = cache_plan_authority->authorize(
                         *plan_rec, legacy_ret->id,
-                        update_cache && prompt_cache &&
-                        task.type == SERVER_TASK_TYPE_COMPLETION &&
-                        incoming_adapter_matches,
+                        host_lookup_enabled,
                         planned_adapter_matches);
                     if (execution.authoritative() &&
                         server_cache_plan_retarget_currency_required(

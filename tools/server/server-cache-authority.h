@@ -3,6 +3,7 @@
 #include "server-cache-lease.h"
 #include "server-cache-yield.h"
 #include "server-retention-sidecar.h"
+#include "../../common/common-cache-plan.h"
 #include "../../src/llama-cache-authority.h"
 #include "ggml-backend.h"
 
@@ -27,6 +28,7 @@ struct server_cache_authority {
     server_cache_destruction_observer destruction;
     llama_cache_budget_coordinator budget;
     server_cache_yield_result last_yield;
+    common_cache_plan_destruction_counters destruction_counters;
 
     // Immutable bridge from load-time placement to ledger-local device domains.
     std::vector<device_binding> live_device_domains;
@@ -38,6 +40,7 @@ struct server_cache_authority {
     uint64_t admission_refusals  = 0;
     uint64_t admission_commits   = 0;
     uint64_t admission_rollbacks = 0;
+    uint64_t destruction_quote_sequence = 0;
     bool configured = true;
     bool summary_emitted = false;
 
