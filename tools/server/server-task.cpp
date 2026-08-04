@@ -2200,7 +2200,8 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         if constexpr (Observed) {
             obs_idx++;
             row = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
-                                   obs_idx, COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+                                   obs_idx, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                                   rec->id_slot, rec->selection);
         }
 
         // never select a structurally-empty entry [I7/I10]: a size-0 main would "restore" as a
@@ -2272,7 +2273,8 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         rec->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
         if (it_best != states.end() && obs_idx_best >= 0) {
             auto * win = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
-                                          obs_idx_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+                                          obs_idx_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                                          rec->id_slot, rec->selection);
             if (win) {
                 win->accept(); // shipped winner: promote over the scan-time cost-loser default
                 win->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) obs_lcp_sel);

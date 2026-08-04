@@ -138,10 +138,10 @@ endif()
 count_literal("${accounting_header}"
     "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2" accounting_schema)
 count_literal("${cache_plan_header}"
-    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 4" cache_plan_schema)
+    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 5" cache_plan_schema)
 if (NOT accounting_schema EQUAL 1 OR NOT cache_plan_schema EQUAL 1)
     message(FATAL_ERROR
-        "F2.1 changed a frozen schema (C=${accounting_schema}, plan=${cache_plan_schema})")
+        "reviewed C/cache-plan schema pins drifted (C=${accounting_schema}, plan=${cache_plan_schema})")
 endif()
 
 foreach(enum_name IN ITEMS

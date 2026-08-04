@@ -380,6 +380,7 @@ struct server_cache_plan_observer {
     // distinct from observer faults; the per-record closed status carries the WHY
     uint64_t planner_ok      = 0;
     uint64_t planner_refused = 0;
+    common_cache_plan_authority_counters authority;
 
     // B-2 stable calibration-profile id ("{model class}/{hardware class}/b{batch}"),
     // composed once at observer init; copied onto every record. Empty = unprofiled.
@@ -2648,7 +2649,10 @@ private:
 
             // cold replay is the always-valid floor: it always has a row, and it delivered
             // exactly when nothing else did
-            if (auto * cold = rec.find_or_add(common_cache_plan_provider::cold_replay, COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0))) {
+            if (auto * cold = rec.find_or_add(
+                    common_cache_plan_provider::cold_replay,
+                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0), rec.id_slot,
+                    rec.selection)) {
                 cold->disposition = common_cache_plan_disposition::accepted;
                 rec.select(common_cache_plan_provider::cold_replay, cold);
                 rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
@@ -2733,15 +2737,33 @@ private:
                     cache_plan_obs->planner_refused++;
                 }
             }
+            common_cache_plan_finalize_shadow_authority(rec);
+            if (cache_plan_obs) {
+                cache_plan_obs->authority.observe(rec.authority);
+            }
 
             json out = common_cache_plan_record_json(rec);
             if (cache_plan_obs) {
                 cache_plan_obs->records_finalized++;
+                json authority_by_tier = json::object();
+                for (size_t tier = 0;
+                     tier < size_t(common_cache_plan_selection::_count); tier++) {
+                    authority_by_tier[common_cache_plan_selection_name(
+                        common_cache_plan_selection(tier))] = json {
+                        { "observed", cache_plan_obs->authority.observed[tier] },
+                        { "eligible", cache_plan_obs->authority.authority_eligible[tier] },
+                        { "executed", cache_plan_obs->authority.authority_executed[tier] },
+                        { "agree", cache_plan_obs->authority.agree[tier] },
+                        { "disagree", cache_plan_obs->authority.disagree[tier] },
+                        { "fallback_legacy", cache_plan_obs->authority.fallback_legacy[tier] },
+                    };
+                }
                 out["observer"] = json {
                     { "records_finalized",  cache_plan_obs->records_finalized },
                     { "shadow_unavailable", cache_plan_obs->shadow_unavailable },
                     { "planner_ok",         cache_plan_obs->planner_ok },
                     { "planner_refused",    cache_plan_obs->planner_refused },
+                    { "authority",          std::move(authority_by_tier) },
                 };
             }
 
@@ -5173,7 +5195,9 @@ private:
         // loops); nullptr when the observer is off or the inventory overflowed [A2]
         const auto slot_row = [&](const server_slot & slot, uint8_t phase) {
             return plan_rec
-                ? plan_rec->find_or_add(common_cache_plan_provider::live_slot, slot.id, phase)
+                ? plan_rec->find_or_add(
+                      common_cache_plan_provider::live_slot, slot.id, phase, slot.id,
+                      common_cache_plan_origin_for_phase(phase))
                 : (common_cache_plan_candidate *) nullptr;
         };
 
@@ -5427,7 +5451,8 @@ private:
                 // is complete over the declared domain
                 plan_rec->select(common_cache_plan_provider::live_slot,
                                  plan_rec->find_or_add(common_cache_plan_provider::live_slot,
-                                                       ret->id, uint8_t(0)));
+                                                       ret->id, uint8_t(0), ret->id,
+                                                       plan_rec->selection));
                 plan_rec->note_inventory_complete(common_cache_plan_provider::live_slot);
                 ret->cache_plan = std::move(plan_rec);
             }
@@ -5482,7 +5507,8 @@ private:
                     // provider-level, carried by one aggregate row (source -1)
                     auto * row = ret->cache_plan->find_or_add(
                         common_cache_plan_provider::host_cache_entry,
-                        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0));
+                        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0), ret->id,
+                        ret->cache_plan->selection);
                     if (row) {
                         row->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
                     }
@@ -8537,7 +8563,8 @@ private:
                                         for (uint32_t i = 0; i < buf.n; i++) {
                                             auto * row = rec.find_or_add(
                                                 common_cache_plan_provider::live_context_checkpoint,
-                                                (int32_t) i, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+                                                (int32_t) i, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                slot.id, rec.selection);
                                             if (!row) {
                                                 break; // record inventory overflowed (state latched)
                                             }
@@ -8764,7 +8791,8 @@ private:
                                                         if (auto * row = slot.cache_plan->find_or_add(
                                                                 common_cache_plan_provider::live_context_checkpoint,
                                                                 (int32_t) shipped_choice,
-                                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN)) {
+                                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                                slot.id, slot.cache_plan->selection)) {
                                                             row->gen_eval = sel;
                                                         }
                                                     }
@@ -9112,7 +9140,9 @@ private:
                                             if (!row) {
                                                 row = slot.cache_plan->find_or_add(
                                                     common_cache_plan_provider::live_context_checkpoint,
-                                                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+                                                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE,
+                                                    COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                    slot.id, slot.cache_plan->selection);
                                             }
                                             if (row) {
                                                 row->siblings_scanned = (uint32_t)

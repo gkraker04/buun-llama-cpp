@@ -64,6 +64,92 @@ const char * common_cache_plan_selection_name(common_cache_plan_selection s) {
     return "invalid";
 }
 
+const char * common_cache_plan_authority_level_name(common_cache_plan_authority_level level) {
+    switch (level) {
+        case common_cache_plan_authority_level::off:        return "off";
+        case common_cache_plan_authority_level::by_id:      return "by_id";
+        case common_cache_plan_authority_level::similarity: return "similarity";
+        case common_cache_plan_authority_level::route_home: return "route_home";
+        case common_cache_plan_authority_level::lru:        return "lru";
+        case common_cache_plan_authority_level::_count:     break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state) {
+    switch (state) {
+        case common_cache_plan_authority_state::shadow:          return "shadow";
+        case common_cache_plan_authority_state::authoritative:   return "authoritative";
+        case common_cache_plan_authority_state::fallback_legacy: return "fallback_legacy";
+        case common_cache_plan_authority_state::_count:          break;
+    }
+    return "invalid";
+}
+
+const char * common_cache_plan_authority_fallback_name(
+        common_cache_plan_authority_fallback reason) {
+    switch (reason) {
+        case common_cache_plan_authority_fallback::none: return "none";
+        case common_cache_plan_authority_fallback::tier_not_enabled:
+            return "tier_not_enabled";
+        case common_cache_plan_authority_fallback::no_profile: return "no_profile";
+        case common_cache_plan_authority_fallback::profile_unfitted:
+            return "profile_unfitted";
+        case common_cache_plan_authority_fallback::invalid_calibration:
+            return "invalid_calibration";
+        case common_cache_plan_authority_fallback::incomplete_evidence:
+            return "incomplete_evidence";
+        case common_cache_plan_authority_fallback::stale_capability:
+            return "stale_capability";
+        case common_cache_plan_authority_fallback::destruction_authority_required:
+            return "destruction_authority_required";
+        case common_cache_plan_authority_fallback::budget_or_lease_unavailable:
+            return "budget_or_lease_unavailable";
+        case common_cache_plan_authority_fallback::internal_fault:
+            return "internal_fault";
+        case common_cache_plan_authority_fallback::_count: break;
+    }
+    return "invalid";
+}
+
+void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept {
+    auto & receipt = rec.authority;
+    receipt = {};
+    receipt.legacy_tier = rec.selection;
+    receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
+    receipt.planner_plan_candidate =
+        rec.planner_status == common_cache_plan_planner_status::ok ? rec.shadow_choice : -1;
+    receipt.executed_plan_candidate = rec.shipped_plan_candidate;
+    receipt.disagreed = receipt.legacy_plan_candidate >= 0 &&
+                        receipt.planner_plan_candidate >= 0 &&
+                        receipt.legacy_plan_candidate != receipt.planner_plan_candidate;
+}
+
+void common_cache_plan_authority_counters::observe(
+        const common_cache_plan_authority_receipt & receipt) noexcept {
+    last_receipt = receipt;
+    has_receipt = true;
+
+    const size_t tier = size_t(receipt.legacy_tier);
+    if (tier >= size_t(common_cache_plan_selection::_count)) {
+        return;
+    }
+    observed[tier]++;
+    if (receipt.planner_plan_candidate >= 0) {
+        (receipt.disagreed ? disagree : agree)[tier]++;
+    }
+    if (receipt.state == common_cache_plan_authority_state::authoritative) {
+        authority_eligible[tier]++;
+        authority_executed[tier]++;
+    } else if (receipt.state == common_cache_plan_authority_state::fallback_legacy) {
+        fallback_legacy[tier]++;
+        const size_t reason = size_t(receipt.fallback_reason);
+        if (reason < size_t(common_cache_plan_authority_fallback::_count)) {
+            fallback_reason[reason]++;
+        }
+    }
+}
+
 const char * common_cache_plan_inventory_state_name(common_cache_plan_inventory_state s) {
     switch (s) {
         case common_cache_plan_inventory_state::unobserved: return "unobserved";
@@ -378,6 +464,11 @@ static json cache_plan_phases_json(uint8_t phases_seen) {
     return out;
 }
 
+static json cache_plan_ordinal_json(int32_t ordinal) {
+    return ordinal >= 0
+        ? json(ordinal)
+        : json(common_cache_acct_known_name(llama_cache_acct_known::unavailable));
+}
 json common_cache_plan_record_json(const common_cache_plan_record & rec) {
     const bool finalized = rec.outcome != common_cache_plan_outcome::unknown;
 
@@ -386,6 +477,8 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         const auto & c = rec.inventory[i];
         json jc = {
             { "id",            i },
+            { "target_slot_id", cache_plan_ordinal_json(c.target_slot_id) },
+            { "origin_tier",   common_cache_plan_selection_name(c.origin_tier) },
             { "provider",      common_cache_plan_provider_name(c.provider) },
             { "phases",        cache_plan_phases_json(c.phases_seen) },
             { "disposition",   common_cache_plan_disposition_name(c.disposition) },
@@ -526,6 +619,26 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         out["planner_status"] = common_cache_plan_planner_status_name(rec.planner_status);
         out["yield"] = cache_plan_yield_json(rec.yield);
     }
+    out["authority"] = json {
+        { "policy_version",          rec.authority.policy_version },
+        { "configured_level",        common_cache_plan_authority_level_name(
+                                           rec.authority.configured_level) },
+        { "legacy_tier",             common_cache_plan_selection_name(
+                                           rec.authority.legacy_tier) },
+        { "decision_tier",           common_cache_plan_selection_name(
+                                           rec.authority.decision_tier) },
+        { "state",                   common_cache_plan_authority_state_name(
+                                           rec.authority.state) },
+        { "legacy_plan_candidate",   cache_plan_ordinal_json(
+                                           rec.authority.legacy_plan_candidate) },
+        { "planner_plan_candidate",  cache_plan_ordinal_json(
+                                           rec.authority.planner_plan_candidate) },
+        { "executed_plan_candidate", cache_plan_ordinal_json(
+                                           rec.authority.executed_plan_candidate) },
+        { "fallback_reason",         common_cache_plan_authority_fallback_name(
+                                           rec.authority.fallback_reason) },
+        { "disagreed",               rec.authority.disagreed },
+    };
     // shadow-planner result: an object when computed, the typed unavailable name otherwise
     // (string-sentinel follows the acct-value wire convention used record-wide). The tie
     // floors are chooser SEMANTICS: without them on the wire, logs spanning builds with

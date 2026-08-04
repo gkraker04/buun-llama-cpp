@@ -1,4 +1,4 @@
-// B0/B/D-S decision-record contract tests (schema v4): band monotonicity (compile-time),
+// B0/B/D-S/B-A decision-record contract tests (schema v5): band monotonicity (compile-time),
 // multi-failure first-reason precedence including out-of-order arrival, valid-loser
 // disposition, per-entry inventory merge/overflow/completeness semantics, selection
 // mapping, planner-output clearing, unknown-vs-zero on measured fields, and exhaustive
@@ -54,7 +54,7 @@ static void test_valid_loser() {
     CHECK(d.disposition == common_cache_plan_disposition::rejected_invalid);
 }
 
-// per-entry inventory: cross-phase merge on (provider, source), never duplicate rows for
+// per-entry inventory: cross-phase merge on (target, provider, source), never duplicate rows for
 // one physical candidate; phases accumulate; selection maps to a row (r3/r4 A1)
 static void test_inventory_merge() {
     common_cache_plan_record rec;
@@ -77,11 +77,20 @@ static void test_inventory_merge() {
     CHECK(a->phases_seen == (COMMON_CACHE_PLAN_PHASE_SIMILARITY | COMMON_CACHE_PLAN_PHASE_LRU));
     CHECK(a->sim_known); // phase 2 added its scalars without erasing phase 1's
 
+    // the same provider/source offered to another target is another executable plan
+    auto * other_target = rec.find_or_add(
+        common_cache_plan_provider::live_slot, 3,
+        COMMON_CACHE_PLAN_PHASE_SIMILARITY, 9,
+        common_cache_plan_selection::similarity);
+    CHECK(other_target != nullptr && other_target != a);
+    CHECK(other_target->target_slot_id == 9);
+    CHECK(other_target->origin_tier == common_cache_plan_selection::similarity);
+
     // same source id under a DIFFERENT provider is a different physical candidate
     auto * h = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 3,
                                COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
     CHECK(h != nullptr && h != a);
-    CHECK(rec.n_inventory == 2);
+    CHECK(rec.n_inventory == 3);
 
     // first observation flips unobserved -> complete
     CHECK(rec.inventory_states[size_t(common_cache_plan_provider::live_slot)] ==
@@ -183,7 +192,8 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 4);
+    CHECK(rec.schema_version == 5);
+    CHECK(common_cache_plan_accounting_schema(5) == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -192,6 +202,10 @@ static void test_record_defaults() {
     CHECK(rec.shipped_plan_candidate == -1);
     CHECK(!rec.derived_plans_incomplete);
     CHECK(rec.planner_status == common_cache_plan_planner_status::not_attempted);
+    CHECK(rec.authority.policy_version == COMMON_CACHE_PLAN_AUTHORITY_POLICY_VERSION);
+    CHECK(rec.authority.configured_level == common_cache_plan_authority_level::off);
+    CHECK(rec.authority.state == common_cache_plan_authority_state::shadow);
+    CHECK(rec.authority.legacy_plan_candidate == -1);
     CHECK(rec.yield.status == common_cache_plan_yield_status::unavailable);
     CHECK(rec.yield.plan_state ==
           common_cache_plan_yield_plan_state::unavailable);
@@ -234,6 +248,18 @@ static void test_name_tables() {
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_selection::_count); i++) {
         CHECK(strcmp(common_cache_plan_selection_name(common_cache_plan_selection(i)), "invalid") != 0);
     }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_authority_level::_count); i++) {
+        CHECK(strcmp(common_cache_plan_authority_level_name(
+                         common_cache_plan_authority_level(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_authority_state::_count); i++) {
+        CHECK(strcmp(common_cache_plan_authority_state_name(
+                         common_cache_plan_authority_state(i)), "invalid") != 0);
+    }
+    for (uint8_t i = 0; i < uint8_t(common_cache_plan_authority_fallback::_count); i++) {
+        CHECK(strcmp(common_cache_plan_authority_fallback_name(
+                         common_cache_plan_authority_fallback(i)), "invalid") != 0);
+    }
     for (uint8_t i = 0; i < uint8_t(common_cache_plan_inventory_state::_count); i++) {
         CHECK(strcmp(common_cache_plan_inventory_state_name(common_cache_plan_inventory_state(i)), "invalid") != 0);
     }
@@ -254,7 +280,7 @@ static void test_name_tables() {
     }
     // and the closed inventory really is closed: exactly today's four providers
     CHECK(uint8_t(common_cache_plan_provider::_count) == 4);
-    // schema-v4 record retains the v2 reason census + sentinel (compile-time pinned)
+    // schema-v5 record retains the v2 reason census + sentinel (compile-time pinned)
     CHECK(COMMON_CACHE_PLAN_REASON_MEMBER_COUNT == 30);
     CHECK(uint16_t(COMMON_CACHE_PLAN_REASON_COUNT_SENTINEL) == 601);
 }
@@ -270,13 +296,15 @@ static void test_json_serialization() {
     rec.n_prompt_tokens = llama_cache_acct_value::measured(1000);
 
     auto * host = rec.find_or_add(common_cache_plan_provider::host_cache_entry, 0,
-                                  COMMON_CACHE_PLAN_PHASE_HOST_SCAN);
+                                  COMMON_CACHE_PLAN_PHASE_HOST_SCAN, 1,
+                                  common_cache_plan_selection::similarity);
     host->accept();
     host->delivered     = true;
     host->lcp_tokens    = llama_cache_acct_value::measured(500);
     host->payload_bytes = llama_cache_acct_value::measured(1000);
     auto * ckpt = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
-                                  COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
+                                  COMMON_CACHE_PLAN_PHASE_CKPT_SCAN, 1,
+                                  common_cache_plan_selection::similarity);
     ckpt->accept();
     ckpt->delivered      = true;
     ckpt->component_only = true;
@@ -297,7 +325,7 @@ static void test_json_serialization() {
     host->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimator_version = 1;
     host->predicted_total_us = llama_cache_acct_value::measured(50000);
 
-    // Record schema-v4 / accounting-v2 bridge: interned topology table plus per-domain
+    // Record schema-v5 / accounting-v2 bridge: interned topology table plus per-domain
     // producer completeness, with explicit not_applicable rather than fabricated zeroes.
     llama_cache_acct_ledger ledger;
     const auto domain = llama_cache_acct_resource_domain::non_device(
@@ -340,12 +368,15 @@ static void test_json_serialization() {
         llama_cache_acct_value::measured(0),
         llama_cache_acct_value::measured(1794),
     });
+    common_cache_plan_finalize_shadow_authority(rec);
 
     const auto j = common_cache_plan_record_json(rec);
-    CHECK(j["schema_version"] == 4);
+    CHECK(j["schema_version"] == 5);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
+    CHECK(j["candidates"][0]["target_slot_id"] == 1);
+    CHECK(j["candidates"][0]["origin_tier"] == "similarity");
     CHECK(j["candidates"][0]["cost_terms"].contains("replay"));
     CHECK(!j["candidates"][0]["cost_terms"].contains("transfer")); // absence = unavailable
     CHECK(j["candidates"][1]["component_only"] == true);
@@ -356,6 +387,16 @@ static void test_json_serialization() {
     CHECK(j["shipped_plan_candidate"] == 2); // the chain, not the terminal provider row
     CHECK(j["planner_status"] == "profile_unfitted");
     CHECK(j["shadow"] == "unavailable"); // string sentinel per the acct-value convention
+    CHECK(j["authority"]["policy_version"] == 1);
+    CHECK(j["authority"]["configured_level"] == "off");
+    CHECK(j["authority"]["legacy_tier"] == "similarity");
+    CHECK(j["authority"]["decision_tier"] == "none");
+    CHECK(j["authority"]["state"] == "shadow");
+    CHECK(j["authority"]["legacy_plan_candidate"] == 2);
+    CHECK(j["authority"]["planner_plan_candidate"] == "unavailable");
+    CHECK(j["authority"]["executed_plan_candidate"] == 2);
+    CHECK(j["authority"]["fallback_reason"] == "none");
+    CHECK(!j["authority"]["disagreed"]);
     CHECK(j["inventory_states"]["host_cache_entry"] == "complete");
     CHECK(j["delivered_chain"] == nlohmann::ordered_json::array(
         {"host_cache_entry", "live_context_checkpoint"}));
@@ -396,6 +437,59 @@ static void test_json_serialization() {
     CHECK(j["yield"]["projected_domains"][0]["projected_release"] == 128);
     CHECK(j["yield"]["projected_domains"][0]["projected_after"] == 1794);
     CHECK(j["yield"]["actual_domains"].empty());
+}
+
+static void test_authority_receipt_and_counters() {
+    common_cache_plan_record rec;
+    rec.selection = common_cache_plan_selection::similarity;
+    rec.shipped_plan_candidate = 1;
+    rec.shadow_choice = 0;
+    rec.shadow_tie_set[0] = 0;
+    rec.n_shadow_ties = 1;
+    rec.planner_status = common_cache_plan_planner_status::ok;
+
+    common_cache_plan_finalize_shadow_authority(rec);
+    CHECK(rec.authority.state == common_cache_plan_authority_state::shadow);
+    CHECK(rec.authority.legacy_tier == common_cache_plan_selection::similarity);
+    CHECK(rec.authority.decision_tier == common_cache_plan_selection::none);
+    CHECK(rec.authority.legacy_plan_candidate == 1);
+    CHECK(rec.authority.planner_plan_candidate == 0);
+    CHECK(rec.authority.executed_plan_candidate == 1);
+    CHECK(rec.authority.disagreed);
+    // Established schema-v4 semantics remain planner-owned.
+    CHECK(rec.shadow_choice == 0);
+    CHECK(rec.shadow_tie_set[0] == 0);
+
+    common_cache_plan_authority_counters counters;
+    counters.observe(rec.authority);
+    const size_t tier = size_t(common_cache_plan_selection::similarity);
+    CHECK(counters.has_receipt);
+    CHECK(counters.observed[tier] == 1);
+    // A shadow planner result is legible but does not claim authority eligibility.
+    CHECK(counters.authority_eligible[tier] == 0);
+    CHECK(counters.authority_executed[tier] == 0);
+    CHECK(counters.agree[tier] == 0);
+    CHECK(counters.disagree[tier] == 1);
+    CHECK(counters.fallback_legacy[tier] == 0);
+    CHECK(counters.last_receipt.executed_plan_candidate == 1);
+
+    auto authoritative = rec.authority;
+    authoritative.state = common_cache_plan_authority_state::authoritative;
+    authoritative.decision_tier = common_cache_plan_selection::similarity;
+    authoritative.executed_plan_candidate = authoritative.planner_plan_candidate;
+    authoritative.fallback_reason = common_cache_plan_authority_fallback::none;
+    counters.observe(authoritative);
+    CHECK(counters.authority_eligible[tier] == 1);
+    CHECK(counters.authority_executed[tier] == 1);
+
+    auto fallback = rec.authority;
+    fallback.state = common_cache_plan_authority_state::fallback_legacy;
+    fallback.fallback_reason =
+        common_cache_plan_authority_fallback::destruction_authority_required;
+    counters.observe(fallback);
+    CHECK(counters.fallback_legacy[tier] == 1);
+    CHECK(counters.fallback_reason[size_t(
+              common_cache_plan_authority_fallback::destruction_authority_required)] == 1);
 }
 
 static void test_yield_not_required_serialization() {
@@ -574,6 +668,7 @@ int main() {
     test_revoke_and_planner_clear();
     test_record_defaults();
     test_name_tables();
+    test_authority_receipt_and_counters();
     test_json_serialization();
     test_yield_not_required_serialization();
     test_compose_chains();

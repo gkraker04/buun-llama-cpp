@@ -190,9 +190,9 @@ if(accounting_schema EQUAL -1)
 endif()
 file(READ "${ROOT_DIR}/common/common-cache-plan.h" plan_header)
 string(FIND "${plan_header}"
-    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 4" plan_schema)
+    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 5" plan_schema)
 if(plan_schema EQUAL -1)
-    message(FATAL_ERROR "F4.2a-2 must not move cache-plan schema 4")
+    message(FATAL_ERROR "F4.2a-2 contracts require reviewed cache-plan schema 5")
 endif()
 
 message(STATUS "F4.2a-2 atomic adoption contracts passed")

@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — P2 B0/B/D-S shadow decision record, schema version 4.
+// common-cache-plan.h — P2 B0/B/D-S/B-A decision record, schema version 5.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -32,14 +32,16 @@
 // capacity in the record, append-or-mark-overflowed, no allocation in selector hooks.
 // v3 embeds accounting schema v2. v4 adds the D-S shadow yield projection: selected
 // artifacts and exact union-level projected domain values, plus an explicitly
-// not_observed actual-yield slot reserved for later D-A authority.
+// not_observed actual-yield slot reserved for later D-A authority. v5 adds the
+// B-A authority receipt and target-qualified candidate identity without changing
+// the established meaning of `shadow_choice` (the planner counterfactual).
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 4;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 5;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
-    return (record_schema == 3 || record_schema == 4) ? 2 :
+    return (record_schema == 3 || record_schema == 4 || record_schema == 5) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -194,6 +196,75 @@ enum class common_cache_plan_selection : uint8_t {
     _count,
 };
 
+// B-A schema-v5 authority vocabulary. The configured level is graduated: each
+// level includes every earlier tier. The receipt distinguishes the legacy
+// counterfactual, planner result, and actually executed complete plan without
+// changing schema-v4 `shadow_choice` semantics.
+constexpr uint32_t COMMON_CACHE_PLAN_AUTHORITY_POLICY_VERSION = 1;
+
+enum class common_cache_plan_authority_level : uint8_t {
+    off = 0,
+    by_id,
+    similarity,
+    route_home,
+    lru,
+    _count,
+};
+
+enum class common_cache_plan_authority_state : uint8_t {
+    shadow = 0,
+    authoritative,
+    fallback_legacy,
+    _count,
+};
+
+enum class common_cache_plan_authority_fallback : uint8_t {
+    none = 0,
+    tier_not_enabled,
+    no_profile,
+    profile_unfitted,
+    invalid_calibration,
+    incomplete_evidence,
+    stale_capability,
+    destruction_authority_required,
+    budget_or_lease_unavailable,
+    internal_fault,
+    _count,
+};
+
+struct common_cache_plan_authority_receipt {
+    uint32_t policy_version = COMMON_CACHE_PLAN_AUTHORITY_POLICY_VERSION;
+    common_cache_plan_authority_level configured_level =
+        common_cache_plan_authority_level::off;
+    common_cache_plan_selection legacy_tier = common_cache_plan_selection::none;
+    common_cache_plan_selection decision_tier = common_cache_plan_selection::none;
+    common_cache_plan_authority_state state =
+        common_cache_plan_authority_state::shadow;
+    int32_t legacy_plan_candidate = -1;
+    int32_t planner_plan_candidate = -1;
+    int32_t executed_plan_candidate = -1;
+    common_cache_plan_authority_fallback fallback_reason =
+        common_cache_plan_authority_fallback::none;
+    bool disagreed = false;
+};
+
+// Process-local, fixed-size authority telemetry. JSON remains debug-gated; this
+// POD is the bounded receipt/counter surface that B-A0b moves into the independent
+// debug||authority substrate. B-A0a exercises it from the existing observer only.
+struct common_cache_plan_authority_counters {
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> observed{};
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> authority_eligible{};
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> authority_executed{};
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> agree{};
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> disagree{};
+    std::array<uint64_t, size_t(common_cache_plan_selection::_count)> fallback_legacy{};
+    std::array<uint64_t, size_t(common_cache_plan_authority_fallback::_count)> fallback_reason{};
+    common_cache_plan_authority_receipt last_receipt;
+    bool has_receipt = false;
+
+    void observe(const common_cache_plan_authority_receipt & receipt) noexcept;
+};
+
 // Which authoritative shipped scan observed a candidate (bitmask on the row). A physical
 // candidate visited by several phases keeps ONE row (merge key = provider + source id);
 // each phase ORs its bit and adds only the scalars that phase computed (r3 reading 1).
@@ -206,6 +277,14 @@ enum common_cache_plan_phase : uint8_t {
     COMMON_CACHE_PLAN_PHASE_CKPT_SCAN  = 1 << 5,
     COMMON_CACHE_PLAN_PHASE_CHAIN      = 1 << 6,   // derived composed-plan row
 };
+
+constexpr common_cache_plan_selection common_cache_plan_origin_for_phase(uint8_t phase) noexcept {
+    return (phase & COMMON_CACHE_PLAN_PHASE_BY_ID)      ? common_cache_plan_selection::by_id :
+           (phase & COMMON_CACHE_PLAN_PHASE_SIMILARITY) ? common_cache_plan_selection::similarity :
+           (phase & COMMON_CACHE_PLAN_PHASE_ROUTE_HOME) ? common_cache_plan_selection::route_home :
+           (phase & COMMON_CACHE_PLAN_PHASE_LRU)        ? common_cache_plan_selection::lru :
+                                                          common_cache_plan_selection::none;
+}
 
 // Per-provider observed-inventory completeness over the DECLARED domain (= the shipped-
 // visited set). `truncated_by_shipped_short_circuit` marks scans the shipped path cut off
@@ -326,8 +405,14 @@ common_cache_plan_default_cost_terms() {
 // Trivially copyable and written only through noexcept record methods (A2 transport).
 struct common_cache_plan_candidate {
     common_cache_plan_provider provider = common_cache_plan_provider::cold_replay;
-    // request-local source identity (merge key with provider): live slot id, host-entry scan
-    // ordinal, checkpoint scan ordinal; -1 for cold_replay and derived rows
+    // Schema-v5 executable-plan identity. The target is part of the merge key: the same
+    // provider/source offered to two physical slots is two distinct plans. origin_tier is
+    // the legacy/planner tier that introduced the plan, independent of the record's
+    // eventually executed `selection`.
+    int32_t target_slot_id = -1;
+    common_cache_plan_selection origin_tier = common_cache_plan_selection::none;
+    // request-local source identity: live slot id, host-entry scan ordinal, checkpoint scan
+    // ordinal; -1 for cold_replay and derived rows
     int32_t source_id   = -1;
     uint8_t phases_seen = 0;    // OR of common_cache_plan_phase bits
 
@@ -448,6 +533,10 @@ struct common_cache_plan_record {
     // closed planner-attempt outcome, set at finalize (verify-r1 finding 8)
     common_cache_plan_planner_status planner_status = common_cache_plan_planner_status::not_attempted;
 
+    // Schema-v5 three-plan authority receipt. In B-A0a it is always shadow/off:
+    // legacy/executed name the shipped plan and planner names `shadow_choice`.
+    common_cache_plan_authority_receipt authority;
+
     // measured actuals (never estimates)
     llama_cache_acct_value n_prompt_tokens;
     llama_cache_acct_value n_reused_tokens;
@@ -469,16 +558,26 @@ struct common_cache_plan_record {
     // C0 accounting snapshot; meaningful once outcome != unknown
     llama_cache_acct_snapshot acct;
 
-    // Find the row for (provider, source_id) or append one — the cross-phase merge point:
+    // Find the row for (target_slot_id, provider, source_id) or append one — the cross-phase merge point:
     // one row per physical candidate, each visiting phase ORs its bit and adds its scalars.
     // noexcept by construction: fixed storage, linear scan over n_inventory (O(visited)).
     // nullptr = capacity exhausted; the provider's inventory latches `overflowed`, planner
     // completeness dies, the caller (a shipped-path hook) just skips.
     common_cache_plan_candidate * find_or_add(common_cache_plan_provider provider,
-                                              int32_t source_id, uint8_t phase_bit) noexcept {
+                                              int32_t source_id, uint8_t phase_bit,
+                                              int32_t target_slot_id = -1,
+                                              common_cache_plan_selection origin_tier =
+                                                  common_cache_plan_selection::none) noexcept {
         for (uint32_t i = 0; i < n_inventory; i++) {
-            if (inventory[i].provider == provider && inventory[i].source_id == source_id) {
+            if (inventory[i].target_slot_id == target_slot_id &&
+                inventory[i].provider == provider && inventory[i].source_id == source_id) {
                 inventory[i].phases_seen |= phase_bit;
+                // first-writer-wins: the tier that INTRODUCED the row keeps
+                // attribution; later phases only add phase bits
+                if (origin_tier != common_cache_plan_selection::none &&
+                    inventory[i].origin_tier == common_cache_plan_selection::none) {
+                    inventory[i].origin_tier = origin_tier;
+                }
                 return &inventory[i];
             }
         }
@@ -487,9 +586,11 @@ struct common_cache_plan_record {
             return nullptr;
         }
         auto & c = inventory[n_inventory++];
-        c.provider    = provider;
-        c.source_id   = source_id;
-        c.phases_seen = phase_bit;
+        c.target_slot_id = target_slot_id;
+        c.origin_tier    = origin_tier;
+        c.provider       = provider;
+        c.source_id      = source_id;
+        c.phases_seen    = phase_bit;
         // first observation of this provider upgrades unobserved → complete; truncation and
         // overflow are latched explicitly by the hooks that detect them and never downgrade
         auto & st = inventory_states[size_t(provider)];
@@ -538,6 +639,19 @@ struct common_cache_plan_record {
         c.phases_seen       = COMMON_CACHE_PLAN_PHASE_CHAIN;
         c.component_ids[0]  = comp0;
         c.component_ids[1]  = comp1;
+        if (comp0 >= 0 && uint32_t(comp0) < n_inventory - 1) {
+            c.target_slot_id = inventory[size_t(comp0)].target_slot_id;
+            c.origin_tier = inventory[size_t(comp0)].origin_tier;
+        }
+        if (comp1 >= 0 && uint32_t(comp1) < n_inventory - 1) {
+            const auto & rhs = inventory[size_t(comp1)];
+            if (c.target_slot_id != rhs.target_slot_id) {
+                c.target_slot_id = -1;
+            }
+            if (c.origin_tier != rhs.origin_tier) {
+                c.origin_tier = common_cache_plan_selection::none;
+            }
+        }
         return &c;
     }
     void select(common_cache_plan_provider provider, const common_cache_plan_candidate * c) noexcept {
@@ -574,6 +688,12 @@ const char * common_cache_plan_disposition_name(common_cache_plan_disposition d)
 const char * common_cache_plan_provider_name(common_cache_plan_provider p);
 const char * common_cache_plan_outcome_name(common_cache_plan_outcome o);
 const char * common_cache_plan_selection_name(common_cache_plan_selection s);
+const char * common_cache_plan_authority_level_name(common_cache_plan_authority_level level);
+const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state);
+const char * common_cache_plan_authority_fallback_name(common_cache_plan_authority_fallback reason);
+// Populate the B-A0a shadow/off receipt after the planner attempt. This is observation
+// only: it does not alter selection, delivery, shadow choice, or any shipped state.
+void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept;
 // Finalize-time chain composition (one testable implementation; the server calls this
 // after `chosen`/`selected`/deliveries settle). Sets shipped_plan_candidate to the
 // complete shipped plan: selected[chosen], upgraded to the delivered host→checkpoint

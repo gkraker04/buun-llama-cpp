@@ -434,8 +434,8 @@ static void test_controlled_disagreement() {
     CHECK(host->predicted_total_us.value - live->predicted_total_us.value == 49600);
 }
 
-// tie set: totals within max(5%, 100us) tie; the choice is the smallest
-// (provider, source_id, ordinal) key — never a function of the shipped choice
+// tie set: totals within max(5%, 100us) tie; the choice is the smallest schema-v5
+// (target_slot_id, provider, source_id, ordinal) key — never a function of the shipped choice
 static void test_tie_set() {
     common_cache_plan_record rec = make_record(100);
 
@@ -446,11 +446,13 @@ static void test_tie_set() {
     auto * b = add_row(rec, common_cache_plan_provider::live_slot, 3,
                        COMMON_CACHE_PLAN_PHASE_SIMILARITY, 90, 0,
                        common_cache_plan_disposition::accepted);
+    a->target_slot_id = 9;
+    b->target_slot_id = 4;
     (void) a;
 
     CHECK(common_cache_plan_estimate_and_choose(rec, TEST_CALIB) == planner_status::ok);
     CHECK(rec.n_shadow_ties == 2);
-    // stable order: source_id 3 < 7 within the same provider
+    // stable order: target 4 < 9; source/ordinal break ties within one target
     CHECK(&rec.inventory[size_t(rec.shadow_choice)] == b);
 
     // determinism: rerun on the same record yields the same result

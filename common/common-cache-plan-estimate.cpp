@@ -431,11 +431,13 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
         }
         if ((double) c.predicted_total_us.value <= (double) min_total + floor_us) {
             rec.shadow_tie_set[rec.n_shadow_ties++] = (int32_t) i;
-            // stable planner-owned key: (provider, source_id, ordinal), never the shipped choice
+            // schema-v5 stable planner-owned key: target first, then provider/source/ordinal;
+            // never the shipped choice. Target qualification prevents two physical plans
+            // from inheriting insertion order as their only distinction.
             const auto & best = choice >= 0 ? rec.inventory[size_t(choice)] : c;
             if (choice < 0 ||
-                std::make_tuple(uint8_t(c.provider), c.source_id, (int32_t) i) <
-                std::make_tuple(uint8_t(best.provider), best.source_id, choice)) {
+                std::make_tuple(c.target_slot_id, uint8_t(c.provider), c.source_id, (int32_t) i) <
+                std::make_tuple(best.target_slot_id, uint8_t(best.provider), best.source_id, choice)) {
                 choice = (int32_t) i;
             }
         }

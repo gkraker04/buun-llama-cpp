@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # D-S GATE L2: observer parity (the B-a invariant, end-to-end). Certifies that the
 # --cache-debug shadow observer (D-S1..D-S7: accounting, budget, lease, retention,
-# yield planner, schema-4 record) changes NOTHING that ships. Three arms under one
+# yield planner, schema-5 record) changes NOTHING that ships. Three arms under one
 # pinned deterministic schedule (greedy, seed, -np 1, fixed batch=ubatch, spec off,
 # VBR freeze, ctx-checkpoints so the edit engages RESTORE — not cold-only):
 #   OFF-A  : --cache-debug absent            (reference)

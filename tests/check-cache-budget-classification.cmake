@@ -105,7 +105,7 @@ endif()
 count_literal("${acct_header}"
     "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2" acct_schema_pins)
 count_literal("${plan_header}"
-    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 4" plan_schema_pins)
+    "COMMON_CACHE_PLAN_SCHEMA_VERSION = 5" plan_schema_pins)
 if (NOT acct_schema_pins EQUAL 1 OR NOT plan_schema_pins EQUAL 1)
     message(FATAL_ERROR
         "accounting/cache-plan schema pin drifted "

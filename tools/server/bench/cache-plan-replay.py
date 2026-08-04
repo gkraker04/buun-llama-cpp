@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cache-plan-replay.py — B-6 offline replay/eval over CACHE_PLAN records (schema v1-v4).
+# cache-plan-replay.py — B-6 offline replay/eval over CACHE_PLAN records (schema v1-v5).
 #
 # Consumes server log files (grepping the 'CACHE_PLAN {json}' lines) or raw JSONL, and
 # recomputes every report from the JSON alone (no in-process state):
