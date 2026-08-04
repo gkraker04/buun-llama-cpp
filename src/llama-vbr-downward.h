@@ -157,7 +157,8 @@ struct vbr_downward_stash_endpoint {
 };
 
 enum class vbr_downward_reserve_status : uint8_t {
-    reserved = 0,
+    not_attempted = 0,
+    reserved,
     reserved_stashless,
     projection_unavailable,
     accounting_refused,
@@ -179,7 +180,7 @@ struct vbr_downward_reserve_result {
 
 struct vbr_downward_stage_reservation {
     vbr_downward_reserve_status status =
-        vbr_downward_reserve_status::internal_error;
+        vbr_downward_reserve_status::not_attempted;
     std::vector<uint64_t> stashless_units;
 };
 

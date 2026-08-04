@@ -862,6 +862,11 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
             plan.transcode_build_identity_digest = downward ?
                 target_unit->downward_build_identity_digest :
                 std::array<uint8_t, 32> {};
+            // The degrade cursor is controller-wide. A mixed projection may
+            // transcode only some units, but every unit publishes under the
+            // same projected cursor.
+            plan.target_controller_cursor =
+                target_child->controller_policy.cursor;
             if (downward) {
                 if (policy.downward_projection == nullptr ||
                     descriptor.child_id >=
@@ -897,8 +902,6 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                     return terminal_result(
                         vbr_manifest_validation_status::codebook_mismatch);
                 }
-                plan.target_controller_cursor =
-                    target_child->controller_policy.cursor;
             }
             plan.downward = downward;
             // Downward import regenerates the target-tier sink stash before

@@ -931,6 +931,10 @@ private:
     // OFF => every gated branch runs verbatim: a freeze-off build is bit-identical to a pre-freeze
     // build (the P0 base-numerics ratchet). Never a production degrade-policy lever.
     bool     vbr_freeze_           = false;
+    // F5 acceptance-only companion to VBR_FREEZE. The routed downward gate
+    // needs an empty target that retains the naturally selected tier vector;
+    // absent this exact env, empty boundaries retain their shipped full reset.
+    bool     vbr_f5_preserve_empty_tiers_ = false;
     // WS-6: production scoped freeze of representation mutation. Orthogonal to WS-0's
     // deterministic-input freeze above: nesting never changes the ledger/presence machinery.
     struct vbr_retier_freeze_frame {

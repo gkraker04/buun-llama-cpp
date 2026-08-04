@@ -431,14 +431,24 @@ class vbr_kv_import_session {
                     }
                     const size_t pool_index = size_t(
                         pool_it-cache_->vbr_pools_.begin());
-                    if (plan->downward) {
-                        if (plan->descriptor.wm_cells > UINT32_MAX) {
-                            return false;
-                        }
-                        backing_watermarks[pool_index] = std::max(
-                            backing_watermarks[pool_index],
-                            uint32_t(plan->descriptor.wm_cells));
+                    if (plan->descriptor.wm_cells > UINT32_MAX) {
+                        return false;
                     }
+                    // wm_cells is the controller's padded live watermark, not
+                    // merely max(authorized physical cell)+1.  Preserve it
+                    // across import even when the reference owns no row in
+                    // the padding tail.  The backing is zero-filled before
+                    // authorized H2D, so this does not widen row authority;
+                    // it only prevents the first append from growing across
+                    // a falsely-short published watermark.
+                    const uint32_t descriptor_watermark =
+                        uint32_t(plan->descriptor.wm_cells);
+                    backing_watermarks[pool_index] = std::max(
+                        backing_watermarks[pool_index],
+                        descriptor_watermark);
+                    final_watermarks_[pool_index] = std::max(
+                        final_watermarks_[pool_index],
+                        descriptor_watermark);
                     for (const auto & run : plan->authorized_runs) {
                         if (run.cell_count == 0 ||
                             run.first_physical_cell >
@@ -822,20 +832,29 @@ class vbr_kv_import_session {
                     }
                 }
             }
+            // The allocation cursor is live metadata, not a mere search
+            // optimization: unified/SWA placement may legally recycle a
+            // masked cell before a zero head reaches the imported frontier.
+            // Resume immediately after the highest installed physical cell,
+            // matching an ordinary sequentially-built prefix.
+            for (size_t stream = 0; stream < final_cells_.size(); ++stream) {
+                const uint32_t next = final_cells_[stream].used_max_p1();
+                final_heads_[stream] = next < final_cells_[stream].size()
+                    ? next : 0;
+            }
             auto * tracker = cache_->vbr_generation_tracker_mut();
             if (!tracker || !tracker->prepare_import_image(
                     tracker_plan, source, destination_, placements,
                     tracker_image_)) {
                 return false;
             }
-            final_cursor_ = plans.front()->downward
-                ? plans.front()->target_controller_cursor
-                : plans.front()->controller_policy.cursor;
+            // Validation writes the target cursor on every unit plan, even
+            // when a coherent projection changes only a subset of units. The
+            // cursor is tree-wide, so phase 12 must never reconstruct it from
+            // the source policy of an unchanged unit.
+            final_cursor_ = plans.front()->target_controller_cursor;
             for (const auto * plan : plans) {
-                const uint64_t cursor = plan->downward
-                    ? plan->target_controller_cursor
-                    : plan->controller_policy.cursor;
-                if (cursor != final_cursor_) {
+                if (plan->target_controller_cursor != final_cursor_) {
                     return false;
                 }
             }
@@ -940,6 +959,16 @@ class vbr_kv_import_session {
             for (const auto & unit : cache_->vbr_units_of(ikv, is_v)) {
                 unit.second->stash_valid = metadata.stash_valid;
                 unit.second->promote_hops = metadata.promote_hops;
+            }
+            const auto * canonical = is_v
+                ? cache_->layers[ikv].v : cache_->layers[ikv].k;
+            GGML_ASSERT(canonical != nullptr);
+            if (canonical->type != metadata.target_type) {
+                // Graphs bake K/V types and strides. This is the import
+                // analogue of every live retier publication: fence graph
+                // reuse before changing the canonical tensor in place.
+                GGML_ASSERT(cache_->vbr_tier_epoch_ != UINT64_MAX);
+                ++cache_->vbr_tier_epoch_;
             }
             cache_->vbr_import_set_unit_type_noalloc(
                 metadata.logical_unit, metadata.target_type);
@@ -1357,8 +1386,11 @@ vbr_adopt_status downward_source_h2d(
         std::map<uint32_t, vbr_adopt_child_work> & children,
         const vbr_validated_manifest & manifest) noexcept {
     for (const auto & plan : manifest.children()) {
+        if (!plan.downward) {
+            continue;
+        }
         const auto child = children.find(plan.child_id);
-        if (!plan.downward || child == children.end() ||
+        if (child == children.end() ||
             !child->second.session->initialize_downward_backing(plan)) {
             return vbr_adopt_status::transfer_failed;
         }
@@ -1378,7 +1410,7 @@ vbr_adopt_status downward_transform_all(
     std::map<std::pair<uint32_t, uint32_t>, uint32_t> stash_valid;
     for (const auto & plan : manifest.children()) {
         if (!plan.downward) {
-            return vbr_adopt_status::downward_recipe_invalid;
+            continue;
         }
         const auto child = children.find(plan.child_id);
         if (child == children.end()) {
@@ -1414,7 +1446,14 @@ vbr_adopt_status downward_transform_all(
     // Every edge is now enqueued. Synchronize each distinct side backend once
     // before the completion fault seam or any destructive tail trim.
     for (auto & child : children) {
-        if (!child.second.session->synchronize_downward(child.second.plans)) {
+        std::vector<const vbr_validated_child_plan *> downward_plans;
+        for (const auto * plan : child.second.plans) {
+            if (plan && plan->downward) {
+                downward_plans.push_back(plan);
+            }
+        }
+        if (!downward_plans.empty() &&
+            !child.second.session->synchronize_downward(downward_plans)) {
             return vbr_adopt_status::downward_transform_failed;
         }
     }
@@ -1423,6 +1462,9 @@ vbr_adopt_status downward_transform_all(
         return vbr_adopt_status::downward_transform_failed;
     }
     for (const auto & plan : manifest.children()) {
+        if (!plan.downward) {
+            continue;
+        }
         const auto child = children.find(plan.child_id);
         const auto valid = stash_valid.find({
             plan.child_id, plan.logical_unit_id });

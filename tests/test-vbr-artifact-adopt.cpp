@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <array>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -248,6 +249,51 @@ struct llama_kv_cache_vbr_epoch_test {
         }
         return false;
     }
+
+    // F5-only target constructor: the live source schedule is produced by the
+    // shipped controller, then a separate context repeats it.  A normal empty
+    // boundary deliberately full-resets tiers to F16, so it cannot construct
+    // the same-tier native-import target.  Retire the repeated context's VMM
+    // backing while preserving only its controller-selected type vector and
+    // cursor.  This friend lives in the test binary; no production trigger or
+    // environment door can invoke it.
+    static bool make_construction_empty_preserve_tiers(
+            llama_kv_cache * cache) noexcept {
+        if (!cache || !cache->vbr_vmm_active() ||
+            std::any_of(cache->v_cells.begin(), cache->v_cells.end(),
+                [](const llama_kv_cells & cells) {
+                    return cells.get_used() != 0;
+                })) {
+            return false;
+        }
+        cache->vbr_flush_deferred_unmaps();
+        for (auto & pool : cache->vbr_pools_) {
+            if (!pool.vmm || !pool.be || pool.gran == 0) {
+                return false;
+            }
+            if (pool.backend) {
+                ggml_backend_synchronize(pool.backend);
+            }
+            pool.be->sync_device(pool.device);
+            for (size_t layer = 0; layer < cache->layers.size(); ++layer) {
+                for (bool is_v : { false, true }) {
+                    auto & extent = is_v ? pool.v[layer] : pool.k[layer];
+                    if (!extent.t) {
+                        continue;
+                    }
+                    const size_t logical =
+                        size_t(ggml_row_size(GGML_TYPE_F16, extent.t->ne[0]))*
+                        size_t(extent.t->ne[1])*size_t(extent.t->ne[2]);
+                    const size_t span = GGML_PAD(logical, pool.gran);
+                    pool.be->vmm_pool_unmap(
+                        pool.vmm, extent.byte_off, span);
+                    extent.stash_valid = 0;
+                }
+            }
+            pool.wm_cells = 0;
+        }
+        return true;
+    }
 };
 
 struct f42a_harness_target {
@@ -323,15 +369,26 @@ static bool f42a_decode(
     if (!context || tokens.empty()) {
         return false;
     }
-    llama_batch batch = llama_batch_init(int32_t(tokens.size()), 0, 1);
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i],
-                         first_position+llama_pos(i), { 0 },
-                         i+1 == tokens.size());
+    const size_t n_batch = llama_n_batch(context);
+    if (n_batch == 0) {
+        return false;
     }
-    const bool ok = llama_decode(context, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    for (size_t offset = 0; offset < tokens.size();) {
+        const size_t count = std::min(n_batch, tokens.size()-offset);
+        llama_batch batch = llama_batch_init(int32_t(count), 0, 1);
+        for (size_t i = 0; i < count; ++i) {
+            common_batch_add(batch, tokens[offset+i],
+                             first_position+llama_pos(offset+i), { 0 },
+                             offset+i+1 == tokens.size());
+        }
+        const bool ok = llama_decode(context, batch) == 0;
+        llama_batch_free(batch);
+        if (!ok) {
+            return false;
+        }
+        offset += count;
+    }
+    return true;
 }
 
 static bool f42a_initialize_accounting(
@@ -380,7 +437,11 @@ static llama_cache_budget_config f42a_budget(
     input.backend_device = device;
     input.domain = domain;
     input.physical_total = 1ull << 40;
-    input.physical_free = 1ull << 40;
+    // The catalog's device-resident artifact receipts participate in D-S2.
+    // Keep the synthetic physical sample internally consistent with that
+    // nonzero resident baseline; total==free would correctly make fits()
+    // unavailable once a live capture has been charged.
+    input.physical_free = (1ull << 40) - (1ull << 30);
     input.phys_state = llama_cache_budget_capacity_state::known;
     input.current_compute_allocated = 0;
     input.configured_compute_reserve = 0;
@@ -655,6 +716,14 @@ static void test_closed_vocabularies() {
         CHECK(std::string(vbr_adopt_status_name(vbr_adopt_status(i))) !=
               "invalid");
     }
+    for (uint8_t i = 0;
+         i < uint8_t(vbr_downward_reserve_status::_count); ++i) {
+        CHECK(std::string(vbr_downward_reserve_status_name(
+                  vbr_downward_reserve_status(i))) != "invalid");
+    }
+    vbr_adopt_stage_result native_stage_default;
+    CHECK(native_stage_default.downward_status ==
+          vbr_downward_reserve_status::not_attempted);
     CHECK(std::string(vbr_adopt_phase_name(vbr_adopt_phase::_count)) ==
           "invalid");
     CHECK(std::string(vbr_adopt_status_name(vbr_adopt_status::_count)) ==
@@ -2293,6 +2362,7 @@ static void test_g2_downward_subphase_matrix() {
         check_failed_transaction(f, result);
     }
     for (const auto status : {
+            vbr_downward_reserve_status::not_attempted,
             vbr_downward_reserve_status::projection_unavailable,
             vbr_downward_reserve_status::accounting_refused,
             vbr_downward_reserve_status::workspace_reserve_failed,
@@ -2387,11 +2457,21 @@ static void test_cuda_h2d_adapter() {
 static bool f42a_model_backed_adoption(
         const char * model_path, bool downward_mode,
         ggml_type source_type = GGML_TYPE_F16,
-        ggml_type target_type = GGML_TYPE_F16) {
+        ggml_type target_type = GGML_TYPE_F16,
+        uint64_t live_budget_mib = 0,
+        size_t live_token_count = 0,
+        bool require_straddled = false) {
+    const bool live_matrix = live_token_count != 0;
     ggml_backend_load_all();
-    setenv("VBR_FORCE_GENERIC", "1", 1);
+    if (live_matrix) {
+        // F5 validates the shipped, model-matched order. The older homogeneous
+        // tier oracle intentionally keeps the generic test order.
+        unsetenv("VBR_FORCE_GENERIC");
+    } else {
+        setenv("VBR_FORCE_GENERIC", "1", 1);
+    }
     setenv("VBR_PROMOTE", "0", 1);
-    setenv("VBR_STASH_ROWS", downward_mode ? "64" : "0", 1);
+    setenv("VBR_STASH_ROWS", (downward_mode || live_matrix) ? "64" : "0", 1);
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 99;
@@ -2402,9 +2482,10 @@ static bool f42a_model_backed_adoption(
     }
 
     llama_context_params context_params = llama_context_default_params();
-    context_params.n_ctx = 256;
-    context_params.n_batch = 64;
-    context_params.n_ubatch = 64;
+    context_params.n_ctx = live_matrix
+        ? uint32_t(std::max<size_t>(256, live_token_count + 128)) : 256;
+    context_params.n_batch = live_matrix ? 512 : 64;
+    context_params.n_ubatch = live_matrix ? 512 : 64;
     context_params.n_seq_max = 1;
     context_params.n_threads = 2;
     context_params.n_threads_batch = 2;
@@ -2413,7 +2494,8 @@ static bool f42a_model_backed_adoption(
     context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     context_params.vbr_dynamic = true;
     context_params.vbr_budget_explicit = true;
-    context_params.vbr_vram_budget_bytes = 4ull*1024*1024*1024;
+    context_params.vbr_vram_budget_bytes = live_matrix
+        ? live_budget_mib*1024*1024 : 4ull*1024*1024*1024;
     if (downward_mode) {
         context_params.vbr_min_bits = 1.0;
         context_params.vbr_min_bits_explicit = true;
@@ -2430,18 +2512,62 @@ static bool f42a_model_backed_adoption(
     if (!source) {
         return false;
     }
-    auto tokens = common_tokenize(
-        source.get(), "Atomic artifact restore parity fixture.", true, false);
+    std::string prompt = "Atomic artifact restore parity fixture.";
+    if (live_matrix) {
+        prompt.clear();
+        prompt.reserve(live_token_count*8);
+        for (size_t i = 0; i < live_token_count; ++i) {
+            prompt += " F5 ledger row ";
+            prompt += std::to_string(i);
+            prompt += " preserves deterministic controller pressure.";
+        }
+    }
+    auto tokens = common_tokenize(source.get(), prompt, true, false);
     if (tokens.size() < 4) {
         return false;
     }
-    if (tokens.size() > 32) {
+    if (live_matrix && tokens.size() < live_token_count) {
+        return false;
+    }
+    if (live_matrix) {
+        tokens.resize(live_token_count);
+    } else if (tokens.size() > 32) {
         tokens.resize(32);
+    }
+    const llama_token continuation = tokens.back();
+    const int32_t vocab_size = llama_vocab_n_tokens(
+        llama_model_get_vocab(model.get()));
+    std::vector<float> live_source_logits;
+    if (live_matrix) {
+        // Dynamic VBR deliberately permits one controller context per process.
+        // Build the uninterrupted oracle first, destroy it, then reproduce the
+        // frozen schedule in the context that will be captured. This proves
+        // schedule reproducibility without mutating the sealed controller.
+        CHECK(f42a_decode(source.get(), tokens, 0));
+        CHECK(f42a_decode(
+            source.get(), { continuation }, llama_pos(tokens.size())));
+        float * logits = llama_get_logits_ith(source.get(), -1);
+        CHECK(logits != nullptr && vocab_size > 0);
+        if (!logits || vocab_size <= 0) {
+            return false;
+        }
+        live_source_logits.assign(logits, logits+vocab_size);
+        llama_synchronize(source.get());
+        source.reset();
+        source = make_context(GGML_TYPE_F16);
+        CHECK(source != nullptr);
+        if (!source) {
+            return false;
+        }
     }
     CHECK(f42a_decode(source.get(), tokens, 0));
     if (failures) {
         return false;
     }
+    // Explicit capture is an idle decode-thread transaction. Long F5 prefills
+    // span several scheduler submissions, so close the final submitted VBR
+    // operation before asking the capture door to prove quiescence.
+    llama_synchronize(source.get());
 
     llama_memory_i * source_memory = llama_get_memory(source.get());
     std::vector<vbr_explicit_capture_runtime_pool> source_pools;
@@ -2556,6 +2682,110 @@ static bool f42a_model_backed_adoption(
     CHECK(catalog.resolve_reference(reference, package) ==
           vbr_artifact_resolve_status::ok);
     CHECK(package && package.validate() == vbr_artifact_status::ok);
+    if (live_matrix) {
+        std::set<int32_t> types;
+        std::map<uint32_t, int32_t> by_unit;
+        std::array<size_t, size_t(vbr_artifact_clean_stash_state::_count)>
+            stash_states = {};
+        for (const auto & unit : package.units()) {
+            types.insert(unit.descriptor.current_type);
+            by_unit[unit.descriptor.logical_unit_id] =
+                unit.descriptor.current_type;
+            if (unit.descriptor.clean_stash_state <
+                    vbr_artifact_clean_stash_state::_count) {
+                stash_states[size_t(
+                    unit.descriptor.clean_stash_state)]++;
+            }
+            if (unit.descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::absent_at_source) {
+                const auto & controller =
+                    package.manifest().generation.controllers[
+                        unit.descriptor.child_id];
+                if (unit.descriptor.logical_unit_id <
+                        controller.units.size() &&
+                    controller.units[unit.descriptor.logical_unit_id].domain !=
+                        vbr_repr_domain::full) {
+                    std::fprintf(stderr,
+                        "F5 tapped-without-stash unit=%u type=%d domain=%u\n",
+                        unit.descriptor.logical_unit_id,
+                        unit.descriptor.current_type,
+                        unsigned(controller.units[
+                            unit.descriptor.logical_unit_id].domain));
+                }
+            }
+            if (unit.descriptor.clean_stash_state ==
+                    vbr_artifact_clean_stash_state::present) {
+                const auto reference = std::find_if(
+                    package.manifest().unit_references.begin(),
+                    package.manifest().unit_references.end(),
+                    [&](const vbr_artifact_unit_reference & value) {
+                        return value.logical_unit_id ==
+                                   unit.descriptor.logical_unit_id &&
+                               value.lineage_uuid ==
+                                   unit.descriptor.lineage_uuid;
+                    });
+                uint64_t covered = 0;
+                if (reference !=
+                        package.manifest().unit_references.end()) {
+                    for (const auto & page :
+                            reference->stash_reference.covered_sink_pages) {
+                        for (uint64_t word : page.covered_mask) {
+                            covered += uint64_t(__builtin_popcountll(word));
+                        }
+                    }
+                    std::fprintf(stderr,
+                        "F5 stash unit=%u rows=%" PRIu64
+                        " captured=%u covered=%" PRIu64 " pages=%zu\n",
+                        unit.descriptor.logical_unit_id,
+                        reference->stash_reference.valid_rows,
+                        reference->stash_reference.captured_sink_count,
+                        covered,
+                        reference->stash_reference.covered_sink_pages.size());
+                }
+            }
+        }
+        const auto tier_rank = [](int32_t type) {
+            switch (ggml_type(type)) {
+                case GGML_TYPE_F16: return 6;
+                case GGML_TYPE_TURBO8_0: return 5;
+                case GGML_TYPE_TURBO4_0: return 4;
+                case GGML_TYPE_TURBO3_TCQ: return 3;
+                case GGML_TYPE_TURBO2_TCQ: return 2;
+                case GGML_TYPE_TURBO1_TCQ: return 1;
+                default: return -1;
+            }
+        };
+        bool straddled = false;
+        for (const auto & [unit, type] : by_unit) {
+            if ((unit & 1u) != 0) {
+                continue;
+            }
+            const auto peer = by_unit.find(unit + 1);
+            if (peer != by_unit.end() && tier_rank(type) >= 0 &&
+                tier_rank(peer->second) >= 0 &&
+                std::abs(tier_rank(type) - tier_rank(peer->second)) >= 2) {
+                straddled = true;
+            }
+        }
+        std::fprintf(stderr,
+            "F5 source_state tokens=%zu budget_mib=%" PRIu64
+            " types=%zu straddled=%d stash_absent=%zu stash_present=%zu "
+            "stash_omitted=%zu\n",
+            tokens.size(), live_budget_mib, types.size(), straddled,
+            stash_states[size_t(
+                vbr_artifact_clean_stash_state::absent_at_source)],
+            stash_states[size_t(
+                vbr_artifact_clean_stash_state::present)],
+            stash_states[size_t(
+                vbr_artifact_clean_stash_state::omitted_source_present)]);
+        std::fprintf(stderr, "F5 manifest_consistency=%u\n",
+            unsigned(package.manifest().consistency.kind));
+        CHECK(types.size() > 1);
+        CHECK(!require_straddled || straddled);
+        if (types.size() <= 1 || (require_straddled && !straddled)) {
+            return false;
+        }
+    }
     if (downward_mode) {
         CHECK(std::all_of(
             package.units().begin(), package.units().end(),
@@ -2565,23 +2795,25 @@ static bool f42a_model_backed_adoption(
     }
     const auto source_instance = source_pools.front().instance_id;
 
-    const llama_token continuation = tokens.back();
-    CHECK(f42a_decode(source.get(), { continuation }, llama_pos(tokens.size())));
-    const int32_t vocab_size = llama_vocab_n_tokens(
-        llama_model_get_vocab(model.get()));
-    float * source_logits_ptr = llama_get_logits_ith(source.get(), -1);
-    CHECK(source_logits_ptr != nullptr && vocab_size > 0);
-    if (!source_logits_ptr || vocab_size <= 0) {
-        return false;
+    std::vector<float> source_logits = std::move(live_source_logits);
+    if (!live_matrix) {
+        CHECK(f42a_decode(
+            source.get(), { continuation }, llama_pos(tokens.size())));
+        float * source_logits_ptr = llama_get_logits_ith(source.get(), -1);
+        CHECK(source_logits_ptr != nullptr && vocab_size > 0);
+        if (!source_logits_ptr || vocab_size <= 0) {
+            return false;
+        }
+        source_logits.assign(
+            source_logits_ptr, source_logits_ptr+vocab_size);
+        // Context destruction is a terminal scheduler boundary. Keep the
+        // retained hardware harness explicit about the production settle.
+        llama_synchronize(source.get());
     }
-    std::vector<float> source_logits(
-        source_logits_ptr, source_logits_ptr+vocab_size);
-    // Context destruction is a terminal scheduler boundary.  Keep the retained
-    // hardware harness explicit about the same settle contract used by the
-    // production context destructor, even though logits retrieval also fences.
-    llama_synchronize(source.get());
-    source.reset();
     capture_ring.reset();
+    if (!live_matrix) {
+        source.reset();
+    }
 
     // P3 two-standard oracle: the ordinary F4.2a cell remains byte-exact to
     // its F16 source. Downward compares encoded rows against the shipped live
@@ -2631,14 +2863,42 @@ static bool f42a_model_backed_adoption(
                                 vbr_import_decision expected_decision,
                                 vbr_adopt_phase fail_before_phase =
                                     vbr_adopt_phase::_count) {
+        const auto find_attention_child = [](auto & tree) {
+            return std::find_if(
+                tree.begin(), tree.end(),
+                [](const llama_memory_tree_child & child) {
+                    return child.attention != nullptr;
+                });
+        };
         const uint64_t baseline_live_ops = ledger.snapshot().live_ops;
-        auto target_context = make_context(
-            downward_mode ? target_type : GGML_TYPE_F16);
+        llama_context_ptr target_context = live_matrix
+            ? std::move(source)
+            : make_context(downward_mode ? target_type : GGML_TYPE_F16);
         CHECK(target_context != nullptr);
         if (!target_context) {
             return false;
         }
         llama_memory_i * target_memory = llama_get_memory(target_context.get());
+        if (live_matrix) {
+            // Consume the checkpoint back into the same live controller after
+            // the reference continuation. This is the production slot shape:
+            // the naturally-created mixed tier/generation history is retained,
+            // while the sequence itself is removed before native import.
+            CHECK(target_memory && target_memory->seq_rm(0, -1, -1));
+            std::vector<llama_memory_tree_child> empty_tree;
+            CHECK(target_memory &&
+                  llama_memory_tree_collect(target_memory, empty_tree));
+            const auto attention = find_attention_child(empty_tree);
+            CHECK(attention != empty_tree.end() &&
+                  llama_kv_cache_vbr_epoch_test::
+                      make_construction_empty_preserve_tiers(
+                          attention->attention));
+            CHECK(target_memory && target_memory->seq_pos_min(0) < 0 &&
+                  target_memory->seq_pos_max(0) < 0);
+            if (!target_memory || target_memory->seq_pos_max(0) >= 0) {
+                return false;
+            }
+        }
         std::vector<vbr_explicit_capture_runtime_pool> target_pools;
         uint32_t target_children = 0;
         CHECK(target_memory && vbr_explicit_capture_runtime_pools(
@@ -2646,9 +2906,39 @@ static bool f42a_model_backed_adoption(
         if (!target_memory || target_children != 1 || target_pools.empty()) {
             return false;
         }
-        CHECK(target_pools.front().instance_id != source_instance);
+        CHECK(live_matrix
+            ? target_pools.front().instance_id == source_instance
+            : target_pools.front().instance_id != source_instance);
 
         const auto accounting_snapshot = ledger.snapshot();
+        llama_cache_budget_coordinator baseline_budget;
+        CHECK(baseline_budget.reset(accounting_snapshot, budget));
+        llama_cache_budget_plan baseline_plan;
+        baseline_plan.accounting_serial = accounting_snapshot.serial;
+        const auto baseline_fit = baseline_budget.fits(baseline_plan);
+        CHECK(baseline_fit.state == llama_cache_budget_fit_state::fits);
+        if (baseline_fit.state != llama_cache_budget_fit_state::fits) {
+            std::fprintf(stderr,
+                "F5 baseline budget state=%u cells=%zu completeness=%zu\n",
+                unsigned(baseline_fit.state), accounting_snapshot.cells.size(),
+                accounting_snapshot.completeness.size());
+            for (const auto & row : accounting_snapshot.cells) {
+                const auto resident = row.cell.measures[size_t(
+                    llama_cache_acct_measure::resident_allocated)];
+                const auto reserved = row.cell.measures[size_t(
+                    llama_cache_acct_measure::reserved)];
+                if (row.certification != llama_cache_acct_known::known ||
+                    resident.state != llama_cache_acct_known::known ||
+                    reserved.state != llama_cache_acct_known::known) {
+                    std::fprintf(stderr,
+                        "F5 accounting category=%u residency=%u cert=%u "
+                        "resident=%u reserved=%u\n",
+                        unsigned(row.category), unsigned(row.domain.residency),
+                        unsigned(row.certification), unsigned(resident.state),
+                        unsigned(reserved.state));
+                }
+            }
+        }
         vbr_target_validation_snapshot target_snapshot;
         vbr_downward_policy_projection downward_projection;
         bool detected_downward = false;
@@ -2698,6 +2988,7 @@ static bool f42a_model_backed_adoption(
         policy.read_accounting_serial =
             f42a_harness_target::accounting_serial;
         policy.read_policy_epoch = f42a_harness_target::policy_serial;
+        policy.parse_companion = vbr_parse_recurrent_companion;
         llama_cache_budget_plan downward_budget_plan;
         if (downward_mode) {
             downward_budget_plan.accounting_serial =
@@ -2710,6 +3001,57 @@ static bool f42a_model_backed_adoption(
 
         auto validated = vbr_validate_unit_manifest_snapshot(
             target_snapshot, package, policy);
+        if (validated.status != vbr_manifest_validation_status::validated ||
+            validated.decision != expected_decision || !validated.proof) {
+            std::fprintf(stderr,
+                "F5 validation failed status=%s decision=%s expected=%s "
+                "observed=%d downward=%d\n",
+                vbr_manifest_validation_status_name(validated.status),
+                vbr_import_decision_name(validated.decision),
+                vbr_import_decision_name(expected_decision),
+                previously_observed, detected_downward);
+            for (const auto & unit : package.units()) {
+                if (unit.descriptor.child_id >= target_snapshot.children.size()) {
+                    continue;
+                }
+                const auto & target_units =
+                    target_snapshot.children[unit.descriptor.child_id].units;
+                const auto found = std::find_if(
+                    target_units.begin(), target_units.end(),
+                    [&](const vbr_target_unit_snapshot & value) {
+                        return value.logical_unit_id ==
+                            unit.descriptor.logical_unit_id;
+                    });
+                if (found == target_units.end()) {
+                    continue;
+                }
+                const auto & source_unit = unit.descriptor;
+                if (source_unit.current_type != found->current_type ||
+                    source_unit.last_source_type != found->last_source_type ||
+                    source_unit.promote_hops != found->promote_hops ||
+                    source_unit.last_transition != found->last_transition ||
+                    source_unit.representation.source_loss_history !=
+                        found->source_loss_history ||
+                    source_unit.representation.checkpoint_codec_hops !=
+                        found->checkpoint_codec_hops) {
+                    std::fprintf(stderr,
+                        "F5 representation unit=%u type=%d/%d source=%d/%d "
+                        "hops=%u/%u transition=%u/%u loss=%u/%u codec=%u/%u\n",
+                        source_unit.logical_unit_id,
+                        source_unit.current_type, found->current_type,
+                        source_unit.last_source_type, found->last_source_type,
+                        unsigned(source_unit.promote_hops),
+                        unsigned(found->promote_hops),
+                        unsigned(source_unit.last_transition),
+                        unsigned(found->last_transition),
+                        source_unit.representation.source_loss_history,
+                        found->source_loss_history,
+                        source_unit.representation.checkpoint_codec_hops,
+                        found->checkpoint_codec_hops);
+                    break;
+                }
+            }
+        }
         CHECK(validated.status == vbr_manifest_validation_status::validated);
         CHECK(validated.decision == expected_decision);
         CHECK(validated.proof);
@@ -2745,6 +3087,15 @@ static bool f42a_model_backed_adoption(
         hooks.context = target_memory;
         hooks.owner_token = target_memory;
         hooks.validate_owner_token = f42a_owner_token;
+        std::vector<llama_memory_tree_child> adoption_tree;
+        CHECK(llama_memory_tree_collect(target_memory, adoption_tree));
+        for (const auto & child : adoption_tree) {
+            if (child.recurrent) {
+                hooks.companions.push_back(
+                    vbr_recurrent_companion_adoption_provider(
+                        *child.recurrent));
+            }
+        }
         vbr_adopt_test_control test;
         test.fault.fail_before = fail_before_phase;
         hooks.test = fail_before_phase == vbr_adopt_phase::_count
@@ -2784,11 +3135,12 @@ static bool f42a_model_backed_adoption(
 
         std::vector<llama_memory_tree_child> adopted_tree;
         CHECK(llama_memory_tree_collect(target_memory, adopted_tree));
-        CHECK(adopted_tree.size() == 1 && adopted_tree[0].attention);
-        if (adopted_tree.size() != 1 || !adopted_tree[0].attention) {
+        const auto adopted_attention = find_attention_child(adopted_tree);
+        CHECK(adopted_attention != adopted_tree.end());
+        if (adopted_attention == adopted_tree.end()) {
             return false;
         }
-        auto * adopted_cache = adopted_tree[0].attention;
+        auto * adopted_cache = adopted_attention->attention;
         vbr_controller_instance_id adopted_instance;
         vbr_lineage_uuid adopted_lineage;
         uint64_t adopted_generation = 0;
@@ -2830,7 +3182,8 @@ static bool f42a_model_backed_adoption(
         if (!target_logits) {
             return false;
         }
-        if (!downward_mode) {
+        if (!downward_mode &&
+            expected_decision == vbr_import_decision::native_import) {
             if (std::memcmp(
                     expected_logits.data(), target_logits,
                     expected_logits.size()*sizeof(float)) != 0) {
@@ -2844,7 +3197,7 @@ static bool f42a_model_backed_adoption(
                     max_abs, std::abs(expected_logits[i]-target_logits[i]));
             }
             std::fprintf(stderr,
-                "F4.2b downward same-tier continuation max_abs=%g\n",
+                "F5 representation-level continuation max_abs=%g\n",
                 double(max_abs));
             // The target representation is deterministic on pinned kernels;
             // the retained 27B gate records this metric and applies the
@@ -2867,7 +3220,11 @@ static bool f42a_model_backed_adoption(
     // pre-publication checkpoint is driven on a real target. A fail-before
     // at phase N is also the fail-after oracle for phase N-1. Composite
     // publication and close deliberately have no post-boundary fault seam.
-    if (!downward_mode) {
+    if (live_matrix) {
+        CHECK(run_import(false, require_straddled
+            ? vbr_import_decision::live_rebased
+            : vbr_import_decision::native_import));
+    } else if (!downward_mode) {
         for (uint8_t phase = uint8_t(vbr_adopt_phase::operation_open);
              phase <= uint8_t(vbr_adopt_phase::composite_publish); ++phase) {
             CHECK(run_import(false, vbr_import_decision::native_import,
@@ -2950,14 +3307,20 @@ int main(int argc, char ** argv) {
     test_native_tracker_rejects_uncovered_cell_and_tuple_splice();
     if (argc >= 2 &&
         (std::string(argv[1]) == "--f42a-cuda" ||
-         std::string(argv[1]) == "--f42b-cuda")) {
+         std::string(argv[1]) == "--f42b-cuda" ||
+         std::string(argv[1]) == "--f5-cuda")) {
         const bool downward = std::string(argv[1]) == "--f42b-cuda";
-        if ((!downward && argc != 3) ||
+        const bool f5 = std::string(argv[1]) == "--f5-cuda";
+        if ((!downward && !f5 && argc != 3) ||
+            (f5 && argc != 6) ||
             (downward && argc != 3 && argc != 5)) {
             std::fprintf(stderr,
                 "usage: %s --f42a-cuda MODEL\n"
                 "       %s --f42b-cuda MODEL [SOURCE TARGET]\n"
-                "tiers: f16 t8 t4 t3 t2 t1\n", argv[0], argv[0]);
+                "       %s --f5-cuda MODEL BUDGET_MIB TOKENS "
+                "mixed|straddled\n"
+                "tiers: f16 t8 t4 t3 t2 t1\n",
+                argv[0], argv[0], argv[0]);
             return 2;
         }
         ggml_type source_type = GGML_TYPE_F16;
@@ -2981,8 +3344,26 @@ int main(int argc, char ** argv) {
         }
         test_cuda_h2d_adapter();
         if (failures == 0) {
-            f42a_model_backed_adoption(
-                argv[2], downward, source_type, target_type);
+            if (f5) {
+                char * budget_end = nullptr;
+                char * tokens_end = nullptr;
+                const uint64_t budget = std::strtoull(
+                    argv[3], &budget_end, 10);
+                const uint64_t n_tokens = std::strtoull(
+                    argv[4], &tokens_end, 10);
+                const bool straddled = std::string(argv[5]) == "straddled";
+                if (!budget || !n_tokens || *budget_end || *tokens_end ||
+                    (!straddled && std::string(argv[5]) != "mixed")) {
+                    std::fprintf(stderr, "invalid F5 live-matrix arguments\n");
+                    return 2;
+                }
+                f42a_model_backed_adoption(
+                    argv[2], false, GGML_TYPE_F16, GGML_TYPE_F16,
+                    budget, size_t(n_tokens), straddled);
+            } else {
+                f42a_model_backed_adoption(
+                    argv[2], downward, source_type, target_type);
+            }
         }
     }
     if (failures != 0) {

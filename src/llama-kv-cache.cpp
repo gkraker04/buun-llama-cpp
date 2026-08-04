@@ -691,6 +691,43 @@ static vbr_span vbr_span_of(const ggml_tensor * t, ggml_type type_B, int64_t n_c
     return { slot, keep, keep_live, keep_pad };
 }
 
+struct vbr_scrub_span {
+    size_t keep;
+    size_t scrub_end;
+};
+
+// One page-tail scrub calculation shared by live degrade, atomic tree shed,
+// and downward import. The callers retain their local failure policy: live
+// controller paths assert an impossible geometry, while artifact import
+// rejects malformed/overflowing evidence recoverably.
+static bool vbr_scrub_span_of(
+        const ggml_tensor * t,
+                  ggml_type type_A,
+                    int64_t n_cells,
+           const vbr_span & span,
+                     size_t gran,
+           vbr_scrub_span & result) {
+    if (t == nullptr || n_cells < 0 || gran == 0) {
+        return false;
+    }
+    const size_t row_a = ggml_row_size(type_A, t->ne[0]);
+    const size_t cells = size_t(n_cells);
+    if ((row_a != 0 && cells > SIZE_MAX/row_a) ||
+        row_a*cells > SIZE_MAX-(gran - 1) ||
+        span.keep_live > SIZE_MAX-(gran - 1)) {
+        return false;
+    }
+    const size_t mapped_hi = std::min(
+        span.slot, (size_t) GGML_PAD(row_a*cells, gran));
+    const size_t scrub_end = std::min(
+        mapped_hi, (size_t) GGML_PAD(span.keep_live, gran));
+    if (scrub_end < span.keep) {
+        return false;
+    }
+    result = { span.keep, scrub_end };
+    return true;
+}
+
 
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
@@ -1519,6 +1556,8 @@ llama_kv_cache::llama_kv_cache(
             // clamp + the ledger; a fixed budget + no clamp makes degrade waves a pure function of
             // occupancy (deterministic "scripted" waves). No effect on any production run.
             vbr_freeze_ = turbo_vbr_env_enabled("VBR_FREEZE");
+            vbr_f5_preserve_empty_tiers_ = vbr_freeze_ &&
+                turbo_vbr_env_enabled("VBR_F5_PRESERVE_EMPTY_TIERS");
             if (vbr_freeze_) {
                 LLAMA_LOG_INFO("%s: VBR_FREEZE active — live-VRAM clamp + ledger disabled "
                         "(deterministic tier schedule; test/gating only)\n", __func__);
@@ -1526,6 +1565,11 @@ llama_kv_cache::llama_kv_cache(
                     LLAMA_LOG_WARN("%s: VBR_FREEZE without an explicit VBR_BUDGET_MIB — the auto-budget "
                             "re-derivation reads live free VRAM and is NOT frozen; set VBR_BUDGET_MIB\n",
                             __func__);
+                }
+                if (vbr_f5_preserve_empty_tiers_) {
+                    LLAMA_LOG_WARN("%s: VBR_F5_PRESERVE_EMPTY_TIERS active — "
+                            "empty boundaries retain the current tier vector "
+                            "(F5 gate only)\n", __func__);
                 }
             }
             // WS-0 (P1) schedule-trace recorder (test/gating only): open the sink if requested.
@@ -2639,7 +2683,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             //  - container promotion: occupancy dropped (seq_rm) far enough that a higher tier fits
             //    with headroom — old rows keep their degraded quality (re-encoded recon, no
             //    information restored), but FUTURE rows encode at the higher tier.
-            if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+            if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
+                !vbr_f5_preserve_empty_tiers_) {
                 vbr_full_reset();
             }
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
@@ -4045,7 +4090,8 @@ void llama_kv_cache::breathe() {
     for (uint32_t st = 0; st < n_stream; ++st) {
         used_now += v_cells[st].get_used();
     }
-    if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+    if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
+        !vbr_f5_preserve_empty_tiers_) {
         vbr_full_reset();
     }
     const uint32_t wm_next = vbr_watermark_cells(0);
@@ -5253,10 +5299,27 @@ vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
                         value.extent->stash_off;
                     stash_rows = value.captured_stash;
                 }
+                // Match the live degrade path's page-tail discipline exactly.
+                // The target representation is smaller than its source, but
+                // VMM maps page-granular ranges.  Bytes after the target's
+                // logical prefix on the terminal mapped page must be scrubbed:
+                // a later padded attention read can otherwise reinterpret
+                // source-tier tail bytes as turbo block scales and propagate
+                // NaNs through an otherwise masked row.
+                const vbr_span span = vbr_span_of(
+                    value.extent->t, edge.target_type,
+                    int64_t(value.wm_cells), value.wm_cells,
+                    value.pool->gran);
+                vbr_scrub_span scrub;
+                if (!vbr_scrub_span_of(
+                        value.extent->t, edge.source_type,
+                        value.wm_cells, span, value.pool->gran, scrub)) {
+                    return false;
+                }
                 const ggml_vbr_transcode_params params = {
                     value.source, edge.target_type, value.extent->t->data,
                     value.pool->buf, int64_t(value.wm_cells), value.is_v,
-                    stash, stash_rows, 0,
+                    stash, stash_rows, scrub.scrub_end - scrub.keep,
                 };
                 value.pool->be->kv_transcode(value.pool->backend, &params);
                 const std::vector<ggml_tensor *> no_views;
@@ -7109,8 +7172,6 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
 
         for (auto & [pp, ep] : units) {
             vbr_extent  & e   = *ep;
-            const int64_t ne0 = e.t->ne[0];
-            const size_t rA = ggml_row_size(e.t->type, ne0);
 
             // every mapped row must become a VALID tier-B row — reads pad n_kv past the used cells, and
             // stale tier-A bytes reinterpreted as B can carry NaN f16 block scales that poison V sums
@@ -7124,12 +7185,15 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
             //               scrub stops here — pages past it are zero-filled fresh on map
             const vbr_span sp = vbr_span_of(e.t, type_B, n_cells, wm_next, pp->gran);
             const size_t slot      = sp.slot;
-            const size_t keep      = sp.keep;
             const size_t keep_live = sp.keep_live;
-            const size_t mapped_hi = std::min(slot, (size_t) GGML_PAD(rA * (size_t) n_cells, pp->gran));
-            const size_t scrub_end = std::min(mapped_hi, (size_t) GGML_PAD(keep_live, pp->gran));
+            vbr_scrub_span scrub = {};
 
             if (n_cells > 0) {
+                // Scrub math is only meaningful (and its >=keep invariant only
+                // holds) for a populated extent; a 0-cell degrade is a free
+                // metadata-only re-typing and must never reach the helper.
+                GGML_ASSERT(vbr_scrub_span_of(
+                    e.t, e.t->type, n_cells, sp, pp->gran, scrub));
                 if (pp->backend == nullptr) {
                     pp->backend = pp->be->backend_init(pp->device); // the dedicated per-device side stream
                     GGML_ASSERT(pp->backend != nullptr);
@@ -7179,7 +7243,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     /*.is_v        =*/ st.is_v != 0,
                     /*.stash_f16   =*/ stash_ptr,
                     /*.stash_rows  =*/ stash_rows,
-                    /*.scrub_bytes =*/ scrub_end - keep,
+                    /*.scrub_bytes =*/ scrub.scrub_end - scrub.keep,
                 };
                 pp->be->kv_transcode(pp->backend, &tp);
                 pp->wave_pending = true;
@@ -8966,12 +9030,9 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_i
             const vbr_span span = vbr_span_of(
                     ep->t, step.type_b, n_cells,
                     std::max(pp->wm_cells, child_state.incoming_wm), pp->gran);
-            const size_t r_a = ggml_row_size(step.type_a, ep->t->ne[0]);
-            const size_t mapped_hi = std::min(
-                    span.slot, (size_t) GGML_PAD(r_a*(size_t) n_cells, pp->gran));
-            const size_t scrub_end = std::min(
-                    mapped_hi, (size_t) GGML_PAD(span.keep_live, pp->gran));
-            GGML_ASSERT(scrub_end >= span.keep);
+            vbr_scrub_span scrub;
+            GGML_ASSERT(vbr_scrub_span_of(
+                ep->t, step.type_a, n_cells, span, pp->gran, scrub));
             const ggml_vbr_transcode_params params = {
                 /* .src         =*/ ep->t,
                 /* .type_B      =*/ step.type_b,
@@ -8981,7 +9042,7 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_i
                 /* .is_v        =*/ step.is_v,
                 /* .stash_f16   =*/ stash_ptr,
                 /* .stash_rows  =*/ stash_rows,
-                /* .scrub_bytes =*/ scrub_end - span.keep,
+                /* .scrub_bytes =*/ scrub.scrub_end - scrub.keep,
             };
             pp->be->kv_transcode(pp->backend, &params);
             pp->wave_pending = true;

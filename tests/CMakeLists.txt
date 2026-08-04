@@ -374,6 +374,13 @@ add_test(
 )
 
 add_test(
+    NAME test-vbr-f5-gate-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-f5-gate.cmake
+)
+
+add_test(
     NAME test-cache-plan-contract-source
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}

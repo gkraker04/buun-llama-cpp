@@ -206,7 +206,7 @@ struct vbr_adopt_stage_result {
     vbr_adopt_stage_status status =
         vbr_adopt_stage_status::internal_error;
     vbr_downward_reserve_status downward_status =
-        vbr_downward_reserve_status::internal_error;
+        vbr_downward_reserve_status::not_attempted;
     std::unique_ptr<vbr_validated_manifest> manifest;
     std::unique_ptr<vbr_staged_payloads> staged;
 };

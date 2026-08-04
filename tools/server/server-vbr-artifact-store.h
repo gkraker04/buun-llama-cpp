@@ -225,7 +225,7 @@ struct server_vbr_artifact_import_output {
     vbr_adopt_stage_status stage_status =
         vbr_adopt_stage_status::internal_error;
     vbr_downward_reserve_status downward_reserve_status =
-        vbr_downward_reserve_status::internal_error;
+        vbr_downward_reserve_status::not_attempted;
     vbr_adopt_status adopt_status = vbr_adopt_status::internal_error;
     bool adopt_attempted = false;
     vbr_adopt_phase phase = vbr_adopt_phase::consume_capabilities;

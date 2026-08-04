@@ -284,6 +284,7 @@ vbr_downward_resource_receipts::find(const endpoint_key & key) noexcept {
 
 const char * vbr_downward_reserve_status_name(vbr_downward_reserve_status status) noexcept {
     switch (status) {
+        case vbr_downward_reserve_status::not_attempted: return "not_attempted";
         case vbr_downward_reserve_status::reserved: return "reserved";
         case vbr_downward_reserve_status::reserved_stashless: return "reserved_stashless";
         case vbr_downward_reserve_status::projection_unavailable: return "projection_unavailable";

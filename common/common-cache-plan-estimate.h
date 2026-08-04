@@ -77,6 +77,7 @@ enum class common_cache_plan_vbr_value_grammar : uint8_t {
     X("VBR_DEGRADE_ORDER",             1, path)                        \
     X("VBR_FORCE_GENERIC",             1, scalar)                      \
     X("VBR_FREEZE",                    1, scalar)                      \
+    X("VBR_F5_PRESERVE_EMPTY_TIERS",  1, scalar)                      \
     X("VBR_GENERATION_FORCE_AUDIT",    1, scalar)                      \
     X("VBR_GENERATION_ORACLE",         1, scalar)                      \
     X("VBR_GENERATION_ORACLE_INJECT",  1, scalar)                      \

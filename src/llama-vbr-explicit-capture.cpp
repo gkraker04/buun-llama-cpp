@@ -505,13 +505,15 @@ public:
             }
             type_mismatch = type_mismatch ||
                 int32_t(tensor->type) != descriptor.current_type;
+            const auto live_generation = tracker->unit_generation(
+                descriptor.logical_unit_id);
             vbr_target_unit_snapshot target;
             target.child_id = descriptor.child_id;
             target.logical_unit_id = descriptor.logical_unit_id;
             target.current_type = tensor->type;
-            target.last_source_type = tensor->type;
-            target.promote_hops = descriptor.promote_hops;
-            target.last_transition = descriptor.last_transition;
+            target.last_source_type = live_generation.last_source_type;
+            target.promote_hops = live_generation.promote_hops;
+            target.last_transition = live_generation.last_transition;
             target.representation_kind = descriptor.representation.kind;
             target.codec_id = descriptor.representation.codec_id;
             target.codec_version = descriptor.representation.codec_version;
@@ -525,8 +527,7 @@ public:
             target.side = descriptor.side;
             target.layout = descriptor.layout;
             target.row_codec_version = descriptor.row_codec_version;
-            target.current_domain = tracker->unit_generation(
-                descriptor.logical_unit_id).domain;
+            target.current_domain = live_generation.domain;
             target.codebook_digest = descriptor.codebook_digest;
             target.rotation_digest = descriptor.rotation_digest;
             target.meansub_digest = descriptor.meansub_digest;
@@ -677,11 +678,19 @@ public:
             auto & child = indexed[child_index];
             for (auto & unit : child.target->units) {
                 if (unit.logical_unit_id >= child.units.size() ||
-                    !child.units[unit.logical_unit_id] ||
+                    !child.units[unit.logical_unit_id]) {
+                    return false;
+                }
+                const auto source_type = static_cast<ggml_type>(
+                    child.units[unit.logical_unit_id]->descriptor.current_type);
+                // The projected prefix is tree-wide, but only units whose
+                // representation changes need a transcode recipe. Unchanged
+                // units retain their native geometry and are validated by the
+                // ordinary representation path.
+                if (source_type != unit.current_type &&
                     !child.cache->vbr_downward_bind_target_unit(
-                        static_cast<ggml_type>(child.units[
-                            unit.logical_unit_id]->descriptor.current_type),
-                        projection, uint32_t(child_index), unit)) {
+                        source_type, projection,
+                        uint32_t(child_index), unit)) {
                     return false;
                 }
             }

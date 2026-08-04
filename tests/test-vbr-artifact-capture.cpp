@@ -723,6 +723,9 @@ static void test_server_reference_tenant_authorization() {
 
 static void test_server_import_route_classification() {
     using status = server_vbr_artifact_import_status;
+    server_vbr_artifact_import_output untouched;
+    CHECK(untouched.downward_reserve_status ==
+          vbr_downward_reserve_status::not_attempted);
     CHECK(server_vbr_artifact_import_route_precheck(
               false, false, false, false, false) == status::unsupported);
     CHECK(server_vbr_artifact_import_route_precheck(
