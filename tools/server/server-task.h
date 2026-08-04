@@ -739,6 +739,11 @@ struct server_prompt_cache_state {
     llama_cache_acct_op_id acct_op_ckpt;
     llama_cache_acct_op_id acct_op_accel;
 
+    // Request-local observer identity. It lives on the list node so save-time
+    // dedup/splice preserves surviving identities and an allocator-reused
+    // address can never inherit a consumed entry's source id.
+    int32_t cache_plan_source_id = -1;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -774,11 +779,7 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    // Observer-only request-local node registry. Raw addresses never leave this
-    // process or enter the record; their fixed-array ordinal is the source id.
-    std::array<const void *, COMMON_CACHE_PLAN_MAX_CANDIDATES>
-        cache_plan_source_instances{};
-    uint32_t cache_plan_n_source_instances = 0;
+    int32_t cache_plan_next_source_id = 0;
 
     size_t size() const;
 
@@ -809,10 +810,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id);
 
     void update();
 

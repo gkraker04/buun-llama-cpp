@@ -464,6 +464,11 @@ struct common_cache_plan_candidate {
 
     bool is_chain() const noexcept { return (phases_seen & COMMON_CACHE_PLAN_PHASE_CHAIN) != 0; }
 
+    bool viable() const noexcept {
+        return disposition == common_cache_plan_disposition::accepted ||
+               disposition == common_cache_plan_disposition::valid_not_chosen_cost;
+    }
+
     // the shipped winner's promotion over the scan-time cost-loser default — one invariant
     // pair, so no site can reset the disposition but forget the reason
     void accept() noexcept {
@@ -559,12 +564,17 @@ struct common_cache_plan_record {
     // legacy/executed name the shipped plan and planner names `shadow_choice`.
     // B-A0b planner evidence is a pre-mutation counterfactual. Agreement stats
     // therefore include known structural noise: save-before-load can introduce
-    // a fresh host entry absent from the planner inventory; host-composed
+    // a fresh host entry absent from the planner inventory; the legacy
+    // counterfactual does not model the seam's pos_min/SWA/recurrent coverage
+    // recovery and can over-claim checkpoint reuse; it can also over-claim
+    // live replay when an adapter rebind makes the shipped path cold; host-composed
     // checkpoints are evaluated optimistically until the post-restore frontier
     // exists; and a flipped frontier ratchet can select by logical-next-position
     // while the inventory still records legacy physical coverage. Ratchet gates
     // must separate these classes rather than treating every disagreement as an
-    // economic-policy miss.
+    // economic-policy miss. Schema 5 has no separate execution_failed fallback;
+    // a genuine post-authorization restore failure is recorded as internal_fault
+    // rather than silently extending the frozen vocabulary in B-A1.
     common_cache_plan_authority_receipt authority;
 
     // Process-local B-A staging state; deliberately not serialized. A
@@ -690,6 +700,37 @@ struct common_cache_plan_record {
             }
         }
         return &c;
+    }
+
+    const common_cache_plan_candidate * find_chain(
+            common_cache_plan_provider base_provider,
+            int32_t comp0,
+            int32_t comp1) const noexcept {
+        for (uint32_t i = 0; i < n_inventory; ++i) {
+            const auto & candidate = inventory[i];
+            if (!candidate.is_chain() || candidate.provider != base_provider ||
+                candidate.component_ids[0] != comp0 ||
+                candidate.component_ids[1] != comp1) {
+                continue;
+            }
+            bool exact = true;
+            for (size_t j = 2; j < candidate.component_ids.size(); ++j) {
+                exact = exact && candidate.component_ids[j] == -1;
+            }
+            if (exact) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    }
+
+    common_cache_plan_candidate * find_chain(
+            common_cache_plan_provider base_provider,
+            int32_t comp0,
+            int32_t comp1) noexcept {
+        return const_cast<common_cache_plan_candidate *>(
+            static_cast<const common_cache_plan_record &>(*this).find_chain(
+                base_provider, comp0, comp1));
     }
     void select(common_cache_plan_provider provider, const common_cache_plan_candidate * c) noexcept {
         selected[size_t(provider)] = c ? int32_t(c - inventory.data()) : -1;

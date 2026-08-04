@@ -4,11 +4,62 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <array>
+#include <memory>
 #include <string>
 
+enum class server_cache_plan_execution_kind : uint8_t {
+    legacy = 0,
+    live_replay,
+    host_restore,
+    checkpoint_restore,
+    host_checkpoint_restore,
+    cold_replay,
+    _count,
+};
+
+// Process-local execution capability. It contains only request-local inventory
+// ordinals/source ids, never a pointer into a cache container. The server
+// revalidates those ids immediately before the first mutation.
+struct server_cache_plan_execution {
+    server_cache_plan_execution_kind kind =
+        server_cache_plan_execution_kind::legacy;
+    int32_t target = -1;
+    int32_t host_source_id = -1;
+    int32_t checkpoint_source_id = -1;
+
+    constexpr bool authoritative() const noexcept {
+        return kind != server_cache_plan_execution_kind::legacy;
+    }
+
+    constexpr bool restores_checkpoint() const noexcept {
+        return kind == server_cache_plan_execution_kind::checkpoint_restore ||
+               kind == server_cache_plan_execution_kind::host_checkpoint_restore;
+    }
+
+    void clear() noexcept { *this = {}; }
+};
+
+static_assert(uint8_t(common_cache_plan_selection::none) ==
+              uint8_t(common_cache_plan_authority_level::off));
+static_assert(uint8_t(common_cache_plan_selection::by_id) ==
+              uint8_t(common_cache_plan_authority_level::by_id));
+static_assert(uint8_t(common_cache_plan_selection::similarity) ==
+              uint8_t(common_cache_plan_authority_level::similarity));
+static_assert(uint8_t(common_cache_plan_selection::route_home) ==
+              uint8_t(common_cache_plan_authority_level::route_home));
+static_assert(uint8_t(common_cache_plan_selection::lru) ==
+              uint8_t(common_cache_plan_authority_level::lru));
+static_assert(uint8_t(common_cache_plan_selection::_count) ==
+              uint8_t(common_cache_plan_authority_level::_count));
+
+constexpr common_cache_plan_authority_level server_cache_plan_level_of(
+        common_cache_plan_selection selection) noexcept {
+    return static_cast<common_cache_plan_authority_level>(selection);
+}
+
 // B-A pre-mutation decision substrate. It is process-local and contains no
-// shipped cache state. B-A0b only dual-runs: execution remains legacy.
+// shipped cache state. Authority is graduated through the parallel selection
+// and configured-level order pinned above.
 struct server_cache_plan_authority {
     common_cache_plan_authority_level configured_level =
         common_cache_plan_authority_level::off;
@@ -31,10 +82,101 @@ struct server_cache_plan_authority {
         common_cache_plan_authority_fallback reason =
             common_cache_plan_authority_fallback::internal_fault) noexcept;
 
-    // Legacy execution has completed. Preserve the pre-mutation counterfactual
-    // and fill only the legacy/executed sides of the schema-v5 receipt.
-    void finalize_legacy_execution(common_cache_plan_record & rec) noexcept;
+    // Authorize one complete plan at the record's selected tier and target.
+    // Any planner refusal or malformed/cross-target plan returns the legacy
+    // directive and records a typed fallback before mutation.
+    server_cache_plan_execution authorize(
+        common_cache_plan_record & rec,
+        int32_t target_slot_id,
+        bool host_lookup_enabled = true,
+        bool target_identity_matches = true) noexcept;
+
+    // Capability drift discovered after planning but before mutation. Preserve
+    // the planner verdict for agreement telemetry while reverting execution to
+    // the untouched legacy path.
+    void fallback_legacy(
+        common_cache_plan_record & rec,
+        common_cache_plan_authority_fallback reason) noexcept;
+
+    // Execution has completed. The schema-v5 receipt keeps the counterfactual
+    // legacy plan under authority and always records the plan that really ran.
+    void finalize_execution(common_cache_plan_record & rec) noexcept;
 };
+
+// Counterfactual forced-slot legacy provider sequence over the complete
+// pre-mutation inventory. This is telemetry identity only; it never executes.
+int32_t server_cache_plan_legacy_candidate(
+    const common_cache_plan_record & rec,
+    int32_t target_slot_id,
+    bool host_lookup_enabled = true) noexcept;
+
+bool server_cache_plan_execution_from_candidate(
+    const common_cache_plan_record & rec,
+    int32_t candidate,
+    int32_t target_slot_id,
+    server_cache_plan_execution & out) noexcept;
+
+constexpr int32_t server_cache_plan_checkpoint_ordinal_from_source_id(
+    int32_t source_id,
+    int32_t host_source_id) noexcept;
+
+// A selected slot is armed before launch so the existing mutation seams can
+// consume the directive. Every exit that does not launch must disarm both
+// process-local pieces together; otherwise a later request could inherit a
+// stale directive and record.
+template<class PlanPtr>
+void server_cache_plan_disarm_unlaunched(
+        server_cache_plan_execution & execution,
+        PlanPtr & plan) noexcept {
+    execution.clear();
+    plan.reset();
+}
+
+// Coverage recovery is a shipped correctness seam, not a cost-planner input.
+// Until B-A2 prices SWA/recurrent frontiers, an authoritative non-checkpoint
+// plan reaching this condition must demote and run the legacy recovery block.
+constexpr bool server_cache_plan_requires_coverage_recovery(
+        const server_cache_plan_execution & execution,
+        int64_t pos_min,
+        int64_t pos_min_threshold) noexcept {
+    return execution.authoritative() && !execution.restores_checkpoint() &&
+           pos_min >= pos_min_threshold;
+}
+
+bool server_cache_plan_demote_for_coverage_recovery(
+    server_cache_plan_authority & authority,
+    common_cache_plan_record & rec,
+    server_cache_plan_execution & execution,
+    int64_t pos_min,
+    int64_t pos_min_threshold) noexcept;
+
+// Translate a planned checkpoint only after the live seam has revalidated its
+// eligibility. A false result means "use the legacy iterator", never "cold".
+constexpr bool server_cache_plan_checkpoint_override_ordinal(
+        const server_cache_plan_execution & execution,
+        size_t checkpoint_count,
+        bool eligible,
+        int32_t & ordinal) noexcept {
+    if (!execution.restores_checkpoint() || !eligible) {
+        ordinal = -1;
+        return false;
+    }
+    const int32_t host_source =
+        execution.kind ==
+                server_cache_plan_execution_kind::host_checkpoint_restore
+            ? execution.host_source_id : -1;
+    ordinal = server_cache_plan_checkpoint_ordinal_from_source_id(
+        execution.checkpoint_source_id, host_source);
+    return ordinal >= 0 && size_t(ordinal) < checkpoint_count;
+}
+
+bool server_cache_plan_revalidate_checkpoint_execution(
+    server_cache_plan_authority & authority,
+    common_cache_plan_record & rec,
+    server_cache_plan_execution & execution,
+    size_t checkpoint_count,
+    bool eligible,
+    int32_t & ordinal) noexcept;
 
 // Stable, allocation-free capability fold used at the immediately-pre-mutation
 // revalidation seam. Callers fold exactly the state that made candidates usable.
@@ -62,23 +204,65 @@ constexpr int32_t server_cache_plan_host_checkpoint_source_id(
           checkpoint_ordinal;
 }
 
-// Observer-only host-state identity. The fixed request-local registry assigns
-// small wire ids to list-node addresses without serializing or hashing the
-// pointer. Surviving nodes retain identity across save dedup/eviction; the new
-// staged node has a distinct address and takes the next id.
-bool server_cache_plan_find_or_assign_source_id(
-    const void * instance,
-    std::array<const void *, COMMON_CACHE_PLAN_MAX_CANDIDATES> & instances,
-    uint32_t & n_instances,
+// Decode a checkpoint source id to the inventory's stable forward ordinal.
+// A host-qualified source must remain inside that host's namespace.
+constexpr int32_t server_cache_plan_checkpoint_ordinal_from_source_id(
+        int32_t source_id,
+        int32_t host_source_id = -1) noexcept {
+    if (source_id < 0) {
+        return -1;
+    }
+    if (host_source_id < 0) {
+        return source_id < SERVER_CACHE_PLAN_HOST_CHECKPOINT_STRIDE
+            ? source_id : -1;
+    }
+    const int32_t base = server_cache_plan_host_checkpoint_source_id(
+        host_source_id, 0);
+    if (base < 0 || source_id < base) {
+        return -1;
+    }
+    const int32_t ordinal = source_id - base;
+    return ordinal < SERVER_CACHE_PLAN_HOST_CHECKPOINT_STRIDE
+        ? ordinal : -1;
+}
+
+constexpr int32_t server_cache_plan_checkpoint_reverse_position_from_source_id(
+        size_t checkpoint_count,
+        int32_t source_id,
+        int32_t host_source_id = -1) noexcept {
+    const int32_t ordinal = server_cache_plan_checkpoint_ordinal_from_source_id(
+        source_id, host_source_id);
+    return ordinal < 0 || size_t(ordinal) >= checkpoint_count
+        ? -1 : int32_t(checkpoint_count - 1 - size_t(ordinal));
+}
+
+// Observer-only request-local host-state identity. The id is stored on the
+// list node, so surviving nodes remain stable across save dedup/splice and an
+// allocator-reused address cannot inherit a consumed source id.
+bool server_cache_plan_assign_source_id(
+    int32_t & instance_source_id,
+    int32_t & next_source_id,
     int32_t & source_id) noexcept;
 
 // Checkpoint containers are enumerated forward by the authority inventory but
 // reverse by the shipped selector. Translate reverse visit position back to
 // the forward ordinal used by both live and host-composed inventory rows.
-int32_t server_cache_plan_checkpoint_source_id_from_reverse(
+constexpr int32_t server_cache_plan_checkpoint_source_id_from_reverse(
     size_t checkpoint_count,
     uint32_t reverse_ordinal,
-    int32_t host_source_id = -1) noexcept;
+    int32_t host_source_id = -1) noexcept {
+    if (checkpoint_count == 0 || reverse_ordinal >= checkpoint_count) {
+        return -1;
+    }
+    const size_t forward = checkpoint_count - 1 - reverse_ordinal;
+    if (forward >= size_t(SERVER_CACHE_PLAN_HOST_CHECKPOINT_STRIDE)) {
+        return -1;
+    }
+    return host_source_id >= 0
+        ? server_cache_plan_host_checkpoint_source_id(
+              host_source_id, int32_t(forward))
+        : int32_t(forward);
+}
 
 constexpr bool server_cache_plan_viable(
         common_cache_plan_reason reason) noexcept {
@@ -89,13 +273,15 @@ struct server_cache_plan_live_evaluation {
     common_cache_plan_reason reason = COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE;
     uint64_t lcp_tokens = 0;
     float sim = 0.0f;
+    float f_keep = 0.0f;
 };
 
 server_cache_plan_live_evaluation server_cache_plan_evaluate_live(
     bool busy,
     bool has_payload,
     uint64_t lcp_tokens,
-    uint64_t prompt_tokens) noexcept;
+    uint64_t prompt_tokens,
+    uint64_t source_tokens = 0) noexcept;
 
 void server_cache_plan_apply_live(
     common_cache_plan_candidate * row,

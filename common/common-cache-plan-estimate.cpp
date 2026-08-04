@@ -239,18 +239,11 @@ std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_desc
     return hw;
 }
 
-// does this row participate in the shadow optimum? (valid candidates only; validity
-// precedes economics — the planner NEVER re-derives validity)
-static bool cache_plan_row_valid(const common_cache_plan_candidate & c) {
-    return c.disposition == common_cache_plan_disposition::accepted ||
-           c.disposition == common_cache_plan_disposition::valid_not_chosen_cost;
-}
-
 // root-optimum membership: valid AND independently executable from the request's starting
 // state — a component-only row (checkpoint exposed by a delivered host entry) is priced as
 // a chain component but can never win on its own (verify-r1 finding 1)
 static bool cache_plan_row_participates(const common_cache_plan_candidate & c) {
-    return cache_plan_row_valid(c) && !c.component_only;
+    return c.viable() && !c.component_only;
 }
 
 // the ONE place terms are written and versions stamped: restore + replay + workspace
@@ -358,7 +351,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     // be a fabricated verdict)
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         auto & c = rec.inventory[i];
-        if (!cache_plan_row_valid(c) || c.is_chain()) {
+        if (!c.viable() || c.is_chain()) {
             continue;
         }
         if (!cache_plan_estimate_row(c, n_prompt, calib)) {
@@ -370,7 +363,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     // the DEEPEST component's (the chain replays only past its furthest frontier)
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         auto & c = rec.inventory[i];
-        if (!c.is_chain() || !cache_plan_row_valid(c)) {
+        if (!c.is_chain() || !c.viable()) {
             continue;
         }
         uint64_t restore_bytes = 0, replay_tokens = UINT64_MAX;

@@ -455,6 +455,7 @@ struct server_slot {
     // record, serialized once at finalize and reused verbatim by /slots
     std::unique_ptr<common_cache_plan_record> cache_plan;
     json cache_plan_json;
+    server_cache_plan_execution cache_plan_execution;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -588,7 +589,7 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr, int32_t required_source_id = -1) {
         // A host snapshot replaces the live frontier wholesale. Any rolling
         // tape rooted in the displaced frontier is no longer a valid lineage.
         if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
@@ -596,7 +597,8 @@ struct server_slot {
             return false;
         }
         dflash_window_identity.clear();
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, adapter_config_key, obs);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
+                                     adapter_config_key, obs, required_source_id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -960,6 +962,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        cache_plan_execution.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2732,7 +2735,7 @@ private:
                 }
             }
             if (cache_plan_authority) {
-                cache_plan_authority->finalize_legacy_execution(rec);
+                cache_plan_authority->finalize_execution(rec);
             } else {
                 common_cache_plan_finalize_shadow_authority(rec);
             }
@@ -5222,7 +5225,7 @@ private:
             }
             server_cache_plan_apply_live(row, server_cache_plan_evaluate_live(
                 slot.is_processing(), !slot.prompt.tokens.empty(), slot_lcps[i],
-                task.tokens.size()));
+                task.tokens.size(), slot.prompt.tokens.size()));
             // The shipped similarity scan visits below-threshold rows too;
             // authority membership is the first tier that can select the target.
             row->origin_tier = origin;
@@ -5314,8 +5317,6 @@ private:
                         if (!chain) {
                             return false;
                         }
-                        chain->target_slot_id = candidate_target.id;
-                        chain->origin_tier = origin;
                         chain->disposition =
                             common_cache_plan_disposition::valid_not_chosen_cost;
                     }
@@ -5442,6 +5443,182 @@ private:
         }
     }
 
+    bool cache_plan_execution_revalidate(
+            const server_task & task,
+            const server_slot & target,
+            bool adapter_matches,
+            const std::string & incoming_adapter,
+            const server_cache_plan_execution & execution) {
+        if (!execution.authoritative() || execution.target != target.id ||
+            target.is_processing()) {
+            return false;
+        }
+        if (execution.kind != server_cache_plan_execution_kind::cold_replay &&
+            !adapter_matches) {
+            // The existing launch seam clears on an adapter rebind. Until a
+            // future ratchet can bind-before-restore, such a plan is not an
+            // executable reuse plan and must fall back before mutation.
+            return false;
+        }
+
+        const auto find_host = [&](int32_t source_id)
+                -> const server_prompt_cache_state * {
+            if (!prompt_cache || source_id < 0) {
+                return nullptr;
+            }
+            for (auto & state : prompt_cache->states) {
+                int32_t observed = -1;
+                if (prompt_cache->cache_plan_get_source_id(state, observed) &&
+                    observed == source_id && !state.data.main.empty() &&
+                    state.adapter_config_key == incoming_adapter) {
+                    return &state;
+                }
+            }
+            return nullptr;
+        };
+        const auto checkpoint_alive = [](
+                const auto & checkpoints,
+                int32_t source_id,
+                int32_t host_source_id) {
+            const int32_t ordinal =
+                server_cache_plan_checkpoint_ordinal_from_source_id(
+                    source_id, host_source_id);
+            return ordinal >= 0 && size_t(ordinal) < checkpoints.size() &&
+                   !std::next(checkpoints.begin(), ordinal)->empty();
+        };
+
+        switch (execution.kind) {
+            case server_cache_plan_execution_kind::live_replay:
+                return !target.prompt.tokens.empty();
+            case server_cache_plan_execution_kind::host_restore: {
+                const auto * host = find_host(execution.host_source_id);
+                return task.type == SERVER_TASK_TYPE_COMPLETION && host;
+            }
+            case server_cache_plan_execution_kind::checkpoint_restore:
+                return checkpoint_alive(target.prompt.checkpoints,
+                    execution.checkpoint_source_id, -1);
+            case server_cache_plan_execution_kind::host_checkpoint_restore: {
+                const auto * host = find_host(execution.host_source_id);
+                return task.type == SERVER_TASK_TYPE_COMPLETION &&
+                       host && checkpoint_alive(host->prompt.checkpoints,
+                           execution.checkpoint_source_id,
+                           execution.host_source_id);
+            }
+            case server_cache_plan_execution_kind::cold_replay:
+                // Pre-D-A cold authority is limited to construction-empty
+                // targets. Clearing retained live/checkpoint state is a
+                // divergent destruction plan and remains D-A's authority.
+                return target.prompt.tokens.empty() &&
+                       target.prompt.checkpoints.empty();
+            case server_cache_plan_execution_kind::legacy:
+            case server_cache_plan_execution_kind::_count:
+                return false;
+        }
+        return false;
+    }
+
+    static void cache_plan_host_restore_failed(
+            server_slot & slot,
+            common_cache_plan_record * rec) {
+        if (rec) {
+            rec->restore_attempt_failed = true;
+        }
+        slot.mandatory_recovery_reset(
+            server_cache_destruction_reason::restore_failure);
+    }
+
+    void cache_plan_fallback_legacy(
+            server_slot & slot,
+            common_cache_plan_authority_fallback reason) {
+        if (!slot.cache_plan_execution.authoritative()) {
+            return;
+        }
+        GGML_ASSERT(cache_plan_authority && slot.cache_plan);
+        cache_plan_authority->fallback_legacy(*slot.cache_plan, reason);
+        slot.cache_plan_execution.clear();
+    }
+
+    bool cache_plan_checkpoint_execution_revalidate(
+            const server_slot & slot,
+            llama_pos pos_next,
+            llama_pos pos_min_threshold) const {
+        const auto & execution = slot.cache_plan_execution;
+        if (!execution.restores_checkpoint()) {
+            return true;
+        }
+        int32_t ordinal = -1;
+        if (!server_cache_plan_checkpoint_override_ordinal(
+                execution, slot.prompt.checkpoints.size(), true, ordinal)) {
+            return false;
+        }
+        const auto & checkpoint = *std::next(
+            slot.prompt.checkpoints.begin(), ordinal);
+        const bool recurrent = llama_model_is_recurrent(model_tgt) ||
+                               llama_model_is_hybrid(model_tgt);
+        const auto vbr_now = llama_memory_vbr_state(
+            llama_get_memory(ctx_tgt), slot.id, 0);
+        const bool representation_matches =
+            !recurrent ||
+            (checkpoint.representation_epoch == vbr_now.representation_epoch &&
+             checkpoint.representation_epoch_swa ==
+                 vbr_now.representation_epoch_swa);
+        bool frontier_current = false;
+        try {
+            // Authority requires current durable frontier evidence even while
+            // the legacy frontier ratchet remains in shadow. Host-composed
+            // inventory was optimistic; this is its first exact live check.
+            frontier_current = checkpoint_frontier_is_current(
+                slot, checkpoint, lora_config_identity(slot.lora));
+        } catch (...) {
+            return false;
+        }
+        return server_cache_plan_viable(
+            server_cache_plan_evaluate_checkpoint(
+                !checkpoint.empty(), frontier_current, recurrent,
+                representation_matches, checkpoint.pos_min,
+                checkpoint.pos_max, pos_next, pos_min_threshold,
+                checkpoint.size_without_shadow()).reason);
+    }
+
+    std::list<common_prompt_checkpoint>::reverse_iterator
+    cache_plan_override_checkpoint(
+            server_slot & slot,
+            std::list<common_prompt_checkpoint>::reverse_iterator fallback) {
+        if (!slot.cache_plan_execution.restores_checkpoint()) {
+            return fallback;
+        }
+        int32_t ordinal = -1;
+        if (!server_cache_plan_checkpoint_override_ordinal(
+                slot.cache_plan_execution, slot.prompt.checkpoints.size(),
+                true, ordinal)) {
+            // A late container drift demotes to the same iterator the shipped
+            // scan selected. Missing authority evidence must never synthesize
+            // a cold reset.
+            cache_plan_fallback_legacy(
+                slot, common_cache_plan_authority_fallback::stale_capability);
+            return fallback;
+        }
+
+        auto selected_it = std::make_reverse_iterator(
+            std::next(slot.prompt.checkpoints.begin(), ordinal + 1));
+        const auto & execution = slot.cache_plan_execution;
+        if (slot.cache_plan) {
+            auto * selected = slot.cache_plan->find_or_add(
+                common_cache_plan_provider::live_context_checkpoint,
+                execution.checkpoint_source_id,
+                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                slot.id,
+                slot.cache_plan->selection);
+            if (selected) {
+                selected->accept();
+                slot.cache_plan->select(
+                    common_cache_plan_provider::live_context_checkpoint,
+                    selected);
+            }
+        }
+        return selected_it;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -5450,6 +5627,7 @@ private:
         std::vector<common_adapter_lora_info> incoming_loras;
         std::string incoming_adapter;
         bool incoming_adapter_ready = false;
+        bool incoming_adapter_matches = false;
 
         // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
         // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
@@ -5748,6 +5926,13 @@ private:
         }
 
         if (ret) {
+            if (!selection_deferred_busy) {
+                // An idle slot cannot own an in-flight directive. Clear any
+                // abandoned pre-launch arm before this request installs its
+                // own record; this also covers observer allocation failure.
+                server_cache_plan_disarm_unlaunched(
+                    ret->cache_plan_execution, ret->cache_plan);
+            }
             if (plan_rec) {
                 // plan_rec is created only by the debug-or-authority substrate,
                 // which always owns cache_plan_authority.
@@ -5760,14 +5945,33 @@ private:
                         : construct_lora_list(task.params.lora);
                     incoming_adapter = lora_config_identity(incoming_loras);
                     incoming_adapter_ready = true;
+                    incoming_adapter_matches =
+                        are_lora_equal(incoming_loras, ret->lora);
                     cache_plan_inventory_before_mutation(
                         task, *ret, incoming_adapter, *plan_rec);
                     const uint64_t capability_after =
                         cache_plan_capability_snapshot(task);
                     cache_plan_authority->plan_before_mutation(
                         *plan_rec, capability_before, capability_after);
+                    auto execution = cache_plan_authority->authorize(
+                        *plan_rec, ret->id,
+                        update_cache && prompt_cache &&
+                        task.type == SERVER_TASK_TYPE_COMPLETION &&
+                        incoming_adapter_matches,
+                        incoming_adapter_matches);
+                    if (execution.authoritative() &&
+                        !cache_plan_execution_revalidate(
+                            task, *ret, incoming_adapter_matches,
+                            incoming_adapter, execution)) {
+                        cache_plan_authority->fallback_legacy(
+                            *plan_rec,
+                            common_cache_plan_authority_fallback::stale_capability);
+                        execution.clear();
+                    }
+                    ret->cache_plan_execution = execution;
                 } catch (...) {
                     cache_plan_authority->fail_closed(*plan_rec);
+                    ret->cache_plan_execution.clear();
                     if (cache_plan_obs) {
                         cache_plan_obs->shadow_unavailable++;
                     }
@@ -5792,27 +5996,29 @@ private:
 
             // note: prompt_save() itself is a no-op when the slot's context is empty
 
+            // A deferred busy slot retains the directive of its in-flight
+            // request. It is reachable here, but must not execute that plan a
+            // second time for the deferred task.
+            common_cache_plan_record * request_cache_plan =
+                selection_deferred_busy ? nullptr : ret->cache_plan.get();
+            bool authority_exec =
+                !selection_deferred_busy &&
+                ret->cache_plan_execution.authoritative();
+
             update_cache = update_cache && prompt_cache;
+            update_cache = update_cache &&
+                           task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
+            int64_t prompt_cache_t_start = 0;
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
+                prompt_cache_t_start = ggml_time_us();
 
-                const int64_t t_start = ggml_time_us();
-
-                // save the displaced slot's state under ITS current adapter identity (prompt_save
-                // reads slot.lora), then load using the INCOMING request's identity [I6/finding 4]:
-                // selection runs before launch_slot_with_task rebinds slot.lora, so slot.lora is
-                // still the previous occupant's config here and would mis-key the cache lookup.
+                // Saving the displaced state is an independent durability
+                // side effect of the shipped path. Authority changes which
+                // complete reuse plan runs; it does not gain D-A destruction
+                // authority to skip this save.
                 ret->prompt_save(*prompt_cache);
-
-                // A busy by-id selection is returned for caller-side deferral.
-                // Its existing record belongs to the in-flight request, so this
-                // retry must not append host evidence to it.
-                common_cache_plan_record * request_cache_plan =
-                    selection_deferred_busy ? nullptr : ret->cache_plan.get();
 
                 if (!incoming_adapter_ready) {
                     incoming_loras = task.params.lora.empty()
@@ -5820,27 +6026,76 @@ private:
                         : construct_lora_list(task.params.lora);
                     incoming_adapter = lora_config_identity(incoming_loras);
                     incoming_adapter_ready = true;
+                    incoming_adapter_matches =
+                        are_lora_equal(incoming_loras, ret->lora);
+                }
+                if (request_cache_plan) {
+                    request_cache_plan->identity.adapter_config_digest =
+                        llama_cache_acct_value::measured(
+                            std::hash<std::string>{}(incoming_adapter));
                 }
 
+                // save/publish can deduplicate or evict host nodes. Revalidate
+                // the exact source after that mutation and before the required
+                // load. A soft miss is a typed legacy fallback, not a restore
+                // failure and never a mandatory slot reset.
+                if (authority_exec &&
+                    (ret->cache_plan_execution.kind ==
+                         server_cache_plan_execution_kind::host_restore ||
+                     ret->cache_plan_execution.kind ==
+                         server_cache_plan_execution_kind::host_checkpoint_restore) &&
+                    !cache_plan_execution_revalidate(
+                        task, *ret, incoming_adapter_matches,
+                        incoming_adapter, ret->cache_plan_execution)) {
+                    cache_plan_fallback_legacy(
+                        *ret,
+                        common_cache_plan_authority_fallback::stale_capability);
+                    authority_exec = false;
+                }
+            }
+
+            if (authority_exec) {
+                GGML_ASSERT(request_cache_plan != nullptr);
+                switch (ret->cache_plan_execution.kind) {
+                    case server_cache_plan_execution_kind::host_restore:
+                    case server_cache_plan_execution_kind::host_checkpoint_restore:
+                        GGML_ASSERT(prompt_cache && incoming_adapter_ready);
+                        if (!ret->prompt_load(
+                                *prompt_cache, task.tokens, incoming_adapter,
+                                request_cache_plan,
+                                ret->cache_plan_execution.host_source_id)) {
+                            cache_plan_host_restore_failed(
+                                *ret, request_cache_plan);
+                        }
+                        break;
+                    case server_cache_plan_execution_kind::cold_replay:
+                        ret->prompt_clear(
+                            server_cache_destruction_reason::slot_rebind);
+                        break;
+                    case server_cache_plan_execution_kind::live_replay:
+                    case server_cache_plan_execution_kind::checkpoint_restore:
+                        // The selected live state is already resident. The
+                        // checkpoint route is applied later at the existing
+                        // restore seam; neither plan mutates host-cache state.
+                        break;
+                    case server_cache_plan_execution_kind::legacy:
+                    case server_cache_plan_execution_kind::_count:
+                        GGML_ABORT("invalid B-A1 authority execution");
+                }
+            }
+
+            if (update_cache && !authority_exec) {
                 // Only restore from the host cache when the selected slot's current adapter identity
                 // already matches the incoming request's [finding 1]. Otherwise launch_slot_with_task
                 // clears this slot for the adapter change, so a restore here would consume a cache
                 // entry only to have it immediately wiped. (Cross-identity reuse -- moving a request
                 // onto a differently-bound LRU slot -- needs identity-aware selection, deferred.)
-                if (request_cache_plan) {
-                    // adapter identity: the shipped path computes this key for the lookup
-                    request_cache_plan->identity.adapter_config_digest = llama_cache_acct_value::measured(
-                        std::hash<std::string>{}(incoming_adapter));
-                }
-                if (are_lora_equal(incoming_loras, ret->lora)) {
+                if (incoming_adapter_matches) {
                     // B0 stage-2: per-entry host rows ride the shipped lookup [B-a/A2]
                     if (!ret->prompt_load(*prompt_cache, task.tokens, incoming_adapter,
                                           request_cache_plan)) {
-                        if (request_cache_plan) {
-                            request_cache_plan->restore_attempt_failed = true;
-                        }
-                        ret->mandatory_recovery_reset(
-                            server_cache_destruction_reason::restore_failure);
+                        cache_plan_host_restore_failed(
+                            *ret, request_cache_plan);
                     }
                 } else if (request_cache_plan) {
                     // shipped path skips the lookup entirely for the adapter change [finding 1]:
@@ -5855,10 +6110,11 @@ private:
                     }
                     request_cache_plan->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
                 }
-
+            }
+            if (update_cache) {
                 prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                SRV_TRC("prompt cache update took %.2f ms\n",
+                        (ggml_time_us() - prompt_cache_t_start) / 1000.0);
             }
         }
 
@@ -6917,11 +7173,15 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            server_cache_plan_disarm_unlaunched(
+                                slot->cache_plan_execution, slot->cache_plan);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                            server_cache_plan_disarm_unlaunched(
+                                slot->cache_plan_execution, slot->cache_plan);
                             break; // drop the task
                         }
                     } else {
@@ -6942,11 +7202,17 @@ private:
                                                string_format(
                                                    "request (%d tokens) exceeds the total context size (%d tokens), try increasing it",
                                                    task.n_tokens(), slot->n_ctx),
-                                               ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot->n_ctx);
+                                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot->n_ctx);
+                                    server_cache_plan_disarm_unlaunched(
+                                        slot->cache_plan_execution,
+                                        slot->cache_plan);
                                     break; // drop the task
                                 }
                                 SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
                                         id_task, task.n_tokens(), cells_available, cells_committed);
+                                server_cache_plan_disarm_unlaunched(
+                                    slot->cache_plan_execution,
+                                    slot->cache_plan);
                                 queue_tasks.defer(std::move(task));
                                 break;
                             }
@@ -6964,6 +7230,8 @@ private:
 
                         if (!launch_slot_with_task(*slot, std::move(task))) {
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            server_cache_plan_disarm_unlaunched(
+                                slot->cache_plan_execution, slot->cache_plan);
                             break; // drop the task
                         }
                     }
@@ -8676,7 +8944,33 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // The planner does not yet carry SWA/recurrent
+                                // frontier coverage. Revalidate the checkpoint
+                                // predicate and the legacy coverage trigger at
+                                // the last seam before recovery mutation.
+                                if (slot.cache_plan_execution.restores_checkpoint()) {
+                                    GGML_ASSERT(cache_plan_authority &&
+                                                slot.cache_plan);
+                                    int32_t checked_ordinal = -1;
+                                    server_cache_plan_revalidate_checkpoint_execution(
+                                        *cache_plan_authority, *slot.cache_plan,
+                                        slot.cache_plan_execution,
+                                        slot.prompt.checkpoints.size(),
+                                        cache_plan_checkpoint_execution_revalidate(
+                                            slot, pos_next, pos_min_thold),
+                                        checked_ordinal);
+                                }
+                                if (slot.cache_plan_execution.authoritative()) {
+                                    GGML_ASSERT(cache_plan_authority &&
+                                                slot.cache_plan);
+                                    server_cache_plan_demote_for_coverage_recovery(
+                                        *cache_plan_authority, *slot.cache_plan,
+                                        slot.cache_plan_execution,
+                                        pos_min, pos_min_thold);
+                                }
+
+                                if (pos_min >= pos_min_thold ||
+                                    slot.cache_plan_execution.restores_checkpoint()) {
                                     // [I9] current VBR representation epoch(s); a recurrent-only checkpoint
                                     // captured against a different epoch is stale (its attention KV moved
                                     // tier / cells were reused / the controller was reset). All-zero when
@@ -8876,8 +9170,13 @@ private:
                                             "checkpoint_selection_shadow_unavailable",
                                             legacy_choice, -2);
                                     }
-                                    const auto it =
-                                        use_frontier ? it_frontier : it_legacy;
+                                    auto it = use_frontier ? it_frontier : it_legacy;
+
+                                    // B-A1 executes the planner-selected checkpoint,
+                                    // not the first match from the legacy/frontier scan.
+                                    // Keep this upstream collision-prone container
+                                    // translation behind one named helper.
+                                    it = cache_plan_override_checkpoint(slot, it);
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
                                     bool vbr_preflight_rejected = false;
@@ -8926,7 +9225,14 @@ private:
                                                 // the scan's first eligible entry = the shipped selection;
                                                 // restore failures below demote it via note_reject
                                                 row->accept();
-                                                rec.select(common_cache_plan_provider::live_context_checkpoint, row);
+                                                if (!slot.cache_plan_execution.restores_checkpoint() ||
+                                                    row->source_id == slot.cache_plan_execution.
+                                                        checkpoint_source_id) {
+                                                    rec.select(
+                                                        common_cache_plan_provider::
+                                                            live_context_checkpoint,
+                                                        row);
+                                                }
                                             } else {
                                                 row->note_reject(buf.v[i].cls);
                                             }
@@ -9434,6 +9740,7 @@ private:
                                                 if (slot.cache_plan) {
                                                     if (auto * sel_row = slot.cache_plan->selected_row(
                                                             common_cache_plan_provider::live_context_checkpoint)) {
+                                                        sel_row->accept();
                                                         sel_row->delivered = true;
                                                         // logical restored token count, not the physical
                                                         // pos_max position; bytes = every applied component
@@ -9446,10 +9753,10 @@ private:
                                                         // actually visited (frontier after a
                                                         // WS-4 flip, else legacy) + that same
                                                         // selector's epoch rejections
-                                                        sel_row->siblings_scanned = (uint32_t)
-                                                            (it == slot.prompt.checkpoints.rend()
-                                                                ? slot.prompt.checkpoints.size()
-                                                                : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                                        sel_row->siblings_scanned =
+                                                            (use_frontier
+                                                                ? obs_frontier_buf.n
+                                                                : obs_legacy_buf.n);
                                                         sel_row->siblings_rejected_epoch = (uint32_t)
                                                             (use_frontier ? n_ckpt_rejected_vbr_frontier
                                                                           : n_ckpt_rejected_vbr);
@@ -9498,10 +9805,10 @@ private:
                                                     slot.id, slot.cache_plan->selection);
                                             }
                                             if (row) {
-                                                row->siblings_scanned = (uint32_t)
-                                                    (it == slot.prompt.checkpoints.rend()
-                                                        ? slot.prompt.checkpoints.size()
-                                                        : std::distance(slot.prompt.checkpoints.rbegin(), it) + 1);
+                                                row->siblings_scanned =
+                                                    (use_frontier
+                                                        ? obs_frontier_buf.n
+                                                        : obs_legacy_buf.n);
                                                 row->siblings_rejected_epoch = (uint32_t) n_rejected_sel;
                                                 if (row->reason == COMMON_CACHE_PLAN_REASON_NONE) {
                                                     if (vbr_preflight_rejected) {

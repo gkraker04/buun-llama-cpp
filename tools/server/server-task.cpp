@@ -1772,15 +1772,17 @@ bool server_prompt_cache::contains(const server_tokens & tokens, const std::stri
 }
 
 void server_prompt_cache::cache_plan_begin_inventory() noexcept {
-    cache_plan_n_source_instances = 0;
+    cache_plan_next_source_id = 0;
+    for (auto & state : states) {
+        state.cache_plan_source_id = -1;
+    }
 }
 
 bool server_prompt_cache::cache_plan_get_source_id(
         server_prompt_cache_state & state,
         int32_t & source_id) noexcept {
-    return server_cache_plan_find_or_assign_source_id(
-        &state, cache_plan_source_instances,
-        cache_plan_n_source_instances, source_id);
+    return server_cache_plan_assign_source_id(
+        state.cache_plan_source_id, cache_plan_next_source_id, source_id);
 }
 
 std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
@@ -2183,9 +2185,10 @@ bool server_prompt_cache::publish(
 // off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec) {
+bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id) {
     if constexpr (!Observed) {
         (void) rec;
+        (void) required_source_id;
     }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -2212,6 +2215,14 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         [[maybe_unused]] int32_t obs_source = -1;
         if constexpr (Observed) {
             if (cache_plan_get_source_id(*it, obs_source)) {
+                // Required-provider authority evaluated every host row before
+                // mutation. Save-before-load may deduplicate the list, but a
+                // surviving node keeps its request-local id; skip non-selected
+                // states before their O(context) token LCP.
+                if (required_source_id >= 0 &&
+                    obs_source != required_source_id) {
+                    continue;
+                }
                 row = rec->find_or_add(
                     common_cache_plan_provider::host_cache_entry,
                     obs_source, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
@@ -2220,6 +2231,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                 rec->inventory_states[size_t(
                     common_cache_plan_provider::host_cache_entry)] =
                     common_cache_plan_inventory_state::overflowed;
+                if (required_source_id >= 0) {
+                    continue;
+                }
             }
         }
 
@@ -2262,6 +2276,20 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             continue;
         }
 
+        if constexpr (Observed) {
+            if (required_source_id >= 0) {
+                // B-A1 exact-provider authority: the planner already selected
+                // this complete host plan. Preserve all structural/identity
+                // guards above, but do not re-run the legacy two-axis choice.
+                it_best = it;
+                f_keep_best = f_keep_cur;
+                sim_best = sim_cur;
+                obs_source_best = obs_source;
+                obs_lcp_sel = lcp_cur;
+                continue;
+            }
+        }
+
         if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
@@ -2294,6 +2322,11 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     }
 
     if (it_best == states.end()) {
+        if constexpr (Observed) {
+            if (required_source_id >= 0) {
+                return false;
+            }
+        }
         // nothing better than the slot's current state; leave the slot as-is
         return true;
     }
@@ -2391,14 +2424,15 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id) {
+    GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id);
 }
 
 void server_prompt_cache::update() {

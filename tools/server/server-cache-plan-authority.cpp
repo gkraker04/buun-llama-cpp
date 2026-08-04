@@ -13,46 +13,23 @@ uint64_t server_cache_plan_capability_fold(
     return (hash ^ 0xffu) * 1099511628211ull;
 }
 
-bool server_cache_plan_find_or_assign_source_id(
-        const void * instance,
-        std::array<const void *, COMMON_CACHE_PLAN_MAX_CANDIDATES> & instances,
-        uint32_t & n_instances,
+bool server_cache_plan_assign_source_id(
+        int32_t & instance_source_id,
+        int32_t & next_source_id,
         int32_t & source_id) noexcept {
-    if (!instance) {
+    if (instance_source_id >= 0) {
+        source_id = instance_source_id;
+        return true;
+    }
+    if (next_source_id < 0 ||
+        next_source_id > SERVER_CACHE_PLAN_MAX_HOST_SOURCE_ID ||
+        next_source_id >= int32_t(COMMON_CACHE_PLAN_MAX_CANDIDATES)) {
         source_id = -1;
         return false;
     }
-    for (uint32_t i = 0; i < n_instances; ++i) {
-        if (instances[i] == instance) {
-            source_id = int32_t(i);
-            return true;
-        }
-    }
-    if (n_instances >= instances.size() ||
-        n_instances > uint32_t(SERVER_CACHE_PLAN_MAX_HOST_SOURCE_ID)) {
-        source_id = -1;
-        return false;
-    }
-    source_id = int32_t(n_instances);
-    instances[n_instances++] = instance;
+    instance_source_id = next_source_id++;
+    source_id = instance_source_id;
     return true;
-}
-
-int32_t server_cache_plan_checkpoint_source_id_from_reverse(
-        size_t checkpoint_count,
-        uint32_t reverse_ordinal,
-        int32_t host_source_id) noexcept {
-    if (checkpoint_count == 0 || reverse_ordinal >= checkpoint_count) {
-        return -1;
-    }
-    const size_t forward = checkpoint_count - 1 - reverse_ordinal;
-    if (forward >= size_t(SERVER_CACHE_PLAN_HOST_CHECKPOINT_STRIDE)) {
-        return -1;
-    }
-    return host_source_id >= 0
-        ? server_cache_plan_host_checkpoint_source_id(
-              host_source_id, int32_t(forward))
-        : int32_t(forward);
 }
 
 void server_cache_plan_authority::plan_before_mutation(
@@ -82,13 +59,310 @@ void server_cache_plan_authority::fail_closed(
     rec.clear_planner_outputs();
     rec.planner_status = common_cache_plan_planner_status::internal_fault;
     common_cache_plan_derive_shadow_authority(rec, configured_level, reason);
+    const auto decision_level = server_cache_plan_level_of(rec.selection);
+    if (decision_level != common_cache_plan_authority_level::off &&
+        decision_level != common_cache_plan_authority_level::_count &&
+        configured_level >= decision_level) {
+        rec.authority.state =
+            common_cache_plan_authority_state::fallback_legacy;
+        rec.authority.fallback_reason = reason;
+    }
     rec.authority_prequalified = false;
     rec.planner_precomputed = true;
 }
 
-void server_cache_plan_authority::finalize_legacy_execution(
+int32_t server_cache_plan_legacy_candidate(
+        const common_cache_plan_record & rec,
+        int32_t target_slot_id,
+        bool host_lookup_enabled) noexcept {
+    int32_t live = -1;
+    int32_t host = -1;
+    double f_keep = -1.0;
+    double sim = 0.0;
+
+    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+        const auto & candidate = rec.inventory[i];
+        if (candidate.target_slot_id != target_slot_id || candidate.is_chain()) {
+            continue;
+        }
+        if (candidate.provider == common_cache_plan_provider::live_slot) {
+            live = int32_t(i);
+            if (candidate.f_keep_known) {
+                f_keep = candidate.f_keep;
+            }
+            if (candidate.sim_known) {
+                sim = candidate.sim;
+            }
+            break;
+        }
+    }
+
+    // Reproduce the legacy host selector's strict two-axis improvement and
+    // insertion-order tie behavior. Invalid rows never enter that selector.
+    for (uint32_t i = 0; host_lookup_enabled && i < rec.n_inventory; ++i) {
+        const auto & candidate = rec.inventory[i];
+        if (candidate.target_slot_id != target_slot_id || candidate.is_chain() ||
+            candidate.provider != common_cache_plan_provider::host_cache_entry ||
+            !candidate.viable() || !candidate.f_keep_known ||
+            !candidate.sim_known) {
+            continue;
+        }
+        if (f_keep < candidate.f_keep && sim < candidate.sim) {
+            f_keep = candidate.f_keep;
+            sim = candidate.sim;
+            host = int32_t(i);
+        }
+    }
+
+    const int32_t host_source = host >= 0
+        ? rec.inventory[size_t(host)].source_id : -1;
+    int32_t checkpoint = -1;
+    int32_t checkpoint_ordinal = -1;
+    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+        const auto & candidate = rec.inventory[i];
+        if (candidate.target_slot_id != target_slot_id || candidate.is_chain() ||
+            candidate.provider != common_cache_plan_provider::live_context_checkpoint ||
+            !candidate.viable()) {
+            continue;
+        }
+        const int32_t ordinal =
+            server_cache_plan_checkpoint_ordinal_from_source_id(
+                candidate.source_id, host >= 0 ? host_source : -1);
+        if (host >= 0) {
+            if (!candidate.component_only ||
+                candidate.dependent_host_source_id != host_source) {
+                continue;
+            }
+        } else if (candidate.component_only) {
+            continue;
+        }
+        // The shipped selector scans newest-to-oldest, so the greatest forward
+        // ordinal is its first viable checkpoint.
+        if (ordinal >= 0 && ordinal > checkpoint_ordinal) {
+            checkpoint_ordinal = ordinal;
+            checkpoint = int32_t(i);
+        }
+    }
+
+    if (checkpoint >= 0) {
+        if (host < 0) {
+            return checkpoint;
+        }
+        const auto * chain = rec.find_chain(
+            common_cache_plan_provider::host_cache_entry, host, checkpoint);
+        const int32_t chain_id = chain
+            ? int32_t(chain - rec.inventory.data()) : -1;
+        return chain_id >= 0 ? chain_id : host;
+    }
+    if (host >= 0) {
+        return host;
+    }
+    if (live >= 0 && rec.inventory[size_t(live)].viable()) {
+        return live;
+    }
+    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+        const auto & candidate = rec.inventory[i];
+        if (candidate.target_slot_id == target_slot_id &&
+            candidate.provider == common_cache_plan_provider::cold_replay &&
+            !candidate.is_chain() && candidate.viable()) {
+            return int32_t(i);
+        }
+    }
+    return -1;
+}
+
+bool server_cache_plan_execution_from_candidate(
+        const common_cache_plan_record & rec,
+        int32_t candidate,
+        int32_t target_slot_id,
+        server_cache_plan_execution & out) noexcept {
+    out = {};
+    if (candidate < 0 || uint32_t(candidate) >= rec.n_inventory) {
+        return false;
+    }
+    const auto & selected = rec.inventory[size_t(candidate)];
+    if (selected.target_slot_id != target_slot_id || !selected.viable()) {
+        return false;
+    }
+    out.target = target_slot_id;
+    if (selected.is_chain()) {
+        const int32_t host = selected.component_ids[0];
+        const int32_t checkpoint = selected.component_ids[1];
+        if (host < 0 || checkpoint < 0 || uint32_t(host) >= rec.n_inventory ||
+            uint32_t(checkpoint) >= rec.n_inventory) {
+            return false;
+        }
+        const auto & h = rec.inventory[size_t(host)];
+        const auto & c = rec.inventory[size_t(checkpoint)];
+        if (h.target_slot_id != target_slot_id || c.target_slot_id != target_slot_id ||
+            h.provider != common_cache_plan_provider::host_cache_entry ||
+            c.provider != common_cache_plan_provider::live_context_checkpoint ||
+            !c.component_only || c.dependent_host_source_id != h.source_id ||
+            !h.viable() || !c.viable()) {
+            return false;
+        }
+        out.kind = server_cache_plan_execution_kind::host_checkpoint_restore;
+        out.host_source_id = h.source_id;
+        out.checkpoint_source_id = c.source_id;
+        return true;
+    }
+    switch (selected.provider) {
+        case common_cache_plan_provider::live_slot:
+            out.kind = server_cache_plan_execution_kind::live_replay;
+            return true;
+        case common_cache_plan_provider::host_cache_entry:
+            out.kind = server_cache_plan_execution_kind::host_restore;
+            out.host_source_id = selected.source_id;
+            return true;
+        case common_cache_plan_provider::live_context_checkpoint:
+            if (selected.component_only) {
+                return false;
+            }
+            out.kind = server_cache_plan_execution_kind::checkpoint_restore;
+            out.checkpoint_source_id = selected.source_id;
+            return true;
+        case common_cache_plan_provider::cold_replay:
+            out.kind = server_cache_plan_execution_kind::cold_replay;
+            return true;
+        case common_cache_plan_provider::_count:
+            break;
+    }
+    return false;
+}
+
+static bool inside_pre_da_safety_envelope(
+        const server_cache_plan_execution & planned,
+        const server_cache_plan_execution & legacy) noexcept {
+    // The forced target may be replayed or restored without evicting a
+    // separate retained artifact. Cold is no worse only when legacy was cold.
+    if (planned.kind == server_cache_plan_execution_kind::cold_replay) {
+        return legacy.kind == server_cache_plan_execution_kind::cold_replay;
+    }
+    // Host restore is consuming. Before D-A it may consume only the exact host
+    // entry legacy would have consumed; checkpoint choice within that restored
+    // state remains non-consuming.
+    if (planned.kind == server_cache_plan_execution_kind::host_restore ||
+        planned.kind ==
+            server_cache_plan_execution_kind::host_checkpoint_restore) {
+        return (legacy.kind == server_cache_plan_execution_kind::host_restore ||
+                legacy.kind ==
+                    server_cache_plan_execution_kind::host_checkpoint_restore) &&
+               planned.host_source_id == legacy.host_source_id;
+    }
+    return true;
+}
+
+server_cache_plan_execution server_cache_plan_authority::authorize(
+        common_cache_plan_record & rec,
+        int32_t target_slot_id,
+        bool host_lookup_enabled,
+        bool target_identity_matches) noexcept {
+    server_cache_plan_execution execution;
+    const auto decision_level = server_cache_plan_level_of(rec.selection);
+    if (decision_level == common_cache_plan_authority_level::off ||
+        decision_level == common_cache_plan_authority_level::_count) {
+        return execution;
+    }
+    if (configured_level < decision_level) {
+        // The tier remains shadow-only, but make the reserved typed reason
+        // observable rather than leaving tier_not_enabled permanently dead.
+        rec.authority.fallback_reason =
+            common_cache_plan_authority_fallback::tier_not_enabled;
+        return execution;
+    }
+    const int32_t legacy_plan_candidate = server_cache_plan_legacy_candidate(
+        rec, target_slot_id, host_lookup_enabled);
+    rec.authority.legacy_plan_candidate = legacy_plan_candidate;
+    if (!rec.authority_prequalified ||
+        rec.planner_status != common_cache_plan_planner_status::ok) {
+        fallback_legacy(rec,
+            rec.authority.fallback_reason !=
+                    common_cache_plan_authority_fallback::none
+                ? rec.authority.fallback_reason
+                : common_cache_plan_authority_fallback::internal_fault);
+        return execution;
+    }
+    if (!server_cache_plan_execution_from_candidate(
+            rec, rec.shadow_choice, target_slot_id, execution)) {
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::internal_fault);
+        return {};
+    }
+    if (!target_identity_matches &&
+        execution.kind != server_cache_plan_execution_kind::cold_replay) {
+        // Identity feasibility is known before mutation; this is incomplete
+        // planner evidence, not capability drift discovered at execution.
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::incomplete_evidence);
+        return {};
+    }
+    server_cache_plan_execution legacy_execution;
+    if (!server_cache_plan_execution_from_candidate(
+            rec, legacy_plan_candidate, target_slot_id, legacy_execution)) {
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::internal_fault);
+        return {};
+    }
+    if (!inside_pre_da_safety_envelope(execution, legacy_execution)) {
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::
+                destruction_authority_required);
+        return {};
+    }
+    rec.authority.state = common_cache_plan_authority_state::authoritative;
+    rec.authority.fallback_reason = common_cache_plan_authority_fallback::none;
+    return execution;
+}
+
+void server_cache_plan_authority::fallback_legacy(
+        common_cache_plan_record & rec,
+        common_cache_plan_authority_fallback reason) noexcept {
+    rec.authority.state = common_cache_plan_authority_state::fallback_legacy;
+    rec.authority.fallback_reason = reason;
+}
+
+bool server_cache_plan_demote_for_coverage_recovery(
+        server_cache_plan_authority & authority,
+        common_cache_plan_record & rec,
+        server_cache_plan_execution & execution,
+        int64_t pos_min,
+        int64_t pos_min_threshold) noexcept {
+    if (!server_cache_plan_requires_coverage_recovery(
+            execution, pos_min, pos_min_threshold)) {
+        return false;
+    }
+    authority.fallback_legacy(
+        rec, common_cache_plan_authority_fallback::stale_capability);
+    execution.clear();
+    return true;
+}
+
+bool server_cache_plan_revalidate_checkpoint_execution(
+        server_cache_plan_authority & authority,
+        common_cache_plan_record & rec,
+        server_cache_plan_execution & execution,
+        size_t checkpoint_count,
+        bool eligible,
+        int32_t & ordinal) noexcept {
+    if (server_cache_plan_checkpoint_override_ordinal(
+            execution, checkpoint_count, eligible, ordinal)) {
+        return true;
+    }
+    authority.fallback_legacy(
+        rec, common_cache_plan_authority_fallback::stale_capability);
+    execution.clear();
+    return false;
+}
+
+void server_cache_plan_authority::finalize_execution(
         common_cache_plan_record & rec) noexcept {
     common_cache_plan_finalize_shadow_authority(rec);
+    if (rec.authority.state == common_cache_plan_authority_state::authoritative &&
+        rec.authority.executed_plan_candidate !=
+            rec.authority.planner_plan_candidate) {
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::internal_fault);
+    }
     counters.observe(rec.authority, rec.authority_prequalified);
 }
 
@@ -96,10 +370,12 @@ server_cache_plan_live_evaluation server_cache_plan_evaluate_live(
         bool busy,
         bool has_payload,
         uint64_t lcp_tokens,
-        uint64_t prompt_tokens) noexcept {
+        uint64_t prompt_tokens,
+        uint64_t source_tokens) noexcept {
     server_cache_plan_live_evaluation out;
     out.lcp_tokens = lcp_tokens;
     out.sim = prompt_tokens ? float(lcp_tokens) / float(prompt_tokens) : 0.0f;
+    out.f_keep = source_tokens ? float(lcp_tokens) / float(source_tokens) : -1.0f;
     out.reason = busy ? COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY :
                  !has_payload ? COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE :
                  lcp_tokens == 0 ? COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT :
@@ -116,6 +392,8 @@ void server_cache_plan_apply_live(
     row->lcp_tokens = llama_cache_acct_value::measured(evaluation.lcp_tokens);
     row->sim = evaluation.sim;
     row->sim_known = true;
+    row->f_keep = evaluation.f_keep;
+    row->f_keep_known = evaluation.f_keep >= 0.0f;
     row->note_reject(evaluation.reason);
 }
 

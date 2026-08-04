@@ -4,6 +4,8 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <initializer_list>
+#include <iterator>
 #include <list>
 
 namespace {
@@ -50,6 +52,15 @@ std::list<server_prompt_cache_state> make_entry(
     return entry;
 }
 
+std::list<server_prompt_cache_state> make_prompt_entry(
+        const char * identity,
+        std::initializer_list<llama_token> tokens) {
+    auto entry = make_entry(identity, 1);
+    entry.front().prompt.tokens = server_tokens(
+        llama_tokens(tokens), false);
+    return entry;
+}
+
 // Regression for F0b review MUST-1: lifecycle accounting may prove/transact publication, but the
 // prompt cache's configured limit remains a FIFO rotation policy—not an admission ceiling. A full
 // 1 MiB cache must accept a second 700 KiB entry and evict the oldest, rather than become fill-once.
@@ -73,11 +84,41 @@ void test_lifecycle_full_cache_rotates() {
     CHECK(authority.admission_refusals == 0);
 }
 
+void test_authority_source_ids_survive_save_dedup() {
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    CHECK(cache.publish(make_prompt_entry("same", { 1 })));
+    CHECK(cache.publish(make_prompt_entry("same", { 9 })));
+    CHECK(cache.states.size() == 2);
+
+    cache.cache_plan_begin_inventory();
+    auto old = cache.states.begin();
+    auto survivor = std::next(old);
+    int32_t old_source = -1;
+    int32_t survivor_source = -1;
+    CHECK(cache.cache_plan_get_source_id(*old, old_source));
+    CHECK(cache.cache_plan_get_source_id(*survivor, survivor_source));
+    CHECK(old_source == 0);
+    CHECK(survivor_source == 1);
+
+    // Publishing the larger {1,2} prompt removes {1}. The surviving {9}
+    // node keeps source 1, while the new node gets 2 even if the allocator
+    // recycles the erased node's address.
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2 })));
+    CHECK(cache.states.size() == 2);
+    CHECK(cache.cache_plan_get_source_id(
+        cache.states.front(), old_source));
+    CHECK(old_source == survivor_source);
+    CHECK(cache.cache_plan_get_source_id(
+        cache.states.back(), old_source));
+    CHECK(old_source == 2);
+}
+
 } // namespace
 
 int main() {
     llama_backend_init();
     test_lifecycle_full_cache_rotates();
+    test_authority_source_ids_survive_save_dedup();
     llama_backend_free();
 
     if (failures != 0) {

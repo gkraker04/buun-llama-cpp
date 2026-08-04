@@ -189,7 +189,13 @@ void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec)
     }
     auto & receipt = rec.authority;
     receipt.legacy_tier = rec.selection;
-    receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
+    // An authoritative receipt already carries the pre-mutation legacy
+    // counterfactual. Shadow/fallback execution actually ran legacy, so its
+    // final delivered plan remains the legacy identity.
+    if (receipt.state != common_cache_plan_authority_state::authoritative ||
+        receipt.legacy_plan_candidate < 0) {
+        receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
+    }
     receipt.executed_plan_candidate = rec.shipped_plan_candidate;
     receipt.disagreed = receipt.legacy_plan_candidate >= 0 &&
                         receipt.planner_plan_candidate >= 0 &&
@@ -415,30 +421,11 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
             sib.dependent_host_source_id != host->source_id) {
             continue;
         }
-        const bool valid =
-            sib.disposition == common_cache_plan_disposition::accepted ||
-            sib.disposition == common_cache_plan_disposition::valid_not_chosen_cost;
-        if (!valid) {
+        if (!sib.viable()) {
             continue;
         }
-        common_cache_plan_candidate * chain = nullptr;
-        for (uint32_t j = 0; j < n_before; ++j) {
-            auto & candidate = rec.inventory[j];
-            if (!candidate.is_chain() ||
-                candidate.provider != common_cache_plan_provider::host_cache_entry ||
-                candidate.component_ids[0] != host_ord ||
-                candidate.component_ids[1] != int32_t(i)) {
-                continue;
-            }
-            bool exact = true;
-            for (size_t k = 2; k < candidate.component_ids.size(); ++k) {
-                exact = exact && candidate.component_ids[k] == -1;
-            }
-            if (exact) {
-                chain = &candidate;
-                break;
-            }
-        }
+        common_cache_plan_candidate * chain = rec.find_chain(
+            common_cache_plan_provider::host_cache_entry, host_ord, int32_t(i));
         if (!chain) {
             chain = rec.add_chain(common_cache_plan_provider::host_cache_entry,
                                   host_ord, int32_t(i));
