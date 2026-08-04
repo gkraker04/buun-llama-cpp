@@ -49,6 +49,30 @@ const common_cache_plan_calib * common_cache_plan_calib_find(const std::string &
     return nullptr;
 }
 
+bool common_cache_plan_restore_us(
+        const common_cache_plan_calib & calib,
+        uint64_t bytes,
+        double & restore_us,
+        double & workspace_us) noexcept {
+    restore_us = 0.0;
+    workspace_us = 0.0;
+    if (!calib.profile || calib.estimator_version == 0 ||
+        !std::isfinite(calib.restore_us_per_byte) ||
+        calib.restore_us_per_byte < 0.0 ||
+        !std::isfinite(calib.workspace_setup_us) ||
+        calib.workspace_setup_us < 0.0) {
+        return false;
+    }
+    restore_us = (double) bytes * calib.restore_us_per_byte;
+    workspace_us = calib.workspace_setup_us;
+    if (!std::isfinite(restore_us)) {
+        restore_us = 0.0;
+        workspace_us = 0.0;
+        return false;
+    }
+    return true;
+}
+
 std::string common_cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out;
@@ -361,10 +385,16 @@ static bool cache_plan_estimate_row(common_cache_plan_candidate & c, uint64_t n_
             return false;
     }
 
+    double restore_us = 0.0;
+    double workspace_us = 0.0;
+    if (has_restore && !common_cache_plan_restore_us(
+            calib, restore_bytes, restore_us, workspace_us)) {
+        return false;
+    }
     cache_plan_fill_terms(c, calib,
-                          restore_bytes, (double) restore_bytes * calib.restore_us_per_byte,
+                          restore_bytes, restore_us,
                           replay_tokens, (double) replay_tokens * calib.replay_us_per_token,
-                          has_restore ? calib.workspace_setup_us : 0.0);
+                          workspace_us);
     return true;
 }
 
@@ -373,11 +403,13 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     // trust boundary (verify-r1 finding 6): the estimator validates its calibration —
     // exact profile match against the record, a reviewed (nonzero) version, and
     // finite/nonnegative coefficients. A false match here would fabricate economics.
+    double restore_check = 0.0;
+    double workspace_check = 0.0;
     if (calib.profile == nullptr || rec.calibration_profile != calib.profile ||
         calib.estimator_version == 0 ||
         !std::isfinite(calib.replay_us_per_token) || calib.replay_us_per_token < 0.0 ||
-        !std::isfinite(calib.restore_us_per_byte) || calib.restore_us_per_byte < 0.0 ||
-        !std::isfinite(calib.workspace_setup_us)  || calib.workspace_setup_us  < 0.0) {
+        !common_cache_plan_restore_us(
+            calib, 0, restore_check, workspace_check)) {
         return common_cache_plan_planner_status::invalid_calibration;
     }
 

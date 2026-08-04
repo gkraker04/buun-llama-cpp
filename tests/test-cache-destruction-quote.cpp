@@ -658,6 +658,15 @@ static void test_prepared_release_capability() {
     CHECK(project()(released, quote.projected_domains));
 
     uint64_t releases = 0;
+    auto binding_pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, { op });
+    CHECK(binding_pin.binds_exact({ 99 }, { op }));
+    CHECK(!binding_pin.binds_exact({ 98 }, { op }));
+    CHECK(!binding_pin.binds_exact({ 99 }, {}));
+    binding_pin = {};
+    CHECK(releases == 1);
+    releases = 0;
+
     auto missing_host_pin = server_cache_recovery_pin::acquire(
         &releases, release_pin, { { 99 } }, {});
     auto missing_host = server_cache_prepare_release_set(

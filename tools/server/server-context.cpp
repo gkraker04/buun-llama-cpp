@@ -562,6 +562,7 @@ struct server_slot {
                 return prompt_save_result::failed;
             }
             auto & entry = staged.front();
+            entry.main_family = !task || !task->is_child();
 
             size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
@@ -5077,7 +5078,7 @@ private:
             }
         }
 
-        if (cache_plan_obs || cache_plan_authority) {
+        if (cache_plan_obs || cache_plan_authority || cache_authority) {
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -5117,6 +5118,9 @@ private:
                 }
                 if (cache_plan_authority) {
                     cache_plan_authority->calibration_profile = calibration_profile;
+                }
+                if (cache_authority) {
+                    cache_authority->calibration_profile = calibration_profile;
                 }
             }
             if (cache_plan_obs) {

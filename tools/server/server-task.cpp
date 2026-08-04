@@ -17,7 +17,9 @@
 #include "server-common.h"
 
 #include <limits>
+#include <cmath>
 #include <thread>
+#include <tuple>
 
 using json = nlohmann::ordered_json;
 
@@ -2286,11 +2288,23 @@ server_cache_recovery_pin acquire_host_recovery_pin(
     return pin;
 }
 
-struct redundant_host_certification {
+struct host_trade_ranking {
+    bool price_known = false;
+    uint64_t price_us = 0;
+    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
+    uint32_t ordinal = 0;
+    int32_t source_id = -1;
+    llama_cache_acct_artifact_id artifact_id;
+    bool zero_destruction = false;
+    bool zero_destruction_tie_break = false;
+};
+
+struct host_destruction_certification {
     bool ready = false;
     server_cache_prepared_release_capability capability;
     server_cache_recovery_pin pin;
     common_cache_plan_destruction_quote quote;
+    server_prompt_cache_retirement_manifest retirement;
     uint64_t projected_bytes = 0;
 };
 
@@ -2298,7 +2312,8 @@ void server_prompt_cache_observe_host_destruction(
         server_prompt_cache & cache,
         const common_cache_plan_destruction_receipt & receipt,
         bool observe_classification,
-        uint64_t projected_bytes) noexcept {
+        uint64_t projected_bytes,
+        const host_trade_ranking * ranking = nullptr) noexcept {
     cache.publish_authority->observe_host_destruction(
         receipt, observe_classification);
     if (!cache.debug_observability) {
@@ -2334,6 +2349,8 @@ void server_prompt_cache_observe_host_destruction(
                       receipt.recovery_source_manifest_digest.bytes()) },
             };
         }
+        const json unavailable = common_cache_acct_known_name(
+            llama_cache_acct_known::unavailable);
         const json payload = {
             { "state", common_cache_plan_destruction_state_name(
                   receipt.state) },
@@ -2343,6 +2360,35 @@ void server_prompt_cache_observe_host_destruction(
             { "victim_ids", std::move(victims) },
             { "recovery_source", std::move(recovery_source) },
             { "projected_bytes", projected_bytes },
+            { "price_us", ranking && ranking->price_known
+                  ? json(ranking->price_us)
+                  : unavailable },
+            { "retention_weight_milli", ranking
+                  ? json(ranking->weight_milli)
+                  : unavailable },
+            { "rank_ordinal", ranking
+                  ? json(ranking->ordinal)
+                  : unavailable },
+            { "victim_source_id", ranking && ranking->source_id >= 0
+                  ? json(ranking->source_id)
+                  : unavailable },
+            { "victim_artifact_id", ranking && ranking->artifact_id.v != 0
+                  ? json(ranking->artifact_id.v)
+                  : unavailable },
+            { "zero_destruction", ranking
+                  ? json(ranking->zero_destruction)
+                  : unavailable },
+            { "zero_destruction_tie_break", ranking
+                  ? json(ranking->zero_destruction_tie_break)
+                  : json(false) },
+            { "legacy_fallbacks",
+                  cache.destruction_obs
+                      ? cache.destruction_obs->host_trade_legacy_fallbacks
+                      : uint64_t(0) },
+            { "publication_skips",
+                  cache.destruction_obs
+                      ? cache.destruction_obs->host_trade_publication_skips
+                      : uint64_t(0) },
         };
         cache.debug_destruction_emissions++;
         SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
@@ -2351,13 +2397,15 @@ void server_prompt_cache_observe_host_destruction(
     }
 }
 
-redundant_host_certification certify_redundant_host(
+host_destruction_certification certify_host_destruction(
         server_prompt_cache & cache,
         server_prompt_cache::iterator victim_state,
         server_prompt_cache::iterator survivor_state,
         uint64_t admission_sequence,
-        bool retirement_ready) noexcept {
-    redundant_host_certification out;
+        bool allow_authorized_recovery,
+        bool count_redundant_refusals,
+        const host_trade_ranking * ranking = nullptr) noexcept {
+    host_destruction_certification out;
     auto & authority = *cache.publish_authority;
 
     const auto refuse_initial = [&](common_cache_plan_destruction_reason reason) {
@@ -2370,8 +2418,8 @@ redundant_host_certification certify_redundant_host(
         receipt.reason = reason;
         receipt.admission_sequence = admission_sequence;
         server_prompt_cache_observe_host_destruction(
-            cache, receipt, true, 0);
-        if (cache.destruction_obs) {
+            cache, receipt, true, 0, ranking);
+        if (cache.destruction_obs && count_redundant_refusals) {
             cache.destruction_obs->note_redundant_host_refused(
                 admission_sequence);
         }
@@ -2381,23 +2429,32 @@ redundant_host_certification certify_redundant_host(
         receipt.state = common_cache_plan_destruction_state::refused;
         receipt.reason = reason;
         server_prompt_cache_observe_host_destruction(
-            cache, receipt, true, 0);
-        if (cache.destruction_obs) {
+            cache, receipt, true, 0, ranking);
+        if (cache.destruction_obs && count_redundant_refusals) {
             cache.destruction_obs->note_redundant_host_refused(
                 admission_sequence);
         }
     };
 
     server_cache_destruction_artifact victim;
-    std::vector<llama_cache_acct_artifact_id> survivor_ids;
-    std::vector<llama_cache_acct_op_id> survivor_ops;
-    if (!retirement_ready) {
-        refuse_initial(common_cache_plan_destruction_reason::manifest_incomplete);
+    std::vector<llama_cache_acct_artifact_id> recovery_ids;
+    std::vector<llama_cache_acct_op_id> recovery_ops;
+    llama_cache_acct_artifact_id recovery_artifact;
+    common_cache_plan_displaced_fate recovery_fate =
+        common_cache_plan_displaced_fate::unavailable;
+    // D-A2 taxonomy: a named survivor that is not an exact three-payload
+    // duplicate is recovery_unavailable even when the victim's artifact
+    // manifest is independently incomplete. Redundancy is the outer proof.
+    if (survivor_state != cache.states.end() &&
+        !server_prompt_cache::exactly_redundant(
+            *victim_state, *survivor_state)) {
+        refuse_initial(
+            common_cache_plan_destruction_reason::recovery_unavailable);
         return out;
     }
-    if (!server_prompt_cache::exactly_redundant(
-            *victim_state, *survivor_state)) {
-        refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
+    if (!server_prompt_cache_capture_retirement(
+            cache, victim_state, out.retirement)) {
+        refuse_initial(common_cache_plan_destruction_reason::manifest_incomplete);
         return out;
     }
     if (!build_host_destruction_artifact(cache, *victim_state, victim)) {
@@ -2407,19 +2464,47 @@ redundant_host_certification certify_redundant_host(
         refuse_initial(common_cache_plan_destruction_reason::manifest_incomplete);
         return out;
     }
-    if (!build_host_recovery_source(
-            cache, *survivor_state, survivor_ids, survivor_ops)) {
+    if (survivor_state != cache.states.end()) {
+        if (!build_host_recovery_source(
+                cache, *survivor_state, recovery_ids, recovery_ops)) {
+            refuse_initial(
+                common_cache_plan_destruction_reason::recovery_unavailable);
+            return out;
+        }
+        recovery_artifact = recovery_ids.front();
+        out.pin = acquire_host_recovery_pin(
+            *survivor_state, recovery_ids, recovery_ops);
+        recovery_fate = common_cache_plan_displaced_fate::exact_duplicate;
+    } else if (allow_authorized_recovery && authority.host_recovery) {
+        server_cache_host_recovery_evidence evidence;
+        if (!authority.host_recovery(
+                authority.host_recovery_context, *victim_state, evidence) ||
+            evidence.artifact.v == 0 || evidence.ops.empty() ||
+            !evidence.pin.valid() ||
+            !evidence.pin.binds_exact(evidence.artifact, evidence.ops) ||
+            evidence.fate !=
+                common_cache_plan_displaced_fate::retained_sealed_artifact) {
+            refuse_initial(
+                common_cache_plan_destruction_reason::recovery_unavailable);
+            return out;
+        }
+        recovery_artifact = evidence.artifact;
+        recovery_ops = std::move(evidence.ops);
+        try {
+            recovery_ids.push_back(recovery_artifact);
+        } catch (...) {
+            refuse_initial(
+                common_cache_plan_destruction_reason::internal_fault);
+            return out;
+        }
+        out.pin = std::move(evidence.pin);
+        recovery_fate = evidence.fate;
+    } else {
         refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
         return out;
     }
 
     try {
-        const auto recovery_artifact = survivor_ids.front();
-        auto recovery_ops = survivor_ops;
-        out.pin = acquire_host_recovery_pin(
-            *survivor_state,
-            std::move(survivor_ids),
-            std::move(survivor_ops));
         if (!out.pin.valid()) {
             refuse_initial(common_cache_plan_destruction_reason::recovery_unavailable);
             return out;
@@ -2445,10 +2530,11 @@ redundant_host_certification certify_redundant_host(
             out.quote.receipt,
             out.quote.receipt.state !=
                 common_cache_plan_destruction_state::quoted,
-            0);
+            0,
+            ranking);
         if (out.quote.receipt.state !=
                 common_cache_plan_destruction_state::quoted) {
-            if (cache.destruction_obs) {
+            if (cache.destruction_obs && count_redundant_refusals) {
                 cache.destruction_obs->note_redundant_host_refused(
                     admission_sequence);
             }
@@ -2483,7 +2569,7 @@ redundant_host_certification certify_redundant_host(
         // has succeeded. Schema 6 retains the source identity after the pin
         // itself closes.
         out.quote.receipt.displaced_fate =
-            common_cache_plan_displaced_fate::exact_duplicate;
+            recovery_fate;
         out.quote.receipt.recovery_citation =
             common_cache_plan_recovery_citation::resolved;
         out.quote.receipt.recovery_source_artifact_id = recovery_artifact;
@@ -2493,7 +2579,7 @@ redundant_host_certification certify_redundant_host(
         out.quote.receipt.state =
             common_cache_plan_destruction_state::certified;
         server_prompt_cache_observe_host_destruction(
-            cache, out.quote.receipt, true, out.projected_bytes);
+            cache, out.quote.receipt, true, out.projected_bytes, ranking);
         out.capability = std::move(prepared.capability);
         out.ready = true;
         return out;
@@ -2506,6 +2592,157 @@ redundant_host_certification certify_redundant_host(
         }
         return out;
     }
+}
+
+void commit_certified_host_destruction(
+        server_prompt_cache & cache,
+        host_destruction_certification & certified,
+        const std::thread::id & scheduler_owner,
+        const host_trade_ranking * ranking = nullptr) noexcept {
+    GGML_ASSERT(certified.ready);
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    const auto release_status =
+        certified.capability.commit(certified.pin);
+    GGML_ASSERT(release_status ==
+                common_cache_plan_destruction_reason::none);
+    server_prompt_cache_retire_manifest(cache, certified.retirement);
+    certified.quote.receipt.state =
+        common_cache_plan_destruction_state::executed;
+    certified.quote.receipt.actual_accounting_serial =
+        cache.acct->snapshot().serial;
+    server_prompt_cache_observe_host_destruction(
+        cache,
+        certified.quote.receipt,
+        false,
+        certified.projected_bytes,
+        ranking);
+    // The cited recovery source was held through accounting commit and
+    // receipt publication; this local destruction dependency now closes.
+    certified.pin = {};
+}
+
+struct host_trade_candidate {
+    server_prompt_cache::iterator victim;
+    server_prompt_cache::iterator recovery;
+    host_trade_ranking ranking;
+    bool attempted = false;
+    bool lease_known = false;
+    bool main_family = false;
+    bool soft_leased = false;
+    bool hard_leased = false;
+};
+
+server_prompt_cache::iterator find_exact_host_recovery(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator victim) noexcept {
+    for (auto it = cache.states.begin(); it != cache.states.end(); ++it) {
+        if (it != victim && server_prompt_cache::exactly_redundant(
+                *victim, *it)) {
+            return it;
+        }
+    }
+    return cache.states.end();
+}
+
+bool host_trade_price(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator victim,
+        uint32_t ordinal,
+        const common_cache_plan_calib * calib,
+        host_trade_candidate & out) noexcept {
+    out = {};
+    out.victim = victim;
+    out.recovery = find_exact_host_recovery(cache, victim);
+    out.ranking.ordinal = ordinal;
+    out.ranking.source_id = victim->cache_plan_source_id;
+    out.ranking.zero_destruction = out.recovery != cache.states.end();
+    out.main_family = victim->main_family;
+    try {
+        auto & authority = *cache.publish_authority;
+        server_cache_destruction_artifact artifact;
+        if (!build_host_destruction_artifact(cache, *victim, artifact)) {
+            return false;
+        }
+        out.ranking.artifact_id = artifact.candidate.artifact_id;
+        if (artifact.candidate.lease.state !=
+                server_cache_lease_eval_state::known) {
+            return false;
+        }
+        out.lease_known = true;
+        out.soft_leased = artifact.candidate.lease.cls ==
+            server_cache_lease_class::soft;
+        out.hard_leased = artifact.candidate.lease.cls ==
+                server_cache_lease_class::hard ||
+            artifact.candidate.lease.eligibility ==
+                server_cache_lease_eligibility::hard_blocked;
+        if (out.hard_leased || !calib) {
+            return false;
+        }
+
+        uint64_t weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
+        const auto multiply_weight = [&](uint32_t factor) {
+            if (factor == 0 || weight >
+                    std::numeric_limits<uint64_t>::max() / factor) {
+                return false;
+            }
+            weight = (weight * factor +
+                      SERVER_CACHE_HOST_WEIGHT_SCALE - 1) /
+                     SERVER_CACHE_HOST_WEIGHT_SCALE;
+            return weight <= std::numeric_limits<uint32_t>::max();
+        };
+        if (out.soft_leased &&
+            !multiply_weight(SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) {
+            return false;
+        }
+        if (out.main_family &&
+            !multiply_weight(SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) {
+            return false;
+        }
+        if (authority.host_retention_weight) {
+            uint32_t custom = 0;
+            if (!authority.host_retention_weight(
+                    authority.host_retention_weight_context,
+                    *victim, custom) || !multiply_weight(custom)) {
+                return false;
+            }
+        }
+
+        double restore_us = 0.0;
+        double workspace_us = 0.0;
+        if (!common_cache_plan_restore_us(
+                *calib, victim->size(), restore_us, workspace_us)) {
+            return false;
+        }
+        const long double base = restore_us + workspace_us;
+        const long double price = base * (long double) weight /
+            SERVER_CACHE_HOST_WEIGHT_SCALE;
+        if (!std::isfinite((double) price) || price < 0.0L ||
+            price > (long double) std::numeric_limits<long long>::max()) {
+            return false;
+        }
+        out.ranking.weight_milli = uint32_t(weight);
+        out.ranking.price_us = uint64_t(std::llround(price));
+        out.ranking.price_known = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void observe_host_trade_refusal(
+        server_prompt_cache & cache,
+        uint64_t admission_sequence,
+        common_cache_plan_destruction_reason reason,
+        const host_trade_ranking * ranking = nullptr) noexcept {
+    common_cache_plan_destruction_receipt receipt;
+    receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::
+            different_host_source_consumption);
+    receipt.state = common_cache_plan_destruction_state::refused;
+    receipt.reason = reason;
+    receipt.admission_sequence = admission_sequence;
+    server_prompt_cache_observe_host_destruction(
+        cache, receipt, true, 0, ranking);
 }
 
 } // namespace
@@ -2548,6 +2785,274 @@ bool server_prompt_cache::exactly_redundant(
     }
 }
 
+bool server_prompt_cache::destroy_priced_host_entry(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        iterator & legacy_floor,
+        common_cache_plan_destruction_reason & floor_reason) {
+    legacy_floor = states.end();
+    floor_reason = common_cache_plan_destruction_reason::capacity_refused;
+    if (!publish_authority ||
+        (reason != server_cache_destruction_reason::host_capacity &&
+         reason != server_cache_destruction_reason::host_token_limit)) {
+        return false;
+    }
+    if (!acct || !retention_obs || !lease_obs || !lease_execution_identity) {
+        floor_reason = common_cache_plan_destruction_reason::lease_unavailable;
+        if (destruction_obs) {
+            destruction_obs->note_host_trade_substrate_fault();
+            destruction_obs->host_trade_legacy_fallbacks++;
+        }
+        if (!host_trade_substrate_warned) {
+            host_trade_substrate_warned = true;
+            SRV_WRN("%s\n",
+                    "host retention pricing unavailable: lifecycle lease/accounting substrate is incomplete");
+        }
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it != incoming && it->recovery_pins == 0) {
+                legacy_floor = it;
+                break;
+            }
+        }
+        const uint64_t sequence =
+            ++publish_authority->destruction_quote_sequence;
+        observe_host_trade_refusal(*this, sequence, floor_reason);
+        return false;
+    }
+
+    // D-A3 is an execution-time lease boundary. Expire first, then inspect
+    // each immutable host artifact once for pricing. Soft protection raises
+    // price; only a hard lease makes a candidate ineligible. If every priced
+    // candidate fails certification, the caller deliberately executes the
+    // historical FIFO victim so the user's configured bound remains real.
+    lease_obs->lifecycle_point();
+    const auto * calib = common_cache_plan_calib_find(
+        publish_authority->calibration_profile);
+    std::vector<host_trade_candidate> candidates;
+    try {
+        candidates.reserve(states.size());
+        uint32_t ordinal = 0;
+        for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
+            if (it == incoming || it->recovery_pins != 0) {
+                continue;
+            }
+            host_trade_candidate candidate;
+            (void) host_trade_price(
+                *this, it, ordinal, calib, candidate);
+            if (candidate.hard_leased) {
+                candidate.attempted = true;
+                const uint64_t quote_sequence =
+                    ++publish_authority->destruction_quote_sequence;
+                observe_host_trade_refusal(
+                    *this,
+                    quote_sequence,
+                    common_cache_plan_destruction_reason::hard_lease_blocked,
+                    &candidate.ranking);
+                if (destruction_obs) {
+                    destruction_obs->note_host_trade_veto();
+                }
+            }
+            candidates.push_back(std::move(candidate));
+        }
+    } catch (...) {
+        if (destruction_obs) {
+            destruction_obs->host_trade_legacy_fallbacks++;
+        }
+        return false;
+    }
+
+    const auto stable_key = [](const host_trade_candidate & candidate) {
+        // Keep B's planner-key shape explicit even though this inventory has
+        // only the host provider; later mixed-provider trades retain ordering.
+        return std::make_tuple(
+            uint8_t(common_cache_plan_provider::host_cache_entry),
+            candidate.victim->cache_plan_source_id,
+            candidate.ranking.ordinal);
+    };
+    while (true) {
+        uint64_t minimum = std::numeric_limits<uint64_t>::max();
+        for (const auto & candidate : candidates) {
+            if (!candidate.attempted && candidate.ranking.price_known) {
+                minimum = std::min(minimum, candidate.ranking.price_us);
+            }
+        }
+        if (minimum == std::numeric_limits<uint64_t>::max()) {
+            break;
+        }
+        const long double floor = std::max<long double>(
+            (long double) minimum * COMMON_CACHE_PLAN_TIE_REL_FLOOR,
+            COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US);
+        host_trade_candidate * chosen = nullptr;
+        bool saw_zero = false;
+        bool saw_destructive = false;
+        for (auto & candidate : candidates) {
+            if (candidate.attempted || !candidate.ranking.price_known ||
+                (long double) candidate.ranking.price_us >
+                    (long double) minimum + floor) {
+                continue;
+            }
+            saw_zero |= candidate.ranking.zero_destruction;
+            saw_destructive |= !candidate.ranking.zero_destruction;
+            if (!chosen ||
+                std::make_tuple(!candidate.ranking.zero_destruction,
+                                stable_key(candidate)) <
+                std::make_tuple(!chosen->ranking.zero_destruction,
+                                stable_key(*chosen))) {
+                chosen = &candidate;
+            }
+        }
+        const bool mixed_destruction_tie = saw_zero && saw_destructive;
+        GGML_ASSERT(chosen != nullptr);
+        chosen->attempted = true;
+        chosen->ranking.zero_destruction_tie_break =
+            mixed_destruction_tie && chosen->ranking.zero_destruction;
+
+        const uint64_t quote_sequence =
+            ++publish_authority->destruction_quote_sequence;
+        auto certified = certify_host_destruction(
+            *this,
+            chosen->victim,
+            chosen->recovery,
+            quote_sequence,
+            true,
+            false,
+            &chosen->ranking);
+        if (!certified.ready) {
+            if (destruction_obs) {
+                if (certified.quote.receipt.reason ==
+                        common_cache_plan_destruction_reason::
+                            hard_lease_blocked) {
+                    destruction_obs->note_host_trade_veto();
+                } else {
+                    destruction_obs->note_host_trade_refused();
+                }
+            }
+            if (certified.quote.receipt.reason ==
+                    common_cache_plan_destruction_reason::
+                        hard_lease_blocked) {
+                chosen->hard_leased = true;
+            } else if (certified.quote.receipt.reason ==
+                    common_cache_plan_destruction_reason::
+                        lease_unavailable) {
+                chosen->lease_known = false;
+            }
+            continue;
+        }
+
+        if (destruction_obs) {
+            destruction_obs->host_trade_attempted++;
+        }
+
+        const auto admission = server_prompt_cache_observe_drop(
+            *this, *chosen->victim, reason);
+        const std::thread::id scheduler_owner = std::this_thread::get_id();
+        SRV_WRN(
+            " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
+            chosen->victim->cache_plan_source_id,
+            chosen->victim->size() / (1024.0 * 1024.0));
+        server_prompt_cache_destroy_entry_impl(*this, chosen->victim);
+        // D-A3 uses the same no-interleaving terminal as D-A2. Pricing and all
+        // fallible recovery work completed before the physical erase; the raw
+        // list mutation has no callback/C writer, and capability commit is the
+        // immediately following operation on update_slots' owner thread.
+        commit_certified_host_destruction(
+            *this, certified, scheduler_owner, &chosen->ranking);
+        if (destruction_obs) {
+            destruction_obs->note_host_trade_executed(
+                admission.sequence,
+                certified.projected_bytes,
+                chosen->main_family,
+                chosen->soft_leased,
+                chosen->ranking.zero_destruction_tie_break);
+        }
+        return true;
+    }
+
+    // Candidates without a fitted/complete price never join a partial
+    // optimum. Emit one typed refusal per skipped victim, then retain the
+    // exact historical FIFO terminal. No new request is refused merely
+    // because D-A evidence is incomplete.
+    for (auto & candidate : candidates) {
+        if (candidate.attempted || candidate.ranking.price_known) {
+            continue;
+        }
+        candidate.attempted = true;
+        const uint64_t quote_sequence =
+            ++publish_authority->destruction_quote_sequence;
+        observe_host_trade_refusal(
+            *this,
+            quote_sequence,
+            common_cache_plan_destruction_reason::capacity_refused,
+            &candidate.ranking);
+        if (destruction_obs) {
+            destruction_obs->note_host_trade_unpriced();
+        }
+    }
+    for (const auto & candidate : candidates) {
+        if (candidate.lease_known && !candidate.hard_leased &&
+            candidate.victim->recovery_pins == 0) {
+            legacy_floor = candidate.victim;
+            break;
+        }
+    }
+    if (legacy_floor == states.end() && std::any_of(
+            candidates.begin(), candidates.end(), [](const auto & candidate) {
+                return candidate.hard_leased;
+            })) {
+        floor_reason =
+            common_cache_plan_destruction_reason::hard_lease_blocked;
+    }
+    if (destruction_obs) {
+        destruction_obs->host_trade_legacy_fallbacks++;
+    }
+    return false;
+}
+
+bool server_prompt_cache::evict_front_under_pressure(
+        server_cache_destruction_reason reason,
+        iterator incoming) {
+    GGML_ASSERT(!states.empty());
+    iterator legacy_floor = states.end();
+    common_cache_plan_destruction_reason floor_reason =
+        common_cache_plan_destruction_reason::capacity_refused;
+    if (destroy_priced_host_entry(
+            reason, incoming, legacy_floor, floor_reason)) {
+        return true;
+    }
+
+    // Lifecycle-off is the byte-identical historical FIFO floor. Once
+    // lifecycle authority exists, the floor skips recovery pins and admits
+    // only entries whose inspected lease is known non-hard.
+    if (!publish_authority) {
+        legacy_floor = states.begin();
+    }
+    if (legacy_floor != states.end()) {
+        SRV_WRN(
+            " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
+            legacy_floor->cache_plan_source_id,
+            legacy_floor->size() / (1024.0 * 1024.0));
+        destroy_entry(legacy_floor, reason);
+        return true;
+    }
+
+    // Hard leases are proof-backed guarantees. If no unpinned, known-nonhard
+    // retained entry exists, publication—not an existing protected entry—is
+    // the refused operation. Public maintenance without an incoming save
+    // simply leaves the configured pressure visible for a later retry.
+    if (destruction_obs && incoming != states.end()) {
+        destruction_obs->note_host_trade_publication_skip();
+    }
+    if (publish_authority) {
+        const uint64_t sequence =
+            ++publish_authority->destruction_quote_sequence;
+        observe_host_trade_refusal(*this, sequence, floor_reason);
+    }
+    if (incoming != states.end()) {
+        destroy_entry(incoming, reason);
+    }
+    return false;
+}
+
 server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         iterator it,
         server_cache_destruction_reason reason,
@@ -2562,15 +3067,19 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
 
     llama_cache_prepared_release_set prepared;
     server_prompt_cache_retirement_manifest retirement;
+    // The legacy-fallback manifest is captured independently from D-A2's
+    // certified manifest: a refused exact-redundancy proof must still execute
+    // the historical retirement terminal. Both are read-only snapshots; only
+    // the selected terminal retires them after the physical erase.
     const bool retirement_ready = publish_authority && acct &&
         server_prompt_cache_capture_retirement(*this, it, retirement);
     bool capability_ready = false;
-    redundant_host_certification redundant;
+    host_destruction_certification redundant;
     if (publish_authority && acct &&
         reason == server_cache_destruction_reason::host_dedup &&
         recovery != states.end()) {
-        redundant = certify_redundant_host(
-            *this, it, recovery, admission.sequence, retirement_ready);
+        redundant = certify_host_destruction(
+            *this, it, recovery, admission.sequence, false, true);
     }
     if (publish_authority && acct) {
         std::vector<llama_cache_acct_op_id> ops;
@@ -2599,32 +3108,18 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     }
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
     if (redundant.ready) {
-        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
         // D-A2 certify→mutate→commit boundary. Like D-A1, publication and
         // dedup run synchronously on update_slots. The physical list erase has
         // no callback or C producer; the immediate capability commit is the
         // only ledger terminal, so no ledger write can interleave. The
         // recovery pin remains live across both operations and prevents the
         // cited survivor from entering this raw primitive.
-        const auto release_status =
-            redundant.capability.commit(redundant.pin);
-        GGML_ASSERT(release_status ==
-                    common_cache_plan_destruction_reason::none);
-        server_prompt_cache_retire_manifest(*this, retirement);
-        redundant.quote.receipt.state =
-            common_cache_plan_destruction_state::executed;
-        redundant.quote.receipt.actual_accounting_serial =
-            acct->snapshot().serial;
-        server_prompt_cache_observe_host_destruction(
-            *this, redundant.quote.receipt, false,
-            redundant.projected_bytes);
+        commit_certified_host_destruction(
+            *this, redundant, scheduler_owner);
         if (destruction_obs) {
             destruction_obs->note_redundant_host_executed(
                 admission.sequence, redundant.projected_bytes);
         }
-        // The surviving host entry outlives the D-A commit; this local
-        // dedup dependency closes here, so its non-policy pin may now release.
-        redundant.pin = {};
     } else if (capability_ready) {
         GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
         // D-A1 prepare→mutate→commit boundary. destroy_entry() is called
@@ -2770,7 +3265,9 @@ bool server_prompt_cache::publish(
     // are already committed, so a local make-room loop would prevent no memory spike and, being
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
-    update();
+    if (!update_impl(self)) {
+        return false;
+    }
     return true;
 }
 
@@ -3124,12 +3621,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    (void) update_impl(states.end());
+}
+
+bool server_prompt_cache::update_impl(iterator incoming) {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache size limit reached (size = %.3f MiB)\n",
+                    size() / (1024.0 * 1024.0));
 
-            destroy_entry(
-                states.begin(), server_cache_destruction_reason::host_capacity);
+            if (!evict_front_under_pressure(
+                    server_cache_destruction_reason::host_capacity,
+                    incoming)) {
+                return false;
+            }
         }
     }
 
@@ -3141,11 +3646,15 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur,
+                    size() / (1024.0 * 1024.0));
 
-            destroy_entry(
-                states.begin(), server_cache_destruction_reason::host_token_limit);
+            if (!evict_front_under_pressure(
+                    server_cache_destruction_reason::host_token_limit,
+                    incoming)) {
+                return false;
+            }
         }
     }
 
@@ -3156,4 +3665,5 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+    return true;
 }

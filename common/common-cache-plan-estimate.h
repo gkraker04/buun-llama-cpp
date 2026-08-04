@@ -37,6 +37,14 @@ struct common_cache_plan_calib {
 // profile has no fitted entry — the caller then leaves planner outputs unavailable.
 const common_cache_plan_calib * common_cache_plan_calib_find(const std::string & profile);
 
+// One versioned/trust-checked restore formula for B estimates and D-A host
+// retention pricing. False means the fitted formula cannot be trusted.
+bool common_cache_plan_restore_us(
+        const common_cache_plan_calib & calib,
+        uint64_t bytes,
+        double & restore_us,
+        double & workspace_us) noexcept;
+
 // THE profile-composition rule (single producer-side spelling, tested): lowercases and
 // squashes everything outside [a-z0-9/.] to '-'. The server composes records with this;
 // fitted table entries must key on exactly this output — a drifted spelling fails silently

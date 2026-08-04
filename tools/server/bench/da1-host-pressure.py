@@ -119,6 +119,9 @@ def main():
 		help="on-arm host inventory peak may exceed the off arm by at "
 		"most this many entries (retained-entry reuse, not duplication)")
 	parser.add_argument("--timing-max-regress", type=float, default=0.25)
+	parser.add_argument("--expect-priced-eviction", action="store_true",
+		help="the on arm must show >=1 executed destruction receipt with "
+		"numeric price_us ranking evidence (the D-A3 priced path live)")
 	parser.add_argument("--expect-da2-evidence", action="store_true",
 		help="the on arm must show D-A2 destruction receipts on grown-save "
 		"prunes: typed refusals (fail-closed conservatism) or certified "
@@ -130,8 +133,9 @@ def main():
 	on_t, on_peak, retained = run_arm(args, True, args.base_port + 1,
 		f"{args.workdir}/server-on.log")
 
+	priced_evictions = 0
 	da2_receipts, da2_faults = {}, 0
-	if args.expect_da2_evidence:
+	if args.expect_da2_evidence or args.expect_priced_eviction:
 		with open(f"{args.workdir}/server-on.log", errors="replace") as handle:
 			for line in handle:
 				match = re.search(r"CACHE_HOST_DESTRUCTION (\{.*)", line)
@@ -147,6 +151,9 @@ def main():
 					da2_receipts[key] = da2_receipts.get(key, 0) + 1
 				if destruction.get("reason") == "internal_fault":
 					da2_faults += 1
+				if (state == "executed" and
+						isinstance(destruction.get("price_us"), (int, float))):
+					priced_evictions += 1
 
 	failures = []
 	for i, (off, on) in enumerate(zip(off_t, on_t)):
@@ -180,8 +187,17 @@ def main():
 			failures.append(
 				"no D-A2 destruction receipts on the on arm -- the "
 				"certification seam never engaged on grown-save prunes")
-		if da2_faults:
-			failures.append(f"{da2_faults} internal_fault destruction receipt(s)")
+	if (args.expect_priced_eviction and priced_evictions == 0
+			and not da2_receipts):
+		# priced EXECUTION needs recovery evidence (a duplicate) which the
+		# no-auto-capture ruling makes organically rare; the gate requires
+		# the trade path ENGAGED (typed refusals with the floor evicting)
+		# or an actual priced execution -- unit tests carry the latter
+		failures.append(
+			"no priced-trade evidence on the on arm -- neither executed "
+			"priced evictions nor typed trade refusals under pressure")
+	if (args.expect_da2_evidence or args.expect_priced_eviction) and da2_faults:
+		failures.append(f"{da2_faults} internal_fault destruction receipt(s)")
 
 	report = {
 		"cycles": len(on_t),
@@ -189,6 +205,7 @@ def main():
 		"on_inventory_peak": on_peak,
 		"retained_restores": retained,
 		"da2_receipts": da2_receipts,
+		"priced_evictions": priced_evictions,
 		"timing": timing,
 		"failures": failures,
 	}

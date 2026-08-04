@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-cache-lease.h"
+#include "server-cache-destruction-quote.h"
 #include "server-cache-yield.h"
 #include "server-retention-sidecar.h"
 #include "../../common/common-cache-plan.h"
@@ -11,6 +12,36 @@
 #include <vector>
 
 struct server_prompt_cache_state;
+
+// D-A3's process-local policy seams. The weight callback is deliberately a
+// dimensionless fixed-point multiplier: fitted B restore cost remains the
+// economic base, while E1/capstone policy can replace the provisional
+// automatic weight without changing the victim ladder. A weight callback that
+// returns false, or returns true with weight_milli == 0, refuses pricing for
+// that victim (fail-closed); zero never means free-to-evict. The recovery callback
+// is invoked only for an already-authorized durable source; it may never
+// enumerate or widen tenant authorization.
+constexpr uint32_t SERVER_CACHE_HOST_WEIGHT_SCALE = 1000;
+constexpr uint32_t SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT = 2000;
+constexpr uint32_t SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT = 2000;
+
+using server_cache_host_retention_weight_fn = bool (*)(
+    void * context,
+    const server_prompt_cache_state & victim,
+    uint32_t & weight_milli) noexcept;
+
+struct server_cache_host_recovery_evidence {
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin pin;
+    common_cache_plan_displaced_fate fate =
+        common_cache_plan_displaced_fate::unavailable;
+};
+
+using server_cache_host_recovery_fn = bool (*)(
+    void * context,
+    const server_prompt_cache_state & victim,
+    server_cache_host_recovery_evidence & out) noexcept;
 
 // P2 F0 authority substrate. The debug observer is only a serialization layer over this
 // independently-owned state; --cache-lifecycle can therefore enforce accounting with debug off.
@@ -41,6 +72,11 @@ struct server_cache_authority {
     uint64_t admission_commits   = 0;
     uint64_t admission_rollbacks = 0;
     uint64_t destruction_quote_sequence = 0;
+    std::string calibration_profile;
+    void * host_retention_weight_context = nullptr;
+    server_cache_host_retention_weight_fn host_retention_weight = nullptr;
+    void * host_recovery_context = nullptr;
+    server_cache_host_recovery_fn host_recovery = nullptr;
     bool configured = true;
     bool summary_emitted = false;
 

@@ -10,6 +10,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/contract-scan-utils.cmake")
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-lifecycle.h" inventory_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" server_context)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.cpp" server_task)
+file(READ "${SOURCE_ROOT}/tests/test-server-prompt-cache.cpp" server_task_test)
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-destruction-quote.h" quote_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-destruction-quote.cpp" quote_source)
 
@@ -285,9 +286,9 @@ if (raw_call_pos EQUAL -1 OR legacy_release_pos LESS_EQUAL raw_call_pos)
 endif()
 count_literal(
     "${server_task}" "server_prompt_cache_destroy_entry_impl(" raw_impl_sites)
-if (NOT raw_impl_sites EQUAL 2)
+if (NOT raw_impl_sites EQUAL 3)
     message(FATAL_ERROR
-        "D-A0b raw host primitive must have one definition and one censused wrapper call; found ${raw_impl_sites}")
+        "D-A3 raw host primitive must have one definition and two censused capability/wrapper calls; found ${raw_impl_sites}")
 endif()
 
 # Negative control C: injecting an internal release into the raw primitive must
@@ -417,14 +418,58 @@ if (da1_release_negative_valid)
         "D-A1 host commit-gap release negative control did not trip")
 endif()
 
+# D-A2 and D-A3 share one certified commit terminal. The helper itself and
+# each raw-erase -> helper-call edge are scanned: moving any ledger producer
+# into either side of that boundary must fail this contract.
+contract_extract_region(
+    "${server_task}"
+    "void commit_certified_host_destruction("
+    "certified.capability.commit(certified.pin);"
+    certified_commit_helper certified_commit_helper_found)
+contract_find_forbidden(
+    "${certified_commit_helper}" certified_helper_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+count_literal(
+    "${server_task}"
+    "commit_certified_host_destruction(" certified_commit_sites)
+if (NOT certified_commit_helper_found OR certified_helper_forbidden OR
+    NOT certified_commit_sites EQUAL 3)
+    message(FATAL_ERROR
+        "D-A2/D-A3 shared certified-destruction terminal drifted")
+endif()
+string(REPLACE
+    "    GGML_ASSERT(certified.ready);"
+    "    cache.acct->release({}); GGML_ASSERT(certified.ready);"
+    certified_helper_negative "${server_task}")
+contract_extract_region(
+    "${certified_helper_negative}"
+    "void commit_certified_host_destruction("
+    "certified.capability.commit(certified.pin);"
+    certified_negative_region certified_negative_found)
+contract_find_forbidden(
+    "${certified_negative_region}" certified_negative_forbidden "release(")
+if (NOT certified_negative_found OR NOT certified_negative_forbidden)
+    message(FATAL_ERROR
+        "D-A2/D-A3 shared-terminal negative control did not trip")
+endif()
+
 # D-A2 opens only the exact host_dedup class. Its disjoint survivor pin is
-# acquired before the raw erase, and the alternate capability terminal is the
+# acquired before the raw erase, and the shared capability terminal is the
 # first operation after the erase on that control-flow arm. Every other reason
 # continues through D-A1's legacy/capability behavior.
 contract_extract_region(
     "${server_task}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "const auto release_status =\n            redundant.capability.commit(redundant.pin);"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
     da2_commit_gap da2_commit_gap_found)
 contract_find_forbidden(
     "${da2_commit_gap}" da2_gap_forbidden
@@ -456,7 +501,7 @@ string(REPLACE
 contract_extract_region(
     "${da2_gap_negative}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "const auto release_status =\n            redundant.capability.commit(redundant.pin);"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
     da2_negative_gap da2_negative_found)
 contract_find_forbidden(
     "${da2_negative_gap}" da2_negative_forbidden "release(")
@@ -493,7 +538,7 @@ endif()
 contract_extract_region(
     "${server_task}"
     "void server_prompt_cache_observe_host_destruction("
-    "redundant_host_certification certify_redundant_host("
+    "host_destruction_certification certify_host_destruction("
     da2_debug_emit_region da2_debug_emit_region_found)
 string(FIND "${da2_debug_emit_region}"
     "if (!cache.debug_observability) {" da2_debug_emit_gate)
@@ -507,6 +552,137 @@ if (NOT da2_debug_emit_region_found OR da2_debug_emit_gate EQUAL -1 OR
     message(FATAL_ERROR "D-A2 debug-only maintenance evidence gate drifted")
 endif()
 
+# D-A3 routes both bounded host-pressure loops through one pressure terminal,
+# which owns the fitted-price attempt and the historical FIFO all-refused
+# fallback. A successful trade uses the same shared capability terminal as
+# D-A2 and emits ranking evidence only through the debug-gated D-A2 line.
+count_literal(
+    "${server_task}" "destroy_priced_host_entry(" da3_priced_entry_sites)
+count_literal(
+    "${server_task}" "evict_front_under_pressure(" da3_pressure_entry_sites)
+function(da3_hard_floor_valid source output)
+    foreach(needle
+            "candidate.lease_known && !candidate.hard_leased"
+            "candidate.victim->recovery_pins == 0"
+            "if (!update_impl(self)) {"
+            "note_host_trade_publication_skip()")
+        string(FIND "${source}" "${needle}" needle_pos)
+        if (needle_pos EQUAL -1)
+            set(${output} FALSE PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${output} TRUE PARENT_SCOPE)
+endfunction()
+da3_hard_floor_valid("${server_task}" da3_hard_floor_ok)
+contract_extract_region(
+    "${server_task}"
+    "host_destruction_certification certify_host_destruction("
+    "server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl("
+    da3_trade_body da3_trade_body_found)
+contract_extract_region(
+    "${da3_trade_body}"
+    "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
+    da3_commit_gap da3_commit_gap_found)
+contract_find_forbidden(
+    "${da3_commit_gap}" da3_gap_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+foreach(pin
+        "common_cache_plan_calib_find("
+        "common_cache_plan_restore_us("
+        "SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT"
+        "SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT"
+        "evidence.pin.binds_exact("
+        "candidate.ranking.zero_destruction"
+        "COMMON_CACHE_PLAN_TIE_REL_FLOOR"
+        "host_trade_legacy_fallbacks++"
+        "candidate.hard_leased"
+        "candidate.victim->recovery_pins == 0")
+    string(FIND "${da3_trade_body}" "${pin}" da3_pin)
+    if (da3_pin EQUAL -1)
+        message(FATAL_ERROR "D-A3 priced-host trade pin missing: ${pin}")
+    endif()
+endforeach()
+foreach(pin
+        "note_host_trade_veto()"
+        "note_host_trade_publication_skip()"
+        "host_trade_hard_lease_vetoes++"
+        "host_trade_publication_skips++")
+    string(FIND "${server_task}${inventory_header}" "${pin}" da3_floor_pin)
+    if (da3_floor_pin EQUAL -1)
+        message(FATAL_ERROR "D-A3 hard-floor evidence pin missing: ${pin}")
+    endif()
+endforeach()
+foreach(pin
+        "server_cache_destruction_reason::host_capacity"
+        "server_cache_destruction_reason::host_token_limit")
+    string(FIND "${server_task}" "evict_front_under_pressure(\n                    ${pin}," da3_route)
+    if (da3_route EQUAL -1)
+        message(FATAL_ERROR "D-A3 host-pressure entry point drifted: ${pin}")
+    endif()
+endforeach()
+foreach(pin
+        "price_us"
+        "retention_weight_milli"
+        "rank_ordinal"
+        "victim_source_id"
+        "victim_artifact_id"
+        "zero_destruction_tie_break")
+    string(FIND "${da2_debug_emit_region}" "${pin}" da3_debug_pin)
+    if (da3_debug_pin EQUAL -1)
+        message(FATAL_ERROR "D-A3 ranking evidence field missing: ${pin}")
+    endif()
+endforeach()
+if (NOT da3_priced_entry_sites EQUAL 2 OR
+    NOT da3_pressure_entry_sites EQUAL 3 OR
+    NOT da3_hard_floor_ok OR
+    NOT da3_trade_body_found OR NOT da3_commit_gap_found OR
+    da3_gap_forbidden)
+    message(FATAL_ERROR
+        "D-A3 priced-host routing/capability-adjacency contract drifted")
+endif()
+string(REPLACE
+    "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
+    "server_prompt_cache_destroy_entry_impl(*this, chosen->victim); acct->release({});"
+    da3_gap_negative "${server_task}")
+contract_extract_region(
+    "${da3_gap_negative}"
+    "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
+    da3_negative_gap da3_negative_found)
+contract_find_forbidden(
+    "${da3_negative_gap}" da3_negative_forbidden "release(")
+if (NOT da3_negative_found OR NOT da3_negative_forbidden)
+    message(FATAL_ERROR "D-A3 commit-gap negative control did not trip")
+endif()
+string(REPLACE
+    "candidate.lease_known && !candidate.hard_leased"
+    "candidate.lease_known"
+    da3_floor_negative "${server_task}")
+da3_hard_floor_valid("${da3_floor_negative}" da3_floor_negative_valid)
+if (da3_floor_negative_valid)
+    message(FATAL_ERROR "D-A3 hard-floor negative control did not trip")
+endif()
+foreach(test_pin
+        "test_host_trade_hard_lease_veto"
+        "test_host_trade_all_hard_skips_publication"
+        "test_host_trade_floor_skips_recovery_pin")
+    string(FIND "${server_task_test}" "${test_pin}" da3_floor_test)
+    if (da3_floor_test EQUAL -1)
+        message(FATAL_ERROR "D-A3 hard-floor regression missing: ${test_pin}")
+    endif()
+endforeach()
+
 message(STATUS
     "D-S4 destruction inventory scan passed: 6 classes, ${admission_owner_count} admission owners, "
-    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2 commit-gap/debug-emission negative controls")
+    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2/D-A3 commit-gap/debug-emission negative controls")

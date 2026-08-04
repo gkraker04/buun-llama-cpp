@@ -5,11 +5,13 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <initializer_list>
 #include <iterator>
 #include <list>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -94,6 +96,123 @@ std::list<server_prompt_cache_state> make_redundant_entry() {
     checkpoint.accel.ring.assign(5, 11);
     checkpoint.accel.spec.assign(2, 12);
     return entry;
+}
+
+constexpr const char * HOST_TRADE_TEST_PROFILE =
+    "qwen35-2b-q4-k---medium/nvidia-geforce-rtx-3090-ngl99/b512/kf16-vf16";
+
+class available_host_fallback final : public server_cache_lease_fallback_provider {
+public:
+    server_cache_lease_fallback_state preflight(
+            const server_cache_lease_subject &,
+            const server_cache_lease_identity &) noexcept override {
+        return server_cache_lease_fallback_state::available;
+    }
+};
+
+void configure_host_trade(
+        server_cache_authority & authority,
+        server_prompt_cache & cache,
+        const std::string & execution_identity,
+        server_cache_lease_table * leases = nullptr) {
+    configure_host_accounting(authority, true);
+    authority.calibration_profile = HOST_TRADE_TEST_PROFILE;
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    cache.retention_obs = &authority.retention;
+    cache.lease_obs = leases ? leases : &authority.leases;
+    cache.lease_execution_identity = &execution_identity;
+}
+
+server_prompt_cache::iterator install_host_trade_entry(
+        server_prompt_cache & cache,
+        server_cache_authority & authority,
+        const char * unique_adapter,
+        size_t bytes) {
+    static llama_token next_token = 100;
+    const llama_token first = next_token;
+    next_token += 3;
+    auto entry = make_prompt_entry(
+        unique_adapter, { first, first + 1, first + 2 });
+    entry.front().data.main.assign(bytes, uint8_t(next_token));
+    CHECK(cache.publish(std::move(entry)));
+    auto installed = std::prev(cache.states.end());
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, 1);
+    spans.add(COMMON_CHAT_ROLE_USER, 1, 1);
+    spans.add(COMMON_CHAT_ROLE_USER, 2, 1);
+    CHECK(authority.retention.publish(
+        server_retention_instance_key::for_host_entry(&*installed),
+        common_retention_pool::attention,
+        spans,
+        true,
+        3,
+        1,
+        true));
+    return installed;
+}
+
+void make_host_trade_pair(
+        server_prompt_cache::iterator victim,
+        server_prompt_cache::iterator recovery,
+        const char * adapter,
+        llama_token token,
+        int32_t source_id,
+        bool main_family = false) {
+    victim->adapter_config_key = adapter;
+    recovery->adapter_config_key = adapter;
+    victim->prompt.tokens = server_tokens(
+        llama_tokens { token, token + 1, token + 2 }, false);
+    recovery->prompt.tokens = server_tokens(
+        llama_tokens { token, token + 1, token + 2 }, false);
+    victim->prompt.sequence_epoch = uint64_t(token);
+    recovery->prompt.sequence_epoch = uint64_t(token);
+    victim->data.main = recovery->data.main;
+    victim->cache_plan_source_id = source_id;
+    recovery->cache_plan_source_id = source_id + 100;
+    victim->main_family = main_family;
+    // Keep the proof source outside the victim candidate set while still
+    // allowing D-A's short-lived pin to nest over it.
+    recovery->recovery_pins = 1;
+    CHECK(server_prompt_cache::exactly_redundant(*victim, *recovery));
+}
+
+server_cache_lease_id grant_host_lease(
+        server_prompt_cache & cache,
+        server_cache_lease_table & leases,
+        server_prompt_cache::iterator victim,
+        server_cache_lease_class cls) {
+    const auto artifact = cache.retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*victim));
+    server_cache_lease_identity identity;
+    CHECK(server_cache_lease_build_identity(
+        *cache.lease_execution_identity,
+        victim->adapter_config_key,
+        victim->prompt.tokens,
+        victim->prompt.n_tokens(),
+        identity));
+    const server_cache_lease_subject subject {
+        artifact,
+        common_retention_artifact_kind::host_entry,
+        -1,
+    };
+    const auto scope = server_cache_lease_scope::from(
+        leases.new_context_scope());
+    return cls == server_cache_lease_class::hard
+        ? leases.grant_hard(subject, scope, identity,
+              server_cache_lease_table::IMPLICIT_SOFT_TTL_NS)
+        : leases.grant_soft(subject, scope, identity,
+              server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+}
+
+bool host_source_present(
+        const server_prompt_cache & cache,
+        int32_t source_id) {
+    return std::any_of(cache.states.begin(), cache.states.end(),
+        [&](const auto & state) {
+            return state.cache_plan_source_id == source_id;
+        });
 }
 
 // Regression for F0b review MUST-1: lifecycle accounting may prove/transact publication, but the
@@ -437,6 +556,233 @@ void test_redundancy_payload_mismatch_and_missing_catalog() {
     CHECK(authority.destruction.prepared_release_commits == 1);
 }
 
+void test_host_trade_soft_lease_weight_flips_victim() {
+    server_cache_authority authority;
+    const std::string execution = "trade-soft";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+
+    auto a = install_host_trade_entry(cache, authority, "a-v", 64);
+    auto ar = install_host_trade_entry(cache, authority, "a-r", 64);
+    auto b = install_host_trade_entry(cache, authority, "b-v", 64);
+    auto br = install_host_trade_entry(cache, authority, "b-r", 64);
+    make_host_trade_pair(a, ar, "pair-a", 10, 10);
+    make_host_trade_pair(b, br, "pair-b", 20, 20);
+    CHECK(grant_host_lease(
+        cache, authority.leases, a, server_cache_lease_class::soft));
+
+    cache.limit_size = cache.size() - b->size() + 1;
+    cache.update();
+    CHECK(host_source_present(cache, 10));
+    CHECK(!host_source_present(cache, 20));
+    CHECK(authority.destruction.host_trade_attempted == 1);
+    CHECK(authority.destruction.host_trade_executed == 1);
+    CHECK(authority.destruction.host_trade_soft_lease_evictions == 0);
+    CHECK(authority.destruction_counters.last_receipt.state ==
+          common_cache_plan_destruction_state::executed);
+    CHECK(authority.destruction_counters.last_receipt.lease_verdict ==
+          common_cache_plan_destruction_lease_verdict::unleased);
+
+    // Soft protection is a price, never a veto: once it is the only
+    // certifiable victim, the same lease must still permit eviction.
+    cache.limit_size = cache.size() - a->size() + 1;
+    cache.update();
+    CHECK(!host_source_present(cache, 10));
+    CHECK(authority.destruction.host_trade_executed == 2);
+    CHECK(authority.destruction.host_trade_soft_lease_evictions == 1);
+    CHECK(cache.debug_destruction_emissions == 0);
+}
+
+void test_host_trade_main_family_weight_flips_victim() {
+    server_cache_authority authority;
+    const std::string execution = "trade-main";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+
+    auto main = install_host_trade_entry(cache, authority, "m-v", 64);
+    auto main_r = install_host_trade_entry(cache, authority, "m-r", 64);
+    auto child = install_host_trade_entry(cache, authority, "c-v", 64);
+    auto child_r = install_host_trade_entry(cache, authority, "c-r", 64);
+    make_host_trade_pair(main, main_r, "pair-main", 30, 30, true);
+    make_host_trade_pair(child, child_r, "pair-child", 40, 40, false);
+
+    cache.limit_size = cache.size() - child->size() + 1;
+    cache.update();
+    CHECK(host_source_present(cache, 30));
+    CHECK(!host_source_present(cache, 40));
+    CHECK(authority.destruction.host_trade_attempted == 1);
+    CHECK(authority.destruction.host_trade_main_family_evictions == 0);
+
+    // The automatic family signal is likewise a finite pricing weight.
+    cache.limit_size = cache.size() - main->size() + 1;
+    cache.update();
+    CHECK(!host_source_present(cache, 30));
+    CHECK(authority.destruction.host_trade_executed == 2);
+    CHECK(authority.destruction.host_trade_main_family_evictions == 1);
+}
+
+void test_host_trade_zero_destruction_tie_break() {
+    server_cache_authority authority;
+    const std::string execution = "trade-tie";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    cache.debug_observability = true;
+
+    auto destructive = install_host_trade_entry(cache, authority, "d-v", 64);
+    destructive->cache_plan_source_id = 1;
+    auto duplicate = install_host_trade_entry(cache, authority, "z-v", 64);
+    auto duplicate_r = install_host_trade_entry(cache, authority, "z-r", 64);
+    make_host_trade_pair(
+        duplicate, duplicate_r, "pair-zero", 50, 2, false);
+
+    cache.limit_size = cache.size() - duplicate->size() + 1;
+    cache.update();
+    CHECK(host_source_present(cache, 1));
+    CHECK(!host_source_present(cache, 2));
+    CHECK(authority.destruction.host_trade_attempted == 1);
+    CHECK(authority.destruction.host_trade_refused == 0);
+    CHECK(authority.destruction.host_trade_zero_destruction_ties == 1);
+    CHECK(cache.debug_destruction_emissions == 3);
+}
+
+void test_host_trade_all_refuse_falls_back_to_legacy() {
+    server_cache_authority authority;
+    const std::string execution = "trade-fallback";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+
+    auto oldest = install_host_trade_entry(cache, authority, "old", 64);
+    auto newer = install_host_trade_entry(cache, authority, "new", 64);
+    oldest->cache_plan_source_id = 1;
+    newer->cache_plan_source_id = 2;
+    cache.limit_tokens = 3;
+    cache.update();
+    CHECK(!host_source_present(cache, 1));
+    CHECK(host_source_present(cache, 2));
+    CHECK(authority.destruction.host_trade_attempted == 2);
+    CHECK(authority.destruction.host_trade_refused == 2);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    CHECK(authority.destruction.prepared_release_commits == 1);
+    CHECK(authority.destruction_counters.last_receipt.reason ==
+          common_cache_plan_destruction_reason::recovery_unavailable);
+    const auto * event = authority.destruction.event_for_sequence(
+        authority.destruction.n_events);
+    CHECK(event != nullptr);
+    CHECK(event->execution !=
+          server_cache_destruction_execution::priced_host_eviction);
+    CHECK(cache.debug_destruction_emissions == 0);
+}
+
+void test_host_trade_hard_lease_veto() {
+    server_cache_authority authority;
+    available_host_fallback fallback;
+    server_cache_lease_table hard_leases(nullptr, &fallback);
+    const std::string execution = "trade-hard";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution, &hard_leases);
+
+    auto hard = install_host_trade_entry(cache, authority, "h-v", 64);
+    auto open = install_host_trade_entry(cache, authority, "o-v", 64);
+    hard->cache_plan_source_id = 1;
+    open->cache_plan_source_id = 2;
+    CHECK(grant_host_lease(
+        cache, hard_leases, hard, server_cache_lease_class::hard));
+
+    // Neither victim has durable recovery evidence, so the ranked ladder
+    // refuses. The legacy floor must still honor the hard veto and evict the
+    // next-oldest known-nonhard entry.
+    cache.limit_tokens = 3;
+    cache.update();
+    CHECK(host_source_present(cache, 1));
+    CHECK(!host_source_present(cache, 2));
+    CHECK(authority.destruction.host_trade_attempted == 2);
+    CHECK(authority.destruction.host_trade_hard_lease_vetoes == 1);
+    CHECK(authority.destruction.host_trade_refused == 1);
+    CHECK(authority.destruction.host_trade_executed == 0);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    CHECK(authority.destruction_counters.refused
+              [size_t(common_cache_plan_selection::none)]
+              [size_t(common_cache_plan_destruction_reason::
+                  hard_lease_blocked)] == 1);
+}
+
+void test_host_trade_all_hard_skips_publication() {
+    server_cache_authority authority;
+    available_host_fallback fallback;
+    server_cache_lease_table hard_leases(nullptr, &fallback);
+    const std::string execution = "trade-all-hard";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution, &hard_leases);
+    cache.debug_observability = true;
+
+    auto first = install_host_trade_entry(cache, authority, "hard-a", 64);
+    auto second = install_host_trade_entry(cache, authority, "hard-b", 64);
+    first->cache_plan_source_id = 11;
+    second->cache_plan_source_id = 12;
+    CHECK(grant_host_lease(
+        cache, hard_leases, first, server_cache_lease_class::hard));
+    CHECK(grant_host_lease(
+        cache, hard_leases, second, server_cache_lease_class::hard));
+
+    const auto live_ops_before = authority.ledger.snapshot().live_ops;
+    cache.limit_tokens = cache.n_tokens();
+    CHECK(!cache.publish(make_prompt_entry("incoming", { 90, 91, 92 })));
+    CHECK(cache.states.size() == 2);
+    CHECK(host_source_present(cache, 11));
+    CHECK(host_source_present(cache, 12));
+    CHECK(authority.destruction.host_trade_hard_lease_vetoes == 2);
+    CHECK(authority.destruction.host_trade_refused == 0);
+    CHECK(authority.destruction.host_trade_publication_skips == 1);
+    CHECK(authority.ledger.snapshot().live_ops == live_ops_before);
+    CHECK(authority.destruction_counters.last_receipt.state ==
+          common_cache_plan_destruction_state::refused);
+    CHECK(authority.destruction_counters.last_receipt.reason ==
+          common_cache_plan_destruction_reason::hard_lease_blocked);
+    CHECK(cache.debug_destruction_emissions == 3);
+}
+
+void test_host_trade_floor_skips_recovery_pin() {
+    server_cache_authority authority;
+    const std::string execution = "trade-pinned-floor";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+
+    auto pinned = install_host_trade_entry(cache, authority, "pinned", 64);
+    auto open = install_host_trade_entry(cache, authority, "open", 64);
+    pinned->cache_plan_source_id = 21;
+    open->cache_plan_source_id = 22;
+    pinned->recovery_pins = 1;
+
+    cache.limit_tokens = 3;
+    cache.update();
+    CHECK(host_source_present(cache, 21));
+    CHECK(!host_source_present(cache, 22));
+    CHECK(authority.destruction.host_trade_refused == 1);
+    CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+}
+
+void test_host_trade_partial_substrate_is_typed() {
+    server_cache_authority authority;
+    const std::string execution = "trade-partial-substrate";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    auto first = install_host_trade_entry(cache, authority, "first", 64);
+    auto second = install_host_trade_entry(cache, authority, "second", 64);
+    first->cache_plan_source_id = 31;
+    second->cache_plan_source_id = 32;
+
+    cache.lease_obs = nullptr;
+    cache.limit_tokens = 3;
+    cache.update();
+    CHECK(cache.states.size() == 1);
+    CHECK(!host_source_present(cache, 31));
+    CHECK(host_source_present(cache, 32));
+    CHECK(cache.host_trade_substrate_warned);
+    CHECK(authority.destruction.host_trade_substrate_unavailable == 1);
+    CHECK(authority.destruction_counters.last_receipt.reason ==
+          common_cache_plan_destruction_reason::lease_unavailable);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -457,6 +803,14 @@ int main(int argc, char ** argv) {
     test_authority_source_ids_survive_save_dedup();
     test_exact_redundant_host_eviction();
     test_redundancy_payload_mismatch_and_missing_catalog();
+    test_host_trade_soft_lease_weight_flips_victim();
+    test_host_trade_main_family_weight_flips_victim();
+    test_host_trade_zero_destruction_tie_break();
+    test_host_trade_all_refuse_falls_back_to_legacy();
+    test_host_trade_hard_lease_veto();
+    test_host_trade_all_hard_skips_publication();
+    test_host_trade_floor_skips_recovery_pin();
+    test_host_trade_partial_substrate_is_typed();
     llama_backend_free();
 
     if (failures != 0) {

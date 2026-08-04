@@ -120,6 +120,9 @@ public:
     bool disjoint(
         const std::vector<llama_cache_acct_artifact_id> & artifacts,
         const std::vector<llama_cache_acct_op_id> & ops) const noexcept;
+    bool binds_exact(
+        llama_cache_acct_artifact_id artifact,
+        const std::vector<llama_cache_acct_op_id> & ops) const noexcept;
 
 private:
     void reset() noexcept;

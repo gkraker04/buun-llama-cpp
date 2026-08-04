@@ -65,6 +65,20 @@ static void test_profile_refusal() {
     CHECK(common_cache_plan_calib_find("") == nullptr);
 }
 
+static void test_restore_formula_door() {
+    double restore = 0.0;
+    double workspace = 0.0;
+    CHECK(common_cache_plan_restore_us(
+        TEST_CALIB, 1'000'000, restore, workspace));
+    CHECK(restore == 1000.0);
+    CHECK(workspace == 500.0);
+
+    auto invalid = TEST_CALIB;
+    invalid.estimator_version = 0;
+    CHECK(!common_cache_plan_restore_us(
+        invalid, 1, restore, workspace));
+}
+
 // the ONE producer-side profile-composition rule: lowercase, [a-z0-9/.] kept, rest '-'
 // (a drifted spelling fails silently — estimators legally refuse forever)
 static void test_profile_composition() {
@@ -679,6 +693,7 @@ static void test_sibling_chain_alternative() {
 
 int main() {
     test_profile_refusal();
+    test_restore_formula_door();
     test_profile_composition();
     test_placement_key();
     test_vbr_regime_key();

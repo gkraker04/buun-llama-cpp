@@ -333,6 +333,27 @@ bool server_cache_recovery_pin::disjoint(
     return true;
 }
 
+bool server_cache_recovery_pin::binds_exact(
+        llama_cache_acct_artifact_id artifact,
+        const std::vector<llama_cache_acct_op_id> & ops) const noexcept {
+    if (!valid() || artifact.v == 0 || artifacts_.size() != 1 ||
+        artifacts_.front() != artifact) {
+        return false;
+    }
+    try {
+        auto expected = ops;
+        std::sort(expected.begin(), expected.end());
+        expected.erase(std::unique(expected.begin(), expected.end()),
+                       expected.end());
+        return !expected.empty() &&
+               std::none_of(expected.begin(), expected.end(),
+                            [](auto op) { return !op; }) &&
+               expected == ops_;
+    } catch (...) {
+        return false;
+    }
+}
+
 void server_cache_recovery_pin::reset() noexcept {
     if (context_ && release_) {
         release_(context_);

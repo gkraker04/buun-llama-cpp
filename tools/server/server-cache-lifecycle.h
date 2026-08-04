@@ -79,6 +79,9 @@ enum class server_cache_destruction_execution : uint8_t {
     // proved identical to a disjoint survivor and the survivor was pinned
     // through the exact prepared-release commit.
     redundant_host_eviction,
+    // D-A3: B-priced host capacity/token victim, certified against a
+    // disjoint retained or pre-authorized durable recovery source.
+    priced_host_eviction,
     _count,
 };
 
@@ -209,6 +212,19 @@ struct server_cache_destruction_observer {
     uint64_t redundant_host_executed = 0;
     uint64_t redundant_host_refused = 0;
     uint64_t redundant_host_release_bytes = 0;
+    uint64_t host_trade_attempted = 0;
+    uint64_t host_trade_certified = 0;
+    uint64_t host_trade_executed = 0;
+    uint64_t host_trade_refused = 0;
+    uint64_t host_trade_unpriced = 0;
+    uint64_t host_trade_legacy_fallbacks = 0;
+    uint64_t host_trade_hard_lease_vetoes = 0;
+    uint64_t host_trade_publication_skips = 0;
+    uint64_t host_trade_substrate_unavailable = 0;
+    uint64_t host_trade_main_family_evictions = 0;
+    uint64_t host_trade_soft_lease_evictions = 0;
+    uint64_t host_trade_zero_destruction_ties = 0;
+    uint64_t host_trade_release_bytes = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
 
@@ -285,6 +301,47 @@ struct server_cache_destruction_observer {
         if (auto * event = event_for_sequence(sequence)) {
             event->execution =
                 server_cache_destruction_execution::redundant_host_eviction;
+        }
+    }
+
+    void note_host_trade_refused() noexcept {
+        host_trade_attempted++;
+        host_trade_refused++;
+    }
+
+    void note_host_trade_unpriced() noexcept {
+        host_trade_attempted++;
+        host_trade_unpriced++;
+    }
+
+    void note_host_trade_veto() noexcept {
+        host_trade_attempted++;
+        host_trade_hard_lease_vetoes++;
+    }
+
+    void note_host_trade_publication_skip() noexcept {
+        host_trade_publication_skips++;
+    }
+
+    void note_host_trade_substrate_fault() noexcept {
+        host_trade_substrate_unavailable++;
+    }
+
+    void note_host_trade_executed(
+            uint64_t sequence,
+            uint64_t released_bytes,
+            bool main_family,
+            bool soft_leased,
+            bool zero_destruction_tie) noexcept {
+        host_trade_certified++;
+        host_trade_executed++;
+        host_trade_release_bytes += released_bytes;
+        host_trade_main_family_evictions += main_family ? 1 : 0;
+        host_trade_soft_lease_evictions += soft_leased ? 1 : 0;
+        host_trade_zero_destruction_ties += zero_destruction_tie ? 1 : 0;
+        if (auto * event = event_for_sequence(sequence)) {
+            event->execution =
+                server_cache_destruction_execution::priced_host_eviction;
         }
     }
 };

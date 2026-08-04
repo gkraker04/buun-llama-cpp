@@ -744,6 +744,11 @@ struct server_prompt_cache_state {
     // refuses to destroy the cited survivor until capability close.
     uint32_t recovery_pins = 0;
 
+    // Automatic pre-E1 family signal. A save sourced from a parent/main slot
+    // receives the provisional D-A3 retention weight; child-task saves do not.
+    // E1 declared identity replaces this heuristic rather than stacking with it.
+    bool main_family = false;
+
     std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
         return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };
     }
@@ -819,7 +824,9 @@ struct server_prompt_cache {
     // completely untouched (no eviction, no limit change). The caller fills + validates the state
     // bytes; publish() then removes now-obsolete entries and splices the completed node in (no
     // allocation, no throw). A failed fill drops the staged node — never a poisoned/half-filled
-    // published entry, never an eviction that bought nothing.
+    // published entry, never an eviction that bought nothing. Under lifecycle hard-lease pressure,
+    // publish() may also return false after removing only its just-spliced incoming node; every
+    // previously retained hard-leased/recovery-pinned entry remains untouched.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
     bool publish(
             std::list<server_prompt_cache_state> entry,
@@ -878,6 +885,7 @@ struct server_prompt_cache {
     bool debug_observability = false;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
+    bool host_trade_substrate_warned = false;
 
     ~server_prompt_cache() {
         clear_accounting();
@@ -897,6 +905,15 @@ struct server_prompt_cache {
             std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
 
 private:
+    bool destroy_priced_host_entry(
+            server_cache_destruction_reason reason,
+            iterator incoming,
+            iterator & legacy_floor,
+            common_cache_plan_destruction_reason & floor_reason);
+    bool evict_front_under_pressure(
+            server_cache_destruction_reason reason,
+            iterator incoming);
+    bool update_impl(iterator incoming);
     iterator destroy_entry_impl(
             iterator it,
             server_cache_destruction_reason reason,
