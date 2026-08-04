@@ -10020,6 +10020,20 @@ private:
                             n_past = vbr_reset_on_low_lcp(
                                 slot, n_past, vbr_low_lcp_admission);
                             if (n_past < n_past_before_vbr_reset) {
+                                // The reset decision depends on the ownership
+                                // re-sample after idle reclaim, so it cannot be
+                                // predicted safely before the checkpoint seam.
+                                // Once applied, however, it supersedes the
+                                // authorized plan just like coverage recovery:
+                                // record typed capability drift, not an
+                                // apparent post-authorization internal fault.
+                                if (slot.cache_plan_execution.authoritative()) {
+                                    GGML_ASSERT(cache_plan_authority &&
+                                                slot.cache_plan);
+                                    server_cache_plan_demote_for_vbr_low_lcp_reset(
+                                        *cache_plan_authority, *slot.cache_plan,
+                                        slot.cache_plan_execution, true);
+                                }
                                 // A VBR reset physically cleared state; do not let true-LCP token
                                 // retention claim the cleared prefix.
                                 n_past_keep = std::min(n_past_keep, (size_t) n_past);

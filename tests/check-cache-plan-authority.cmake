@@ -12,6 +12,15 @@ file(READ "${SOURCE_ROOT}/tools/server/server-cache-plan-authority.h" authority_
 file(READ "${SOURCE_ROOT}/common/common.h" common_header)
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" plan_header)
 
+# The landed behavior ceiling moves one ratchet at a time. Parsed future levels
+# may enable the landed prefix, but must not authorize LRU before B-A4.
+string(REGEX MATCH
+    "SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL[ \t\r\n]*=[ \t\r\n]*common_cache_plan_authority_level::route_home;"
+    implemented_ceiling "${authority_header}")
+if (NOT implemented_ceiling)
+    message(FATAL_ERROR "B-A implemented authority ceiling is not route_home")
+endif()
+
 function(cache_plan_authority_order_valid source output)
     string(FIND "${source}" "task, *ret, incoming_adapter, *plan_rec);" inventory_pos)
     string(FIND "${source}" "cache_plan_authority->plan_before_mutation(" planner_pos)

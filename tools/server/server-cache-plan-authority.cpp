@@ -236,6 +236,13 @@ static bool inside_pre_da_safety_envelope(
         const server_cache_plan_execution & planned,
         const server_cache_plan_execution & legacy) noexcept {
     if (planned.target != legacy.target) {
+        // The one priced zero-destruction cross-target case belongs to the
+        // similarity ratchet. Route-home has no host durability, and future
+        // LRU needs D-A retention/destruction evidence rather than silently
+        // inheriting this exception.
+        if (rec.selection != common_cache_plan_selection::similarity) {
+            return false;
+        }
         // Before D-A, changing the selected target is safe only when the new
         // live plan retains every byte of that target's existing prefix. This
         // is the one genuinely zero-destruction cross-target similarity case:
@@ -360,6 +367,20 @@ bool server_cache_plan_demote_for_coverage_recovery(
         int64_t pos_min_threshold) noexcept {
     if (!server_cache_plan_requires_coverage_recovery(
             execution, pos_min, pos_min_threshold)) {
+        return false;
+    }
+    authority.fallback_legacy(
+        rec, common_cache_plan_authority_fallback::stale_capability);
+    execution.clear();
+    return true;
+}
+
+bool server_cache_plan_demote_for_vbr_low_lcp_reset(
+        server_cache_plan_authority & authority,
+        common_cache_plan_record & rec,
+        server_cache_plan_execution & execution,
+        bool reset_applied) noexcept {
+    if (!reset_applied || !execution.authoritative()) {
         return false;
     }
     authority.fallback_legacy(

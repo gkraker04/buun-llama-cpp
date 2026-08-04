@@ -59,10 +59,10 @@ constexpr common_cache_plan_authority_level server_cache_plan_level_of(
 
 // Highest behavior-changing ratchet implemented in this tree. Higher parsed
 // levels still enable every landed prefix tier, but cannot prematurely flip a
-// route-home/LRU decision before those units supply their domain contracts.
+// LRU decision before that unit supplies its domain contract.
 constexpr common_cache_plan_authority_level
     SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL =
-        common_cache_plan_authority_level::similarity;
+        common_cache_plan_authority_level::route_home;
 
 constexpr bool server_cache_plan_level_enabled(
         common_cache_plan_authority_level configured,
@@ -194,6 +194,16 @@ bool server_cache_plan_demote_for_coverage_recovery(
     server_cache_plan_execution & execution,
     int64_t pos_min,
     int64_t pos_min_threshold) noexcept;
+
+// Dynamic-VBR low-LCP reset is another shipped correctness recovery that can
+// supersede a previously authorized plan. The exact outcome is known only
+// after idle reclaim and the second ownership sample; a completed reset must
+// therefore demote before the execution receipt is finalized.
+bool server_cache_plan_demote_for_vbr_low_lcp_reset(
+    server_cache_plan_authority & authority,
+    common_cache_plan_record & rec,
+    server_cache_plan_execution & execution,
+    bool reset_applied) noexcept;
 
 // Translate a planned checkpoint only after the live seam has revalidated its
 // eligibility. A false result means "use the legacy iterator", never "cold".

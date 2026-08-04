@@ -593,7 +593,16 @@ struct common_cache_plan_record {
     // exists; and a flipped frontier ratchet can select by logical-next-position
     // while the inventory still records legacy physical coverage. Ratchet gates
     // must separate these classes rather than treating every disagreement as an
-    // economic-policy miss. Schema 5 has no separate execution_failed fallback;
+    // economic-policy miss. Route-home cross-target disagreements are also
+    // receipt-only before D-A: dynamic VBR has no host cache to preserve the
+    // displaced target, and schema 5 carries no priced retention loss. A
+    // BOS-only apparent home therefore stays legacy rather than being treated
+    // as a free retarget. Shared-system-prefix fleets add a second safe noise
+    // class: candidates inside the planner tie floor use its stable slot-key
+    // ordering, which can differ from legacy strict-max-LCP selection. The
+    // resulting cross-target plan is refused as destruction_authority_required;
+    // ratchet reads must separate that churn from economic disagreements.
+    // Schema 5 has no separate execution_failed fallback;
     // a genuine post-authorization restore failure is recorded as internal_fault
     // rather than silently extending the frozen vocabulary in B-A1.
     common_cache_plan_authority_receipt authority;

@@ -46,6 +46,9 @@ class ServerArm:
 			"-np", str(args.parallel), "-fa", "on",
 			"--cache-ram", str(args.cache_ram), "--slots", "--cache-debug",
 			"--cache-plan-authority", level, "--seed", str(args.seed)]
+		if args.slot_prompt_similarity:
+			cmd += ["--slot-prompt-similarity",
+				str(args.slot_prompt_similarity)]
 		if args.ctk:
 			cmd += ["-ctk", args.ctk, "-ctv", args.ctv or args.ctk]
 		self.log = open(log_path, "w")
@@ -95,6 +98,30 @@ def sequence_steps(args):
 			(1, convo_a),
 		]
 	convo_c = "Conversation C opens a third thread. " + filler
+	if args.sequence == "route_home":
+		# Main-agent/sub-agent displacement (plan §4.3): a long main context
+		# homes on one slot; short sub-agent tasks churn the other; the main
+		# agent returns with a continuation long enough to push similarity
+		# below threshold while the home prefix stays nonzero -> route_home.
+		# The final step is a genuinely new stream (LRU/cold control).
+		# The continuation must outweigh the retained prefix so similarity
+		# (lcp/prompt) falls below the threshold while the home lcp stays
+		# large -- that is what routes the return through route_home.
+		long_cont = " The main agent now resumes and reviews every ledger " \
+			"row in detail, considering " + " and ".join(
+			f"aspect {i} of the retained plan"
+			for i in range(int(args.prompt_rows * 2.5))) + "."
+		sub = "Sub-agent task: reply tersely. "
+		return [
+			(None, convo_a),
+			(None, sub + "List one prime number."),
+			(None, sub + "Name one color of the rainbow."),
+			(None, convo_a + "<0>" + long_cont),
+			(None, sub + "State one day of the week."),
+			(None, convo_a + "<0>" + long_cont + "<3> Conclude briefly."),
+			(None, "Entirely new stream D with no shared prefix beyond "
+				"structural tokens. " + filler),
+		]
 	# Chat-echo battery: follow-ups accumulate the model's own reply (the
 	# "<i>" placeholder splices step i's completion), so live replay is a
 	# pure append (f_keep == 1.0). A trimming replay would rewind the
@@ -213,9 +240,21 @@ def main():
 		"authority domain (e.g. dynamic-VBR servers route reuse through "
 		"route_home): assert parity + zero executions, not liveness")
 	parser.add_argument("--sequence", default="forced",
-		choices=["forced", "similarity"],
+		choices=["forced", "similarity", "route_home"],
 		help="forced = id_slot battery (by_id tier); similarity = "
-		"non-forced reuse battery (similarity tier)")
+		"non-forced reuse battery (similarity tier); route_home = "
+		"main/sub-agent displacement battery (route_home tier)")
+	parser.add_argument("--slot-prompt-similarity", type=float, default=0.0,
+		help="pass through to the server (0 = server default); the "
+		"route_home battery needs a threshold the long continuation "
+		"actually crosses")
+	parser.add_argument("--liveness-optional", action="store_true",
+		help="do not require authoritative executions (nondeterministic "
+		"drift arms: parity + typed-fallback discipline still assert)")
+	parser.add_argument("--allow-internal-fault", action="store_true",
+		help="skip the record-level assertion that no receipt carries "
+		"fallback_reason=internal_fault (deterministic gate cells must "
+		"not book designed policy resets as faults)")
 	parser.add_argument("--contention", action="store_true",
 		help="run the battery under a long background generation; "
 		"content parity is skipped (scheduling nondeterminism), "
@@ -231,7 +270,29 @@ def main():
 	on_transcript, on_totals = run_arm(
 		args, args.level, args.base_port + 1, args.workdir)
 
+	internal_faults = 0
+	if not args.allow_internal_fault:
+		import re
+		log_path = f"{args.workdir}/server-{args.level}.log"
+		with open(log_path, errors="replace") as handle:
+			for line in handle:
+				match = re.search(r"CACHE_PLAN (\{.*)", line)
+				if not match:
+					continue
+				try:
+					rec = json.loads(match.group(1))
+				except ValueError:
+					continue
+				authority = rec.get("authority") or {}
+				if authority.get("fallback_reason") == "internal_fault":
+					internal_faults += 1
+
 	failures = []
+	if internal_faults:
+		failures.append(
+			f"{internal_faults} receipt(s) booked internal_fault -- "
+			"designed policy resets must demote typed, and genuine "
+			"faults must not occur in a deterministic gate cell")
 	for i, (off, on) in enumerate(zip(off_transcript, on_transcript)):
 		if not args.contention:
 			if off["content"] != on["content"]:
@@ -285,7 +346,7 @@ def main():
 		if tier_on.get("fallback_legacy", 0) == 0:
 			failures.append(
 				f"unfitted arm recorded no fallback_legacy[{args.tier}]")
-	else:
+	elif not args.liveness_optional:
 		if tier_on.get("executed", 0) == 0:
 			failures.append(
 				f"on arm executed nothing at tier {args.tier}; "

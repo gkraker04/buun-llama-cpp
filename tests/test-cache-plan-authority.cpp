@@ -368,6 +368,37 @@ static void test_execution_seam_fallbacks() {
           common_cache_plan_authority_fallback::stale_capability);
     CHECK(coverage.authority_prequalified);
 
+    // A routine dynamic-VBR low-LCP reset supersedes the armed plan after its
+    // post-reclaim ownership sample. It is capability drift, not an internal
+    // execution fault, and remains in the qualified denominator.
+    common_cache_plan_record low_lcp;
+    auto * low_lcp_live = add_viable(
+        low_lcp, common_cache_plan_provider::live_slot, target, target,
+        common_cache_plan_selection::route_home);
+    server_cache_plan_authority route_home(
+        common_cache_plan_authority_level::route_home);
+    execution = authorize_choice(
+        route_home, low_lcp,
+        int32_t(low_lcp_live - low_lcp.inventory.data()), target, true,
+        common_cache_plan_authority_level::route_home,
+        common_cache_plan_selection::route_home);
+    CHECK(execution.authoritative());
+    CHECK(server_cache_plan_demote_for_vbr_low_lcp_reset(
+        route_home, low_lcp, execution, true));
+    CHECK(!execution.authoritative());
+    CHECK(low_lcp.authority.state ==
+          common_cache_plan_authority_state::fallback_legacy);
+    CHECK(low_lcp.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::stale_capability);
+    CHECK(low_lcp.authority_prequalified);
+    low_lcp.shipped_plan_candidate =
+        int32_t(low_lcp_live - low_lcp.inventory.data());
+    route_home.finalize_execution(low_lcp);
+    CHECK(route_home.counters.authority_eligible[size_t(
+              common_cache_plan_selection::route_home)] == 1);
+    CHECK(route_home.counters.fallback_reason[size_t(
+              common_cache_plan_authority_fallback::stale_capability)] == 1);
+
     // A post-retarget coverage demotion executes legacy recovery on the
     // planner-selected slot, not on the legacy-selected slot. Preserve the
     // pre-mutation slot-A counterfactual so the receipt records disagreement.
@@ -577,15 +608,20 @@ static void test_by_id_execution_shapes_and_target_binding() {
     CHECK(authorize_choice(future, copy,
               int32_t(live - rec.inventory.data()), target, true,
               common_cache_plan_authority_level::lru,
-              common_cache_plan_selection::route_home).kind ==
-          server_cache_plan_execution_kind::legacy);
-    CHECK(copy.authority.fallback_reason ==
-          common_cache_plan_authority_fallback::tier_not_enabled);
+              common_cache_plan_selection::route_home).authoritative());
     copy = rec;
     CHECK(authorize_choice(future, copy,
               int32_t(live - rec.inventory.data()), target, true,
               common_cache_plan_authority_level::lru,
               common_cache_plan_selection::similarity).authoritative());
+    copy = rec;
+    CHECK(authorize_choice(future, copy,
+              int32_t(live - rec.inventory.data()), target, true,
+              common_cache_plan_authority_level::lru,
+              common_cache_plan_selection::lru).kind ==
+          server_cache_plan_execution_kind::legacy);
+    CHECK(copy.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::tier_not_enabled);
 
     // A disabled future tier must not blur an existing planner refusal into
     // tier_not_enabled. The latter names only an otherwise-qualified plan.
@@ -801,6 +837,115 @@ static void test_similarity_crossover_and_safety_envelope() {
           common_cache_plan_authority_fallback::incomplete_evidence);
 }
 
+static void test_route_home_authority_domain() {
+    constexpr int32_t home_target = 4;
+    constexpr int32_t other_target = 5;
+    const common_cache_plan_calib calib = {
+        "route-home", 1,
+        /* replay_us_per_token */ 100.0,
+        /* restore_us_per_byte */ 0.001,
+        /* workspace_setup_us */  500.0,
+    };
+
+    common_cache_plan_record rec;
+    rec.selection = common_cache_plan_selection::route_home;
+    rec.calibration_profile = calib.profile;
+    rec.n_prompt_tokens = llama_cache_acct_value::measured(100);
+    auto * home = add_viable(
+        rec, common_cache_plan_provider::live_slot,
+        home_target, home_target, common_cache_plan_selection::route_home);
+    home->lcp_tokens = llama_cache_acct_value::measured(10);
+    home->sim = 0.1;
+    home->sim_known = true;
+    home->f_keep = 1.0;
+    home->f_keep_known = true;
+    auto * checkpoint = add_viable(
+        rec, common_cache_plan_provider::live_context_checkpoint,
+        0, home_target, common_cache_plan_selection::route_home);
+    checkpoint->lcp_tokens = llama_cache_acct_value::measured(90);
+    checkpoint->payload_bytes = llama_cache_acct_value::measured(1'000);
+    add_viable(rec, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, home_target,
+        common_cache_plan_selection::route_home);
+
+    // LRU-origin and busy rows are each cheaper than the accepted checkpoint;
+    // only their independent domain/provider exclusions keep them out.
+    auto * lru_only = add_viable(
+        rec, common_cache_plan_provider::live_slot,
+        other_target, other_target, common_cache_plan_selection::lru);
+    lru_only->lcp_tokens = llama_cache_acct_value::measured(100);
+    lru_only->sim = 1.0;
+    lru_only->sim_known = true;
+    lru_only->f_keep = 1.0;
+    lru_only->f_keep_known = true;
+    auto * busy = add_viable(
+        rec, common_cache_plan_provider::live_slot,
+        other_target + 1, other_target + 1,
+        common_cache_plan_selection::route_home);
+    busy->lcp_tokens = llama_cache_acct_value::measured(99);
+    busy->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+
+    rec.planner_status = common_cache_plan_estimate_and_choose(rec, calib);
+    CHECK(rec.planner_status == common_cache_plan_planner_status::ok);
+    CHECK(rec.shadow_choice ==
+          int32_t(checkpoint - rec.inventory.data()));
+    CHECK(rec.inventory[size_t(rec.shadow_choice)].target_slot_id ==
+          home_target);
+
+    server_cache_plan_authority route_home(
+        common_cache_plan_authority_level::route_home);
+    auto execution = authorize_choice(
+        route_home, rec, rec.shadow_choice, home_target, false,
+        common_cache_plan_authority_level::route_home,
+        common_cache_plan_selection::route_home);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind ==
+          server_cache_plan_execution_kind::checkpoint_restore);
+    CHECK(execution.target == home_target);
+    CHECK(rec.authority.decision_tier ==
+          common_cache_plan_selection::route_home);
+
+    // The previous ceiling remains a hard boundary for route-home records.
+    auto lower = rec;
+    server_cache_plan_authority similarity(
+        common_cache_plan_authority_level::similarity);
+    CHECK(!authorize_choice(
+        similarity, lower, lower.shadow_choice, home_target, false,
+        common_cache_plan_authority_level::similarity,
+        common_cache_plan_selection::route_home).authoritative());
+    CHECK(lower.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::tier_not_enabled);
+
+    // A BOS-only cross-target choice needs retention/destruction economics the
+    // current fit does not carry. Dynamic VBR cannot durabilize the displaced
+    // target in a host cache, so this shape remains typed legacy until D-A.
+    common_cache_plan_record trivial;
+    auto * legacy_bos = add_viable(
+        trivial, common_cache_plan_provider::live_slot,
+        home_target, home_target,
+        common_cache_plan_selection::route_home);
+    legacy_bos->lcp_tokens = llama_cache_acct_value::measured(1);
+    legacy_bos->f_keep = 0.01;
+    legacy_bos->f_keep_known = true;
+    auto * alternate_bos = add_viable(
+        trivial, common_cache_plan_provider::live_slot,
+        other_target, other_target,
+        common_cache_plan_selection::route_home);
+    alternate_bos->lcp_tokens = llama_cache_acct_value::measured(1);
+    alternate_bos->f_keep = 1.0;
+    alternate_bos->f_keep_known = true;
+    execution = authorize_choice(
+        route_home, trivial,
+        int32_t(alternate_bos - trivial.inventory.data()), home_target,
+        false, common_cache_plan_authority_level::route_home,
+        common_cache_plan_selection::route_home);
+    CHECK(!execution.authoritative());
+    CHECK(trivial.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::
+              destruction_authority_required);
+
+}
+
 static void test_typed_planner_fallbacks() {
     const common_cache_plan_planner_status statuses[] = {
         common_cache_plan_planner_status::no_profile,
@@ -914,6 +1059,7 @@ int main() {
     test_by_id_execution_shapes_and_target_binding();
     test_legacy_counterfactual_and_authoritative_receipt();
     test_similarity_crossover_and_safety_envelope();
+    test_route_home_authority_domain();
     test_typed_planner_fallbacks();
     test_off_stays_shadow_and_failed_delivery_not_counted();
     test_eligible_and_executed_index_different_tiers();
