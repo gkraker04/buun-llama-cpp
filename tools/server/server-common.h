@@ -132,6 +132,7 @@ std::string lora_config_identity(const std::vector<common_adapter_lora_info> & l
 // non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
 //   save_short  - force the state-save writer to report a short write (aborts the save)
 //   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
+//   load_clone_fail - force lifecycle restore clone staging to fail before target mutation
 //   frontier_disagree_after_flip - make the frontier selector disagree only after
 //                                  it owns reads (exercises fail-closed legacy fallback)
 bool server_fault(const char * tag);

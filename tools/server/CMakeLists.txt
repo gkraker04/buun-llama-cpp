@@ -95,4 +95,9 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
     add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
     set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
+    add_test(NAME test-server-prompt-cache-clone-fault
+        COMMAND test-server-prompt-cache --clone-fault)
+    set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
+        LABELS main
+        ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
 endif()

@@ -14,6 +14,7 @@
 #include "server-common.h"
 
 #include <limits>
+#include <thread>
 
 using json = nlohmann::ordered_json;
 
@@ -1983,12 +1984,44 @@ static void server_prompt_cache_mirror_lease(
     }
 }
 
-static void server_prompt_cache_observe_drop(
+static void server_prompt_cache_mirror_artifact_clone(
+        server_prompt_cache & cache,
+        const server_retention_instance_key & source_key,
+        common_retention_artifact_kind source_kind,
+        int32_t source_slot,
+        const server_retention_instance_key & destination_key,
+        common_retention_artifact_kind destination_kind,
+        int32_t destination_slot,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) {
+    if (!cache.retention_obs) {
+        return;
+    }
+
+    const bool cloned = cache.retention_obs->clone(
+        source_key, destination_key);
+    const server_cache_lease_subject source {
+        cache.retention_obs->artifact_id(source_key),
+        source_kind,
+        source_slot,
+    };
+    const server_cache_lease_subject destination {
+        cache.retention_obs->artifact_id(destination_key),
+        destination_kind,
+        destination_slot,
+    };
+    server_prompt_cache_mirror_lease(
+        cache, cloned, &source, destination, prompt,
+        adapter_identity, coverage_tokens);
+}
+
+static server_cache_destruction_admission server_prompt_cache_observe_drop(
         server_prompt_cache & cache,
         const server_prompt_cache_state & state,
         server_cache_destruction_reason reason) noexcept {
     if (!cache.destruction_obs) {
-        return;
+        return {};
     }
 
     server_cache_destruction_request request;
@@ -2027,7 +2060,48 @@ static void server_prompt_cache_observe_drop(
             request.add_yield(value);
         }
     }
-    (void) server_cache_retention_admit(cache.destruction_obs, request);
+    return server_cache_retention_admit(cache.destruction_obs, request);
+}
+
+struct server_prompt_cache_retirement_manifest {
+    server_retention_instance_key host;
+    std::vector<server_retention_instance_key> checkpoints;
+};
+
+static bool server_prompt_cache_capture_retirement(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it,
+        server_prompt_cache_retirement_manifest & manifest) noexcept {
+    try {
+        manifest = {};
+        if (!cache.retention_obs) {
+            return true;
+        }
+        manifest.host =
+            server_retention_instance_key::for_host_entry(&*it);
+        manifest.checkpoints.reserve(it->prompt.checkpoints.size());
+        for (auto & checkpoint : it->prompt.checkpoints) {
+            manifest.checkpoints.push_back(
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint));
+        }
+        return true;
+    } catch (...) {
+        manifest = {};
+        return false;
+    }
+}
+
+static void server_prompt_cache_retire_manifest(
+        server_prompt_cache & cache,
+        const server_prompt_cache_retirement_manifest & manifest) noexcept {
+    if (!cache.retention_obs) {
+        return;
+    }
+    cache.retention_obs->retire(manifest.host);
+    for (const auto & checkpoint : manifest.checkpoints) {
+        cache.retention_obs->retire(checkpoint);
+    }
 }
 
 static void server_prompt_cache_retire_entry(
@@ -2057,18 +2131,75 @@ static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
 server_prompt_cache::iterator server_prompt_cache::destroy_entry(
         iterator it,
         server_cache_destruction_reason reason) {
-    server_prompt_cache_observe_drop(*this, *it, reason);
+    const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     // Legacy pass-through owns exactly one accounting terminal outside the
-    // raw physical primitive. D-A capability commit replaces this wrapper
-    // terminal only when a later ratchet flips mutation authority.
+    // raw physical primitive. Under D-A1 lifecycle mode, the existing legacy
+    // eviction order is unchanged, but the exact accounting terminal executes
+    // through a freshly prepared capability.
     const auto release_ops = it->release_ops();
-    server_prompt_cache_retire_entry(*this, it);
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+
+    llama_cache_prepared_release_set prepared;
+    server_prompt_cache_retirement_manifest retirement;
+    bool capability_ready = false;
+    if (publish_authority && acct) {
+        std::vector<llama_cache_acct_op_id> ops;
+        bool setup_ok = server_prompt_cache_capture_retirement(
+            *this, it, retirement);
+        try {
+            ops.reserve(release_ops.size());
+            for (const auto op : release_ops) {
+                if (op) {
+                    ops.push_back(op);
+                }
+            }
+        } catch (...) {
+            setup_ok = false;
+        }
+
+        if (setup_ok && !ops.empty()) {
+            const uint64_t serial = acct->snapshot().serial;
+            prepared = llama_cache_prepare_release_set(
+                *acct, ops, serial);
+            capability_ready = prepared.ready();
+        }
+    }
+
+    if (!capability_ready) {
+        server_prompt_cache_retire_entry(*this, it);
+    }
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
-    if (acct) {
+    if (capability_ready) {
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        // D-A1 prepare→mutate→commit boundary. destroy_entry() is called
+        // synchronously by update_slots-owned prompt-cache publication/load
+        // maintenance. The raw erase only destroys value storage: it has no
+        // callback and no C producer. The very next operation commits the
+        // prepared release, so no scheduler-owned ledger write can interleave.
+        // A future asynchronous producer invalidates this proof and must add
+        // a real claim/lock before this authority remains enabled.
+        // The same-frame assertion above is a machine-checked refactor
+        // tripwire: the CMake contract scan deliberately string-matches it.
+        const auto release_status = prepared.commit();
+        GGML_ASSERT(release_status ==
+                    llama_cache_conditional_release_status::released);
+        server_prompt_cache_retire_manifest(*this, retirement);
+        if (destruction_obs) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, true);
+        }
+    } else if (acct) {
+        // Preparation is fail-closed with respect to the new capability, but
+        // D-A1 does not yet own host victim selection: retain the bounded
+        // legacy FIFO/dedup behavior and its exactly-one release terminal.
         for (const auto op : release_ops) {
             if (op) {
                 (void) acct->release(op);
             }
+        }
+        if (publish_authority && destruction_obs) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, false);
         }
     }
     return next;
@@ -2133,20 +2264,14 @@ bool server_prompt_cache::publish(
             server_retention_instance_key::for_slot(source_slot);
         const auto destination_key =
             server_retention_instance_key::for_host_entry(&*self);
-        const bool cloned = retention_obs->clone(source_key, destination_key);
-        const server_cache_lease_subject source {
-            retention_obs->artifact_id(source_key),
-            common_retention_artifact_kind::live_slot,
+        server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::live_slot,
             source_slot,
-        };
-        const server_cache_lease_subject destination {
-            retention_obs->artifact_id(destination_key),
-            common_retention_artifact_kind::host_entry,
+            destination_key, common_retention_artifact_kind::host_entry,
             -1,
-        };
-        server_prompt_cache_mirror_lease(
-            *this, cloned, &source, destination, self->prompt,
-            self->adapter_config_key, self->prompt.n_tokens());
+            self->prompt, self->adapter_config_key,
+            self->prompt.n_tokens());
         auto source_checkpoint = source_prompt->checkpoints.begin();
         auto host_checkpoint = self->prompt.checkpoints.begin();
         for (; source_checkpoint != source_prompt->checkpoints.end() &&
@@ -2158,22 +2283,16 @@ bool server_prompt_cache::publish(
             const auto host_checkpoint_key =
                 server_retention_instance_key::for_checkpoint(
                     -1, &*host_checkpoint);
-            const bool checkpoint_cloned = retention_obs->clone(
-                source_checkpoint_key, host_checkpoint_key);
-            const server_cache_lease_subject source_checkpoint_subject {
-                retention_obs->artifact_id(source_checkpoint_key),
+            server_prompt_cache_mirror_artifact_clone(
+                *this,
+                source_checkpoint_key,
                 common_retention_artifact_kind::checkpoint,
                 source_slot,
-            };
-            const server_cache_lease_subject host_checkpoint_subject {
-                retention_obs->artifact_id(host_checkpoint_key),
+                host_checkpoint_key,
                 common_retention_artifact_kind::checkpoint,
                 -1,
-            };
-            server_prompt_cache_mirror_lease(
-                *this, checkpoint_cloned, &source_checkpoint_subject,
-                host_checkpoint_subject, self->prompt,
-                self->adapter_config_key, host_checkpoint->n_tokens);
+                self->prompt, self->adapter_config_key,
+                host_checkpoint->n_tokens);
         }
     }
 
@@ -2196,6 +2315,135 @@ bool server_prompt_cache::publish(
     // preserving the just-added entry.
     update();
     return true;
+}
+
+bool server_prompt_cache::prepare_restore_delivery(
+        iterator source,
+        server_prompt_cache_restore_delivery & delivery) const noexcept {
+    delivery = {};
+    if (!publish_authority) {
+        return true;
+    }
+    try {
+        if (server_fault("load_clone_fail")) {
+            return false;
+        }
+        delivery.prompt = source->prompt.clone();
+        delivery.retains_source = true;
+        return true;
+    } catch (...) {
+        delivery = {};
+        return false;
+    }
+}
+
+static void server_prompt_cache_mirror_restore_retention(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator source,
+        const server_prompt & destination,
+        int32_t id_slot,
+        bool retained_source) {
+    if (!cache.retention_obs) {
+        return;
+    }
+    const auto host_key =
+        server_retention_instance_key::for_host_entry(&*source);
+    const auto live_key =
+        server_retention_instance_key::for_slot(id_slot);
+    server_prompt_cache_mirror_artifact_clone(
+        cache,
+        host_key, common_retention_artifact_kind::host_entry, -1,
+        live_key, common_retention_artifact_kind::live_slot, id_slot,
+        destination, source->adapter_config_key,
+        destination.n_tokens());
+
+    if (!retained_source) {
+        // std::list's equal allocator move transfers the original nodes, so
+        // destination checkpoint addresses are the historical host keys.
+        for (const auto & checkpoint : destination.checkpoints) {
+            const auto host_checkpoint =
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint);
+            const auto live_checkpoint =
+                server_retention_instance_key::for_checkpoint(
+                    id_slot, &checkpoint);
+            const auto artifact =
+                cache.retention_obs->artifact_id(host_checkpoint);
+            const bool rebound = cache.retention_obs->rebind(
+                host_checkpoint, live_checkpoint);
+            const server_cache_lease_subject checkpoint_destination {
+                artifact,
+                common_retention_artifact_kind::checkpoint,
+                id_slot,
+            };
+            server_prompt_cache_mirror_lease(
+                cache, rebound, nullptr, checkpoint_destination,
+                destination, source->adapter_config_key,
+                checkpoint.n_tokens);
+        }
+        return;
+    }
+
+    auto source_checkpoint = source->prompt.checkpoints.begin();
+    auto destination_checkpoint = destination.checkpoints.begin();
+    for (; source_checkpoint != source->prompt.checkpoints.end() &&
+           destination_checkpoint != destination.checkpoints.end();
+           ++source_checkpoint, ++destination_checkpoint) {
+        const auto source_key =
+            server_retention_instance_key::for_checkpoint(
+                -1, &*source_checkpoint);
+        const auto destination_key =
+            server_retention_instance_key::for_checkpoint(
+                id_slot, &*destination_checkpoint);
+        server_prompt_cache_mirror_artifact_clone(
+            cache,
+            source_key, common_retention_artifact_kind::checkpoint, -1,
+            destination_key, common_retention_artifact_kind::checkpoint,
+            id_slot,
+            destination, source->adapter_config_key,
+            destination_checkpoint->n_tokens);
+    }
+    GGML_ASSERT(source_checkpoint == source->prompt.checkpoints.end());
+    GGML_ASSERT(destination_checkpoint == destination.checkpoints.end());
+}
+
+void server_prompt_cache::commit_restore_delivery(
+        iterator source,
+        server_prompt_cache_restore_delivery && delivery,
+        server_prompt & destination,
+        int32_t id_slot,
+        int32_t debug_source_id) {
+    if (delivery.retains_source) {
+        GGML_ASSERT(publish_authority != nullptr);
+        destination = std::move(delivery.prompt);
+        server_prompt_cache_mirror_restore_retention(
+            *this, source, destination, id_slot, true);
+        if (destruction_obs) {
+            destruction_obs->note_host_restore(true);
+        }
+        if (debug_observability) {
+            debug_lifecycle_emissions++;
+            SRV_INF(
+                "CACHE_HOST_LIFECYCLE {\"mode\":\"non_consuming\","
+                "\"source_id\":%d,\"host_entries\":%zu,"
+                "\"host_bytes\":%zu,\"retained_restores\":%" PRIu64 "}\n",
+                debug_source_id, states.size(), size(),
+                destruction_obs
+                    ? destruction_obs->host_restores_retained
+                    : uint64_t(0));
+        }
+        return;
+    }
+
+    // Lifecycle-off is the historical move/rebind/erase terminal verbatim.
+    destination = std::move(source->prompt);
+    server_prompt_cache_mirror_restore_retention(
+        *this, source, destination, id_slot, false);
+    if (destruction_obs) {
+        destruction_obs->note_host_restore(false);
+    }
+    destroy_entry(
+        source, server_cache_destruction_reason::host_consumed_restore);
 }
 
 // The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer
@@ -2350,13 +2598,19 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
-    // NON-CONSUMING restore [I7]: do NOT clear the entry's bytes while restoring, and remove the
-    // entry only after BOTH sides restore successfully. The previous code cleared main after
-    // restoring it, then attempted the draft restore — a draft failure returned with main already
-    // freed, leaving a poisoned (empty-main, tokens-intact) entry that later passed the 0 == 0
-    // false-success check and crashed. On any failure here we leave the entry fully intact and
-    // return false; the caller (update_slots) then calls prompt_clear(), which resets both the
-    // target and draft sequences, so the slot is never left in a half-restored state.
+    // D-A1 stages the immutable source copy before either main or draft
+    // context is touched. Allocation failure therefore leaves the source and
+    // both target contexts at the caller-owned pre-restore boundary.
+    server_prompt_cache_restore_delivery delivery;
+    if (!prepare_restore_delivery(it_best, delivery)) {
+        SRV_ERR("%s\n", "failed to stage non-consuming host restore");
+        return false;
+    }
+
+    // Source bytes remain immutable throughout both restores. Lifecycle mode
+    // keeps the entry after success too; legacy mode consumes it only after
+    // BOTH sides succeed. On any failure the source remains fully intact and
+    // the caller resets both target sequences, never leaving a half-restore.
     {
         const size_t size_tgt = it_best->data.main.size();
         size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0);
@@ -2388,55 +2642,15 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         }
     }
 
-    // both sides restored: now it is safe to consume the entry (its bytes become live-slot
-    // state, so its host-cache accounting charge is released here)
+    // Both sides restored: atomically select the lifecycle retain terminal or
+    // the historical move+release+erase terminal.
     if constexpr (Observed) {
         if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
             sel->delivered = true; // recorded at the delivery point, never inferred [B0]
         }
     }
-    if (retention_obs) {
-        const auto host_key =
-            server_retention_instance_key::for_host_entry(&*it_best);
-        const auto live_key =
-            server_retention_instance_key::for_slot(id_slot);
-        const bool cloned = retention_obs->clone(host_key, live_key);
-        const server_cache_lease_subject source {
-            retention_obs->artifact_id(host_key),
-            common_retention_artifact_kind::host_entry,
-            -1,
-        };
-        const server_cache_lease_subject destination {
-            retention_obs->artifact_id(live_key),
-            common_retention_artifact_kind::live_slot,
-            id_slot,
-        };
-        server_prompt_cache_mirror_lease(
-            *this, cloned, &source, destination, it_best->prompt,
-            it_best->adapter_config_key, it_best->prompt.n_tokens());
-        for (auto & checkpoint : it_best->prompt.checkpoints) {
-            const auto host_checkpoint =
-                server_retention_instance_key::for_checkpoint(
-                    -1, &checkpoint);
-            const auto live_checkpoint =
-                server_retention_instance_key::for_checkpoint(
-                    id_slot, &checkpoint);
-            const auto artifact = retention_obs->artifact_id(host_checkpoint);
-            const bool rebound = retention_obs->rebind(
-                host_checkpoint, live_checkpoint);
-            const server_cache_lease_subject destination {
-                artifact,
-                common_retention_artifact_kind::checkpoint,
-                id_slot,
-            };
-            server_prompt_cache_mirror_lease(
-                *this, rebound, nullptr, destination, it_best->prompt,
-                it_best->adapter_config_key, checkpoint.n_tokens);
-        }
-    }
-    prompt = std::move(it_best->prompt);
-    destroy_entry(
-        it_best, server_cache_destruction_reason::host_consumed_restore);
+    commit_restore_delivery(
+        it_best, std::move(delivery), prompt, id_slot, obs_source_best);
 
     return true;
 }

@@ -768,6 +768,17 @@ struct server_prompt_cache_payload_leaf {
     llama_cache_acct_op_id * operation = nullptr;
 };
 
+// Move-only storage transaction staged before llama_state_seq_set_data_ext().
+// In lifecycle mode it owns an immutable copy of the host prompt/checkpoints;
+// the successful delivery moves this copy into the live slot and retains the
+// source node. In legacy mode it stays empty and commit consumes the source.
+// Move-only is currently derived from server_prompt/server_tokens; preserve
+// that intent explicitly if server_tokens ever becomes copyable.
+struct server_prompt_cache_restore_delivery {
+    server_prompt prompt;
+    bool retains_source = false;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -819,26 +830,42 @@ struct server_prompt_cache {
     template <bool Observed>
     bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id);
 
+    // D-A1's two-phase immutable host restore. prepare() runs before either
+    // target is touched; commit() is called only after main+draft restore.
+    // Public only so the model-free server cache test can pin the storage
+    // transaction without constructing a llama_context.
+    bool prepare_restore_delivery(
+            iterator source,
+            server_prompt_cache_restore_delivery & delivery) const noexcept;
+    void commit_restore_delivery(
+            iterator source,
+            server_prompt_cache_restore_delivery && delivery,
+            server_prompt & destination,
+            int32_t id_slot,
+            int32_t debug_source_id = -1);
+
     void update();
 
     iterator destroy_entry(
             iterator it,
             server_cache_destruction_reason reason);
 
-    // C0 shadow ledger (nullptr = off). publish() records the publication boundary as
-    // reserve→stage→commit per charged leaf; every path that removes an entry from `states`
-    // releases its ops — including whole-cache destruction/replacement (model reload), or the
-    // surviving ledger would carry phantom host-cache bytes. Observational only — never
-    // blocks, orders, or interrupts the shipped mutation [C-a]; the ledger is non-throwing
-    // and outlives this cache by member order in server_context_impl.
+    // C0 ledger (nullptr = off). Debug-only retains shadow semantics; lifecycle publication
+    // and explicit host erasure use its reservation/prepared-release authority. Every path
+    // that removes an entry from `states` releases its ops, including whole-cache replacement,
+    // or the surviving ledger would carry phantom bytes. It outlives this cache by member order.
     llama_cache_acct_ledger * acct = nullptr;
-    // F0b lifecycle authority. Null keeps the exact pre-F0 publication path. When present, it
-    // reserves/stages/commits every durable leaf before publish() splices the detached node.
+    // F0b/D-A1 lifecycle authority. Null keeps the consuming legacy path. When present, it
+    // gates publication, makes restore non-consuming, and prepares explicit-eviction releases.
     server_cache_authority * publish_authority = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
     server_cache_lease_table * lease_obs = nullptr;
     const std::string * lease_execution_identity = nullptr;
+    // Explicit emission gate. An observed load also exists under B authority,
+    // so rec != nullptr is not evidence that --cache-debug was enabled.
+    bool debug_observability = false;
+    uint64_t debug_lifecycle_emissions = 0;
 
     ~server_prompt_cache() {
         clear_accounting();

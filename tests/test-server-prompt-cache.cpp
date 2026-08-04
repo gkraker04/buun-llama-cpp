@@ -1,4 +1,5 @@
 #include "server-cache-authority.h"
+#include "server-cache-plan-authority.h"
 #include "server-task.h"
 
 #include "llama.h"
@@ -7,6 +8,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <list>
+#include <string>
 
 namespace {
 
@@ -71,6 +73,7 @@ void test_lifecycle_full_cache_rotates() {
     server_prompt_cache cache(/* limit_size_mib */ 1, /* limit_tokens */ 1024);
     cache.acct = &authority.ledger;
     cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
 
     CHECK(cache.publish(make_entry("oldest", 700 * 1024)));
     CHECK(cache.states.size() == 1);
@@ -82,6 +85,163 @@ void test_lifecycle_full_cache_rotates() {
     CHECK(cache.size() == 700 * 1024);
     CHECK(authority.admission_commits == 2);
     CHECK(authority.admission_refusals == 0);
+    CHECK(authority.destruction.prepared_release_commits == 1);
+    CHECK(authority.destruction.prepared_release_fallbacks == 0);
+    CHECK(authority.destruction.n_events == 1);
+    CHECK(authority.destruction.events[0].execution ==
+          server_cache_destruction_execution::prepared_release);
+}
+
+void test_lifecycle_restore_retains_immutable_source() {
+    server_cache_authority authority;
+    configure_host_accounting(authority);
+
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+
+    auto entry = make_prompt_entry("same", { 1, 2, 3 });
+    entry.front().data.main.assign(32, 7);
+    entry.front().prompt.checkpoints.emplace_back();
+    entry.front().prompt.checkpoints.back().n_tokens = 2;
+    entry.front().prompt.checkpoints.back().data_tgt.assign(8, 9);
+    CHECK(cache.publish(std::move(entry)));
+    CHECK(cache.states.size() == 1);
+    const auto live_ops_before = authority.ledger.snapshot().live_ops;
+    const auto host_size_before = cache.states.front().size();
+    const auto * source_checkpoint =
+        &cache.states.front().prompt.checkpoints.front();
+
+    server_prompt_cache_restore_delivery first;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), first));
+    CHECK(first.retains_source);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().size() == host_size_before);
+
+    server_prompt live_first;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(first), live_first, 4);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().size() == host_size_before);
+    CHECK(live_first.n_tokens() == 3);
+    CHECK(live_first.checkpoints.size() == 1);
+    CHECK(&live_first.checkpoints.front() != source_checkpoint);
+    CHECK(live_first.checkpoints.front().n_tokens == 2);
+    CHECK(authority.ledger.snapshot().live_ops == live_ops_before);
+    CHECK(authority.destruction.host_restores_retained == 1);
+    CHECK(authority.destruction.host_restores_consumed == 0);
+
+    server_prompt_cache_restore_delivery second;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), second));
+    server_prompt live_second;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(second), live_second, 5);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().size() == host_size_before);
+    CHECK(live_second.n_tokens() == 3);
+    CHECK(authority.ledger.snapshot().live_ops == live_ops_before);
+    CHECK(authority.destruction.host_restores_retained == 2);
+
+    cache.destroy_entry(
+        cache.states.begin(), server_cache_destruction_reason::host_capacity);
+    CHECK(cache.states.empty());
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+    CHECK(authority.destruction.prepared_release_commits == 1);
+}
+
+void test_lifecycle_off_restore_consumes() {
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    server_cache_destruction_observer observer;
+    cache.destruction_obs = &observer;
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3 })));
+
+    server_prompt_cache_restore_delivery delivery;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), delivery));
+    CHECK(!delivery.retains_source);
+    server_prompt live;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(delivery), live, 0);
+    CHECK(cache.states.empty());
+    CHECK(live.n_tokens() == 3);
+    CHECK(observer.host_restores_retained == 0);
+    CHECK(observer.host_restores_consumed == 1);
+    CHECK(observer.n_events == 1);
+    CHECK(observer.events[0].request.reason ==
+          server_cache_destruction_reason::host_consumed_restore);
+    CHECK(observer.events[0].execution ==
+          server_cache_destruction_execution::pass_through);
+}
+
+void test_lifecycle_release_prepare_failure_keeps_legacy_bound() {
+    server_cache_authority authority;
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+
+    // A pre-authority/unaccounted node has no releasable op union. D-A1 may
+    // not certify it, but must retain the legacy explicit-eviction bound.
+    auto entry = make_prompt_entry("same", { 1, 2, 3 });
+    cache.states.splice(cache.states.end(), entry);
+    cache.destroy_entry(
+        cache.states.begin(), server_cache_destruction_reason::host_capacity);
+    CHECK(cache.states.empty());
+    CHECK(authority.destruction.prepared_release_commits == 0);
+    CHECK(authority.destruction.prepared_release_fallbacks == 1);
+    CHECK(authority.destruction.events[0].execution ==
+          server_cache_destruction_execution::pass_through);
+}
+
+void test_lifecycle_restore_clone_fault() {
+    server_cache_authority authority;
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.publish_authority = &authority;
+    auto entry = make_prompt_entry("same", { 1, 2, 3 });
+    cache.states.splice(cache.states.end(), entry);
+    const auto source_size = cache.states.front().size();
+
+    // The injected tag exercises the explicit fail-closed seam. Deliberately
+    // does not attempt to make the allocator throw std::bad_alloc.
+    server_prompt_cache_restore_delivery delivery;
+    CHECK(!cache.prepare_restore_delivery(cache.states.begin(), delivery));
+    CHECK(!delivery.retains_source);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().size() == source_size);
+    CHECK(cache.states.front().prompt.n_tokens() == 3);
+}
+
+void test_lifecycle_authority_without_debug_is_silent() {
+    server_cache_authority authority;
+    configure_host_accounting(authority);
+    server_cache_plan_authority plan_authority(
+        common_cache_plan_authority_level::lru);
+    CHECK(plan_authority.configured_level ==
+          common_cache_plan_authority_level::lru);
+    server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
+    cache.publish_authority = &authority;
+    cache.destruction_obs = &authority.destruction;
+    CHECK(!cache.debug_observability);
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3 })));
+
+    server_prompt_cache_restore_delivery delivery;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), delivery));
+    server_prompt live;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(delivery), live, 0, 7);
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.debug_lifecycle_emissions == 0);
+
+    // Positive control: the same retained restore emits exactly once when the
+    // explicit debug view is enabled, proving the zero above is a real gate.
+    cache.debug_observability = true;
+    server_prompt_cache_restore_delivery debug_delivery;
+    CHECK(cache.prepare_restore_delivery(
+        cache.states.begin(), debug_delivery));
+    server_prompt debug_live;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(debug_delivery), debug_live, 1, 7);
+    CHECK(cache.debug_lifecycle_emissions == 1);
 }
 
 void test_authority_source_ids_survive_save_dedup() {
@@ -115,9 +275,21 @@ void test_authority_source_ids_survive_save_dedup() {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     llama_backend_init();
+    if (argc == 2 && std::string(argv[1]) == "--clone-fault") {
+        test_lifecycle_restore_clone_fault();
+        llama_backend_free();
+        if (failures == 0) {
+            std::puts("test-server-prompt-cache: CLONE_FAULT_PASS");
+        }
+        return failures == 0 ? 0 : 1;
+    }
     test_lifecycle_full_cache_rotates();
+    test_lifecycle_restore_retains_immutable_source();
+    test_lifecycle_off_restore_consumes();
+    test_lifecycle_release_prepare_failure_keeps_legacy_bound();
+    test_lifecycle_authority_without_debug_is_silent();
     test_authority_source_ids_survive_save_dedup();
     llama_backend_free();
 

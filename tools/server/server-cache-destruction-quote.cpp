@@ -1,9 +1,10 @@
 #include "server-cache-destruction-quote.h"
 
+#include "ggml.h"
+
 #include "../../src/llama-sha256.h"
 
 #include <algorithm>
-#include <cassert>
 #include <map>
 #include <tuple>
 #include <unordered_map>
@@ -321,8 +322,7 @@ server_cache_prepared_release_capability::commit(
         server_cache_recovery_pin & retained_pin) noexcept {
     const bool same_thread =
         scheduler_owner_ == std::this_thread::get_id();
-    assert(same_thread &&
-           "destruction release must commit on its scheduler owner thread");
+    GGML_ASSERT(same_thread);
     if (!same_thread || !ready() || retained_pin.valid()) {
         return common_cache_plan_destruction_reason::internal_fault;
     }

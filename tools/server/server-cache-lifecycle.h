@@ -70,6 +70,11 @@ enum class server_cache_destruction_verdict : uint8_t {
 
 enum class server_cache_destruction_execution : uint8_t {
     pass_through = 0,
+    // D-A1: the legacy-selected host victim is still chosen by the existing
+    // FIFO/dedup policy, but its exact C release is committed through the
+    // prepared capability after the physical erase. Lease verdicts remain
+    // pricing evidence here; host victim-selection authority lands in D-A3.
+    prepared_release,
     _count,
 };
 
@@ -192,8 +197,26 @@ struct server_cache_destruction_observer {
     std::array<uint64_t, size_t(server_cache_destruction_class::_count)> totals = {};
     uint64_t n_events   = 0;
     uint64_t overflows  = 0;
+    uint64_t host_restores_retained = 0;
+    uint64_t host_restores_consumed = 0;
+    uint64_t prepared_release_commits = 0;
+    uint64_t prepared_release_fallbacks = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
+
+    server_cache_destruction_event & event_slot_for_sequence(
+            uint64_t sequence) noexcept {
+        return events[size_t((sequence - 1) % events.size())];
+    }
+
+    server_cache_destruction_event * event_for_sequence(
+            uint64_t sequence) noexcept {
+        if (sequence == 0) {
+            return nullptr;
+        }
+        auto & event = event_slot_for_sequence(sequence);
+        return event.sequence == sequence ? &event : nullptr;
+    }
 
     uint64_t observe(
             const server_cache_destruction_request & request,
@@ -203,18 +226,42 @@ struct server_cache_destruction_observer {
             overflows++;
             return 0;
         }
+        const uint64_t sequence = n_events + 1;
         server_cache_destruction_event & event =
-            events[size_t(n_events % events.size())];
+            event_slot_for_sequence(sequence);
         event.request   = request;
         event.verdict   = verdict;
         event.execution = server_cache_destruction_execution::pass_through;
-        event.sequence  = n_events + 1;
+        event.sequence  = sequence;
         totals[cls]++;
         n_events++;
         if (request.overflowed) {
             overflows++;
         }
         return event.sequence;
+    }
+
+    void note_host_restore(bool retained) noexcept {
+        if (retained) {
+            host_restores_retained++;
+        } else {
+            host_restores_consumed++;
+        }
+    }
+
+    void note_prepared_release(uint64_t sequence, bool committed) noexcept {
+        if (committed) {
+            prepared_release_commits++;
+        } else {
+            prepared_release_fallbacks++;
+        }
+        if (!committed || sequence == 0) {
+            return;
+        }
+        if (auto * event = event_for_sequence(sequence)) {
+            event->execution =
+                server_cache_destruction_execution::prepared_release;
+        }
     }
 };
 

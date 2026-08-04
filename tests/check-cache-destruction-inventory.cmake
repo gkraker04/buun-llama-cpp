@@ -352,6 +352,88 @@ if (callback_negative_valid)
     message(FATAL_ERROR "D-A0b ledger-callback negative control did not trip")
 endif()
 
+# D-A1 is the first live capability terminal. The host raw erase and the
+# prepared C commit are adjacent on the scheduler owner thread: no callback,
+# sidecar retirement, or ledger producer may enter this physical-mutation gap.
+function(da1_host_commit_gap_valid source output)
+    contract_extract_region(
+        "${source}"
+        "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+        "const auto release_status = prepared.commit();"
+        body found)
+    if (NOT found)
+        set(${output} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    contract_find_forbidden(
+        "${body}" forbidden
+        "gauge_set("
+        "reserve("
+        "stage("
+        "preview_release_set("
+        "release("
+        "clone("
+        "retire("
+        "server_cache_retention_admit("
+        "server_fault("
+        "std::function")
+    if (forbidden)
+        set(${output} FALSE PARENT_SCOPE)
+    else()
+        set(${output} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+da1_host_commit_gap_valid("${server_task}" host_commit_gap_valid)
+string(FIND "${server_task}"
+    "GGML_ASSERT(scheduler_owner == std::this_thread::get_id());"
+    da1_owner_assert)
+if (NOT host_commit_gap_valid OR da1_owner_assert EQUAL -1)
+    message(FATAL_ERROR
+        "D-A1 host prepare-to-commit owner-thread/no-callback contract drifted")
+endif()
+string(REPLACE
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it); acct->gauge_set();"
+    da1_gap_negative "${server_task}")
+da1_host_commit_gap_valid("${da1_gap_negative}" da1_gap_negative_valid)
+if (da1_gap_negative_valid)
+    message(FATAL_ERROR "D-A1 host commit-gap negative control did not trip")
+endif()
+string(REPLACE
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
+    "auto next = server_prompt_cache_destroy_entry_impl(*this, it); acct->release({});"
+    da1_release_negative "${server_task}")
+da1_host_commit_gap_valid(
+    "${da1_release_negative}" da1_release_negative_valid)
+if (da1_release_negative_valid)
+    message(FATAL_ERROR
+        "D-A1 host commit-gap release negative control did not trip")
+endif()
+
+# CACHE_HOST_LIFECYCLE is debug evidence, not an Observed-template signal:
+# B authority also supplies a record when --cache-debug is absent.
+string(FIND "${server_context}"
+    "prompt_cache->debug_observability = params_base.cache_debug;"
+    da1_debug_wiring)
+contract_extract_region(
+    "${server_task}"
+    "void server_prompt_cache::commit_restore_delivery("
+    "// Lifecycle-off is the historical move/rebind/erase terminal verbatim."
+    da1_restore_commit da1_restore_commit_found)
+string(FIND "${da1_restore_commit}"
+    "if (debug_observability) {" da1_debug_emit_gate)
+string(FIND "${da1_restore_commit}"
+    "debug_lifecycle_emissions++;" da1_debug_emit_count)
+string(FIND "${da1_restore_commit}"
+    "CACHE_HOST_LIFECYCLE" da1_debug_emit)
+if (da1_debug_wiring EQUAL -1 OR NOT da1_restore_commit_found OR
+    da1_debug_emit_gate EQUAL -1 OR
+    da1_debug_emit_count LESS da1_debug_emit_gate OR
+    da1_debug_emit LESS da1_debug_emit_count)
+    message(FATAL_ERROR "D-A1 debug-only lifecycle evidence gate drifted")
+endif()
+
 message(STATUS
     "D-S4 destruction inventory scan passed: 6 classes, ${admission_owner_count} admission owners, "
-    "raw-call + missing-class + D-A0b release-owner negative controls")
+    "raw-call + missing-class + D-A0b release-owner + D-A1 commit-gap/debug-emission negative controls")

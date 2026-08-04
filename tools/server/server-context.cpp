@@ -4645,6 +4645,7 @@ private:
                         : common_retention_pool::attention;
             }
             if (prompt_cache) {
+                prompt_cache->debug_observability = params_base.cache_debug;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
                 prompt_cache->lease_obs = &cache_authority->leases;
