@@ -57,12 +57,11 @@ constexpr common_cache_plan_authority_level server_cache_plan_level_of(
     return static_cast<common_cache_plan_authority_level>(selection);
 }
 
-// Highest behavior-changing ratchet implemented in this tree. Higher parsed
-// levels still enable every landed prefix tier, but cannot prematurely flip a
-// LRU decision before that unit supplies its domain contract.
+// Highest behavior-changing ratchet implemented in this tree. LRU is the final
+// declared level; its configured value keeps every earlier prefix tier enabled.
 constexpr common_cache_plan_authority_level
     SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL =
-        common_cache_plan_authority_level::route_home;
+        common_cache_plan_authority_level::lru;
 
 constexpr bool server_cache_plan_level_enabled(
         common_cache_plan_authority_level configured,
@@ -78,6 +77,27 @@ constexpr bool server_cache_plan_selection_admits_retarget(
     return decision > common_cache_plan_authority_level::by_id &&
            decision < common_cache_plan_authority_level::_count &&
            server_cache_plan_level_enabled(configured, decision);
+}
+
+// Revalidate inventory currency only when authority changes the physical
+// target. Same-target executions are revalidated by their provider-specific
+// seam; in particular an empty LRU target has no live row to revalidate.
+constexpr bool server_cache_plan_retarget_currency_required(
+        bool selection_admits_retarget,
+        int32_t planned_target_slot_id,
+        int32_t legacy_target_slot_id) noexcept {
+    return selection_admits_retarget &&
+           planned_target_slot_id != legacy_target_slot_id;
+}
+
+// Cold authority is executable only against a still-construction-empty target.
+// Keep this predicate shared with the model-free seam regression.
+constexpr bool server_cache_plan_cold_target_current(
+        const server_cache_plan_execution & execution,
+        bool prompt_empty,
+        bool checkpoints_empty) noexcept {
+    return execution.kind != server_cache_plan_execution_kind::cold_replay ||
+           (prompt_empty && checkpoints_empty);
 }
 
 // Single planned-target derivation for both authorization and the server's
@@ -204,6 +224,19 @@ bool server_cache_plan_demote_for_vbr_low_lcp_reset(
     common_cache_plan_record & rec,
     server_cache_plan_execution & execution,
     bool reset_applied) noexcept;
+
+constexpr bool server_cache_plan_checkpoint_superseded_by_window(
+        const server_cache_plan_execution & execution,
+        bool window_restored) noexcept {
+    return window_restored && execution.restores_checkpoint();
+}
+
+constexpr bool server_cache_plan_live_replay_lost_to_logits(
+        const server_cache_plan_execution & execution,
+        int64_t n_past_after_decrement) noexcept {
+    return n_past_after_decrement == 0 &&
+           execution.kind == server_cache_plan_execution_kind::live_replay;
+}
 
 // Translate a planned checkpoint only after the live seam has revalidated its
 // eligibility. A false result means "use the legacy iterator", never "cold".

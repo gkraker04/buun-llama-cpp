@@ -239,18 +239,74 @@ std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_desc
     return hw;
 }
 
-// root-optimum membership: valid AND independently executable from the request's starting
+static const common_cache_plan_candidate * cache_plan_target_live_row(
+        const common_cache_plan_record & rec,
+        int32_t target_slot_id) noexcept {
+    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+        const auto & row = rec.inventory[i];
+        if (row.provider == common_cache_plan_provider::live_slot &&
+            row.target_slot_id == target_slot_id &&
+            row.source_id == target_slot_id && !row.is_chain()) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+static bool cache_plan_base_row_participates(
+        const common_cache_plan_record & rec,
+        const common_cache_plan_candidate & row) noexcept {
+    return common_cache_plan_origin_in_domain(
+               row.origin_tier, rec.selection) &&
+           row.viable() && !row.component_only;
+}
+
+static bool cache_plan_lru_stratum_complete(
+        const common_cache_plan_record & rec) noexcept {
+    if (rec.selection != common_cache_plan_selection::lru) {
+        return true;
+    }
+    const auto * legacy = cache_plan_target_live_row(rec, rec.id_slot);
+    if (!legacy || !legacy->spec_capable_known) {
+        return false;
+    }
+    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+        const auto & row = rec.inventory[i];
+        if (!cache_plan_base_row_participates(rec, row)) {
+            continue;
+        }
+        const auto * target = cache_plan_target_live_row(
+            rec, row.target_slot_id);
+        if (!target || !target->spec_capable_known) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Root-optimum membership: valid AND independently executable from the request's starting
 // state — a component-only row (checkpoint exposed by a delivered host entry) is priced as
-// a chain component but can never win on its own (verify-r1 finding 1)
+// a chain component but can never win on its own (verify-r1 finding 1).
 static bool cache_plan_row_participates(
         const common_cache_plan_record & rec,
-        const common_cache_plan_candidate & c) {
+        const common_cache_plan_candidate & c,
+        const common_cache_plan_candidate * lru_legacy) {
     // B-A absorbs tiers cumulatively. A similarity decision may compare only
     // targets that crossed the strict similarity threshold; route-home/LRU
     // rows remain evidence but cannot win until their ratchets are enabled.
-    return common_cache_plan_origin_in_domain(
-               c.origin_tier, rec.selection) &&
-           c.viable() && !c.component_only;
+    if (!cache_plan_base_row_participates(rec, c)) {
+        return false;
+    }
+    if (rec.selection != common_cache_plan_selection::lru) {
+        return true;
+    }
+    // buun's B-A4 rule: speculative capability is a hard eligibility
+    // stratum exactly matching legacy. B has no calibrated speculation credit;
+    // minimize only among targets in the legacy-selected stratum.
+    const auto * target = cache_plan_target_live_row(rec, c.target_slot_id);
+    return lru_legacy && target && lru_legacy->spec_capable_known &&
+           target->spec_capable_known &&
+           lru_legacy->spec_capable == target->spec_capable;
 }
 
 // the ONE place terms are written and versions stamped: restore + replay + workspace
@@ -340,6 +396,11 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     if (rec.n_prompt_tokens.state != llama_cache_acct_known::known) {
         return common_cache_plan_planner_status::incomplete_evidence;
     }
+    if (!cache_plan_lru_stratum_complete(rec)) {
+        return common_cache_plan_planner_status::incomplete_evidence;
+    }
+    const auto * lru_legacy = rec.selection == common_cache_plan_selection::lru
+        ? cache_plan_target_live_row(rec, rec.id_slot) : nullptr;
     const uint64_t n_prompt = rec.n_prompt_tokens.value;
 
     // pass 0 (verify-r1 finding 2): a visited candidate whose shipped phase established
@@ -409,7 +470,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     bool     any        = false;
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         const auto & c = rec.inventory[i];
-        if (cache_plan_row_participates(rec, c) &&
+        if (cache_plan_row_participates(rec, c, lru_legacy) &&
             c.predicted_total_us.state == llama_cache_acct_known::known) {
             min_total = std::min(min_total, c.predicted_total_us.value);
             any = true;
@@ -425,7 +486,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     int32_t choice = -1;
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         const auto & c = rec.inventory[i];
-        if (!cache_plan_row_participates(rec, c) ||
+        if (!cache_plan_row_participates(rec, c, lru_legacy) ||
             c.predicted_total_us.state != llama_cache_acct_known::known) {
             continue;
         }

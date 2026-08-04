@@ -237,9 +237,10 @@ static bool inside_pre_da_safety_envelope(
         const server_cache_plan_execution & legacy) noexcept {
     if (planned.target != legacy.target) {
         // The one priced zero-destruction cross-target case belongs to the
-        // similarity ratchet. Route-home has no host durability, and future
-        // LRU needs D-A retention/destruction evidence rather than silently
-        // inheriting this exception.
+        // similarity ratchet. Route-home has no host durability, and landed
+        // LRU remains behind the D-A retention/eviction-evidence fence. The
+        // authorize() refusal below types that LRU case as
+        // budget_or_lease_unavailable.
         if (rec.selection != common_cache_plan_selection::similarity) {
             return false;
         }
@@ -273,6 +274,25 @@ static bool inside_pre_da_safety_envelope(
                planned.host_source_id == legacy.host_source_id;
     }
     return true;
+}
+
+static common_cache_plan_authority_fallback pre_da_envelope_refusal_reason(
+        const common_cache_plan_record & rec,
+        const server_cache_plan_execution & planned,
+        const server_cache_plan_execution & legacy) noexcept {
+    // Schema 5 has no eviction_evidence_unavailable spelling. At LRU, use its
+    // existing budget/lease availability reason only for the D-A fence: a
+    // target change, or a cold replacement of retained same-target state.
+    // Consuming a different host source remains destruction authority, just as
+    // it does at every earlier ratchet.
+    if (rec.selection == common_cache_plan_selection::lru &&
+        (planned.target != legacy.target ||
+         (planned.kind == server_cache_plan_execution_kind::cold_replay &&
+          legacy.kind != server_cache_plan_execution_kind::cold_replay))) {
+        return common_cache_plan_authority_fallback::budget_or_lease_unavailable;
+    }
+    return common_cache_plan_authority_fallback::
+        destruction_authority_required;
 }
 
 server_cache_plan_execution server_cache_plan_authority::authorize(
@@ -343,8 +363,8 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
     if (!inside_pre_da_safety_envelope(
             rec, rec.shadow_choice, execution, legacy_execution)) {
         fallback_legacy(rec,
-            common_cache_plan_authority_fallback::
-                destruction_authority_required);
+            pre_da_envelope_refusal_reason(
+                rec, execution, legacy_execution));
         return {};
     }
     rec.authority.state = common_cache_plan_authority_state::authoritative;

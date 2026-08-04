@@ -399,6 +399,23 @@ static void test_execution_seam_fallbacks() {
     CHECK(route_home.counters.fallback_reason[size_t(
               common_cache_plan_authority_fallback::stale_capability)] == 1);
 
+    server_cache_plan_execution checkpoint_execution;
+    checkpoint_execution.kind =
+        server_cache_plan_execution_kind::checkpoint_restore;
+    CHECK(server_cache_plan_checkpoint_superseded_by_window(
+        checkpoint_execution, true));
+    CHECK(!server_cache_plan_checkpoint_superseded_by_window(
+        checkpoint_execution, false));
+    server_cache_plan_execution live_execution;
+    live_execution.kind =
+        server_cache_plan_execution_kind::live_replay;
+    CHECK(!server_cache_plan_checkpoint_superseded_by_window(
+        live_execution, true));
+    CHECK(server_cache_plan_live_replay_lost_to_logits(
+        live_execution, 0));
+    CHECK(!server_cache_plan_live_replay_lost_to_logits(
+        live_execution, 1));
+
     // A post-retarget coverage demotion executes legacy recovery on the
     // planner-selected slot, not on the legacy-selected slot. Preserve the
     // pre-mutation slot-A counterfactual so the receipt records disagreement.
@@ -600,8 +617,8 @@ static void test_by_id_execution_shapes_and_target_binding() {
               common_cache_plan_authority_level::similarity,
               common_cache_plan_selection::similarity).authoritative());
 
-    // Parsed future levels enable the landed prefix but cannot prematurely
-    // flip their own still-unimplemented selection tiers.
+    // The final landed level keeps every earlier ratchet cumulative and now
+    // admits its own LRU tier as well.
     server_cache_plan_authority future(
         common_cache_plan_authority_level::lru);
     copy = rec;
@@ -618,10 +635,7 @@ static void test_by_id_execution_shapes_and_target_binding() {
     CHECK(authorize_choice(future, copy,
               int32_t(live - rec.inventory.data()), target, true,
               common_cache_plan_authority_level::lru,
-              common_cache_plan_selection::lru).kind ==
-          server_cache_plan_execution_kind::legacy);
-    CHECK(copy.authority.fallback_reason ==
-          common_cache_plan_authority_fallback::tier_not_enabled);
+              common_cache_plan_selection::lru).authoritative());
 
     // A disabled future tier must not blur an existing planner refusal into
     // tier_not_enabled. The latter names only an otherwise-qualified plan.
@@ -946,6 +960,143 @@ static void test_route_home_authority_domain() {
 
 }
 
+static void test_lru_authority_domain_and_eviction_fence() {
+    constexpr int32_t legacy_target = 6;
+    constexpr int32_t other_target = 2;
+    server_cache_plan_authority lru(
+        common_cache_plan_authority_level::lru);
+
+    // Empty-slot spread: a target-qualified cold plan on the shipped LRU slot
+    // has exactly the same destructive effect and is authoritative.
+    common_cache_plan_record empty;
+    auto * cold = add_viable(
+        empty, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
+        common_cache_plan_selection::lru);
+    auto execution = authorize_choice(
+        lru, empty, int32_t(cold - empty.inventory.data()), legacy_target,
+        true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind == server_cache_plan_execution_kind::cold_replay);
+    CHECK(execution.target == legacy_target);
+    // Exercise the two server seam predicates that follow authorize(): an LRU
+    // same-target cold plan must skip cross-target currency lookup (there is no
+    // viable live row on an empty target) and pass construction-empty recheck.
+    CHECK(!server_cache_plan_retarget_currency_required(
+        server_cache_plan_selection_admits_retarget(
+            common_cache_plan_authority_level::lru,
+            common_cache_plan_selection::lru),
+        execution.target, legacy_target));
+    // and the positive direction: a genuine cross-target plan still requires
+    // the currency lookup (a predicate degraded to `return false` must fail)
+    CHECK(server_cache_plan_retarget_currency_required(
+        server_cache_plan_selection_admits_retarget(
+            common_cache_plan_authority_level::lru,
+            common_cache_plan_selection::lru),
+        execution.target + 1, legacy_target));
+    CHECK(server_cache_plan_cold_target_current(execution, true, true));
+    CHECK(!server_cache_plan_cold_target_current(execution, false, true));
+
+    // Occupied same-target reuse remains inside the pre-D-A envelope.
+    common_cache_plan_record occupied;
+    auto * live = add_viable(
+        occupied, common_cache_plan_provider::live_slot,
+        legacy_target, legacy_target, common_cache_plan_selection::lru);
+    live->f_keep = 1.0;
+    live->f_keep_known = true;
+    execution = authorize_choice(
+        lru, occupied, int32_t(live - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind == server_cache_plan_execution_kind::live_replay);
+
+    // Cross-target replacement has no certified eviction/retention evidence
+    // before D-A. Schema 5 uses its existing availability spelling rather than
+    // adding a new wire enum value.
+    auto * foreign = add_viable(
+        occupied, common_cache_plan_provider::live_slot,
+        other_target, other_target, common_cache_plan_selection::lru);
+    foreign->f_keep = 1.0;
+    foreign->f_keep_known = true;
+    execution = authorize_choice(
+        lru, occupied, int32_t(foreign - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru);
+    CHECK(!execution.authoritative());
+    CHECK(occupied.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::
+              budget_or_lease_unavailable);
+
+    // Same-target cold replacement is the other eviction-evidence shape.
+    auto * occupied_cold = add_viable(
+        occupied, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
+        common_cache_plan_selection::lru);
+    execution = authorize_choice(
+        lru, occupied, int32_t(occupied_cold - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru);
+    CHECK(!execution.authoritative());
+    CHECK(occupied.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::
+              budget_or_lease_unavailable);
+
+    // Host-consumption authority is not eviction evidence: choosing another
+    // retained host source on the same target keeps the established reason.
+    common_cache_plan_record hosts;
+    auto * legacy_host = add_viable(
+        hosts, common_cache_plan_provider::host_cache_entry,
+        41, legacy_target, common_cache_plan_selection::lru);
+    legacy_host->f_keep = 0.8; legacy_host->f_keep_known = true;
+    legacy_host->sim = 0.8; legacy_host->sim_known = true;
+    auto * other_host = add_viable(
+        hosts, common_cache_plan_provider::host_cache_entry,
+        42, legacy_target, common_cache_plan_selection::lru);
+    other_host->f_keep = 0.7; other_host->f_keep_known = true;
+    other_host->sim = 0.9; other_host->sim_known = true;
+    execution = authorize_choice(
+        lru, hosts, int32_t(other_host - hosts.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru);
+    CHECK(!execution.authoritative());
+    CHECK(hosts.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::
+              destruction_authority_required);
+
+    // The previous ceiling still cannot flip an LRU selection.
+    common_cache_plan_record lower;
+    auto * lower_cold = add_viable(
+        lower, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
+        common_cache_plan_selection::lru);
+    server_cache_plan_authority route_home(
+        common_cache_plan_authority_level::route_home);
+    CHECK(!authorize_choice(
+        route_home, lower,
+        int32_t(lower_cold - lower.inventory.data()), legacy_target, true,
+        common_cache_plan_authority_level::route_home,
+        common_cache_plan_selection::lru).authoritative());
+    CHECK(lower.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::tier_not_enabled);
+
+    // Raising the configured ceiling leaves all prior ratchets cumulative.
+    for (const auto selection : {
+            common_cache_plan_selection::by_id,
+            common_cache_plan_selection::similarity,
+            common_cache_plan_selection::route_home }) {
+        common_cache_plan_record prior;
+        auto * prior_live = add_viable(
+            prior, common_cache_plan_provider::live_slot,
+            legacy_target, legacy_target, selection);
+        CHECK(authorize_choice(
+            lru, prior, int32_t(prior_live - prior.inventory.data()),
+            legacy_target, true, common_cache_plan_authority_level::lru,
+            selection).authoritative());
+    }
+}
+
 static void test_typed_planner_fallbacks() {
     const common_cache_plan_planner_status statuses[] = {
         common_cache_plan_planner_status::no_profile,
@@ -1060,6 +1211,7 @@ int main() {
     test_legacy_counterfactual_and_authoritative_receipt();
     test_similarity_crossover_and_safety_envelope();
     test_route_home_authority_domain();
+    test_lru_authority_domain_and_eviction_fence();
     test_typed_planner_fallbacks();
     test_off_stays_shadow_and_failed_delivery_not_counted();
     test_eligible_and_executed_index_different_tiers();

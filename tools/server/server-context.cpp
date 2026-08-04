@@ -5547,8 +5547,9 @@ private:
                 // Pre-D-A cold authority is limited to construction-empty
                 // targets. Clearing retained live/checkpoint state is a
                 // divergent destruction plan and remains D-A's authority.
-                return target.prompt.tokens.empty() &&
-                       target.prompt.checkpoints.empty();
+                return server_cache_plan_cold_target_current(
+                    execution, target.prompt.tokens.empty(),
+                    target.prompt.checkpoints.empty());
             case server_cache_plan_execution_kind::legacy:
             case server_cache_plan_execution_kind::_count:
                 return false;
@@ -6024,7 +6025,9 @@ private:
                         incoming_adapter_matches,
                         planned_adapter_matches);
                     if (execution.authoritative() &&
-                        selection_admits_retarget &&
+                        server_cache_plan_retarget_currency_required(
+                            selection_admits_retarget, planned_target,
+                            legacy_ret->id) &&
                         (!planned_ret ||
                          !cache_plan_retarget_target_current(
                              *plan_rec, *planned_ret))) {
@@ -9007,6 +9010,19 @@ private:
                                 }
                             }
 
+                            if (server_cache_plan_checkpoint_superseded_by_window(
+                                    slot.cache_plan_execution,
+                                    window_restored)) {
+                                // The rolling-window recovery superseded the
+                                // planned checkpoint before its seam could run.
+                                // This is typed capability drift, not a failed
+                                // checkpoint execution.
+                                cache_plan_fallback_legacy(
+                                    slot,
+                                    common_cache_plan_authority_fallback::
+                                        stale_capability);
+                            }
+
                             if (!window_restored &&
                                 n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -10061,6 +10077,16 @@ private:
                             // only in token bookkeeping would skip that decode.
                             n_past_keep = std::min(n_past_keep, (size_t) n_past);
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            if (server_cache_plan_live_replay_lost_to_logits(
+                                    slot.cache_plan_execution, n_past)) {
+                                // A one-token exact hit becomes cold so logits
+                                // can be produced. The live plan was superseded,
+                                // not internally failed.
+                                cache_plan_fallback_legacy(
+                                    slot,
+                                    common_cache_plan_authority_fallback::
+                                        stale_capability);
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;

@@ -12,13 +12,13 @@ file(READ "${SOURCE_ROOT}/tools/server/server-cache-plan-authority.h" authority_
 file(READ "${SOURCE_ROOT}/common/common.h" common_header)
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.h" plan_header)
 
-# The landed behavior ceiling moves one ratchet at a time. Parsed future levels
-# may enable the landed prefix, but must not authorize LRU before B-A4.
+# The landed behavior ceiling moves one ratchet at a time. B-A4 is the final
+# declared level, so this pin certifies the complete graduated ladder.
 string(REGEX MATCH
-    "SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL[ \t\r\n]*=[ \t\r\n]*common_cache_plan_authority_level::route_home;"
+    "SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL[ \t\r\n]*=[ \t\r\n]*common_cache_plan_authority_level::lru;"
     implemented_ceiling "${authority_header}")
 if (NOT implemented_ceiling)
-    message(FATAL_ERROR "B-A implemented authority ceiling is not route_home")
+    message(FATAL_ERROR "B-A implemented authority ceiling is not lru")
 endif()
 
 function(cache_plan_authority_order_valid source output)

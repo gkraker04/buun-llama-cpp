@@ -464,6 +464,57 @@ static void test_tie_set() {
     CHECK(rec.shadow_choice == first && rec.n_shadow_ties == 2);
 }
 
+static void test_lru_spec_stratum_and_tie_determinism() {
+    common_cache_plan_record rec = make_record(100);
+    rec.selection = common_cache_plan_selection::lru;
+    rec.id_slot = 9; // legacy LRU winner establishes the hard spec stratum
+
+    const auto add_target = [&](int32_t target, bool spec, uint64_t lcp,
+                                common_cache_plan_selection origin) {
+        auto * live = rec.find_or_add(
+            common_cache_plan_provider::live_slot, target,
+            COMMON_CACHE_PLAN_PHASE_LRU, target, origin);
+        CHECK(live != nullptr);
+        live->lcp_tokens = llama_cache_acct_value::measured(lcp);
+        live->payload_bytes = llama_cache_acct_value::measured(0);
+        live->disposition =
+            common_cache_plan_disposition::valid_not_chosen_cost;
+        live->spec_capable = spec;
+        live->spec_capable_known = true;
+        auto * cold = rec.find_or_add(
+            common_cache_plan_provider::cold_replay,
+            COMMON_CACHE_PLAN_SOURCE_AGGREGATE, COMMON_CACHE_PLAN_PHASE_LRU,
+            target, origin);
+        CHECK(cold != nullptr);
+        cold->disposition =
+            common_cache_plan_disposition::valid_not_chosen_cost;
+        return live;
+    };
+
+    add_target(9, true, 10, common_cache_plan_selection::lru);
+    auto * spec_7 = add_target(
+        7, true, 90, common_cache_plan_selection::route_home);
+    auto * spec_6 = add_target(
+        6, true, 90, common_cache_plan_selection::similarity);
+    auto * non_spec = add_target(
+        4, false, 100, common_cache_plan_selection::lru);
+
+    CHECK(common_cache_plan_estimate_and_choose(rec, TEST_CALIB) ==
+          planner_status::ok);
+    CHECK(rec.n_shadow_ties == 2);
+    CHECK(&rec.inventory[size_t(rec.shadow_choice)] == spec_6);
+    CHECK(non_spec->predicted_total_us.value == 0); // cheapest, but wrong stratum
+    CHECK(spec_6->predicted_total_us.value ==
+          spec_7->predicted_total_us.value);
+
+    // Missing target capability evidence refuses the whole LRU optimum rather
+    // than silently dropping one target from the stratum comparison.
+    spec_7->spec_capable_known = false;
+    CHECK(common_cache_plan_estimate_and_choose(rec, TEST_CALIB) ==
+          planner_status::incomplete_evidence);
+    CHECK(rec.shadow_choice == -1);
+}
+
 // unavailability propagation, each a closed status and ENTIRELY all-or-nothing:
 // overflow, dropped derived plan, unresolved visited candidate, missing participant
 // scalars, unknown n_prompt — never an optimum over a partial set
@@ -636,6 +687,7 @@ int main() {
     test_basic_estimation();
     test_controlled_disagreement();
     test_tie_set();
+    test_lru_spec_stratum_and_tie_determinism();
     test_unavailability();
     test_capacity_chain_boundary();
     test_chain_composition_and_root_feasibility();

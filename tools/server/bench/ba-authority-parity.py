@@ -49,6 +49,8 @@ class ServerArm:
 		if args.slot_prompt_similarity:
 			cmd += ["--slot-prompt-similarity",
 				str(args.slot_prompt_similarity)]
+		for extra in args.extra_server_arg:
+			cmd += extra.split()
 		if args.ctk:
 			cmd += ["-ctk", args.ctk, "-ctv", args.ctv or args.ctk]
 		self.log = open(log_path, "w")
@@ -244,6 +246,9 @@ def main():
 		help="forced = id_slot battery (by_id tier); similarity = "
 		"non-forced reuse battery (similarity tier); route_home = "
 		"main/sub-agent displacement battery (route_home tier)")
+	parser.add_argument("--extra-server-arg", action="append", default=[],
+		help="extra server argument group (repeatable, split on spaces; "
+		"e.g. --extra-server-arg '--draft-model d.gguf')")
 	parser.add_argument("--slot-prompt-similarity", type=float, default=0.0,
 		help="pass through to the server (0 = server default); the "
 		"route_home battery needs a threshold the long continuation "

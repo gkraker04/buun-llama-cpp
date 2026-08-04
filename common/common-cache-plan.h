@@ -602,6 +602,11 @@ struct common_cache_plan_record {
     // ordering, which can differ from legacy strict-max-LCP selection. The
     // resulting cross-target plan is refused as destruction_authority_required;
     // ratchet reads must separate that churn from economic disagreements.
+    // At LRU, budget_or_lease_unavailable also names missing certified eviction
+    // evidence for cross-target or cold-replacement shapes: schema 5 has no
+    // eviction_evidence_unavailable spelling, and expanding the frozen fallback
+    // vocabulary would itself be a wire change. Consuming a different retained
+    // host source remains destruction_authority_required at every tier.
     // Schema 5 has no separate execution_failed fallback;
     // a genuine post-authorization restore failure is recorded as internal_fault
     // rather than silently extending the frozen vocabulary in B-A1.
