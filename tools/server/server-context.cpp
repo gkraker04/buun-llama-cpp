@@ -1083,6 +1083,9 @@ private:
     }
 
     void reload_mmproj(bool use_gpu) {
+        for (server_slot & slot : slots) {
+            slot.mbatch.reset();
+        }
         mtmd_free(mctx);
         mctx = nullptr;
         auto mparams = make_mmproj_params(use_gpu);
