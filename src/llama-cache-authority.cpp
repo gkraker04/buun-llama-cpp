@@ -1,5 +1,8 @@
 #include "llama-cache-authority.h"
 
+#include <algorithm>
+#include <utility>
+
 const char * llama_cache_admission_status_name(llama_cache_admission_status status) noexcept {
     switch (status) {
         case llama_cache_admission_status::admitted:            return "admitted";
@@ -40,6 +43,86 @@ const char * llama_cache_prepare_status_name(
         case llama_cache_prepare_status::_count:            break;
     }
     return "unknown";
+}
+
+const char * llama_cache_prepare_release_status_name(
+        llama_cache_prepare_release_status status) noexcept {
+    switch (status) {
+        case llama_cache_prepare_release_status::prepared:         return "prepared";
+        case llama_cache_prepare_release_status::invalid_argument: return "invalid_argument";
+        case llama_cache_prepare_release_status::serial_conflict:  return "serial_conflict";
+        case llama_cache_prepare_release_status::ledger_fault:     return "ledger_fault";
+        case llama_cache_prepare_release_status::internal_fault:   return "internal_fault";
+        case llama_cache_prepare_release_status::_count:           break;
+    }
+    return "unknown";
+}
+
+llama_cache_prepared_release_set::llama_cache_prepared_release_set(
+        llama_cache_prepared_release_set && other) noexcept
+    : ledger_(other.ledger_),
+      ops_(std::move(other.ops_)),
+      preview_(std::move(other.preview_)),
+      status_(other.status_) {
+    other.ledger_ = nullptr;
+}
+
+llama_cache_prepared_release_set &
+llama_cache_prepared_release_set::operator=(
+        llama_cache_prepared_release_set && other) noexcept {
+    if (this != &other) {
+        ledger_ = other.ledger_;
+        ops_ = std::move(other.ops_);
+        preview_ = std::move(other.preview_);
+        status_ = other.status_;
+        other.ledger_ = nullptr;
+    }
+    return *this;
+}
+
+llama_cache_conditional_release_status
+llama_cache_prepared_release_set::commit() noexcept {
+    if (!ready()) {
+        return llama_cache_conditional_release_status::ledger_fault;
+    }
+    auto * ledger = ledger_;
+    ledger_ = nullptr;
+    return ledger->release_set_if_serial(ops_, preview_.accounting_serial);
+}
+
+llama_cache_prepared_release_set llama_cache_prepare_release_set(
+        llama_cache_acct_ledger & ledger,
+        const std::vector<llama_cache_acct_op_id> & selected,
+        uint64_t expected_serial) noexcept {
+    llama_cache_prepared_release_set out;
+    try {
+        if (selected.empty() || expected_serial == 0) {
+            return out;
+        }
+        out.ops_ = selected;
+        std::sort(out.ops_.begin(), out.ops_.end());
+        if (!out.ops_.front() ||
+            std::adjacent_find(out.ops_.begin(), out.ops_.end()) !=
+                out.ops_.end()) {
+            return out;
+        }
+        if (!ledger.preview_release_set(
+                out.ops_, expected_serial, out.preview_)) {
+            // A fresh snapshot distinguishes benign serial drift from a hard
+            // invalid operation set without turning drift into a ledger fault.
+            out.status_ = ledger.snapshot().serial != expected_serial
+                ? llama_cache_prepare_release_status::serial_conflict
+                : llama_cache_prepare_release_status::ledger_fault;
+            return out;
+        }
+        out.ledger_ = &ledger;
+        out.status_ = llama_cache_prepare_release_status::prepared;
+        return out;
+    } catch (...) {
+        out = {};
+        out.status_ = llama_cache_prepare_release_status::internal_fault;
+        return out;
+    }
 }
 
 llama_cache_reservation_claim::llama_cache_reservation_claim(

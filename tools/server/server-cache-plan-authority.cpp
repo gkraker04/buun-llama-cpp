@@ -2,6 +2,63 @@
 
 #include "common-cache-plan-estimate.h"
 
+int32_t server_cache_plan_host_source(
+        const common_cache_plan_record & rec,
+        int32_t candidate) noexcept {
+    if (candidate < 0 || uint32_t(candidate) >= rec.n_inventory) {
+        return -1;
+    }
+    const auto & row = rec.inventory[size_t(candidate)];
+    if (row.is_chain()) {
+        const int32_t base = row.component_ids[0];
+        return base >= 0 && uint32_t(base) < rec.n_inventory
+            ? rec.inventory[size_t(base)].source_id : -1;
+    }
+    return row.provider == common_cache_plan_provider::host_cache_entry
+        ? row.source_id : -1;
+}
+
+common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
+        const common_cache_plan_record & rec,
+        int32_t candidate,
+        int32_t legacy_candidate) noexcept {
+    if (candidate < 0 || legacy_candidate < 0 ||
+        uint32_t(candidate) >= rec.n_inventory ||
+        uint32_t(legacy_candidate) >= rec.n_inventory) {
+        return 0;
+    }
+    const auto & planned = rec.inventory[size_t(candidate)];
+    const auto & legacy = rec.inventory[size_t(legacy_candidate)];
+    common_cache_plan_destruction_effect_set effects = 0;
+    if (planned.target_slot_id != legacy.target_slot_id) {
+        if (rec.selection == common_cache_plan_selection::similarity &&
+            planned.provider == common_cache_plan_provider::live_slot &&
+            planned.f_keep_known && planned.f_keep >= 1.0) {
+            // The sole B-A zero-destruction cross-target case.
+        } else {
+            effects |= common_cache_plan_destruction_effect_bit(
+                rec.selection == common_cache_plan_selection::similarity
+                    ? common_cache_plan_destruction_effect::
+                          destructive_similarity_retarget
+                    : common_cache_plan_destruction_effect::
+                          cross_target_displacement);
+        }
+    }
+    if (planned.target_slot_id == legacy.target_slot_id &&
+        planned.provider == common_cache_plan_provider::cold_replay &&
+        legacy.provider != common_cache_plan_provider::cold_replay) {
+        effects |= common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::same_target_cold_replacement);
+    }
+    const int32_t planned_host = server_cache_plan_host_source(rec, candidate);
+    const int32_t legacy_host = server_cache_plan_host_source(rec, legacy_candidate);
+    if (planned_host >= 0 && planned_host != legacy_host) {
+        effects |= common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::different_host_source_consumption);
+    }
+    return effects;
+}
+
 uint64_t server_cache_plan_capability_fold(
         uint64_t hash,
         uint64_t value) noexcept {
@@ -233,47 +290,9 @@ bool server_cache_plan_execution_from_candidate(
 static bool inside_pre_da_safety_envelope(
         const common_cache_plan_record & rec,
         int32_t planned_candidate,
-        const server_cache_plan_execution & planned,
-        const server_cache_plan_execution & legacy) noexcept {
-    if (planned.target != legacy.target) {
-        // The one priced zero-destruction cross-target case belongs to the
-        // similarity ratchet. Route-home has no host durability, and landed
-        // LRU remains behind the D-A retention/eviction-evidence fence. The
-        // authorize() refusal below types that LRU case as
-        // budget_or_lease_unavailable.
-        if (rec.selection != common_cache_plan_selection::similarity) {
-            return false;
-        }
-        // Before D-A, changing the selected target is safe only when the new
-        // live plan retains every byte of that target's existing prefix. This
-        // is the one genuinely zero-destruction cross-target similarity case:
-        // no host capability is consumed and no divergent suffix is trimmed.
-        if (planned.kind != server_cache_plan_execution_kind::live_replay ||
-            planned_candidate < 0 ||
-            uint32_t(planned_candidate) >= rec.n_inventory) {
-            return false;
-        }
-        const auto & row = rec.inventory[size_t(planned_candidate)];
-        return row.provider == common_cache_plan_provider::live_slot &&
-               row.f_keep_known && row.f_keep >= 1.0;
-    }
-    // The forced target may be replayed or restored without evicting a
-    // separate retained artifact. Cold is no worse only when legacy was cold.
-    if (planned.kind == server_cache_plan_execution_kind::cold_replay) {
-        return legacy.kind == server_cache_plan_execution_kind::cold_replay;
-    }
-    // Host restore is consuming. Before D-A it may consume only the exact host
-    // entry legacy would have consumed; checkpoint choice within that restored
-    // state remains non-consuming.
-    if (planned.kind == server_cache_plan_execution_kind::host_restore ||
-        planned.kind ==
-            server_cache_plan_execution_kind::host_checkpoint_restore) {
-        return (legacy.kind == server_cache_plan_execution_kind::host_restore ||
-                legacy.kind ==
-                    server_cache_plan_execution_kind::host_checkpoint_restore) &&
-               planned.host_source_id == legacy.host_source_id;
-    }
-    return true;
+        int32_t legacy_candidate) noexcept {
+    return server_cache_destruction_effects_for(
+               rec, planned_candidate, legacy_candidate) == 0;
 }
 
 static common_cache_plan_authority_fallback pre_da_envelope_refusal_reason(
@@ -361,7 +380,7 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
         return {};
     }
     if (!inside_pre_da_safety_envelope(
-            rec, rec.shadow_choice, execution, legacy_execution)) {
+            rec, rec.shadow_choice, legacy_plan_candidate)) {
         fallback_legacy(rec,
             pre_da_envelope_refusal_reason(
                 rec, execution, legacy_execution));

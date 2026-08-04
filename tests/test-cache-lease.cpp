@@ -441,6 +441,33 @@ static void test_observer_off_zero_work() {
     CHECK(clock.calls == 1);
 }
 
+static void test_lifecycle_without_debug_consults_lease() {
+    fake_clock clock;
+    fake_fallback fallback;
+    fallback.state = server_cache_lease_fallback_state::available;
+    server_cache_lease_table table(&clock, &fallback);
+    const auto value = subject(
+        88, common_retention_artifact_kind::host_entry, -1);
+    CHECK(table.grant_hard(value, context_scope(), identity(), 100));
+
+    // This is the lifecycle-only wiring shape: the policy observer/evaluator
+    // exists, while no cache-plan JSON observer is involved. The hard lease is
+    // consulted, yet D-A0b still executes pass-through.
+    server_cache_destruction_observer lifecycle;
+    lifecycle.lease_context = &table;
+    lifecycle.lease_evaluator = server_cache_lease_evaluate_request;
+    const auto admission = server_cache_retention_admit(
+        &lifecycle,
+        direct_request(
+            server_cache_destruction_target_kind::host_artifact,
+            value));
+    CHECK(admission.verdict ==
+          server_cache_destruction_verdict::would_refuse_hard_leased);
+    CHECK(admission.execution ==
+          server_cache_destruction_execution::pass_through);
+    CHECK(lifecycle.n_events == 1);
+}
+
 int main() {
     test_closed_scope_types();
     test_soft_renew_expire_release();
@@ -450,6 +477,7 @@ int main() {
     test_identity_clone_rebind_retire();
     test_replay_and_ring_overflow();
     test_observer_off_zero_work();
+    test_lifecycle_without_debug_consults_lease();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d cache-lease test(s) failed\n", failures);

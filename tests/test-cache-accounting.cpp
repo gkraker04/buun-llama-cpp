@@ -350,8 +350,15 @@ static void test_release_set_preview() {
         { op0, op1 }, before.serial + 1, preview));
     CHECK(ledger.snapshot().serial == before.serial);
 
-    CHECK(ledger.release(op0));
-    CHECK(ledger.release(op1));
+    CHECK(ledger.release_set_if_serial(
+        { op0, op1 }, before.serial) ==
+          llama_cache_conditional_release_status::released);
+    const auto terminal = ledger.snapshot();
+    CHECK(terminal.live_ops == 0);
+    CHECK(cell(terminal, CAT, DOM,
+               llama_cache_acct_measure::logical_payload).value == 0);
+    CHECK(cell(terminal, CAT, DOM,
+               llama_cache_acct_measure::resident_allocated).value == 0);
 }
 
 // Sol verify-r2 finding 3: a RETIRED allocation id can never name a new physical allocation.

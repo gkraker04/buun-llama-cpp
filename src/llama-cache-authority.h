@@ -114,6 +114,65 @@ llama_cache_admission_result llama_cache_admit_reservation(
         const llama_cache_budget_config  & budget_config,
         const llama_cache_authority_request & request) noexcept;
 
+enum class llama_cache_prepare_release_status : uint8_t {
+    prepared,
+    invalid_argument,
+    serial_conflict,
+    ledger_fault,
+    internal_fault,
+    _count,
+};
+
+const char * llama_cache_prepare_release_status_name(
+        llama_cache_prepare_release_status status) noexcept;
+
+// Move-only, non-claiming preparation for a complete release union. Preparing
+// only snapshots exact last-reference effects; destruction authority owns the
+// later physical mutation and calls commit() exactly once at its terminal.
+class llama_cache_prepared_release_set {
+public:
+    llama_cache_prepared_release_set() = default;
+    ~llama_cache_prepared_release_set() = default;
+
+    llama_cache_prepared_release_set(const llama_cache_prepared_release_set &) = delete;
+    llama_cache_prepared_release_set & operator=(const llama_cache_prepared_release_set &) = delete;
+    llama_cache_prepared_release_set(llama_cache_prepared_release_set &&) noexcept;
+    llama_cache_prepared_release_set & operator=(llama_cache_prepared_release_set &&) noexcept;
+
+    bool ready() const noexcept {
+        return ledger_ != nullptr &&
+               status_ == llama_cache_prepare_release_status::prepared;
+    }
+    llama_cache_prepare_release_status status() const noexcept { return status_; }
+    uint64_t accounting_serial() const noexcept { return preview_.accounting_serial; }
+    const std::vector<llama_cache_acct_op_id> & ops() const noexcept { return ops_; }
+    const llama_cache_acct_release_set_preview & preview() const noexcept { return preview_; }
+
+    // Allocation-free atomic terminal. serial_conflict means a forbidden
+    // ledger write occurred after prepare; no operation was released.
+    llama_cache_conditional_release_status commit() noexcept;
+
+private:
+    llama_cache_acct_ledger * ledger_ = nullptr;
+    std::vector<llama_cache_acct_op_id> ops_;
+    llama_cache_acct_release_set_preview preview_;
+    llama_cache_prepare_release_status status_ =
+        llama_cache_prepare_release_status::invalid_argument;
+
+    friend llama_cache_prepared_release_set llama_cache_prepare_release_set(
+        llama_cache_acct_ledger &,
+        const std::vector<llama_cache_acct_op_id> &,
+        uint64_t) noexcept;
+};
+
+// Fresh-serial prepare at the mutation boundary. The quote's earlier serial is
+// evidence only; callers compare this canonical op set and exact union effect
+// to the quote before permitting a physical mutation.
+llama_cache_prepared_release_set llama_cache_prepare_release_set(
+    llama_cache_acct_ledger & ledger,
+    const std::vector<llama_cache_acct_op_id> & ops,
+    uint64_t expected_serial) noexcept;
+
 // One leaf in the shared all-or-nothing authority transaction. A zero existing_allocation asks
 // the primitive to mint a fresh allocation; a nonzero one joins that immutable allocation and
 // normally reserves zero new physical bytes while staging its full resident tuple. Output pointers

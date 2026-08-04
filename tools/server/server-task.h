@@ -739,6 +739,10 @@ struct server_prompt_cache_state {
     llama_cache_acct_op_id acct_op_ckpt;
     llama_cache_acct_op_id acct_op_accel;
 
+    std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
+        return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };
+    }
+
     // Request-local observer identity. It lives on the list node so save-time
     // dedup/splice preserves surviving identities and an allocator-reused
     // address can never inherit a consumed entry's source id.

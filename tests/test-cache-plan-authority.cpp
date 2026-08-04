@@ -1028,6 +1028,11 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(occupied.authority.fallback_reason ==
           common_cache_plan_authority_fallback::
               budget_or_lease_unavailable);
+    CHECK(common_cache_plan_destruction_effect_has(
+        server_cache_destruction_effects_for(
+            occupied, int32_t(foreign - occupied.inventory.data()),
+            occupied.authority.legacy_plan_candidate),
+        common_cache_plan_destruction_effect::cross_target_displacement));
 
     // Same-target cold replacement is the other eviction-evidence shape.
     auto * occupied_cold = add_viable(
@@ -1042,6 +1047,12 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(occupied.authority.fallback_reason ==
           common_cache_plan_authority_fallback::
               budget_or_lease_unavailable);
+    CHECK(common_cache_plan_destruction_effect_has(
+        server_cache_destruction_effects_for(
+            occupied,
+            int32_t(occupied_cold - occupied.inventory.data()),
+            occupied.authority.legacy_plan_candidate),
+        common_cache_plan_destruction_effect::same_target_cold_replacement));
 
     // Host-consumption authority is not eviction evidence: choosing another
     // retained host source on the same target keeps the established reason.
@@ -1064,6 +1075,12 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(hosts.authority.fallback_reason ==
           common_cache_plan_authority_fallback::
               destruction_authority_required);
+    CHECK(common_cache_plan_destruction_effect_has(
+        server_cache_destruction_effects_for(
+            hosts, int32_t(other_host - hosts.inventory.data()),
+            hosts.authority.legacy_plan_candidate),
+        common_cache_plan_destruction_effect::
+            different_host_source_consumption));
 
     // The previous ceiling still cannot flip an LRU selection.
     common_cache_plan_record lower;

@@ -328,6 +328,8 @@ inline bool operator==(llama_cache_acct_alloc_id       a, llama_cache_acct_alloc
 inline bool operator==(llama_cache_acct_artifact_id    a, llama_cache_acct_artifact_id    b) { return a.v == b.v; }
 inline bool operator==(llama_cache_acct_content_digest a, llama_cache_acct_content_digest b) { return a.v == b.v; }
 inline bool operator==(llama_cache_acct_lineage_id     a, llama_cache_acct_lineage_id     b) { return a.v == b.v; }
+inline bool operator< (llama_cache_acct_op_id          a, llama_cache_acct_op_id          b) { return a.v < b.v; }
+inline bool operator< (llama_cache_acct_artifact_id    a, llama_cache_acct_artifact_id    b) { return a.v < b.v; }
 inline bool operator!=(llama_cache_acct_op_id          a, llama_cache_acct_op_id          b) { return !(a == b); }
 inline bool operator!=(llama_cache_acct_alloc_id       a, llama_cache_acct_alloc_id       b) { return !(a == b); }
 inline bool operator!=(llama_cache_acct_artifact_id    a, llama_cache_acct_artifact_id    b) { return !(a == b); }
@@ -564,6 +566,17 @@ struct llama_cache_conditional_reserve_result {
     llama_cache_acct_op_id                  op     = {};
 };
 
+// Mutation-boundary release outcome. serial_conflict is optimistic concurrency
+// drift and mutates nothing; ledger_fault means at least one operation was no
+// longer a live committed reference (also no partial release). `released`
+// applies the complete set under one lock and advances the serial once.
+enum class llama_cache_conditional_release_status : uint8_t {
+    released,
+    serial_conflict,
+    ledger_fault,
+    _count,
+};
+
 // Shadow accounting ledger: reserve → stage → commit | abort → release, observational in P2
 // (header preamble). Charge-once for shared immutable allocations: the durable bytes of a
 // physical allocation are charged when its FIRST reference commits and discharged when its
@@ -649,6 +662,13 @@ struct llama_cache_acct_ledger {
             const std::vector<llama_cache_acct_op_id> & ops,
             uint64_t expected_serial,
             llama_cache_acct_release_set_preview & out) const noexcept;
+
+    // Commit a previously previewed canonical operation set atomically. The
+    // caller must pass strictly increasing, nonzero operation ids; this keeps
+    // the post-mutation terminal allocation-free and prevents duplicate refs.
+    llama_cache_conditional_release_status release_set_if_serial(
+            const std::vector<llama_cache_acct_op_id> & ops,
+            uint64_t expected_serial) noexcept;
 
     // Direct gauge reporting for non-transactional producers (live state, metadata gauges).
     // Checked: overflow latches the cell unavailable and counts a fault.
@@ -736,6 +756,11 @@ private:
     release_resolution_status resolve_release_locked(
             llama_cache_acct_op_id op,
             release_resolution & out) const noexcept;
+    // Apply one release already validated by resolve_release_locked while the
+    // caller retains the ledger lock. This has no failure arm: set release
+    // validates the complete batch before invoking it, structurally excluding
+    // a partial-release error return.
+    void apply_release_locked(llama_cache_acct_op_id op) noexcept;
 
     // Unlocked helpers (callers hold the mutex). Aggregate rows are pre-created atomically
     // with the required-producer manifest, so the gauge and failure paths never allocate.

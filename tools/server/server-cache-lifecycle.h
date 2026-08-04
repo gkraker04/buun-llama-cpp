@@ -7,19 +7,21 @@
 #include <cstdint>
 
 // D-S4's one closed inventory. The second argument is the physical choke-point allowed to
-// contain the corresponding raw primitive; the third is its logical admission owner. Two
-// full-slot classes deliberately share one manifest builder/admission owner. CI extracts the
-// mapping, so adding a class or raw primitive without extending it fails the contract scan.
+// contain the corresponding raw primitive; the third is its logical admission owner; the
+// fourth names the accounting release owner. Two full-slot classes deliberately share one
+// manifest builder/admission owner. Only host artifacts own committed C operations today:
+// their raw eraser is physical-only and the legacy wrapper owns the lifecycle-off terminal.
+// CI extracts the mapping, so adding a class or raw primitive without extending it fails.
 #define SERVER_CACHE_DESTRUCTION_INVENTORY(X) \
-    X(slot_drop,                server_cache_slot_drop_impl,                observe_full_slot) \
-    X(live_range_drop,          server_cache_live_range_drop_impl,          observe_live_range_drop) \
-    X(host_artifact_drop,       server_prompt_cache_destroy_entry_impl,     server_prompt_cache_observe_drop) \
-    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          checkpoint_drop) \
-    X(token_ledger_truncate,    server_cache_token_ledger_truncate_impl,    token_ledger_truncate) \
-    X(mandatory_recovery_reset, server_cache_mandatory_recovery_reset_impl, observe_full_slot)
+    X(slot_drop,                server_cache_slot_drop_impl,                observe_full_slot,                   none) \
+    X(live_range_drop,          server_cache_live_range_drop_impl,          observe_live_range_drop,             none) \
+    X(host_artifact_drop,       server_prompt_cache_destroy_entry_impl,     server_prompt_cache_observe_drop,     legacy_wrapper_or_capability) \
+    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          checkpoint_drop,                     none) \
+    X(token_ledger_truncate,    server_cache_token_ledger_truncate_impl,    token_ledger_truncate,               none) \
+    X(mandatory_recovery_reset, server_cache_mandatory_recovery_reset_impl, observe_full_slot,                   none)
 
 enum class server_cache_destruction_class : uint8_t {
-#define SERVER_CACHE_DESTRUCTION_CLASS(name, symbol, admission) name,
+#define SERVER_CACHE_DESTRUCTION_CLASS(name, symbol, admission, release_owner) name,
     SERVER_CACHE_DESTRUCTION_INVENTORY(SERVER_CACHE_DESTRUCTION_CLASS)
 #undef SERVER_CACHE_DESTRUCTION_CLASS
     _count,
@@ -216,9 +218,9 @@ struct server_cache_destruction_observer {
     }
 };
 
-// The ONE retention-admission API. D-S5 supplies a type-erased evaluator
-// only when the cache-debug observer exists. Execution remains pass-through;
-// D-A is the later authority flip.
+// The ONE retention-admission API. D-A0b supplies the type-erased evaluator
+// under cache-debug OR cache-lifecycle; only record/log emission remains
+// debug-only. Execution remains pass-through until a later D-A ratchet flips.
 inline server_cache_destruction_admission server_cache_retention_admit(
         server_cache_destruction_observer * observer,
         const server_cache_destruction_request & request) noexcept {

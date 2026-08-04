@@ -3,6 +3,7 @@
 #include "../../src/llama-sha256.h"
 
 #include <algorithm>
+#include <cassert>
 #include <map>
 #include <tuple>
 #include <unordered_map>
@@ -10,18 +11,10 @@
 
 namespace {
 
-int32_t host_source(const common_cache_plan_record & rec, int32_t candidate) noexcept {
-    if (candidate < 0 || uint32_t(candidate) >= rec.n_inventory) {
-        return -1;
-    }
-    const auto & row = rec.inventory[size_t(candidate)];
-    if (row.is_chain()) {
-        const int32_t base = row.component_ids[0];
-        return base >= 0 && uint32_t(base) < rec.n_inventory
-            ? rec.inventory[size_t(base)].source_id : -1;
-    }
-    return row.provider == common_cache_plan_provider::host_cache_entry
-        ? row.source_id : -1;
+bool artifact_ptr_less(
+        const server_cache_destruction_artifact * a,
+        const server_cache_destruction_artifact * b) noexcept {
+    return a->candidate.artifact_id < b->candidate.artifact_id;
 }
 
 common_cache_plan_destruction_manifest_digest manifest_digest(
@@ -39,54 +32,74 @@ common_cache_plan_destruction_manifest_digest manifest_digest(
         hash.finish());
 }
 
-common_cache_plan_destruction_effect_digest effect_digest(
-        const std::vector<llama_cache_acct_op_id> & ops,
-        const llama_cache_acct_release_set_preview & release) {
-    llama_sha256_writer hash;
-    static constexpr char tag[] = "cache-destruction-union-effect-v1";
-    hash.string(tag, sizeof(tag) - 1);
-    hash.u64(ops.size());
-    for (const auto op : ops) {
-        hash.u64(op.v);
-    }
-    hash.u64(release.rows.size());
-    for (const auto & row : release.rows) {
-        hash.u32(uint32_t(row.domain.residency));
-        hash.u32(uint32_t(row.domain.kind));
-        hash.u32(row.domain.topology.v);
-        hash.u32(row.domain.device_ordinal.v);
-        hash.u64(row.logical_payload);
-        hash.u64(row.resident_allocated);
-    }
-    return common_cache_plan_destruction_effect_digest::from_sha256(
-        hash.finish());
-}
-
 std::string digest_key(
         const common_cache_plan_destruction_manifest_digest & digest) {
     return std::string(reinterpret_cast<const char *>(digest.bytes().data()),
                        digest.bytes().size());
 }
 
-common_cache_plan_destruction_lease_verdict lease_verdict(
-        const server_cache_destruction_artifact & artifact) noexcept {
-    if (artifact.mandatory_anchor) {
-        return common_cache_plan_destruction_lease_verdict::mandatory_recovery;
+common_cache_plan_destruction_reason artifact_refusal_base(
+        const server_cache_destruction_artifact & artifact,
+        common_cache_plan_destruction_lease_verdict & lease) noexcept {
+    lease = common_cache_plan_destruction_lease_verdict::unleased;
+    if (!artifact.candidate.identity_known) {
+        return common_cache_plan_destruction_reason::identity_unavailable;
     }
-    if (artifact.candidate.lease.state != server_cache_lease_eval_state::known) {
-        return common_cache_plan_destruction_lease_verdict::unavailable;
+    if (artifact.candidate.availability !=
+            server_retention_candidate_availability::available ||
+        artifact.candidate.record.stamp.state !=
+            common_retention_score_state::known) {
+        return common_cache_plan_destruction_reason::manifest_incomplete;
     }
-    switch (artifact.candidate.lease.cls) {
-        case server_cache_lease_class::none:
-            return common_cache_plan_destruction_lease_verdict::unleased;
-        case server_cache_lease_class::soft:
-            return common_cache_plan_destruction_lease_verdict::soft_leased;
-        case server_cache_lease_class::hard:
-            return common_cache_plan_destruction_lease_verdict::hard_leased;
-        case server_cache_lease_class::_count:
-            return common_cache_plan_destruction_lease_verdict::unavailable;
+    if (artifact.mandatory_anchor ||
+        artifact.candidate.record.stamp.mandatory_anchor) {
+        lease = common_cache_plan_destruction_lease_verdict::mandatory_recovery;
+        return common_cache_plan_destruction_reason::mandatory_anchor;
     }
-    return common_cache_plan_destruction_lease_verdict::unavailable;
+    if (artifact.candidate.lease.state != server_cache_lease_eval_state::known ||
+        artifact.candidate.lease.cls == server_cache_lease_class::_count ||
+        artifact.candidate.lease.eligibility ==
+            server_cache_lease_eligibility::_count) {
+        lease = common_cache_plan_destruction_lease_verdict::unavailable;
+        return common_cache_plan_destruction_reason::lease_unavailable;
+    }
+    if (artifact.candidate.lease.cls == server_cache_lease_class::hard ||
+        artifact.candidate.lease.eligibility ==
+            server_cache_lease_eligibility::hard_blocked) {
+        lease = common_cache_plan_destruction_lease_verdict::hard_leased;
+        return common_cache_plan_destruction_reason::hard_lease_blocked;
+    }
+    if (artifact.candidate.lease.cls == server_cache_lease_class::soft) {
+        lease = common_cache_plan_destruction_lease_verdict::soft_leased;
+    }
+    if (artifact.candidate.release_ops.empty() ||
+        std::any_of(
+            artifact.candidate.release_ops.begin(),
+            artifact.candidate.release_ops.end(),
+            [](auto op) { return !op; })) {
+        return common_cache_plan_destruction_reason::release_evidence_unavailable;
+    }
+    return common_cache_plan_destruction_reason::none;
+}
+
+common_cache_plan_destruction_reason server_cache_destruction_artifact_refusal(
+        const server_cache_destruction_artifact & artifact,
+        bool mutation_boundary,
+        common_cache_plan_destruction_lease_verdict & lease) noexcept {
+    const auto base = artifact_refusal_base(artifact, lease);
+    if (base != common_cache_plan_destruction_reason::none) {
+        return base;
+    }
+    // Quote assembly constructs these fields from the same catalog record.
+    // Mutation-boundary callers are externally supplied and must re-prove the
+    // structural join in addition to the shared eligibility ladder.
+    if (mutation_boundary &&
+        (artifact.kind != artifact.candidate.record.kind ||
+         artifact.pool != artifact.candidate.record.stamp.pool ||
+         artifact.pool >= common_retention_pool::_count)) {
+        return common_cache_plan_destruction_reason::manifest_incomplete;
+    }
+    return common_cache_plan_destruction_reason::none;
 }
 
 void refuse(common_cache_plan_destruction_receipt & out,
@@ -138,49 +151,315 @@ bool domain_row_equal(const common_cache_plan_yield_domain & a,
            value_equal(a.projected_after_bytes, b.after);
 }
 
+bool value_equal(
+        const llama_cache_acct_value & a,
+        const llama_cache_acct_value & b) noexcept {
+    return a.state == b.state && a.value == b.value;
+}
+
+bool effect_rows_equal(
+        const common_cache_plan_yield_domain & quoted,
+        const common_cache_plan_yield_domain & current,
+        bool full_row) noexcept {
+    if (quoted.domain != current.domain ||
+        !value_equal(
+            quoted.projected_release_bytes,
+            current.projected_release_bytes)) {
+        return false;
+    }
+    return !full_row ||
+           (value_equal(
+                quoted.current_resident_bytes,
+                current.current_resident_bytes) &&
+            value_equal(quoted.fit_before_bytes, current.fit_before_bytes) &&
+            value_equal(
+                quoted.projected_reserve_bytes,
+                current.projected_reserve_bytes) &&
+            value_equal(
+                quoted.projected_after_bytes,
+                current.projected_after_bytes));
+}
+
+bool effect_equivalent(
+        const common_cache_plan_destruction_receipt & quote,
+        const common_cache_plan_destruction_effect_digest & current_effect,
+        const std::vector<common_cache_plan_yield_domain> & quoted_domains,
+        const std::vector<common_cache_plan_yield_domain> & current_domains,
+        bool full_rows) noexcept {
+    if (!quote.union_effect_digest.valid() || !current_effect.valid() ||
+        quote.union_effect_digest != current_effect ||
+        quoted_domains.size() != current_domains.size()) {
+        return false;
+    }
+    return std::all_of(
+        quoted_domains.begin(), quoted_domains.end(),
+        [&](const auto & row) {
+            return std::any_of(
+                current_domains.begin(), current_domains.end(),
+                [&](const auto & current) {
+                    return effect_rows_equal(row, current, full_rows);
+                });
+        });
+}
+
 } // namespace
 
-common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
-        const common_cache_plan_record & rec,
-        int32_t candidate,
-        int32_t legacy_candidate) noexcept {
-    if (candidate < 0 || legacy_candidate < 0 ||
-        uint32_t(candidate) >= rec.n_inventory ||
-        uint32_t(legacy_candidate) >= rec.n_inventory) {
-        return 0;
+common_cache_plan_destruction_effect_digest
+server_cache_destruction_union_effect_digest(
+        const std::vector<llama_cache_acct_op_id> & ops,
+        const llama_cache_acct_release_set_preview & release) {
+    llama_sha256_writer hash;
+    static constexpr char tag[] = "cache-destruction-union-effect-v1";
+    hash.string(tag, sizeof(tag) - 1);
+    hash.u64(ops.size());
+    for (const auto op : ops) {
+        hash.u64(op.v);
     }
-    const auto & planned = rec.inventory[size_t(candidate)];
-    const auto & legacy = rec.inventory[size_t(legacy_candidate)];
-    common_cache_plan_destruction_effect_set effects = 0;
-    if (planned.target_slot_id != legacy.target_slot_id) {
-        if (rec.selection == common_cache_plan_selection::similarity &&
-            planned.provider == common_cache_plan_provider::live_slot &&
-            planned.f_keep_known && planned.f_keep >= 1.0) {
-            // B-A's zero-destruction similarity retarget is already inside the
-            // pre-D-A envelope; other independent effects still apply below.
-        } else {
-            effects |= common_cache_plan_destruction_effect_bit(
-                rec.selection == common_cache_plan_selection::similarity
-                    ? common_cache_plan_destruction_effect::
-                          destructive_similarity_retarget
-                    : common_cache_plan_destruction_effect::
-                          cross_target_displacement);
+    hash.u64(release.rows.size());
+    for (const auto & row : release.rows) {
+        hash.u32(uint32_t(row.domain.residency));
+        hash.u32(uint32_t(row.domain.kind));
+        hash.u32(row.domain.topology.v);
+        hash.u32(row.domain.device_ordinal.v);
+        hash.u64(row.logical_payload);
+        hash.u64(row.resident_allocated);
+    }
+    return common_cache_plan_destruction_effect_digest::from_sha256(
+        hash.finish());
+}
+
+server_cache_recovery_pin::~server_cache_recovery_pin() {
+    reset();
+}
+
+server_cache_recovery_pin::server_cache_recovery_pin(
+        server_cache_recovery_pin && other) noexcept
+    : context_(other.context_),
+      release_(other.release_),
+      artifacts_(std::move(other.artifacts_)),
+      ops_(std::move(other.ops_)) {
+    other.context_ = nullptr;
+    other.release_ = nullptr;
+}
+
+server_cache_recovery_pin & server_cache_recovery_pin::operator=(
+        server_cache_recovery_pin && other) noexcept {
+    if (this != &other) {
+        reset();
+        context_ = other.context_;
+        release_ = other.release_;
+        artifacts_ = std::move(other.artifacts_);
+        ops_ = std::move(other.ops_);
+        other.context_ = nullptr;
+        other.release_ = nullptr;
+    }
+    return *this;
+}
+
+server_cache_recovery_pin server_cache_recovery_pin::acquire(
+        void * context,
+        release_fn release,
+        std::vector<llama_cache_acct_artifact_id> artifacts,
+        std::vector<llama_cache_acct_op_id> ops) noexcept {
+    server_cache_recovery_pin out;
+    try {
+        if (!context || !release || (artifacts.empty() && ops.empty())) {
+            return out;
+        }
+        std::sort(artifacts.begin(), artifacts.end());
+        artifacts.erase(std::unique(artifacts.begin(), artifacts.end()),
+                        artifacts.end());
+        std::sort(ops.begin(), ops.end());
+        ops.erase(std::unique(ops.begin(), ops.end()), ops.end());
+        if ((!artifacts.empty() && artifacts.front().v == 0) ||
+            (!ops.empty() && !ops.front())) {
+            return out;
+        }
+        out.context_ = context;
+        out.release_ = release;
+        out.artifacts_ = std::move(artifacts);
+        out.ops_ = std::move(ops);
+    } catch (...) {
+        out.reset();
+    }
+    return out;
+}
+
+bool server_cache_recovery_pin::disjoint(
+        const std::vector<llama_cache_acct_artifact_id> & artifacts,
+        const std::vector<llama_cache_acct_op_id> & ops) const noexcept {
+    if (!valid()) {
+        return false;
+    }
+    for (const auto artifact : artifacts) {
+        if (std::binary_search(
+                artifacts_.begin(), artifacts_.end(), artifact)) {
+            return false;
         }
     }
-    if (planned.target_slot_id == legacy.target_slot_id &&
-        planned.provider == common_cache_plan_provider::cold_replay &&
-        legacy.provider != common_cache_plan_provider::cold_replay) {
-        effects |= common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::same_target_cold_replacement);
+    for (const auto op : ops) {
+        if (std::binary_search(
+                ops_.begin(), ops_.end(), op)) {
+            return false;
+        }
     }
-    const int32_t planned_host = host_source(rec, candidate);
-    const int32_t legacy_host = host_source(rec, legacy_candidate);
-    if (planned_host >= 0 && planned_host != legacy_host) {
-        effects |= common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::
-                different_host_source_consumption);
+    return true;
+}
+
+void server_cache_recovery_pin::reset() noexcept {
+    if (context_ && release_) {
+        release_(context_);
     }
-    return effects;
+    context_ = nullptr;
+    release_ = nullptr;
+    artifacts_.clear();
+    ops_.clear();
+}
+
+common_cache_plan_destruction_reason
+server_cache_prepared_release_capability::commit(
+        server_cache_recovery_pin & retained_pin) noexcept {
+    const bool same_thread =
+        scheduler_owner_ == std::this_thread::get_id();
+    assert(same_thread &&
+           "destruction release must commit on its scheduler owner thread");
+    if (!same_thread || !ready() || retained_pin.valid()) {
+        return common_cache_plan_destruction_reason::internal_fault;
+    }
+    switch (release_.commit()) {
+        case llama_cache_conditional_release_status::released:
+            retained_pin = std::move(pin_);
+            return common_cache_plan_destruction_reason::none;
+        case llama_cache_conditional_release_status::serial_conflict:
+            return common_cache_plan_destruction_reason::effect_drift;
+        case llama_cache_conditional_release_status::ledger_fault:
+        case llama_cache_conditional_release_status::_count:
+            return common_cache_plan_destruction_reason::accounting_unavailable;
+    }
+    return common_cache_plan_destruction_reason::internal_fault;
+}
+
+server_cache_prepare_release_result server_cache_prepare_release_set(
+        const common_cache_plan_destruction_quote & quote,
+        const std::vector<server_cache_destruction_artifact> & current_artifacts,
+        llama_cache_acct_ledger & ledger,
+        uint64_t fresh_accounting_serial,
+        const server_cache_destruction_projection_callback & project,
+        server_cache_recovery_pin && recovery_pin) noexcept {
+    server_cache_prepare_release_result out;
+    try {
+        if (quote.receipt.state !=
+                common_cache_plan_destruction_state::quoted ||
+            !quote.receipt.union_effect_digest.valid() ||
+            !project) {
+            return out;
+        }
+        std::vector<llama_cache_acct_artifact_id> victims =
+            quote.receipt.selected_attention;
+        victims.insert(victims.end(),
+                       quote.receipt.selected_recurrent.begin(),
+                       quote.receipt.selected_recurrent.end());
+        std::vector<const server_cache_destruction_artifact *> manifest;
+        std::vector<llama_cache_acct_op_id> current_ops;
+        manifest.reserve(victims.size());
+        std::unordered_map<uint64_t,
+                           const server_cache_destruction_artifact *> current_by_id;
+        current_by_id.reserve(current_artifacts.size());
+        for (const auto & artifact : current_artifacts) {
+            if (artifact.candidate.artifact_id.v == 0 ||
+                !current_by_id.emplace(
+                    artifact.candidate.artifact_id.v, &artifact).second) {
+                out.reason =
+                    common_cache_plan_destruction_reason::manifest_incomplete;
+                return out;
+            }
+        }
+        for (const auto victim : victims) {
+            const auto found = current_by_id.find(victim.v);
+            if (found == current_by_id.end()) {
+                out.reason = common_cache_plan_destruction_reason::manifest_incomplete;
+                return out;
+            }
+            const auto & current = *found->second;
+            common_cache_plan_destruction_lease_verdict lease;
+            out.reason = server_cache_destruction_artifact_refusal(
+                current, true, lease);
+            if (out.reason != common_cache_plan_destruction_reason::none) {
+                return out;
+            }
+            manifest.push_back(&current);
+            current_ops.insert(current_ops.end(),
+                               current.candidate.release_ops.begin(),
+                               current.candidate.release_ops.end());
+        }
+        std::sort(manifest.begin(), manifest.end(), artifact_ptr_less);
+        std::sort(current_ops.begin(), current_ops.end());
+        current_ops.erase(
+            std::unique(current_ops.begin(), current_ops.end()),
+            current_ops.end());
+        if (manifest_digest(manifest) != quote.receipt.manifest_digest ||
+            !quote.receipt.manifest_digest.valid()) {
+            out.status = server_cache_prepare_release_status::effect_drift;
+            out.reason = common_cache_plan_destruction_reason::effect_drift;
+            return out;
+        }
+        if (!recovery_pin.valid() ||
+            !recovery_pin.disjoint(victims, current_ops)) {
+            out.status = server_cache_prepare_release_status::recovery_unavailable;
+            out.reason = common_cache_plan_destruction_reason::recovery_unavailable;
+            return out;
+        }
+
+        auto prepared = llama_cache_prepare_release_set(
+            ledger, current_ops, fresh_accounting_serial);
+        switch (prepared.status()) {
+            case llama_cache_prepare_release_status::prepared:
+                break;
+            case llama_cache_prepare_release_status::serial_conflict:
+                out.status = server_cache_prepare_release_status::serial_conflict;
+                out.reason = common_cache_plan_destruction_reason::accounting_unavailable;
+                return out;
+            case llama_cache_prepare_release_status::invalid_argument:
+                out.status = server_cache_prepare_release_status::invalid_quote;
+                out.reason = common_cache_plan_destruction_reason::manifest_incomplete;
+                return out;
+            case llama_cache_prepare_release_status::ledger_fault:
+                out.status = server_cache_prepare_release_status::accounting_unavailable;
+                out.reason = common_cache_plan_destruction_reason::accounting_unavailable;
+                return out;
+            case llama_cache_prepare_release_status::internal_fault:
+            case llama_cache_prepare_release_status::_count:
+                out.status = server_cache_prepare_release_status::internal_fault;
+                out.reason = common_cache_plan_destruction_reason::internal_fault;
+                return out;
+        }
+        std::vector<common_cache_plan_yield_domain> current_domains;
+        if (!project(prepared.preview(), current_domains)) {
+            out.status = server_cache_prepare_release_status::accounting_unavailable;
+            out.reason = common_cache_plan_destruction_reason::capacity_refused;
+            return out;
+        }
+        const auto effect = server_cache_destruction_union_effect_digest(
+            prepared.ops(), prepared.preview());
+        out.reason = server_cache_destruction_effect_recheck(
+            quote.receipt, effect, quote.projected_domains, current_domains);
+        if (out.reason != common_cache_plan_destruction_reason::none) {
+            out.status = server_cache_prepare_release_status::effect_drift;
+            return out;
+        }
+
+        out.capability.release_ = std::move(prepared);
+        out.capability.pin_ = std::move(recovery_pin);
+        out.capability.scheduler_owner_ = std::this_thread::get_id();
+        out.status = server_cache_prepare_release_status::prepared;
+        out.reason = common_cache_plan_destruction_reason::none;
+        return out;
+    } catch (...) {
+        out = {};
+        out.status = server_cache_prepare_release_status::internal_fault;
+        out.reason = common_cache_plan_destruction_reason::internal_fault;
+        return out;
+    }
 }
 
 bool server_cache_destruction_has_effect(
@@ -252,11 +531,8 @@ bool server_cache_destruction_quote_all(
             }
             pools[size_t(artifact.pool)].push_back(&artifact);
         }
-        const auto artifact_less = [](const auto * a, const auto * b) {
-            return a->candidate.artifact_id.v < b->candidate.artifact_id.v;
-        };
         for (auto & pool : pools) {
-            std::sort(pool.begin(), pool.end(), artifact_less);
+            std::sort(pool.begin(), pool.end(), artifact_ptr_less);
         }
         for (const auto & pool : pools) {
             for (const auto * artifact : pool) {
@@ -315,13 +591,20 @@ bool server_cache_destruction_quote_all(
                     effects,
                     common_cache_plan_destruction_effect::
                         different_host_source_consumption)) {
-                const int32_t source = host_source(rec, int32_t(i));
+                const int32_t source =
+                    server_cache_plan_host_source(rec, int32_t(i));
                 const auto it = by_host.find(source);
-                if (it != by_host.end()) {
+                if (source < 0 || it == by_host.end() || it->second.empty()) {
+                    // Consumption is an independent destructive effect. A
+                    // displacement manifest must never mask missing host
+                    // coverage and become a silently partial exact union.
+                    manifest.clear();
+                    manifest_ids.clear();
+                } else {
                     add_manifest(it->second);
                 }
             }
-            std::sort(manifest.begin(), manifest.end(), artifact_less);
+            std::sort(manifest.begin(), manifest.end(), artifact_ptr_less);
 
             common_cache_plan_destruction_quote staged;
             auto & quote = staged.receipt;
@@ -365,33 +648,12 @@ bool server_cache_destruction_quote_all(
             bool unavailable = false;
             quote.lease_verdict = common_cache_plan_destruction_lease_verdict::unleased;
             for (const auto * artifact : manifest) {
-                if (!artifact->candidate.identity_known) {
-                    refuse(quote, common_cache_plan_destruction_reason::identity_unavailable);
-                    unavailable = true;
-                    break;
-                }
-                if (artifact->candidate.availability !=
-                        server_retention_candidate_availability::available) {
-                    refuse(quote, common_cache_plan_destruction_reason::manifest_incomplete);
-                    unavailable = true;
-                    break;
-                }
-                const auto verdict = lease_verdict(*artifact);
-                if (verdict == common_cache_plan_destruction_lease_verdict::mandatory_recovery) {
+                common_cache_plan_destruction_lease_verdict verdict;
+                const auto reason = server_cache_destruction_artifact_refusal(
+                    *artifact, false, verdict);
+                if (reason != common_cache_plan_destruction_reason::none) {
                     quote.lease_verdict = verdict;
-                    refuse(quote, common_cache_plan_destruction_reason::mandatory_anchor);
-                    unavailable = true;
-                    break;
-                }
-                if (verdict == common_cache_plan_destruction_lease_verdict::unavailable) {
-                    quote.lease_verdict = verdict;
-                    refuse(quote, common_cache_plan_destruction_reason::lease_unavailable);
-                    unavailable = true;
-                    break;
-                }
-                if (verdict == common_cache_plan_destruction_lease_verdict::hard_leased) {
-                    quote.lease_verdict = verdict;
-                    refuse(quote, common_cache_plan_destruction_reason::hard_lease_blocked);
+                    refuse(quote, reason);
                     unavailable = true;
                     break;
                 }
@@ -402,32 +664,25 @@ bool server_cache_destruction_quote_all(
                     ? quote.selected_attention : quote.selected_recurrent)
                     .push_back(artifact->candidate.artifact_id);
                 for (const auto op : artifact->candidate.release_ops) {
-                    if (!op) {
-                        refuse(quote, common_cache_plan_destruction_reason::release_evidence_unavailable);
-                        unavailable = true;
-                        break;
-                    }
                     if (!op_ids.insert(op.v).second) {
                         continue;
                     }
                     ops.push_back(op);
-                }
-                if (unavailable) {
-                    break;
                 }
             }
             if (!unavailable && ops.empty()) {
                 refuse(quote, common_cache_plan_destruction_reason::release_evidence_unavailable);
                 unavailable = true;
             }
-            std::sort(ops.begin(), ops.end(), [](auto a, auto b) { return a.v < b.v; });
+            std::sort(ops.begin(), ops.end());
             llama_cache_acct_release_set_preview released;
             if (!unavailable && !preview(ops, accounting_serial, released)) {
                 refuse(quote, common_cache_plan_destruction_reason::accounting_unavailable);
                 unavailable = true;
             }
             if (!unavailable) {
-                quote.union_effect_digest = effect_digest(ops, released);
+                quote.union_effect_digest =
+                    server_cache_destruction_union_effect_digest(ops, released);
                 if (!project(released, staged.projected_domains)) {
                     refuse(quote, common_cache_plan_destruction_reason::capacity_refused);
                     unavailable = true;
@@ -514,9 +769,8 @@ void server_cache_destruction_finalize_projection(
         std::vector<llama_cache_acct_artifact_id> yield_ids = yield.selected[size_t(common_retention_pool::attention)];
         yield_ids.insert(yield_ids.end(), yield.selected[size_t(common_retention_pool::recurrent)].begin(),
                          yield.selected[size_t(common_retention_pool::recurrent)].end());
-        const auto by_id = [](auto a, auto b) { return a.v < b.v; };
-        std::sort(quote_ids.begin(), quote_ids.end(), by_id);
-        std::sort(yield_ids.begin(), yield_ids.end(), by_id);
+        std::sort(quote_ids.begin(), quote_ids.end());
+        std::sort(yield_ids.begin(), yield_ids.end());
         bool same = quote_ids == yield_ids &&
                     quoted->projected_domains.size() == yield.projected_fit.domains.size();
         for (const auto & row : quoted->projected_domains) {
@@ -563,42 +817,8 @@ bool server_cache_destruction_effect_matches(
         const common_cache_plan_destruction_effect_digest & current_effect,
         const std::vector<common_cache_plan_yield_domain> & quoted_domains,
         const std::vector<common_cache_plan_yield_domain> & current_domains) noexcept {
-    if (!quote.union_effect_digest.valid() || !current_effect.valid() ||
-        quote.union_effect_digest != current_effect ||
-        quoted_domains.size() != current_domains.size()) {
-        return false;
-    }
-    for (const auto & row : quoted_domains) {
-        const auto it = std::find_if(
-            current_domains.begin(), current_domains.end(),
-            [&](const auto & current) {
-                return current.domain == row.domain &&
-                       current.current_resident_bytes.state ==
-                           row.current_resident_bytes.state &&
-                       current.current_resident_bytes.value ==
-                           row.current_resident_bytes.value &&
-                       current.fit_before_bytes.state ==
-                           row.fit_before_bytes.state &&
-                       current.fit_before_bytes.value ==
-                           row.fit_before_bytes.value &&
-                       current.projected_release_bytes.state ==
-                           row.projected_release_bytes.state &&
-                       current.projected_release_bytes.value ==
-                           row.projected_release_bytes.value &&
-                       current.projected_reserve_bytes.state ==
-                           row.projected_reserve_bytes.state &&
-                       current.projected_reserve_bytes.value ==
-                           row.projected_reserve_bytes.value &&
-                       current.projected_after_bytes.state ==
-                           row.projected_after_bytes.state &&
-                       current.projected_after_bytes.value ==
-                           row.projected_after_bytes.value;
-            });
-        if (it == current_domains.end()) {
-            return false;
-        }
-    }
-    return true;
+    return effect_equivalent(
+        quote, current_effect, quoted_domains, current_domains, true);
 }
 
 common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
@@ -606,8 +826,12 @@ common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
         const common_cache_plan_destruction_effect_digest & current_effect,
         const std::vector<common_cache_plan_yield_domain> & quoted_domains,
         const std::vector<common_cache_plan_yield_domain> & current_domains) noexcept {
-    return server_cache_destruction_effect_matches(
-               quote, current_effect, quoted_domains, current_domains)
+    // Mutation-boundary equivalence is deliberately narrower than the D-S6
+    // full-row oracle above. Unrelated gauge/reservation traffic may change
+    // before/after while leaving the selected union effect intact; only the
+    // domain and exact projected release are capability inputs.
+    return effect_equivalent(
+               quote, current_effect, quoted_domains, current_domains, false)
         ? common_cache_plan_destruction_reason::none
         : common_cache_plan_destruction_reason::effect_drift;
 }

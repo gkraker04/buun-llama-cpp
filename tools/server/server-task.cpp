@@ -1926,12 +1926,14 @@ void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
     if (!acct) {
         return;
     }
-    for (llama_cache_acct_op_id * op : { &st.acct_op_snapshot, &st.acct_op_ckpt, &st.acct_op_accel }) {
-        if (*op) {
-            acct->release(*op);
-            *op = {};
+    for (const auto op : st.release_ops()) {
+        if (op) {
+            acct->release(op);
         }
     }
+    st.acct_op_snapshot = {};
+    st.acct_op_ckpt = {};
+    st.acct_op_accel = {};
 }
 
 bool server_cache_lease_build_identity(
@@ -1999,11 +2001,7 @@ static void server_prompt_cache_observe_drop(
             server_retention_instance_key::for_host_entry(&state))
             : llama_cache_acct_artifact_id{});
 
-    const llama_cache_acct_op_id ops[] = {
-        state.acct_op_snapshot,
-        state.acct_op_ckpt,
-        state.acct_op_accel,
-    };
+    const auto ops = state.release_ops();
     const llama_cache_acct_category categories[] = {
         llama_cache_acct_category::full_snapshot_payload,
         llama_cache_acct_category::checkpoint_state_payload,
@@ -2032,21 +2030,27 @@ static void server_prompt_cache_observe_drop(
     (void) server_cache_retention_admit(cache.destruction_obs, request);
 }
 
+static void server_prompt_cache_retire_entry(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it) noexcept {
+    // Retention retirement is a post-capability finalizer on authoritative
+    // paths because it releases the sidecar provenance op. The legacy wrapper
+    // invokes it at its historical pre-erase position.
+    if (!cache.retention_obs) {
+        return;
+    }
+    cache.retention_obs->retire(
+        server_retention_instance_key::for_host_entry(&*it));
+    for (auto & checkpoint : it->prompt.checkpoints) {
+        cache.retention_obs->retire(
+            server_retention_instance_key::for_checkpoint(
+                -1, &checkpoint));
+    }
+}
+
 static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
         server_prompt_cache & cache,
         server_prompt_cache::iterator it) {
-    if (cache.retention_obs) {
-        cache.retention_obs->retire(
-            server_retention_instance_key::for_host_entry(&*it));
-        for (auto & checkpoint : it->prompt.checkpoints) {
-            cache.retention_obs->retire(
-                server_retention_instance_key::for_checkpoint(
-                    -1, &checkpoint));
-        }
-    }
-    if (cache.acct) {
-        cache.acct_release_entry(*it);
-    }
     return cache.states.erase(it);
 }
 
@@ -2054,7 +2058,20 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
         iterator it,
         server_cache_destruction_reason reason) {
     server_prompt_cache_observe_drop(*this, *it, reason);
-    return server_prompt_cache_destroy_entry_impl(*this, it);
+    // Legacy pass-through owns exactly one accounting terminal outside the
+    // raw physical primitive. D-A capability commit replaces this wrapper
+    // terminal only when a later ratchet flips mutation authority.
+    const auto release_ops = it->release_ops();
+    server_prompt_cache_retire_entry(*this, it);
+    auto next = server_prompt_cache_destroy_entry_impl(*this, it);
+    if (acct) {
+        for (const auto op : release_ops) {
+            if (op) {
+                (void) acct->release(op);
+            }
+        }
+    }
+    return next;
 }
 
 // Release symmetry for whole-cache destruction/replacement (model reload swaps the cache

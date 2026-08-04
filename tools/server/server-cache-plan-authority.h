@@ -120,6 +120,18 @@ constexpr int32_t server_cache_plan_planned_target(
         ? selected.target_slot_id : -1;
 }
 
+// One compiled classification door shared by the B-A pre-D-A envelope and
+// D-A quote assembly. A nonzero bit is precisely a destruction certificate
+// the envelope must refuse until its ratchet is enabled.
+int32_t server_cache_plan_host_source(
+    const common_cache_plan_record & rec,
+    int32_t candidate) noexcept;
+
+common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
+    const common_cache_plan_record & rec,
+    int32_t candidate,
+    int32_t legacy_candidate) noexcept;
+
 // B-A pre-mutation decision substrate. It is process-local and contains no
 // shipped cache state. Authority is graduated through the parallel selection
 // and configured-level order pinned above.

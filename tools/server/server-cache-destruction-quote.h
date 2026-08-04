@@ -2,8 +2,10 @@
 
 #include "server-cache-yield.h"
 #include "server-cache-plan-authority.h"
+#include "../../src/llama-cache-authority.h"
 
 #include <functional>
+#include <thread>
 #include <vector>
 
 struct server_cache_destruction_artifact {
@@ -60,6 +62,11 @@ bool server_cache_destruction_effect_matches(
     const std::vector<common_cache_plan_yield_domain> & quoted_domains,
     const std::vector<common_cache_plan_yield_domain> & current_domains) noexcept;
 
+common_cache_plan_destruction_effect_digest
+server_cache_destruction_union_effect_digest(
+    const std::vector<llama_cache_acct_op_id> & ops,
+    const llama_cache_acct_release_set_preview & release);
+
 // Forward contract for D-A0b's mutation-boundary certify-time recheck. The
 // quote serial is evidence only; exact union/digest/domain equality decides.
 common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
@@ -68,11 +75,113 @@ common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
     const std::vector<common_cache_plan_yield_domain> & quoted_domains,
     const std::vector<common_cache_plan_yield_domain> & current_domains) noexcept;
 
-common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
-    const common_cache_plan_record & rec,
-    int32_t candidate,
-    int32_t legacy_candidate) noexcept;
-
 bool server_cache_destruction_has_effect(
     const common_cache_plan_record & rec,
     int32_t legacy_candidate) noexcept;
+
+// A non-policy recovery guard, separate from WS-D leases. The owner callback
+// releases the underlying immutable host/catalog/live guard. Destruction
+// authority requires its protected source to be disjoint from the victim union.
+class server_cache_recovery_pin {
+public:
+    using release_fn = void (*)(void *) noexcept;
+
+    server_cache_recovery_pin() = default;
+    ~server_cache_recovery_pin();
+    server_cache_recovery_pin(const server_cache_recovery_pin &) = delete;
+    server_cache_recovery_pin & operator=(const server_cache_recovery_pin &) = delete;
+    server_cache_recovery_pin(server_cache_recovery_pin &&) noexcept;
+    server_cache_recovery_pin & operator=(server_cache_recovery_pin &&) noexcept;
+
+    static server_cache_recovery_pin acquire(
+        void * context,
+        release_fn release,
+        std::vector<llama_cache_acct_artifact_id> artifacts,
+        std::vector<llama_cache_acct_op_id> ops) noexcept;
+
+    bool valid() const noexcept { return context_ != nullptr && release_ != nullptr; }
+    bool disjoint(
+        const std::vector<llama_cache_acct_artifact_id> & artifacts,
+        const std::vector<llama_cache_acct_op_id> & ops) const noexcept;
+
+private:
+    void reset() noexcept;
+    void * context_ = nullptr;
+    release_fn release_ = nullptr;
+    std::vector<llama_cache_acct_artifact_id> artifacts_;
+    std::vector<llama_cache_acct_op_id> ops_;
+};
+
+enum class server_cache_prepare_release_status : uint8_t {
+    prepared,
+    invalid_quote,
+    recovery_unavailable,
+    serial_conflict,
+    effect_drift,
+    accounting_unavailable,
+    internal_fault,
+    _count,
+};
+
+struct server_cache_prepare_release_result;
+
+class server_cache_prepared_release_capability {
+public:
+    server_cache_prepared_release_capability() = default;
+    ~server_cache_prepared_release_capability() = default;
+    server_cache_prepared_release_capability(
+        const server_cache_prepared_release_capability &) = delete;
+    server_cache_prepared_release_capability & operator=(
+        const server_cache_prepared_release_capability &) = delete;
+    server_cache_prepared_release_capability(
+        server_cache_prepared_release_capability &&) noexcept = default;
+    server_cache_prepared_release_capability & operator=(
+        server_cache_prepared_release_capability &&) noexcept = default;
+
+    bool ready() const noexcept { return release_.ready() && pin_.valid(); }
+    uint64_t accounting_serial() const noexcept {
+        return release_.accounting_serial();
+    }
+
+    // Phase-7 accounting terminal. The API deliberately accepts no callback:
+    // the prepare→physical-mutation→commit interval cannot re-enter the ledger
+    // through this substrate. Same-thread ownership and unchanged serial are
+    // asserted/checked by this terminal. On success, the caller owns the pin
+    // for its longer B-execution dependency lifetime.
+    common_cache_plan_destruction_reason commit(
+        server_cache_recovery_pin & retained_pin) noexcept;
+
+private:
+    llama_cache_prepared_release_set release_;
+    server_cache_recovery_pin pin_;
+    std::thread::id scheduler_owner_;
+
+    friend server_cache_prepare_release_result server_cache_prepare_release_set(
+        const common_cache_plan_destruction_quote &,
+        const std::vector<server_cache_destruction_artifact> &,
+        llama_cache_acct_ledger &,
+        uint64_t,
+        const server_cache_destruction_projection_callback &,
+        server_cache_recovery_pin &&) noexcept;
+};
+
+struct server_cache_prepare_release_result {
+    server_cache_prepare_release_status status =
+        server_cache_prepare_release_status::invalid_quote;
+    common_cache_plan_destruction_reason reason =
+        common_cache_plan_destruction_reason::manifest_incomplete;
+    server_cache_prepared_release_capability capability;
+};
+
+// D-A0b fresh-serial certification. The caller first advances the lease
+// lifecycle and builds `current_artifacts` with one fresh inspection per
+// artifact. This compares identity/anchor/lease state, the canonical op-set
+// bound inside the exact union digest, and projected release rows against the
+// launch-time quote. The quote serial is deliberately ignored as an execution pin.
+server_cache_prepare_release_result server_cache_prepare_release_set(
+    const common_cache_plan_destruction_quote & quote,
+    const std::vector<server_cache_destruction_artifact> & current_artifacts,
+    llama_cache_acct_ledger & ledger,
+    uint64_t fresh_accounting_serial,
+    const server_cache_destruction_projection_callback & project,
+    server_cache_recovery_pin && recovery_pin) noexcept;

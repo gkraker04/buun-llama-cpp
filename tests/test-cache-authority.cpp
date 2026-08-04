@@ -483,6 +483,68 @@ static void test_prepared_transaction_split_phase() {
     CHECK(ledger.snapshot().live_ops == 0);
 }
 
+static llama_cache_acct_op_id commit_host_leaf(
+        llama_cache_acct_ledger & ledger,
+        uint64_t bytes) {
+    llama_cache_budget_config config;
+    auto admitted = llama_cache_admit_reservation(
+        ledger, config, host_request(bytes));
+    CHECK(admitted.status == llama_cache_admission_status::admitted);
+    const auto alloc = ledger.new_alloc();
+    CHECK(bool(alloc));
+    CHECK(ledger.stage(admitted.claim.op(), alloc, bytes));
+    llama_cache_acct_op_id committed;
+    CHECK(admitted.claim.commit(bytes, committed));
+    return committed;
+}
+
+static void test_prepared_release_set() {
+    llama_cache_acct_ledger ledger;
+    configure_fitting_host(ledger);
+    const auto op = commit_host_leaf(ledger, 64);
+    const auto before_invalid = ledger.snapshot();
+    CHECK(ledger.release_set_if_serial(
+        { op, llama_cache_acct_op_id{ op.v + 1000 } },
+        before_invalid.serial) ==
+          llama_cache_conditional_release_status::ledger_fault);
+    CHECK(ledger.snapshot().live_ops == 1);
+    const auto quote = ledger.snapshot();
+
+    auto prepared = llama_cache_prepare_release_set(
+        ledger, { op }, quote.serial);
+    CHECK(prepared.ready());
+    CHECK(prepared.status() ==
+          llama_cache_prepare_release_status::prepared);
+    CHECK(prepared.preview().rows.size() == 1);
+    CHECK(prepared.preview().rows[0].resident_allocated == 64);
+
+    // Any observable ledger write invalidates this preparation without
+    // releasing the operation. A fresh prepare absorbs the serial drift.
+    ledger.gauge_set(PAYLOAD, HOST,
+                     llama_cache_acct_measure::logical_payload, 64);
+    CHECK(prepared.commit() ==
+          llama_cache_conditional_release_status::serial_conflict);
+    CHECK(ledger.snapshot().live_ops == 1);
+
+    const auto fresh = ledger.snapshot();
+    auto reprepared = llama_cache_prepare_release_set(
+        ledger, { op }, fresh.serial);
+    CHECK(reprepared.ready());
+    CHECK(reprepared.accounting_serial() == fresh.serial);
+    llama_cache_prepared_release_set moved(std::move(reprepared));
+    CHECK(!reprepared.ready());
+    CHECK(moved.ready());
+    CHECK(moved.commit() ==
+          llama_cache_conditional_release_status::released);
+    CHECK(ledger.snapshot().live_ops == 0);
+
+    auto invalid = llama_cache_prepare_release_set(
+        ledger, { op, op }, ledger.snapshot().serial);
+    CHECK(!invalid.ready());
+    CHECK(invalid.status() ==
+          llama_cache_prepare_release_status::invalid_argument);
+}
+
 static void test_status_names() {
     CHECK(std::string(llama_cache_admission_status_name(
         llama_cache_admission_status::admitted)) == "admitted");
@@ -497,6 +559,8 @@ static void test_status_names() {
         "post_commit_fault");
     CHECK(std::string(llama_cache_prepare_status_name(
         llama_cache_prepare_status::prepared)) == "prepared");
+    CHECK(std::string(llama_cache_prepare_release_status_name(
+        llama_cache_prepare_release_status::prepared)) == "prepared");
 }
 
 int main() {
@@ -514,6 +578,7 @@ int main() {
     test_transaction_fault_rollback();
     test_transaction_after_admit_failure();
     test_prepared_transaction_split_phase();
+    test_prepared_release_set();
     test_status_names();
 
     if (failures > 0) {

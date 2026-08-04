@@ -38,6 +38,16 @@ static server_cache_destruction_artifact artifact(uint64_t id, uint64_t op) {
     server_cache_destruction_artifact out;
     out.candidate.artifact_id = { id };
     out.kind = common_retention_artifact_kind::live_slot;
+    out.candidate.record.kind = out.kind;
+    out.candidate.record.turns.source =
+        common_retention_source_state::known;
+    out.candidate.record.turns.token_count = 1;
+    out.candidate.record.turns.boundaries = { { 0, 0, 1 } };
+    out.candidate.record.stamp.state =
+        common_retention_score_state::known;
+    out.candidate.record.stamp.stable_id = id;
+    out.candidate.record.stamp.recency_ordinal = id;
+    out.candidate.record.stamp.coverage_tokens = 1;
     out.owner_slot = 0;
     out.pool = common_retention_pool::attention;
     out.candidate.identity_known = true;
@@ -137,6 +147,21 @@ static void test_complete_memoized_and_permutation() {
     CHECK(server_cache_destruction_effect_recheck(
         later, effect, domains, domains) ==
         common_cache_plan_destruction_reason::none);
+    auto gauge_drift = domains;
+    gauge_drift[0].current_resident_bytes =
+        llama_cache_acct_value::measured(999);
+    gauge_drift[0].fit_before_bytes =
+        llama_cache_acct_value::measured(999);
+    gauge_drift[0].projected_after_bytes =
+        llama_cache_acct_value::measured(935);
+    CHECK(server_cache_destruction_effect_recheck(
+        later, effect, domains, gauge_drift) ==
+        common_cache_plan_destruction_reason::none);
+    gauge_drift[0].projected_release_bytes =
+        llama_cache_acct_value::measured(63);
+    CHECK(server_cache_destruction_effect_recheck(
+        later, effect, domains, gauge_drift) ==
+        common_cache_plan_destruction_reason::effect_drift);
 }
 
 static void test_fail_closed_matrix() {
@@ -149,12 +174,18 @@ static void test_fail_closed_matrix() {
           [](auto & a) { a.candidate.identity_known = false; } },
         { common_cache_plan_destruction_reason::manifest_incomplete,
           [](auto & a) { a.candidate.availability = server_retention_candidate_availability::backing_missing_or_stale; } },
+        { common_cache_plan_destruction_reason::manifest_incomplete,
+          [](auto & a) { a.candidate.record.stamp.state = common_retention_score_state::unavailable; } },
         { common_cache_plan_destruction_reason::mandatory_anchor,
           [](auto & a) { a.mandatory_anchor = true; } },
+        { common_cache_plan_destruction_reason::mandatory_anchor,
+          [](auto & a) { a.candidate.record.stamp.mandatory_anchor = true; } },
         { common_cache_plan_destruction_reason::lease_unavailable,
           [](auto & a) { a.candidate.lease.state = server_cache_lease_eval_state::unavailable; } },
         { common_cache_plan_destruction_reason::hard_lease_blocked,
           [](auto & a) { a.candidate.lease.cls = server_cache_lease_class::hard; a.candidate.lease.eligibility = server_cache_lease_eligibility::hard_blocked; } },
+        { common_cache_plan_destruction_reason::hard_lease_blocked,
+          [](auto & a) { a.candidate.lease.eligibility = server_cache_lease_eligibility::hard_blocked; } },
         { common_cache_plan_destruction_reason::release_evidence_unavailable,
           [](auto & a) { a.candidate.release_ops.clear(); } },
     };
@@ -423,6 +454,18 @@ static void test_plural_effect_union_and_counters() {
               common_cache_plan_destruction_class::slot_drop)] == 1);
     CHECK(counters.quoted[tier][size_t(
               common_cache_plan_destruction_class::host_artifact_drop)] == 1);
+
+    // A displacement artifact cannot hide absent coverage for the independent
+    // host-consumption effect: the exact union is incomplete, not merely the
+    // available displacement subset.
+    common_cache_plan_destruction_counters partial_counters;
+    CHECK(server_cache_destruction_quote_all(
+        rec, 0, { live }, 17, preview(17), project(),
+        { true, common_cache_plan_recovery_citation::resolved, 2 },
+        partial_counters));
+    CHECK(rec.destruction_quotes.size() == 1);
+    CHECK(rec.destruction_quotes[0].receipt.reason ==
+          common_cache_plan_destruction_reason::manifest_incomplete);
 }
 
 static void test_refused_projection_and_selection_failure() {
@@ -546,6 +589,168 @@ static void test_max_inventory_memoizes_one_manifest() {
           COMMON_CACHE_PLAN_MAX_CANDIDATES - 2);
 }
 
+static llama_cache_acct_op_id committed_release_op(
+        llama_cache_acct_ledger & ledger,
+        uint64_t bytes) {
+    const llama_cache_acct_completeness_requirement requirement = {
+        HOST, llama_cache_acct_producer::host_cache,
+    };
+    CHECK(ledger.configure_required_producers(&requirement, 1));
+    for (const auto category : {
+            llama_cache_acct_category::full_snapshot_payload,
+            llama_cache_acct_category::checkpoint_state_payload,
+            llama_cache_acct_category::typed_accelerator_payload }) {
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated,
+                llama_cache_acct_measure::reserved }) {
+            ledger.gauge_set(category, HOST, measure, 0);
+        }
+    }
+    CHECK(ledger.certify_complete(
+        HOST, llama_cache_acct_producer::host_cache));
+    const auto op = ledger.reserve(
+        llama_cache_acct_category::full_snapshot_payload,
+        HOST, {}, bytes, bytes);
+    const auto alloc = ledger.new_alloc();
+    CHECK(bool(op));
+    CHECK(bool(alloc));
+    CHECK(ledger.stage(op, alloc, bytes));
+    CHECK(ledger.commit(op, bytes));
+    return op;
+}
+
+static void release_pin(void * context) noexcept {
+    ++*static_cast<uint64_t *>(context);
+}
+
+static void test_prepared_release_capability() {
+    llama_cache_acct_ledger ledger;
+    const auto op = committed_release_op(ledger, 64);
+    const auto quoted_snapshot = ledger.snapshot();
+    llama_cache_acct_release_set_preview released;
+    CHECK(ledger.preview_release_set(
+        { op }, quoted_snapshot.serial, released));
+
+    common_cache_plan_destruction_quote quote;
+    quote.receipt.state = common_cache_plan_destruction_state::quoted;
+    quote.receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::cross_target_displacement);
+    quote.receipt.selected_attention = { { 1 } };
+    auto current = artifact(1, op.v);
+    quote.receipt.manifest_digest = [](
+            const server_cache_destruction_artifact & current) {
+        common_cache_plan_record rec = record_with_cold_candidates();
+        common_cache_plan_destruction_counters counters;
+        CHECK(server_cache_destruction_quote_all(
+            rec, 0, { current }, 17, preview(17), project(),
+            { true, common_cache_plan_recovery_citation::resolved, 99 },
+            counters));
+        return rec.destruction_quotes[0].receipt.manifest_digest;
+    }(current);
+    quote.receipt.union_effect_digest =
+        server_cache_destruction_union_effect_digest(
+            { op }, released);
+    CHECK(project()(released, quote.projected_domains));
+
+    uint64_t releases = 0;
+    auto pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, {});
+    CHECK(pin.valid());
+
+    // Unrelated serial drift is evidence, not invalidation: fresh reprepare
+    // proves the operation union/effect remained identical.
+    ledger.gauge_set(
+        llama_cache_acct_category::checkpoint_state_payload,
+        HOST, llama_cache_acct_measure::logical_payload, 0);
+    const auto fresh = ledger.snapshot();
+    auto result = server_cache_prepare_release_set(
+        quote, { current }, ledger, fresh.serial, project(), std::move(pin));
+    CHECK(result.status == server_cache_prepare_release_status::prepared);
+    CHECK(result.reason == common_cache_plan_destruction_reason::none);
+    CHECK(result.capability.ready());
+    CHECK(result.capability.accounting_serial() == fresh.serial);
+
+    server_cache_recovery_pin retained;
+    CHECK(result.capability.commit(retained) ==
+          common_cache_plan_destruction_reason::none);
+    CHECK(retained.valid());
+    CHECK(ledger.snapshot().live_ops == 0);
+    CHECK(releases == 0);
+    retained = {};
+    CHECK(releases == 1);
+
+    // A stale caller sample is retryable serial drift, not effect_drift.
+    llama_cache_acct_ledger stale_ledger;
+    const auto stale_op = committed_release_op(stale_ledger, 64);
+    const auto stale_serial = stale_ledger.snapshot().serial;
+    CHECK(stale_ledger.preview_release_set(
+        { stale_op }, stale_serial, released));
+    current.candidate.release_ops = { stale_op };
+    quote.receipt.union_effect_digest =
+        server_cache_destruction_union_effect_digest({ stale_op }, released);
+    CHECK(project()(released, quote.projected_domains));
+    stale_ledger.gauge_set(
+        llama_cache_acct_category::checkpoint_state_payload,
+        HOST, llama_cache_acct_measure::reserved, 0);
+    auto stale_pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, {});
+    auto serial_conflict = server_cache_prepare_release_set(
+        quote, { current }, stale_ledger, stale_serial, project(),
+        std::move(stale_pin));
+    CHECK(serial_conflict.status ==
+          server_cache_prepare_release_status::serial_conflict);
+    CHECK(serial_conflict.reason ==
+          common_cache_plan_destruction_reason::accounting_unavailable);
+    CHECK(stale_ledger.snapshot().live_ops == 1);
+    CHECK(stale_ledger.release(stale_op));
+
+    // The recovery source is a fourth conjunct: overlap with either victims
+    // or release ops fails before a capability is minted.
+    llama_cache_acct_ledger second;
+    const auto op2 = committed_release_op(second, 64);
+    const auto serial2 = second.snapshot().serial;
+    CHECK(second.preview_release_set({ op2 }, serial2, released));
+    current.candidate.release_ops = { op2 };
+    quote.receipt.union_effect_digest =
+        server_cache_destruction_union_effect_digest({ op2 }, released);
+    CHECK(project()(released, quote.projected_domains));
+    auto overlapping = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 1 } }, {});
+    auto refused = server_cache_prepare_release_set(
+        quote, { current }, second, serial2, project(), std::move(overlapping));
+    CHECK(refused.status ==
+          server_cache_prepare_release_status::recovery_unavailable);
+    CHECK(refused.reason ==
+          common_cache_plan_destruction_reason::recovery_unavailable);
+    CHECK(second.snapshot().live_ops == 1);
+
+    auto drifted_quote = quote;
+    drifted_quote.receipt.union_effect_digest =
+        common_cache_plan_destruction_effect_digest::from_sha256(
+            std::array<uint8_t, 32>{ 1 });
+    auto clean_pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, {});
+    auto effect_drift = server_cache_prepare_release_set(
+        drifted_quote, { current }, second, serial2, project(),
+        std::move(clean_pin));
+    CHECK(effect_drift.status ==
+          server_cache_prepare_release_status::effect_drift);
+    CHECK(effect_drift.reason ==
+          common_cache_plan_destruction_reason::effect_drift);
+    auto hard = current;
+    hard.candidate.lease.eligibility =
+        server_cache_lease_eligibility::hard_blocked;
+    auto hard_pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, {});
+    auto hard_refused = server_cache_prepare_release_set(
+        quote, { hard }, second, serial2, project(),
+        std::move(hard_pin));
+    CHECK(hard_refused.reason ==
+          common_cache_plan_destruction_reason::hard_lease_blocked);
+    CHECK(second.release(op2));
+}
+
 int main() {
     test_complete_memoized_and_permutation();
     test_fail_closed_matrix();
@@ -553,6 +758,7 @@ int main() {
     test_plural_effect_union_and_counters();
     test_refused_projection_and_selection_failure();
     test_max_inventory_memoizes_one_manifest();
+    test_prepared_release_capability();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

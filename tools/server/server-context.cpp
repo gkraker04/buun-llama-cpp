@@ -3452,19 +3452,6 @@ private:
         SRV_INF("swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
     }
 
-    void slot_save_and_clear(server_slot & slot) {
-        if (slot.prompt.n_tokens() == 0) {
-            return;
-        }
-        SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
-        SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-        // clear the live slot only if its state is now durable in the cache [I7]; a failed save must
-        // not destroy the only copy of the state. publish() enforces the cache limits on success.
-        if (prompt_save_durable(slot.prompt_save(*prompt_cache))) {
-            slot.prompt_clear(); // #25649 dropped the fork's bool allow_processing param (now no-arg)
-        }
-    }
-
     // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
     // gates, so unlike cache_idle_slots there is nothing to save into — the cost is a re-prefill
     // if that conversation returns). Never touches processing slots or a slot an explicitly
@@ -4621,6 +4608,9 @@ private:
         // (cache_debug || cache_lifecycle). Neither flag remains the strictly-zero-work legacy
         // path; debug alone observes the shared substrate, while lifecycle enables publication
         // admission without allocating or emitting a cache-plan observer.
+        if (params_base.cache_debug) {
+            cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+        }
         if (params_base.cache_debug || params_base.cache_lifecycle) {
             cache_authority = std::make_unique<server_cache_authority>();
         }
@@ -4635,8 +4625,11 @@ private:
                 std::make_unique<server_cache_plan_authority>(plan_authority_level);
         }
 
-        if (params_base.cache_debug) {
-            cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+        if (params_base.cache_debug || params_base.cache_lifecycle) {
+            // Policy substrate is live under either gate. CACHE_PLAN JSON/log
+            // emission remains below behind cache_plan_obs/cache_debug, but
+            // lifecycle-only operation must still inspect WS-D leases before
+            // every censused destructive primitive.
             cache_authority->destruction.lease_context = &cache_authority->leases;
             cache_authority->destruction.lease_evaluator =
                 server_cache_lease_evaluate_request;
@@ -6487,7 +6480,8 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear();
+                slot.prompt_clear(
+                    server_cache_destruction_reason::idle_reclaim);
 
                 res = true;
 
@@ -7596,7 +7590,8 @@ private:
                                 // [I7]; a failed save must not destroy the only copy of the state
                                 if (params_base.kv_unified && prompt_save_durable(saved)) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    slot.prompt_clear(
+                                        server_cache_destruction_reason::idle_reclaim);
                                 }
                             }
                         }
