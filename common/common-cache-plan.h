@@ -196,6 +196,23 @@ enum class common_cache_plan_selection : uint8_t {
     _count,
 };
 
+constexpr bool common_cache_plan_strict_similarity(
+        double similarity,
+        double threshold) noexcept {
+    return threshold != 0.0 && similarity > threshold;
+}
+
+// Graduated authority domain: each decision tier can consume candidates first
+// admitted by that tier or an earlier one. `none` is never a production plan
+// origin and therefore fails closed.
+constexpr bool common_cache_plan_origin_in_domain(
+        common_cache_plan_selection origin,
+        common_cache_plan_selection decision) noexcept {
+    return origin != common_cache_plan_selection::none &&
+           decision != common_cache_plan_selection::none &&
+           uint8_t(origin) <= uint8_t(decision);
+}
+
 // B-A schema-v5 authority vocabulary. The configured level is graduated: each
 // level includes every earlier tier. The receipt distinguishes the legacy
 // counterfactual, planner result, and actually executed complete plan without
@@ -566,7 +583,11 @@ struct common_cache_plan_record {
     // therefore include known structural noise: save-before-load can introduce
     // a fresh host entry absent from the planner inventory; the legacy
     // counterfactual does not model the seam's pos_min/SWA/recurrent coverage
-    // recovery and can over-claim checkpoint reuse; it can also over-claim
+    // recovery and can over-claim checkpoint reuse. In particular, live-context
+    // replay cannot beat a checkpoint that legacy would restore: below the
+    // coverage threshold legacy replays, while at/above it replay is invalid;
+    // replay-wins differences between those rows are receipt-only noise. The
+    // counterfactual can also over-claim
     // live replay when an adapter rebind makes the shipped path cold; host-composed
     // checkpoints are evaluated optimistically until the post-restore frontier
     // exists; and a flipped frontier ratchet can select by logical-next-position

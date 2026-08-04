@@ -242,8 +242,15 @@ std::string common_cache_plan_calib_hw(const std::vector<std::string> & gpu_desc
 // root-optimum membership: valid AND independently executable from the request's starting
 // state — a component-only row (checkpoint exposed by a delivered host entry) is priced as
 // a chain component but can never win on its own (verify-r1 finding 1)
-static bool cache_plan_row_participates(const common_cache_plan_candidate & c) {
-    return c.viable() && !c.component_only;
+static bool cache_plan_row_participates(
+        const common_cache_plan_record & rec,
+        const common_cache_plan_candidate & c) {
+    // B-A absorbs tiers cumulatively. A similarity decision may compare only
+    // targets that crossed the strict similarity threshold; route-home/LRU
+    // rows remain evidence but cannot win until their ratchets are enabled.
+    return common_cache_plan_origin_in_domain(
+               c.origin_tier, rec.selection) &&
+           c.viable() && !c.component_only;
 }
 
 // the ONE place terms are written and versions stamped: restore + replay + workspace
@@ -402,7 +409,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     bool     any        = false;
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         const auto & c = rec.inventory[i];
-        if (cache_plan_row_participates(c) &&
+        if (cache_plan_row_participates(rec, c) &&
             c.predicted_total_us.state == llama_cache_acct_known::known) {
             min_total = std::min(min_total, c.predicted_total_us.value);
             any = true;
@@ -418,7 +425,7 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     int32_t choice = -1;
     for (uint32_t i = 0; i < rec.n_inventory; i++) {
         const auto & c = rec.inventory[i];
-        if (!cache_plan_row_participates(c) ||
+        if (!cache_plan_row_participates(rec, c) ||
             c.predicted_total_us.state != llama_cache_acct_known::known) {
             continue;
         }

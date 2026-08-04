@@ -57,6 +57,49 @@ constexpr common_cache_plan_authority_level server_cache_plan_level_of(
     return static_cast<common_cache_plan_authority_level>(selection);
 }
 
+// Highest behavior-changing ratchet implemented in this tree. Higher parsed
+// levels still enable every landed prefix tier, but cannot prematurely flip a
+// route-home/LRU decision before those units supply their domain contracts.
+constexpr common_cache_plan_authority_level
+    SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL =
+        common_cache_plan_authority_level::similarity;
+
+constexpr bool server_cache_plan_level_enabled(
+        common_cache_plan_authority_level configured,
+        common_cache_plan_authority_level decision) noexcept {
+    return configured >= decision &&
+           SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL >= decision;
+}
+
+constexpr bool server_cache_plan_selection_admits_retarget(
+        common_cache_plan_authority_level configured,
+        common_cache_plan_selection selection) noexcept {
+    const auto decision = server_cache_plan_level_of(selection);
+    return decision > common_cache_plan_authority_level::by_id &&
+           decision < common_cache_plan_authority_level::_count &&
+           server_cache_plan_level_enabled(configured, decision);
+}
+
+// Single planned-target derivation for both authorization and the server's
+// process-local slot lookup. -1 is malformed/incomplete evidence.
+constexpr int32_t server_cache_plan_planned_target(
+        const common_cache_plan_record & rec,
+        common_cache_plan_authority_level configured,
+        int32_t legacy_target_slot_id) noexcept {
+    if (!server_cache_plan_selection_admits_retarget(
+            configured, rec.selection)) {
+        return legacy_target_slot_id;
+    }
+    if (rec.shadow_choice < 0 ||
+        uint32_t(rec.shadow_choice) >= rec.n_inventory) {
+        return -1;
+    }
+    const auto & selected = rec.inventory[size_t(rec.shadow_choice)];
+    return common_cache_plan_origin_in_domain(
+               selected.origin_tier, rec.selection)
+        ? selected.target_slot_id : -1;
+}
+
 // B-A pre-mutation decision substrate. It is process-local and contains no
 // shipped cache state. Authority is graduated through the parallel selection
 // and configured-level order pinned above.
@@ -82,12 +125,14 @@ struct server_cache_plan_authority {
         common_cache_plan_authority_fallback reason =
             common_cache_plan_authority_fallback::internal_fault) noexcept;
 
-    // Authorize one complete plan at the record's selected tier and target.
-    // Any planner refusal or malformed/cross-target plan returns the legacy
+    // Authorize one complete plan at the record's selected tier. The argument
+    // names the legacy-selected target: by_id remains bound to it, while later
+    // tiers may name a different target only inside the pre-D-A safety
+    // envelope. Any planner refusal or malformed plan returns the legacy
     // directive and records a typed fallback before mutation.
     server_cache_plan_execution authorize(
         common_cache_plan_record & rec,
-        int32_t target_slot_id,
+        int32_t legacy_target_slot_id,
         bool host_lookup_enabled = true,
         bool target_identity_matches = true) noexcept;
 

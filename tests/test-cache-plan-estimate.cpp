@@ -41,6 +41,7 @@ static const common_cache_plan_calib TEST_CALIB = {
 
 static common_cache_plan_record make_record(uint64_t n_prompt) {
     common_cache_plan_record rec;
+    rec.selection           = common_cache_plan_selection::similarity;
     rec.calibration_profile = TEST_CALIB.profile; // the estimator enforces the match
     rec.n_prompt_tokens     = llama_cache_acct_value::measured(n_prompt);
     return rec;
@@ -50,7 +51,8 @@ static common_cache_plan_candidate * add_row(common_cache_plan_record & rec,
                                              common_cache_plan_provider prov, int32_t src,
                                              uint8_t phase, uint64_t lcp, uint64_t bytes,
                                              common_cache_plan_disposition disp) {
-    auto * c = rec.find_or_add(prov, src, phase);
+    auto * c = rec.find_or_add(
+        prov, src, phase, -1, common_cache_plan_selection::similarity);
     c->lcp_tokens    = llama_cache_acct_value::measured(lcp);
     c->payload_bytes = llama_cache_acct_value::measured(bytes);
     c->disposition   = disp;
@@ -347,6 +349,7 @@ static void test_calibration_validation() {
 
     // record whose profile is EMPTY never matches a fitted entry either
     common_cache_plan_record unprofiled;
+    unprofiled.selection = common_cache_plan_selection::similarity;
     unprofiled.n_prompt_tokens = llama_cache_acct_value::measured(10);
     add_row(unprofiled, common_cache_plan_provider::cold_replay, -1, 0, 0, 0,
             common_cache_plan_disposition::accepted);
@@ -511,6 +514,7 @@ static void test_unavailability() {
     }
     {
         common_cache_plan_record rec; // n_prompt unknown
+        rec.selection = common_cache_plan_selection::similarity;
         rec.calibration_profile = TEST_CALIB.profile;
         add_row(rec, common_cache_plan_provider::cold_replay, -1, 0, 0, 0,
                 common_cache_plan_disposition::accepted);

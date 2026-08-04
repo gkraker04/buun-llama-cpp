@@ -75,31 +75,56 @@ class ServerArm:
 		self.log.close()
 
 
-def drive_sequence(base, args):
-	"""Forced-slot sequence covering live / host / cold candidate shapes:
-	cold fill on slot 0, exact re-ask (live), extension (live replay),
-	displacement by a second conversation (host save), return of the first
-	(host restore), plus a cold fill on slot 1 proving non-forced isolation."""
+def sequence_steps(args):
+	"""Forced-slot sequence covering live / host / cold candidate shapes,
+	or (sequence=similarity) a non-forced battery whose reuse shapes select
+	via the similarity tier: cold fills, short-suffix returns (live replay),
+	a displacing newcomer, and post-displacement returns (host restore)."""
 	filler = " ".join(
 		f"authority parity row {i} keeps the ledger deterministic."
 		for i in range(args.prompt_rows))
 	convo_a = "Conversation A. " + filler
 	convo_b = "Conversation B considers different state. " + filler
-	steps = [
-		(0, convo_a),
-		(0, convo_a),
-		(0, convo_a + " Continue the ledger with one more row."),
-		(0, convo_b),
-		(0, convo_a),
-		(1, convo_a),
+	if args.sequence == "forced":
+		return [
+			(0, convo_a),
+			(0, convo_a),
+			(0, convo_a + " Continue the ledger with one more row."),
+			(0, convo_b),
+			(0, convo_a),
+			(1, convo_a),
+		]
+	convo_c = "Conversation C opens a third thread. " + filler
+	# Chat-echo battery: follow-ups accumulate the model's own reply (the
+	# "<i>" placeholder splices step i's completion), so live replay is a
+	# pure append (f_keep == 1.0). A trimming replay would rewind the
+	# recurrent frontier on hybrid models and correctly demote — that arm
+	# is structurally non-authoritative and not a liveness vehicle.
+	return [
+		(None, convo_a),
+		(None, convo_b),
+		(None, convo_a + "<0> Add one short clarifying row."),
+		(None, convo_b + "<1> Add one short clarifying row."),
+		(None, convo_c),
+		(None, convo_a + "<0> Add one short clarifying row.<2> Summarize."),
+		(None, convo_b + "<1> Add one short clarifying row.<3> Continue "
+			"with a medium extension before stopping."),
 	]
+
+
+def drive_sequence(base, args):
 	transcript = []
-	for slot, prompt in steps:
-		status, payload = request(base, "/completion", {
+	for slot, prompt in sequence_steps(args):
+		for i, row in enumerate(transcript):
+			prompt = prompt.replace(f"<{i}>", row["content"] or "")
+		body = {
 			"prompt": prompt, "n_predict": args.n_predict,
 			"temperature": 0, "seed": args.seed, "cache_prompt": True,
-			"id_slot": slot, "n_probs": args.n_probs,
-		})
+			"n_probs": args.n_probs,
+		}
+		if slot is not None:
+			body["id_slot"] = slot
+		status, payload = request(base, "/completion", body)
 		if status != 200:
 			raise RuntimeError(f"completion failed: {status} {payload}")
 		probs = []
@@ -112,8 +137,25 @@ def drive_sequence(base, args):
 			"slot_served": payload.get("id_slot"),
 			"content": payload.get("content"),
 			"probs": probs,
+			"ttft_ms": (payload.get("timings") or {}).get("prompt_ms"),
 		})
 	return transcript
+
+
+def start_contention(base, args):
+	"""Long background generation occupying one slot for the whole battery."""
+	import threading
+
+	def spin():
+		request(base, "/completion", {
+			"prompt": "Background contention stream. " * 30,
+			"n_predict": args.contention_tokens, "temperature": 0,
+			"seed": 11, "cache_prompt": False, "ignore_eos": True,
+		}, timeout=1800)
+	thread = threading.Thread(target=spin, daemon=True)
+	thread.start()
+	time.sleep(2)
+	return thread
 
 
 def authority_totals(base):
@@ -134,6 +176,8 @@ def run_arm(args, level, port, workdir):
 	arm = ServerArm(args, level, port, f"{workdir}/server-{level}.log")
 	try:
 		arm.wait_healthy()
+		if args.contention:
+			start_contention(arm.base, args)
 		transcript = drive_sequence(arm.base, args)
 		totals = authority_totals(arm.base)
 	finally:
@@ -164,6 +208,22 @@ def main():
 	parser.add_argument("--expect-fallback", default="",
 		help="expected sole fallback_reason; arm must show zero "
 		"authoritative executions (unfitted-profile negative cell)")
+	parser.add_argument("--expect-shadow", action="store_true",
+		help="the workload's selections fall outside the implemented "
+		"authority domain (e.g. dynamic-VBR servers route reuse through "
+		"route_home): assert parity + zero executions, not liveness")
+	parser.add_argument("--sequence", default="forced",
+		choices=["forced", "similarity"],
+		help="forced = id_slot battery (by_id tier); similarity = "
+		"non-forced reuse battery (similarity tier)")
+	parser.add_argument("--contention", action="store_true",
+		help="run the battery under a long background generation; "
+		"content parity is skipped (scheduling nondeterminism), "
+		"liveness and TTFT sanity still assert")
+	parser.add_argument("--contention-tokens", type=int, default=384)
+	parser.add_argument("--ttft-max-regress", type=float, default=0.05,
+		help="on-arm mean TTFT may not exceed off-arm mean by more "
+		"than this fraction")
 	args = parser.parse_args()
 
 	off_transcript, off_totals = run_arm(
@@ -173,15 +233,37 @@ def main():
 
 	failures = []
 	for i, (off, on) in enumerate(zip(off_transcript, on_transcript)):
-		if off["content"] != on["content"]:
-			failures.append(f"step {i}: content diverged")
-		if off["probs"] != on["probs"]:
-			failures.append(f"step {i}: logprobs diverged")
+		if not args.contention:
+			if off["content"] != on["content"]:
+				failures.append(f"step {i}: content diverged")
+			if off["probs"] != on["probs"]:
+				failures.append(f"step {i}: logprobs diverged")
 		for arm_name, row in (("off", off), ("on", on)):
-			if row["slot_served"] != row["slot_requested"]:
+			if (row["slot_requested"] is not None and
+					row["slot_served"] != row["slot_requested"]):
 				failures.append(
 					f"step {i} {arm_name}: served slot "
 					f"{row['slot_served']} != forced {row['slot_requested']}")
+
+	ttft_off = [r["ttft_ms"] for r in off_transcript if r["ttft_ms"]]
+	ttft_on = [r["ttft_ms"] for r in on_transcript if r["ttft_ms"]]
+	ttft_report = {}
+	if ttft_off and ttft_on:
+		mean_off = sum(ttft_off) / len(ttft_off)
+		mean_on = sum(ttft_on) / len(ttft_on)
+		deltas = [round(a - b, 3) for a, b in zip(ttft_off, ttft_on)]
+		ttft_report = {
+			"mean_off_ms": round(mean_off, 3),
+			"mean_on_ms": round(mean_on, 3),
+			"per_step_win_ms": deltas,
+		}
+		if any(t < 0 for t in ttft_on):
+			failures.append("negative TTFT measured on the on arm")
+		if mean_on > mean_off * (1.0 + args.ttft_max_regress):
+			failures.append(
+				f"on-arm mean TTFT {mean_on:.1f}ms exceeds off-arm "
+				f"{mean_off:.1f}ms by more than "
+				f"{args.ttft_max_regress:.0%}")
 
 	def tier_sum(totals, key):
 		return sum(t.get(key, 0) for t in totals.values())
@@ -189,7 +271,13 @@ def main():
 	if tier_sum(off_totals, "executed") != 0:
 		failures.append("off arm shows authoritative executions")
 	tier_on = on_totals.get(args.tier, {})
-	if args.expect_fallback:
+	if args.expect_shadow:
+		if tier_sum(on_totals, "executed") != 0:
+			failures.append(
+				"out-of-domain workload executed authoritatively")
+		if tier_sum(on_totals, "observed") == 0:
+			failures.append("no records observed at all")
+	elif args.expect_fallback:
 		if tier_sum(on_totals, "executed") != 0:
 			failures.append(
 				"unfitted arm executed authoritatively; expected "
@@ -210,6 +298,7 @@ def main():
 		"off_totals": off_totals,
 		"on_totals": on_totals,
 		"steps": len(on_transcript),
+		"ttft": ttft_report,
 		"failures": failures,
 	}
 	print(json.dumps(report, indent=1))

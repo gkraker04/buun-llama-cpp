@@ -5191,7 +5191,8 @@ private:
             ? 0.0f : float(lcp) / float(task.tokens.size());
         // Keep in lockstep with the shipped tier boundaries below: strict
         // similarity threshold, then dynamic-VBR route-home, then LRU.
-        if (slot_prompt_similarity != 0.0f && sim > slot_prompt_similarity) {
+        if (common_cache_plan_strict_similarity(
+                sim, slot_prompt_similarity)) {
             return common_cache_plan_selection::similarity;
         }
         if (server_vbr_dynamic_active(params_base) && lcp > 0) {
@@ -5205,6 +5206,44 @@ private:
             const server_slot & slot) const noexcept {
         return !slot.is_processing() &&
                (task.id_slot == -1 || slot.id == task.id_slot);
+    }
+
+    server_slot * cache_plan_slot_by_exact_id(int32_t id) noexcept {
+        // get_slot_by_id deliberately modulo-wraps client routing ids; a
+        // planner capability names one exact recorded physical slot instead.
+        for (auto & slot : slots) {
+            if (slot.id == id) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    bool cache_plan_retarget_target_current(
+            const common_cache_plan_record & rec,
+            const server_slot & slot) const noexcept {
+        // Token contents cannot change inside this synchronous scheduler block.
+        // Reuse the LCP/sim result captured by the complete inventory instead
+        // of rescanning a potentially 200k-token prompt; only busy/empty can
+        // drift independently before the mutation seam.
+        if (slot.is_processing() || slot.prompt.tokens.empty()) {
+            return false;
+        }
+        for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+            const auto & row = rec.inventory[i];
+            if (row.provider != common_cache_plan_provider::live_slot ||
+                row.target_slot_id != slot.id || row.source_id != slot.id ||
+                row.lcp_tokens.state != llama_cache_acct_known::known ||
+                !row.sim_known || !row.viable() ||
+                !common_cache_plan_origin_in_domain(
+                    row.origin_tier, rec.selection)) {
+                continue;
+            }
+            return rec.selection != common_cache_plan_selection::similarity ||
+                   common_cache_plan_strict_similarity(
+                       row.sim, slot_prompt_similarity);
+        }
+        return false;
     }
 
     bool cache_plan_inventory_live_rows(
@@ -5757,7 +5796,9 @@ private:
                     }
 
                     // select the current slot if the criteria match
-                    if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
+                    if (sim_cur > sim_best &&
+                        common_cache_plan_strict_similarity(
+                            sim_cur, slot_prompt_similarity)) {
                         sim_best = sim_cur;
 
                         ret = &slot;
@@ -5937,6 +5978,7 @@ private:
                 // plan_rec is created only by the debug-or-authority substrate,
                 // which always owns cache_plan_authority.
                 GGML_ASSERT(cache_plan_authority);
+                server_slot * const legacy_ret = ret;
                 const uint64_t capability_before =
                     cache_plan_capability_snapshot(task);
                 try {
@@ -5953,20 +5995,110 @@ private:
                         cache_plan_capability_snapshot(task);
                     cache_plan_authority->plan_before_mutation(
                         *plan_rec, capability_before, capability_after);
+
+                    // B-A2 may choose another strict-similarity target, but
+                    // only the authority layer interprets that choice. Lower
+                    // levels keep the B-A1/legacy target exactly as selected.
+                    const bool selection_admits_retarget =
+                        server_cache_plan_selection_admits_retarget(
+                            cache_plan_authority->configured_level,
+                            plan_rec->selection);
+                    const int32_t planned_target =
+                        server_cache_plan_planned_target(
+                            *plan_rec,
+                            cache_plan_authority->configured_level,
+                            legacy_ret->id);
+                    server_slot * planned_ret = planned_target == legacy_ret->id
+                        ? legacy_ret
+                        : cache_plan_slot_by_exact_id(planned_target);
+                    const bool planned_adapter_matches =
+                        planned_ret == legacy_ret
+                            ? incoming_adapter_matches
+                            : (planned_ret &&
+                               are_lora_equal(
+                                   incoming_loras, planned_ret->lora));
                     auto execution = cache_plan_authority->authorize(
-                        *plan_rec, ret->id,
+                        *plan_rec, legacy_ret->id,
                         update_cache && prompt_cache &&
                         task.type == SERVER_TASK_TYPE_COMPLETION &&
                         incoming_adapter_matches,
-                        incoming_adapter_matches);
+                        planned_adapter_matches);
+                    if (execution.authoritative() &&
+                        selection_admits_retarget &&
+                        (!planned_ret ||
+                         !cache_plan_retarget_target_current(
+                             *plan_rec, *planned_ret))) {
+                        cache_plan_authority->fallback_legacy(
+                            *plan_rec,
+                            common_cache_plan_authority_fallback::stale_capability);
+                        execution.clear();
+                    }
                     if (execution.authoritative() &&
                         !cache_plan_execution_revalidate(
-                            task, *ret, incoming_adapter_matches,
+                            task, *planned_ret, planned_adapter_matches,
                             incoming_adapter, execution)) {
                         cache_plan_authority->fallback_legacy(
                             *plan_rec,
                             common_cache_plan_authority_fallback::stale_capability);
                         execution.clear();
+                    }
+                    if (execution.authoritative() &&
+                        planned_ret != legacy_ret) {
+                        // Retargeting leaves the legacy-selected slot idle and
+                        // exposed to ordinary idle/VBR reclaim. Preserve the
+                        // durability side effect legacy would have performed
+                        // before switching targets; without a durable copy the
+                        // retarget remains outside the pre-D-A envelope.
+                        bool displaced_durable = false;
+                        if (prompt_cache &&
+                            task.type == SERVER_TASK_TYPE_COMPLETION) {
+                            const auto saved =
+                                legacy_ret->prompt_save(*prompt_cache);
+                            if (prompt_save_durable(saved)) {
+                                // Match the shipped save/load maintenance
+                                // boundary even when no load follows.
+                                prompt_cache->update();
+                                displaced_durable = prompt_cache->contains(
+                                    legacy_ret->prompt.tokens,
+                                    lora_config_identity(legacy_ret->lora));
+                            }
+                        }
+                        if (!displaced_durable) {
+                            cache_plan_authority->fallback_legacy(
+                                *plan_rec,
+                                common_cache_plan_authority_fallback::
+                                    destruction_authority_required);
+                            execution.clear();
+                        }
+                    }
+                    if (execution.authoritative() &&
+                        planned_ret != legacy_ret) {
+                        // The exact target gets the same stale-arm hygiene as
+                        // a legacy-selected idle slot. The displaced live row
+                        // remains counterfactual evidence, but is no longer a
+                        // second accepted shipped winner.
+                        server_cache_plan_disarm_unlaunched(
+                            planned_ret->cache_plan_execution,
+                            planned_ret->cache_plan);
+                        for (uint32_t i = 0; i < plan_rec->n_inventory; ++i) {
+                            auto & row = plan_rec->inventory[i];
+                            if (row.provider ==
+                                    common_cache_plan_provider::live_slot &&
+                                row.target_slot_id == legacy_ret->id &&
+                                row.source_id == legacy_ret->id) {
+                                row.note_reject(
+                                    COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL);
+                                break;
+                            }
+                        }
+                        ret = planned_ret;
+                        incoming_adapter_matches = planned_adapter_matches;
+                        update_cache = false;
+                        SLT_INF(*ret,
+                            "selected slot by cache-plan %s authority (legacy slot %d)\n",
+                            common_cache_plan_selection_name(
+                                plan_rec->selection),
+                            legacy_ret->id);
                     }
                     ret->cache_plan_execution = execution;
                 } catch (...) {

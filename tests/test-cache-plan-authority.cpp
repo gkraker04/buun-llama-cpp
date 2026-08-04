@@ -54,6 +54,16 @@ static host_checkpoint_chain_fixture add_host_checkpoint_chain(
 }
 
 static void test_candidate_classifiers() {
+    CHECK(common_cache_plan_strict_similarity(0.75, 0.50));
+    CHECK(!common_cache_plan_strict_similarity(0.50, 0.50));
+    CHECK(!common_cache_plan_strict_similarity(0.75, 0.0));
+    CHECK(common_cache_plan_origin_in_domain(
+        common_cache_plan_selection::similarity,
+        common_cache_plan_selection::similarity));
+    CHECK(!common_cache_plan_origin_in_domain(
+        common_cache_plan_selection::route_home,
+        common_cache_plan_selection::similarity));
+
     CHECK(common_cache_plan_authority_level_parse("off") ==
           common_cache_plan_authority_level::off);
     CHECK(common_cache_plan_authority_level_parse("route_home") ==
@@ -358,6 +368,49 @@ static void test_execution_seam_fallbacks() {
           common_cache_plan_authority_fallback::stale_capability);
     CHECK(coverage.authority_prequalified);
 
+    // A post-retarget coverage demotion executes legacy recovery on the
+    // planner-selected slot, not on the legacy-selected slot. Preserve the
+    // pre-mutation slot-A counterfactual so the receipt records disagreement.
+    constexpr int32_t legacy_target = 8;
+    constexpr int32_t planned_target = 9;
+    common_cache_plan_record retarget;
+    auto * legacy_live = add_viable(
+        retarget, common_cache_plan_provider::live_slot,
+        legacy_target, legacy_target,
+        common_cache_plan_selection::similarity);
+    legacy_live->f_keep = 0.8;
+    legacy_live->f_keep_known = true;
+    auto * planned_live = add_viable(
+        retarget, common_cache_plan_provider::live_slot,
+        planned_target, planned_target,
+        common_cache_plan_selection::similarity);
+    planned_live->f_keep = 1.0;
+    planned_live->f_keep_known = true;
+    server_cache_plan_authority similarity(
+        common_cache_plan_authority_level::similarity);
+    execution = authorize_choice(
+        similarity, retarget,
+        int32_t(planned_live - retarget.inventory.data()), legacy_target,
+        true, common_cache_plan_authority_level::similarity,
+        common_cache_plan_selection::similarity);
+    CHECK(execution.authoritative());
+    CHECK(server_cache_plan_demote_for_coverage_recovery(
+        similarity, retarget, execution, 64, 64));
+    retarget.shipped_plan_candidate =
+        int32_t(planned_live - retarget.inventory.data());
+    similarity.finalize_execution(retarget);
+    CHECK(retarget.authority.legacy_plan_candidate ==
+          int32_t(legacy_live - retarget.inventory.data()));
+    CHECK(retarget.authority.planner_plan_candidate ==
+          int32_t(planned_live - retarget.inventory.data()));
+    CHECK(retarget.authority.executed_plan_candidate ==
+          int32_t(planned_live - retarget.inventory.data()));
+    CHECK(retarget.authority.disagreed);
+    CHECK(similarity.counters.agree[size_t(
+              common_cache_plan_selection::similarity)] == 0);
+    CHECK(similarity.counters.disagree[size_t(
+              common_cache_plan_selection::similarity)] == 1);
+
     common_cache_plan_record checkpoint;
     auto * row = add_viable(
         checkpoint,
@@ -516,6 +569,39 @@ static void test_by_id_execution_shapes_and_target_binding() {
               common_cache_plan_authority_level::similarity,
               common_cache_plan_selection::similarity).authoritative());
 
+    // Parsed future levels enable the landed prefix but cannot prematurely
+    // flip their own still-unimplemented selection tiers.
+    server_cache_plan_authority future(
+        common_cache_plan_authority_level::lru);
+    copy = rec;
+    CHECK(authorize_choice(future, copy,
+              int32_t(live - rec.inventory.data()), target, true,
+              common_cache_plan_authority_level::lru,
+              common_cache_plan_selection::route_home).kind ==
+          server_cache_plan_execution_kind::legacy);
+    CHECK(copy.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::tier_not_enabled);
+    copy = rec;
+    CHECK(authorize_choice(future, copy,
+              int32_t(live - rec.inventory.data()), target, true,
+              common_cache_plan_authority_level::lru,
+              common_cache_plan_selection::similarity).authoritative());
+
+    // A disabled future tier must not blur an existing planner refusal into
+    // tier_not_enabled. The latter names only an otherwise-qualified plan.
+    common_cache_plan_record unfitted = rec;
+    unfitted.selection = common_cache_plan_selection::route_home;
+    unfitted.planner_status =
+        common_cache_plan_planner_status::profile_unfitted;
+    unfitted.planner_precomputed = true;
+    unfitted.authority_prequalified = false;
+    common_cache_plan_derive_shadow_authority(
+        unfitted, common_cache_plan_authority_level::lru,
+        common_cache_plan_authority_fallback::none);
+    CHECK(!future.authorize(unfitted, target).authoritative());
+    CHECK(unfitted.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::profile_unfitted);
+
     copy = rec;
     CHECK(!authorize_choice(authority, copy,
               int32_t(live - rec.inventory.data()), target, true,
@@ -562,6 +648,157 @@ static void test_legacy_counterfactual_and_authoritative_receipt() {
     CHECK(rec.authority.disagreed);
     CHECK(authority.counters.authority_executed[size_t(
               common_cache_plan_selection::by_id)] == 1);
+}
+
+static void test_similarity_crossover_and_safety_envelope() {
+    constexpr int32_t legacy_target = 2;
+    constexpr int32_t other_target = 3;
+    const common_cache_plan_calib calib = {
+        "similarity-crossover", 1,
+        /* replay_us_per_token */ 100.0,
+        /* restore_us_per_byte */ 0.001,
+        /* workspace_setup_us */  500.0,
+    };
+
+    common_cache_plan_record rec;
+    rec.selection = common_cache_plan_selection::similarity;
+    rec.calibration_profile = calib.profile;
+    rec.n_prompt_tokens = llama_cache_acct_value::measured(100);
+    auto * live = add_viable(rec, common_cache_plan_provider::live_slot,
+        legacy_target, legacy_target, common_cache_plan_selection::similarity);
+    live->lcp_tokens = llama_cache_acct_value::measured(90);
+    live->f_keep = 0.9; live->f_keep_known = true;
+    const auto host_checkpoint = add_host_checkpoint_chain(
+        rec, legacy_target, 11, 0,
+        common_cache_plan_selection::similarity);
+    host_checkpoint.host->lcp_tokens = llama_cache_acct_value::measured(80);
+    host_checkpoint.host->payload_bytes =
+        llama_cache_acct_value::measured(5'000'000);
+    host_checkpoint.host->f_keep = 0.95;
+    host_checkpoint.host->f_keep_known = true;
+    host_checkpoint.host->sim = 0.95;
+    host_checkpoint.host->sim_known = true;
+    host_checkpoint.checkpoint->lcp_tokens =
+        llama_cache_acct_value::measured(99);
+    host_checkpoint.checkpoint->payload_bytes =
+        llama_cache_acct_value::measured(45'000'000);
+    auto * cold = add_viable(rec, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
+        common_cache_plan_selection::similarity);
+    (void) cold;
+
+    // A cheaper row below the strict threshold is route-home evidence, not a
+    // similarity-tier authority candidate.
+    auto * below_threshold = add_viable(
+        rec, common_cache_plan_provider::live_slot,
+        other_target, other_target, common_cache_plan_selection::route_home);
+    below_threshold->lcp_tokens = llama_cache_acct_value::measured(100);
+    below_threshold->f_keep = 1.0; below_threshold->f_keep_known = true;
+
+    CHECK(server_cache_plan_legacy_candidate(rec, legacy_target) ==
+          int32_t(host_checkpoint.chain - rec.inventory.data()));
+    rec.planner_status = common_cache_plan_estimate_and_choose(rec, calib);
+    CHECK(rec.planner_status == common_cache_plan_planner_status::ok);
+    CHECK(rec.shadow_choice == int32_t(live - rec.inventory.data()));
+
+    server_cache_plan_authority authority(
+        common_cache_plan_authority_level::similarity);
+    rec.authority_prequalified = true;
+    rec.planner_precomputed = true;
+    common_cache_plan_derive_shadow_authority(
+        rec, common_cache_plan_authority_level::similarity,
+        common_cache_plan_authority_fallback::none);
+    auto execution = authority.authorize(rec, legacy_target);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind == server_cache_plan_execution_kind::live_replay);
+    CHECK(execution.target == legacy_target); // crossover changes provider, not slot
+    rec.shipped_plan_candidate = int32_t(live - rec.inventory.data());
+    authority.finalize_execution(rec);
+    CHECK(rec.authority.executed_plan_candidate ==
+          int32_t(live - rec.inventory.data()));
+    CHECK(!host_checkpoint.checkpoint->delivered);
+    CHECK(!rec.restore_attempt_failed);
+
+    // A replay-wins crossover against a LIVE checkpoint is structurally
+    // impossible: below the coverage threshold legacy replays, while at/above
+    // it replay is invalid and the coverage seam demotes. The real replay win
+    // above is the host-side prompt-load/host-checkpoint chain.
+
+    common_cache_plan_record long_suffix;
+    long_suffix.selection = common_cache_plan_selection::similarity;
+    long_suffix.calibration_profile = calib.profile;
+    long_suffix.n_prompt_tokens = llama_cache_acct_value::measured(100);
+    auto * long_live = add_viable(
+        long_suffix, common_cache_plan_provider::live_slot,
+        legacy_target, legacy_target,
+        common_cache_plan_selection::similarity);
+    long_live->lcp_tokens = llama_cache_acct_value::measured(20);
+    long_live->f_keep = 0.2; long_live->f_keep_known = true;
+    auto * cheap_checkpoint = add_viable(
+        long_suffix, common_cache_plan_provider::live_context_checkpoint,
+        0, legacy_target, common_cache_plan_selection::similarity);
+    cheap_checkpoint->lcp_tokens = llama_cache_acct_value::measured(90);
+    cheap_checkpoint->payload_bytes = llama_cache_acct_value::measured(1'000);
+    add_viable(long_suffix, common_cache_plan_provider::cold_replay,
+        COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
+        common_cache_plan_selection::similarity);
+    long_suffix.planner_status =
+        common_cache_plan_estimate_and_choose(long_suffix, calib);
+    CHECK(long_suffix.planner_status == common_cache_plan_planner_status::ok);
+    CHECK(long_suffix.shadow_choice ==
+          int32_t(cheap_checkpoint - long_suffix.inventory.data()));
+    long_suffix.authority_prequalified = true;
+    long_suffix.planner_precomputed = true;
+    common_cache_plan_derive_shadow_authority(
+        long_suffix, common_cache_plan_authority_level::similarity,
+        common_cache_plan_authority_fallback::none);
+    execution = authority.authorize(long_suffix, legacy_target);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind ==
+          server_cache_plan_execution_kind::checkpoint_restore);
+    int32_t restore_ordinal = -1;
+    CHECK(server_cache_plan_revalidate_checkpoint_execution(
+        authority, long_suffix, execution, 1, true, restore_ordinal));
+    CHECK(execution.authoritative());
+    CHECK(restore_ordinal == 0);
+
+    // Cross-target similarity execution remains pre-D-A fail-closed unless it
+    // retains the target's complete live prefix (the zero-destruction case).
+    common_cache_plan_record cross;
+    auto * legacy_live = add_viable(
+        cross, common_cache_plan_provider::live_slot,
+        legacy_target, legacy_target, common_cache_plan_selection::similarity);
+    legacy_live->f_keep = 0.8; legacy_live->f_keep_known = true;
+    auto * cross_live = add_viable(
+        cross, common_cache_plan_provider::live_slot,
+        other_target, other_target, common_cache_plan_selection::similarity);
+    cross_live->f_keep = 0.5; cross_live->f_keep_known = true;
+    execution = authorize_choice(
+        authority, cross, int32_t(cross_live - cross.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::similarity,
+        common_cache_plan_selection::similarity);
+    CHECK(!execution.authoritative());
+    CHECK(cross.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::destruction_authority_required);
+
+    cross_live->f_keep = 1.0;
+    execution = authorize_choice(
+        authority, cross, int32_t(cross_live - cross.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::similarity,
+        common_cache_plan_selection::similarity);
+    CHECK(execution.authoritative());
+    CHECK(execution.target == other_target);
+
+    // A route-home row cannot be smuggled into a similarity receipt even if a
+    // malformed caller installs it as the planner choice.
+    execution = authorize_choice(
+        authority, rec,
+        int32_t(below_threshold - rec.inventory.data()), legacy_target,
+        true, common_cache_plan_authority_level::similarity,
+        common_cache_plan_selection::similarity);
+    CHECK(!execution.authoritative());
+    CHECK(rec.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::incomplete_evidence);
 }
 
 static void test_typed_planner_fallbacks() {
@@ -676,6 +913,7 @@ int main() {
     test_qualified_fallback_remains_eligible();
     test_by_id_execution_shapes_and_target_binding();
     test_legacy_counterfactual_and_authoritative_receipt();
+    test_similarity_crossover_and_safety_envelope();
     test_typed_planner_fallbacks();
     test_off_stays_shadow_and_failed_delivery_not_counted();
     test_eligible_and_executed_index_different_tiers();

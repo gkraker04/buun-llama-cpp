@@ -62,7 +62,7 @@ void server_cache_plan_authority::fail_closed(
     const auto decision_level = server_cache_plan_level_of(rec.selection);
     if (decision_level != common_cache_plan_authority_level::off &&
         decision_level != common_cache_plan_authority_level::_count &&
-        configured_level >= decision_level) {
+        server_cache_plan_level_enabled(configured_level, decision_level)) {
         rec.authority.state =
             common_cache_plan_authority_state::fallback_legacy;
         rec.authority.fallback_reason = reason;
@@ -231,8 +231,24 @@ bool server_cache_plan_execution_from_candidate(
 }
 
 static bool inside_pre_da_safety_envelope(
+        const common_cache_plan_record & rec,
+        int32_t planned_candidate,
         const server_cache_plan_execution & planned,
         const server_cache_plan_execution & legacy) noexcept {
+    if (planned.target != legacy.target) {
+        // Before D-A, changing the selected target is safe only when the new
+        // live plan retains every byte of that target's existing prefix. This
+        // is the one genuinely zero-destruction cross-target similarity case:
+        // no host capability is consumed and no divergent suffix is trimmed.
+        if (planned.kind != server_cache_plan_execution_kind::live_replay ||
+            planned_candidate < 0 ||
+            uint32_t(planned_candidate) >= rec.n_inventory) {
+            return false;
+        }
+        const auto & row = rec.inventory[size_t(planned_candidate)];
+        return row.provider == common_cache_plan_provider::live_slot &&
+               row.f_keep_known && row.f_keep >= 1.0;
+    }
     // The forced target may be replayed or restored without evicting a
     // separate retained artifact. Cold is no worse only when legacy was cold.
     if (planned.kind == server_cache_plan_execution_kind::cold_replay) {
@@ -254,7 +270,7 @@ static bool inside_pre_da_safety_envelope(
 
 server_cache_plan_execution server_cache_plan_authority::authorize(
         common_cache_plan_record & rec,
-        int32_t target_slot_id,
+        int32_t legacy_target_slot_id,
         bool host_lookup_enabled,
         bool target_identity_matches) noexcept {
     server_cache_plan_execution execution;
@@ -263,15 +279,21 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
         decision_level == common_cache_plan_authority_level::_count) {
         return execution;
     }
-    if (configured_level < decision_level) {
-        // The tier remains shadow-only, but make the reserved typed reason
-        // observable rather than leaving tier_not_enabled permanently dead.
-        rec.authority.fallback_reason =
-            common_cache_plan_authority_fallback::tier_not_enabled;
+    if (!server_cache_plan_level_enabled(configured_level, decision_level)) {
+        // Preserve a planner refusal (no profile, incomplete evidence, ...).
+        // tier_not_enabled describes only an otherwise-qualified plan whose
+        // decision ratchet has not landed yet.
+        if (rec.authority.fallback_reason ==
+                common_cache_plan_authority_fallback::none &&
+            rec.authority_prequalified &&
+            rec.planner_status == common_cache_plan_planner_status::ok) {
+            rec.authority.fallback_reason =
+                common_cache_plan_authority_fallback::tier_not_enabled;
+        }
         return execution;
     }
     const int32_t legacy_plan_candidate = server_cache_plan_legacy_candidate(
-        rec, target_slot_id, host_lookup_enabled);
+        rec, legacy_target_slot_id, host_lookup_enabled);
     rec.authority.legacy_plan_candidate = legacy_plan_candidate;
     if (!rec.authority_prequalified ||
         rec.planner_status != common_cache_plan_planner_status::ok) {
@@ -282,8 +304,15 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
                 : common_cache_plan_authority_fallback::internal_fault);
         return execution;
     }
+    const int32_t planned_target_slot_id = server_cache_plan_planned_target(
+        rec, configured_level, legacy_target_slot_id);
+    if (planned_target_slot_id < 0) {
+        fallback_legacy(rec,
+            common_cache_plan_authority_fallback::incomplete_evidence);
+        return {};
+    }
     if (!server_cache_plan_execution_from_candidate(
-            rec, rec.shadow_choice, target_slot_id, execution)) {
+            rec, rec.shadow_choice, planned_target_slot_id, execution)) {
         fallback_legacy(rec,
             common_cache_plan_authority_fallback::internal_fault);
         return {};
@@ -298,12 +327,14 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
     }
     server_cache_plan_execution legacy_execution;
     if (!server_cache_plan_execution_from_candidate(
-            rec, legacy_plan_candidate, target_slot_id, legacy_execution)) {
+            rec, legacy_plan_candidate, legacy_target_slot_id,
+            legacy_execution)) {
         fallback_legacy(rec,
             common_cache_plan_authority_fallback::internal_fault);
         return {};
     }
-    if (!inside_pre_da_safety_envelope(execution, legacy_execution)) {
+    if (!inside_pre_da_safety_envelope(
+            rec, rec.shadow_choice, execution, legacy_execution)) {
         fallback_legacy(rec,
             common_cache_plan_authority_fallback::
                 destruction_authority_required);

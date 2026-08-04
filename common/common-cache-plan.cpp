@@ -189,11 +189,12 @@ void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec)
     }
     auto & receipt = rec.authority;
     receipt.legacy_tier = rec.selection;
-    // An authoritative receipt already carries the pre-mutation legacy
-    // counterfactual. Shadow/fallback execution actually ran legacy, so its
-    // final delivered plan remains the legacy identity.
-    if (receipt.state != common_cache_plan_authority_state::authoritative ||
-        receipt.legacy_plan_candidate < 0) {
+    // Preserve a pre-mutation legacy counterfactual through every later
+    // fallback. A similarity retarget can demote after switching slots; its
+    // shipped plan then belongs to the planner target even though the state is
+    // fallback_legacy. Only records that never computed a counterfactual may
+    // derive one from the final shipped plan.
+    if (receipt.legacy_plan_candidate < 0) {
         receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
     }
     receipt.executed_plan_candidate = rec.shipped_plan_candidate;
