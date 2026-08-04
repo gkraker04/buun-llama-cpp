@@ -45,6 +45,11 @@ struct common_time_meas {
     int64_t & t_acc;
 };
 
+// Defined by common-cache-plan.h. Fixed underlying type permits common_params
+// to carry the closed value without introducing the common.h <-> checkpoint-
+// shadow include cycle.
+enum class common_cache_plan_authority_level : uint8_t;
+
 struct common_adapter_lora_info {
     std::string path;
     float scale;
@@ -799,6 +804,11 @@ struct common_params {
 
     // B0 shadow cache-plan observer: strictly zero observer work when disabled
     bool cache_debug = false;
+
+    // B-A graduated authority request. B-A0b dual-runs every non-off level but
+    // still executes legacy unconditionally; later ratchets consume the same
+    // closed spelling without another flag migration.
+    common_cache_plan_authority_level cache_plan_authority{}; // zero = off
 
     // P2 F: cache-lifecycle authority substrate (accounting-gated admission). Constructs the
     // authority (ledger/coordinator/leases/retention) independent of --cache-debug; enforcement

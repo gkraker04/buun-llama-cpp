@@ -3,6 +3,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <stdexcept>
+
 using json = nlohmann::ordered_json;
 
 // Exhaustive name tables for the B0 closed enums. Switch-based with no default case so a new
@@ -76,6 +78,26 @@ const char * common_cache_plan_authority_level_name(common_cache_plan_authority_
     return "invalid";
 }
 
+common_cache_plan_authority_level common_cache_plan_authority_level_parse(
+        const std::string & value) {
+    if (value == "off") {
+        return common_cache_plan_authority_level::off;
+    }
+    if (value == "by_id") {
+        return common_cache_plan_authority_level::by_id;
+    }
+    if (value == "similarity") {
+        return common_cache_plan_authority_level::similarity;
+    }
+    if (value == "route_home") {
+        return common_cache_plan_authority_level::route_home;
+    }
+    if (value == "lru") {
+        return common_cache_plan_authority_level::lru;
+    }
+    throw std::invalid_argument("invalid cache-plan authority level: " + value);
+}
+
 const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state) {
     switch (state) {
         case common_cache_plan_authority_state::shadow:          return "shadow";
@@ -112,13 +134,62 @@ const char * common_cache_plan_authority_fallback_name(
     return "invalid";
 }
 
-void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept {
+static common_cache_plan_authority_fallback planner_fallback(
+        common_cache_plan_planner_status status) noexcept {
+    switch (status) {
+        case common_cache_plan_planner_status::ok:
+        case common_cache_plan_planner_status::not_attempted:
+            return common_cache_plan_authority_fallback::none;
+        case common_cache_plan_planner_status::no_profile:
+            return common_cache_plan_authority_fallback::no_profile;
+        case common_cache_plan_planner_status::profile_unfitted:
+            return common_cache_plan_authority_fallback::profile_unfitted;
+        case common_cache_plan_planner_status::invalid_calibration:
+            return common_cache_plan_authority_fallback::invalid_calibration;
+        case common_cache_plan_planner_status::incomplete_evidence:
+            return common_cache_plan_authority_fallback::incomplete_evidence;
+        case common_cache_plan_planner_status::internal_fault:
+            return common_cache_plan_authority_fallback::internal_fault;
+        case common_cache_plan_planner_status::_count:
+            break;
+    }
+    return common_cache_plan_authority_fallback::internal_fault;
+}
+
+void common_cache_plan_derive_shadow_authority(
+        common_cache_plan_record & rec,
+        common_cache_plan_authority_level configured_level,
+        common_cache_plan_authority_fallback fallback_reason) noexcept {
     auto & receipt = rec.authority;
     receipt = {};
+    receipt.configured_level = configured_level;
+    receipt.state = common_cache_plan_authority_state::shadow;
+    receipt.planner_plan_candidate =
+        rec.planner_status == common_cache_plan_planner_status::ok
+            ? rec.shadow_choice : -1;
+    if (receipt.planner_plan_candidate >= 0 &&
+        uint32_t(receipt.planner_plan_candidate) < rec.n_inventory) {
+        receipt.decision_tier =
+            rec.inventory[size_t(receipt.planner_plan_candidate)].origin_tier;
+    }
+    receipt.fallback_reason = fallback_reason ==
+            common_cache_plan_authority_fallback::none
+        ? planner_fallback(rec.planner_status) : fallback_reason;
+}
+
+void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept {
+    if (!rec.planner_precomputed) {
+        common_cache_plan_derive_shadow_authority(
+            rec, common_cache_plan_authority_level::off,
+            common_cache_plan_authority_fallback::none);
+        // Observer-only records predate authority fallbacks: preserve their
+        // schema-v5 meaning even when the shadow planner itself refused.
+        rec.authority.fallback_reason =
+            common_cache_plan_authority_fallback::none;
+    }
+    auto & receipt = rec.authority;
     receipt.legacy_tier = rec.selection;
     receipt.legacy_plan_candidate = rec.shipped_plan_candidate;
-    receipt.planner_plan_candidate =
-        rec.planner_status == common_cache_plan_planner_status::ok ? rec.shadow_choice : -1;
     receipt.executed_plan_candidate = rec.shipped_plan_candidate;
     receipt.disagreed = receipt.legacy_plan_candidate >= 0 &&
                         receipt.planner_plan_candidate >= 0 &&
@@ -126,7 +197,8 @@ void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec)
 }
 
 void common_cache_plan_authority_counters::observe(
-        const common_cache_plan_authority_receipt & receipt) noexcept {
+        const common_cache_plan_authority_receipt & receipt,
+        bool qualified) noexcept {
     last_receipt = receipt;
     has_receipt = true;
 
@@ -138,9 +210,17 @@ void common_cache_plan_authority_counters::observe(
     if (receipt.planner_plan_candidate >= 0) {
         (receipt.disagreed ? disagree : agree)[tier]++;
     }
+    const size_t decision_tier = size_t(receipt.decision_tier);
+    if (qualified && decision_tier < size_t(common_cache_plan_selection::_count)) {
+        authority_eligible[decision_tier]++;
+    }
     if (receipt.state == common_cache_plan_authority_state::authoritative) {
-        authority_eligible[tier]++;
-        authority_executed[tier]++;
+        if (decision_tier < size_t(common_cache_plan_selection::_count)) {
+            if (!qualified) {
+                authority_eligible[decision_tier]++;
+            }
+            authority_executed[decision_tier]++;
+        }
     } else if (receipt.state == common_cache_plan_authority_state::fallback_legacy) {
         fallback_legacy[tier]++;
         const size_t reason = size_t(receipt.fallback_reason);
@@ -316,11 +396,11 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
     if (!host || !host->delivered) {
         return;
     }
-    // the checkpoint list the scan visited ARRIVED WITH the delivered host entry (the
-    // restore replaces the slot's prompt wholesale), so EVERY checkpoint sibling is
-    // host-dependent (verify-r2 finding 1): each valid sibling's true complete plan is
-    // host→sibling. The delivered pair's chain is the shipped plan; every other valid
-    // sibling gets a cost-loser chain so the planner compares real alternatives.
+    // Only checkpoints exposed by THIS delivered host entry can compose with it.
+    // Pre-mutation live checkpoints were destroyed by the restore, and checkpoints exposed
+    // by another host are unreachable alternatives. Prefer the pre-mutation inventory chain
+    // with the exact component ordinals: the authority receipt compares stable inventory
+    // ordinals, so appending a duplicate here would fabricate a disagreement.
     const int32_t host_ord =
         rec.selected[size_t(common_cache_plan_provider::host_cache_entry)];
     const int32_t sel_ckpt =
@@ -329,28 +409,49 @@ void common_cache_plan_compose_chains(common_cache_plan_record & rec) {
     bool shipped_chain_recorded = false;
     for (uint32_t i = 0; i < n_before; i++) {
         auto & sib = rec.inventory[i];
-        if (sib.provider != common_cache_plan_provider::live_context_checkpoint) {
+        if (sib.provider != common_cache_plan_provider::live_context_checkpoint ||
+            sib.target_slot_id != host->target_slot_id ||
+            !sib.component_only ||
+            sib.dependent_host_source_id != host->source_id) {
             continue;
         }
-        sib.component_only = true;
         const bool valid =
             sib.disposition == common_cache_plan_disposition::accepted ||
             sib.disposition == common_cache_plan_disposition::valid_not_chosen_cost;
         if (!valid) {
             continue;
         }
-        auto * chain = rec.add_chain(common_cache_plan_provider::host_cache_entry,
-                                     host_ord, (int32_t) i);
+        common_cache_plan_candidate * chain = nullptr;
+        for (uint32_t j = 0; j < n_before; ++j) {
+            auto & candidate = rec.inventory[j];
+            if (!candidate.is_chain() ||
+                candidate.provider != common_cache_plan_provider::host_cache_entry ||
+                candidate.component_ids[0] != host_ord ||
+                candidate.component_ids[1] != int32_t(i)) {
+                continue;
+            }
+            bool exact = true;
+            for (size_t k = 2; k < candidate.component_ids.size(); ++k) {
+                exact = exact && candidate.component_ids[k] == -1;
+            }
+            if (exact) {
+                chain = &candidate;
+                break;
+            }
+        }
         if (!chain) {
-            break; // derived_plans_incomplete latched; planner will refuse
+            chain = rec.add_chain(common_cache_plan_provider::host_cache_entry,
+                                  host_ord, int32_t(i));
+            if (!chain) {
+                break; // derived_plans_incomplete latched; planner will refuse
+            }
+            chain->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL);
         }
         if ((int32_t) i == sel_ckpt && sib.delivered) {
-            chain->disposition = common_cache_plan_disposition::accepted;
-            chain->delivered   = true;
+            chain->accept();
+            chain->delivered = true;
             rec.shipped_plan_candidate = int32_t(chain - rec.inventory.data());
             shipped_chain_recorded = true;
-        } else {
-            chain->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL);
         }
     }
     // a composed delivery whose chain could not be recorded has NO honest shipped-plan

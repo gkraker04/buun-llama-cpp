@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-cache-plan-authority.h"
 
 #include "build-info.h"
 #include "server-cache-authority.h"
@@ -1770,6 +1771,18 @@ bool server_prompt_cache::contains(const server_tokens & tokens, const std::stri
     return false;
 }
 
+void server_prompt_cache::cache_plan_begin_inventory() noexcept {
+    cache_plan_n_source_instances = 0;
+}
+
+bool server_prompt_cache::cache_plan_get_source_id(
+        server_prompt_cache_state & state,
+        int32_t & source_id) noexcept {
+    return server_cache_plan_find_or_assign_source_id(
+        &state, cache_plan_source_instances,
+        cache_plan_n_source_instances, source_id);
+}
+
 std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
     // calculate checkpoints size to see if it will fit with the prompt. This prices the
     // invalidate-first COPY made below (checkpoint copies drop their generation-record shadow),
@@ -2185,23 +2198,39 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     // observer tallies [B-a]: these exist only in the observed instantiation, and only carry
     // values this selection computes anyway
-    [[maybe_unused]] int32_t obs_idx      = -1;
-    [[maybe_unused]] int32_t obs_idx_best = -1;
+    [[maybe_unused]] int32_t obs_source_best = -1;
     [[maybe_unused]] int     obs_lcp_sel  = 0;
 
     // find the most similar cached prompt, that would also preserve the most context.
-    // Observer transport [A2, noexcept]: ONE row per visited entry, keyed by the entry's
-    // scan ordinal; every evaluated survivor starts as a cost loser (cost_not_minimal) and
+    // Observer transport [A2, noexcept]: ONE row per visited entry, keyed by its
+    // request-local immutable source id; every evaluated survivor starts as a cost loser and
     // the shipped winner is promoted to accepted after the scan. find_or_add returning
     // nullptr = inventory overflow — the provider's state latches and rows stop, the
     // shipped scan is untouched.
     for (auto it = states.begin(); it != states.end(); ++it) {
         [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+        [[maybe_unused]] int32_t obs_source = -1;
         if constexpr (Observed) {
-            obs_idx++;
-            row = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
-                                   obs_idx, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
-                                   rec->id_slot, rec->selection);
+            if (cache_plan_get_source_id(*it, obs_source)) {
+                row = rec->find_or_add(
+                    common_cache_plan_provider::host_cache_entry,
+                    obs_source, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                    rec->id_slot, rec->selection);
+            } else {
+                rec->inventory_states[size_t(
+                    common_cache_plan_provider::host_cache_entry)] =
+                    common_cache_plan_inventory_state::overflowed;
+            }
+        }
+
+        int lcp_cur = 0;
+        if constexpr (Observed) {
+            lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+            server_cache_plan_apply_host(row, server_cache_plan_evaluate_host(
+                !it->data.main.empty(),
+                it->adapter_config_key == adapter_config_key,
+                lcp_cur, tokens_new.size(), it->prompt.tokens.size(),
+                it->data.size()));
         }
 
         // never select a structurally-empty entry [I7/I10]: a size-0 main would "restore" as a
@@ -2209,9 +2238,6 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         // were present -> pos_min == -1 with n_past > 0 abort. The transactional save/load here
         // never produces an empty-main entry, but guard the selector so a stray one is inert.
         if (it->data.main.empty()) {
-            if constexpr (Observed) {
-                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY); }
-            }
             continue;
         }
 
@@ -2219,40 +2245,21 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         // would hand adapter A's KV to a base/adapter-B request. Live-slot rebinds are caught at
         // launch, but a host-cache entry is restored here during prefill, after that check.
         if (it->adapter_config_key != adapter_config_key) {
-            if constexpr (Observed) {
-                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH); }
-            }
             continue;
         }
 
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        if constexpr (!Observed) {
+            // Preserve the pre-B-A shipped instantiation: the potentially O(n)
+            // LCP scan occurs only after both O(1) reject guards.
+            lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        }
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
-        if constexpr (Observed) {
-            if (row) {
-                // metadata the shipped loop computed (plus O(1) payload sizes per B-a's
-                // metadata-level allowance)
-                row->lcp_tokens    = llama_cache_acct_value::measured((uint64_t) lcp_cur);
-                row->payload_bytes = llama_cache_acct_value::measured(
-                    (uint64_t) it->data.main.size() + (uint64_t) it->data.drft.size());
-                row->sim    = sim_cur;    row->sim_known    = true;
-                row->f_keep = f_keep_cur; row->f_keep_known = true;
-            }
-        }
-
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
-            if constexpr (Observed) {
-                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
-            }
             continue;
-        }
-
-        if constexpr (Observed) {
-            // valid candidate; not-chosen by the shipped heuristic unless promoted below
-            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL); }
         }
 
         if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
@@ -2261,7 +2268,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
             it_best = it;
             if constexpr (Observed) {
-                obs_idx_best = obs_idx;
+                obs_source_best = obs_source;
                 obs_lcp_sel  = lcp_cur; // the winner's exact LCP, from the shipped computation
             }
         }
@@ -2271,9 +2278,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         // the scan visits every entry (no short-circuit): the declared domain is complete
         // even when it is empty
         rec->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
-        if (it_best != states.end() && obs_idx_best >= 0) {
+        if (it_best != states.end() && obs_source_best >= 0) {
             auto * win = rec->find_or_add(common_cache_plan_provider::host_cache_entry,
-                                          obs_idx_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                                          obs_source_best, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
                                           rec->id_slot, rec->selection);
             if (win) {
                 win->accept(); // shipped winner: promote over the scan-time cost-loser default

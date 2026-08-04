@@ -184,3 +184,8 @@ constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
 // until D.
 common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib);
+
+// The single planner attempt boundary shared by pre-mutation B-A staging and
+// legacy finalize fallback. It owns profile lookup and exception isolation.
+common_cache_plan_planner_status common_cache_plan_run_planner(
+        common_cache_plan_record & rec) noexcept;

@@ -458,3 +458,21 @@ common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
     }
     return status;
 }
+
+common_cache_plan_planner_status common_cache_plan_run_planner(
+        common_cache_plan_record & rec) noexcept {
+    try {
+        if (rec.calibration_profile.empty()) {
+            rec.planner_status = common_cache_plan_planner_status::no_profile;
+        } else if (const auto * calib =
+                       common_cache_plan_calib_find(rec.calibration_profile)) {
+            rec.planner_status = common_cache_plan_estimate_and_choose(rec, *calib);
+        } else {
+            rec.planner_status = common_cache_plan_planner_status::profile_unfitted;
+        }
+    } catch (...) {
+        rec.clear_planner_outputs();
+        rec.planner_status = common_cache_plan_planner_status::internal_fault;
+    }
+    return rec.planner_status;
+}

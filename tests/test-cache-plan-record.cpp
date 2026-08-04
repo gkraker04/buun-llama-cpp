@@ -535,13 +535,18 @@ static void test_compose_chains() {
         host->accept(); host->delivered = true;
         auto * sel = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
                                      COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
-        sel->accept(); sel->delivered = true;
+        sel->accept(); sel->delivered = true; sel->component_only = true;
+        sel->dependent_host_source_id = host->source_id;
         auto * sib = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 1,
                                      COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
         sib->note_reject(COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL); // valid loser
+        sib->component_only = true;
+        sib->dependent_host_source_id = host->source_id;
         auto * bad = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 2,
                                      COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
         bad->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED); // invalid
+        bad->component_only = true;
+        bad->dependent_host_source_id = host->source_id;
         rec.select(common_cache_plan_provider::host_cache_entry, host);
         rec.select(common_cache_plan_provider::live_context_checkpoint, sel);
         rec.chosen = common_cache_plan_provider::live_context_checkpoint;
@@ -573,7 +578,8 @@ static void test_compose_chains() {
         host->accept(); host->delivered = true;
         auto * sel = rec.find_or_add(common_cache_plan_provider::live_context_checkpoint, 0,
                                      COMMON_CACHE_PLAN_PHASE_CKPT_SCAN);
-        sel->accept(); sel->delivered = true;
+        sel->accept(); sel->delivered = true; sel->component_only = true;
+        sel->dependent_host_source_id = host->source_id;
         for (int32_t i = 1; rec.n_inventory < COMMON_CACHE_PLAN_MAX_CANDIDATES; i++) {
             rec.find_or_add(common_cache_plan_provider::live_slot, i,
                             COMMON_CACHE_PLAN_PHASE_LRU)

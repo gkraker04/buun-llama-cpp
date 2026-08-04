@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-cache-authority.h"
+#include "server-cache-plan-authority.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
 #include "server-task.h"
@@ -380,7 +381,6 @@ struct server_cache_plan_observer {
     // distinct from observer faults; the per-record closed status carries the WHY
     uint64_t planner_ok      = 0;
     uint64_t planner_refused = 0;
-    common_cache_plan_authority_counters authority;
 
     // B-2 stable calibration-profile id ("{model class}/{hardware class}/b{batch}"),
     // composed once at observer init; copied onto every record. Empty = unprofiled.
@@ -1901,6 +1901,10 @@ private:
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
     std::thread::id vbr_capture_scheduler_thread;
 
+    // B-A authority substrate. Independent of debug serialization: non-off
+    // graduated levels dual-run even when CACHE_PLAN JSON is disabled.
+    std::unique_ptr<server_cache_plan_authority> cache_plan_authority;
+
     // B0 shadow cache-plan observer [P2]. Constructed ONLY under params_base.cache_debug (B-a
     // literal: no observer object, no record init, no hook work of any kind on the disabled path
     // — absence IS the disabled state). References cache_authority for the substrate it records.
@@ -2717,18 +2721,8 @@ private:
             // only; B0 finalization and emission continue unconditionally. Every attempt
             // outcome is a closed status on the record, and refusals move the observer
             // counter exactly once (verify-r1 finding 8).
-            try {
-                if (rec.calibration_profile.empty()) {
-                    rec.planner_status = common_cache_plan_planner_status::no_profile;
-                } else if (const auto * calib = common_cache_plan_calib_find(rec.calibration_profile)) {
-                    // refusal is all-or-nothing inside the estimator (its postcondition)
-                    rec.planner_status = common_cache_plan_estimate_and_choose(rec, *calib);
-                } else {
-                    rec.planner_status = common_cache_plan_planner_status::profile_unfitted;
-                }
-            } catch (...) {
-                rec.clear_planner_outputs();
-                rec.planner_status = common_cache_plan_planner_status::internal_fault;
+            if (!rec.planner_precomputed) {
+                common_cache_plan_run_planner(rec);
             }
             if (cache_plan_obs) {
                 if (rec.planner_status == common_cache_plan_planner_status::ok) {
@@ -2737,25 +2731,30 @@ private:
                     cache_plan_obs->planner_refused++;
                 }
             }
-            common_cache_plan_finalize_shadow_authority(rec);
-            if (cache_plan_obs) {
-                cache_plan_obs->authority.observe(rec.authority);
+            if (cache_plan_authority) {
+                cache_plan_authority->finalize_legacy_execution(rec);
+            } else {
+                common_cache_plan_finalize_shadow_authority(rec);
             }
 
-            json out = common_cache_plan_record_json(rec);
             if (cache_plan_obs) {
+                json out = common_cache_plan_record_json(rec);
                 cache_plan_obs->records_finalized++;
                 json authority_by_tier = json::object();
+                // cache_plan_obs implies the shared debug-or-authority substrate,
+                // so cache_plan_authority is always present here.
+                GGML_ASSERT(cache_plan_authority);
+                const auto & authority = cache_plan_authority->counters;
                 for (size_t tier = 0;
                      tier < size_t(common_cache_plan_selection::_count); tier++) {
                     authority_by_tier[common_cache_plan_selection_name(
                         common_cache_plan_selection(tier))] = json {
-                        { "observed", cache_plan_obs->authority.observed[tier] },
-                        { "eligible", cache_plan_obs->authority.authority_eligible[tier] },
-                        { "executed", cache_plan_obs->authority.authority_executed[tier] },
-                        { "agree", cache_plan_obs->authority.agree[tier] },
-                        { "disagree", cache_plan_obs->authority.disagree[tier] },
-                        { "fallback_legacy", cache_plan_obs->authority.fallback_legacy[tier] },
+                        { "observed", authority.observed[tier] },
+                        { "eligible", authority.authority_eligible[tier] },
+                        { "executed", authority.authority_executed[tier] },
+                        { "agree", authority.agree[tier] },
+                        { "disagree", authority.disagree[tier] },
+                        { "fallback_legacy", authority.fallback_legacy[tier] },
                     };
                 }
                 out["observer"] = json {
@@ -2765,11 +2764,10 @@ private:
                     { "planner_refused",    cache_plan_obs->planner_refused },
                     { "authority",          std::move(authority_by_tier) },
                 };
+
+                SRV_INF("CACHE_PLAN %s\n", out.dump().c_str());
+                slot.cache_plan_json = std::move(out); // built once; /slots reuses it verbatim
             }
-
-            SRV_INF("CACHE_PLAN %s\n", out.dump().c_str());
-
-            slot.cache_plan_json = std::move(out); // built once; /slots reuses it verbatim
             slot.cache_plan.reset();
         } catch (...) {
             if (cache_plan_obs) {
@@ -4449,6 +4447,13 @@ private:
         // B0 shadow observer [P2]: constructed only under params_base.cache_debug — the observer
         // object and both surfaces exist iff the flag is set. Off = strictly zero observer work
         // (B-a). It records the shared authority substrate above (owned by server_context).
+        const auto plan_authority_level = params_base.cache_plan_authority;
+        if (params_base.cache_debug ||
+            plan_authority_level != common_cache_plan_authority_level::off) {
+            cache_plan_authority =
+                std::make_unique<server_cache_plan_authority>(plan_authority_level);
+        }
+
         if (params_base.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
             cache_authority->destruction.lease_context = &cache_authority->leases;
@@ -4897,7 +4902,7 @@ private:
             }
         }
 
-        if (cache_plan_obs) {
+        if (cache_plan_obs || cache_plan_authority) {
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -4909,7 +4914,7 @@ private:
                 char desc[256] = {0};
                 llama_model_desc(model_tgt, desc, sizeof(desc));
 
-                cache_plan_obs->calibration_profile = common_cache_plan_calib_profile(
+                const auto calibration_profile = common_cache_plan_calib_profile(
                     desc,
                     common_cache_plan_calib_hw(gpu_descs, ngl_eff,
                                                int(params_base.split_mode),
@@ -4932,9 +4937,17 @@ private:
                             ggml_type_name(params_base.cache_type_k),
                             ggml_type_name(params_base.cache_type_v));
                     }());
+                if (cache_plan_obs) {
+                    cache_plan_obs->calibration_profile = calibration_profile;
+                }
+                if (cache_plan_authority) {
+                    cache_plan_authority->calibration_profile = calibration_profile;
+                }
             }
-            SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
-                    cache_plan_obs->calibration_profile.c_str());
+            if (cache_plan_obs) {
+                SRV_INF("cache-debug enabled: shadow cache-plan records per request (JSON log line + /slots.cache_plan), calibration profile '%s'\n",
+                        cache_plan_obs->calibration_profile.c_str());
+            }
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -5140,10 +5153,303 @@ private:
         return nullptr;
     }
 
+    uint64_t cache_plan_capability_snapshot(const server_task & task) const noexcept {
+        uint64_t hash = 1469598103934665603ull;
+        hash = server_cache_plan_capability_fold(hash, uint64_t(uint32_t(task.id_slot)));
+        hash = server_cache_plan_capability_fold(hash, task.tokens.size());
+        for (const auto & slot : slots) {
+            hash = server_cache_plan_capability_fold(hash, uint64_t(uint32_t(slot.id)));
+            hash = server_cache_plan_capability_fold(hash, slot.is_processing());
+            hash = server_cache_plan_capability_fold(hash, slot.prompt.tokens.size());
+            hash = server_cache_plan_capability_fold(hash, slot.prompt.checkpoints.size());
+            hash = server_cache_plan_capability_fold(hash, uint64_t(slot.t_last_used));
+            hash = server_cache_plan_capability_fold(hash, slot.can_speculate());
+        }
+        if (prompt_cache) {
+            hash = server_cache_plan_capability_fold(hash, prompt_cache->states.size());
+            for (const auto & state : prompt_cache->states) {
+                hash = server_cache_plan_capability_fold(hash, state.prompt.tokens.size());
+                hash = server_cache_plan_capability_fold(hash, state.prompt.checkpoints.size());
+                hash = server_cache_plan_capability_fold(hash, state.data.size());
+                hash = server_cache_plan_capability_fold(hash,
+                    std::hash<std::string>{}(state.adapter_config_key));
+            }
+        }
+        return hash;
+    }
+
+    common_cache_plan_selection cache_plan_origin_for(
+            const server_task & task,
+            uint64_t lcp) const noexcept {
+        if (task.id_slot != -1) {
+            return common_cache_plan_selection::by_id;
+        }
+        const float sim = task.tokens.empty()
+            ? 0.0f : float(lcp) / float(task.tokens.size());
+        // Keep in lockstep with the shipped tier boundaries below: strict
+        // similarity threshold, then dynamic-VBR route-home, then LRU.
+        if (slot_prompt_similarity != 0.0f && sim > slot_prompt_similarity) {
+            return common_cache_plan_selection::similarity;
+        }
+        if (server_vbr_dynamic_active(params_base) && lcp > 0) {
+            return common_cache_plan_selection::route_home;
+        }
+        return common_cache_plan_selection::lru;
+    }
+
+    bool cache_plan_target_in_domain(
+            const server_task & task,
+            const server_slot & slot) const noexcept {
+        return !slot.is_processing() &&
+               (task.id_slot == -1 || slot.id == task.id_slot);
+    }
+
+    bool cache_plan_inventory_live_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            common_cache_plan_record & rec) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & slot = slots[i];
+            if (task.id_slot != -1 && slot.id != task.id_slot) {
+                continue;
+            }
+            const auto origin = cache_plan_origin_for(task, slot_lcps[i]);
+            auto * row = rec.find_or_add(
+                common_cache_plan_provider::live_slot, slot.id,
+                COMMON_CACHE_PLAN_PHASE_LRU, slot.id, origin);
+            if (!row) {
+                return false;
+            }
+            server_cache_plan_apply_live(row, server_cache_plan_evaluate_live(
+                slot.is_processing(), !slot.prompt.tokens.empty(), slot_lcps[i],
+                task.tokens.size()));
+            // The shipped similarity scan visits below-threshold rows too;
+            // authority membership is the first tier that can select the target.
+            row->origin_tier = origin;
+            row->t_last_used_us = llama_cache_acct_value::measured(
+                uint64_t(std::max<int64_t>(slot.t_last_used, 0)));
+            row->spec_capable = slot.can_speculate();
+            row->spec_capable_known = true;
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::live_slot);
+        return true;
+    }
+
+    bool cache_plan_inventory_host_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            const std::string & incoming_adapter,
+            bool recurrent,
+            common_cache_plan_record & rec) {
+        if (!prompt_cache) {
+            rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+            return true;
+        }
+        for (auto & state : prompt_cache->states) {
+            int32_t host_source_id = -1;
+            if (!prompt_cache->cache_plan_get_source_id(
+                    state, host_source_id)) {
+                rec.inventory_states[size_t(
+                    common_cache_plan_provider::host_cache_entry)] =
+                    common_cache_plan_inventory_state::overflowed;
+                return false;
+            }
+            const uint64_t lcp = state.prompt.tokens.get_common_prefix(task.tokens);
+            const auto host_eval = server_cache_plan_evaluate_host(
+                !state.data.main.empty(),
+                state.adapter_config_key == incoming_adapter,
+                lcp, task.tokens.size(), state.prompt.tokens.size(),
+                state.data.size());
+            std::vector<server_cache_plan_checkpoint_evaluation> checkpoint_evals;
+            checkpoint_evals.reserve(state.prompt.checkpoints.size());
+            for (const auto & checkpoint : state.prompt.checkpoints) {
+                checkpoint_evals.push_back(server_cache_plan_evaluate_checkpoint(
+                    !checkpoint.empty(), true, recurrent, true,
+                    checkpoint.pos_min, checkpoint.pos_max,
+                    int64_t(lcp), 0, checkpoint.size_without_shadow()));
+            }
+
+            for (size_t target_i = 0; target_i < slots.size(); ++target_i) {
+                const auto & candidate_target = slots[target_i];
+                if (!cache_plan_target_in_domain(task, candidate_target)) {
+                    continue;
+                }
+                const auto origin = cache_plan_origin_for(task, slot_lcps[target_i]);
+                auto * host = rec.find_or_add(
+                    common_cache_plan_provider::host_cache_entry, host_source_id,
+                    COMMON_CACHE_PLAN_PHASE_HOST_SCAN, candidate_target.id, origin);
+                if (!host) {
+                    return false;
+                }
+                server_cache_plan_apply_host(host, host_eval);
+
+                int32_t checkpoint_ordinal = 0;
+                for (const auto & eval : checkpoint_evals) {
+                    const int32_t checkpoint_source =
+                        server_cache_plan_host_checkpoint_source_id(
+                            host_source_id, checkpoint_ordinal++);
+                    if (checkpoint_source < 0) {
+                        rec.inventory_states[size_t(
+                            common_cache_plan_provider::live_context_checkpoint)] =
+                            common_cache_plan_inventory_state::overflowed;
+                        return false;
+                    }
+                    auto * checkpoint = rec.find_or_add(
+                        common_cache_plan_provider::live_context_checkpoint,
+                        checkpoint_source,
+                        COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                        candidate_target.id, origin);
+                    if (!checkpoint) {
+                        return false;
+                    }
+                    server_cache_plan_apply_checkpoint(checkpoint, eval);
+                    if (server_cache_plan_viable(host_eval.reason) &&
+                        server_cache_plan_viable(eval.reason)) {
+                        checkpoint->component_only = true;
+                        checkpoint->dependent_host_source_id = host_source_id;
+                        auto * chain = rec.add_chain(
+                            common_cache_plan_provider::host_cache_entry,
+                            int32_t(host - rec.inventory.data()),
+                            int32_t(checkpoint - rec.inventory.data()));
+                        if (!chain) {
+                            return false;
+                        }
+                        chain->target_slot_id = candidate_target.id;
+                        chain->origin_tier = origin;
+                        chain->disposition =
+                            common_cache_plan_disposition::valid_not_chosen_cost;
+                    }
+                }
+            }
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+        return true;
+    }
+
+    bool cache_plan_inventory_checkpoint_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            bool recurrent,
+            common_cache_plan_record & rec) {
+        // Complete planner scan. The shipped restore keeps its reverse find_if
+        // and its shipped-visited transport below.
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & candidate_target = slots[i];
+            if (!cache_plan_target_in_domain(task, candidate_target)) {
+                continue;
+            }
+            const llama_pos pos_next = task.tokens.pos_next(slot_lcps[i]);
+            const bool has_new_tokens = slot_lcps[i] < task.tokens.size();
+            const llama_pos pos_min_threshold =
+                std::max<llama_pos>(
+                    0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+            const auto vbr_now = llama_memory_vbr_state(
+                llama_get_memory(ctx_tgt), candidate_target.id, 0);
+            std::string adapter_identity;
+            bool adapter_known = true;
+            try {
+                adapter_identity = lora_config_identity(candidate_target.lora);
+            } catch (...) {
+                adapter_known = false;
+            }
+            int32_t checkpoint_ordinal = 0;
+            for (const auto & checkpoint : candidate_target.prompt.checkpoints) {
+                const bool representation_matches =
+                    !recurrent ||
+                    (checkpoint.representation_epoch == vbr_now.representation_epoch &&
+                     checkpoint.representation_epoch_swa == vbr_now.representation_epoch_swa);
+                const bool frontier_current =
+                    !candidate_target.frontier_ratchet_flipped ||
+                    (adapter_known && checkpoint_frontier_is_current(
+                        candidate_target, checkpoint, adapter_identity));
+                auto * row = rec.find_or_add(
+                    common_cache_plan_provider::live_context_checkpoint,
+                    checkpoint_ordinal++, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                    candidate_target.id,
+                    cache_plan_origin_for(task, slot_lcps[i]));
+                if (!row) {
+                    return false;
+                }
+                server_cache_plan_apply_checkpoint(row,
+                    server_cache_plan_evaluate_checkpoint(
+                        !checkpoint.empty(), frontier_current, recurrent,
+                        representation_matches, checkpoint.pos_min,
+                        checkpoint.pos_max, pos_next, pos_min_threshold,
+                        checkpoint.size_without_shadow()));
+            }
+        }
+        rec.note_inventory_complete(
+            common_cache_plan_provider::live_context_checkpoint);
+        rec.authority_inventory_complete = true;
+        return true;
+    }
+
+    bool cache_plan_inventory_cold_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            common_cache_plan_record & rec) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & candidate_target = slots[i];
+            if (!cache_plan_target_in_domain(task, candidate_target)) {
+                continue;
+            }
+            auto * cold = rec.find_or_add(
+                common_cache_plan_provider::cold_replay,
+                COMMON_CACHE_PLAN_SOURCE_AGGREGATE, 0, candidate_target.id,
+                cache_plan_origin_for(task, slot_lcps[i]));
+            if (!cold) {
+                return false;
+            }
+            cold->accept();
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
+        return true;
+    }
+
+    void cache_plan_inventory_before_mutation(
+            const server_task & task,
+            server_slot & target,
+            const std::string & incoming_adapter,
+            common_cache_plan_record & rec) {
+        rec.id_slot = target.id;
+        rec.n_prompt_tokens = llama_cache_acct_value::measured(task.tokens.size());
+        rec.identity.adapter_config_digest = llama_cache_acct_value::measured(
+            std::hash<std::string>{}(incoming_adapter));
+
+        if (prompt_cache) {
+            prompt_cache->cache_plan_begin_inventory();
+        }
+
+        std::vector<uint64_t> slot_lcps;
+        slot_lcps.reserve(slots.size());
+        for (const auto & slot : slots) {
+            slot_lcps.push_back(slot.prompt.tokens.get_common_prefix(task.tokens));
+        }
+        const bool recurrent = llama_model_is_recurrent(model_tgt) ||
+                               llama_model_is_hybrid(model_tgt);
+
+        // A fixed record is an honest bounded surface, not a promise that a
+        // cross-product always fits. Any failed append latches provider
+        // overflow (or derived_plans_incomplete); stop paying work immediately.
+        if (!cache_plan_inventory_live_rows(task, slot_lcps, rec) ||
+            !cache_plan_inventory_host_rows(
+                task, slot_lcps, incoming_adapter, recurrent, rec) ||
+            !cache_plan_inventory_checkpoint_rows(
+                task, slot_lcps, recurrent, rec) ||
+            !cache_plan_inventory_cold_rows(task, slot_lcps, rec)) {
+            GGML_ASSERT(rec.inventory_saturated());
+            return;
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool selection_deferred_busy = false;
+        std::vector<common_adapter_lora_info> incoming_loras;
+        std::string incoming_adapter;
+        bool incoming_adapter_ready = false;
 
         // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
         // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
@@ -5155,13 +5461,14 @@ private:
         // every row write from here on is noexcept (fixed-array record), so the shipped path
         // cannot throw through the observer. An allocation fault is swallowed and counted.
         std::unique_ptr<common_cache_plan_record> plan_rec;
-        if (cache_plan_obs) {
+        if (cache_plan_authority) {
             try {
                 plan_rec = std::make_unique<common_cache_plan_record>();
                 plan_rec->id_task = task.id;
                 // B-2: the profile is composed once at init and copied here (inside the
                 // creation try — never from a selector hook)
-                plan_rec->calibration_profile = cache_plan_obs->calibration_profile;
+                plan_rec->calibration_profile =
+                    cache_plan_authority->calibration_profile;
                 // opaque identity evidence from already-computed keys (never raw values);
                 // identities the server has not computed stay typed unknown
                 plan_rec->identity.model_digest = llama_cache_acct_value::measured(
@@ -5187,7 +5494,9 @@ private:
                     plan_rec->identity.prefix_token_digest = llama_cache_acct_value::measured(h);
                 }
             } catch (...) {
-                cache_plan_obs->shadow_unavailable++;
+                if (cache_plan_obs) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
             }
         }
 
@@ -5264,16 +5573,9 @@ private:
                     sim_best_any = std::max(sim_best_any, sim_cur);
 
                     if constexpr (Obs) {
-                        if (row) {
-                            row->sim        = sim_cur; row->sim_known = true;
-                            row->lcp_tokens = llama_cache_acct_value::measured((uint64_t) lcp_cur);
-                            // B-8 applies to the LCP itself, not the shipped selection threshold
-                            // (verify-r1 finding 2): ANY nonzero overlap is a valid replay plan —
-                            // a below-threshold slot is a cost loser, not a coverage reject
-                            row->note_reject(lcp_cur > 0
-                                ? COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL
-                                : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
-                        }
+                        server_cache_plan_apply_live(row,
+                            server_cache_plan_evaluate_live(
+                                false, true, lcp_cur, task.tokens.size()));
                     }
 
                     // select the current slot if the criteria match
@@ -5350,14 +5652,9 @@ private:
 
                     const size_t lcp = tokens.get_common_prefix(task.tokens);
                     if constexpr (Obs) {
-                        if (row) {
-                            row->lcp_tokens = llama_cache_acct_value::measured(lcp);
-                            // zero overlap WITH state is a coverage rejection [B-8]; any nonzero LCP
-                            // is a valid route-home candidate that loses unless promoted below
-                            row->note_reject(lcp > 0
-                                ? COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL
-                                : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
-                        }
+                        server_cache_plan_apply_live(row,
+                            server_cache_plan_evaluate_live(
+                                false, true, lcp, task.tokens.size()));
                     }
                     if (lcp > lcp_best) {
                         lcp_best = lcp;
@@ -5442,7 +5739,41 @@ private:
             }
         }
 
+        if (ret && ret->is_processing()) {
+            // A by-id task targeting a busy slot is deferred by the caller.
+            // Do not replace that slot's in-flight evidence record with this
+            // retry's local record; shipped selection/mutation remains intact.
+            selection_deferred_busy = true;
+            plan_rec.reset();
+        }
+
         if (ret) {
+            if (plan_rec) {
+                // plan_rec is created only by the debug-or-authority substrate,
+                // which always owns cache_plan_authority.
+                GGML_ASSERT(cache_plan_authority);
+                const uint64_t capability_before =
+                    cache_plan_capability_snapshot(task);
+                try {
+                    incoming_loras = task.params.lora.empty()
+                        ? params_base.lora_adapters
+                        : construct_lora_list(task.params.lora);
+                    incoming_adapter = lora_config_identity(incoming_loras);
+                    incoming_adapter_ready = true;
+                    cache_plan_inventory_before_mutation(
+                        task, *ret, incoming_adapter, *plan_rec);
+                    const uint64_t capability_after =
+                        cache_plan_capability_snapshot(task);
+                    cache_plan_authority->plan_before_mutation(
+                        *plan_rec, capability_before, capability_after);
+                } catch (...) {
+                    cache_plan_authority->fail_closed(*plan_rec);
+                    if (cache_plan_obs) {
+                        cache_plan_obs->shadow_unavailable++;
+                    }
+                }
+            }
+
             // B0: the record follows the chosen slot; stages 2-3 and finalize find it there
             if (plan_rec) {
                 plan_rec->id_slot = ret->id;
@@ -5477,42 +5808,52 @@ private:
                 // still the previous occupant's config here and would mis-key the cache lookup.
                 ret->prompt_save(*prompt_cache);
 
-                const auto incoming_loras = task.params.lora.empty()
-                    ? params_base.lora_adapters
-                    : construct_lora_list(task.params.lora);
+                // A busy by-id selection is returned for caller-side deferral.
+                // Its existing record belongs to the in-flight request, so this
+                // retry must not append host evidence to it.
+                common_cache_plan_record * request_cache_plan =
+                    selection_deferred_busy ? nullptr : ret->cache_plan.get();
+
+                if (!incoming_adapter_ready) {
+                    incoming_loras = task.params.lora.empty()
+                        ? params_base.lora_adapters
+                        : construct_lora_list(task.params.lora);
+                    incoming_adapter = lora_config_identity(incoming_loras);
+                    incoming_adapter_ready = true;
+                }
 
                 // Only restore from the host cache when the selected slot's current adapter identity
                 // already matches the incoming request's [finding 1]. Otherwise launch_slot_with_task
                 // clears this slot for the adapter change, so a restore here would consume a cache
                 // entry only to have it immediately wiped. (Cross-identity reuse -- moving a request
                 // onto a differently-bound LRU slot -- needs identity-aware selection, deferred.)
-                if (ret->cache_plan) {
+                if (request_cache_plan) {
                     // adapter identity: the shipped path computes this key for the lookup
-                    ret->cache_plan->identity.adapter_config_digest = llama_cache_acct_value::measured(
-                        std::hash<std::string>{}(lora_config_identity(incoming_loras)));
+                    request_cache_plan->identity.adapter_config_digest = llama_cache_acct_value::measured(
+                        std::hash<std::string>{}(incoming_adapter));
                 }
                 if (are_lora_equal(incoming_loras, ret->lora)) {
                     // B0 stage-2: per-entry host rows ride the shipped lookup [B-a/A2]
-                    if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(incoming_loras),
-                                          ret->cache_plan.get())) {
-                        if (ret->cache_plan) {
-                            ret->cache_plan->restore_attempt_failed = true;
+                    if (!ret->prompt_load(*prompt_cache, task.tokens, incoming_adapter,
+                                          request_cache_plan)) {
+                        if (request_cache_plan) {
+                            request_cache_plan->restore_attempt_failed = true;
                         }
                         ret->mandatory_recovery_reset(
                             server_cache_destruction_reason::restore_failure);
                     }
-                } else if (ret->cache_plan) {
+                } else if (request_cache_plan) {
                     // shipped path skips the lookup entirely for the adapter change [finding 1]:
                     // no entries were scanned (empty declared domain) — the classified fact is
                     // provider-level, carried by one aggregate row (source -1)
-                    auto * row = ret->cache_plan->find_or_add(
+                    auto * row = request_cache_plan->find_or_add(
                         common_cache_plan_provider::host_cache_entry,
                         COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0), ret->id,
-                        ret->cache_plan->selection);
+                        request_cache_plan->selection);
                     if (row) {
                         row->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
                     }
-                    ret->cache_plan->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+                    request_cache_plan->note_inventory_complete(common_cache_plan_provider::host_cache_entry);
                 }
 
                 prompt_cache->update();
@@ -8341,6 +8682,9 @@ private:
                                     // tier / cells were reused / the controller was reset). All-zero when
                                     // VBR is inactive, so this rejects nothing then.
                                     const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+                                    const bool recurrent =
+                                        llama_model_is_recurrent(model_tgt) ||
+                                        llama_model_is_hybrid(model_tgt);
 
                                     // [obs] count checkpoints rejected specifically for a changed VBR
                                     // representation, to explain a resulting cold reprocess in /slots
@@ -8393,40 +8737,27 @@ private:
                                             // reach the mutating restore path.
                                             [[maybe_unused]] uint64_t obs_bytes = 0;
                                             if constexpr (Obs) { obs_bytes = (uint64_t) cur.size_without_shadow(); }
-                                            if (cur.empty()) {
-                                                if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY, cur.pos_max, obs_bytes); }
-                                                return false;
+                                            const bool representation_matches =
+                                                !recurrent ||
+                                                (cur.representation_epoch == vbr_now.representation_epoch &&
+                                                 cur.representation_epoch_swa == vbr_now.representation_epoch_swa);
+                                            const auto evaluation =
+                                                server_cache_plan_evaluate_checkpoint(
+                                                    !cur.empty(), true, recurrent,
+                                                    representation_matches,
+                                                    cur.pos_min, cur.pos_max, pos_next,
+                                                    pos_min_thold, obs_bytes);
+                                            const bool ok = server_cache_plan_viable(
+                                                evaluation.reason);
+                                            if (!cur.empty() && !representation_matches) {
+                                                n_ckpt_rejected_vbr++;
                                             }
-                                            // for hybrid/recurrent models (DeltaNet, Mamba), pos_min always equals
-                                            // the full sequence length, so the SWA-based pos_min check always fails.
-                                            // use pos_max < pos_next to find the most recent valid checkpoint whose
-                                            // frontier is at or before the divergence point [I11/N1]: pos_max == pos_next
-                                            // (frontier == pos_next+1) would include the first divergent token, so restoring
-                                            // it and trimming to pos_next demands a 1-token recurrent rollback of a
-                                            // just-restored state (valid depth 0 -> rejected). Strictly earlier frontiers
-                                            // replay forward with no rollback.
-                                            if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
-                                                // [I9] fail closed on a changed attention representation: pairing the
-                                                // exact recurrent state with a moved/reused attention KV is not the
-                                                // captured state. Conservative (rejects tier-only changes too); P0
-                                                // fails closed, a later phase may admit a validated live_rebased.
-                                                if (cur.representation_epoch     != vbr_now.representation_epoch ||
-                                                    cur.representation_epoch_swa != vbr_now.representation_epoch_swa) {
-                                                    n_ckpt_rejected_vbr++;
-                                                    if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED, cur.pos_max, obs_bytes); }
-                                                    return false;
-                                                }
-                                                const bool ok = cur.pos_max < pos_next;
-                                                if constexpr (Obs) { obs_legacy_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
-                                                return ok;
+                                            if constexpr (Obs) {
+                                                obs_legacy_buf.note(
+                                                    ok ? COMMON_CACHE_PLAN_REASON_NONE
+                                                       : evaluation.reason,
+                                                    cur.pos_max, obs_bytes);
                                             }
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                if constexpr (Obs) { obs_legacy_buf.note(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
-                                                return false;
-                                            }
-                                            const bool ok = cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                            if constexpr (Obs) { obs_legacy_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
                                             return ok;
                                         };
                                     };
@@ -8477,8 +8808,7 @@ private:
                                                     return false;
                                                 }
                                                 frontier_eligible = true;
-                                                if (llama_model_is_recurrent(model_tgt) ||
-                                                    llama_model_is_hybrid(model_tgt)) {
+                                                if (recurrent) {
                                                     if (cur.representation_epoch !=
                                                             vbr_now.representation_epoch ||
                                                         cur.representation_epoch_swa !=
@@ -8553,17 +8883,36 @@ private:
                                     bool vbr_preflight_rejected = false;
 
                                     // B candidate transport [A2, noexcept]: the AUTHORITATIVE
-                                    // scan's visit buffer becomes checkpoint candidate rows
-                                    // (ordinal = reverse-scan position). The short-circuit
+                                    // scan's visit buffer becomes checkpoint candidate rows.
+                                    // Reverse visit positions are translated to the stable
+                                    // forward container ordinal before row identity joins.
+                                    // The short-circuit
                                     // leaves later siblings outside the declared domain —
                                     // recorded as truncation, never extrapolated (r3 A1).
                                     if (slot.cache_plan) {
                                         auto & rec = *slot.cache_plan;
                                         const auto & buf = use_frontier ? obs_frontier_buf : obs_legacy_buf;
+                                        int32_t checkpoint_host_source = -1;
+                                        if (const auto * host = rec.selected_row(
+                                                common_cache_plan_provider::host_cache_entry);
+                                            host && host->delivered && host->source_id >= 0) {
+                                            checkpoint_host_source = host->source_id;
+                                        }
                                         for (uint32_t i = 0; i < buf.n; i++) {
+                                            const int32_t checkpoint_source =
+                                                server_cache_plan_checkpoint_source_id_from_reverse(
+                                                    slot.prompt.checkpoints.size(), i,
+                                                    checkpoint_host_source);
+                                            if (checkpoint_source < 0) {
+                                                rec.inventory_states[size_t(
+                                                    common_cache_plan_provider::live_context_checkpoint)] =
+                                                    common_cache_plan_inventory_state::overflowed;
+                                                break;
+                                            }
                                             auto * row = rec.find_or_add(
                                                 common_cache_plan_provider::live_context_checkpoint,
-                                                (int32_t) i, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                checkpoint_source,
+                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
                                                 slot.id, rec.selection);
                                             if (!row) {
                                                 break; // record inventory overflowed (state latched)
@@ -8571,6 +8920,8 @@ private:
                                             row->lcp_tokens    = llama_cache_acct_value::measured(
                                                 (uint64_t) std::max<int32_t>(buf.v[i].pos_max, 0));
                                             row->payload_bytes = llama_cache_acct_value::measured(buf.v[i].bytes);
+                                            row->component_only = checkpoint_host_source >= 0;
+                                            row->dependent_host_source_id = checkpoint_host_source;
                                             if (buf.v[i].cls == COMMON_CACHE_PLAN_REASON_NONE) {
                                                 // the scan's first eligible entry = the shipped selection;
                                                 // restore failures below demote it via note_reject
@@ -8584,7 +8935,9 @@ private:
                                             rec.inventory_states[size_t(common_cache_plan_provider::live_context_checkpoint)] =
                                                 common_cache_plan_inventory_state::overflowed;
                                         } else if (!do_reset && buf.n < slot.prompt.checkpoints.size()) {
-                                            rec.note_inventory_truncated(common_cache_plan_provider::live_context_checkpoint);
+                                            if (!rec.authority_inventory_complete) {
+                                                rec.note_inventory_truncated(common_cache_plan_provider::live_context_checkpoint);
+                                            }
                                         } else {
                                             rec.note_inventory_complete(common_cache_plan_provider::live_context_checkpoint);
                                         }

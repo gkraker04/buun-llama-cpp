@@ -774,6 +774,12 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // Observer-only request-local node registry. Raw addresses never leave this
+    // process or enter the record; their fixed-array ordinal is the source id.
+    std::array<const void *, COMMON_CACHE_PLAN_MAX_CANDIDATES>
+        cache_plan_source_instances{};
+    uint32_t cache_plan_n_source_instances = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -781,6 +787,11 @@ struct server_prompt_cache {
     // true if a token-identical entry with the SAME adapter identity is already fully cached, i.e.
     // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
     bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
+
+    void cache_plan_begin_inventory() noexcept;
+    bool cache_plan_get_source_id(
+        server_prompt_cache_state & state,
+        int32_t & source_id) noexcept;
 
     // Transactional save is a stage -> fill -> publish sequence [I7]. stage() allocates a DETACHED
     // single-node list WITHOUT touching `states`; any allocation failure there leaves the cache

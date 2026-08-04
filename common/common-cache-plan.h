@@ -47,10 +47,10 @@ constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
               LLAMA_CACHE_ACCT_SCHEMA_VERSION);
 
-// Bounded inventory capacity (fixed-in-record option of the A2 transport contract). Sized
-// for worst realistic scan breadth (parallel slots + host-cache entries + checkpoint
-// siblings + derived chain rows); exhaustion is NOT an error: the overflow marker latches,
-// planner completeness goes unavailable, the B0 record and shipped path are untouched.
+// Bounded inventory capacity (fixed-in-record option of the A2 transport contract). No
+// fixed bound can cover the unconstrained slot x host-state x checkpoint product. A failed
+// append therefore latches typed saturation, immediately stops the authority scan, and
+// makes planner qualification unavailable; B0 emission and the shipped path continue.
 constexpr size_t COMMON_CACHE_PLAN_MAX_CANDIDATES = 96;
 
 // Bounded component references for composed candidate plans (host entry + checkpoint
@@ -262,7 +262,11 @@ struct common_cache_plan_authority_counters {
     common_cache_plan_authority_receipt last_receipt;
     bool has_receipt = false;
 
-    void observe(const common_cache_plan_authority_receipt & receipt) noexcept;
+    // `qualified` is the dual-run eligibility result, independent of whether
+    // authority actually executed. Eligibility is indexed by decision_tier;
+    // observed/agreement remain indexed by the legacy tier.
+    void observe(const common_cache_plan_authority_receipt & receipt,
+                 bool qualified = false) noexcept;
 };
 
 // Which authoritative shipped scan observed a candidate (bitmask on the row). A physical
@@ -423,6 +427,12 @@ struct common_cache_plan_candidate {
     // and a chain component, but not a standalone plan — it never enters the root optimum.
     bool component_only = false;
 
+    // Process-local composition identity for a host-dependent checkpoint. This is the
+    // source_id of the exact host entry whose restore exposed the checkpoint; -1 for
+    // standalone rows. It is deliberately not serialized: the wire identity remains the
+    // stable component ordinals of the resulting chain.
+    int32_t dependent_host_source_id = -1;
+
     common_cache_plan_disposition disposition = common_cache_plan_disposition::unavailable;
     common_cache_plan_reason      reason      = COMMON_CACHE_PLAN_REASON_NONE;
 
@@ -530,12 +540,39 @@ struct common_cache_plan_record {
     // planner must refuse.
     bool derived_plans_incomplete = false;
 
+    bool inventory_saturated() const noexcept {
+        if (derived_plans_incomplete) {
+            return true;
+        }
+        for (const auto state : inventory_states) {
+            if (state == common_cache_plan_inventory_state::overflowed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // closed planner-attempt outcome, set at finalize (verify-r1 finding 8)
     common_cache_plan_planner_status planner_status = common_cache_plan_planner_status::not_attempted;
 
     // Schema-v5 three-plan authority receipt. In B-A0a it is always shadow/off:
     // legacy/executed name the shipped plan and planner names `shadow_choice`.
+    // B-A0b planner evidence is a pre-mutation counterfactual. Agreement stats
+    // therefore include known structural noise: save-before-load can introduce
+    // a fresh host entry absent from the planner inventory; host-composed
+    // checkpoints are evaluated optimistically until the post-restore frontier
+    // exists; and a flipped frontier ratchet can select by logical-next-position
+    // while the inventory still records legacy physical coverage. Ratchet gates
+    // must separate these classes rather than treating every disagreement as an
+    // economic-policy miss.
     common_cache_plan_authority_receipt authority;
+
+    // Process-local B-A staging state; deliberately not serialized. A
+    // precomputed planner result survives legacy mutation/finalization, while
+    // the receipt remains the schema-v5 wire surface.
+    bool planner_precomputed = false;
+    bool authority_prequalified = false;
+    bool authority_inventory_complete = false;
 
     // measured actuals (never estimates)
     llama_cache_acct_value n_prompt_tokens;
@@ -689,11 +726,17 @@ const char * common_cache_plan_provider_name(common_cache_plan_provider p);
 const char * common_cache_plan_outcome_name(common_cache_plan_outcome o);
 const char * common_cache_plan_selection_name(common_cache_plan_selection s);
 const char * common_cache_plan_authority_level_name(common_cache_plan_authority_level level);
+common_cache_plan_authority_level common_cache_plan_authority_level_parse(
+    const std::string & value);
 const char * common_cache_plan_authority_state_name(common_cache_plan_authority_state state);
 const char * common_cache_plan_authority_fallback_name(common_cache_plan_authority_fallback reason);
 // Populate the B-A0a shadow/off receipt after the planner attempt. This is observation
 // only: it does not alter selection, delivery, shadow choice, or any shipped state.
 void common_cache_plan_finalize_shadow_authority(common_cache_plan_record & rec) noexcept;
+void common_cache_plan_derive_shadow_authority(
+    common_cache_plan_record & rec,
+    common_cache_plan_authority_level configured_level,
+    common_cache_plan_authority_fallback fallback_reason) noexcept;
 // Finalize-time chain composition (one testable implementation; the server calls this
 // after `chosen`/`selected`/deliveries settle). Sets shipped_plan_candidate to the
 // complete shipped plan: selected[chosen], upgraded to the delivered host→checkpoint

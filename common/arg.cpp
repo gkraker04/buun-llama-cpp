@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "common-cache-plan.h"
 
 #include "build-info.h"
 #include "chat.h"
@@ -4269,6 +4270,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_debug = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
+    add_opt(common_arg(
+        {"--cache-plan-authority"}, "LEVEL",
+        "dual-run the P2 cache-plan authority substrate at LEVEL: off, by_id, similarity, route_home, or lru (B-A0b remains shadow-only; default: off)",
+        [](common_params & params, const std::string & value) {
+            params.cache_plan_authority =
+                common_cache_plan_authority_level_parse(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_AUTHORITY"));
     add_opt(common_arg(
         {"--cache-lifecycle"},
         string_format("enable the P2 cache-lifecycle authority substrate (accounting-gated admission); no observer serialization, independent of --cache-debug (default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
