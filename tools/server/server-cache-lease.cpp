@@ -108,6 +108,11 @@ server_cache_lease_table::server_cache_lease_table(
     fallback(fallback_in ? fallback_in : &default_fallback) {
 }
 
+void server_cache_lease_table::bind_fallback_provider(
+        server_cache_lease_fallback_provider * provider) noexcept {
+    fallback = provider ? provider : &default_fallback;
+}
+
 server_cache_context_scope_id
 server_cache_lease_table::new_context_scope() noexcept {
     if (!available || next_context_scope_id == 0) {
@@ -214,7 +219,7 @@ void server_cache_lease_table::record(
     }
 }
 
-server_cache_lease_id server_cache_lease_table::emit_grant(
+server_cache_lease_table::entry * server_cache_lease_table::emit_grant(
         const server_cache_lease_subject & subject,
         const server_cache_lease_scope & scope,
         server_cache_lease_identity_id identity_id,
@@ -234,11 +239,10 @@ server_cache_lease_id server_cache_lease_table::emit_grant(
     value.expires_at_ns = deadline;
     value.ttl_ns = ttl_ns;
     value.fallback_proof = std::move(proof);
-    const auto lease = value.lease;
-    if (!lease || !identity_id || !add_entry(std::move(value), kind)) {
-        return {};
+    if (!value.lease || !identity_id || !add_entry(std::move(value), kind)) {
+        return nullptr;
     }
-    return lease;
+    return &leases.back();
 }
 
 bool server_cache_lease_table::add_entry(
@@ -266,7 +270,52 @@ server_cache_lease_table::entry server_cache_lease_table::clone_core(
     clone.expires_at_ns = source.expires_at_ns;
     clone.ttl_ns = source.ttl_ns;
     clone.fallback_proof = source.fallback_proof.retain();
+    clone.owner = source.owner;
+    clone.proven_frontier = source.proven_frontier;
+    clone.explicit_hard = source.explicit_hard;
+    clone.orphaned = source.orphaned;
+    clone.subject_lost = source.subject_lost;
     return clone;
+}
+
+bool server_cache_lease_table::owned_scope_match(
+        const entry & value,
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept {
+    return value.owner == owner && value.explicit_hard &&
+           value.scope.kind == server_cache_lease_scope_kind::lease &&
+           value.scope.id == scope.v;
+}
+
+bool server_cache_lease_table::orphan_entry(entry & value) noexcept {
+    if (!value.explicit_hard || value.orphaned) {
+        return false;
+    }
+    value.orphaned = true;
+    record(server_cache_lease_event_kind::orphan_hard, &value, {},
+           server_cache_lease_fallback_state::available);
+    value.last_event_ordinal = next_event_ordinal - 1;
+    return true;
+}
+
+void server_cache_lease_table::mark_subject_lost(size_t index) noexcept {
+    const auto scope = server_cache_explicit_lease_scope_id {
+        leases[index].scope.id,
+    };
+    const auto owner = leases[index].owner;
+    for (auto & value : leases) {
+        if (&value != &leases[index] &&
+            !owned_scope_match(value, scope, owner)) {
+            continue;
+        }
+        if (!value.subject_lost) {
+            record(server_cache_lease_event_kind::invalidate_identity,
+                   &value, {}, server_cache_lease_fallback_state::available);
+            value.last_event_ordinal = next_event_ordinal - 1;
+            value.subject_lost = true;
+        }
+        value.fallback_proof = {};
+    }
 }
 
 void server_cache_lease_table::invalidate_entry(
@@ -317,7 +366,7 @@ void server_cache_lease_table::clear_identity_unavailable(
 
 void server_cache_lease_table::expire_due(uint64_t now) noexcept {
     for (size_t i = 0; i < leases.size();) {
-        if (leases[i].expires_at_ns <= now) {
+        if (!leases[i].explicit_hard && leases[i].expires_at_ns <= now) {
             invalidate_entry(i, server_cache_lease_event_kind::expire);
         } else {
             ++i;
@@ -366,12 +415,22 @@ server_cache_lease_id server_cache_lease_table::grant_soft(
         }
     }
 
-    return emit_grant(
+    const auto * granted = emit_grant(
         subject, scope, identity_id, server_cache_lease_class::soft,
         now, deadline, ttl_ns, server_cache_lease_event_kind::grant_soft);
+    return granted ? granted->lease : server_cache_lease_id{};
 }
 
 server_cache_lease_id server_cache_lease_table::grant_hard(
+        const server_cache_lease_subject & subject,
+        const server_cache_lease_scope & scope,
+        const server_cache_lease_identity & identity,
+        uint64_t ttl_ns) noexcept {
+    const auto * granted = grant_hard_entry(subject, scope, identity, ttl_ns);
+    return granted ? granted->lease : server_cache_lease_id{};
+}
+
+server_cache_lease_table::entry * server_cache_lease_table::grant_hard_entry(
         const server_cache_lease_subject & subject,
         const server_cache_lease_scope & scope,
         const server_cache_lease_identity & identity,
@@ -382,12 +441,12 @@ server_cache_lease_id server_cache_lease_table::grant_hard(
     if (!available || !subject.valid() || !scope.valid() || !identity.valid() ||
         !checked_deadline(now, ttl_ns, deadline)) {
         n_unavailable++;
-        return {};
+        return nullptr;
     }
     auto proof = fallback->acquire(subject, identity);
     const auto identity_id = intern_identity(identity);
     if (!identity_id) {
-        return {};
+        return nullptr;
     }
     const auto proof_state = proof.state();
     if (!proof.available()) {
@@ -402,13 +461,137 @@ server_cache_lease_id server_cache_lease_table::grant_hard(
                 ? server_cache_lease_event_kind::refuse_hard_invalid
                 : server_cache_lease_event_kind::refuse_hard_unavailable,
             &refusal, {}, proof_state);
-        return {};
+        return nullptr;
     }
     clear_identity_unavailable(subject.artifact);
     return emit_grant(
         subject, scope, identity_id, server_cache_lease_class::hard,
         now, deadline, ttl_ns, server_cache_lease_event_kind::grant_hard,
         std::move(proof));
+}
+
+server_cache_lease_id server_cache_lease_table::grant_hard_owned(
+        const server_cache_lease_subject & subject,
+        const server_cache_lease_scope & scope,
+        const server_cache_lease_identity & identity,
+        server_cache_lease_owner_id owner,
+        const server_cache_lease_frontier & proven_frontier,
+        uint64_t ttl_ns) noexcept {
+    if (!owner || !proven_frontier.valid()) {
+        n_unavailable++;
+        return {};
+    }
+    auto * granted = grant_hard_entry(subject, scope, identity, ttl_ns);
+    if (!granted) {
+        return {};
+    }
+    granted->owner = owner;
+    granted->proven_frontier = proven_frontier;
+    granted->explicit_hard = true;
+    granted->orphaned = false;
+    return granted->lease;
+}
+
+bool server_cache_lease_table::renew_owned(
+        server_cache_lease_id lease,
+        server_cache_lease_owner_id owner,
+        const server_cache_lease_frontier & proven_frontier,
+        uint64_t ttl_ns) noexcept {
+    const uint64_t now = sample_now();
+    expire_due(now);
+    auto it = std::find_if(leases.begin(), leases.end(),
+        [lease, owner](const entry & value) {
+            return value.lease == lease && value.owner == owner &&
+                   value.explicit_hard;
+        });
+    uint64_t deadline = 0;
+    if (it == leases.end() || !proven_frontier.valid() ||
+        !checked_deadline(now, ttl_ns, deadline)) {
+        return false;
+    }
+    const auto identity = std::find_if(
+        identities.begin(), identities.end(), [&](const auto & value) {
+            return value.id == it->identity_id;
+        });
+    if (identity == identities.end()) {
+        mark_table_unavailable();
+        return false;
+    }
+    auto proof = fallback->acquire(it->subject, identity->value);
+    if (!proof.available()) {
+        return false;
+    }
+    it->fallback_proof = std::move(proof);
+    it->proven_frontier = proven_frontier;
+    it->expires_at_ns = deadline;
+    it->ttl_ns = ttl_ns;
+    it->orphaned = false;
+    record(server_cache_lease_event_kind::renew, &*it, {},
+           server_cache_lease_fallback_state::available);
+    it->last_event_ordinal = next_event_ordinal - 1;
+    return true;
+}
+
+bool server_cache_lease_table::orphan_owner(
+        server_cache_lease_owner_id owner) noexcept {
+    bool changed = false;
+    for (auto & value : leases) {
+        if (value.owner == owner) {
+            changed |= orphan_entry(value);
+        }
+    }
+    return changed;
+}
+
+bool server_cache_lease_table::orphan_owned_scope(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept {
+    bool changed = false;
+    for (auto & value : leases) {
+        if (owned_scope_match(value, scope, owner)) {
+            changed |= orphan_entry(value);
+        }
+    }
+    return changed;
+}
+
+bool server_cache_lease_table::release_owned_scope(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept {
+    if (!scope.v || !owner) {
+        return false;
+    }
+    bool released = false;
+    for (size_t i = 0; i < leases.size();) {
+        if (owned_scope_match(leases[i], scope, owner)) {
+            invalidate_entry(i, server_cache_lease_event_kind::release);
+            released = true;
+        } else {
+            ++i;
+        }
+    }
+    return released;
+}
+
+bool server_cache_lease_table::lease_active(
+        server_cache_lease_id lease) const noexcept {
+    return std::any_of(leases.begin(), leases.end(),
+        [lease](const entry & value) { return value.lease == lease; });
+}
+
+bool server_cache_lease_table::lease_subject_lost(
+        server_cache_lease_id lease) const noexcept {
+    const auto found = std::find_if(leases.begin(), leases.end(),
+        [lease](const entry & value) { return value.lease == lease; });
+    return found != leases.end() && found->subject_lost;
+}
+
+bool server_cache_lease_table::owned_scope_active(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) const noexcept {
+    return std::any_of(leases.begin(), leases.end(), [&](const entry & value) {
+        return owned_scope_match(value, scope, owner);
+    });
 }
 
 bool server_cache_lease_table::renew(
@@ -468,7 +651,12 @@ void server_cache_lease_table::artifact_retired(
     expire_due(now);
     for (size_t i = 0; i < leases.size();) {
         if (leases[i].subject.artifact == artifact) {
-            invalidate_entry(i, server_cache_lease_event_kind::release);
+            if (leases[i].explicit_hard) {
+                mark_subject_lost(i);
+                ++i;
+            } else {
+                invalidate_entry(i, server_cache_lease_event_kind::release);
+            }
         } else {
             ++i;
         }
@@ -570,8 +758,13 @@ bool server_cache_lease_table::artifact_rebound(
         if (leases[i].identity_id != expected_identity_id) {
             rebound_subject = leases[i].subject;
             mismatched = true;
-            invalidate_entry(
-                i, server_cache_lease_event_kind::invalidate_identity);
+            if (leases[i].explicit_hard) {
+                mark_subject_lost(i);
+                ++i;
+            } else {
+                invalidate_entry(
+                    i, server_cache_lease_event_kind::invalidate_identity);
+            }
         } else {
             ++i;
         }
@@ -615,11 +808,23 @@ server_cache_lease_evaluation server_cache_lease_table::evaluate(
         if (leases[i].identity_id != expected_identity_id) {
             mismatch_subject = leases[i].subject;
             mismatched = true;
-            invalidate_entry(
-                i, server_cache_lease_event_kind::invalidate_identity);
+            if (leases[i].explicit_hard) {
+                mark_subject_lost(i);
+                ++i;
+            } else {
+                invalidate_entry(
+                    i, server_cache_lease_event_kind::invalidate_identity);
+            }
             result.state = server_cache_lease_eval_state::unavailable;
             result.cls = server_cache_lease_class::none;
             result.eligibility = server_cache_lease_eligibility::eligible;
+            continue;
+        }
+        if (leases[i].subject_lost) {
+            result.state = server_cache_lease_eval_state::unavailable;
+            result.cls = server_cache_lease_class::none;
+            result.eligibility = server_cache_lease_eligibility::eligible;
+            ++i;
             continue;
         }
         if (leases[i].cls > result.cls) {
@@ -657,7 +862,8 @@ server_cache_lease_evaluation server_cache_lease_table::inspect(
     result.state = server_cache_lease_eval_state::known;
     for (const auto & lease : leases) {
         if (lease.subject.artifact != artifact ||
-            lease.expires_at_ns <= now) {
+            lease.subject_lost ||
+            (!lease.explicit_hard && lease.expires_at_ns <= now)) {
             continue;
         }
         const auto identity = std::find_if(
@@ -678,6 +884,52 @@ server_cache_lease_evaluation server_cache_lease_table::inspect(
     }
     if (result.cls == server_cache_lease_class::hard) {
         result.eligibility = server_cache_lease_eligibility::hard_blocked;
+    }
+    return result;
+}
+
+server_cache_lease_evaluation server_cache_lease_table::inspect_range(
+        llama_cache_acct_artifact_id artifact,
+        const server_cache_lease_identity & expected_identity,
+        uint64_t sequence_epoch,
+        uint64_t first_token,
+        uint64_t token_count) const noexcept {
+    auto result = inspect(artifact, expected_identity);
+    if (result.state != server_cache_lease_eval_state::known ||
+        result.cls != server_cache_lease_class::hard || token_count == 0 ||
+        first_token > std::numeric_limits<uint64_t>::max() - token_count) {
+        return result;
+    }
+    const uint64_t end = first_token + token_count;
+    bool saw_unscoped_hard = false;
+    bool overlaps_scoped_hard = false;
+    bool saw_soft = false;
+    const uint64_t now = clock->now_ns();
+    for (const auto & lease : leases) {
+        if (lease.subject.artifact != artifact ||
+            lease.subject_lost ||
+            (!lease.explicit_hard && lease.expires_at_ns <= now)) {
+            continue;
+        }
+        if (lease.cls == server_cache_lease_class::soft) {
+            saw_soft = true;
+            continue;
+        }
+        if (!lease.explicit_hard || !lease.proven_frontier.valid()) {
+            saw_unscoped_hard = true;
+            continue;
+        }
+        if (lease.proven_frontier.sequence_epoch != sequence_epoch) {
+            result.state = server_cache_lease_eval_state::unavailable;
+            return result;
+        }
+        overlaps_scoped_hard |= first_token < lease.proven_frontier.token_count &&
+                                end > 0;
+    }
+    if (!saw_unscoped_hard && !overlaps_scoped_hard) {
+        result.cls = saw_soft ? server_cache_lease_class::soft
+                              : server_cache_lease_class::none;
+        result.eligibility = server_cache_lease_eligibility::eligible;
     }
     return result;
 }
@@ -869,6 +1121,7 @@ bool server_cache_lease_table::replay(
                     out.active.push_back(event);
                     break;
                 case server_cache_lease_event_kind::renew:
+                case server_cache_lease_event_kind::orphan_hard:
                     if (active == out.active.end()) {
                         return false;
                     }

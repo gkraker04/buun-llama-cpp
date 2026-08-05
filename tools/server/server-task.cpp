@@ -6,6 +6,7 @@
 
 #include "build-info.h"
 #include "server-cache-authority.h"
+#include "server-cache-retention-proof.h"
 #include "server-vbr-artifact-store.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -22,6 +23,14 @@
 #include <tuple>
 
 using json = nlohmann::ordered_json;
+
+json server_task_result_cache_control::to_json() {
+    // E1.1a is scheduler-internal. E1.2 owns the redacted public serializer;
+    // this deliberately contains no holder, lease, content, or proof handle.
+    return json {
+        { "status", server_cache_control_status_name(result.status) },
+    };
+}
 
 //
 // task_params
@@ -2505,7 +2514,8 @@ bool server_cache_checkpoint_thin_priced(
                     victim_catalog.stable_id;
                 candidate.price.identity_known = true;
                 candidate.price.mandatory_anchor =
-                    victim_catalog.mandatory_anchor;
+                    victim_catalog.mandatory_anchor ||
+                    victim_catalog.recovery_pinned;
                 candidate.price.hard_leased = server_cache_lease_is_hard(
                     victim_catalog.lease);
                 uint32_t weight = 0;
@@ -3251,6 +3261,32 @@ bool server_prompt_cache::acquire_durable_recovery(
         pin = {};
     }
     return false;
+}
+
+server_cache_durable_fallback_proof
+server_prompt_cache_host_fallback_proof(
+        server_prompt_cache & cache,
+        const server_cache_control_selector & selector) noexcept {
+    if (selector.kind != server_cache_control_subject_kind::host_snapshot ||
+        selector.retention_key.kind !=
+            common_retention_artifact_kind::host_entry) {
+        return {};
+    }
+    auto state = std::find_if(
+        cache.states.begin(), cache.states.end(), [&](const auto & value) {
+            return &value == reinterpret_cast<const server_prompt_cache_state *>(
+                selector.retention_key.instance);
+        });
+    if (state == cache.states.end()) {
+        return {};
+    }
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin pin;
+    if (!cache.acquire_durable_recovery(state, artifact, ops, pin)) {
+        return {};
+    }
+    return server_cache_retention_fallback_proof(std::move(pin));
 }
 
 bool server_prompt_cache::exactly_redundant(

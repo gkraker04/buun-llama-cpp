@@ -288,6 +288,14 @@ public:
     server_vbr_artifact_import_output import(
         server_vbr_artifact_import_request request) noexcept;
 
+    // Scheduler-only E1 resolver. Authorization is identical to import and
+    // the returned move-only package is the durable catalog pin. No raw
+    // artifact lookup or tenant-agnostic enumeration is exposed.
+    bool resolve_control_reference(
+        const std::string & reference,
+        const std::string & tenant_key,
+        vbr_artifact_package_view & package) noexcept;
+
     const server_vbr_artifact_store_counters & counters() const noexcept;
     uint32_t attention_children() const noexcept;
 

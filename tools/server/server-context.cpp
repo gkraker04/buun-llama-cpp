@@ -2102,11 +2102,16 @@ private:
     // prompt_cache so it outlives both the observer that references it and the cache's
     // accounting-release destructor.
     std::unique_ptr<server_cache_authority> cache_authority;
-
     // F3 artifact machinery is a lifecycle-authority sibling: it references
     // the frozen ledger but is destroyed before it. It exists only for an
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    // E1.1a is lazily constructed by its scheduler-only task. destroy()
+    // explicitly closes it before prompt_cache because host proofs point into
+    // cache list nodes; this declaration after the F store is the secondary
+    // reverse-destruction guard for retained package proofs. With no E1
+    // route/flag, production allocates and executes nothing.
+    std::unique_ptr<server_cache_control_authority> cache_control_authority;
     std::thread::id vbr_capture_scheduler_thread;
     std::thread::id cache_plan_preflight_scheduler_thread;
 
@@ -3875,6 +3880,11 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // E1 host-fallback proofs call back into prompt-cache list nodes, and
+        // F subject/fallback proofs retain the artifact store. Close every
+        // holder/lease/proof explicitly while both owners are still alive;
+        // reverse member destruction would otherwise free prompt_cache first.
+        cache_control_authority.reset();
         // Slot-held D-A recovery pins point into cache_authority->retention.
         // `slots` is declared before that owner and would otherwise be
         // destroyed after it; close every dependency explicitly while the
@@ -8077,6 +8087,61 @@ private:
         }
     }
 
+    bool cache_control_refresh_prompt(
+            const server_prompt & prompt,
+            const std::string & adapter_identity,
+            server_cache_lease_identity & identity,
+            server_cache_lease_frontier & frontier) noexcept {
+        const int64_t tokens = prompt.n_tokens();
+        if (!server_cache_lease_build_identity(
+                frontier_execution_identity, adapter_identity,
+                prompt.tokens, tokens, identity)) {
+            return false;
+        }
+        frontier = {
+            prompt.sequence_epoch, uint64_t(tokens), tokens,
+        };
+        return frontier.valid();
+    }
+
+    bool cache_control_refresh_subject(
+            const server_cache_control_selector & selector,
+            server_cache_lease_identity & identity,
+            server_cache_lease_frontier & frontier) noexcept {
+        if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+            const auto slot = std::find_if(
+                slots.begin(), slots.end(), [&](const server_slot & value) {
+                    return value.id == selector.retention_key.owner_slot;
+                });
+            if (slot == slots.end()) {
+                return false;
+            }
+            return cache_control_refresh_prompt(
+                slot->prompt, lora_config_identity(slot->lora),
+                identity, frontier);
+        }
+        if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+            if (!prompt_cache) {
+                return false;
+            }
+            const auto * wanted =
+                reinterpret_cast<const server_prompt_cache_state *>(
+                    selector.retention_key.instance);
+            const auto state = std::find_if(
+                prompt_cache->states.begin(), prompt_cache->states.end(),
+                [&](const server_prompt_cache_state & value) {
+                    return &value == wanted;
+                });
+            if (state == prompt_cache->states.end()) {
+                return false;
+            }
+            return cache_control_refresh_prompt(
+                state->prompt, state->adapter_config_key,
+                identity, frontier);
+        }
+        return false;
+    }
+
     bool cache_plan_preflight_inputs_current(
             const common_cache_plan_record & rec,
             const server_slot & legacy_target,
@@ -8584,6 +8649,67 @@ private:
                     } catch (...) {
                         res->view.status =
                             server_cache_plan_preflight_status::internal_fault;
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CACHE_HOLDER_CREATE:
+            case SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE:
+            case SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH:
+            case SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE:
+            case SERVER_TASK_TYPE_CACHE_LEASE_INSPECT:
+            case SERVER_TASK_TYPE_CACHE_LEASE_RENEW:
+            case SERVER_TASK_TYPE_CACHE_LEASE_RELEASE:
+            case SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS:
+                {
+                    auto res = std::make_unique<server_task_result_cache_control>();
+                    res->id = task.id;
+                    static_assert(
+                        SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS -
+                                SERVER_TASK_TYPE_CACHE_HOLDER_CREATE + 1 ==
+                            int(server_cache_control_operation::_count));
+                    const auto operation = static_cast<
+                        server_cache_control_operation>(
+                            task.type - SERVER_TASK_TYPE_CACHE_HOLDER_CREATE);
+                    const auto precheck = server_cache_control_task_precheck(
+                        task.cache_control != nullptr,
+                        params_base.cache_lifecycle,
+                        cache_authority != nullptr);
+                    if (precheck != server_cache_control_status::ok) {
+                        res->result.status = precheck;
+                    } else {
+                        try {
+                            if (!cache_control_authority) {
+                                server_cache_control_config config;
+                                config.leases = &cache_authority->leases;
+                                config.retention = &cache_authority->retention;
+                                config.artifacts = vbr_artifact_store.get();
+                                config.refresh_context = this;
+                                config.refresh_subject = [](void * context,
+                                    const server_cache_control_selector & selector,
+                                    server_cache_lease_identity & identity,
+                                    server_cache_lease_frontier & frontier) noexcept {
+                                    return static_cast<server_context_impl *>(context)
+                                        ->cache_control_refresh_subject(
+                                            selector, identity, frontier);
+                                };
+                                config.host_proof_context = prompt_cache.get();
+                                config.acquire_host_proof = [](void * context,
+                                    const server_cache_control_selector & selector) noexcept {
+                                    auto * cache = static_cast<server_prompt_cache *>(context);
+                                    return cache
+                                        ? server_prompt_cache_host_fallback_proof(
+                                            *cache, selector)
+                                        : server_cache_durable_fallback_proof{};
+                                };
+                                cache_control_authority = std::make_unique<
+                                    server_cache_control_authority>(config);
+                            }
+                            res->result = cache_control_authority->execute(
+                                operation, *task.cache_control);
+                        } catch (...) {
+                            res->result.status =
+                                server_cache_control_status::internal_fault;
+                        }
                     }
                     queue_results.send(std::move(res));
                 } break;
@@ -9238,6 +9364,13 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // E1 holder/lease expiry is scheduler-owned even when no further E1
+        // task arrives. This is the existing update-slots lifecycle point;
+        // the authority itself pins and asserts the owning thread.
+        if (cache_control_authority) {
+            cache_control_authority->lifecycle_point();
+        }
 
         // check if all slots are idle
         {

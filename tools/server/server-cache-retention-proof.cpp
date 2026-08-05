@@ -5,7 +5,7 @@
 #include <utility>
 
 server_cache_durable_fallback_proof
-server_cache_retention_fallback_proof_for_test(
+server_cache_retention_fallback_proof(
         server_cache_recovery_pin && pin) noexcept {
     if (!pin.valid()) {
         return server_cache_durable_fallback_proof_for_test(
@@ -19,4 +19,10 @@ server_cache_retention_fallback_proof_for_test(
     } catch (...) {
         return {};
     }
+}
+
+server_cache_durable_fallback_proof
+server_cache_retention_fallback_proof_for_test(
+        server_cache_recovery_pin && pin) noexcept {
+    return server_cache_retention_fallback_proof(std::move(pin));
 }

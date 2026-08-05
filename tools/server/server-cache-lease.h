@@ -56,6 +56,7 @@ enum class server_cache_lease_event_kind : uint8_t {
     mark_identity_unavailable,
     clear_identity_unavailable,
     clone,
+    orphan_hard,
     _count,
 };
 
@@ -75,6 +76,11 @@ struct server_cache_lease_id {
     uint64_t v = 0;
     explicit operator bool() const noexcept { return v != 0; }
 };
+
+struct server_cache_lease_owner_id {
+    uint64_t v = 0;
+    explicit operator bool() const noexcept { return v != 0; }
+};
 struct server_cache_lease_identity_id {
     uint64_t v = 0;
     explicit operator bool() const noexcept { return v != 0; }
@@ -89,6 +95,7 @@ SERVER_CACHE_LEASE_ID_EQUALITY(server_cache_context_scope_id)
 SERVER_CACHE_LEASE_ID_EQUALITY(server_cache_explicit_lease_scope_id)
 SERVER_CACHE_LEASE_ID_EQUALITY(server_cache_lease_id)
 SERVER_CACHE_LEASE_ID_EQUALITY(server_cache_lease_identity_id)
+SERVER_CACHE_LEASE_ID_EQUALITY(server_cache_lease_owner_id)
 #undef SERVER_CACHE_LEASE_ID_EQUALITY
 
 struct server_cache_lease_scope {
@@ -140,6 +147,24 @@ struct server_cache_lease_evaluation {
     server_cache_lease_eligibility eligibility =
         server_cache_lease_eligibility::eligible;
 };
+
+struct server_cache_lease_frontier {
+    uint64_t sequence_epoch = 0;
+    uint64_t token_count = 0;
+    int64_t next_position = 0;
+
+    bool valid() const noexcept {
+        return sequence_epoch != 0 && next_position >= 0;
+    }
+};
+
+inline bool operator==(
+        const server_cache_lease_frontier & a,
+        const server_cache_lease_frontier & b) noexcept {
+    return a.sequence_epoch == b.sequence_epoch &&
+           a.token_count == b.token_count &&
+           a.next_position == b.next_position;
+}
 
 inline bool server_cache_lease_is_hard(
         const server_cache_lease_evaluation & lease) noexcept {
@@ -282,6 +307,35 @@ public:
         const server_cache_lease_scope & scope,
         const server_cache_lease_identity & identity,
         uint64_t ttl_ns) noexcept;
+    // E1's holder-owned hard lease. `ttl_ns` is the holder inspection/
+    // reattach deadline; it is deliberately not a destruction deadline.
+    // The entry remains enforced until explicit release/owner close/restart.
+    server_cache_lease_id grant_hard_owned(
+        const server_cache_lease_subject & subject,
+        const server_cache_lease_scope & scope,
+        const server_cache_lease_identity & identity,
+        server_cache_lease_owner_id owner,
+        const server_cache_lease_frontier & proven_frontier,
+        uint64_t ttl_ns) noexcept;
+    bool renew_owned(
+        server_cache_lease_id lease,
+        server_cache_lease_owner_id owner,
+        const server_cache_lease_frontier & proven_frontier,
+        uint64_t ttl_ns) noexcept;
+    bool orphan_owner(server_cache_lease_owner_id owner) noexcept;
+    bool orphan_owned_scope(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept;
+    bool release_owned_scope(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept;
+    bool lease_active(server_cache_lease_id lease) const noexcept;
+    bool lease_subject_lost(server_cache_lease_id lease) const noexcept;
+    bool owned_scope_active(
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) const noexcept;
+    void bind_fallback_provider(
+        server_cache_lease_fallback_provider * provider) noexcept;
     bool renew(server_cache_lease_id lease, uint64_t ttl_ns) noexcept;
     bool release(server_cache_lease_id lease) noexcept;
 
@@ -306,6 +360,12 @@ public:
     server_cache_lease_evaluation inspect(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity) const noexcept;
+    server_cache_lease_evaluation inspect_range(
+        llama_cache_acct_artifact_id artifact,
+        const server_cache_lease_identity & expected_identity,
+        uint64_t sequence_epoch,
+        uint64_t first_token,
+        uint64_t token_count) const noexcept;
     server_cache_destruction_verdict admit(
         const server_cache_destruction_request & request) noexcept;
 
@@ -329,6 +389,11 @@ private:
         uint64_t ttl_ns = 0;
         uint64_t last_event_ordinal = 0;
         server_cache_durable_fallback_proof fallback_proof;
+        server_cache_lease_owner_id owner;
+        server_cache_lease_frontier proven_frontier;
+        bool explicit_hard = false;
+        bool orphaned = false;
+        bool subject_lost = false;
     };
 
     static entry clone_core(const entry & source) noexcept;
@@ -345,7 +410,7 @@ private:
         const entry * lease,
         server_cache_lease_id source,
         server_cache_lease_fallback_state fallback) noexcept;
-    server_cache_lease_id emit_grant(
+    entry * emit_grant(
         const server_cache_lease_subject & subject,
         const server_cache_lease_scope & scope,
         server_cache_lease_identity_id identity_id,
@@ -355,8 +420,19 @@ private:
         uint64_t ttl_ns,
         server_cache_lease_event_kind kind,
         server_cache_durable_fallback_proof proof = {}) noexcept;
+    entry * grant_hard_entry(
+        const server_cache_lease_subject & subject,
+        const server_cache_lease_scope & scope,
+        const server_cache_lease_identity & identity,
+        uint64_t ttl_ns) noexcept;
     bool add_entry(entry && value, server_cache_lease_event_kind kind,
                    server_cache_lease_id source = {}) noexcept;
+    static bool owned_scope_match(
+        const entry & value,
+        server_cache_explicit_lease_scope_id scope,
+        server_cache_lease_owner_id owner) noexcept;
+    bool orphan_entry(entry & value) noexcept;
+    void mark_subject_lost(size_t index) noexcept;
     void invalidate_entry(size_t index, server_cache_lease_event_kind kind) noexcept;
     void mark_identity_unavailable(
         const server_cache_lease_subject & subject) noexcept;

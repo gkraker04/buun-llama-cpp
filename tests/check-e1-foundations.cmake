@@ -179,10 +179,10 @@ if (NOT classifier_callers_valid)
     message(FATAL_ERROR "E1.0 hard-seal classifier gained a premature caller")
 endif()
 
-# E1.0 creates no control task, route, CLI flag, or public llama.h schema.
+# E1.1a deliberately adds the scheduler-only control task. Routes, CLI flags,
+# family propagation, and public llama.h remain outside this unit.
 function(surface_contract_valid source output)
     foreach(token
-            "SERVER_TASK_TYPE_CACHE_CONTROL"
             "/cache/lease"
             "/cache/family"
             "--cache-family")

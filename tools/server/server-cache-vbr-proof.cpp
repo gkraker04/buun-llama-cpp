@@ -5,7 +5,7 @@
 #include <utility>
 
 server_cache_durable_fallback_proof
-server_cache_vbr_fallback_proof_for_test(
+server_cache_vbr_fallback_proof(
         vbr_artifact_package_view && package) noexcept {
     if (!package || package.validate() != vbr_artifact_status::ok) {
         return server_cache_durable_fallback_proof_for_test(
@@ -20,4 +20,10 @@ server_cache_vbr_fallback_proof_for_test(
     } catch (...) {
         return {};
     }
+}
+
+server_cache_durable_fallback_proof
+server_cache_vbr_fallback_proof_for_test(
+        vbr_artifact_package_view && package) noexcept {
+    return server_cache_vbr_fallback_proof(std::move(package));
 }

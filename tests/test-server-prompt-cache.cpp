@@ -133,6 +133,60 @@ private:
     std::shared_ptr<void> owner = std::make_shared<int>(1);
 };
 
+struct control_vbr_fixture {
+    server_cache_lease_identity identity;
+    server_cache_lease_frontier frontier;
+    std::shared_ptr<void> owner = std::make_shared<int>(1);
+};
+
+server_cache_control_status resolve_control_vbr_fixture(
+        void * context,
+        const server_cache_control_selector &,
+        server_cache_lease_subject & subject,
+        server_cache_lease_identity & identity,
+        server_cache_lease_frontier & frontier,
+        server_cache_durable_fallback_proof & pin) noexcept {
+    auto * fixture = static_cast<control_vbr_fixture *>(context);
+    subject = {
+        { 0xe11a }, common_retention_artifact_kind::host_entry, -1,
+    };
+    identity = fixture->identity;
+    frontier = fixture->frontier;
+    pin = server_cache_durable_fallback_proof_for_test(
+        server_cache_lease_fallback_state::available, fixture->owner);
+    return server_cache_control_status::ok;
+}
+
+struct control_host_refresh_fixture {
+    server_prompt_cache * cache = nullptr;
+    const std::string * execution_identity = nullptr;
+};
+
+bool refresh_control_host_fixture(
+        void * context,
+        const server_cache_control_selector & selector,
+        server_cache_lease_identity & identity,
+        server_cache_lease_frontier & frontier) noexcept {
+    auto * fixture = static_cast<control_host_refresh_fixture *>(context);
+    const auto * wanted = reinterpret_cast<const server_prompt_cache_state *>(
+        selector.retention_key.instance);
+    const auto found = std::find_if(
+        fixture->cache->states.begin(), fixture->cache->states.end(),
+        [&](const auto & value) { return &value == wanted; });
+    if (found == fixture->cache->states.end() ||
+        !server_cache_lease_build_identity(
+            *fixture->execution_identity, found->adapter_config_key,
+            found->prompt.tokens, found->prompt.n_tokens(), identity)) {
+        return false;
+    }
+    frontier = {
+        found->prompt.sequence_epoch,
+        uint64_t(found->prompt.n_tokens()),
+        found->prompt.n_tokens(),
+    };
+    return frontier.valid();
+}
+
 void configure_host_trade(
         server_cache_authority & authority,
         server_prompt_cache & cache,
@@ -227,6 +281,27 @@ server_cache_lease_id grant_host_lease(
               server_cache_lease_table::IMPLICIT_SOFT_TTL_NS)
         : leases.grant_soft(subject, scope, identity,
               server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+}
+
+server_cache_lease_id grant_explicit_host_lease(
+        server_prompt_cache & cache,
+        server_cache_lease_table & leases,
+        server_prompt_cache::iterator victim,
+        uint64_t scope_id) {
+    const auto artifact = cache.retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*victim));
+    server_cache_lease_identity identity;
+    CHECK(server_cache_lease_build_identity(
+        *cache.lease_execution_identity, victim->adapter_config_key,
+        victim->prompt.tokens, victim->prompt.n_tokens(), identity));
+    return leases.grant_hard_owned(
+        { artifact, common_retention_artifact_kind::host_entry, -1 },
+        server_cache_lease_scope::from(
+            server_cache_explicit_lease_scope_id { scope_id }),
+        identity,
+        server_cache_lease_owner_id { 1 },
+        { 1, uint64_t(victim->prompt.n_tokens()), victim->prompt.n_tokens() },
+        server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
 }
 
 bool host_source_present(
@@ -1363,10 +1438,8 @@ void test_host_trade_all_hard_skips_publication() {
     auto second = install_host_trade_entry(cache, authority, "hard-b", 64);
     first->cache_plan_source_id = 11;
     second->cache_plan_source_id = 12;
-    CHECK(grant_host_lease(
-        cache, hard_leases, first, server_cache_lease_class::hard));
-    CHECK(grant_host_lease(
-        cache, hard_leases, second, server_cache_lease_class::hard));
+    CHECK(grant_explicit_host_lease(cache, hard_leases, first, 101));
+    CHECK(grant_explicit_host_lease(cache, hard_leases, second, 102));
 
     const auto live_ops_before = authority.ledger.snapshot().live_ops;
     cache.limit_tokens = cache.n_tokens();
@@ -1395,7 +1468,54 @@ void test_host_trade_floor_skips_recovery_pin() {
     auto open = install_host_trade_entry(cache, authority, "open", 64);
     pinned->cache_plan_source_id = 21;
     open->cache_plan_source_id = 22;
-    pinned->recovery_pins = 1;
+    pinned->prompt.sequence_epoch = 1;
+
+    server_cache_lease_identity identity;
+    CHECK(server_cache_lease_build_identity(
+        execution, pinned->adapter_config_key, pinned->prompt.tokens,
+        pinned->prompt.n_tokens(), identity));
+    const server_cache_lease_frontier frontier {
+        pinned->prompt.sequence_epoch,
+        uint64_t(pinned->prompt.n_tokens()),
+        pinned->prompt.n_tokens(),
+    };
+    control_vbr_fixture vbr { identity, frontier };
+    control_host_refresh_fixture refresh { &cache, &execution };
+    server_cache_control_config config;
+    config.leases = &authority.leases;
+    config.retention = &authority.retention;
+    config.refresh_context = &refresh;
+    config.refresh_subject = refresh_control_host_fixture;
+    config.resolve_vbr_context = &vbr;
+    config.resolve_vbr = resolve_control_vbr_fixture;
+    config.host_proof_context = &cache;
+    config.acquire_host_proof = [](void * context,
+        const server_cache_control_selector & selector) noexcept {
+        return server_prompt_cache_host_fallback_proof(
+            *static_cast<server_prompt_cache *>(context), selector);
+    };
+    server_cache_control_authority control(config);
+    server_cache_control_request holder_request;
+    holder_request.ttl_ns = 1000000000000ULL;
+    const auto holder = control.execute(
+        server_cache_control_operation::holder_create, holder_request);
+    CHECK(holder.status == server_cache_control_status::ok);
+    server_cache_control_request acquire;
+    acquire.holder = holder.holder;
+    acquire.requested_class = server_cache_lease_class::hard;
+    acquire.ttl_ns = holder_request.ttl_ns;
+    acquire.subject.kind = server_cache_control_subject_kind::vbr_reference;
+    acquire.subject.reference = "subject";
+    acquire.subject.tenant_key = "tenant";
+    acquire.fallback.kind = server_cache_control_subject_kind::host_snapshot;
+    acquire.fallback.retention_key =
+        server_retention_instance_key::for_host_entry(&*pinned);
+    acquire.fallback.identity = identity;
+    acquire.fallback.frontier = frontier;
+    const auto granted = control.execute(
+        server_cache_control_operation::lease_acquire, acquire);
+    CHECK(granted.status == server_cache_control_status::ok);
+    CHECK(pinned->recovery_pins == 1);
 
     cache.limit_tokens = 3;
     cache.update();
@@ -1403,6 +1523,82 @@ void test_host_trade_floor_skips_recovery_pin() {
     CHECK(!host_source_present(cache, 22));
     CHECK(authority.destruction.host_trade_refused == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    std::printf(
+        "E1_TWO_COPIES floor_vs_pinned_fallback PASS pinned=%d open=%d pins=%u\n",
+        host_source_present(cache, 21) ? 1 : 0,
+        host_source_present(cache, 22) ? 1 : 0,
+        pinned->recovery_pins);
+
+    server_cache_control_request release;
+    release.holder = holder.holder;
+    release.lease = granted.lease;
+    CHECK(control.execute(
+        server_cache_control_operation::lease_release,
+        release).status == server_cache_control_status::ok);
+    CHECK(pinned->recovery_pins == 0);
+}
+
+void test_cache_control_shutdown_drains_host_pin() {
+    server_cache_authority authority;
+    const std::string execution = "control-shutdown";
+    server_prompt_cache cache(0, 0);
+    configure_host_trade(authority, cache, execution);
+    auto fallback = install_host_trade_entry(
+        cache, authority, "shutdown-fallback", 64);
+    fallback->prompt.sequence_epoch = 1;
+
+    server_cache_lease_identity identity;
+    CHECK(server_cache_lease_build_identity(
+        execution, fallback->adapter_config_key, fallback->prompt.tokens,
+        fallback->prompt.n_tokens(), identity));
+    const server_cache_lease_frontier frontier {
+        fallback->prompt.sequence_epoch,
+        uint64_t(fallback->prompt.n_tokens()),
+        fallback->prompt.n_tokens(),
+    };
+    control_vbr_fixture vbr { identity, frontier };
+    control_host_refresh_fixture refresh { &cache, &execution };
+    server_cache_control_config config;
+    config.leases = &authority.leases;
+    config.retention = &authority.retention;
+    config.refresh_context = &refresh;
+    config.refresh_subject = refresh_control_host_fixture;
+    config.resolve_vbr_context = &vbr;
+    config.resolve_vbr = resolve_control_vbr_fixture;
+    config.host_proof_context = &cache;
+    config.acquire_host_proof = [](void * context,
+        const server_cache_control_selector & selector) noexcept {
+        return server_prompt_cache_host_fallback_proof(
+            *static_cast<server_prompt_cache *>(context), selector);
+    };
+    auto control = std::make_unique<server_cache_control_authority>(config);
+    server_cache_control_request holder_request;
+    holder_request.ttl_ns = 1000000000000ULL;
+    const auto holder = control->execute(
+        server_cache_control_operation::holder_create, holder_request);
+    server_cache_control_request acquire;
+    acquire.holder = holder.holder;
+    acquire.requested_class = server_cache_lease_class::hard;
+    acquire.ttl_ns = holder_request.ttl_ns;
+    acquire.subject.kind = server_cache_control_subject_kind::vbr_reference;
+    acquire.subject.reference = "subject";
+    acquire.subject.tenant_key = "tenant";
+    acquire.fallback.kind = server_cache_control_subject_kind::host_snapshot;
+    acquire.fallback.retention_key =
+        server_retention_instance_key::for_host_entry(&*fallback);
+    acquire.fallback.identity = identity;
+    acquire.fallback.frontier = frontier;
+    CHECK(control->execute(
+        server_cache_control_operation::lease_acquire,
+        acquire).status == server_cache_control_status::ok);
+    CHECK(fallback->recovery_pins == 1);
+
+    // Mirrors server_context_impl::destroy(): proofs close before the prompt
+    // cache list nodes they call back into are released.
+    control.reset();
+    CHECK(fallback->recovery_pins == 0);
+    cache.states.clear();
+    std::puts("E1_SHUTDOWN live_hard_lease PASS pins=0");
 }
 
 void test_host_trade_partial_substrate_is_typed() {
@@ -1540,6 +1736,93 @@ void test_checkpoint_thinning_policy() {
     CHECK(plan.ordinal == selected_before_protected.ordinal);
     CHECK(plan.reason == common_cache_plan_destruction_reason::none);
     CHECK(plan.protection == server_cache_checkpoint_protection::none);
+}
+
+void test_checkpoint_thin_lane_skips_pinned_member() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    authority.calibration_profile = HOST_TRADE_TEST_PROFILE;
+    std::list<common_prompt_checkpoint> ring;
+    ring.emplace_back();
+    ring.emplace_back();
+    ring.front().n_tokens = 100;
+    ring.back().n_tokens = 150;
+    const std::string execution = "thin-pin-execution";
+    const std::string adapter = "thin-pin-adapter";
+    llama_tokens token_ids(200);
+    std::iota(token_ids.begin(), token_ids.end(), 1);
+    server_tokens tokens(token_ids, false);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, 200);
+    for (auto & checkpoint : ring) {
+        server_cache_lease_identity identity;
+        CHECK(server_cache_lease_build_identity(
+            execution, adapter, tokens, checkpoint.n_tokens, identity));
+        checkpoint.computation_frontier.version =
+            common_computation_frontier::VERSION;
+        checkpoint.computation_frontier.sequence_epoch = 1;
+        checkpoint.computation_frontier.token_count = checkpoint.n_tokens;
+        checkpoint.computation_frontier.next_position = checkpoint.n_tokens;
+        checkpoint.computation_frontier.execution_identity =
+            identity.execution_identity;
+        checkpoint.computation_frontier.adapter_config_identity =
+            identity.adapter_config_identity;
+        checkpoint.computation_frontier.media_content_identity =
+            identity.media_content_identity;
+        checkpoint.data_tgt.assign(32, uint8_t(checkpoint.n_tokens));
+        const auto key = server_retention_instance_key::for_checkpoint(
+            17, &checkpoint);
+        CHECK(authority.retention.publish(
+            key, common_retention_pool::attention, spans, false,
+            200, uint64_t(checkpoint.n_tokens), true, &identity));
+        std::vector<llama_cache_acct_op_id> ops;
+        CHECK(authority.admit_live_checkpoint(
+            authority.retention.artifact_id(key),
+            checkpoint.data_tgt.size(), 0, ops));
+        CHECK(authority.retention.attach_release_ops(key, std::move(ops)));
+    }
+    const auto pinned_key = server_retention_instance_key::for_checkpoint(
+        17, &ring.back());
+    auto pin = authority.retention.acquire_recovery_pin(pinned_key);
+    CHECK(pin.valid());
+
+    server_cache_checkpoint_attempt_latch attempts;
+    const common_prompt_checkpoint * seam = nullptr;
+    common_cache_plan_destruction_reason thin_reason =
+        common_cache_plan_destruction_reason::none;
+    common_cache_plan_destruction_reason floor_reason =
+        common_cache_plan_destruction_reason::none;
+    server_cache_checkpoint_authority_context context {
+        17,
+        ring,
+        &authority,
+        &authority.retention,
+        &authority.destruction,
+        &authority.leases,
+        attempts,
+        seam,
+        thin_reason,
+        floor_reason,
+        false,
+        {},
+        false,
+        nullptr,
+        [](void *,
+           server_cache_checkpoint_authority_context::checkpoint_iterator first,
+           server_cache_checkpoint_authority_context::checkpoint_iterator) {
+            return first;
+        },
+    };
+    CHECK(!server_cache_checkpoint_thin_priced(
+        context, -99, 100, nullptr, false));
+    CHECK(ring.size() == 2);
+    CHECK(thin_reason ==
+          common_cache_plan_destruction_reason::mandatory_anchor);
+    std::printf(
+        "E1_TWO_COPIES thin_lane_pinned_member PASS members=%zu pinned=%d\n",
+        ring.size(), authority.retention.recovery_pinned(pinned_key) ? 1 : 0);
+    pin = {};
+    authority.retention.retire_slot(17);
 }
 
 void test_checkpoint_capacity_floor() {
@@ -1798,8 +2081,10 @@ int main(int argc, char ** argv) {
     test_host_trade_hard_lease_veto();
     test_host_trade_all_hard_skips_publication();
     test_host_trade_floor_skips_recovery_pin();
+    test_cache_control_shutdown_drains_host_pin();
     test_host_trade_partial_substrate_is_typed();
     test_checkpoint_thinning_policy();
+    test_checkpoint_thin_lane_skips_pinned_member();
     test_checkpoint_capacity_floor();
     test_checkpoint_attempt_latch_rearms_on_ring_change();
     test_checkpoint_effect_matrix_consistency();

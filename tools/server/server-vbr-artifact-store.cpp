@@ -1103,6 +1103,25 @@ server_vbr_artifact_import_output server_vbr_artifact_store::import(
     }
 }
 
+bool server_vbr_artifact_store::resolve_control_reference(
+        const std::string & reference,
+        const std::string & tenant_key,
+        vbr_artifact_package_view & package) noexcept {
+    package.reset();
+    try {
+        llama_cache_acct_artifact_id artifact;
+        if (!impl_->references.authorize(reference, tenant_key, artifact)) {
+            return false;
+        }
+        return impl_->catalog.resolve_reference(artifact, package) ==
+                   vbr_artifact_resolve_status::ok &&
+               package && package.validate() == vbr_artifact_status::ok;
+    } catch (...) {
+        package.reset();
+        return false;
+    }
+}
+
 const server_vbr_artifact_store_counters &
 server_vbr_artifact_store::counters() const noexcept {
     return impl_->counters;

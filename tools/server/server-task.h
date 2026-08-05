@@ -7,6 +7,7 @@
 #include "server-cache-lifecycle.h"
 #include "server-cache-lease.h"
 #include "server-cache-plan-preflight.h"
+#include "server-cache-control.h"
 #include "server-retention-sidecar.h"
 
 #include <array>
@@ -42,6 +43,14 @@ enum server_task_type {
     SERVER_TASK_TYPE_CACHE_CAPTURE,
     SERVER_TASK_TYPE_CACHE_IMPORT,
     SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT,
+    SERVER_TASK_TYPE_CACHE_HOLDER_CREATE,
+    SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE,
+    SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH,
+    SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE,
+    SERVER_TASK_TYPE_CACHE_LEASE_INSPECT,
+    SERVER_TASK_TYPE_CACHE_LEASE_RENEW,
+    SERVER_TASK_TYPE_CACHE_LEASE_RELEASE,
+    SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -203,6 +212,10 @@ struct server_task {
         std::string reference;
     };
     cache_import_action cache_import;
+
+    // E1.1a scheduler-internal control task. E1.2 is the only unit allowed to
+    // construct this from HTTP; until then production has no caller.
+    std::shared_ptr<const server_cache_control_request> cache_control;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -674,6 +687,12 @@ struct server_task_result_cache_plan_preflight : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_task_result_cache_control : server_task_result {
+    server_cache_control_result result;
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_control : server_task_result {
     bool        success = false;
     std::string message; // optional detail when success is false
@@ -960,6 +979,14 @@ private:
             server_cache_destruction_reason reason,
             iterator recovery);
 };
+
+// E1.1a proof adapter over the same list-node recovery counter consulted by
+// every host victim selector and by the raw eraser assertion. The semantic
+// selector is resolved against the current list before the pin is acquired.
+server_cache_durable_fallback_proof
+server_prompt_cache_host_fallback_proof(
+    server_prompt_cache & cache,
+    const server_cache_control_selector & selector) noexcept;
 
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
