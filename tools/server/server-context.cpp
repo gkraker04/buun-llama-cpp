@@ -437,10 +437,23 @@ static bool server_cache_transient_seq_rm_impl(
     return llama_memory_seq_rm(mem, seq_id, p0, p1);
 }
 
+static server_cache_control_status server_cache_family_resolve_for_launch(
+        server_cache_control_authority * authority,
+        server_cache_control_token token,
+        common_cache_family_binding & out) noexcept {
+    out = {};
+    if (!token) {
+        return server_cache_control_status::ok;
+    }
+    return authority
+        ? authority->resolve_family_binding(token, out)
+        : server_cache_control_status::not_found;
+}
+
 struct server_slot {
     int id;
 
-    // Optional E1 declared-family state. E1.0 leaves it invalid in production.
+    // Optional E1 declared-family state, resolved by the scheduler at launch.
     common_cache_family_binding cache_family;
 
     llama_context * ctx_tgt = nullptr;
@@ -588,10 +601,12 @@ struct server_slot {
                 return prompt_save_result::failed;
             }
             auto & entry = staged.front();
-            entry.cache_family = task ? task->cache_family
-                                      : common_cache_family_binding {};
-            entry.main_family = common_cache_family_main_family(
-                entry.cache_family, !task || !task->is_child());
+            // An idle save has no active task and therefore keeps the
+            // historical automatic-main default. Checkpoint pricing below is
+            // intentionally the opposite polarity: no request means no
+            // provisional automatic-main claim. A declaration overrides both.
+            server_prompt_cache_apply_family(
+                entry, cache_family, !task || !task->is_child());
 
             size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
@@ -630,12 +645,23 @@ struct server_slot {
             return false;
         }
         dflash_window_identity.clear();
+        // No-restore is a successful identity operation. Seed the out-value
+        // with the live lineage; a committed host restore overwrites it with
+        // delivery.cache_family inside load_impl.
+        common_cache_family_binding restored_family = cache_family;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
-                                     adapter_config_key, obs, required_source_id);
+                                     adapter_config_key, obs, required_source_id,
+                                     &restored_family);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
-        } else if (lifecycle_authority) {
-            checkpoint_ring_changed();
+        } else {
+            // A host image replaces the live frontier wholesale, including
+            // its immutable family provenance. A declared current request may
+            // deliberately override this later at the launch boundary.
+            cache_family = restored_family;
+            if (lifecycle_authority) {
+                checkpoint_ring_changed();
+            }
         }
 
         return res;
@@ -663,6 +689,8 @@ struct server_slot {
             checkpoint_seam_heuristic,
             checkpoint_thinning_refusal,
             checkpoint_floor_refusal,
+            // Unlike idle prompt_save(), an absent request does not
+            // provisionally classify a checkpoint as automatic-main.
             common_cache_family_main_family(
                 cache_family, task && !task->is_child()),
             cache_family,
@@ -714,6 +742,7 @@ struct server_slot {
             checkpoint_ring_changed();
         }
         prompt.clear();
+        cache_family = {};
     }
 
     void prompt_clear_certified(
@@ -898,6 +927,7 @@ struct server_slot {
             checkpoint_ring_changed();
         }
         prompt.clear();
+        cache_family = {};
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
         }
@@ -917,6 +947,9 @@ struct server_slot {
         }
         prompt.clear();
         prompt.tokens.insert(retained_tokens);
+        if (prompt.tokens.empty()) {
+            cache_family = {};
+        }
     }
 
     checkpoint_iterator server_cache_checkpoint_drop_impl(
@@ -1843,6 +1876,7 @@ struct server_slot {
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
         other.prompt = prompt.clone();
+        other.cache_family = cache_family;
         other.init_sampler();
         return true;
     }
@@ -1935,6 +1969,56 @@ struct server_slot {
         return try_decode();
     }
 };
+
+server_cache_family_slot_round_trip_result
+server_cache_family_slot_round_trip_for_test(
+        server_cache_control_authority & authority,
+        server_cache_control_token binding_token) {
+    server_cache_family_slot_round_trip_result result;
+    common_cache_family_binding incoming;
+    result.resolved = server_cache_family_resolve_for_launch(
+        &authority, binding_token, incoming) ==
+            server_cache_control_status::ok;
+    if (!result.resolved) {
+        return result;
+    }
+
+    server_slot slot {};
+    slot.id = 0;
+    slot.cache_family = common_cache_family_follow_lineage(
+        {}, incoming, 0);
+    slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    slot.prompt.sequence_epoch = 1;
+
+    // The actual slot wrapper seeds the no-restore out parameter with its
+    // current lineage. Drive the real cache selection path with no host rows;
+    // this is the D1-1 identity terminal that previously returned a default.
+    server_prompt_cache empty_cache(0, 0);
+    common_cache_family_binding restored = slot.cache_family;
+    const server_tokens resumed(
+        llama_tokens { 1, 2, 3, 4 }, false);
+    result.no_restore_resume = empty_cache.load(
+        slot.prompt, resumed, nullptr, nullptr, slot.id, "", nullptr, -1,
+        &restored);
+    if (result.no_restore_resume) {
+        slot.cache_family = restored;
+    }
+    result.binding_intact = slot.cache_family == incoming;
+
+    auto staged = empty_cache.stage(slot.prompt, 8, 0, "");
+    if (!staged.empty()) {
+        server_prompt_cache_apply_family(
+            staged.front(), slot.cache_family, true);
+        result.host_save_carries =
+            staged.front().cache_family == incoming &&
+            staged.front().main_family ==
+                common_cache_family_main_family(incoming, true);
+    }
+    common_prompt_checkpoint checkpoint;
+    checkpoint.cache_family = slot.cache_family;
+    result.checkpoint_carries = checkpoint.cache_family == incoming;
+    return result;
+}
 
 
 
@@ -7277,6 +7361,17 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        common_cache_family_binding incoming_family;
+        if (server_cache_family_resolve_for_launch(
+                cache_control_authority.get(),
+                task.cache_family_binding_token,
+                incoming_family) != server_cache_control_status::ok) {
+            send_error(
+                task, "cache family binding is unavailable",
+                ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         if (dflash_window_server_enabled() && task.tokens.has_media()) {
             send_error(
                 task,
@@ -7537,6 +7632,14 @@ private:
             slot.retention_obs->retire(
                 server_retention_instance_key::for_slot(slot.id));
         }
+        // The binding follows retained immutable content. A new conversation
+        // (zero prefix) adopts the incoming declaration or the undeclared
+        // default; an append/resume keeps the existing lineage. Children carry
+        // the opaque token and later copy the parent's resolved slot binding.
+        const size_t retained_prefix =
+            slot.prompt.tokens.get_common_prefix(task.tokens);
+        slot.cache_family = common_cache_family_follow_lineage(
+            slot.cache_family, incoming_family, retained_prefix);
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -8655,6 +8758,8 @@ private:
             case SERVER_TASK_TYPE_CACHE_HOLDER_CREATE:
             case SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE:
             case SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH:
+            case SERVER_TASK_TYPE_CACHE_FAMILY_REGISTER:
+            case SERVER_TASK_TYPE_CACHE_FAMILY_BIND:
             case SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE:
             case SERVER_TASK_TYPE_CACHE_LEASE_INSPECT:
             case SERVER_TASK_TYPE_CACHE_LEASE_RENEW:
@@ -9035,6 +9140,11 @@ private:
                                  state->prompt.tokens);
                             state->slot->prompt.sequence_epoch =
                                 state->prompt.sequence_epoch;
+                            // F-reference family provenance is not part of the
+                            // v1 artifact metadata. A foreign import therefore
+                            // starts undeclared rather than inheriting a stale
+                            // binding from the destination slot.
+                            state->slot->cache_family = {};
                             state->ready = false;
                         };
 
@@ -11750,6 +11860,7 @@ private:
                             next.representation_epoch     = vbr_now.representation_epoch;
                             next.representation_epoch_swa = vbr_now.representation_epoch_swa;
                             next.computation_frontier = ckpt_frontier;
+                            next.cache_family = slot.cache_family;
 
                             const size_t checkpoint_size =
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

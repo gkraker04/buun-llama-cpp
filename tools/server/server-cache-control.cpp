@@ -144,12 +144,24 @@ struct server_cache_control_authority::impl {
         server_cache_durable_fallback_proof subject_pin;
     };
 
+    struct family_record {
+        uint64_t handle_digest = 0;
+        common_cache_family_id id;
+    };
+
+    struct family_binding_record {
+        uint64_t handle_digest = 0;
+        common_cache_family_binding binding;
+    };
+
     struct holder_record {
         server_cache_lease_owner_id id;
         uint64_t session_digest = 0;
         uint64_t recovery_digest = 0;
         uint64_t expires_at_ns = 0;
         holder_state state = holder_state::active;
+        std::vector<family_record> families;
+        std::vector<family_binding_record> family_bindings;
         std::vector<lease_record> leases;
     };
 
@@ -177,10 +189,13 @@ struct server_cache_control_authority::impl {
     server_cache_control_config::acquire_host_proof_fn acquire_host_proof = nullptr;
     size_t max_holders = 0;
     size_t max_leases = 0;
+    size_t max_families = 0;
+    size_t max_family_bindings = 0;
     size_t test_fail_note_after = std::numeric_limits<size_t>::max();
     size_t note_attempts = 0;
     bool test_fail_remember = false;
     uint64_t next_holder_id = 1;
+    uint64_t next_family_id = 1;
     uint64_t next_event = 1;
     std::vector<holder_record> holders;
     std::vector<event_record> events;
@@ -249,6 +264,22 @@ struct server_cache_control_authority::impl {
         return count;
     }
 
+    size_t family_count() const noexcept {
+        size_t count = 0;
+        for (const auto & holder : holders) {
+            count += holder.families.size();
+        }
+        return count;
+    }
+
+    size_t family_binding_count() const noexcept {
+        size_t count = 0;
+        for (const auto & holder : holders) {
+            count += holder.family_bindings.size();
+        }
+        return count;
+    }
+
     bool issue_token(server_cache_control_token & out) noexcept {
         for (int attempt = 0; attempt < 4; ++attempt) {
             if (!tokens->next(out) || !out) {
@@ -259,6 +290,19 @@ struct server_cache_control_authority::impl {
                 holders.begin(), holders.end(), [&](const holder_record & holder) {
                     if (holder.session_digest == digest ||
                         holder.recovery_digest == digest) {
+                        return true;
+                    }
+                    if (std::any_of(
+                            holder.families.begin(), holder.families.end(),
+                            [digest](const family_record & family) {
+                                return family.handle_digest == digest;
+                            }) ||
+                        std::any_of(
+                            holder.family_bindings.begin(),
+                            holder.family_bindings.end(),
+                            [digest](const family_binding_record & binding) {
+                                return binding.handle_digest == digest;
+                            })) {
                         return true;
                     }
                     return std::any_of(
@@ -337,6 +381,21 @@ struct server_cache_control_authority::impl {
                 return lease.handle_digest == digest;
             });
         return found == holder.leases.end() ? nullptr : &*found;
+    }
+
+    family_record * find_family(
+            holder_record & holder,
+            server_cache_control_token token) noexcept {
+        if (!token) {
+            return nullptr;
+        }
+        const uint64_t digest = this->digest(token);
+        const auto found = std::find_if(
+            holder.families.begin(), holder.families.end(),
+            [digest](const family_record & family) {
+                return family.handle_digest == digest;
+            });
+        return found == holder.families.end() ? nullptr : &*found;
     }
 
     class staged_proof {
@@ -537,6 +596,8 @@ server_cache_control_authority::server_cache_control_authority(
         state_->acquire_host_proof = config.acquire_host_proof;
         state_->max_holders = config.max_holders;
         state_->max_leases = config.max_leases;
+        state_->max_families = config.max_families;
+        state_->max_family_bindings = config.max_family_bindings;
         state_->test_fail_note_after = config.test_fail_note_after;
         state_->test_fail_remember = config.test_fail_remember;
         server_cache_control_token secret;
@@ -546,6 +607,8 @@ server_cache_control_authority::server_cache_control_authority(
         }
         state_->core_available = state_->table && state_->retention &&
                      state_->max_holders > 0 && state_->max_leases > 0 &&
+                     state_->max_families > 0 &&
+                     state_->max_family_bindings > 0 &&
                      state_->token_secret != 0;
         if (state_->core_available) {
             state_->table->bind_fallback_provider(this);
@@ -575,6 +638,34 @@ server_cache_control_authority::~server_cache_control_authority() {
 
 bool server_cache_control_authority::available() const noexcept {
     return state_ && state_->core_available;
+}
+
+server_cache_control_status
+server_cache_control_authority::resolve_family_binding(
+        server_cache_control_token token,
+        common_cache_family_binding & out) noexcept {
+    out = {};
+    if (!available() || !token) {
+        return server_cache_control_status::not_found;
+    }
+    state_->assert_owner();
+    lifecycle_point();
+    const uint64_t digest = state_->digest(token);
+    for (const auto & holder : state_->holders) {
+        if (holder.state != impl::holder_state::active) {
+            continue;
+        }
+        const auto found = std::find_if(
+            holder.family_bindings.begin(), holder.family_bindings.end(),
+            [digest](const impl::family_binding_record & binding) {
+                return binding.handle_digest == digest;
+            });
+        if (found != holder.family_bindings.end()) {
+            out = found->binding;
+            return server_cache_control_status::ok;
+        }
+    }
+    return server_cache_control_status::not_found;
 }
 
 server_cache_durable_fallback_proof
@@ -732,7 +823,9 @@ server_cache_control_result server_cache_control_authority::execute(
             return finish(server_cache_control_status::not_found);
         }
         event_owner = holder->id;
-        if (operation == server_cache_control_operation::lease_acquire) {
+        if (operation == server_cache_control_operation::family_register ||
+            operation == server_cache_control_operation::family_bind ||
+            operation == server_cache_control_operation::lease_acquire) {
             if (const auto * replay = state_->replay(
                     operation, request.idempotency_key,
                     holder->id.v)) {
@@ -757,6 +850,66 @@ server_cache_control_result server_cache_control_authority::execute(
                 if (event.holder == holder->id) {
                     out.events.push_back(event.view);
                 }
+            }
+            return finish(server_cache_control_status::ok);
+        }
+
+        if (operation == server_cache_control_operation::family_register) {
+            if (!state_->grant_path_available) {
+                return finish(server_cache_control_status::internal_fault);
+            }
+            if (state_->family_count() >= state_->max_families) {
+                return finish(server_cache_control_status::capacity_refused);
+            }
+            server_cache_control_token handle;
+            if (state_->next_family_id == 0 ||
+                !state_->issue_token(handle)) {
+                return finish(server_cache_control_status::internal_fault);
+            }
+            impl::family_record family;
+            family.handle_digest = state_->digest(handle);
+            family.id = { state_->next_family_id++ };
+            holder->families.push_back(family);
+            out.family = handle;
+            out.status = server_cache_control_status::ok;
+            if (!state_->remember(
+                    operation, request.idempotency_key,
+                    holder->id.v, out)) {
+                state_->grant_path_available = false;
+            }
+            return finish(server_cache_control_status::ok);
+        }
+
+        if (operation == server_cache_control_operation::family_bind) {
+            auto * family = state_->find_family(*holder, request.family);
+            if (!family) {
+                return finish(server_cache_control_status::not_found);
+            }
+            if (request.family_role >= common_cache_family_role::_count) {
+                return finish(server_cache_control_status::invalid_request);
+            }
+            if (!state_->grant_path_available) {
+                return finish(server_cache_control_status::internal_fault);
+            }
+            if (state_->family_binding_count() >=
+                    state_->max_family_bindings) {
+                return finish(server_cache_control_status::capacity_refused);
+            }
+            server_cache_control_token handle;
+            if (!state_->issue_token(handle)) {
+                return finish(server_cache_control_status::internal_fault);
+            }
+            impl::family_binding_record binding;
+            binding.handle_digest = state_->digest(handle);
+            binding.binding = { family->id, request.family_role };
+            holder->family_bindings.push_back(binding);
+            out.family_binding = handle;
+            out.cache_family = binding.binding;
+            out.status = server_cache_control_status::ok;
+            if (!state_->remember(
+                    operation, request.idempotency_key,
+                    holder->id.v, out)) {
+                state_->grant_path_available = false;
             }
             return finish(server_cache_control_status::ok);
         }

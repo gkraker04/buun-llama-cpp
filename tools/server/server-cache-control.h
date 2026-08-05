@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../common/common-cache-family.h"
 #include "server-cache-lease.h"
 #include "server-retention-sidecar.h"
 
@@ -70,6 +71,8 @@ enum class server_cache_control_operation : uint8_t {
     holder_create = 0,
     holder_close,
     holder_reattach,
+    family_register,
+    family_bind,
     lease_acquire,
     lease_inspect,
     lease_renew,
@@ -103,6 +106,8 @@ struct server_cache_control_request {
     server_cache_control_token holder;
     server_cache_control_token recovery;
     server_cache_control_token lease;
+    server_cache_control_token family;
+    common_cache_family_role family_role = common_cache_family_role::_count;
     // E1.2 supplies a bounded client idempotency digest. Zero is allowed only
     // for scheduler-internal tests and receives no response-loss replay.
     uint64_t idempotency_key = 0;
@@ -126,6 +131,10 @@ struct server_cache_control_result {
     server_cache_control_token holder;
     server_cache_control_token holder_recovery;
     server_cache_control_token lease;
+    server_cache_control_token family;
+    server_cache_control_token family_binding;
+    // Scheduler-internal resolved value. E1.2 serializes only opaque handles.
+    common_cache_family_binding cache_family;
     server_cache_lease_class granted_class = server_cache_lease_class::none;
     server_cache_control_protection_state protection =
         server_cache_control_protection_state::released;
@@ -170,6 +179,8 @@ struct server_cache_control_config {
     acquire_host_proof_fn acquire_host_proof = nullptr;
     size_t max_holders = 64;
     size_t max_leases = 1024;
+    size_t max_families = 1024;
+    size_t max_family_bindings = 4096;
     // Model-free allocation-fault seams. Production must leave both defaults;
     // the E1 contract scan forbids assignments outside tests.
     size_t test_fail_note_after = std::numeric_limits<size_t>::max();
@@ -192,6 +203,11 @@ public:
     server_cache_control_result execute(
         server_cache_control_operation operation,
         const server_cache_control_request & request) noexcept;
+    // Completion launch resolves the opaque binding on the scheduler thread.
+    // Closed/expired holders and unknown handles are indistinguishable misses.
+    server_cache_control_status resolve_family_binding(
+        server_cache_control_token token,
+        common_cache_family_binding & out) noexcept;
     void lifecycle_point() noexcept;
     bool available() const noexcept;
 

@@ -1,6 +1,7 @@
 #include "server-cache-authority.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
+#include "server-context.h"
 #include "server-task.h"
 
 #include "llama.h"
@@ -304,6 +305,142 @@ server_cache_lease_id grant_explicit_host_lease(
         server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
 }
 
+void test_declared_family_round_trip_and_price() {
+    const common_cache_family_binding declared_main {
+        { 0xe11b }, common_cache_family_role::main,
+    };
+    CHECK(declared_main.declared());
+
+    common_prompt_checkpoint checkpoint;
+    checkpoint.n_tokens = 2;
+    checkpoint.pos_min = 0;
+    checkpoint.pos_max = 1;
+    checkpoint.cache_family = declared_main;
+    checkpoint.data_tgt.assign(4, 7);
+
+    common_prompt_checkpoint copied = checkpoint;
+    CHECK(copied.cache_family == declared_main);
+    common_prompt_checkpoint assigned;
+    assigned = checkpoint;
+    CHECK(assigned.cache_family == declared_main);
+    copied.clear();
+    CHECK(!copied.cache_family.declared());
+
+    server_prompt source;
+    source.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    source.checkpoints.push_back(checkpoint);
+    source.sequence_epoch = 9;
+    const auto cloned = source.clone();
+    CHECK(cloned.checkpoints.front().cache_family == declared_main);
+
+    server_prompt_cache cache(0, 0);
+    auto staged = cache.stage(source, 8, 0, "family-adapter");
+    CHECK(staged.size() == 1);
+    CHECK(staged.front().prompt.checkpoints.front().cache_family ==
+          declared_main);
+    server_prompt_cache_apply_family(
+        staged.front(), declared_main, false);
+    CHECK(staged.front().cache_family == declared_main);
+    CHECK(staged.front().main_family);
+    CHECK(cache.publish(std::move(staged)));
+
+    server_prompt_cache_restore_delivery delivery;
+    CHECK(cache.prepare_restore_delivery(cache.states.begin(), delivery));
+    CHECK(delivery.cache_family == declared_main);
+    const auto delivered_family = delivery.cache_family;
+    server_prompt restored_prompt;
+    cache.commit_restore_delivery(
+        cache.states.begin(), std::move(delivery), restored_prompt, 3);
+    CHECK(cache.states.empty());
+    CHECK(delivered_family == declared_main);
+    CHECK(restored_prompt.checkpoints.front().cache_family == declared_main);
+
+    const common_cache_family_binding undeclared;
+    server_prompt_cache_state automatic;
+    server_prompt_cache_apply_family(automatic, undeclared, true);
+    CHECK(automatic.main_family);
+    CHECK(!automatic.cache_family.declared());
+
+    const common_cache_plan_calib calib {
+        "e1-family-test", 1, 0.0, 1.0, 10.0,
+    };
+    uint32_t automatic_weight = 0;
+    uint32_t declared_weight = 0;
+    uint64_t automatic_price = 0;
+    uint64_t declared_price = 0;
+    CHECK(server_cache_host_retention_price_us(
+        calib, 100, false,
+        common_cache_family_main_family(undeclared, true),
+        automatic_weight, automatic_price));
+    CHECK(server_cache_host_retention_price_us(
+        calib, 100, false,
+        common_cache_family_main_family(declared_main, false),
+        declared_weight, declared_price));
+    CHECK(automatic_weight == SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT);
+    CHECK(declared_weight == automatic_weight);
+    CHECK(declared_price == automatic_price);
+    CHECK(!common_cache_family_allows_additional_weight(declared_main));
+    const common_cache_family_binding declared_branch {
+        declared_main.family, common_cache_family_role::branch,
+    };
+    CHECK(!common_cache_family_main_family(declared_branch, true));
+    CHECK(!common_cache_family_allows_additional_weight(declared_branch));
+
+    // One lineage rule covers slot reuse, undeclared append, and an explicit
+    // declaration joining retained content.
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, undeclared, 0) == undeclared);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 0) == declared_branch);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, undeclared, 2) == declared_main);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 2) == declared_main);
+
+    server_task parent(SERVER_TASK_TYPE_COMPLETION);
+    parent.cache_family_binding_token = { 17, 29 };
+    parent.add_child(1, 2);
+    CHECK(parent.child_tasks.size() == 1);
+    CHECK(parent.child_tasks.front().cache_family_binding_token ==
+          parent.cache_family_binding_token);
+
+    server_cache_authority cache_authority;
+    server_cache_control_config control_config;
+    control_config.leases = &cache_authority.leases;
+    control_config.retention = &cache_authority.retention;
+    server_cache_control_authority control(control_config);
+    server_cache_control_request holder_request;
+    holder_request.ttl_ns = 1000000000000ULL;
+    const auto holder = control.execute(
+        server_cache_control_operation::holder_create, holder_request);
+    CHECK(holder.status == server_cache_control_status::ok);
+    server_cache_control_request family_request;
+    family_request.holder = holder.holder;
+    family_request.idempotency_key = 1;
+    const auto family = control.execute(
+        server_cache_control_operation::family_register, family_request);
+    CHECK(family.status == server_cache_control_status::ok);
+    server_cache_control_request binding_request;
+    binding_request.holder = holder.holder;
+    binding_request.family = family.family;
+    binding_request.family_role = common_cache_family_role::main;
+    binding_request.idempotency_key = 2;
+    const auto binding = control.execute(
+        server_cache_control_operation::family_bind, binding_request);
+    CHECK(binding.status == server_cache_control_status::ok);
+    const auto slot_round_trip =
+        server_cache_family_slot_round_trip_for_test(
+            control, binding.family_binding);
+    CHECK(slot_round_trip.resolved);
+    CHECK(slot_round_trip.no_restore_resume);
+    CHECK(slot_round_trip.binding_intact);
+    CHECK(slot_round_trip.host_save_carries);
+    CHECK(slot_round_trip.checkpoint_carries);
+    std::puts(
+        "E1_FAMILY actual_slot_resume PASS binding_intact=1 host=1 checkpoint=1");
+    std::puts("E1_FAMILY round_trip PASS main_price_equal no_stack");
+}
+
 bool host_source_present(
         const server_prompt_cache & cache,
         int32_t source_id) {
@@ -353,6 +490,11 @@ void test_lifecycle_restore_retains_immutable_source() {
     cache.retention_obs = &authority.retention;
 
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
+    const common_cache_family_binding declared_branch {
+        { 0xe11b51de }, common_cache_family_role::branch,
+    };
+    server_prompt_cache_apply_family(
+        entry.front(), declared_branch, true);
     entry.front().data.main.assign(32, 7);
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 2;
@@ -405,6 +547,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     server_prompt_cache_restore_delivery first;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), first));
     CHECK(first.retains_source);
+    CHECK(first.cache_family == declared_branch);
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().size() == host_size_before);
 
@@ -417,6 +560,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     CHECK(live_first.checkpoints.size() == 2);
     CHECK(&live_first.checkpoints.front() != source_checkpoint);
     CHECK(live_first.checkpoints.front().n_tokens == 2);
+    CHECK(cache.states.front().cache_family == declared_branch);
     const auto live_ops_after_first = authority.ledger.snapshot().live_ops;
     CHECK(live_ops_after_first > live_ops_before);
     server_retention_candidate restored;
@@ -429,6 +573,7 @@ void test_lifecycle_restore_retains_immutable_source() {
 
     server_prompt_cache_restore_delivery second;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), second));
+    CHECK(second.cache_family == declared_branch);
     server_prompt live_second;
     cache.commit_restore_delivery(
         cache.states.begin(), std::move(second), live_second, 5);
@@ -1324,6 +1469,26 @@ void test_host_trade_main_family_weight_flips_victim() {
     auto child_r = install_host_trade_entry(cache, authority, "c-r", 64);
     make_host_trade_pair(main, main_r, "pair-main", 30, 30, true);
     make_host_trade_pair(child, child_r, "pair-child", 40, 40, false);
+    const common_cache_family_binding declared_main {
+        { 0xe11b30 }, common_cache_family_role::main,
+    };
+    const common_cache_family_binding declared_branch {
+        declared_main.family, common_cache_family_role::branch,
+    };
+    main->cache_family = declared_main;
+    main_r->cache_family = declared_main;
+    child->cache_family = declared_branch;
+    child_r->cache_family = declared_branch;
+    size_t callback_calls = 0;
+    authority.host_retention_weight_context = &callback_calls;
+    authority.host_retention_weight = [](
+            void * context,
+            const server_prompt_cache_state &,
+            uint32_t & weight) noexcept {
+        ++*static_cast<size_t *>(context);
+        weight = 9000;
+        return true;
+    };
 
     cache.limit_size = cache.size() - child->size() + 1;
     cache.update();
@@ -1331,6 +1496,7 @@ void test_host_trade_main_family_weight_flips_victim() {
     CHECK(!host_source_present(cache, 40));
     CHECK(authority.destruction.host_trade_attempted == 1);
     CHECK(authority.destruction.host_trade_main_family_evictions == 0);
+    CHECK(callback_calls == 0);
 
     // The automatic family signal is likewise a finite pricing weight.
     cache.limit_size = cache.size() - main->size() + 1;
@@ -1338,6 +1504,7 @@ void test_host_trade_main_family_weight_flips_victim() {
     CHECK(!host_source_present(cache, 30));
     CHECK(authority.destruction.host_trade_executed == 2);
     CHECK(authority.destruction.host_trade_main_family_evictions == 1);
+    CHECK(callback_calls == 0);
 }
 
 void test_host_trade_zero_destruction_tie_break() {
@@ -2060,6 +2227,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     test_lifecycle_full_cache_rotates();
+    test_declared_family_round_trip_and_price();
     test_lifecycle_restore_retains_immutable_source();
     test_durable_recovery_binds_exact_published_peer();
     test_unlaunched_disarm_releases_recovery_pin();

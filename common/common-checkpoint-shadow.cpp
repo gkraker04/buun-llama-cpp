@@ -195,6 +195,7 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
     representation_epoch(other.representation_epoch),
     representation_epoch_swa(other.representation_epoch_swa),
     computation_frontier(other.computation_frontier),
+    cache_family(other.cache_family),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
     accel(other.accel),
@@ -233,6 +234,7 @@ void common_prompt_checkpoint::clear() {
     representation_epoch_swa = 0;
 
     computation_frontier.clear();
+    cache_family = {};
 
     data_tgt.clear();
     data_dft.clear();

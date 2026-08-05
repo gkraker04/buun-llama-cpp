@@ -46,6 +46,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_CACHE_HOLDER_CREATE,
     SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE,
     SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH,
+    SERVER_TASK_TYPE_CACHE_FAMILY_REGISTER,
+    SERVER_TASK_TYPE_CACHE_FAMILY_BIND,
     SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE,
     SERVER_TASK_TYPE_CACHE_LEASE_INSPECT,
     SERVER_TASK_TYPE_CACHE_LEASE_RENEW,
@@ -169,9 +171,10 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
-    // Optional E1 declared-family policy input. E1.0 constructs no binding;
-    // the invalid/default value preserves all automatic family behavior.
-    common_cache_family_binding cache_family;
+    // Optional E1 declared-family policy input. E1.2 supplies only this
+    // opaque token; scheduler launch resolves the strong binding locally, so
+    // an HTTP worker cannot inject a policy value into a task.
+    server_cache_control_token cache_family_binding_token;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -282,6 +285,7 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.cache_family_binding_token = cache_family_binding_token;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
@@ -804,6 +808,15 @@ struct server_prompt_cache_state {
     }
 };
 
+inline void server_prompt_cache_apply_family(
+        server_prompt_cache_state & state,
+        common_cache_family_binding binding,
+        bool automatic_main_family) noexcept {
+    state.cache_family = binding;
+    state.main_family = common_cache_family_main_family(
+        binding, automatic_main_family);
+}
+
 struct server_cache_authority;
 class server_cache_recovery_pin;
 
@@ -822,6 +835,7 @@ struct server_prompt_cache_payload_leaf {
 // that intent explicitly if server_tokens ever becomes copyable.
 struct server_prompt_cache_restore_delivery {
     server_prompt prompt;
+    common_cache_family_binding cache_family;
     bool retains_source = false;
 };
 
@@ -891,10 +905,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
 
     // D-A1's two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.

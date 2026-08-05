@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "common-cache-family.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -1354,6 +1355,10 @@ struct common_prompt_checkpoint {
     // Logical validity record, dual-written beside the legacy physical fields
     // during the Phase-1 migration. Legacy checkpoints have version == 0.
     common_computation_frontier computation_frontier;
+
+    // E1 declared-family provenance. This is policy metadata only: it follows
+    // checkpoint copies/restores but never enters checkpoint payload bytes.
+    common_cache_family_binding cache_family;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;

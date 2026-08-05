@@ -20,11 +20,15 @@ file(READ "${SOURCE_ROOT}/tools/server/server.cpp" server_source)
 
 file(GLOB server_production_tus "${SOURCE_ROOT}/tools/server/*.cpp")
 set(server_production_source "")
+set(pre_family_production_source "")
 set(proof_callsite_source "")
 foreach(path IN LISTS server_production_tus)
     file(READ "${path}" source)
     string(APPEND server_production_source "\n${source}")
     get_filename_component(name "${path}" NAME)
+    if (NOT name STREQUAL "server-cache-control.cpp")
+        string(APPEND pre_family_production_source "\n${source}")
+    endif()
     if (NOT name STREQUAL "server-cache-lease.cpp" AND
         NOT name STREQUAL "server-cache-retention-proof.cpp" AND
         NOT name STREQUAL "server-cache-vbr-proof.cpp")
@@ -60,7 +64,7 @@ function(family_contract_valid family task authority context task_cpp output)
         endif()
     endforeach()
     string(FIND "${task}"
-        "common_cache_family_binding cache_family;" task_field)
+        "server_cache_control_token cache_family_binding_token;" task_field)
     string(FIND "${authority}"
         "common_cache_family_binding cache_family;" policy_field)
     string(REGEX MATCH
@@ -117,12 +121,12 @@ family_contract_valid(
 if (NOT family_valid)
     message(FATAL_ERROR "E1.0 family foundation contract failed")
 endif()
-forbid_token("${common_header}" "common-cache-family.h"
-    "deferred checkpoint include")
-forbid_token("${common_header}" "common_cache_family_binding cache_family;"
-    "deferred checkpoint carrier")
+require_token("${common_header}" "common-cache-family.h"
+    "checkpoint family include")
+require_token("${common_header}" "common_cache_family_binding cache_family;"
+    "checkpoint family carrier")
 no_declared_family_construction(
-    "${server_production_source}" no_declared_construction)
+    "${pre_family_production_source}" no_declared_construction)
 if (NOT no_declared_construction)
     message(FATAL_ERROR "E1.0 production constructed a declared family")
 endif()
@@ -179,8 +183,8 @@ if (NOT classifier_callers_valid)
     message(FATAL_ERROR "E1.0 hard-seal classifier gained a premature caller")
 endif()
 
-# E1.1a deliberately adds the scheduler-only control task. Routes, CLI flags,
-# family propagation, and public llama.h remain outside this unit.
+# E1.1a/E1.1b deliberately add scheduler-only control/family tasks. Routes,
+# CLI flags, VBR enforcement, and public llama.h remain outside these units.
 function(surface_contract_valid source output)
     foreach(token
             "/cache/lease"
@@ -216,7 +220,7 @@ if (family_negative_valid)
 endif()
 
 set(declared_negative
-    "${server_production_source}\ncommon_cache_family_role::main")
+    "${pre_family_production_source}\ncommon_cache_family_role::main")
 no_declared_family_construction(
     "${declared_negative}" declared_negative_valid)
 if (declared_negative_valid)

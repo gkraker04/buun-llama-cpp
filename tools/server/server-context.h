@@ -11,6 +11,23 @@
 #include <set>
 
 struct server_context_impl; // private implementation
+class server_cache_control_authority;
+
+// TEST-ONLY E1.1b door. It constructs the private server_slot, resolves a
+// scheduler family token, exercises the real no-restore cache load, and then
+// verifies that host/checkpoint carriers are sourced from that same slot.
+struct server_cache_family_slot_round_trip_result {
+    bool resolved = false;
+    bool no_restore_resume = false;
+    bool binding_intact = false;
+    bool host_save_carries = false;
+    bool checkpoint_carries = false;
+};
+
+server_cache_family_slot_round_trip_result
+server_cache_family_slot_round_trip_for_test(
+        server_cache_control_authority & authority,
+        server_cache_control_token binding_token);
 
 struct server_context_meta {
     std::string build_info;

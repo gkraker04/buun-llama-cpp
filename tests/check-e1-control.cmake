@@ -51,6 +51,7 @@ require_token("${context}" "params_base.cache_lifecycle," "lifecycle task gate i
 require_token("${control}" "if (!lifecycle_available || !substrate_available)" "debug-only refusal")
 foreach(task_name
         CACHE_HOLDER_CREATE CACHE_HOLDER_CLOSE CACHE_HOLDER_REATTACH
+        CACHE_FAMILY_REGISTER CACHE_FAMILY_BIND
         CACHE_LEASE_ACQUIRE CACHE_LEASE_INSPECT CACHE_LEASE_RENEW
         CACHE_LEASE_RELEASE CACHE_CONTROL_EVENTS)
     require_token("${context}" "case SERVER_TASK_TYPE_${task_name}:" "typed task census")

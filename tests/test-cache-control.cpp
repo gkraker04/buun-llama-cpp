@@ -562,6 +562,99 @@ static void test_task_lifecycle_gate() {
           server_cache_control_status::ok);
 }
 
+static void test_family_registry_and_binding() {
+    control_test_clock clock;
+    control_test_tokens tokens;
+    server_cache_lease_table leases(&clock);
+    server_retention_sidecar_store retention;
+    server_cache_control_config config;
+    config.leases = &leases;
+    config.retention = &retention;
+    config.clock = &clock;
+    config.tokens = &tokens;
+    server_cache_control_authority authority(config);
+    CHECK(authority.available());
+
+    const auto holder = execute(
+        authority, server_cache_control_operation::holder_create,
+        create_holder(100));
+    CHECK(holder.status == server_cache_control_status::ok);
+
+    server_cache_control_request register_family;
+    register_family.holder = holder.holder;
+    register_family.idempotency_key = 901;
+    const auto family = execute(
+        authority, server_cache_control_operation::family_register,
+        register_family);
+    CHECK(family.status == server_cache_control_status::ok);
+    CHECK(bool(family.family));
+    const auto family_replay = execute(
+        authority, server_cache_control_operation::family_register,
+        register_family);
+    CHECK(family_replay.family == family.family);
+
+    server_cache_control_request bind;
+    bind.holder = holder.holder;
+    bind.family = family.family;
+    bind.family_role = common_cache_family_role::main;
+    bind.idempotency_key = 902;
+    const auto binding = execute(
+        authority, server_cache_control_operation::family_bind, bind);
+    CHECK(binding.status == server_cache_control_status::ok);
+    CHECK(bool(binding.family_binding));
+    CHECK(binding.cache_family.declared());
+    CHECK(binding.cache_family.role == common_cache_family_role::main);
+    const auto binding_replay = execute(
+        authority, server_cache_control_operation::family_bind, bind);
+    CHECK(binding_replay.family_binding == binding.family_binding);
+
+    common_cache_family_binding resolved;
+    CHECK(authority.resolve_family_binding(
+              binding.family_binding, resolved) ==
+          server_cache_control_status::ok);
+    CHECK(resolved == binding.cache_family);
+
+    const auto other = execute(
+        authority, server_cache_control_operation::holder_create,
+        create_holder(100));
+    auto foreign = bind;
+    foreign.holder = other.holder;
+    foreign.idempotency_key = 0;
+    CHECK(execute(authority, server_cache_control_operation::family_bind,
+                  foreign).status == server_cache_control_status::not_found);
+
+    clock.now = 101;
+    authority.lifecycle_point();
+    resolved = {};
+    CHECK(authority.resolve_family_binding(
+              binding.family_binding, resolved) ==
+          server_cache_control_status::not_found);
+    CHECK(!resolved.declared());
+
+    // A poisoned idempotency/grant path is an internal authority fault, not
+    // capacity pressure. This mirrors lease-acquire's status discipline.
+    server_cache_lease_table poisoned_leases(&clock);
+    server_retention_sidecar_store poisoned_retention;
+    auto poisoned_config = config;
+    poisoned_config.leases = &poisoned_leases;
+    poisoned_config.retention = &poisoned_retention;
+    poisoned_config.test_fail_remember = true;
+    server_cache_control_authority poisoned(poisoned_config);
+    auto poisoned_holder_request = create_holder(200);
+    poisoned_holder_request.idempotency_key = 99;
+    const auto poisoned_holder = execute(
+        poisoned, server_cache_control_operation::holder_create,
+        poisoned_holder_request);
+    CHECK(poisoned_holder.status == server_cache_control_status::ok);
+    server_cache_control_request poisoned_family;
+    poisoned_family.holder = poisoned_holder.holder;
+    CHECK(execute(
+        poisoned, server_cache_control_operation::family_register,
+        poisoned_family).status ==
+            server_cache_control_status::internal_fault);
+    std::puts("E1_FAMILY registry_binding PASS role=main expired=not_found");
+}
+
 static void test_production_store_resolver_leg() {
     llama_cache_acct_ledger ledger;
     const auto pinned = llama_cache_acct_resource_domain::non_device(
@@ -640,6 +733,7 @@ int main() {
     test_refusals_soft_expiry_and_ownership();
     test_poisoned_evidence_still_releases();
     test_task_lifecycle_gate();
+    test_family_registry_and_binding();
     test_production_store_resolver_leg();
     if (failures != 0) {
         std::fprintf(stderr, "test-cache-control: %d failures\n", failures);
