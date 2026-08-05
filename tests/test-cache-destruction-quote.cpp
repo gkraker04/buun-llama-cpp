@@ -164,6 +164,45 @@ static void test_complete_memoized_and_permutation() {
         common_cache_plan_destruction_reason::effect_drift);
 }
 
+static void test_read_only_zero_sequence_quote() {
+    common_cache_plan_destruction_counters production_counters;
+    production_counters.quote_samples = 41;
+    production_counters.quote_duration_us_total = 99;
+    auto ordinary = record_with_cold_candidates();
+    CHECK(!server_cache_destruction_quote_all(
+        ordinary, 0, { artifact(1, 11) }, 17, preview(17), project(),
+        { true, common_cache_plan_recovery_citation::prospective, 0 },
+        production_counters));
+    CHECK(ordinary.destruction.state ==
+          common_cache_plan_destruction_state::failed);
+    CHECK(ordinary.destruction.reason ==
+          common_cache_plan_destruction_reason::internal_fault);
+
+    auto rec = record_with_cold_candidates();
+    const auto production_before = production_counters;
+    common_cache_plan_destruction_counters counters;
+    CHECK(server_cache_destruction_quote_all(
+        rec, 0, { artifact(1, 11) }, 17, preview(17), project(),
+        { true, common_cache_plan_recovery_citation::prospective, 0, 0,
+          true },
+        counters));
+    CHECK(!rec.destruction_quotes.empty());
+    CHECK(rec.destruction_quotes.front().receipt.state ==
+          common_cache_plan_destruction_state::quoted);
+    CHECK(rec.destruction_quotes.front().receipt.admission_sequence == 0);
+    CHECK(std::memcmp(
+              &production_counters, &production_before,
+              sizeof(production_counters)) == 0);
+
+    llama_cache_acct_ledger ledger;
+    auto prepared = server_cache_prepare_release_set(
+        rec.destruction_quotes.front(), { artifact(1, 11) }, ledger,
+        ledger.snapshot().serial, project(), {});
+    CHECK(prepared.status ==
+          server_cache_prepare_release_status::invalid_quote);
+    CHECK(!prepared.capability.ready());
+}
+
 static void test_fail_closed_matrix() {
     struct cell {
         common_cache_plan_destruction_reason reason;
@@ -646,6 +685,7 @@ static void test_prepared_release_capability() {
 
     common_cache_plan_destruction_quote quote;
     quote.receipt.state = common_cache_plan_destruction_state::quoted;
+    quote.receipt.admission_sequence = 7;
     quote.receipt.effects = common_cache_plan_destruction_effect_bit(
         common_cache_plan_destruction_effect::cross_target_displacement);
     quote.receipt.selected_attention = { { 1 } };
@@ -849,6 +889,7 @@ static void test_fixed_pool_known_zero_release() {
 
 int main() {
     test_complete_memoized_and_permutation();
+    test_read_only_zero_sequence_quote();
     test_fail_closed_matrix();
     test_refusal_mapping_and_selection();
     test_plural_effect_union_and_counters();

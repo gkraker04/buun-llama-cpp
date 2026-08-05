@@ -462,6 +462,11 @@ server_cache_prepare_release_result server_cache_prepare_release_set(
     try {
         if (quote.receipt.state !=
                 common_cache_plan_destruction_state::quoted ||
+            // Production receipts are minted from 1. Sequence zero therefore
+            // means the receipt was never minted, irrespective of which
+            // read-only caller produced it, and is invalid at this capability
+            // boundary.
+            quote.receipt.admission_sequence == 0 ||
             !quote.receipt.union_effect_digest.valid() ||
             !project) {
             return out;
@@ -628,7 +633,8 @@ bool server_cache_destruction_quote_all(
             common_cache_plan_destruction_state::refused,
             common_cache_plan_destruction_reason::manifest_incomplete);
     }
-    if (!preview || !project || options.admission_sequence == 0) {
+    if ((options.admission_sequence == 0 && !options.preview_unminted) ||
+        !preview || !project) {
         return fail_whole_pass(
             common_cache_plan_destruction_state::failed,
             common_cache_plan_destruction_reason::internal_fault);
@@ -903,7 +909,7 @@ void server_cache_destruction_select_quote(
     if (rec.destruction_quotes.empty()) {
         return;
     }
-    if (rec.shadow_choice < 0) {
+    if (!server_cache_plan_shadow_choice_valid(rec)) {
         rec.destruction.state = common_cache_plan_destruction_state::failed;
         rec.destruction.reason =
             common_cache_plan_destruction_reason::internal_fault;
@@ -939,6 +945,36 @@ void server_cache_destruction_select_quote(
     rec.destruction.selected_attention.clear();
     rec.destruction.selected_recurrent.clear();
     counters.observe(rec.selection, rec.destruction);
+}
+
+void server_cache_destruction_select_preview(
+        common_cache_plan_record & rec,
+        common_cache_plan_destruction_counters & counters,
+        int32_t legacy_plan_candidate,
+        bool lifecycle_available,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
+    if (lifecycle_available) {
+        server_cache_destruction_select_quote(
+            rec, counters, permitted_effects);
+        return;
+    }
+    if (!server_cache_plan_shadow_choice_valid(rec)) {
+        return;
+    }
+    rec.destruction_legacy_plan_candidate = legacy_plan_candidate;
+    rec.destruction.plan_candidate = rec.shadow_choice;
+    rec.destruction.effects = server_cache_destruction_effects_for(
+        rec, rec.shadow_choice, legacy_plan_candidate, permitted_effects);
+    if (rec.destruction.effects != 0) {
+        rec.destruction.state =
+            common_cache_plan_destruction_state::refused;
+        rec.destruction.reason =
+            common_cache_plan_destruction_reason::lifecycle_disabled;
+        return;
+    }
+    const uint64_t duration = rec.destruction.quote_duration_us;
+    rec.destruction = {};
+    rec.destruction.quote_duration_us = duration;
 }
 
 void server_cache_destruction_finalize_projection(

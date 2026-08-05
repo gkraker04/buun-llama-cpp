@@ -5,6 +5,7 @@
 #include "server-cache-authority.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
+#include "server-cache-plan-preflight-internal.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
 #include "server-task.h"
@@ -41,6 +42,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <filesystem>
 #include <string>
@@ -2098,6 +2100,7 @@ private:
     // armed dynamic-VBR memory after the one-shot manifest and ring admission.
     std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
     std::thread::id vbr_capture_scheduler_thread;
+    std::thread::id cache_plan_preflight_scheduler_thread;
 
     // B-A authority substrate. Independent of debug serialization: non-off
     // graduated levels dual-run even when CACHE_PLAN JSON is disabled.
@@ -2656,8 +2659,62 @@ private:
         }
     }
 
+    struct cache_plan_host_source_registry {
+        explicit cache_plan_host_source_registry(bool publish) noexcept
+            : publish_(publish) {}
+
+        void begin(server_prompt_cache * cache) noexcept {
+            if (publish_ && cache) {
+                cache->cache_plan_begin_inventory();
+                published_.clear();
+                published_.reserve(cache->states.size());
+                for (auto & state : cache->states) {
+                    published_.emplace(
+                        server_retention_instance_key::for_host_entry(
+                            &state).instance,
+                        &state);
+                }
+            }
+        }
+
+        bool get(
+                server_prompt_cache & cache,
+                server_prompt_cache_state & state,
+                int32_t & source_id) {
+            if (publish_) {
+                return cache.cache_plan_get_source_id(state, source_id);
+            }
+            return local_.get_or_assign(
+                server_retention_instance_key::for_host_entry(
+                    &state).instance,
+                source_id);
+        }
+
+        bool find(uintptr_t instance, int32_t & source_id) const noexcept {
+            if (!publish_) {
+                return local_.find(instance, source_id);
+            }
+            const auto found = published_.find(instance);
+            if (found == published_.end() ||
+                found->second->cache_plan_source_id < 0) {
+                source_id = -1;
+                return false;
+            }
+            source_id = found->second->cache_plan_source_id;
+            return true;
+        }
+
+    private:
+        bool publish_ = false;
+        server_cache_plan_local_source_registry local_;
+        std::unordered_map<uintptr_t, const server_prompt_cache_state *>
+            published_;
+    };
+
     bool cache_plan_destruction_artifacts(
-            std::vector<server_cache_destruction_artifact> & artifacts) noexcept {
+            std::vector<server_cache_destruction_artifact> & artifacts,
+            const cache_plan_host_source_registry * source_registry =
+                nullptr) noexcept {
         artifacts.clear();
         if (!cache_authority) {
             return false;
@@ -2670,16 +2727,30 @@ private:
                 normalized.size() != catalog.size()) {
                 return false;
             }
-            std::unordered_map<uintptr_t, int32_t> host_source_ids;
-            if (prompt_cache) {
-                host_source_ids.reserve(prompt_cache->states.size());
-                for (const auto & entry : prompt_cache->states) {
-                    host_source_ids.emplace(
+            std::unordered_map<uintptr_t, int32_t> existing_host_source_ids;
+            if (!source_registry && prompt_cache) {
+                existing_host_source_ids.reserve(prompt_cache->states.size());
+                for (const auto & state : prompt_cache->states) {
+                    existing_host_source_ids.emplace(
                         server_retention_instance_key::for_host_entry(
-                            &entry).instance,
-                        entry.cache_plan_source_id);
+                            &state).instance,
+                        state.cache_plan_source_id);
                 }
             }
+            const auto find_host_source = [&](
+                    uintptr_t instance, int32_t & source_id) noexcept {
+                if (source_registry) {
+                    return source_registry->find(instance, source_id);
+                }
+                const auto found = existing_host_source_ids.find(instance);
+                if (found == existing_host_source_ids.end() ||
+                    found->second < 0) {
+                    source_id = -1;
+                    return false;
+                }
+                source_id = found->second;
+                return true;
+            };
             artifacts.reserve(catalog.size());
             for (size_t i = 0; i < catalog.size(); ++i) {
                 server_cache_destruction_artifact artifact;
@@ -2710,11 +2781,9 @@ private:
                     common_retention_artifact_kind::live_slot;
                 if (artifact.kind ==
                         common_retention_artifact_kind::host_entry) {
-                    const auto backing = host_source_ids.find(
-                        catalog[i].instance_key.instance);
-                    if (backing != host_source_ids.end()) {
-                        artifact.host_source_id = backing->second;
-                    }
+                    (void) find_host_source(
+                        catalog[i].instance_key.instance,
+                        artifact.host_source_id);
                 }
                 artifacts.push_back(std::move(artifact));
             }
@@ -2731,7 +2800,8 @@ private:
             common_cache_plan_record & rec,
             server_cache_destruction_quote_options options,
             uint64_t * admission_sequence,
-            common_cache_plan_destruction_counters & counters) noexcept {
+            common_cache_plan_destruction_counters & counters,
+            const cache_plan_host_source_registry * source_registry) noexcept {
         if (!cache_authority || !options.lifecycle_available) {
             rec.destruction.state = common_cache_plan_destruction_state::refused;
             rec.destruction.reason =
@@ -2772,7 +2842,8 @@ private:
 
             const auto snapshot = cache_authority->ledger.snapshot();
             std::vector<server_cache_destruction_artifact> artifacts;
-            if (!cache_plan_destruction_artifacts(artifacts)) {
+            if (!cache_plan_destruction_artifacts(
+                    artifacts, source_registry)) {
                 fail_whole_pass(
                     common_cache_plan_destruction_state::refused,
                     common_cache_plan_destruction_reason::manifest_incomplete);
@@ -2950,8 +3021,7 @@ private:
             common_cache_plan_record & rec) noexcept {
         live_displacement_certification out;
         if (!params_base.cache_lifecycle || !cache_authority ||
-            !prompt_cache || rec.shadow_choice < 0 ||
-            uint32_t(rec.shadow_choice) >= rec.n_inventory ||
+            !prompt_cache || !server_cache_plan_shadow_choice_valid(rec) ||
             rec.destruction_legacy_plan_candidate < 0 ||
             !cache_plan_authority ||
             !server_cache_plan_level_enabled(
@@ -5917,6 +5987,21 @@ private:
         return false;
     }
 
+    bool cache_plan_planned_slot_current(
+            const common_cache_plan_record & rec,
+            const server_slot & legacy_target,
+            const server_slot * planned,
+            common_cache_plan_provider provider,
+            bool adapter_matches) const noexcept {
+        if (!planned || planned->is_processing() ||
+            (provider != common_cache_plan_provider::cold_replay &&
+             !adapter_matches)) {
+            return false;
+        }
+        return planned == &legacy_target ||
+               cache_plan_retarget_target_current(rec, *planned);
+    }
+
     bool cache_plan_inventory_live_rows(
             const server_task & task,
             const std::vector<uint64_t> & slot_lcps,
@@ -5953,15 +6038,16 @@ private:
             const std::vector<uint64_t> & slot_lcps,
             const std::string & incoming_adapter,
             bool recurrent,
-            common_cache_plan_record & rec) {
+            common_cache_plan_record & rec,
+            cache_plan_host_source_registry & source_registry) {
         if (!prompt_cache) {
             rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
             return true;
         }
         for (auto & state : prompt_cache->states) {
             int32_t host_source_id = -1;
-            if (!prompt_cache->cache_plan_get_source_id(
-                    state, host_source_id)) {
+            if (!source_registry.get(
+                    *prompt_cache, state, host_source_id)) {
                 rec.inventory_states[size_t(
                     common_cache_plan_provider::host_cache_entry)] =
                     common_cache_plan_inventory_state::overflowed;
@@ -6121,15 +6207,14 @@ private:
             const server_task & task,
             server_slot & target,
             const std::string & incoming_adapter,
-            common_cache_plan_record & rec) {
+            common_cache_plan_record & rec,
+            cache_plan_host_source_registry & source_registry) {
         rec.id_slot = target.id;
         rec.n_prompt_tokens = llama_cache_acct_value::measured(task.tokens.size());
         rec.identity.adapter_config_digest = llama_cache_acct_value::measured(
             std::hash<std::string>{}(incoming_adapter));
 
-        if (prompt_cache) {
-            prompt_cache->cache_plan_begin_inventory();
-        }
+        source_registry.begin(prompt_cache.get());
 
         std::vector<uint64_t> slot_lcps;
         slot_lcps.reserve(slots.size());
@@ -6144,7 +6229,8 @@ private:
         // overflow (or derived_plans_incomplete); stop paying work immediately.
         if (!cache_plan_inventory_live_rows(task, slot_lcps, rec) ||
             !cache_plan_inventory_host_rows(
-                task, slot_lcps, incoming_adapter, recurrent, rec) ||
+                task, slot_lcps, incoming_adapter, recurrent, rec,
+                source_registry) ||
             !cache_plan_inventory_checkpoint_rows(
                 task, slot_lcps, recurrent, rec) ||
             !cache_plan_inventory_cold_rows(task, slot_lcps, rec)) {
@@ -6340,7 +6426,9 @@ private:
     };
 
     cache_plan_stage1_selection cache_plan_select_before_mutation(
-            const server_task & task) {
+            const server_task & task,
+            server_cache_plan_authority * plan_authority,
+            bool is_preflight) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -6356,14 +6444,14 @@ private:
         // every row write from here on is noexcept (fixed-array record), so the shipped path
         // cannot throw through the observer. An allocation fault is swallowed and counted.
         std::unique_ptr<common_cache_plan_record> plan_rec;
-        if (cache_plan_authority) {
+        if (plan_authority) {
             try {
                 plan_rec = std::make_unique<common_cache_plan_record>();
                 plan_rec->id_task = task.id;
                 // B-2: the profile is composed once at init and copied here (inside the
                 // creation try — never from a selector hook)
                 plan_rec->calibration_profile =
-                    cache_plan_authority->calibration_profile;
+                    plan_authority->calibration_profile;
                 // opaque identity evidence from already-computed keys (never raw values);
                 // identities the server has not computed stay typed unknown
                 plan_rec->identity.model_digest = llama_cache_acct_value::measured(
@@ -6389,7 +6477,7 @@ private:
                     plan_rec->identity.prefix_token_digest = llama_cache_acct_value::measured(h);
                 }
             } catch (...) {
-                if (cache_plan_obs) {
+                if (!is_preflight && cache_plan_obs) {
                     cache_plan_obs->shadow_unavailable++;
                 }
             }
@@ -6409,7 +6497,9 @@ private:
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
-                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                if (!is_preflight) {
+                    SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                }
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::by_id;
                     // forced selection carries no reuse verdict, but the slot WAS observed —
@@ -6489,8 +6579,10 @@ private:
                 const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            sim_best, slot_prompt_similarity, f_keep);
+                    if (!is_preflight) {
+                        SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                                sim_best, slot_prompt_similarity, f_keep);
+                    }
                     if (plan_rec) {
                         plan_rec->selection = common_cache_plan_selection::similarity;
                         if (auto * row = slot_row(*ret, COMMON_CACHE_PLAN_PHASE_SIMILARITY)) {
@@ -6563,8 +6655,10 @@ private:
             plan_rec ? route_home_scan(std::true_type{}) : route_home_scan(std::false_type{});
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
-                        lcp_best, (double) lcp_best / task.tokens.size(), slot_prompt_similarity);
+                if (!is_preflight) {
+                    SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
+                            lcp_best, (double) lcp_best / task.tokens.size(), slot_prompt_similarity);
+                }
 
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::route_home;
@@ -6625,8 +6719,10 @@ private:
             plan_rec ? lru_scan(std::true_type{}) : lru_scan(std::false_type{});
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
-                        t_last, sim_best_any);
+                if (!is_preflight) {
+                    SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
+                            t_last, sim_best_any);
+                }
 
                 if (plan_rec) {
                     plan_rec->selection = common_cache_plan_selection::lru;
@@ -6640,8 +6736,12 @@ private:
             // A by-id task targeting a busy slot is deferred by the caller.
             // Do not replace that slot's in-flight evidence record with this
             // retry's local record; shipped selection/mutation remains intact.
+            // E0 preflight does retain the request-local record so PROVIDER_BUSY
+            // remains visible as typed evidence without arming the slot.
             selection_deferred_busy = true;
-            plan_rec.reset();
+            if (!is_preflight) {
+                plan_rec.reset();
+            }
         }
 
         return {
@@ -6659,6 +6759,18 @@ private:
         bool incoming_adapter_matches = false;
         bool host_lookup_enabled = false;
     };
+
+    struct cache_plan_stage1_mode {
+        server_cache_plan_authority * plan_authority = nullptr;
+        bool preflight = false;
+    };
+
+    cache_plan_stage1_mode cache_plan_stage1_mode_for(
+            server_cache_plan_authority * plan_authority,
+            bool is_preflight) noexcept {
+        GGML_ASSERT(plan_authority);
+        return { plan_authority, is_preflight };
+    }
 
     void cache_plan_derive_incoming_adapter(
             const server_task & task,
@@ -6678,35 +6790,55 @@ private:
             server_slot & target,
             bool update_cache,
             common_cache_plan_record & rec,
-            cache_plan_stage1_inventory & out) {
+            cache_plan_stage1_inventory & out,
+            const cache_plan_stage1_mode & mode) {
+        GGML_ASSERT(mode.plan_authority);
         const uint64_t capability_before =
             cache_plan_capability_snapshot(task);
+        cache_plan_host_source_registry source_registry(
+            !mode.preflight);
         cache_plan_derive_incoming_adapter(task, target, out);
         cache_plan_inventory_before_mutation(
-            task, target, out.incoming_adapter, rec);
+            task, target, out.incoming_adapter, rec, source_registry);
         const uint64_t capability_after =
             cache_plan_capability_snapshot(task);
-        out.host_lookup_enabled =
-            update_cache && prompt_cache &&
-            task.type == SERVER_TASK_TYPE_COMPLETION &&
-            out.incoming_adapter_matches;
-        if (cache_authority &&
-            (cache_plan_obs || params_base.cache_lifecycle)) {
+        const auto semantics = server_cache_plan_stage1_semantics_for(
+            mode.preflight,
+            task.type == SERVER_TASK_TYPE_COMPLETION,
+            update_cache,
+            prompt_cache != nullptr,
+            out.incoming_adapter_matches);
+        out.host_lookup_enabled = semantics.host_lookup_enabled;
+        common_cache_plan_destruction_counters throwaway_destruction_counters;
+        auto * destruction_counters = mode.preflight
+            ? &throwaway_destruction_counters
+            : (cache_authority
+                ? &cache_authority->destruction_counters
+                : nullptr);
+        uint64_t * production_quote_sequence =
+            !mode.preflight && cache_authority
+                ? &cache_authority->destruction_quote_sequence
+                : nullptr;
+        const bool preview_lifecycle_available =
+            params_base.cache_lifecycle;
+        const bool quote_lifecycle_available = mode.preflight
+            ? preview_lifecycle_available
+            : true;
+        if (destruction_counters &&
+            (cache_authority || !quote_lifecycle_available)) {
             const int64_t destruction_quote_started = ggml_time_us();
-            auto & counters = cache_authority->destruction_counters;
             server_cache_destruction_quote_options options {
-                true,
-                prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION
-                    ? common_cache_plan_recovery_citation::prospective
-                    : common_cache_plan_recovery_citation::unavailable,
+                quote_lifecycle_available,
+                semantics.recovery_citation,
                 0,
                 server_cache_plan_nonconsuming_host_effects(
                     params_base.cache_lifecycle),
+                mode.preflight,
             };
             cache_plan_quote_destruction(
                 target.id, out.host_lookup_enabled, rec,
-                options, &cache_authority->destruction_quote_sequence,
-                counters);
+                options, production_quote_sequence,
+                *destruction_counters, &source_registry);
             const uint64_t destruction_quote_duration = uint64_t(
                 std::max<int64_t>(0,
                     ggml_time_us() - destruction_quote_started));
@@ -6714,23 +6846,33 @@ private:
             for (auto & quote : rec.destruction_quotes) {
                 quote.receipt.quote_duration_us = destruction_quote_duration;
             }
-            counters.quote_samples++;
-            counters.quote_duration_us_total += destruction_quote_duration;
-            counters.quote_duration_us_max = std::max(
-                counters.quote_duration_us_max, destruction_quote_duration);
+            destruction_counters->quote_samples++;
+            destruction_counters->quote_duration_us_total +=
+                destruction_quote_duration;
+            destruction_counters->quote_duration_us_max = std::max(
+                destruction_counters->quote_duration_us_max,
+                destruction_quote_duration);
         }
-        cache_plan_authority->plan_before_mutation(
+        mode.plan_authority->plan_before_mutation(
             rec, capability_before, capability_after);
-        if (cache_plan_obs && cache_authority) {
-            server_cache_destruction_select_quote(
-                rec, cache_authority->destruction_counters,
+        if (destruction_counters &&
+            (mode.preflight || cache_plan_obs != nullptr)) {
+            const int32_t legacy_candidate =
+                rec.destruction_legacy_plan_candidate >= 0
+                    ? rec.destruction_legacy_plan_candidate
+                    : server_cache_plan_legacy_candidate(
+                        rec, target.id, out.host_lookup_enabled);
+            server_cache_destruction_select_preview(
+                rec, *destruction_counters, legacy_candidate,
+                preview_lifecycle_available,
                 server_cache_plan_nonconsuming_host_effects(
                     params_base.cache_lifecycle));
         }
     }
 
     server_slot * get_available_slot(const server_task & task) {
-        auto stage1 = cache_plan_select_before_mutation(task);
+        auto stage1 = cache_plan_select_before_mutation(
+            task, cache_plan_authority.get(), false);
         server_slot * ret = stage1.target;
         bool update_cache = stage1.update_cache;
         const bool selection_deferred_busy = stage1.selection_deferred_busy;
@@ -6763,7 +6905,9 @@ private:
                 try {
                     cache_plan_inventory_and_plan_before_mutation(
                         task, *legacy_ret, update_cache, *plan_rec,
-                        stage1_inventory);
+                        stage1_inventory,
+                        cache_plan_stage1_mode_for(
+                            cache_plan_authority.get(), false));
                     const bool host_lookup_enabled =
                         stage1_inventory.host_lookup_enabled;
 
@@ -6788,6 +6932,15 @@ private:
                             : (planned_ret &&
                                are_lora_equal(
                                    incoming_loras, planned_ret->lora));
+                    const auto planned_provider =
+                        server_cache_plan_shadow_choice_valid(*plan_rec)
+                            ? plan_rec->inventory[size_t(
+                                  plan_rec->shadow_choice)].provider
+                            : common_cache_plan_provider::cold_replay;
+                    const bool planned_slot_current =
+                        cache_plan_planned_slot_current(
+                            *plan_rec, *legacy_ret, planned_ret,
+                            planned_provider, planned_adapter_matches);
                     live_displacement_certification displacement;
                     if (planned_ret) {
                         displacement = cache_plan_certify_live_displacement(
@@ -6804,9 +6957,7 @@ private:
                         server_cache_plan_retarget_currency_required(
                             selection_admits_retarget, planned_target,
                             legacy_ret->id) &&
-                        (!planned_ret ||
-                         !cache_plan_retarget_target_current(
-                             *plan_rec, *planned_ret))) {
+                        !planned_slot_current) {
                         cache_plan_authority->fallback_legacy(
                             *plan_rec,
                             common_cache_plan_authority_fallback::stale_capability);
@@ -7897,14 +8048,81 @@ private:
     // The live capture path fills accel.ring only; accel.spec remains a stash slot
     // for spec impls that need it (e.g. eagle3), applied on restore when present.
 
-    void assert_vbr_artifact_scheduler_thread() {
+    void assert_scheduler_thread(
+            std::thread::id & pinned,
+            const char * what) {
         const auto current = std::this_thread::get_id();
-        if (vbr_capture_scheduler_thread == std::thread::id{}) {
-            vbr_capture_scheduler_thread = current;
+        if (pinned == std::thread::id{}) {
+            pinned = current;
         }
-        GGML_ASSERT(
-            vbr_capture_scheduler_thread == current &&
-            "VBR artifact work must run on scheduler thread");
+        if (pinned != current) {
+            GGML_ABORT("%s\n", what);
+        }
+    }
+
+    bool cache_plan_preflight_inputs_current(
+            const common_cache_plan_record & rec,
+            const server_slot & legacy_target,
+            const cache_plan_stage1_inventory & inventory) noexcept {
+        if (rec.planner_status != common_cache_plan_planner_status::ok ||
+            !server_cache_plan_shadow_choice_valid(rec)) {
+            return false;
+        }
+        const auto & selected = rec.inventory[size_t(rec.shadow_choice)];
+        server_slot * planned = cache_plan_slot_by_exact_id(
+            selected.target_slot_id);
+        const bool adapter_matches = planned &&
+            are_lora_equal(inventory.incoming_loras, planned->lora);
+        return cache_plan_planned_slot_current(
+            rec, legacy_target, planned, selected.provider,
+            adapter_matches);
+    }
+
+    server_cache_plan_preflight_view cache_plan_preflight(
+            const server_task & task) {
+        assert_scheduler_thread(
+            cache_plan_preflight_scheduler_thread,
+            "cache-plan preflight must run on scheduler thread");
+        server_cache_plan_preflight_view view;
+        std::optional<server_cache_plan_authority> local_authority;
+        server_cache_plan_authority * plan_authority =
+            cache_plan_authority.get();
+        if (!plan_authority) {
+            // E0 must not allocate the production per-request observer merely
+            // because a preflight exists. Reuse an already-composed lifecycle
+            // profile when present; otherwise the local planner reports the
+            // typed no_profile refusal.
+            local_authority.emplace(params_base.cache_plan_authority);
+            if (cache_authority) {
+                local_authority->calibration_profile =
+                    cache_authority->calibration_profile;
+            }
+            plan_authority = &*local_authority;
+        }
+
+        auto stage1 = cache_plan_select_before_mutation(
+            task, plan_authority, true);
+        if (!stage1.target) {
+            view.status = server_cache_plan_preflight_status::no_target;
+            return view;
+        }
+        if (!stage1.record) {
+            view.status = server_cache_plan_preflight_status::internal_fault;
+            return view;
+        }
+
+        cache_plan_stage1_inventory inventory;
+        cache_plan_inventory_and_plan_before_mutation(
+            task, *stage1.target, stage1.update_cache, *stage1.record,
+            inventory,
+            cache_plan_stage1_mode_for(plan_authority, true));
+        const bool inputs_current = cache_plan_preflight_inputs_current(
+            *stage1.record, *stage1.target, inventory);
+        if (!server_cache_plan_preflight_build_view(
+                *stage1.record, stage1.target->id, inputs_current, view)) {
+            view.status = server_cache_plan_preflight_status::internal_fault;
+        }
+        return view;
     }
 
     bool build_capture_request(
@@ -8341,6 +8559,19 @@ private:
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT:
+                {
+                    auto res = std::make_unique<
+                        server_task_result_cache_plan_preflight>();
+                    res->id = task.id;
+                    try {
+                        res->view = cache_plan_preflight(task);
+                    } catch (...) {
+                        res->view.status =
+                            server_cache_plan_preflight_status::internal_fault;
+                    }
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_CACHE_CAPTURE:
                 {
                     auto send_capture = [&](server_vbr_artifact_capture_status status) {
@@ -8361,7 +8592,9 @@ private:
                         break;
                     }
                     try {
-                    assert_vbr_artifact_scheduler_thread();
+                    assert_scheduler_thread(
+                        vbr_capture_scheduler_thread,
+                        "VBR artifact work must run on scheduler thread");
 
                     server_slot * slot =
                         get_slot_by_id(task.cache_capture.id_slot);
@@ -8556,7 +8789,9 @@ private:
                         break;
                     }
                     try {
-                        assert_vbr_artifact_scheduler_thread();
+                        assert_scheduler_thread(
+                            vbr_capture_scheduler_thread,
+                            "VBR artifact work must run on scheduler thread");
 
                         server_slot * slot = get_slot_by_id(
                             task.cache_import.id_slot);

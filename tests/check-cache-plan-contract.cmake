@@ -60,7 +60,8 @@ if (NOT nonconsuming_effect_mask_sites EQUAL 5)
 endif()
 string(FIND "${server_context_source}"
     "cache_plan_quote_destruction(" quote_call REVERSE)
-string(FIND "${server_context_source}" "cache_plan_authority->plan_before_mutation(" planner_call)
+string(FIND "${server_context_source}"
+    "mode.plan_authority->plan_before_mutation(" planner_call)
 if (quote_call EQUAL -1 OR planner_call EQUAL -1 OR NOT quote_call LESS planner_call)
     message(FATAL_ERROR
         "D-A quote must run before B minimizes at the pre-mutation boundary")
@@ -102,8 +103,8 @@ if (local_quote_budget EQUAL -1)
         "D-A0a quote must not perturb the shared D-S6 budget coordinator")
 endif()
 foreach(debug_guard
-        "if (cache_authority &&\n            (cache_plan_obs || params_base.cache_lifecycle)) {\n            const int64_t destruction_quote_started"
-        "if (cache_plan_obs && cache_authority) {\n            server_cache_destruction_select_quote")
+        "if (destruction_counters &&\n            (cache_authority || !quote_lifecycle_available)) {\n            const int64_t destruction_quote_started"
+        "if (destruction_counters &&\n            (mode.preflight || cache_plan_obs != nullptr)) {")
     string(FIND "${server_context_source}" "${debug_guard}" debug_guard_pos)
     if (debug_guard_pos EQUAL -1)
         message(FATAL_ERROR "D-A quote/serialization work guard drifted: '${debug_guard}'")

@@ -85,6 +85,12 @@ constexpr bool server_cache_plan_selection_admits_retarget(
            server_cache_plan_level_enabled(configured, decision);
 }
 
+constexpr bool server_cache_plan_shadow_choice_valid(
+        const common_cache_plan_record & rec) noexcept {
+    return rec.shadow_choice >= 0 &&
+           uint32_t(rec.shadow_choice) < rec.n_inventory;
+}
+
 // Revalidate inventory currency only when authority changes the physical
 // target. Same-target executions are revalidated by their provider-specific
 // seam; in particular an empty LRU target has no live row to revalidate.
@@ -116,8 +122,7 @@ constexpr int32_t server_cache_plan_planned_target(
             configured, rec.selection)) {
         return legacy_target_slot_id;
     }
-    if (rec.shadow_choice < 0 ||
-        uint32_t(rec.shadow_choice) >= rec.n_inventory) {
+    if (!server_cache_plan_shadow_choice_valid(rec)) {
         return -1;
     }
     const auto & selected = rec.inventory[size_t(rec.shadow_choice)];

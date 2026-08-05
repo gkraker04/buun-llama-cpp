@@ -1700,6 +1700,12 @@ json server_task_result_cache_import::to_json() {
     };
 }
 
+json server_task_result_cache_plan_preflight::to_json() {
+    // E0.1 intentionally has no wire schema or route. E0.2 replaces this
+    // internal null with the reviewed redacted serializer.
+    return json();
+}
+
 //
 // server_task_result_get_lora
 //

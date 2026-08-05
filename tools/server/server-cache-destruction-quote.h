@@ -38,6 +38,10 @@ struct server_cache_destruction_quote_options {
         common_cache_plan_recovery_citation::unavailable;
     uint64_t admission_sequence = 0;
     common_cache_plan_destruction_effect_set permitted_effects = 0;
+    // E0 may inspect an explicitly unminted receipt. Ordinary callers retain
+    // quote_all's fail-closed sequence-zero validation; the capability door
+    // independently rejects every never-minted receipt.
+    bool preview_unminted = false;
 };
 
 // One tooling-visible JSON core for both host-entry and live-checkpoint
@@ -88,6 +92,15 @@ server_cache_destruction_quote_single_artifact(
 void server_cache_destruction_select_quote(
     common_cache_plan_record & rec,
     common_cache_plan_destruction_counters & counters,
+    common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
+
+// E0's lifecycle-off projection lives beside the production selector so its
+// no-quote/refusal semantics cannot drift into a second server-context policy.
+void server_cache_destruction_select_preview(
+    common_cache_plan_record & rec,
+    common_cache_plan_destruction_counters & counters,
+    int32_t legacy_plan_candidate,
+    bool lifecycle_available,
     common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
 void server_cache_destruction_finalize_projection(

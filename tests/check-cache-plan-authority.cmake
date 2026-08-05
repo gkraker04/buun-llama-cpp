@@ -22,8 +22,10 @@ if (NOT implemented_ceiling)
 endif()
 
 function(cache_plan_authority_order_valid source output)
-    string(FIND "${source}" "task, target, out.incoming_adapter, rec);" inventory_pos)
-    string(FIND "${source}" "cache_plan_authority->plan_before_mutation(" planner_pos)
+    string(FIND "${source}"
+        "task, target, out.incoming_adapter, rec, source_registry);"
+        inventory_pos)
+    string(FIND "${source}" "mode.plan_authority->plan_before_mutation(" planner_pos)
     string(FIND "${source}" "cache_plan_authority->authorize(" authority_pos)
     string(FIND "${source}" "recurrent_shrink_for_prefill(\"before prompt cache save/load\")" mutation_pos)
     if (inventory_pos GREATER_EQUAL 0 AND
@@ -93,7 +95,8 @@ function(cache_plan_stage1_boundary_valid source output)
     endif()
     math(EXPR get_length "${get_end} - ${get_begin}")
     string(SUBSTRING "${source}" ${get_begin} ${get_length} get_body)
-    string(FIND "${get_body}" "cache_plan_select_before_mutation(task)"
+    string(FIND "${get_body}"
+        "cache_plan_select_before_mutation(\n            task, cache_plan_authority.get(), false)"
         select_call)
     string(FIND "${get_body}" "server_cache_plan_disarm_unlaunched("
         disarm_call)

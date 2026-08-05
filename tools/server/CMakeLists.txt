@@ -15,6 +15,9 @@ add_library(${TARGET} STATIC
     server-cache-destruction-quote.h
     server-cache-plan-authority.cpp
     server-cache-plan-authority.h
+    server-cache-plan-preflight.cpp
+    server-cache-plan-preflight.h
+    server-cache-plan-preflight-internal.h
     server-cache-lease.cpp
     server-cache-lease.h
     server-cache-yield.cpp

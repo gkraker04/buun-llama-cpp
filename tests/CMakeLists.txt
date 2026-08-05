@@ -231,6 +231,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-authority.cmake)
 
     llama_build_and_test(
+        test-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-plan-preflight PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    add_test(
+        NAME test-cache-plan-preflight-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-preflight.cmake)
+
+    llama_build_and_test(
         test-retention-sidecar.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp

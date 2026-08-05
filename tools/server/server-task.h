@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "server-cache-lifecycle.h"
 #include "server-cache-lease.h"
+#include "server-cache-plan-preflight.h"
 #include "server-retention-sidecar.h"
 
 #include <array>
@@ -39,6 +40,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_CACHE_CAPTURE,
     SERVER_TASK_TYPE_CACHE_IMPORT,
+    SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -655,6 +657,14 @@ struct server_task_result_cache_import : server_task_result {
     uint32_t companions = 0;
     uint64_t payload_bytes = 0;
     uint64_t companion_bytes = 0;
+
+    virtual json to_json() override;
+};
+
+// Internal E0.1 scheduler result. E0.2 adds the deliberately redacted wire
+// serializer; until then no route can serialize this task result.
+struct server_task_result_cache_plan_preflight : server_task_result {
+    server_cache_plan_preflight_view view;
 
     virtual json to_json() override;
 };
