@@ -73,7 +73,8 @@ common_cache_plan_destruction_reason artifact_refusal_base(
     if (artifact.candidate.lease.cls == server_cache_lease_class::soft) {
         lease = common_cache_plan_destruction_lease_verdict::soft_leased;
     }
-    if (artifact.candidate.release_ops.empty() ||
+    if ((!artifact.fixed_pool_logical_ownership &&
+         artifact.candidate.release_ops.empty()) ||
         std::any_of(
             artifact.candidate.release_ops.begin(),
             artifact.candidate.release_ops.end(),
@@ -119,7 +120,9 @@ void bind_recovery(
         common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::cross_target_displacement) |
         common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::destructive_similarity_retarget);
+            common_cache_plan_destruction_effect::destructive_similarity_retarget) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::same_target_cold_replacement);
     const bool prospective_cross_target =
         citation == common_cache_plan_recovery_citation::prospective &&
         effects != 0 && (effects & ~displacement) == 0;
@@ -300,6 +303,21 @@ server_cache_destruction_recovery_source_digest(
     }
     return common_cache_plan_destruction_recovery_digest::from_sha256(
         hash.finish());
+}
+
+void server_cache_destruction_certify_receipt(
+        common_cache_plan_destruction_receipt & receipt,
+        common_cache_plan_displaced_fate fate,
+        llama_cache_acct_artifact_id recovery_artifact,
+        const std::vector<llama_cache_acct_op_id> & recovery_ops) noexcept {
+    receipt.state = common_cache_plan_destruction_state::certified;
+    receipt.reason = common_cache_plan_destruction_reason::none;
+    receipt.displaced_fate = fate;
+    receipt.recovery_citation = common_cache_plan_recovery_citation::resolved;
+    receipt.recovery_source_artifact_id = recovery_artifact;
+    receipt.recovery_source_manifest_digest =
+        server_cache_destruction_recovery_source_digest(
+            recovery_artifact, recovery_ops);
 }
 
 server_cache_recovery_pin::~server_cache_recovery_pin() {
@@ -528,7 +546,8 @@ server_cache_prepare_release_result server_cache_prepare_release_set(
                 return out;
         }
         std::vector<common_cache_plan_yield_domain> current_domains;
-        if (!project(prepared.preview(), current_domains)) {
+        if (!prepared.ops().empty() &&
+            !project(prepared.preview(), current_domains)) {
             out.status = server_cache_prepare_release_status::accounting_unavailable;
             out.reason = common_cache_plan_destruction_reason::capacity_refused;
             return out;
@@ -558,7 +577,8 @@ server_cache_prepare_release_result server_cache_prepare_release_set(
 
 bool server_cache_destruction_has_effect(
         const common_cache_plan_record & rec,
-        int32_t legacy_candidate) noexcept {
+        int32_t legacy_candidate,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     for (uint32_t i = 0; i < rec.n_inventory; ++i) {
         const auto & candidate = rec.inventory[i];
         if (candidate.viable() && !candidate.component_only &&
@@ -566,7 +586,8 @@ bool server_cache_destruction_has_effect(
             common_cache_plan_origin_in_domain(
                 candidate.origin_tier, rec.selection) &&
             server_cache_destruction_effects_for(
-                rec, int32_t(i), legacy_candidate) != 0) {
+                rec, int32_t(i), legacy_candidate,
+                permitted_effects) != 0) {
             return true;
         }
     }
@@ -650,7 +671,8 @@ bool server_cache_destruction_quote_all(
                 continue;
             }
             const auto effects = server_cache_destruction_effects_for(
-                rec, int32_t(i), legacy_plan_candidate);
+                rec, int32_t(i), legacy_plan_candidate,
+                options.permitted_effects);
             if (effects == 0) {
                 continue;
             }
@@ -665,17 +687,7 @@ bool server_cache_destruction_quote_all(
                     }
                 }
             };
-            const auto displacement_effects =
-                common_cache_plan_destruction_effect_bit(
-                    common_cache_plan_destruction_effect::
-                        cross_target_displacement) |
-                common_cache_plan_destruction_effect_bit(
-                    common_cache_plan_destruction_effect::
-                        destructive_similarity_retarget) |
-                common_cache_plan_destruction_effect_bit(
-                    common_cache_plan_destruction_effect::
-                        same_target_cold_replacement);
-            if ((effects & displacement_effects) != 0) {
+            if ((effects & SERVER_CACHE_LIVE_DISPLACEMENT_EFFECTS) != 0) {
                 const auto it = by_slot.find(candidate.target_slot_id);
                 if (it != by_slot.end()) {
                     add_manifest(it->second);
@@ -764,7 +776,13 @@ bool server_cache_destruction_quote_all(
                     ops.push_back(op);
                 }
             }
-            if (!unavailable && ops.empty()) {
+            const bool known_zero_live_union = !unavailable && ops.empty() &&
+                !manifest.empty() && std::all_of(
+                    manifest.begin(), manifest.end(), [](const auto * artifact) {
+                        return artifact->fixed_pool_logical_ownership &&
+                               artifact->candidate.release_ops.empty();
+                    });
+            if (!unavailable && ops.empty() && !known_zero_live_union) {
                 refuse(quote, common_cache_plan_destruction_reason::release_evidence_unavailable);
                 unavailable = true;
             }
@@ -777,7 +795,8 @@ bool server_cache_destruction_quote_all(
             if (!unavailable) {
                 quote.union_effect_digest =
                     server_cache_destruction_union_effect_digest(ops, released);
-                if (!project(released, staged.projected_domains)) {
+                if (!ops.empty() &&
+                    !project(released, staged.projected_domains)) {
                     refuse(quote, common_cache_plan_destruction_reason::capacity_refused);
                     unavailable = true;
                 }
@@ -879,7 +898,8 @@ server_cache_destruction_quote_redundant_host(
 
 void server_cache_destruction_select_quote(
         common_cache_plan_record & rec,
-        common_cache_plan_destruction_counters & counters) noexcept {
+        common_cache_plan_destruction_counters & counters,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     if (rec.destruction_quotes.empty()) {
         return;
     }
@@ -905,7 +925,8 @@ void server_cache_destruction_select_quote(
     }
     if (server_cache_destruction_effects_for(
             rec, rec.shadow_choice,
-            rec.destruction_legacy_plan_candidate) == 0) {
+            rec.destruction_legacy_plan_candidate,
+            permitted_effects) == 0) {
         const uint64_t duration = rec.destruction.quote_duration_us;
         const uint64_t sequence = rec.destruction.admission_sequence;
         rec.destruction = {};

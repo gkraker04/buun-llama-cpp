@@ -21,7 +21,8 @@ int32_t server_cache_plan_host_source(
 common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
         const common_cache_plan_record & rec,
         int32_t candidate,
-        int32_t legacy_candidate) noexcept {
+        int32_t legacy_candidate,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     if (candidate < 0 || legacy_candidate < 0 ||
         uint32_t(candidate) >= rec.n_inventory ||
         uint32_t(legacy_candidate) >= rec.n_inventory) {
@@ -44,9 +45,25 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
                           cross_target_displacement);
         }
     }
+    const bool legacy_uses_live_target =
+        common_cache_plan_provider_is_live(legacy.provider);
+    const bool destruction_certification_available =
+        (permitted_effects &
+         server_cache_plan_nonconsuming_host_effects(true)) != 0;
     if (planned.target_slot_id == legacy.target_slot_id &&
-        planned.provider == common_cache_plan_provider::cold_replay &&
-        legacy.provider != common_cache_plan_provider::cold_replay) {
+        ((planned.provider == common_cache_plan_provider::cold_replay &&
+          legacy.provider != common_cache_plan_provider::cold_replay) ||
+         (destruction_certification_available &&
+          (planned.provider == common_cache_plan_provider::host_cache_entry ||
+           planned.is_chain()) && legacy_uses_live_target))) {
+        // Cold replacement is the frozen B-A4 effect. D-A5 adds host restore
+        // to the same physical class only when lifecycle certification exists;
+        // lifecycle-off therefore preserves B-A4's previously-authorized
+        // same-target host-restore behavior byte-for-byte.
+        // The schema-v6 name predates non-consuming host restore. Its physical
+        // class is the stable contract: any certified same-target whole-state
+        // replacement destroys the live slot, whether replacement bytes come
+        // from cold replay or an immutable host snapshot.
         effects |= common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::same_target_cold_replacement);
     }
@@ -56,7 +73,9 @@ common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
         effects |= common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::different_host_source_consumption);
     }
-    return effects;
+    // Physical non-effects (lifecycle's non-consuming host restore) and
+    // mutation-boundary D-A certificates share this single row-opening mask.
+    return effects & ~permitted_effects;
 }
 
 uint64_t server_cache_plan_capability_fold(
@@ -290,9 +309,10 @@ bool server_cache_plan_execution_from_candidate(
 static bool inside_pre_da_safety_envelope(
         const common_cache_plan_record & rec,
         int32_t planned_candidate,
-        int32_t legacy_candidate) noexcept {
+        int32_t legacy_candidate,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     return server_cache_destruction_effects_for(
-               rec, planned_candidate, legacy_candidate) == 0;
+        rec, planned_candidate, legacy_candidate, permitted_effects) == 0;
 }
 
 static common_cache_plan_authority_fallback pre_da_envelope_refusal_reason(
@@ -318,7 +338,8 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
         common_cache_plan_record & rec,
         int32_t legacy_target_slot_id,
         bool host_lookup_enabled,
-        bool target_identity_matches) noexcept {
+        bool target_identity_matches,
+        common_cache_plan_destruction_effect_set permitted_effects) noexcept {
     server_cache_plan_execution execution;
     const auto decision_level = server_cache_plan_level_of(rec.selection);
     if (decision_level == common_cache_plan_authority_level::off ||
@@ -341,8 +362,7 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
     const int32_t legacy_plan_candidate = server_cache_plan_legacy_candidate(
         rec, legacy_target_slot_id, host_lookup_enabled);
     rec.authority.legacy_plan_candidate = legacy_plan_candidate;
-    if (!rec.authority_prequalified ||
-        rec.planner_status != common_cache_plan_planner_status::ok) {
+    if (!server_cache_plan_candidate_prequalified(rec)) {
         fallback_legacy(rec,
             rec.authority.fallback_reason !=
                     common_cache_plan_authority_fallback::none
@@ -380,7 +400,8 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
         return {};
     }
     if (!inside_pre_da_safety_envelope(
-            rec, rec.shadow_choice, legacy_plan_candidate)) {
+            rec, rec.shadow_choice, legacy_plan_candidate,
+            permitted_effects)) {
         fallback_legacy(rec,
             pre_da_envelope_refusal_reason(
                 rec, execution, legacy_execution));

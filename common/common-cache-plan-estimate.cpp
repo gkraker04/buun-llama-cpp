@@ -333,9 +333,9 @@ static bool cache_plan_row_participates(
            lru_legacy->spec_capable == target->spec_capable;
 }
 
-// the ONE place terms are written and versions stamped: restore + replay + workspace
-// (B-covered) and the predicted total; transfer/eviction stay typed-unavailable until D
-static void cache_plan_fill_terms(common_cache_plan_candidate & c,
+// the ONE place B terms are written and versions stamped. Optional D-owned
+// transfer/eviction terms are included in the same predicted total.
+static bool cache_plan_fill_terms(common_cache_plan_candidate & c,
                                   const common_cache_plan_calib & calib,
                                   uint64_t restore_bytes, double restore_us,
                                   uint64_t replay_tokens, double replay_us,
@@ -349,8 +349,31 @@ static void cache_plan_fill_terms(common_cache_plan_candidate & c,
     set_term(llama_cache_acct_cost_kind::restore,   restore_bytes, restore_us);
     set_term(llama_cache_acct_cost_kind::replay,    replay_tokens, replay_us);
     set_term(llama_cache_acct_cost_kind::workspace, 0,             workspace_us);
+    long double total = restore_us + replay_us + workspace_us;
+    // D owns these terms. They remain optional so a B-only record keeps its
+    // historical estimate; when a D quote supplies one, the one B optimum
+    // includes it without reimplementing the planner or its tie rule.
+    for (const auto kind : {
+            llama_cache_acct_cost_kind::transfer,
+            llama_cache_acct_cost_kind::eviction }) {
+        const auto & term = c.cost_terms[size_t(kind)];
+        if (term.estimated_us.state == llama_cache_acct_known::known) {
+            if (term.raw.state != llama_cache_acct_known::known ||
+                term.estimator_version != calib.estimator_version) {
+                c.predicted_total_us = {};
+                return false;
+            }
+            total += term.estimated_us.value;
+        }
+    }
+    if (!std::isfinite(total) || total < 0.0L ||
+        total > (long double) UINT64_MAX) {
+        c.predicted_total_us = {};
+        return false;
+    }
     c.predicted_total_us = llama_cache_acct_value::measured(
-        (uint64_t) std::llround(restore_us + replay_us + workspace_us));
+        (uint64_t) std::llround(total));
+    return true;
 }
 
 // estimate one non-chain row; false = a needed scalar is missing (typed-unknown lcp/bytes)
@@ -391,11 +414,10 @@ static bool cache_plan_estimate_row(common_cache_plan_candidate & c, uint64_t n_
             calib, restore_bytes, restore_us, workspace_us)) {
         return false;
     }
-    cache_plan_fill_terms(c, calib,
-                          restore_bytes, restore_us,
-                          replay_tokens, (double) replay_tokens * calib.replay_us_per_token,
-                          workspace_us);
-    return true;
+    return cache_plan_fill_terms(
+        c, calib, restore_bytes, restore_us,
+        replay_tokens, (double) replay_tokens * calib.replay_us_per_token,
+        workspace_us);
 }
 
 static common_cache_plan_planner_status cache_plan_estimate_impl(
@@ -493,8 +515,11 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
         if (!ok) {
             return common_cache_plan_planner_status::incomplete_evidence;
         }
-        cache_plan_fill_terms(c, calib, restore_bytes, restore_us,
-                              replay_tokens, replay_us, workspace_us);
+        if (!cache_plan_fill_terms(
+                c, calib, restore_bytes, restore_us,
+                replay_tokens, replay_us, workspace_us)) {
+            return common_cache_plan_planner_status::incomplete_evidence;
+        }
     }
 
     // pass 3: minimum + tie set + planner-owned stable choice

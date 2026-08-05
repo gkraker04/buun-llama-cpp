@@ -171,6 +171,13 @@ public:
     // only the sidecar descriptor/association after the physical mutation.
     void retire_after_committed_release(
         const server_retention_instance_key & key) noexcept;
+    // D-A5 complete-slot terminal. The selected artifact set is the
+    // capability's committed manifest. Every slot association must belong to
+    // it before payload and descriptor operation ownership is cleared.
+    bool retire_slot_after_committed_release(
+        int32_t owner_slot,
+        const std::vector<llama_cache_acct_artifact_id> & selected_attention,
+        const std::vector<llama_cache_acct_artifact_id> & selected_recurrent) noexcept;
     std::vector<server_retention_candidate> candidate_snapshot() const noexcept;
 
     common_retention_sidecar_snapshot snapshot() const noexcept;

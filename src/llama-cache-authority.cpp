@@ -96,12 +96,12 @@ llama_cache_prepared_release_set llama_cache_prepare_release_set(
         uint64_t expected_serial) noexcept {
     llama_cache_prepared_release_set out;
     try {
-        if (selected.empty() || expected_serial == 0) {
+        if (expected_serial == 0) {
             return out;
         }
         out.ops_ = selected;
         std::sort(out.ops_.begin(), out.ops_.end());
-        if (!out.ops_.front() ||
+        if ((!out.ops_.empty() && !out.ops_.front()) ||
             std::adjacent_find(out.ops_.begin(), out.ops_.end()) !=
                 out.ops_.end()) {
             return out;

@@ -57,6 +57,21 @@ bool server_cache_weighted_price_us(
     uint32_t weight_milli,
     uint64_t & out) noexcept;
 
+bool server_cache_retention_weight_milli(
+    bool soft_leased,
+    bool main_family,
+    uint32_t additional_weight_milli,
+    uint32_t & weight_milli) noexcept;
+
+bool server_cache_host_retention_price_us(
+    const common_cache_plan_calib & calib,
+    uint64_t bytes,
+    bool soft_leased,
+    bool main_family,
+    uint32_t & weight_milli,
+    uint64_t & price_us,
+    uint32_t additional_weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE) noexcept;
+
 enum class server_cache_checkpoint_protection : uint8_t {
     none = 0,
     seam_heuristic,
@@ -259,6 +274,13 @@ struct server_cache_authority {
     // release would affect. D-A2+ share this one projection door.
     bool project_release(
             const llama_cache_acct_release_set_preview & release,
+            std::vector<common_cache_plan_yield_domain> & out) noexcept;
+
+    // Re-sample the affected accounting domains after a committed release.
+    // D-A actual yield is derived from this post-mutation observation, never
+    // relabeled from the quote-time projection.
+    bool observe_release_domains(
+            const std::vector<common_cache_plan_yield_domain> & projected,
             std::vector<common_cache_plan_yield_domain> & out) noexcept;
 
     // F0b's first authoritative producer: admit/stage/commit all host-entry payload leaves as one

@@ -334,7 +334,8 @@ static server_cache_plan_execution authorize_choice(
             common_cache_plan_authority_level::by_id,
         common_cache_plan_selection selection =
             common_cache_plan_selection::by_id,
-        bool target_identity_matches = true) {
+        bool target_identity_matches = true,
+        common_cache_plan_destruction_effect_set permitted_effects = 0) {
     rec.selection = selection;
     rec.planner_status = common_cache_plan_planner_status::ok;
     rec.shadow_choice = choice;
@@ -344,7 +345,8 @@ static server_cache_plan_execution authorize_choice(
         rec, level,
         common_cache_plan_authority_fallback::none);
     return authority.authorize(
-        rec, target, host_lookup_enabled, target_identity_matches);
+        rec, target, host_lookup_enabled, target_identity_matches,
+        permitted_effects);
 }
 
 static void test_execution_seam_fallbacks() {
@@ -479,12 +481,15 @@ static void test_execution_seam_fallbacks() {
 
     common_cache_plan_record armed_record;
     auto armed_plan = std::make_unique<common_cache_plan_record>(armed_record);
+    auto armed_recovery = std::make_unique<int>(1);
     server_cache_plan_execution armed;
     armed.kind = server_cache_plan_execution_kind::live_replay;
     armed.target = target;
-    server_cache_plan_disarm_unlaunched(armed, armed_plan);
+    server_cache_plan_disarm_unlaunched(
+        armed, armed_plan, armed_recovery);
     CHECK(!armed.authoritative());
     CHECK(!armed_plan);
+    CHECK(!armed_recovery);
 }
 
 static void test_qualified_fallback_remains_eligible() {
@@ -1034,7 +1039,8 @@ static void test_lru_authority_domain_and_eviction_fence() {
             occupied.authority.legacy_plan_candidate),
         common_cache_plan_destruction_effect::cross_target_displacement));
 
-    // Same-target cold replacement is the other eviction-evidence shape.
+    // Same-target cold replacement is the frozen B-A4 eviction-evidence
+    // shape and remains closed without a D-A certificate.
     auto * occupied_cold = add_viable(
         occupied, common_cache_plan_provider::cold_replay,
         COMMON_CACHE_PLAN_SOURCE_AGGREGATE, legacy_target,
@@ -1047,12 +1053,58 @@ static void test_lru_authority_domain_and_eviction_fence() {
     CHECK(occupied.authority.fallback_reason ==
           common_cache_plan_authority_fallback::
               budget_or_lease_unavailable);
+    const auto lifecycle_effects =
+        server_cache_plan_nonconsuming_host_effects(true);
+    CHECK(common_cache_plan_destruction_effect_has(
+        server_cache_destruction_effects_for(
+              occupied,
+              int32_t(occupied_cold - occupied.inventory.data()),
+              occupied.authority.legacy_plan_candidate),
+        common_cache_plan_destruction_effect::same_target_cold_replacement));
     CHECK(common_cache_plan_destruction_effect_has(
         server_cache_destruction_effects_for(
             occupied,
             int32_t(occupied_cold - occupied.inventory.data()),
-            occupied.authority.legacy_plan_candidate),
+            occupied.authority.legacy_plan_candidate,
+            lifecycle_effects),
         common_cache_plan_destruction_effect::same_target_cold_replacement));
+
+    // Lifecycle-on introduces that D-A5 class but keeps it closed until the
+    // selected effect is certified.
+    execution = authorize_choice(
+        lru, occupied, int32_t(occupied_cold - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru, true, lifecycle_effects);
+    CHECK(!execution.authoritative());
+    CHECK(occupied.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::
+              budget_or_lease_unavailable);
+
+    // D-A5 opens exactly the certified effect bit. The same occupied cold
+    // replacement remains refused above with no capability evidence.
+    const auto certified_cold = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::same_target_cold_replacement);
+    execution = authorize_choice(
+        lru, occupied,
+        int32_t(occupied_cold - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru, true,
+        certified_cold | lifecycle_effects);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind == server_cache_plan_execution_kind::cold_replay);
+
+    // A partial certificate never opens a plural destructive plan.
+    auto plural = occupied;
+    plural.inventory[size_t(occupied_cold - occupied.inventory.data())]
+        .provider = common_cache_plan_provider::host_cache_entry;
+    plural.inventory[size_t(occupied_cold - occupied.inventory.data())]
+        .source_id = 77;
+    execution = authorize_choice(
+        lru, plural,
+        int32_t(occupied_cold - occupied.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru, true, certified_cold);
+    CHECK(!execution.authoritative());
 
     // Host-consumption authority is not eviction evidence: choosing another
     // retained host source on the same target keeps the established reason.
@@ -1081,6 +1133,18 @@ static void test_lru_authority_domain_and_eviction_fence() {
             hosts.authority.legacy_plan_candidate),
         common_cache_plan_destruction_effect::
             different_host_source_consumption));
+    const auto nonconsuming_host =
+        server_cache_plan_nonconsuming_host_effects(true);
+    CHECK(server_cache_destruction_effects_for(
+              hosts, int32_t(other_host - hosts.inventory.data()),
+              hosts.authority.legacy_plan_candidate,
+              nonconsuming_host) == 0);
+    execution = authorize_choice(
+        lru, hosts, int32_t(other_host - hosts.inventory.data()),
+        legacy_target, true, common_cache_plan_authority_level::lru,
+        common_cache_plan_selection::lru, true, nonconsuming_host);
+    CHECK(execution.authoritative());
+    CHECK(execution.kind == server_cache_plan_execution_kind::host_restore);
 
     // The previous ceiling still cannot flip an LRU selection.
     common_cache_plan_record lower;

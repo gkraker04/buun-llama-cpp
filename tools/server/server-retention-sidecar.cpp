@@ -572,6 +572,49 @@ void server_retention_sidecar_store::retire_after_committed_release(
     retire_association(association);
 }
 
+bool server_retention_sidecar_store::retire_slot_after_committed_release(
+        int32_t owner_slot,
+        const std::vector<llama_cache_acct_artifact_id> & selected_attention,
+        const std::vector<llama_cache_acct_artifact_id> & selected_recurrent) noexcept {
+    const auto selected = [&](llama_cache_acct_artifact_id artifact) {
+        return std::find(selected_attention.begin(), selected_attention.end(), artifact) !=
+                   selected_attention.end() ||
+               std::find(selected_recurrent.begin(), selected_recurrent.end(), artifact) !=
+                   selected_recurrent.end();
+    };
+    bool found = false;
+    for (const auto & association : associations) {
+        if (association.first.owner_slot != owner_slot) {
+            continue;
+        }
+        found = true;
+        const auto item = catalog.find(association.second.v);
+        if (item == catalog.end() || item->second.recovery_pins != 0 ||
+            !selected(association.second)) {
+            mark_unavailable();
+            return false;
+        }
+    }
+    if (!found) {
+        mark_unavailable();
+        return false;
+    }
+    for (auto it = associations.begin(); it != associations.end();) {
+        if (it->first.owner_slot != owner_slot) {
+            ++it;
+            continue;
+        }
+        auto victim = it++;
+        const auto item = catalog.find(victim->second.v);
+        GGML_ASSERT(item != catalog.end());
+        GGML_ASSERT(item->second.recovery_pins == 0);
+        item->second.release_ops.clear();
+        item->second.accounting_op = {};
+        retire_association(victim);
+    }
+    return true;
+}
+
 std::vector<server_retention_candidate>
 server_retention_sidecar_store::candidate_snapshot() const noexcept {
     try {

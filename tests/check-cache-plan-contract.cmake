@@ -50,6 +50,14 @@ foreach(quote_pin
     endif()
 endforeach()
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" server_context_source)
+count_literal(
+    "${server_context_source}"
+    "server_cache_plan_nonconsuming_host_effects("
+    nonconsuming_effect_mask_sites)
+if (NOT nonconsuming_effect_mask_sites EQUAL 5)
+    message(FATAL_ERROR
+        "D-A5 non-consuming host semantics escaped the one effect-mask channel")
+endif()
 string(FIND "${server_context_source}"
     "cache_plan_quote_destruction(" quote_call REVERSE)
 string(FIND "${server_context_source}" "cache_plan_authority->plan_before_mutation(" planner_call)
@@ -76,11 +84,11 @@ if (local_quote_budget EQUAL -1)
         "D-A0a quote must not perturb the shared D-S6 budget coordinator")
 endif()
 foreach(debug_guard
-        "if (cache_plan_obs) {\n                        const int64_t destruction_quote_started"
+        "if (cache_plan_obs ||\n                        (cache_authority && params_base.cache_lifecycle)) {\n                        const int64_t destruction_quote_started"
         "if (cache_plan_obs) {\n                        server_cache_destruction_select_quote")
     string(FIND "${server_context_source}" "${debug_guard}" debug_guard_pos)
     if (debug_guard_pos EQUAL -1)
-        message(FATAL_ERROR "D-A0a debug-only work guard drifted: '${debug_guard}'")
+        message(FATAL_ERROR "D-A quote/serialization work guard drifted: '${debug_guard}'")
     endif()
 endforeach()
 string(FIND "${destruction_quote_source}" ".inspect(" quote_lease_mutation)

@@ -180,6 +180,12 @@ enum class common_cache_plan_provider : uint8_t {
     _count,
 };
 
+constexpr bool common_cache_plan_provider_is_live(
+        common_cache_plan_provider provider) noexcept {
+    return provider == common_cache_plan_provider::live_slot ||
+           provider == common_cache_plan_provider::live_context_checkpoint;
+}
+
 enum class common_cache_plan_outcome : uint8_t {
     unknown = 0,        // the typed not-finalized state
     restored,
@@ -633,6 +639,10 @@ struct common_cache_plan_actual_yield_domain {
     llama_cache_acct_value after_bytes;
 };
 
+bool common_cache_plan_projected_release_bytes(
+    const std::vector<common_cache_plan_yield_domain> & domains,
+    uint64_t & total) noexcept;
+
 struct common_cache_plan_yield_record {
     common_cache_plan_yield_status status =
         common_cache_plan_yield_status::unavailable;
@@ -648,6 +658,11 @@ struct common_cache_plan_yield_record {
     std::vector<common_cache_plan_yield_domain> projected_domains;
     std::vector<common_cache_plan_actual_yield_domain> actual_domains;
 };
+
+void common_cache_plan_fill_actual_yield(
+    common_cache_plan_yield_record & yield,
+    const std::vector<common_cache_plan_yield_domain> & projected,
+    const std::vector<common_cache_plan_yield_domain> & observed_after) noexcept;
 
 // Opaque identity evidence (§7.7 redaction: digests of already-computed keys/strings, never
 // raw values). An identity the server has not computed stays typed unknown — never a

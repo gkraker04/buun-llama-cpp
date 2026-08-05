@@ -17,6 +17,10 @@ struct server_cache_destruction_artifact {
     int32_t host_source_id = -1;
     common_retention_pool pool = common_retention_pool::attention;
     bool mandatory_anchor = false;
+    // Fixed pooled KV retains its physical allocation after sequence removal;
+    // this explicit bit distinguishes a certified zero release from missing
+    // transactional ownership evidence.
+    bool fixed_pool_logical_ownership = false;
 };
 
 using server_cache_destruction_preview_callback = std::function<bool(
@@ -33,6 +37,7 @@ struct server_cache_destruction_quote_options {
     common_cache_plan_recovery_citation recovery_citation =
         common_cache_plan_recovery_citation::unavailable;
     uint64_t admission_sequence = 0;
+    common_cache_plan_destruction_effect_set permitted_effects = 0;
 };
 
 // One tooling-visible JSON core for both host-entry and live-checkpoint
@@ -82,7 +87,8 @@ server_cache_destruction_quote_single_artifact(
 
 void server_cache_destruction_select_quote(
     common_cache_plan_record & rec,
-    common_cache_plan_destruction_counters & counters) noexcept;
+    common_cache_plan_destruction_counters & counters,
+    common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
 void server_cache_destruction_finalize_projection(
     common_cache_plan_record & rec,
@@ -114,7 +120,14 @@ common_cache_plan_destruction_reason server_cache_destruction_effect_recheck(
 
 bool server_cache_destruction_has_effect(
     const common_cache_plan_record & rec,
-    int32_t legacy_candidate) noexcept;
+    int32_t legacy_candidate,
+    common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
+
+void server_cache_destruction_certify_receipt(
+    common_cache_plan_destruction_receipt & receipt,
+    common_cache_plan_displaced_fate fate,
+    llama_cache_acct_artifact_id recovery_artifact,
+    const std::vector<llama_cache_acct_op_id> & recovery_ops) noexcept;
 
 // A non-policy recovery guard, separate from WS-D leases. The owner callback
 // releases the underlying immutable host/catalog/live guard. Destruction

@@ -13,7 +13,7 @@
 // their raw eraser is physical-only and the legacy wrapper owns the lifecycle-off terminal.
 // CI extracts the mapping, so adding a class or raw primitive without extending it fails.
 #define SERVER_CACHE_DESTRUCTION_INVENTORY(X) \
-    X(slot_drop,                server_cache_slot_drop_impl,                observe_full_slot,                   none) \
+    X(slot_drop,                server_cache_slot_drop_impl,                observe_full_slot,                   legacy_wrapper_or_capability) \
     X(live_range_drop,          server_cache_live_range_drop_impl,          observe_live_range_drop,             none) \
     X(host_artifact_drop,       server_prompt_cache_destroy_entry_impl,     server_prompt_cache_observe_drop,     legacy_wrapper_or_capability) \
     X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          observe_checkpoint_drop,             legacy_wrapper_or_capability) \
@@ -86,6 +86,9 @@ enum class server_cache_destruction_execution : uint8_t {
     // under a pinned replay-source certificate. Host-entry checkpoint rings
     // remain aggregate-owned and can never reach this terminal.
     priced_checkpoint_thinning,
+    // D-A5: B selected an occupied live target only after a durable recovery
+    // source and the complete fixed-pool/checkpoint union were certified.
+    priced_live_displacement,
     _count,
 };
 
@@ -238,6 +241,9 @@ struct server_cache_destruction_observer {
     uint64_t checkpoint_thin_hard_lease_refusals = 0;
     uint64_t checkpoint_publication_skips = 0;
     uint64_t checkpoint_thin_release_bytes = 0;
+    uint64_t live_displacement_certified = 0;
+    uint64_t live_displacement_executed = 0;
+    uint64_t live_displacement_refused = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
 
@@ -298,6 +304,22 @@ struct server_cache_destruction_observer {
         if (auto * event = event_for_sequence(sequence)) {
             event->execution =
                 server_cache_destruction_execution::prepared_release;
+        }
+    }
+
+    void note_live_displacement_certified() noexcept {
+        live_displacement_certified++;
+    }
+
+    void note_live_displacement_refused() noexcept {
+        live_displacement_refused++;
+    }
+
+    void note_live_displacement_executed(uint64_t sequence) noexcept {
+        live_displacement_executed++;
+        if (auto * event = event_for_sequence(sequence)) {
+            event->execution =
+                server_cache_destruction_execution::priced_live_displacement;
         }
     }
 

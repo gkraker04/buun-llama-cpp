@@ -167,7 +167,9 @@ private:
 
 // Fresh-serial prepare at the mutation boundary. The quote's earlier serial is
 // evidence only; callers compare this canonical op set and exact union effect
-// to the quote before permitting a physical mutation.
+// to the quote before permitting a physical mutation. An empty op set is the
+// canonical known-zero release for logical ownership in fixed pooled storage;
+// commit still checks the serial and performs no ledger mutation.
 llama_cache_prepared_release_set llama_cache_prepare_release_set(
     llama_cache_acct_ledger & ledger,
     const std::vector<llama_cache_acct_op_id> & ops,

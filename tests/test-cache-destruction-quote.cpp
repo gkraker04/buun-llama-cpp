@@ -260,9 +260,17 @@ static void test_fail_closed_matrix() {
 
 static void test_refusal_mapping_and_selection() {
     auto rec = record_with_cold_candidates();
+    const auto lifecycle_effects =
+        server_cache_plan_nonconsuming_host_effects(true);
     CHECK(server_cache_destruction_has_effect(rec, 0));
+    CHECK(server_cache_destruction_has_effect(
+        rec, 0, lifecycle_effects));
     CHECK(common_cache_plan_destruction_effect_has(
         server_cache_destruction_effects_for(rec, 1, 0),
+        common_cache_plan_destruction_effect::same_target_cold_replacement));
+    CHECK(common_cache_plan_destruction_effect_has(
+        server_cache_destruction_effects_for(
+            rec, 1, 0, lifecycle_effects),
         common_cache_plan_destruction_effect::same_target_cold_replacement));
     common_cache_plan_destruction_counters counters;
     CHECK(server_cache_destruction_quote_all(
@@ -276,8 +284,8 @@ static void test_refusal_mapping_and_selection() {
         preview(17), project(),
         { true, common_cache_plan_recovery_citation::prospective, 2 },
         counters));
-    CHECK(prospective_same.destruction_quotes[0].receipt.reason ==
-          common_cache_plan_destruction_reason::recovery_unavailable);
+    CHECK(prospective_same.destruction_quotes[0].receipt.state ==
+          common_cache_plan_destruction_state::quoted);
     CHECK(server_cache_destruction_quote_all(
         rec, 0, { artifact(1, 11) }, 17, preview(17), project(),
         { true, common_cache_plan_recovery_citation::resolved, 3 }, counters));
@@ -781,6 +789,64 @@ static void test_prepared_release_capability() {
     CHECK(second.release(op2));
 }
 
+static void test_fixed_pool_known_zero_release() {
+    llama_cache_acct_ledger ledger;
+    const auto warmup = committed_release_op(ledger, 1);
+    CHECK(ledger.release(warmup));
+    const auto serial = ledger.snapshot().serial;
+    auto live = artifact(1, 11);
+    live.candidate.release_ops.clear();
+    live.fixed_pool_logical_ownership = true;
+
+    auto rec = record_with_cold_candidates();
+    common_cache_plan_destruction_counters counters;
+    const server_cache_destruction_preview_callback preview_zero =
+        [serial](const auto & ops, uint64_t expected, auto & out) {
+            out = {};
+            if (!ops.empty() || expected != serial) {
+                return false;
+            }
+            out.accounting_serial = serial;
+            return true;
+        };
+    CHECK(server_cache_destruction_quote_all(
+        rec, 0, { live }, serial, preview_zero, project(),
+        { true, common_cache_plan_recovery_citation::prospective, 1 },
+        counters));
+    CHECK(rec.destruction_quotes.size() == 2);
+    auto quote = rec.destruction_quotes.front();
+    CHECK(quote.receipt.state ==
+          common_cache_plan_destruction_state::quoted);
+    CHECK(quote.projected_domains.empty());
+    CHECK(quote.receipt.union_effect_digest.valid());
+
+    uint64_t releases = 0;
+    auto pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 99 } }, { { 77 } });
+    auto prepared = server_cache_prepare_release_set(
+        quote, { live }, ledger, serial, project(), std::move(pin));
+    CHECK(prepared.status ==
+          server_cache_prepare_release_status::prepared);
+    server_cache_recovery_pin retained;
+    CHECK(prepared.capability.commit(retained) ==
+          common_cache_plan_destruction_reason::none);
+    CHECK(ledger.snapshot().serial == serial);
+    retained = {};
+    CHECK(releases == 1);
+
+    // Missing release evidence remains fail-closed unless the artifact is
+    // explicitly the fixed-pool logical owner.
+    live.fixed_pool_logical_ownership = false;
+    rec = record_with_cold_candidates();
+    CHECK(server_cache_destruction_quote_all(
+        rec, 0, { live }, serial, preview_zero, project(),
+        { true, common_cache_plan_recovery_citation::prospective, 2 },
+        counters));
+    CHECK(rec.destruction_quotes.front().receipt.reason ==
+          common_cache_plan_destruction_reason::
+              release_evidence_unavailable);
+}
+
 int main() {
     test_complete_memoized_and_permutation();
     test_fail_closed_matrix();
@@ -789,6 +855,7 @@ int main() {
     test_refused_projection_and_selection_failure();
     test_max_inventory_memoizes_one_manifest();
     test_prepared_release_capability();
+    test_fixed_pool_known_zero_release();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

@@ -188,8 +188,8 @@ constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
 //   incomplete_evidence — provider overflow, a dropped derived plan, an unresolved visited
 //       candidate (disposition unavailable), a valid row missing the scalars estimation
 //       needs, unknown n_prompt, or an empty participant set — never a partial optimum.
-// B-covered terms are restore/replay/workspace; transfer and eviction stay unavailable
-// until D.
+// B-covered terms are restore/replay/workspace. D may prefill transfer or
+// eviction; the same total/optimum consumes those optional terms.
 common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib);
 

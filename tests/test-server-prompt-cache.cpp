@@ -84,6 +84,23 @@ std::list<server_prompt_cache_state> make_prompt_entry(
     return entry;
 }
 
+llama_cache_acct_artifact_id publish_host_retention(
+        server_cache_authority & authority,
+        server_prompt_cache::iterator state) {
+    common_chat_msg_spans spans;
+    for (int32_t i = 0; i < state->prompt.n_tokens(); ++i) {
+        spans.add(COMMON_CHAT_ROLE_USER, i, 1);
+    }
+    const auto key =
+        server_retention_instance_key::for_host_entry(&*state);
+    CHECK(authority.retention.publish(
+        key, common_retention_pool::attention, spans, true,
+        state->prompt.n_tokens(), 1, true));
+    const auto artifact = authority.retention.artifact_id(key);
+    CHECK(artifact.v != 0);
+    return artifact;
+}
+
 std::list<server_prompt_cache_state> make_redundant_entry() {
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
     entry.front().data.main.assign(16, 7);
@@ -287,6 +304,20 @@ void test_lifecycle_restore_retains_immutable_source() {
     CHECK(authority.retention.artifact_id(
         server_retention_instance_key::for_checkpoint(
             -1, &cache.states.front().prompt.checkpoints.back())).v != 0);
+    llama_cache_acct_artifact_id durable_artifact;
+    std::vector<llama_cache_acct_op_id> durable_ops;
+    server_cache_recovery_pin durable_pin;
+    CHECK(cache.acquire_durable_recovery(
+        cache.states.front().prompt.tokens, "same",
+        durable_artifact, durable_ops, durable_pin));
+    CHECK(durable_artifact.v != 0);
+    CHECK(durable_ops.size() == 3);
+    CHECK(durable_pin.binds_exact(durable_artifact, durable_ops));
+    durable_pin = {};
+    server_tokens missing;
+    missing.insert(llama_tokens { 99 });
+    CHECK(!cache.acquire_durable_recovery(
+        missing, "same", durable_artifact, durable_ops, durable_pin));
     const auto live_ops_before = authority.ledger.snapshot().live_ops;
     const auto host_size_before = cache.states.front().size();
     const auto * source_checkpoint =
@@ -364,6 +395,136 @@ void test_lifecycle_restore_retains_immutable_source() {
     authority.retention.retire_slot(5);
     CHECK(authority.ledger.snapshot().live_ops == 0);
     CHECK(authority.destruction.prepared_release_commits == 1);
+}
+
+void test_durable_recovery_binds_exact_published_peer() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    server_prompt_cache::iterator older;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2, 3 }), nullptr, -1, &older));
+    const auto older_artifact = publish_host_retention(authority, older);
+    llama_cache_acct_artifact_id pinned_artifact;
+    std::vector<llama_cache_acct_op_id> pinned_ops;
+    server_cache_recovery_pin older_pin;
+    CHECK(cache.acquire_durable_recovery(
+        older, pinned_artifact, pinned_ops, older_pin));
+    CHECK(pinned_artifact == older_artifact);
+
+    // The older token-identical peer is pinned, so publish's dedup pass must
+    // retain it. The returned iterator is the newly published physical node,
+    // and durable recovery must bind that node rather than find_state_exact's
+    // first (older) peer.
+    server_prompt_cache::iterator fresh;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2, 3 }), nullptr, -1, &fresh));
+    CHECK(cache.states.size() == 2);
+    CHECK(fresh != older);
+    const auto fresh_artifact = publish_host_retention(authority, fresh);
+    CHECK(fresh_artifact != older_artifact);
+
+    llama_cache_acct_artifact_id recovery_artifact;
+    std::vector<llama_cache_acct_op_id> recovery_ops;
+    server_cache_recovery_pin fresh_pin;
+    CHECK(cache.acquire_durable_recovery(
+        fresh, recovery_artifact, recovery_ops, fresh_pin));
+    CHECK(recovery_artifact == fresh_artifact);
+    CHECK(recovery_artifact != older_artifact);
+    CHECK(fresh->recovery_pins == 1);
+    CHECK(older->recovery_pins == 1);
+}
+
+void test_unlaunched_disarm_releases_recovery_pin() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    server_prompt_cache::iterator displaced_copy;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2, 3 }),
+        nullptr, -1, &displaced_copy));
+    (void) publish_host_retention(authority, displaced_copy);
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin recovery_pin;
+    CHECK(cache.acquire_durable_recovery(
+        displaced_copy, artifact, ops, recovery_pin));
+    CHECK(displaced_copy->recovery_pins == 1);
+
+    server_cache_plan_execution execution;
+    execution.kind = server_cache_plan_execution_kind::cold_replay;
+    execution.target = 0;
+    auto plan = std::make_unique<common_cache_plan_record>();
+    server_cache_plan_disarm_unlaunched(
+        execution, plan, recovery_pin);
+    CHECK(!execution.authoritative());
+    CHECK(!plan);
+    CHECK(!recovery_pin.valid());
+    CHECK(displaced_copy->recovery_pins == 0);
+
+    // The former recovery source is ordinary priced inventory again: a later
+    // superset publication may retire it rather than treating it as pinned.
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3, 4 })));
+    CHECK(cache.states.size() == 1);
+    CHECK(cache.states.front().prompt.n_tokens() == 4);
+}
+
+void test_displacement_save_order_preserves_prefix_recovery() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    server_prompt_cache cache(0, 0);
+    cache.acct = &authority.ledger;
+    cache.publish_authority = &authority;
+    cache.retention_obs = &authority.retention;
+    cache.destruction_obs = &authority.destruction;
+
+    // The old ordering (legacy prefix first, then longer victim) demonstrates
+    // why contains(legacy) must be rechecked: ordinary publish dedup removes
+    // the just-saved shorter state.
+    server_prompt_cache::iterator legacy_first;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2 }), nullptr, -1, &legacy_first));
+    CHECK(cache.publish(make_prompt_entry("same", { 1, 2, 3 })));
+    server_tokens legacy_tokens(llama_tokens { 1, 2 }, false);
+    CHECK(!cache.contains(legacy_tokens, "same"));
+
+    // Reset the fixture, then model the certified ordering: publish the
+    // victim, bind and pin that exact node, publish the legacy frontier, and
+    // verify both recovery sources remain physically present.
+    cache.clear_accounting();
+    cache.states.clear();
+    server_prompt_cache::iterator victim;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2, 3 }), nullptr, -1, &victim));
+    const auto victim_artifact = publish_host_retention(authority, victim);
+    llama_cache_acct_artifact_id recovery_artifact;
+    std::vector<llama_cache_acct_op_id> recovery_ops;
+    server_cache_recovery_pin victim_pin;
+    CHECK(cache.acquire_durable_recovery(
+        victim, recovery_artifact, recovery_ops, victim_pin));
+    CHECK(recovery_artifact == victim_artifact);
+
+    server_prompt_cache::iterator legacy;
+    CHECK(cache.publish(
+        make_prompt_entry("same", { 1, 2 }), nullptr, -1, &legacy));
+    const auto legacy_artifact = publish_host_retention(authority, legacy);
+    CHECK(legacy_artifact != victim_artifact);
+    CHECK(cache.states.size() == 2);
+    CHECK(cache.contains(legacy_tokens, "same"));
+    server_tokens victim_tokens(llama_tokens { 1, 2, 3 }, false);
+    CHECK(cache.contains(victim_tokens, "same"));
+    CHECK(victim_pin.valid());
+    CHECK(victim->recovery_pins == 1);
 }
 
 void test_lifecycle_off_restore_consumes() {
@@ -1494,6 +1655,8 @@ void test_live_checkpoint_payload_ownership() {
     server_retention_candidate candidate;
     CHECK(authority.retention.candidate_for_instance(live, candidate));
     CHECK(candidate.release_ops == ops);
+    const auto provenance_op = candidate.provenance_op;
+    CHECK(provenance_op);
 
     // Host copies remain aggregate-owned: clone the retention record but not
     // the live member's independently releasable operation set.
@@ -1503,7 +1666,20 @@ void test_live_checkpoint_payload_ownership() {
     CHECK(authority.retention.candidate_for_instance(host, candidate));
     CHECK(candidate.release_ops.empty());
     authority.retention.retire(host);
-    authority.retention.retire(live);
+    auto committed_ops = ops;
+    committed_ops.push_back(provenance_op);
+    auto prepared = llama_cache_prepare_release_set(
+        authority.ledger, committed_ops,
+        authority.ledger.snapshot().serial);
+    CHECK(prepared.ready());
+    CHECK(prepared.commit() ==
+          llama_cache_conditional_release_status::released);
+    CHECK(!authority.retention.retire_slot_after_committed_release(
+        3, { { artifact.v + 2 } }, {}));
+    CHECK(authority.retention.candidate_for_instance(live, candidate));
+    CHECK(authority.retention.retire_slot_after_committed_release(
+        3, {}, { artifact }));
+    CHECK(!authority.retention.candidate_for_instance(live, candidate));
     CHECK(authority.ledger.snapshot().live_ops == 0);
 }
 
@@ -1598,6 +1774,9 @@ int main(int argc, char ** argv) {
     }
     test_lifecycle_full_cache_rotates();
     test_lifecycle_restore_retains_immutable_source();
+    test_durable_recovery_binds_exact_published_peer();
+    test_unlaunched_disarm_releases_recovery_pin();
+    test_displacement_save_order_preserves_prefix_recovery();
     test_lifecycle_off_restore_consumes();
     test_lifecycle_restore_batch_timing();
     test_checkpoint_creation_churn_timing();

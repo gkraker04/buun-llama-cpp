@@ -770,6 +770,7 @@ struct server_prompt_cache_state {
 };
 
 struct server_cache_authority;
+class server_cache_recovery_pin;
 
 struct server_prompt_cache_payload_leaf {
     llama_cache_acct_category category =
@@ -797,6 +798,7 @@ struct server_prompt_cache {
 
     std::list<server_prompt_cache_state> states;
     using iterator = std::list<server_prompt_cache_state>::iterator;
+    using const_iterator = std::list<server_prompt_cache_state>::const_iterator;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -813,6 +815,22 @@ struct server_prompt_cache {
     // true if a token-identical entry with the SAME adapter identity is already fully cached, i.e.
     // the state is durable and the live slot may be safely cleared without saving again [I6/I7].
     bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
+
+    // Resolve the exact durable host state used by prompt_save's durability
+    // predicate and pin its three-payload accounting source. D-A5 calls this
+    // after the same-flow save and before preparing live-slot destruction.
+    bool acquire_durable_recovery(
+            const server_tokens & tokens,
+            const std::string & adapter_config_key,
+            llama_cache_acct_artifact_id & artifact,
+            std::vector<llama_cache_acct_op_id> & ops,
+            server_cache_recovery_pin & pin) noexcept;
+
+    bool acquire_durable_recovery(
+            iterator state,
+            llama_cache_acct_artifact_id & artifact,
+            std::vector<llama_cache_acct_op_id> & ops,
+            server_cache_recovery_pin & pin) noexcept;
 
     void cache_plan_begin_inventory() noexcept;
     bool cache_plan_get_source_id(
@@ -831,7 +849,8 @@ struct server_prompt_cache {
     bool publish(
             std::list<server_prompt_cache_state> entry,
             const server_prompt * source_prompt = nullptr,
-            int32_t source_slot = -1);
+            int32_t source_slot = -1,
+            iterator * published = nullptr);
 
     // `obs` is the B0 shadow observer row for the host_cache_entry candidate (nullptr = observer
     // off). It only receives values this selection already computes — never a re-scan [B-a].
@@ -905,6 +924,12 @@ struct server_prompt_cache {
             std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
 
 private:
+    iterator find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) noexcept;
+    const_iterator find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const noexcept;
     bool destroy_priced_host_entry(
             server_cache_destruction_reason reason,
             iterator incoming,

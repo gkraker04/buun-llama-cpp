@@ -70,6 +70,12 @@ constexpr bool server_cache_plan_level_enabled(
            SERVER_CACHE_PLAN_IMPLEMENTED_AUTHORITY_LEVEL >= decision;
 }
 
+constexpr bool server_cache_plan_candidate_prequalified(
+        const common_cache_plan_record & rec) noexcept {
+    return rec.authority_prequalified &&
+           rec.planner_status == common_cache_plan_planner_status::ok;
+}
+
 constexpr bool server_cache_plan_selection_admits_retarget(
         common_cache_plan_authority_level configured,
         common_cache_plan_selection selection) noexcept {
@@ -127,10 +133,31 @@ int32_t server_cache_plan_host_source(
     const common_cache_plan_record & rec,
     int32_t candidate) noexcept;
 
+constexpr common_cache_plan_destruction_effect_set
+    SERVER_CACHE_LIVE_DISPLACEMENT_EFFECTS =
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::cross_target_displacement) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                destructive_similarity_retarget) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                same_target_cold_replacement);
+
+constexpr common_cache_plan_destruction_effect_set
+server_cache_plan_nonconsuming_host_effects(bool lifecycle) noexcept {
+    return lifecycle
+        ? common_cache_plan_destruction_effect_bit(
+              common_cache_plan_destruction_effect::
+                  different_host_source_consumption)
+        : 0;
+}
+
 common_cache_plan_destruction_effect_set server_cache_destruction_effects_for(
     const common_cache_plan_record & rec,
     int32_t candidate,
-    int32_t legacy_candidate) noexcept;
+    int32_t legacy_candidate,
+    common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
 // B-A pre-mutation decision substrate. It is process-local and contains no
 // shipped cache state. Authority is graduated through the parallel selection
@@ -166,7 +193,8 @@ struct server_cache_plan_authority {
         common_cache_plan_record & rec,
         int32_t legacy_target_slot_id,
         bool host_lookup_enabled = true,
-        bool target_identity_matches = true) noexcept;
+        bool target_identity_matches = true,
+        common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
     // Capability drift discovered after planning but before mutation. Preserve
     // the planner verdict for agreement telemetry while reverting execution to
@@ -198,15 +226,19 @@ constexpr int32_t server_cache_plan_checkpoint_ordinal_from_source_id(
     int32_t host_source_id) noexcept;
 
 // A selected slot is armed before launch so the existing mutation seams can
-// consume the directive. Every exit that does not launch must disarm both
-// process-local pieces together; otherwise a later request could inherit a
-// stale directive and record.
-template<class PlanPtr>
+// consume the directive. The D-A recovery source outlives a successful
+// displacement through the dependent B execution, but every exit that does
+// not launch must disarm all three process-local pieces together; otherwise a
+// later request could inherit a stale directive/record or over-retain the
+// displaced state's durable copy.
+template<class PlanPtr, class RecoveryPin>
 void server_cache_plan_disarm_unlaunched(
         server_cache_plan_execution & execution,
-        PlanPtr & plan) noexcept {
+        PlanPtr & plan,
+        RecoveryPin & recovery_pin) noexcept {
     execution.clear();
     plan.reset();
+    recovery_pin = {};
 }
 
 // Coverage recovery is a shipped correctness seam, not a cost-planner input.

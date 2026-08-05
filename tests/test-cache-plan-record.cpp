@@ -615,6 +615,33 @@ static void test_yield_not_required_serialization() {
     CHECK(j["yield"]["actual_domains"].empty());
 }
 
+static void test_actual_yield_uses_post_commit_observation() {
+    common_cache_plan_yield_record yield;
+    common_cache_plan_yield_domain projected;
+    projected.domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    projected.current_resident_bytes = llama_cache_acct_value::measured(100);
+    projected.projected_release_bytes = llama_cache_acct_value::measured(40);
+    auto after = projected;
+    after.current_resident_bytes = llama_cache_acct_value::measured(65);
+
+    common_cache_plan_fill_actual_yield(yield, { projected }, { after });
+    CHECK(yield.actual_state ==
+          common_cache_plan_yield_actual_state::measured);
+    CHECK(yield.actual_domains.size() == 1);
+    CHECK(yield.actual_domains[0].before_bytes.value == 100);
+    CHECK(yield.actual_domains[0].after_bytes.value == 65);
+    // The actual is the observed delta (35), not the quote-time projection
+    // (40) relabeled as measured evidence.
+    CHECK(yield.actual_domains[0].released_bytes.value == 35);
+
+    after.current_resident_bytes = llama_cache_acct_value::measured(101);
+    common_cache_plan_fill_actual_yield(yield, { projected }, { after });
+    CHECK(yield.actual_state ==
+          common_cache_plan_yield_actual_state::unavailable);
+    CHECK(yield.actual_domains.empty());
+}
+
 // finalize-shaped chain composition (verify-r4): the ONE tested implementation the server
 // calls — simple delivery, composed delivery with sibling cost-loser chains, and the
 // exact-capacity shape where the delivered pair's chain cannot be recorded
@@ -779,6 +806,7 @@ int main() {
     test_authority_receipt_and_counters();
     test_json_serialization();
     test_yield_not_required_serialization();
+    test_actual_yield_uses_post_commit_observation();
     test_compose_chains();
     test_destruction_observer();
 

@@ -91,7 +91,11 @@ endif()
 
 string(REGEX MATCHALL "server_cache_plan_disarm_unlaunched\\(" disarm_sites "${server_source}")
 list(LENGTH disarm_sites n_disarm_sites)
-if (n_disarm_sites LESS 5)
+string(REGEX MATCHALL
+    "server_cache_plan_disarm_unlaunched\\([^\\)]*cache_plan_destruction_recovery_pin\\)"
+    disarm_pin_sites "${server_source}")
+list(LENGTH disarm_pin_sites n_disarm_pin_sites)
+if (n_disarm_sites LESS 5 OR NOT n_disarm_pin_sites EQUAL n_disarm_sites)
     message(FATAL_ERROR "B-A launch-failure exits are not fully disarmed")
 endif()
 

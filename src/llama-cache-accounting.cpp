@@ -1006,8 +1006,12 @@ llama_cache_acct_ledger::release_set_if_serial(
     if (state.serial != expected_serial) {
         return llama_cache_conditional_release_status::serial_conflict;
     }
+    // An empty exact union is a valid known-zero release. Live-slot clearing
+    // drops logical sequence ownership from fixed pooled KV allocations, so
+    // there may be no transactional allocation to discharge. Preserve the
+    // serial fence without fabricating an accounting mutation.
     if (selected.empty()) {
-        return llama_cache_conditional_release_status::ledger_fault;
+        return llama_cache_conditional_release_status::released;
     }
 
     // Full validation precedes the first mutation. prepare_release_set sorts

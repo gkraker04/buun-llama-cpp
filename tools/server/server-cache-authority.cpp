@@ -39,6 +39,43 @@ bool server_cache_weighted_price_us(
     return true;
 }
 
+bool server_cache_retention_weight_milli(
+        bool soft_leased,
+        bool main_family,
+        uint32_t additional_weight_milli,
+        uint32_t & weight_milli) noexcept {
+    weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
+    return (!soft_leased || server_cache_multiply_retention_weight(
+                weight_milli, SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) &&
+           (!main_family || server_cache_multiply_retention_weight(
+                weight_milli, SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) &&
+           server_cache_multiply_retention_weight(
+                weight_milli, additional_weight_milli);
+}
+
+bool server_cache_host_retention_price_us(
+        const common_cache_plan_calib & calib,
+        uint64_t bytes,
+        bool soft_leased,
+        bool main_family,
+        uint32_t & weight_milli,
+        uint64_t & price_us,
+        uint32_t additional_weight_milli) noexcept {
+    price_us = 0;
+    if (!server_cache_retention_weight_milli(
+            soft_leased, main_family, additional_weight_milli,
+            weight_milli)) {
+        return false;
+    }
+    double restore_us = 0.0;
+    double workspace_us = 0.0;
+    return common_cache_plan_restore_us(
+               calib, bytes, restore_us, workspace_us) &&
+           server_cache_weighted_price_us(
+               (long double) restore_us + workspace_us,
+               weight_milli, price_us);
+}
+
 server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
         const std::vector<server_cache_checkpoint_trade_input> & candidates,
         const common_cache_plan_calib * calib) noexcept {
@@ -356,6 +393,59 @@ bool server_cache_authority::project_release(
             out.push_back(lowered);
         }
         return !out.empty();
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+bool server_cache_authority::observe_release_domains(
+        const std::vector<common_cache_plan_yield_domain> & projected,
+        std::vector<common_cache_plan_yield_domain> & out) noexcept {
+    out.clear();
+    if (projected.empty()) {
+        return true;
+    }
+    try {
+        llama_cache_budget_config config;
+        if (!sample_budget(config)) {
+            return false;
+        }
+        auto snapshot = ledger.snapshot();
+        const uint64_t serial = snapshot.serial;
+        llama_cache_budget_coordinator coordinator;
+        if (!coordinator.reset(std::move(snapshot), config)) {
+            return false;
+        }
+        llama_cache_budget_plan plan;
+        plan.accounting_serial = serial;
+        const auto fit = coordinator.fits(plan);
+        if (fit.accounting_serial != serial ||
+            fit.state == llama_cache_budget_fit_state::unavailable) {
+            return false;
+        }
+        out.reserve(projected.size());
+        for (const auto & expected : projected) {
+            const auto row = std::find_if(
+                fit.domains.begin(), fit.domains.end(),
+                [&](const auto & current) {
+                    return current.resource.kind ==
+                               llama_cache_budget_resource_kind::
+                                   accounting_domain &&
+                           current.resource.domain == expected.domain;
+                });
+            if (row == fit.domains.end()) {
+                out.clear();
+                return false;
+            }
+            common_cache_plan_yield_domain lowered;
+            if (!server_cache_yield_lower_domain(*row, lowered)) {
+                out.clear();
+                return false;
+            }
+            out.push_back(std::move(lowered));
+        }
+        return true;
     } catch (...) {
         out.clear();
         return false;

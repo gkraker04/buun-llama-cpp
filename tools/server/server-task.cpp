@@ -1755,26 +1755,29 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-bool server_prompt_cache::contains(const server_tokens & tokens, const std::string & adapter_config_key) const {
-    for (const auto & st : states) {
-        // identity-scoped [I6]: a token-identical entry under a DIFFERENT adapter config is not a
-        // durable copy of THIS state and must not suppress its save
-        if (st.adapter_config_key != adapter_config_key) {
-            continue;
-        }
+server_prompt_cache::iterator server_prompt_cache::find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) noexcept {
+    return std::find_if(states.begin(), states.end(), [&](const auto & state) {
+        // Identity-scoped [I6]: token equality under another adapter is not a
+        // durable copy. Equal length closes the recurrent/hybrid prefix hole.
+        return state.adapter_config_key == adapter_config_key &&
+               state.prompt.tokens.size() == tokens.size() &&
+               state.prompt.tokens.get_common_prefix(tokens) == tokens.size();
+    });
+}
 
-        // EXACT match only [I6/durability]: a prefix hit (tokens is a prefix of a LONGER cached
-        // prompt) does not make this state durable for recurrent/hybrid memory -- the state after
-        // "P || X" is not the state after "P" without an exact checkpoint at P. Requiring identical
-        // token length ensures clearing the live slot cannot discard an exact frontier the cache
-        // could not reconstruct.
-        const int lcp_len = st.prompt.tokens.get_common_prefix(tokens);
-        if (lcp_len == (int) tokens.size() && st.prompt.tokens.size() == tokens.size()) {
-            return true;
-        }
-    }
+server_prompt_cache::const_iterator server_prompt_cache::find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const noexcept {
+    return const_cast<server_prompt_cache *>(this)->find_state_exact(
+        tokens, adapter_config_key);
+}
 
-    return false;
+bool server_prompt_cache::contains(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const {
+    return find_state_exact(tokens, adapter_config_key) != states.end();
 }
 
 void server_prompt_cache::cache_plan_begin_inventory() noexcept {
@@ -2209,23 +2212,6 @@ bool build_host_destruction_artifact(
     }
 }
 
-bool projected_release_bytes(
-        const std::vector<common_cache_plan_yield_domain> & domains,
-        uint64_t & total) noexcept {
-    total = 0;
-    for (const auto & row : domains) {
-        if (row.projected_release_bytes.state !=
-                llama_cache_acct_known::known ||
-            row.projected_release_bytes.value >
-                std::numeric_limits<uint64_t>::max() - total) {
-            total = 0;
-            return false;
-        }
-        total += row.projected_release_bytes.value;
-    }
-    return true;
-}
-
 void release_host_recovery_pin(void * context) noexcept {
     auto * state = static_cast<server_prompt_cache_state *>(context);
     GGML_ASSERT(state && state->recovery_pins > 0);
@@ -2510,7 +2496,7 @@ host_destruction_certification certify_host_destruction(
             refuse_certified(prepared.reason);
             return out;
         }
-        if (!projected_release_bytes(
+        if (!common_cache_plan_projected_release_bytes(
                 out.quote.projected_domains, out.projected_bytes)) {
             refuse_certified(
                 common_cache_plan_destruction_reason::accounting_unavailable);
@@ -2521,16 +2507,9 @@ host_destruction_certification certify_host_destruction(
         // after every refusal conjunct, fresh effect check, and disjoint pin
         // has succeeded. Schema 6 retains the source identity after the pin
         // itself closes.
-        out.quote.receipt.displaced_fate =
-            recovery_fate;
-        out.quote.receipt.recovery_citation =
-            common_cache_plan_recovery_citation::resolved;
-        out.quote.receipt.recovery_source_artifact_id = recovery_artifact;
-        out.quote.receipt.recovery_source_manifest_digest =
-            server_cache_destruction_recovery_source_digest(
-                recovery_artifact, recovery_ops);
-        out.quote.receipt.state =
-            common_cache_plan_destruction_state::certified;
+        server_cache_destruction_certify_receipt(
+            out.quote.receipt, recovery_fate,
+            recovery_artifact, recovery_ops);
         server_prompt_cache_observe_host_destruction(
             cache, out.quote.receipt, true, out.projected_bytes, ranking);
         out.capability = std::move(prepared.capability);
@@ -2630,36 +2609,21 @@ bool host_trade_price(
             return false;
         }
 
-        uint32_t weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
-        if (out.soft_leased &&
-            !server_cache_multiply_retention_weight(
-                weight, SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) {
-            return false;
-        }
-        if (out.main_family &&
-            !server_cache_multiply_retention_weight(
-                weight, SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) {
-            return false;
-        }
+        uint32_t additional_weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
         if (authority.host_retention_weight) {
-            uint32_t custom = 0;
             if (!authority.host_retention_weight(
                     authority.host_retention_weight_context,
-                    *victim, custom) ||
-                !server_cache_multiply_retention_weight(weight, custom)) {
+                    *victim, additional_weight) ||
+                additional_weight == 0) {
                 return false;
             }
         }
 
-        double restore_us = 0.0;
-        double workspace_us = 0.0;
-        if (!common_cache_plan_restore_us(
-                *calib, victim->size(), restore_us, workspace_us)) {
-            return false;
-        }
+        uint32_t weight = 0;
         uint64_t price = 0;
-        if (!server_cache_weighted_price_us(
-                restore_us + workspace_us, weight, price)) {
+        if (!server_cache_host_retention_price_us(
+                *calib, victim->size(), out.soft_leased,
+                out.main_family, weight, price, additional_weight)) {
             return false;
         }
         out.ranking.weight_milli = weight;
@@ -2688,6 +2652,51 @@ void observe_host_trade_refusal(
 }
 
 } // namespace
+
+bool server_prompt_cache::acquire_durable_recovery(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key,
+        llama_cache_acct_artifact_id & artifact,
+        std::vector<llama_cache_acct_op_id> & ops,
+        server_cache_recovery_pin & pin) noexcept {
+    return acquire_durable_recovery(
+        find_state_exact(tokens, adapter_config_key), artifact, ops, pin);
+}
+
+bool server_prompt_cache::acquire_durable_recovery(
+        iterator state,
+        llama_cache_acct_artifact_id & artifact,
+        std::vector<llama_cache_acct_op_id> & ops,
+        server_cache_recovery_pin & pin) noexcept {
+    artifact = {};
+    ops.clear();
+    pin = {};
+    try {
+        if (state == states.end()) {
+            return false;
+        }
+        std::vector<llama_cache_acct_artifact_id> artifacts;
+        if (!build_host_recovery_source(
+                *this, *state, artifacts, ops) || artifacts.size() != 1) {
+            return false;
+        }
+        artifact = artifacts.front();
+        pin = acquire_host_recovery_pin(
+            *state, std::move(artifacts), ops);
+        if (!pin.valid() || !pin.binds_exact(artifact, ops)) {
+            artifact = {};
+            ops.clear();
+            pin = {};
+            return false;
+        }
+        return true;
+    } catch (...) {
+        artifact = {};
+        ops.clear();
+        pin = {};
+    }
+    return false;
+}
 
 bool server_prompt_cache::exactly_redundant(
         const server_prompt_cache_state & victim,
@@ -3126,7 +3135,11 @@ void server_prompt_cache::clear_accounting() {
 bool server_prompt_cache::publish(
         std::list<server_prompt_cache_state> entry,
         const server_prompt * source_prompt,
-        int32_t source_slot) {
+        int32_t source_slot,
+        iterator * published) {
+    if (published) {
+        *published = states.end();
+    }
     if (entry.empty()) {
         return false;
     }
@@ -3193,6 +3206,15 @@ bool server_prompt_cache::publish(
         if (it != self && it->adapter_config_key == self->adapter_config_key) {
             const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
             if (len == (int) it->prompt.tokens.size()) {
+                // A D-A recovery citation outlives its destruction commit
+                // through the dependent B execution. Dedup is another victim
+                // enumerator: it must leave the cited physical host node in
+                // place rather than reaching the raw eraser's invariant
+                // assert while that non-policy pin is live.
+                if (it->recovery_pins != 0) {
+                    ++it;
+                    continue;
+                }
                 SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
                 it = destroy_entry_impl(
                     it, server_cache_destruction_reason::host_dedup,
@@ -3209,6 +3231,9 @@ bool server_prompt_cache::publish(
     // preserving the just-added entry.
     if (!update_impl(self)) {
         return false;
+    }
+    if (published) {
+        *published = self;
     }
     return true;
 }

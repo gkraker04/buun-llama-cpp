@@ -116,7 +116,7 @@ if (lifecycle_negative_valid)
 endif()
 
 set(expected_release_owners
-    "slot_drop:none;live_range_drop:none;host_artifact_drop:legacy_wrapper_or_capability;checkpoint_drop:legacy_wrapper_or_capability;token_ledger_truncate:none;mandatory_recovery_reset:none")
+    "slot_drop:legacy_wrapper_or_capability;live_range_drop:none;host_artifact_drop:legacy_wrapper_or_capability;checkpoint_drop:legacy_wrapper_or_capability;token_ledger_truncate:none;mandatory_recovery_reset:none")
 if (NOT release_owners STREQUAL expected_release_owners)
     message(FATAL_ERROR
         "D-A0b accounting release-owner inventory drifted: ${release_owners}")
@@ -601,9 +601,8 @@ contract_find_forbidden(
     "std::function")
 foreach(pin
         "common_cache_plan_calib_find("
-        "common_cache_plan_restore_us("
-        "SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT"
-        "SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT"
+        "server_cache_host_retention_price_us("
+        "authority.host_retention_weight("
         "evidence.pin.binds_exact("
         "candidate.ranking.zero_destruction"
         "COMMON_CACHE_PLAN_TIE_REL_FLOOR"
@@ -843,6 +842,132 @@ if (NOT da4_negative_found OR NOT da4_negative_forbidden)
     message(FATAL_ERROR "D-A4 commit-gap negative control did not trip")
 endif()
 
+# D-A5 is the sole B-candidate live-slot capability terminal. The raw slot
+# mutation must be immediately followed by the conditional release commit;
+# autonomous VBR/unified-KV reclaim keeps using the legacy wrapper and may not
+# call this door.
+contract_extract_region(
+    "${server_context}"
+    "server_cache_slot_drop_impl(false);"
+    "capability.commit(\n            cache_plan_destruction_recovery_pin);"
+    da5_commit_gap da5_commit_gap_found)
+contract_find_forbidden(
+    "${da5_commit_gap}" da5_gap_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+count_literal("${server_context}" "prompt_clear_certified(" da5_certified_sites)
+if (NOT da5_commit_gap_found OR da5_gap_forbidden OR
+    NOT da5_certified_sites EQUAL 2)
+    message(FATAL_ERROR
+        "D-A5 live-displacement single-site/commit-gap contract drifted")
+endif()
+string(REPLACE
+    "server_cache_slot_drop_impl(false);"
+    "server_cache_slot_drop_impl(false); cache_authority->ledger.release({});"
+    da5_gap_negative "${server_context}")
+contract_extract_region(
+    "${da5_gap_negative}"
+    "server_cache_slot_drop_impl(false);"
+    "capability.commit(\n            cache_plan_destruction_recovery_pin);"
+    da5_negative_gap da5_negative_found)
+contract_find_forbidden(
+    "${da5_negative_gap}" da5_negative_forbidden "release(")
+if (NOT da5_negative_found OR NOT da5_negative_forbidden)
+    message(FATAL_ERROR "D-A5 commit-gap negative control did not trip")
+endif()
+
+# The capability becomes live inside certify, before control returns to the B
+# authorization seam. Prove the whole window in two pieces: the certify tail
+# after prepare is ledger-quiet, and the caller reaches the raw terminal with
+# no writer. The sole prompt_save spelling in the caller is structurally
+# guarded by !displacement.ready and therefore belongs only to the
+# uncertified fallback arm.
+contract_extract_region(
+    "${server_context}"
+    "const auto fresh = cache_authority->ledger.snapshot();\n        auto prepared = server_cache_prepare_release_set("
+    "out.ready = true;"
+    da5_prepare_tail da5_prepare_tail_found)
+contract_find_forbidden(
+    "${da5_prepare_tail}" da5_prepare_tail_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "prompt_save("
+    "update("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+contract_extract_region(
+    "${server_context}"
+    "displacement = cache_plan_certify_live_displacement("
+    "planned_ret->prompt_clear_certified("
+    da5_authorize_window da5_authorize_window_found)
+contract_find_forbidden(
+    "${da5_authorize_window}" da5_authorize_window_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+count_literal(
+    "${da5_authorize_window}"
+    "planned_ret != legacy_ret &&\n                        !displacement.ready)"
+    da5_uncertified_save_guard)
+count_literal(
+    "${da5_authorize_window}" "legacy_ret->prompt_save(" da5_fallback_saves)
+if (NOT da5_prepare_tail_found OR da5_prepare_tail_forbidden OR
+    NOT da5_authorize_window_found OR da5_authorize_window_forbidden OR
+    NOT da5_uncertified_save_guard EQUAL 1 OR
+    NOT da5_fallback_saves EQUAL 1)
+    message(FATAL_ERROR
+        "D-A5 full prepared-capability window contract drifted")
+endif()
+string(REPLACE
+    "out.capability = std::move(prepared.capability);"
+    "out.capability = std::move(prepared.capability); cache_authority->ledger.release({});"
+    da5_window_negative "${server_context}")
+contract_extract_region(
+    "${da5_window_negative}"
+    "const auto fresh = cache_authority->ledger.snapshot();\n        auto prepared = server_cache_prepare_release_set("
+    "out.ready = true;"
+    da5_negative_prepare_tail da5_negative_prepare_tail_found)
+contract_find_forbidden(
+    "${da5_negative_prepare_tail}"
+    da5_negative_prepare_tail_forbidden "release(")
+if (NOT da5_negative_prepare_tail_found OR
+    NOT da5_negative_prepare_tail_forbidden)
+    message(FATAL_ERROR
+        "D-A5 full-window negative control did not trip")
+endif()
+foreach(legacy_vbr "vbr_clear_idle_slots" "vbr_reclaim_before_degrade" "try_clear_idle_slots")
+    contract_extract_region(
+        "${server_context}" "${legacy_vbr}(" "}" vbr_region vbr_found)
+    if (vbr_found)
+        string(FIND "${vbr_region}" "prompt_clear_certified(" vbr_certified)
+        if (NOT vbr_certified EQUAL -1)
+            message(FATAL_ERROR
+                "D-A5 must not absorb autonomous ${legacy_vbr}")
+        endif()
+    endif()
+endforeach()
+
 message(STATUS
     "D-S4 destruction inventory scan passed: 6 classes, ${admission_owner_count} admission owners, "
-    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2/D-A3/D-A4 commit-gap/debug-emission negative controls")
+    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2/D-A3/D-A4/D-A5 commit-gap/debug-emission negative controls")

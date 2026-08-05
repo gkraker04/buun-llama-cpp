@@ -7,6 +7,63 @@
 
 using json = nlohmann::ordered_json;
 
+bool common_cache_plan_projected_release_bytes(
+        const std::vector<common_cache_plan_yield_domain> & domains,
+        uint64_t & total) noexcept {
+    total = 0;
+    for (const auto & row : domains) {
+        if (row.projected_release_bytes.state !=
+                llama_cache_acct_known::known ||
+            row.projected_release_bytes.value > UINT64_MAX - total) {
+            total = 0;
+            return false;
+        }
+        total += row.projected_release_bytes.value;
+    }
+    return true;
+}
+
+void common_cache_plan_fill_actual_yield(
+        common_cache_plan_yield_record & yield,
+        const std::vector<common_cache_plan_yield_domain> & projected,
+        const std::vector<common_cache_plan_yield_domain> & observed_after) noexcept {
+    yield.actual_domains.clear();
+    try {
+        yield.actual_domains.reserve(projected.size());
+        for (const auto & row : projected) {
+            const auto current = std::find_if(
+                observed_after.begin(), observed_after.end(),
+                [&](const auto & observed) {
+                    return observed.domain == row.domain;
+                });
+            if (current == observed_after.end() ||
+                row.current_resident_bytes.state !=
+                    llama_cache_acct_known::known ||
+                current->current_resident_bytes.state !=
+                    llama_cache_acct_known::known ||
+                current->current_resident_bytes.value >
+                    row.current_resident_bytes.value) {
+                yield.actual_domains.clear();
+                yield.actual_state =
+                    common_cache_plan_yield_actual_state::unavailable;
+                return;
+            }
+            common_cache_plan_actual_yield_domain actual;
+            actual.domain = row.domain;
+            actual.before_bytes = row.current_resident_bytes;
+            actual.after_bytes = current->current_resident_bytes;
+            actual.released_bytes = llama_cache_acct_value::measured(
+                row.current_resident_bytes.value -
+                current->current_resident_bytes.value);
+            yield.actual_domains.push_back(std::move(actual));
+        }
+        yield.actual_state = common_cache_plan_yield_actual_state::measured;
+    } catch (...) {
+        yield.actual_domains.clear();
+        yield.actual_state = common_cache_plan_yield_actual_state::unavailable;
+    }
+}
+
 // Exhaustive name tables for the B0 closed enums. Switch-based with no default case so a new
 // member without a name is a compile-time -Wswitch error, and the single unreachable return
 // keeps release builds defined. These are the ONLY spellings of these names — CI bans replicas.

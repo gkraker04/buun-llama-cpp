@@ -691,6 +691,42 @@ static void test_sibling_chain_alternative() {
     }
 }
 
+static void test_destruction_eviction_term_participates() {
+    common_cache_plan_record rec = make_record(100);
+    auto * live = add_row(
+        rec, common_cache_plan_provider::live_slot, 1,
+        COMMON_CACHE_PLAN_PHASE_SIMILARITY, 95, 0,
+        common_cache_plan_disposition::accepted);
+    auto * cold = add_row(
+        rec, common_cache_plan_provider::cold_replay, -1,
+        COMMON_CACHE_PLAN_PHASE_SIMILARITY, 0, 0,
+        common_cache_plan_disposition::valid_not_chosen_cost);
+    auto & eviction = live->cost_terms[size_t(
+        llama_cache_acct_cost_kind::eviction)];
+    eviction.raw = llama_cache_acct_value::measured(4096);
+    eviction.estimated_us = llama_cache_acct_value::measured(20'000);
+    eviction.estimator_version = TEST_CALIB.estimator_version;
+
+    CHECK(common_cache_plan_estimate_and_choose(rec, TEST_CALIB) ==
+          planner_status::ok);
+    CHECK(live->predicted_total_us.value == 20'500);
+    CHECK(cold->predicted_total_us.value == 10'000);
+    CHECK(&rec.inventory[size_t(rec.shadow_choice)] == cold);
+
+    auto stale = make_record(100);
+    auto * stale_live = add_row(
+        stale, common_cache_plan_provider::live_slot, 1,
+        COMMON_CACHE_PLAN_PHASE_SIMILARITY, 95, 0,
+        common_cache_plan_disposition::accepted);
+    auto & stale_eviction = stale_live->cost_terms[size_t(
+        llama_cache_acct_cost_kind::eviction)];
+    stale_eviction.raw = llama_cache_acct_value::measured(4096);
+    stale_eviction.estimated_us = llama_cache_acct_value::measured(20'000);
+    stale_eviction.estimator_version = TEST_CALIB.estimator_version + 1;
+    CHECK(common_cache_plan_estimate_and_choose(stale, TEST_CALIB) ==
+          planner_status::incomplete_evidence);
+}
+
 int main() {
     test_profile_refusal();
     test_restore_formula_door();
@@ -707,6 +743,7 @@ int main() {
     test_capacity_chain_boundary();
     test_chain_composition_and_root_feasibility();
     test_sibling_chain_alternative();
+    test_destruction_eviction_term_participates();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
