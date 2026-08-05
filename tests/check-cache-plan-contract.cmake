@@ -65,6 +65,24 @@ if (quote_call EQUAL -1 OR planner_call EQUAL -1 OR NOT quote_call LESS planner_
     message(FATAL_ERROR
         "D-A quote must run before B minimizes at the pre-mutation boundary")
 endif()
+count_literal(
+    "${server_context_source}" "cache_plan_quote_destruction(" quote_wrapper_sites)
+if (NOT quote_wrapper_sites EQUAL 2)
+    message(FATAL_ERROR
+        "E0.0 D-A quote wrapper must have one definition and one real-path call")
+endif()
+foreach(quote_wrapper_pin
+        "server_cache_destruction_quote_options options"
+        "uint64_t * admission_sequence"
+        "common_cache_plan_destruction_counters & counters"
+        "options.admission_sequence = ++*admission_sequence;")
+    string(FIND "${server_context_source}" "${quote_wrapper_pin}"
+        quote_wrapper_pin_pos)
+    if (quote_wrapper_pin_pos EQUAL -1)
+        message(FATAL_ERROR
+            "E0.0 parameterized quote wrapper drifted: '${quote_wrapper_pin}'")
+    endif()
+endforeach()
 string(FIND "${server_context_source}"
     "server_cache_destruction_has_effect(" effect_scan)
 string(FIND "${server_context_source}"
@@ -84,8 +102,8 @@ if (local_quote_budget EQUAL -1)
         "D-A0a quote must not perturb the shared D-S6 budget coordinator")
 endif()
 foreach(debug_guard
-        "if (cache_plan_obs ||\n                        (cache_authority && params_base.cache_lifecycle)) {\n                        const int64_t destruction_quote_started"
-        "if (cache_plan_obs) {\n                        server_cache_destruction_select_quote")
+        "if (cache_authority &&\n            (cache_plan_obs || params_base.cache_lifecycle)) {\n            const int64_t destruction_quote_started"
+        "if (cache_plan_obs && cache_authority) {\n            server_cache_destruction_select_quote")
     string(FIND "${server_context_source}" "${debug_guard}" debug_guard_pos)
     if (debug_guard_pos EQUAL -1)
         message(FATAL_ERROR "D-A quote/serialization work guard drifted: '${debug_guard}'")

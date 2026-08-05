@@ -22,7 +22,7 @@ if (NOT implemented_ceiling)
 endif()
 
 function(cache_plan_authority_order_valid source output)
-    string(FIND "${source}" "task, *ret, incoming_adapter, *plan_rec);" inventory_pos)
+    string(FIND "${source}" "task, target, out.incoming_adapter, rec);" inventory_pos)
     string(FIND "${source}" "cache_plan_authority->plan_before_mutation(" planner_pos)
     string(FIND "${source}" "cache_plan_authority->authorize(" authority_pos)
     string(FIND "${source}" "recurrent_shrink_for_prefill(\"before prompt cache save/load\")" mutation_pos)
@@ -48,6 +48,98 @@ string(REPLACE
 cache_plan_authority_order_valid("${order_negative}" negative_valid)
 if (negative_valid)
     message(FATAL_ERROR "B-A pre-mutation ordering negative control did not trip")
+endif()
+
+# E0.0 extracts the selector/inventory stages with the real request's existing
+# observer bookkeeping intact, but stale-arm cleanup is an unrelated mutation
+# and must remain between them at the caller. E0.1 can parameterize observer
+# transport without inheriting that disarm.
+function(cache_plan_stage1_boundary_valid source output)
+    string(FIND "${source}"
+        "cache_plan_stage1_selection cache_plan_select_before_mutation("
+        selection_begin)
+    string(FIND "${source}"
+        "void cache_plan_inventory_and_plan_before_mutation("
+        inventory_begin)
+    string(FIND "${source}" "server_slot * get_available_slot(" get_begin)
+    if (selection_begin EQUAL -1 OR
+        inventory_begin LESS_EQUAL selection_begin OR
+        get_begin LESS_EQUAL inventory_begin)
+        set(${output} FALSE PARENT_SCOPE)
+        return()
+    endif()
+
+    math(EXPR selection_length "${inventory_begin} - ${selection_begin}")
+    math(EXPR inventory_length "${get_begin} - ${inventory_begin}")
+    string(SUBSTRING "${source}" ${selection_begin} ${selection_length}
+        selection_body)
+    string(SUBSTRING "${source}" ${inventory_begin} ${inventory_length}
+        inventory_body)
+    string(FIND "${selection_body}" "server_cache_plan_disarm_unlaunched("
+        selection_disarm)
+    string(FIND "${inventory_body}" "server_cache_plan_disarm_unlaunched("
+        inventory_disarm)
+    if (NOT selection_disarm EQUAL -1 OR NOT inventory_disarm EQUAL -1)
+        set(${output} FALSE PARENT_SCOPE)
+        return()
+    endif()
+
+    string(FIND "${source}"
+        "recurrent_shrink_for_prefill(\"before prompt cache save/load\")"
+        get_end)
+    if (get_end LESS_EQUAL get_begin)
+        set(${output} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    math(EXPR get_length "${get_end} - ${get_begin}")
+    string(SUBSTRING "${source}" ${get_begin} ${get_length} get_body)
+    string(FIND "${get_body}" "cache_plan_select_before_mutation(task)"
+        select_call)
+    string(FIND "${get_body}" "server_cache_plan_disarm_unlaunched("
+        disarm_call)
+    string(FIND "${get_body}"
+        "cache_plan_inventory_and_plan_before_mutation(" inventory_call)
+    if (inventory_call GREATER 0)
+        string(SUBSTRING "${get_body}" 0 ${inventory_call} get_stage1_prefix)
+        string(REGEX MATCHALL "server_cache_plan_disarm_unlaunched\\("
+            get_disarm_sites "${get_stage1_prefix}")
+        list(LENGTH get_disarm_sites n_get_disarm_sites)
+    else()
+        set(n_get_disarm_sites 0)
+    endif()
+    if (select_call GREATER_EQUAL 0 AND
+        disarm_call GREATER select_call AND
+        inventory_call GREATER disarm_call AND
+        n_get_disarm_sites EQUAL 1)
+        set(${output} TRUE PARENT_SCOPE)
+    else()
+        set(${output} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+
+cache_plan_stage1_boundary_valid("${server_source}" stage1_boundary_valid)
+if (NOT stage1_boundary_valid)
+    message(FATAL_ERROR
+        "E0.0 selector/inventory boundary absorbed the real-request disarm")
+endif()
+string(REPLACE
+    "server_slot * ret = nullptr;"
+    "server_cache_plan_disarm_unlaunched(); server_slot * ret = nullptr;"
+    stage1_boundary_negative "${server_source}")
+cache_plan_stage1_boundary_valid(
+    "${stage1_boundary_negative}" stage1_boundary_negative_valid)
+if (stage1_boundary_negative_valid)
+    message(FATAL_ERROR "E0.0 disarm-boundary negative control did not trip")
+endif()
+string(REPLACE
+    "cache_plan_inventory_and_plan_before_mutation(\n                        task, *legacy_ret"
+    "server_cache_plan_disarm_unlaunched();\n                    cache_plan_inventory_and_plan_before_mutation(\n                        task, *legacy_ret"
+    stage1_duplicate_disarm_negative "${server_source}")
+cache_plan_stage1_boundary_valid(
+    "${stage1_duplicate_disarm_negative}"
+    stage1_duplicate_disarm_negative_valid)
+if (stage1_duplicate_disarm_negative_valid)
+    message(FATAL_ERROR "E0.0 duplicate-disarm negative control did not trip")
 endif()
 
 function(cache_plan_complete_inventory_valid source output)
@@ -122,6 +214,11 @@ foreach(pin
         "server_cache_plan_demote_for_coverage_recovery("
         "server_cache_plan_revalidate_checkpoint_execution("
         "server_cache_plan_disarm_unlaunched("
+        "cache_plan_stage1_selection cache_plan_select_before_mutation("
+        "void cache_plan_inventory_and_plan_before_mutation("
+        "server_cache_destruction_quote_options options"
+        "uint64_t * admission_sequence"
+        "common_cache_plan_destruction_counters & counters"
         "GGML_ASSERT(rec != nullptr || required_source_id < 0);"
         "int32_t cache_plan_source_id = -1;"
         "COMMON_CACHE_PLAN_SCHEMA_VERSION = 6")

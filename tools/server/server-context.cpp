@@ -2726,11 +2726,13 @@ private:
     }
 
     void cache_plan_quote_destruction(
-            const server_task & task,
             int32_t legacy_target_slot,
             bool host_lookup_enabled,
-            common_cache_plan_record & rec) noexcept {
-        if (!cache_authority) {
+            common_cache_plan_record & rec,
+            server_cache_destruction_quote_options options,
+            uint64_t * admission_sequence,
+            common_cache_plan_destruction_counters & counters) noexcept {
+        if (!cache_authority || !options.lifecycle_available) {
             rec.destruction.state = common_cache_plan_destruction_state::refused;
             rec.destruction.reason =
                 common_cache_plan_destruction_reason::lifecycle_disabled;
@@ -2742,8 +2744,7 @@ private:
                     common_cache_plan_destruction_reason reason) {
                 rec.destruction.state = state;
                 rec.destruction.reason = reason;
-                cache_authority->destruction_counters.observe(
-                    rec.selection, rec.destruction);
+                counters.observe(rec.selection, rec.destruction);
             };
             const int32_t legacy_candidate =
                 server_cache_plan_legacy_candidate(
@@ -2818,25 +2819,21 @@ private:
                 }
                 return true;
             };
-            if (cache_authority->destruction_quote_sequence == UINT64_MAX) {
-                fail_whole_pass(
-                    common_cache_plan_destruction_state::failed,
-                    common_cache_plan_destruction_reason::internal_fault);
-                return;
+            // Production advances its sequence only at the original
+            // post-assembly boundary. A read-only caller passes null and can
+            // never consume production quote identity.
+            if (admission_sequence) {
+                if (*admission_sequence == UINT64_MAX) {
+                    fail_whole_pass(
+                        common_cache_plan_destruction_state::failed,
+                        common_cache_plan_destruction_reason::internal_fault);
+                    return;
+                }
+                options.admission_sequence = ++*admission_sequence;
             }
-            const server_cache_destruction_quote_options options {
-                true,
-                prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION
-                    ? common_cache_plan_recovery_citation::prospective
-                    : common_cache_plan_recovery_citation::unavailable,
-                ++cache_authority->destruction_quote_sequence,
-                server_cache_plan_nonconsuming_host_effects(
-                    params_base.cache_lifecycle),
-            };
             if (!server_cache_destruction_quote_all(
                     rec, legacy_candidate, artifacts, snapshot.serial,
-                    preview, project, options,
-                    cache_authority->destruction_counters)) {
+                    preview, project, options, counters)) {
                 if (rec.destruction.reason ==
                     common_cache_plan_destruction_reason::none) {
                     rec.destruction.state =
@@ -2936,10 +2933,7 @@ private:
             rec.destruction.state = common_cache_plan_destruction_state::failed;
             rec.destruction.reason =
                 common_cache_plan_destruction_reason::internal_fault;
-            if (cache_authority) {
-                cache_authority->destruction_counters.observe(
-                    rec.selection, rec.destruction);
-            }
+            counters.observe(rec.selection, rec.destruction);
         }
     }
 
@@ -6338,15 +6332,19 @@ private:
         return selected_it;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    struct cache_plan_stage1_selection {
+        server_slot * target = nullptr;
+        bool update_cache = false;
+        bool selection_deferred_busy = false;
+        std::unique_ptr<common_cache_plan_record> record;
+    };
+
+    cache_plan_stage1_selection cache_plan_select_before_mutation(
+            const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
         bool selection_deferred_busy = false;
-        std::vector<common_adapter_lora_info> incoming_loras;
-        std::string incoming_adapter;
-        bool incoming_adapter_ready = false;
-        bool incoming_adapter_matches = false;
 
         // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
         // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
@@ -6646,8 +6644,110 @@ private:
             plan_rec.reset();
         }
 
+        return {
+            ret,
+            update_cache,
+            selection_deferred_busy,
+            std::move(plan_rec),
+        };
+    }
+
+    struct cache_plan_stage1_inventory {
+        std::vector<common_adapter_lora_info> incoming_loras;
+        std::string incoming_adapter;
+        bool incoming_adapter_ready = false;
+        bool incoming_adapter_matches = false;
+        bool host_lookup_enabled = false;
+    };
+
+    void cache_plan_derive_incoming_adapter(
+            const server_task & task,
+            const server_slot & target,
+            cache_plan_stage1_inventory & out) {
+        out.incoming_loras = task.params.lora.empty()
+            ? params_base.lora_adapters
+            : construct_lora_list(task.params.lora);
+        out.incoming_adapter = lora_config_identity(out.incoming_loras);
+        out.incoming_adapter_ready = true;
+        out.incoming_adapter_matches =
+            are_lora_equal(out.incoming_loras, target.lora);
+    }
+
+    void cache_plan_inventory_and_plan_before_mutation(
+            const server_task & task,
+            server_slot & target,
+            bool update_cache,
+            common_cache_plan_record & rec,
+            cache_plan_stage1_inventory & out) {
+        const uint64_t capability_before =
+            cache_plan_capability_snapshot(task);
+        cache_plan_derive_incoming_adapter(task, target, out);
+        cache_plan_inventory_before_mutation(
+            task, target, out.incoming_adapter, rec);
+        const uint64_t capability_after =
+            cache_plan_capability_snapshot(task);
+        out.host_lookup_enabled =
+            update_cache && prompt_cache &&
+            task.type == SERVER_TASK_TYPE_COMPLETION &&
+            out.incoming_adapter_matches;
+        if (cache_authority &&
+            (cache_plan_obs || params_base.cache_lifecycle)) {
+            const int64_t destruction_quote_started = ggml_time_us();
+            auto & counters = cache_authority->destruction_counters;
+            server_cache_destruction_quote_options options {
+                true,
+                prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION
+                    ? common_cache_plan_recovery_citation::prospective
+                    : common_cache_plan_recovery_citation::unavailable,
+                0,
+                server_cache_plan_nonconsuming_host_effects(
+                    params_base.cache_lifecycle),
+            };
+            cache_plan_quote_destruction(
+                target.id, out.host_lookup_enabled, rec,
+                options, &cache_authority->destruction_quote_sequence,
+                counters);
+            const uint64_t destruction_quote_duration = uint64_t(
+                std::max<int64_t>(0,
+                    ggml_time_us() - destruction_quote_started));
+            rec.destruction.quote_duration_us = destruction_quote_duration;
+            for (auto & quote : rec.destruction_quotes) {
+                quote.receipt.quote_duration_us = destruction_quote_duration;
+            }
+            counters.quote_samples++;
+            counters.quote_duration_us_total += destruction_quote_duration;
+            counters.quote_duration_us_max = std::max(
+                counters.quote_duration_us_max, destruction_quote_duration);
+        }
+        cache_plan_authority->plan_before_mutation(
+            rec, capability_before, capability_after);
+        if (cache_plan_obs && cache_authority) {
+            server_cache_destruction_select_quote(
+                rec, cache_authority->destruction_counters,
+                server_cache_plan_nonconsuming_host_effects(
+                    params_base.cache_lifecycle));
+        }
+    }
+
+    server_slot * get_available_slot(const server_task & task) {
+        auto stage1 = cache_plan_select_before_mutation(task);
+        server_slot * ret = stage1.target;
+        bool update_cache = stage1.update_cache;
+        const bool selection_deferred_busy = stage1.selection_deferred_busy;
+        auto plan_rec = std::move(stage1.record);
+
+        cache_plan_stage1_inventory stage1_inventory;
+        auto & incoming_loras = stage1_inventory.incoming_loras;
+        auto & incoming_adapter = stage1_inventory.incoming_adapter;
+        auto & incoming_adapter_ready = stage1_inventory.incoming_adapter_ready;
+        auto & incoming_adapter_matches =
+            stage1_inventory.incoming_adapter_matches;
+
         if (ret) {
             if (!selection_deferred_busy) {
+                // E0.0 boundary: this real-request mutation deliberately stays
+                // outside both reusable stage-1 functions. A preflight caller
+                // must never inherit stale-arm cleanup.
                 // An idle slot cannot own an in-flight directive. Clear any
                 // abandoned pre-launch arm before this request installs its
                 // own record; this also covers observer allocation failure.
@@ -6660,60 +6760,12 @@ private:
                 // which always owns cache_plan_authority.
                 GGML_ASSERT(cache_plan_authority);
                 server_slot * const legacy_ret = ret;
-                const uint64_t capability_before =
-                    cache_plan_capability_snapshot(task);
                 try {
-                    incoming_loras = task.params.lora.empty()
-                        ? params_base.lora_adapters
-                        : construct_lora_list(task.params.lora);
-                    incoming_adapter = lora_config_identity(incoming_loras);
-                    incoming_adapter_ready = true;
-                    incoming_adapter_matches =
-                        are_lora_equal(incoming_loras, ret->lora);
-                    cache_plan_inventory_before_mutation(
-                        task, *ret, incoming_adapter, *plan_rec);
-                    const uint64_t capability_after =
-                        cache_plan_capability_snapshot(task);
+                    cache_plan_inventory_and_plan_before_mutation(
+                        task, *legacy_ret, update_cache, *plan_rec,
+                        stage1_inventory);
                     const bool host_lookup_enabled =
-                        update_cache && prompt_cache &&
-                        task.type == SERVER_TASK_TYPE_COMPLETION &&
-                        incoming_adapter_matches;
-                    if (cache_plan_obs ||
-                        (cache_authority && params_base.cache_lifecycle)) {
-                        const int64_t destruction_quote_started =
-                            ggml_time_us();
-                        cache_plan_quote_destruction(
-                            task, legacy_ret->id,
-                            host_lookup_enabled, *plan_rec);
-                        const uint64_t destruction_quote_duration = uint64_t(
-                            std::max<int64_t>(0,
-                                ggml_time_us() - destruction_quote_started));
-                        plan_rec->destruction.quote_duration_us =
-                            destruction_quote_duration;
-                        for (auto & quote : plan_rec->destruction_quotes) {
-                            quote.receipt.quote_duration_us =
-                                destruction_quote_duration;
-                        }
-                        if (cache_authority) {
-                            auto & counters =
-                                cache_authority->destruction_counters;
-                            counters.quote_samples++;
-                            counters.quote_duration_us_total +=
-                                destruction_quote_duration;
-                            counters.quote_duration_us_max = std::max(
-                                counters.quote_duration_us_max,
-                                destruction_quote_duration);
-                        }
-                    }
-                    cache_plan_authority->plan_before_mutation(
-                        *plan_rec, capability_before, capability_after);
-                    if (cache_plan_obs) {
-                        server_cache_destruction_select_quote(
-                            *plan_rec,
-                            cache_authority->destruction_counters,
-                            server_cache_plan_nonconsuming_host_effects(
-                                params_base.cache_lifecycle));
-                    }
+                        stage1_inventory.host_lookup_enabled;
 
                     // B-A2 may choose another strict-similarity target, but
                     // only the authority layer interprets that choice. Lower
@@ -6901,13 +6953,8 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 if (!incoming_adapter_ready) {
-                    incoming_loras = task.params.lora.empty()
-                        ? params_base.lora_adapters
-                        : construct_lora_list(task.params.lora);
-                    incoming_adapter = lora_config_identity(incoming_loras);
-                    incoming_adapter_ready = true;
-                    incoming_adapter_matches =
-                        are_lora_equal(incoming_loras, ret->lora);
+                    cache_plan_derive_incoming_adapter(
+                        task, *ret, stage1_inventory);
                 }
                 if (request_cache_plan) {
                     request_cache_plan->identity.adapter_config_digest =
