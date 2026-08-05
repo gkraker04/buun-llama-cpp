@@ -5,12 +5,21 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
 
 struct common_params;
+
+// Vertex /predict is a compatibility dispatcher, not an alternate security
+// boundary. Cache-plan preflight is intentionally reachable only through its
+// reviewed route so its no-store and body-redaction contracts cannot be lost.
+constexpr bool server_http_gcp_predict_dispatch_allowed(
+        std::string_view path) noexcept {
+    return path != "/cache/plan";
+}
 
 // generator-like API for HTTP response generation
 // this object response with one of the 2 modes:

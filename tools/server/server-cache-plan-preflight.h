@@ -2,8 +2,13 @@
 
 #include "common-cache-plan.h"
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <vector>
 
 // E0.1 is an internal scheduler result only. E0.2 owns the public JSON schema;
@@ -88,12 +93,29 @@ struct server_cache_plan_preflight_view {
     llama_cache_acct_value predicted_replay_tokens;
     llama_cache_acct_value predicted_restore_bytes;
     llama_cache_acct_value predicted_ttft_us;
+    uint32_t estimator_version = 0;
     std::array<llama_cache_acct_cost_term,
                size_t(llama_cache_acct_cost_kind::_count)> cost_terms =
         common_cache_plan_default_cost_terms();
     server_cache_plan_preflight_destruction destruction;
     std::vector<server_cache_plan_preflight_miss_reason> miss_reasons;
 };
+
+// E0 v1 public projection. This is deliberately independent of the schema-6
+// debug serializer: identities, digests, accounting rows, ordinals, serials,
+// leases, and recovery-source handles have no representation here.
+nlohmann::ordered_json server_cache_plan_preflight_json(
+    const server_cache_plan_preflight_view & view);
+
+// Exposure remains opt-in and single-principal. The existing API-key
+// middleware authenticates zero/one configured key; E0 refuses configurations
+// where that middleware represents multiple principals.
+bool server_cache_plan_preflight_exposure_allowed(
+    const std::string & hostname,
+    size_t api_key_count) noexcept;
+
+bool server_cache_plan_preflight_request_field_allowed(
+    std::string_view field) noexcept;
 
 server_cache_plan_preflight_expected_path
 server_cache_plan_preflight_derive_expected_path(

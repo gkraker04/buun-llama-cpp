@@ -2105,6 +2105,10 @@ private:
     // B-A authority substrate. Independent of debug serialization: non-off
     // graduated levels dual-run even when CACHE_PLAN JSON is disabled.
     std::unique_ptr<server_cache_plan_authority> cache_plan_authority;
+    // Feature-neutral once-per-model profile source. Observability, B/D
+    // authority, and E0 all copy from this one composition result without
+    // forcing any sibling feature object to exist.
+    std::string cache_plan_calibration_profile;
 
     // B0 shadow cache-plan observer [P2]. Constructed ONLY under params_base.cache_debug (B-a
     // literal: no observer object, no record init, no hook work of any kind on the disabled path
@@ -5643,7 +5647,8 @@ private:
             }
         }
 
-        if (cache_plan_obs || cache_plan_authority || cache_authority) {
+        if (cache_plan_obs || cache_plan_authority || cache_authority ||
+            params_base.cache_plan_preflight) {
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -5655,7 +5660,7 @@ private:
                 char desc[256] = {0};
                 llama_model_desc(model_tgt, desc, sizeof(desc));
 
-                const auto calibration_profile = common_cache_plan_calib_profile(
+                cache_plan_calibration_profile = common_cache_plan_calib_profile(
                     desc,
                     common_cache_plan_calib_hw(gpu_descs, ngl_eff,
                                                int(params_base.split_mode),
@@ -5679,13 +5684,16 @@ private:
                             ggml_type_name(params_base.cache_type_v));
                     }());
                 if (cache_plan_obs) {
-                    cache_plan_obs->calibration_profile = calibration_profile;
+                    cache_plan_obs->calibration_profile =
+                        cache_plan_calibration_profile;
                 }
                 if (cache_plan_authority) {
-                    cache_plan_authority->calibration_profile = calibration_profile;
+                    cache_plan_authority->calibration_profile =
+                        cache_plan_calibration_profile;
                 }
                 if (cache_authority) {
-                    cache_authority->calibration_profile = calibration_profile;
+                    cache_authority->calibration_profile =
+                        cache_plan_calibration_profile;
                 }
             }
             if (cache_plan_obs) {
@@ -8093,10 +8101,8 @@ private:
             // profile when present; otherwise the local planner reports the
             // typed no_profile refusal.
             local_authority.emplace(params_base.cache_plan_authority);
-            if (cache_authority) {
-                local_authority->calibration_profile =
-                    cache_authority->calibration_profile;
-            }
+            local_authority->calibration_profile =
+                cache_plan_calibration_profile;
             plan_authority = &*local_authority;
         }
 
@@ -13623,6 +13629,117 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_cache_plan = [this](const server_http_req & req) {
+        auto res = create_response();
+        // E0 is point-in-time advice. Every terminal, including parse and
+        // feature-gate errors, is route-locally non-cacheable.
+        res->headers["Cache-Control"] = "no-store";
+
+        // Disabled means zero tokenization/planning work and no cache oracle.
+        if (!params.cache_plan_preflight) {
+            res->error(format_error_response(
+                "This server does not support cache-plan preflight. Start it with `--cache-plan-preflight`",
+                ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (!server_cache_plan_preflight_exposure_allowed(
+                params.hostname, params.api_keys.size())) {
+            res->error(format_error_response(
+                "Cache-plan preflight requires a trusted-local single-principal server",
+                ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        try {
+            const json data = json::parse(req.body);
+            if (!data.is_object()) {
+                throw std::runtime_error("cache-plan preflight body must be an object");
+            }
+            for (const auto & field : data.items()) {
+                if (!server_cache_plan_preflight_request_field_allowed(
+                        field.key())) {
+                    throw std::runtime_error(
+                        "unsupported cache-plan preflight field: " +
+                        field.key());
+                }
+            }
+            if (!data.contains("prompt")) {
+                throw std::runtime_error(
+                    "cache-plan preflight requires prompt");
+            }
+            if (!req.files.empty()) {
+                throw std::runtime_error(
+                    "cache-plan preflight does not accept multipart files");
+            }
+
+            const auto & prompt = data.at("prompt");
+            if (prompt.is_array() &&
+                !json_is_array_and_contains_numbers(prompt) &&
+                prompt.size() != 1) {
+                throw std::runtime_error(
+                    "cache-plan preflight accepts exactly one prompt");
+            }
+
+            auto inputs = tokenize_input_prompts(
+                ctx_server.vocab, ctx_server.mctx, prompt,
+                true, true);
+            if (inputs.size() != 1) {
+                throw std::runtime_error(
+                    "cache-plan preflight accepts exactly one prompt");
+            }
+
+            server_task task(SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT);
+            task.id = res->rd.get_new_id();
+            task.tokens = std::move(inputs.front());
+            task.id_slot = data.contains("id_slot")
+                ? data.at("id_slot").get<int>() : -1;
+            task.params.cache_prompt = data.contains("cache_prompt")
+                ? data.at("cache_prompt").get<bool>()
+                : params.cache_prompt;
+            if (data.contains("lora")) {
+                if (!data.at("lora").is_array()) {
+                    throw std::runtime_error(
+                        "cache-plan preflight lora must use the native array form");
+                }
+                task.params.lora = parse_lora_request(data.at("lora"));
+            }
+            if (data.contains("message_delimiters") &&
+                !data.at("message_delimiters").is_array()) {
+                throw std::runtime_error(
+                    "cache-plan preflight message_delimiters must be an array");
+            }
+            auto delimiters = common_chat_msg_delimiters_parse(
+                data.contains("message_delimiters")
+                    ? data.at("message_delimiters") : json::array());
+            delimiters.tokenize(ctx_server.vocab);
+            task.params.message_spans =
+                task.tokens.find_message_spans(delimiters);
+
+            // The scheduler-thread assertion lives inside cache_plan_preflight;
+            // the HTTP worker has no direct call door to the planning kernel.
+            res->rd.post_task(std::move(task));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(
+                e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * preview = dynamic_cast<
+            server_task_result_cache_plan_preflight *>(result.get());
+        GGML_ASSERT(preview != nullptr);
+        res->ok(preview->to_json());
         return res;
     };
 

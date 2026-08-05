@@ -4271,6 +4271,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
     add_opt(common_arg(
+        {"--cache-plan-preflight"},
+        string_format("expose trusted-local POST /cache/plan previews (default: %s)", params.cache_plan_preflight ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_plan_preflight = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_PREFLIGHT"));
+    add_opt(common_arg(
         {"--cache-plan-authority"}, "LEVEL",
         "dual-run the P2 cache-plan authority substrate at LEVEL: off, by_id, similarity, route_home, or lru (B-A0b remains shadow-only; default: off)",
         [](common_params & params, const std::string & value) {

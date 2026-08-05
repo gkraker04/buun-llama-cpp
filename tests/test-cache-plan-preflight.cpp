@@ -1,8 +1,14 @@
 #include "server-cache-plan-preflight-internal.h"
 #include "server-cache-plan-authority.h"
+#include "server-http.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <set>
+#include <sstream>
 
 #define CHECK(COND) do { if (!(COND)) { \
     std::fprintf(stderr, "CHECK failed at %s:%d: %s\n", \
@@ -30,6 +36,8 @@ static common_cache_plan_record fitted_live_record() {
         llama_cache_acct_value::measured(4);
     live->cost_terms[size_t(llama_cache_acct_cost_kind::replay)].estimated_us =
         llama_cache_acct_value::measured(40);
+    live->cost_terms[size_t(llama_cache_acct_cost_kind::replay)]
+        .estimator_version = 7;
     live->predicted_total_us = llama_cache_acct_value::measured(40);
     rec.shadow_choice = int32_t(live - rec.inventory.data());
     rec.authority.planner_plan_candidate = rec.shadow_choice;
@@ -132,7 +140,14 @@ static void test_destruction_view_mapping() {
     CHECK(view.destruction.state ==
           common_cache_plan_destruction_state::failed);
     CHECK(view.destruction.reason ==
-          common_cache_plan_destruction_reason::manifest_incomplete);
+          common_cache_plan_destruction_reason::
+              release_evidence_unavailable);
+}
+
+static void test_gcp_dispatch_excludes_preflight() {
+    CHECK(!server_http_gcp_predict_dispatch_allowed("/cache/plan"));
+    CHECK(server_http_gcp_predict_dispatch_allowed("/completion"));
+    CHECK(server_http_gcp_predict_dispatch_allowed("cachePlan"));
 }
 
 static void test_saturated_inventory_refuses_typed() {
@@ -263,6 +278,146 @@ static void test_local_source_registry() {
     CHECK(publish_b == second);
 }
 
+static void assert_redacted_keys(const nlohmann::ordered_json & value) {
+    // Canonical exhaustive E0 private-key oracle. The contract scan and live
+    // driver carry deliberate security-critical subsets and point back here.
+    static const std::set<std::string> forbidden = {
+        "target_slot_id", "source_id", "candidate_id", "component_ids",
+        "checkpoint_ordinal", "artifact_id", "victim_ids",
+        "recovery_source", "manifest_digest", "effect_digest",
+        "recovery_digest", "accounting_serial", "admission_sequence",
+        "memo_key", "lease_holder", "lease_scope", "lease_expiry",
+        "main_family", "device_ordinal", "topology_id", "domains",
+        "journal_id", "re_request",
+    };
+    if (value.is_object()) {
+        for (const auto & item : value.items()) {
+            CHECK(forbidden.count(item.key()) == 0);
+            assert_redacted_keys(item.value());
+        }
+    } else if (value.is_array()) {
+        for (const auto & item : value) {
+            assert_redacted_keys(item);
+        }
+    }
+}
+
+static void test_wire_serializer_and_golden() {
+    auto rec = fitted_live_record();
+    auto & selected = rec.inventory[size_t(rec.shadow_choice)];
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::restore)].raw =
+        llama_cache_acct_value::measured(16);
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::restore)]
+        .estimated_us = llama_cache_acct_value::measured(3);
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::restore)]
+        .estimator_version = 7;
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::eviction)].raw =
+        llama_cache_acct_value::measured(64);
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::eviction)]
+        .estimated_us = llama_cache_acct_value::measured(9);
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::eviction)]
+        .estimator_version = 7;
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::workspace)].raw =
+        llama_cache_acct_value::measured(2);
+    selected.cost_terms[size_t(llama_cache_acct_cost_kind::workspace)]
+        .raw_unit = llama_cache_acct_unit::operations;
+    selected.predicted_total_us = llama_cache_acct_value::measured(52);
+
+    auto * rejected = rec.find_or_add(
+        common_cache_plan_provider::host_cache_entry, 91,
+        COMMON_CACHE_PLAN_PHASE_HOST_SCAN, 7,
+        common_cache_plan_selection::similarity);
+    CHECK(rejected != nullptr);
+    rejected->note_reject(COMMON_CACHE_PLAN_REASON_ADAPTER_CONFIG_MISMATCH);
+
+    rec.destruction.state = common_cache_plan_destruction_state::quoted;
+    rec.destruction.reason = common_cache_plan_destruction_reason::none;
+    rec.destruction.plan_candidate = rec.shadow_choice;
+    rec.destruction.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::cross_target_displacement) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+    rec.destruction.lease_verdict =
+        common_cache_plan_destruction_lease_verdict::soft_leased;
+    rec.destruction.displaced_fate =
+        common_cache_plan_displaced_fate::retained_host;
+    rec.destruction.recovery_citation =
+        common_cache_plan_recovery_citation::prospective;
+    rec.destruction.selected_attention.push_back({ 987654321 });
+    rec.destruction.recovery_source_artifact_id = { 876543210 };
+    rec.destruction.manifest_digest =
+        common_cache_plan_destruction_manifest_digest::from_sha256(
+            std::array<uint8_t, 32>{ 0xab });
+    common_cache_plan_destruction_quote quote;
+    quote.receipt = rec.destruction;
+    common_cache_plan_yield_domain domain;
+    domain.projected_release_bytes = llama_cache_acct_value::measured(64);
+    quote.projected_domains.push_back(domain);
+    rec.destruction_quotes.push_back(std::move(quote));
+
+    server_cache_plan_preflight_view view;
+    CHECK(server_cache_plan_preflight_build_view(rec, 7, true, view));
+    const auto wire = server_cache_plan_preflight_json(view);
+    CHECK(wire["object"] == "cache_plan_preflight");
+    CHECK(wire["schema_version"] == 1);
+    CHECK(wire["cache_plan_schema_version"] == 6);
+    CHECK(wire["authoritative"] == false);
+    CHECK(wire["reservation"] == "none");
+    CHECK(wire["valid_until"].is_null());
+    CHECK(wire["planner"]["expected_path"] ==
+          "conditional_on_destruction_certification");
+    CHECK(wire["planner"]["estimate_scope"] == "cache_path_only");
+    CHECK(wire["planner"]["estimator_version"] == 7);
+    CHECK(wire["planner"]["cost_terms"]["workspace"]["operations"] == 2);
+    CHECK(!wire["planner"]["cost_terms"]["workspace"].contains("bytes"));
+    CHECK(wire["destruction"]["effects"].size() == 2);
+    CHECK(wire["limitations"].size() == 4);
+    assert_redacted_keys(wire);
+    const std::string encoded = wire.dump(2) + "\n";
+    CHECK(encoded.find("987654321") == std::string::npos);
+    CHECK(encoded.find("876543210") == std::string::npos);
+    CHECK(encoded.find("ab000000") == std::string::npos);
+
+    if (std::getenv("CACHE_PLAN_PRINT_PREFLIGHT_GOLDEN")) {
+        std::fputs(encoded.c_str(), stdout);
+        std::fflush(stdout);
+        std::exit(EXIT_SUCCESS);
+    }
+#ifdef CACHE_PLAN_PREFLIGHT_GOLDEN_PATH
+    std::ifstream golden(CACHE_PLAN_PREFLIGHT_GOLDEN_PATH);
+    CHECK(golden.good());
+    std::ostringstream expected;
+    expected << golden.rdbuf();
+    CHECK(encoded == expected.str());
+#endif
+}
+
+static void test_exposure_gate() {
+    CHECK(server_cache_plan_preflight_exposure_allowed("127.0.0.1", 0));
+    CHECK(server_cache_plan_preflight_exposure_allowed("localhost", 1));
+    CHECK(server_cache_plan_preflight_exposure_allowed("::1", 0));
+    CHECK(server_cache_plan_preflight_exposure_allowed(
+        "/tmp/llama.sock", 1));
+    CHECK(!server_cache_plan_preflight_exposure_allowed("0.0.0.0", 0));
+    CHECK(!server_cache_plan_preflight_exposure_allowed("127.0.0.1", 2));
+
+    CHECK(server_cache_plan_preflight_request_field_allowed("prompt"));
+    CHECK(server_cache_plan_preflight_request_field_allowed("id_slot"));
+    CHECK(server_cache_plan_preflight_request_field_allowed("cache_prompt"));
+    CHECK(server_cache_plan_preflight_request_field_allowed("lora"));
+    CHECK(server_cache_plan_preflight_request_field_allowed(
+        "message_delimiters"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("sampling"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("ticket"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("claim"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("preview_id"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("nonce"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed(
+        "manifest_digest"));
+    CHECK(!server_cache_plan_preflight_request_field_allowed("artifact_id"));
+}
+
 int main() {
     test_expected_path_closed_set();
     test_view_and_oracles();
@@ -270,6 +425,9 @@ int main() {
     test_saturated_inventory_refuses_typed();
     test_as_if_completion_semantics();
     test_local_source_registry();
+    test_wire_serializer_and_golden();
+    test_exposure_gate();
+    test_gcp_dispatch_excludes_preflight();
     std::puts("test-cache-plan-preflight: PASS");
     return 0;
 }

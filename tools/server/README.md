@@ -225,6 +225,7 @@ is forced when `-np > 1`.
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
+| `--cache-plan-preflight` | expose trusted-local `POST /cache/plan` point-in-time previews (default: disabled)<br/>(env: LLAMA_ARG_CACHE_PLAN_PREFLIGHT) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
@@ -912,6 +913,33 @@ Same as the `/v1/embeddings` endpoint.
     ]
   }
 ]
+```
+
+### POST `/cache/plan`: Preview cache reuse and displacement
+
+This opt-in endpoint is enabled with `--cache-plan-preflight`. It is available
+only on a loopback/Unix-socket, single-model server with at most one configured
+API key. The request accepts the native `prompt` form plus `id_slot`,
+`cache_prompt`, `lora`, and `message_delimiters`; all other fields are rejected.
+
+The response is a point-in-time, read-only estimate. It is **not** a reservation
+or claim: `authoritative` is always `false`, `reservation` is always `none`, and
+`valid_until` is always `null`. Cache contents may change before the following
+completion. The preview models production mutability. In particular, with
+`--cache-debug` enabled but `--cache-lifecycle` disabled, its destruction view
+may intentionally differ from the more permissive debug shadow record.
+
+`predicted_ttft_us` covers fitted cache-path work only, not tokenization,
+queueing, generation, or unrelated contention. The response exposes coarse
+reuse and destruction classes but no slot/source/artifact identifiers, digests,
+accounting domains, serials, or lease identities. Every response carries
+`Cache-Control: no-store`, and request/response bodies are excluded from server
+request logs and `--log-prompts-dir` output.
+
+```bash
+curl --request POST http://127.0.0.1:8080/cache/plan \
+  --header "Content-Type: application/json" \
+  --data '{"prompt":"Hello","cache_prompt":true}'
 ```
 
 ### GET `/slots`: Returns the current slots processing state

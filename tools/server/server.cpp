@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-cache-plan-preflight.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -129,6 +130,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
+
+    if (params.cache_plan_preflight &&
+        (is_router_server ||
+         !server_cache_plan_preflight_exposure_allowed(
+             params.hostname, params.api_keys.size()))) {
+        SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
+        return 1;
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
@@ -263,6 +272,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.post("/cache/plan",                ex_wrapper(routes.post_cache_plan));
 
     // resumable streaming, the conversation_id is the session identity end to end. router and
     // child wire different handlers under the same paths: a child binds the local session

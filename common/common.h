@@ -805,6 +805,11 @@ struct common_params {
     // B0 shadow cache-plan observer: strictly zero observer work when disabled
     bool cache_debug = false;
 
+    // Trusted-local, single-principal E0 cache-plan preview surface. This flag
+    // only exposes the route; ordinary requests allocate no observer/planner
+    // state merely because it is enabled.
+    bool cache_plan_preflight = false;
+
     // B-A graduated authority request. B-A0b dual-runs every non-off level but
     // still executes legacy unconditionally; later ratchets consume the same
     // closed spelling without another flag migration.
