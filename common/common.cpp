@@ -1770,16 +1770,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.vbr_pin_k = params.vbr_pin_k();
     cparams.vbr_pin_v = params.vbr_pin_v();
 
-    switch (params.moe_cache.mode) {
-        case COMMON_MOE_CACHE_MODE_OFF:
-            cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
-            break;
-        case COMMON_MOE_CACHE_MODE_AUTO:
-            cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
-            break;
-        case COMMON_MOE_CACHE_MODE_ON:
-            cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
-            break;
+    if (params.moe_cache.mode_explicit) {
+        switch (params.moe_cache.mode) {
+            case COMMON_MOE_CACHE_MODE_OFF:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+                break;
+            case COMMON_MOE_CACHE_MODE_AUTO:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+                break;
+            case COMMON_MOE_CACHE_MODE_ON:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+                break;
+        }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
 
