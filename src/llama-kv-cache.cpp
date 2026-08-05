@@ -42,6 +42,11 @@ enum vbr_tier : uint8_t {
     VBR_TIER_T1_TCQ,
     VBR_TIER_COUNT,
 };
+bool llama_kv_cache::vbr_hard_seal_classify(
+        vbr_hard_seal_classification & out) const noexcept {
+    return vbr_classify_hard_seal(
+        vbr_degrade_order_, VBR_TIER_T4, out);
+}
 
 // a type the degrade ladder can move: the five turbo tiers plus F16, which is the dynamic
 // entry tier (full-quality until budget pressure; the measured orders' first band is

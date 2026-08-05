@@ -1,4 +1,5 @@
 #include "server-cache-destruction-quote.h"
+#include "server-cache-retention-proof.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -887,6 +888,25 @@ static void test_fixed_pool_known_zero_release() {
               release_evidence_unavailable);
 }
 
+static void test_retention_fallback_proof_lifetime() {
+    uint64_t releases = 0;
+    auto pin = server_cache_recovery_pin::acquire(
+        &releases, release_pin, { { 301 } }, { { 302 } });
+    auto proof = server_cache_retention_fallback_proof_for_test(
+        std::move(pin));
+    CHECK(proof.available());
+    CHECK(releases == 0);
+    auto moved = std::move(proof);
+    CHECK(!proof.available());
+    CHECK(moved.available());
+    moved = {};
+    CHECK(releases == 1);
+
+    auto invalid = server_cache_retention_fallback_proof_for_test({});
+    CHECK(!invalid.available());
+    CHECK(invalid.state() == server_cache_lease_fallback_state::invalid);
+}
+
 int main() {
     test_complete_memoized_and_permutation();
     test_read_only_zero_sequence_quote();
@@ -897,6 +917,7 @@ int main() {
     test_max_inventory_memoizes_one_manifest();
     test_prepared_release_capability();
     test_fixed_pool_known_zero_release();
+    test_retention_fallback_proof_lifetime();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

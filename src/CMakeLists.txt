@@ -42,6 +42,7 @@ add_library(llama
             llama-cache-budget.cpp
             llama-cache-authority.cpp
             llama-vbr-checkpoint.cpp
+            llama-vbr-hard-seal.cpp
             llama-vbr-extent.cpp
             llama-vbr-artifact.cpp
             llama-vbr-pinned-ring.cpp

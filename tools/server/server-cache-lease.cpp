@@ -20,10 +20,10 @@ public:
 class unavailable_fallback_provider final :
         public server_cache_lease_fallback_provider {
 public:
-    server_cache_lease_fallback_state preflight(
+    server_cache_durable_fallback_proof acquire(
             const server_cache_lease_subject &,
             const server_cache_lease_identity &) noexcept override {
-        return server_cache_lease_fallback_state::unavailable;
+        return {};
     }
 };
 
@@ -45,6 +45,18 @@ bool target_is_lease_applicable(server_cache_destruction_target_kind kind) noexc
 }
 
 } // namespace
+
+server_cache_durable_fallback_proof
+server_cache_durable_fallback_proof_for_test(
+        server_cache_lease_fallback_state state,
+        std::shared_ptr<void> owner) noexcept {
+    if (state == server_cache_lease_fallback_state::available && !owner) {
+        state = server_cache_lease_fallback_state::unavailable;
+    } else if (state != server_cache_lease_fallback_state::available) {
+        owner.reset();
+    }
+    return { state, std::move(owner) };
+}
 
 server_cache_lease_scope server_cache_lease_scope::from(
         server_cache_process_scope_id value) noexcept {
@@ -210,7 +222,8 @@ server_cache_lease_id server_cache_lease_table::emit_grant(
         uint64_t now,
         uint64_t deadline,
         uint64_t ttl_ns,
-        server_cache_lease_event_kind kind) noexcept {
+        server_cache_lease_event_kind kind,
+        server_cache_durable_fallback_proof proof) noexcept {
     entry value;
     value.lease = issue_lease_id();
     value.subject = subject;
@@ -220,6 +233,7 @@ server_cache_lease_id server_cache_lease_table::emit_grant(
     value.granted_at_ns = now;
     value.expires_at_ns = deadline;
     value.ttl_ns = ttl_ns;
+    value.fallback_proof = std::move(proof);
     const auto lease = value.lease;
     if (!lease || !identity_id || !add_entry(std::move(value), kind)) {
         return {};
@@ -241,6 +255,18 @@ bool server_cache_lease_table::add_entry(
         mark_table_unavailable();
         return false;
     }
+}
+
+server_cache_lease_table::entry server_cache_lease_table::clone_core(
+        const entry & source) noexcept {
+    entry clone;
+    clone.scope = source.scope;
+    clone.identity_id = source.identity_id;
+    clone.cls = source.cls;
+    clone.expires_at_ns = source.expires_at_ns;
+    clone.ttl_ns = source.ttl_ns;
+    clone.fallback_proof = source.fallback_proof.retain();
+    return clone;
 }
 
 void server_cache_lease_table::invalidate_entry(
@@ -358,12 +384,13 @@ server_cache_lease_id server_cache_lease_table::grant_hard(
         n_unavailable++;
         return {};
     }
-    const auto proof = fallback->preflight(subject, identity);
+    auto proof = fallback->acquire(subject, identity);
     const auto identity_id = intern_identity(identity);
     if (!identity_id) {
         return {};
     }
-    if (proof != server_cache_lease_fallback_state::available) {
+    const auto proof_state = proof.state();
+    if (!proof.available()) {
         entry refusal;
         refusal.subject = subject;
         refusal.scope = scope;
@@ -371,16 +398,17 @@ server_cache_lease_id server_cache_lease_table::grant_hard(
         refusal.cls = server_cache_lease_class::hard;
         refusal.ttl_ns = ttl_ns;
         record(
-            proof == server_cache_lease_fallback_state::invalid
+            proof_state == server_cache_lease_fallback_state::invalid
                 ? server_cache_lease_event_kind::refuse_hard_invalid
                 : server_cache_lease_event_kind::refuse_hard_unavailable,
-            &refusal, {}, proof);
+            &refusal, {}, proof_state);
         return {};
     }
     clear_identity_unavailable(subject.artifact);
     return emit_grant(
         subject, scope, identity_id, server_cache_lease_class::hard,
-        now, deadline, ttl_ns, server_cache_lease_event_kind::grant_hard);
+        now, deadline, ttl_ns, server_cache_lease_event_kind::grant_hard,
+        std::move(proof));
 }
 
 bool server_cache_lease_table::renew(
@@ -482,13 +510,12 @@ bool server_cache_lease_table::artifact_cloned(
                 return false;
             }
             pending_clone clone;
-            clone.value = existing;
+            clone.value = clone_core(existing);
             clone.parent = existing.lease;
             clone.value.lease = issue_lease_id();
             clone.value.subject = destination;
             clone.value.granted_at_ns = now;
             clone.value.ttl_ns = existing.expires_at_ns - now;
-            clone.value.last_event_ordinal = 0;
             if (!clone.value.lease || clone.value.ttl_ns == 0) {
                 return false;
             }

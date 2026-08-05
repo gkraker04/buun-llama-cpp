@@ -171,8 +171,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-authority.cpp)
     target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-    llama_build_and_test(test-vbr-artifact.cpp)
-    target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(
+        test-vbr-artifact.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp)
+    target_include_directories(test-vbr-artifact PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-vbr-artifact-adopt.cpp)
     target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
     add_test(
@@ -205,6 +210,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(
         test-cache-destruction-quote.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
@@ -214,6 +220,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-cache-plan-record.cpp)
     target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-vbr-hard-seal.cpp)
+    target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(
+        NAME test-e1-foundations-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-foundations.cmake)
 
     llama_build_and_test(test-cache-plan-estimate.cpp)
     target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)

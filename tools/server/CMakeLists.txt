@@ -20,6 +20,10 @@ add_library(${TARGET} STATIC
     server-cache-plan-preflight-internal.h
     server-cache-lease.cpp
     server-cache-lease.h
+    server-cache-retention-proof.cpp
+    server-cache-retention-proof.h
+    server-cache-vbr-proof.cpp
+    server-cache-vbr-proof.h
     server-cache-yield.cpp
     server-cache-yield.h
     server-vbr-artifact-store.cpp

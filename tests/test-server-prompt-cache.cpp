@@ -122,11 +122,15 @@ constexpr const char * HOST_TRADE_TEST_PROFILE =
 
 class available_host_fallback final : public server_cache_lease_fallback_provider {
 public:
-    server_cache_lease_fallback_state preflight(
+    server_cache_durable_fallback_proof acquire(
             const server_cache_lease_subject &,
             const server_cache_lease_identity &) noexcept override {
-        return server_cache_lease_fallback_state::available;
+        return server_cache_durable_fallback_proof_for_test(
+            server_cache_lease_fallback_state::available, owner);
     }
+
+private:
+    std::shared_ptr<void> owner = std::make_shared<int>(1);
 };
 
 void configure_host_trade(

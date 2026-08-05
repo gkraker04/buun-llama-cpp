@@ -440,6 +440,9 @@ static bool server_cache_transient_seq_rm_impl(
 struct server_slot {
     int id;
 
+    // Optional E1 declared-family state. E1.0 leaves it invalid in production.
+    common_cache_family_binding cache_family;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
     server_cache_destruction_observer * destruction_obs = nullptr;
@@ -585,7 +588,10 @@ struct server_slot {
                 return prompt_save_result::failed;
             }
             auto & entry = staged.front();
-            entry.main_family = !task || !task->is_child();
+            entry.cache_family = task ? task->cache_family
+                                      : common_cache_family_binding {};
+            entry.main_family = common_cache_family_main_family(
+                entry.cache_family, !task || !task->is_child());
 
             size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
@@ -657,7 +663,9 @@ struct server_slot {
             checkpoint_seam_heuristic,
             checkpoint_thinning_refusal,
             checkpoint_floor_refusal,
-            task && !task->is_child(),
+            common_cache_family_main_family(
+                cache_family, task && !task->is_child()),
+            cache_family,
             cache_debug_observability,
             this,
             checkpoint_drop_authority_adapter,
@@ -2983,8 +2991,9 @@ private:
                     // Child slots clear their prompts on release, so every
                     // retained non-empty idle conversation is provisionally
                     // main-family until E1 supplies declared identity.
-                    const bool main_family =
-                        !victim->task || !victim->task->is_child();
+                    const bool main_family = common_cache_family_main_family(
+                        victim->cache_family,
+                        !victim->task || !victim->task->is_child());
                     uint32_t weight = 0;
                     uint64_t price_us = 0;
                     if (!server_cache_host_retention_price_us(

@@ -6,6 +6,7 @@
 #include "server-retention-sidecar.h"
 #include "../../common/common-cache-plan.h"
 #include "../../common/common-cache-plan-estimate.h"
+#include "../../common/common-cache-family.h"
 #include "../../src/llama-cache-authority.h"
 #include "ggml-backend.h"
 
@@ -235,6 +236,7 @@ struct server_cache_checkpoint_authority_context {
     common_cache_plan_destruction_reason & thinning_refusal;
     common_cache_plan_destruction_reason & floor_refusal;
     bool main_family = false;
+    common_cache_family_binding cache_family;
     bool debug_observability = false;
     void * raw_owner = nullptr;
     checkpoint_drop_fn raw_drop = nullptr;

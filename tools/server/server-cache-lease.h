@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -201,10 +202,60 @@ public:
     virtual uint64_t now_ns() noexcept = 0;
 };
 
+// A hard lease owns this move-only lifetime proof. The payload is deliberately
+// type-erased here: retention and F catalogs remain the concrete content
+// owners, while the one lease table owns only a shared lifetime pin.
+class server_cache_durable_fallback_proof {
+public:
+    server_cache_durable_fallback_proof() = default;
+    ~server_cache_durable_fallback_proof() = default;
+    server_cache_durable_fallback_proof(
+        server_cache_durable_fallback_proof &&) noexcept = default;
+    server_cache_durable_fallback_proof & operator=(
+        server_cache_durable_fallback_proof &&) noexcept = default;
+
+    server_cache_durable_fallback_proof(
+        const server_cache_durable_fallback_proof &) = delete;
+    server_cache_durable_fallback_proof & operator=(
+        const server_cache_durable_fallback_proof &) = delete;
+
+    server_cache_lease_fallback_state state() const noexcept { return state_; }
+    bool available() const noexcept {
+        return state_ == server_cache_lease_fallback_state::available &&
+               owner_ != nullptr;
+    }
+
+private:
+    friend class server_cache_lease_table;
+    friend server_cache_durable_fallback_proof
+        server_cache_durable_fallback_proof_for_test(
+            server_cache_lease_fallback_state,
+            std::shared_ptr<void>) noexcept;
+    server_cache_durable_fallback_proof(
+            server_cache_lease_fallback_state state,
+            std::shared_ptr<void> owner) noexcept :
+        state_(state), owner_(std::move(owner)) {
+    }
+    server_cache_durable_fallback_proof retain() const noexcept {
+        return { state_, owner_ };
+    }
+
+    server_cache_lease_fallback_state state_ =
+        server_cache_lease_fallback_state::unavailable;
+    std::shared_ptr<void> owner_;
+};
+
+// Private test door used to verify proof lifetime without granting production
+// code a proof minting surface. Contract scans forbid production call sites.
+server_cache_durable_fallback_proof
+server_cache_durable_fallback_proof_for_test(
+    server_cache_lease_fallback_state state,
+    std::shared_ptr<void> owner) noexcept;
+
 class server_cache_lease_fallback_provider {
 public:
     virtual ~server_cache_lease_fallback_provider() = default;
-    virtual server_cache_lease_fallback_state preflight(
+    virtual server_cache_durable_fallback_proof acquire(
         const server_cache_lease_subject & subject,
         const server_cache_lease_identity & identity) noexcept = 0;
 };
@@ -277,7 +328,10 @@ private:
         uint64_t expires_at_ns = 0;
         uint64_t ttl_ns = 0;
         uint64_t last_event_ordinal = 0;
+        server_cache_durable_fallback_proof fallback_proof;
     };
+
+    static entry clone_core(const entry & source) noexcept;
 
     uint64_t sample_now() noexcept;
     void mark_table_unavailable() noexcept;
@@ -299,7 +353,8 @@ private:
         uint64_t now,
         uint64_t deadline,
         uint64_t ttl_ns,
-        server_cache_lease_event_kind kind) noexcept;
+        server_cache_lease_event_kind kind,
+        server_cache_durable_fallback_proof proof = {}) noexcept;
     bool add_entry(entry && value, server_cache_lease_event_kind kind,
                    server_cache_lease_id source = {}) noexcept;
     void invalidate_entry(size_t index, server_cache_lease_event_kind kind) noexcept;

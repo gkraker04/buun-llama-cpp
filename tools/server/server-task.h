@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "common-cache-family.h"
 #include "common-cache-plan.h" // B0 shadow observer row + C0 ledger types [P2]
 #include "llama.h"
 #include "server-cache-lifecycle.h"
@@ -158,6 +159,10 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+
+    // Optional E1 declared-family policy input. E1.0 constructs no binding;
+    // the invalid/default value preserves all automatic family behavior.
+    common_cache_family_binding cache_family;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -758,6 +763,7 @@ struct server_prompt_cache_state {
     // receives the provisional D-A3 retention weight; child-task saves do not.
     // E1 declared identity replaces this heuristic rather than stacking with it.
     bool main_family = false;
+    common_cache_family_binding cache_family;
 
     std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
         return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };

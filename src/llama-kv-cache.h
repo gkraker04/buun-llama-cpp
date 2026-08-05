@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 #include "llama-vbr-generation.h"
+#include "llama-vbr-hard-seal.h"
 #include "llama-vbr-downward.h"
 #include "llama-vbr-policy.h"
 #include "llama-vbr-transaction.h"
@@ -42,14 +43,6 @@ struct vbr_artifact_stream_placement;
 //
 // llama_kv_cache
 //
-
-// Dynamic VBR (S3): one step of the measured decode-time degrade price order —
-// knock (layer il, K/V side) down to `tier` (a vbr_tier index, see llama-kv-cache.cpp).
-struct vbr_degrade_step {
-    uint8_t il;
-    uint8_t is_v;
-    uint8_t tier;
-};
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -315,6 +308,11 @@ public:
     };
     vbr_floor_sim_result vbr_floor_sim(double floor_bpv, bool pooled_only,
             ggml_type entry_k = GGML_TYPE_COUNT, ggml_type entry_v = GGML_TYPE_COUNT) const;
+
+    // E1.0 read-only policy classification. Enforcement remains an E1.1c
+    // controller concern; this hook cannot change controller decisions.
+    bool vbr_hard_seal_classify(
+        vbr_hard_seal_classification & out) const noexcept;
 
     bool get_has_shift() const;
 

@@ -3164,7 +3164,8 @@ bool host_trade_price(
         }
 
         uint32_t additional_weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
-        if (authority.host_retention_weight) {
+        if (common_cache_family_allows_additional_weight(
+                victim->cache_family) && authority.host_retention_weight) {
             if (!authority.host_retention_weight(
                     authority.host_retention_weight_context,
                     *victim, additional_weight) ||

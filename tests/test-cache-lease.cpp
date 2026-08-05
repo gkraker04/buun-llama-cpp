@@ -1,4 +1,5 @@
 #include "server-cache-lease.h"
+#include "common-cache-family.h"
 #include "common.h"
 
 #include <cstdio>
@@ -31,12 +32,13 @@ public:
     server_cache_lease_fallback_state state =
         server_cache_lease_fallback_state::unavailable;
     uint64_t calls = 0;
+    std::shared_ptr<void> owner = std::make_shared<int>(1);
 
-    server_cache_lease_fallback_state preflight(
+    server_cache_durable_fallback_proof acquire(
             const server_cache_lease_subject &,
             const server_cache_lease_identity &) noexcept override {
         calls++;
-        return state;
+        return server_cache_durable_fallback_proof_for_test(state, owner);
     }
 };
 
@@ -69,6 +71,10 @@ static server_cache_destruction_request direct_request(
 }
 
 static void test_closed_scope_types() {
+    static_assert(!std::is_copy_constructible<
+                      server_cache_durable_fallback_proof>::value, "");
+    static_assert(std::is_move_constructible<
+                      server_cache_durable_fallback_proof>::value, "");
     static_assert(!std::is_same<server_cache_process_scope_id,
                                server_cache_session_scope_id>::value, "");
     static_assert(!std::is_same<server_cache_process_scope_id,
@@ -148,6 +154,49 @@ static void test_closed_scope_types() {
     };
     CHECK(mirrored.valid());
     CHECK(mirrored == expected);
+}
+
+static void test_declared_family_replaces_automatic_weight() {
+    const common_cache_family_binding absent;
+    CHECK(common_cache_family_main_family(absent, true));
+    CHECK(!common_cache_family_main_family(absent, false));
+    CHECK(common_cache_family_allows_additional_weight(absent));
+
+    const common_cache_family_binding declared_main {
+        { 71 }, common_cache_family_role::main,
+    };
+    const common_cache_family_binding declared_branch {
+        { 71 }, common_cache_family_role::branch,
+    };
+    CHECK(common_cache_family_main_family(declared_main, false));
+    CHECK(!common_cache_family_main_family(declared_branch, true));
+    CHECK(!common_cache_family_allows_additional_weight(declared_main));
+    CHECK(!common_cache_family_allows_additional_weight(declared_branch));
+}
+
+static void test_hard_proof_lifetime_across_clone() {
+    fake_clock clock;
+    fake_fallback fallback;
+    fallback.state = server_cache_lease_fallback_state::available;
+    std::weak_ptr<void> lifetime = fallback.owner;
+    server_cache_lease_table table(&clock, &fallback);
+    const auto source = subject(901);
+    const auto destination = subject(
+        902, common_retention_artifact_kind::host_entry, -1);
+    const auto lease = table.grant_hard(
+        source, context_scope(), identity(), 100);
+    CHECK(lease);
+    fallback.owner.reset();
+    CHECK(!lifetime.expired());
+    CHECK(table.artifact_cloned(source, destination, identity()));
+    table.artifact_retired(source.artifact);
+    CHECK(!lifetime.expired());
+    table.artifact_retired(destination.artifact);
+    CHECK(lifetime.expired());
+
+    auto invalid = server_cache_durable_fallback_proof_for_test(
+        server_cache_lease_fallback_state::available, {});
+    CHECK(!invalid.available());
 }
 
 static void test_soft_renew_expire_release() {
@@ -470,6 +519,7 @@ static void test_lifecycle_without_debug_consults_lease() {
 
 int main() {
     test_closed_scope_types();
+    test_declared_family_replaces_automatic_weight();
     test_soft_renew_expire_release();
     test_checked_deadline();
     test_hard_preflight_and_admission();
@@ -478,6 +528,7 @@ int main() {
     test_replay_and_ring_overflow();
     test_observer_off_zero_work();
     test_lifecycle_without_debug_consults_lease();
+    test_hard_proof_lifetime_across_clone();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d cache-lease test(s) failed\n", failures);

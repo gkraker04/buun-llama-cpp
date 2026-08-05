@@ -1,5 +1,7 @@
 #include "llama-vbr-artifact.h"
 #include "llama-vbr-artifact-catalog.h"
+#include "server-cache-lease.h"
+#include "server-cache-vbr-proof.h"
 #include "llama-vbr-artifact-stage.h"
 #include "llama-vbr-artifact-validate.h"
 #include "llama-sha256.h"
@@ -1995,6 +1997,14 @@ static void test_catalog_package_lease_and_reference_placement() {
     CHECK(second_view.manifest().stream_placements[0].cells[1].physical_cell == 2);
     CHECK(first_view.units()[0].unit_version_id ==
           second_view.units()[0].unit_version_id);
+    auto fallback_proof = server_cache_vbr_fallback_proof_for_test(
+        std::move(first_view));
+    CHECK(fallback_proof.available());
+    CHECK(f.catalog->retire(first.reference_artifact) ==
+          vbr_artifact_retire_status::busy);
+    fallback_proof = {};
+    CHECK(f.catalog->resolve_reference(first.reference_artifact, first_view) ==
+          vbr_artifact_resolve_status::ok);
     const auto live_before_busy = f.ledger.snapshot().live_ops;
     CHECK(f.catalog->retire(first.reference_artifact) ==
           vbr_artifact_retire_status::busy);
