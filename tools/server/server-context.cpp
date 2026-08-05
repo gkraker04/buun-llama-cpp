@@ -633,27 +633,52 @@ struct server_slot {
         return res;
     }
 
+    using checkpoint_iterator = std::list<common_prompt_checkpoint>::iterator;
+
+    static checkpoint_iterator checkpoint_drop_authority_adapter(
+            void * owner,
+            checkpoint_iterator first,
+            checkpoint_iterator last) {
+        return static_cast<server_slot *>(owner)->
+            server_cache_checkpoint_drop_impl(first, last);
+    }
+
+    server_cache_checkpoint_authority_context checkpoint_authority_context() noexcept {
+        return {
+            id,
+            prompt.checkpoints,
+            lifecycle_authority,
+            retention_obs,
+            destruction_obs,
+            lease_obs,
+            checkpoint_attempts,
+            checkpoint_seam_heuristic,
+            checkpoint_thinning_refusal,
+            checkpoint_floor_refusal,
+            task && !task->is_child(),
+            cache_debug_observability,
+            this,
+            checkpoint_drop_authority_adapter,
+        };
+    }
+
     void checkpoint_ring_changed() noexcept {
-        checkpoint_attempts.ring_changed();
-        checkpoint_seam_heuristic = nullptr;
-        checkpoint_thinning_refusal =
-            common_cache_plan_destruction_reason::none;
-        checkpoint_floor_refusal =
-            common_cache_plan_destruction_reason::mandatory_anchor;
+        auto context = checkpoint_authority_context();
+        server_cache_checkpoint_ring_changed(context);
     }
 
     bool checkpoint_thinning_attempt_begin(bool capacity_mode) noexcept {
-        return checkpoint_attempts.begin(
-            capacity_mode
-                ? server_cache_checkpoint_attempt_lane::capacity_thinning
-                : server_cache_checkpoint_attempt_lane::optional_thinning);
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_thinning_attempt_begin(
+            context, capacity_mode);
     }
 
     bool checkpoint_refusal_state_changed(
             common_cache_plan_destruction_reason reason,
             bool publication_skip = false) noexcept {
-        return checkpoint_attempts.refusal_changed(
-            reason, publication_skip);
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_refusal_state_changed(
+            context, reason, publication_skip);
     }
 
     void server_cache_slot_drop_impl(bool retire_retention = true) {
@@ -884,8 +909,6 @@ struct server_slot {
         prompt.tokens.insert(retained_tokens);
     }
 
-    using checkpoint_iterator = std::list<common_prompt_checkpoint>::iterator;
-
     checkpoint_iterator server_cache_checkpoint_drop_impl(
             checkpoint_iterator first,
             checkpoint_iterator last) {
@@ -910,16 +933,9 @@ struct server_slot {
 
     server_cache_destruction_admission observe_checkpoint_drop(
             server_cache_destruction_reason reason,
-            llama_cache_acct_artifact_id artifact = {}) const {
-        server_cache_destruction_request request;
-        request.cls = server_cache_destruction_class::checkpoint_drop;
-        request.reason = reason;
-        request.add_target(
-            server_cache_destruction_target_kind::checkpoint_ring,
-            id, artifact);
-        request.add_yield(
-            llama_cache_acct_category::checkpoint_state_payload);
-        return server_cache_retention_admit(destruction_obs, request);
+            llama_cache_acct_artifact_id artifact = {}) {
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_observe_drop(context, reason, artifact);
     }
 
     checkpoint_iterator checkpoint_drop(
@@ -940,407 +956,16 @@ struct server_slot {
         return checkpoint_drop_joined_impl(first, last);
     }
 
-    bool checkpoint_destruction_artifact(
-            checkpoint_iterator checkpoint,
-            server_cache_destruction_artifact & out) const noexcept {
-        out = {};
-        try {
-            if (!retention_obs || !lease_obs ||
-                checkpoint == prompt.checkpoints.end()) {
-                return false;
-            }
-            const auto key = server_retention_instance_key::for_checkpoint(
-                id, &*checkpoint);
-            server_retention_checkpoint_inventory inventory;
-            server_retention_candidate catalog;
-            if (!retention_obs->checkpoint_inventory(key, inventory) ||
-                !inventory.identity_known || !inventory.release_owned ||
-                !retention_obs->candidate_for_instance(key, catalog) ||
-                catalog.artifact_id.v == 0 ||
-                catalog.record.kind !=
-                    common_retention_artifact_kind::checkpoint ||
-                catalog.release_ops.empty()) {
-                return false;
-            }
-            out.candidate.artifact_id = catalog.artifact_id;
-            out.candidate.record = catalog.record;
-            out.candidate.availability = catalog.avail;
-            out.candidate.release_ops = catalog.release_ops;
-            out.candidate.identity_known = true;
-            out.candidate.lease = inventory.lease;
-            out.kind = common_retention_artifact_kind::checkpoint;
-            out.owner_slot = id;
-            out.pool = catalog.record.stamp.pool;
-            out.mandatory_anchor =
-                catalog.record.stamp.mandatory_anchor;
-            return true;
-        } catch (...) {
-            out = {};
-            return false;
-        }
-    }
-
-    void emit_checkpoint_destruction(
-            const common_cache_plan_destruction_receipt & receipt,
-            uint64_t projected_bytes,
-            uint64_t price_us,
-            uint32_t weight_milli,
-            uint32_t ordinal) const noexcept {
-        if (!cache_debug_observability) {
-            return;
-        }
-        try {
-            json payload = server_cache_destruction_receipt_json(
-                receipt, projected_bytes, "checkpoint_drop");
-            payload["price_us"] = price_us;
-            payload["retention_weight_milli"] = weight_milli;
-            payload["rank_ordinal"] = ordinal;
-            SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
-                    payload.dump().c_str());
-        } catch (...) {
-            // Debug evidence must never perturb checkpoint ownership.
-        }
-    }
-
-    bool checkpoint_drop_certified(
-            checkpoint_iterator victim,
-            checkpoint_iterator recovery,
-            server_cache_destruction_reason reason,
-            uint64_t price_us,
-            uint32_t weight_milli,
-            uint32_t ordinal,
-            checkpoint_iterator & next) noexcept {
-        if (!lifecycle_authority || !retention_obs || !destruction_obs ||
-            victim == prompt.checkpoints.end() ||
-            recovery == prompt.checkpoints.end() || victim == recovery) {
-            return false;
-        }
-        auto & authority = *lifecycle_authority;
-        const uint64_t sequence = ++authority.destruction_quote_sequence;
-        const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
-                                common_cache_plan_destruction_reason why) {
-            checkpoint_thinning_refusal = why;
-            if (!checkpoint_refusal_state_changed(why)) {
-                return;
-            }
-            common_cache_plan_destruction_receipt receipt = existing
-                ? std::move(*existing)
-                : common_cache_plan_destruction_receipt{};
-            receipt.state = common_cache_plan_destruction_state::refused;
-            receipt.reason = why;
-            receipt.effects = common_cache_plan_destruction_effect_bit(
-                common_cache_plan_destruction_effect::checkpoint_member_drop);
-            receipt.admission_sequence = sequence;
-            authority.observe_host_destruction(receipt, true);
-            destruction_obs->note_checkpoint_thin_refused();
-            emit_checkpoint_destruction(
-                receipt, 0, price_us, weight_milli, ordinal);
-        };
-
-        server_cache_destruction_artifact victim_artifact;
-        server_cache_destruction_artifact recovery_artifact;
-        if (!checkpoint_destruction_artifact(
-                victim, victim_artifact) ||
-            !checkpoint_destruction_artifact(
-                recovery, recovery_artifact)) {
-            refuse(nullptr,
-                   common_cache_plan_destruction_reason::manifest_incomplete);
-            return false;
-        }
-        const auto recovery_key =
-            server_retention_instance_key::for_checkpoint(id, &*recovery);
-        auto pin = retention_obs->acquire_recovery_pin(recovery_key);
-        if (!pin.valid() || !pin.binds_exact(
-                recovery_artifact.candidate.artifact_id,
-                recovery_artifact.candidate.release_ops)) {
-            refuse(nullptr,
-                   common_cache_plan_destruction_reason::recovery_unavailable);
-            return false;
-        }
-
-        const auto preview = [&](const auto & ops, uint64_t serial,
-                                 auto & released) {
-            return authority.ledger.preview_release_set(
-                ops, serial, released);
-        };
-        const auto project = [&](const auto & released, auto & domains) {
-            return authority.project_release(released, domains);
-        };
-        const auto snapshot = authority.ledger.snapshot();
-        auto quote = server_cache_destruction_quote_single_artifact(
-            victim_artifact,
-            common_cache_plan_destruction_effect_bit(
-                common_cache_plan_destruction_effect::checkpoint_member_drop),
-            snapshot.serial, sequence,
-            preview, project);
-        if (quote.receipt.state !=
-                common_cache_plan_destruction_state::quoted) {
-            const auto why = quote.receipt.reason;
-            refuse(&quote.receipt, why);
-            return false;
-        }
-        authority.observe_host_destruction(quote.receipt, false);
-        std::vector<server_cache_destruction_artifact> current;
-        try {
-            current.push_back(std::move(victim_artifact));
-        } catch (...) {
-            refuse(&quote.receipt,
-                   common_cache_plan_destruction_reason::internal_fault);
-            return false;
-        }
-        const auto fresh = authority.ledger.snapshot();
-        auto prepared = server_cache_prepare_release_set(
-            quote, current, authority.ledger, fresh.serial,
-            project, std::move(pin));
-        if (prepared.status !=
-                server_cache_prepare_release_status::prepared) {
-            refuse(&quote.receipt, prepared.reason);
-            return false;
-        }
-        uint64_t projected_bytes = 0;
-        for (const auto & row : quote.projected_domains) {
-            if (row.projected_release_bytes.state !=
-                    llama_cache_acct_known::known ||
-                row.projected_release_bytes.value >
-                    std::numeric_limits<uint64_t>::max() - projected_bytes) {
-                refuse(&quote.receipt,
-                       common_cache_plan_destruction_reason::
-                           accounting_unavailable);
-                return false;
-            }
-            projected_bytes += row.projected_release_bytes.value;
-        }
-        quote.receipt.displaced_fate =
-            common_cache_plan_displaced_fate::exact_replay_recipe;
-        quote.receipt.recovery_citation =
-            common_cache_plan_recovery_citation::resolved;
-        quote.receipt.recovery_source_artifact_id =
-            recovery_artifact.candidate.artifact_id;
-        quote.receipt.recovery_source_manifest_digest =
-            server_cache_destruction_recovery_source_digest(
-                recovery_artifact.candidate.artifact_id,
-                recovery_artifact.candidate.release_ops);
-        quote.receipt.state =
-            common_cache_plan_destruction_state::certified;
-        authority.observe_host_destruction(quote.receipt, true);
-        emit_checkpoint_destruction(
-            quote.receipt, projected_bytes,
-            price_us, weight_milli, ordinal);
-
-        const auto victim_key =
-            server_retention_instance_key::for_checkpoint(id, &*victim);
-        const auto admission = observe_checkpoint_drop(
-            reason, current.front().candidate.artifact_id);
-        const std::thread::id scheduler_owner = std::this_thread::get_id();
-        next = server_cache_checkpoint_drop_impl(
-            victim, std::next(victim));
-        // The list-node destructor only frees checkpoint-owned vectors and
-        // shadow metadata. It has no callback and cannot write C. The owner
-        // thread therefore reaches the single-shot capability commit with no
-        // interleaving ledger producer between physical mutation and release.
-        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
-        server_cache_recovery_pin retained_pin;
-        const auto committed = prepared.capability.commit(retained_pin);
-        GGML_ASSERT(committed ==
-                    common_cache_plan_destruction_reason::none);
-        retention_obs->retire_after_committed_release(victim_key);
-        quote.receipt.state =
-            common_cache_plan_destruction_state::executed;
-        quote.receipt.actual_accounting_serial =
-            authority.ledger.snapshot().serial;
-        authority.observe_host_destruction(quote.receipt, false);
-        emit_checkpoint_destruction(
-            quote.receipt, projected_bytes,
-            price_us, weight_milli, ordinal);
-        destruction_obs->note_checkpoint_thin_executed(
-            admission.sequence, projected_bytes);
-        return true;
-    }
-
     bool checkpoint_thin_priced(
             int checkpoint_task_id,
             uint64_t max_replay_tokens,
             const common_prompt_checkpoint * seam_heuristic,
             bool capacity_mode,
             bool attempt_claimed = false) noexcept {
-        if (!lifecycle_authority || !retention_obs || !lease_obs ||
-            prompt.checkpoints.size() < 2) {
-            return false;
-        }
-        if (!attempt_claimed &&
-            !checkpoint_thinning_attempt_begin(capacity_mode)) {
-            return false;
-        }
-        checkpoint_thinning_refusal =
-            common_cache_plan_destruction_reason::none;
-        lease_obs->lifecycle_point();
-        struct local_candidate {
-            checkpoint_iterator victim;
-            checkpoint_iterator recovery;
-            server_cache_checkpoint_trade_input price;
-        };
-        struct member_inventory {
-            checkpoint_iterator member;
-            server_retention_checkpoint_inventory catalog;
-            bool found = false;
-        };
-        std::vector<local_candidate> local;
-        std::vector<server_cache_checkpoint_trade_input> prices;
-        try {
-            local.reserve(prompt.checkpoints.size());
-            prices.reserve(prompt.checkpoints.size());
-            std::vector<member_inventory> inventory;
-            inventory.reserve(prompt.checkpoints.size());
-            for (auto it = prompt.checkpoints.begin();
-                 it != prompt.checkpoints.end(); ++it) {
-                member_inventory member;
-                member.member = it;
-                member.found = retention_obs->checkpoint_inventory(
-                    server_retention_instance_key::for_checkpoint(id, &*it),
-                    member.catalog);
-                inventory.push_back(std::move(member));
-            }
-
-            size_t previous_index = 0;
-            for (size_t index = 1; index < inventory.size(); ++index) {
-                auto it = inventory[index].member;
-                auto previous = inventory[previous_index].member;
-                const bool close = it->n_tokens >= previous->n_tokens &&
-                    uint64_t(it->n_tokens - previous->n_tokens) <=
-                        max_replay_tokens;
-                if ((!capacity_mode && !close) ||
-                    it->id_task == checkpoint_task_id) {
-                    previous_index = index;
-                    continue;
-                }
-
-                local_candidate candidate;
-                candidate.victim = it;
-                candidate.recovery = previous;
-                candidate.price.ordinal = uint32_t(index);
-                candidate.price.recovery_ordinal =
-                    uint32_t(previous_index);
-                candidate.price.payload_bytes = it->size();
-                candidate.price.replay_tokens =
-                    it->n_tokens >= previous->n_tokens
-                        ? uint64_t(it->n_tokens - previous->n_tokens)
-                        : UINT64_MAX;
-                candidate.price.seam_heuristic_protected =
-                    seam_heuristic == &*it;
-                const bool same_replay_lineage =
-                    server_cache_checkpoint_bounded_replay(
-                        *previous, *it, max_replay_tokens);
-                candidate.price.recovery_available =
-                    same_replay_lineage &&
-                    inventory[previous_index].found &&
-                    inventory[previous_index].catalog.identity_known &&
-                    inventory[previous_index].catalog.release_owned;
-                const auto & victim_catalog = inventory[index].catalog;
-                if (inventory[index].found &&
-                    victim_catalog.identity_known &&
-                    victim_catalog.release_owned) {
-                    candidate.price.artifact =
-                        victim_catalog.artifact_id;
-                    candidate.price.stable_id =
-                        victim_catalog.stable_id;
-                    candidate.price.identity_known = true;
-                    candidate.price.mandatory_anchor =
-                        victim_catalog.mandatory_anchor;
-                    candidate.price.hard_leased = server_cache_lease_is_hard(
-                        victim_catalog.lease);
-                    uint32_t weight = 0;
-                    GGML_ASSERT(server_cache_retention_weight_milli(
-                        victim_catalog.lease.cls ==
-                            server_cache_lease_class::soft,
-                        task && !task->is_child(),
-                        SERVER_CACHE_HOST_WEIGHT_SCALE, weight));
-                    candidate.price.weight_milli = weight;
-                }
-                local.push_back(std::move(candidate));
-                prices.push_back(local.back().price);
-                if (!close) {
-                    previous_index = index;
-                }
-            }
-        } catch (...) {
-            return false;
-        }
-        if (local.empty()) {
-            return false;
-        }
-
-        const auto * calib = common_cache_plan_calib_find(
-            lifecycle_authority->calibration_profile);
-        while (!local.empty()) {
-            const auto plan = server_cache_plan_checkpoint_thinning(
-                prices, calib);
-            if (!plan.selected) {
-                checkpoint_thinning_refusal = plan.reason;
-                if (!checkpoint_refusal_state_changed(plan.reason)) {
-                    return false;
-                }
-                common_cache_plan_destruction_receipt receipt;
-                receipt.state = common_cache_plan_destruction_state::refused;
-                receipt.reason = plan.reason;
-                receipt.effects = common_cache_plan_destruction_effect_bit(
-                    common_cache_plan_destruction_effect::
-                        checkpoint_member_drop);
-                receipt.admission_sequence =
-                    ++lifecycle_authority->destruction_quote_sequence;
-                lifecycle_authority->observe_host_destruction(receipt, true);
-                if (destruction_obs) {
-                    destruction_obs->note_checkpoint_thin_refused();
-                    if (plan.protection !=
-                            server_cache_checkpoint_protection::none) {
-                        switch (plan.protection) {
-                            case server_cache_checkpoint_protection::
-                                     seam_heuristic:
-                                destruction_obs->
-                                    note_checkpoint_thin_heuristic_refused();
-                                break;
-                            case server_cache_checkpoint_protection::
-                                     mandatory_anchor:
-                                destruction_obs->
-                                    note_checkpoint_thin_mandatory_refused();
-                                break;
-                            case server_cache_checkpoint_protection::
-                                     hard_lease:
-                                destruction_obs->
-                                    note_checkpoint_thin_hard_lease_refused();
-                                break;
-                            case server_cache_checkpoint_protection::none:
-                            case server_cache_checkpoint_protection::_count:
-                                break;
-                        }
-                    }
-                }
-                emit_checkpoint_destruction(
-                    receipt, 0, 0,
-                    SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
-                return false;
-            }
-            const auto chosen = std::find_if(
-                local.begin(), local.end(), [&](const auto & candidate) {
-                    return candidate.price.ordinal == plan.ordinal;
-                });
-            if (chosen == local.end()) {
-                return false;
-            }
-            const auto chosen_index = size_t(chosen - local.begin());
-            checkpoint_iterator next;
-            if (checkpoint_drop_certified(
-                    chosen->victim, chosen->recovery,
-                    capacity_mode
-                        ? server_cache_destruction_reason::checkpoint_capacity
-                        : server_cache_destruction_reason::checkpoint_thin,
-                    plan.price_us, plan.weight_milli,
-                    plan.ordinal, next)) {
-                return true;
-            }
-            local.erase(chosen);
-            prices.erase(prices.begin() + chosen_index);
-        }
-        return false;
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_thin_priced(
+            context, checkpoint_task_id, max_replay_tokens,
+            seam_heuristic, capacity_mode, attempt_claimed);
     }
 
     bool checkpoint_capacity_floor(
@@ -1348,90 +973,15 @@ struct server_slot {
             const common_prompt_checkpoint * seam_heuristic,
             checkpoint_iterator & victim,
             common_cache_plan_destruction_reason & refusal) noexcept {
-        victim = prompt.checkpoints.end();
-        refusal = checkpoint_floor_refusal;
-        if (!checkpoint_attempts.begin(
-                server_cache_checkpoint_attempt_lane::capacity_floor)) {
-            return false;
-        }
-        refusal = common_cache_plan_destruction_reason::mandatory_anchor;
-        if (lease_obs) {
-            lease_obs->lifecycle_point();
-        }
-        std::vector<server_cache_checkpoint_floor_input> inputs;
-        std::vector<checkpoint_iterator> members;
-        try {
-            inputs.reserve(prompt.checkpoints.size());
-            members.reserve(prompt.checkpoints.size());
-            uint32_t ordinal = 0;
-            for (auto it = prompt.checkpoints.begin();
-                 it != prompt.checkpoints.end(); ++it, ++ordinal) {
-                server_cache_checkpoint_floor_input input;
-                input.ordinal = ordinal;
-                const auto key =
-                    server_retention_instance_key::for_checkpoint(id, &*it);
-                server_retention_checkpoint_inventory catalog;
-                const bool catalog_found = retention_obs &&
-                    retention_obs->checkpoint_inventory(key, catalog);
-                input.recovery_pinned = catalog_found &&
-                    catalog.recovery_pinned;
-                if (it->id_task == checkpoint_task_id ||
-                    input.recovery_pinned) {
-                    input.protection =
-                        server_cache_checkpoint_protection::mandatory_anchor;
-                } else if (seam_heuristic == &*it) {
-                    input.protection =
-                        server_cache_checkpoint_protection::seam_heuristic;
-                }
-                if (catalog_found) {
-                    if (catalog.mandatory_anchor) {
-                        input.protection =
-                            server_cache_checkpoint_protection::
-                                mandatory_anchor;
-                    }
-                    if (catalog.identity_known &&
-                        server_cache_lease_is_hard(catalog.lease)) {
-                        input.protection =
-                            server_cache_checkpoint_protection::hard_lease;
-                    }
-                }
-                inputs.push_back(input);
-                members.push_back(it);
-            }
-        } catch (...) {
-            refusal = common_cache_plan_destruction_reason::internal_fault;
-            checkpoint_floor_refusal = refusal;
-            return false;
-        }
-        const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
-        refusal = plan.reason;
-        checkpoint_floor_refusal = refusal;
-        if (!plan.selected || plan.ordinal >= members.size()) {
-            return false;
-        }
-        victim = members[plan.ordinal];
-        return true;
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_capacity_floor(
+            context, checkpoint_task_id, seam_heuristic, victim, refusal);
     }
 
     void checkpoint_publication_skipped(
             common_cache_plan_destruction_reason reason) noexcept {
-        if (!lifecycle_authority ||
-            !checkpoint_refusal_state_changed(reason, true)) {
-            return;
-        }
-        common_cache_plan_destruction_receipt receipt;
-        receipt.state = common_cache_plan_destruction_state::refused;
-        receipt.reason = reason;
-        receipt.effects = common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::checkpoint_member_drop);
-        receipt.admission_sequence =
-            ++lifecycle_authority->destruction_quote_sequence;
-        lifecycle_authority->observe_host_destruction(receipt, true);
-        if (destruction_obs) {
-            destruction_obs->note_checkpoint_publication_skip();
-        }
-        emit_checkpoint_destruction(
-            receipt, 0, 0, SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+        auto context = checkpoint_authority_context();
+        server_cache_checkpoint_publication_skipped(context, reason);
     }
 
     void server_cache_token_ledger_truncate_impl(size_t n_tokens) {

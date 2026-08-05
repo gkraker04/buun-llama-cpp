@@ -2143,6 +2143,556 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry(
     return destroy_entry_impl(it, reason, states.end());
 }
 
+using server_cache_checkpoint_iterator =
+    server_cache_checkpoint_authority_context::checkpoint_iterator;
+
+void server_cache_checkpoint_ring_changed(
+        server_cache_checkpoint_authority_context & context) noexcept {
+    context.attempts.ring_changed();
+    context.seam_heuristic = nullptr;
+    context.thinning_refusal =
+        common_cache_plan_destruction_reason::none;
+    context.floor_refusal =
+        common_cache_plan_destruction_reason::mandatory_anchor;
+}
+
+bool server_cache_checkpoint_thinning_attempt_begin(
+        server_cache_checkpoint_authority_context & context,
+        bool capacity_mode) noexcept {
+    return context.attempts.begin(
+        capacity_mode
+            ? server_cache_checkpoint_attempt_lane::capacity_thinning
+            : server_cache_checkpoint_attempt_lane::optional_thinning);
+}
+
+bool server_cache_checkpoint_refusal_state_changed(
+        server_cache_checkpoint_authority_context & context,
+        common_cache_plan_destruction_reason reason,
+        bool publication_skip) noexcept {
+    return context.attempts.refusal_changed(reason, publication_skip);
+}
+
+server_cache_destruction_admission server_cache_checkpoint_observe_drop(
+        const server_cache_checkpoint_authority_context & context,
+        server_cache_destruction_reason reason,
+        llama_cache_acct_artifact_id artifact) noexcept {
+    server_cache_destruction_request request;
+    request.cls = server_cache_destruction_class::checkpoint_drop;
+    request.reason = reason;
+    request.add_target(
+        server_cache_destruction_target_kind::checkpoint_ring,
+        context.slot_id, artifact);
+    request.add_yield(
+        llama_cache_acct_category::checkpoint_state_payload);
+    return server_cache_retention_admit(context.destruction, request);
+}
+
+namespace {
+
+bool build_checkpoint_destruction_artifact(
+        const server_cache_checkpoint_authority_context & context,
+        server_cache_checkpoint_iterator checkpoint,
+        server_cache_destruction_artifact & out) noexcept {
+    out = {};
+    try {
+        if (!context.retention || !context.leases ||
+            checkpoint == context.checkpoints.end()) {
+            return false;
+        }
+        const auto key = server_retention_instance_key::for_checkpoint(
+            context.slot_id, &*checkpoint);
+        server_retention_checkpoint_inventory inventory;
+        server_retention_candidate catalog;
+        if (!context.retention->checkpoint_inventory(key, inventory) ||
+            !inventory.identity_known || !inventory.release_owned ||
+            !context.retention->candidate_for_instance(key, catalog) ||
+            catalog.artifact_id.v == 0 ||
+            catalog.record.kind !=
+                common_retention_artifact_kind::checkpoint ||
+            catalog.release_ops.empty()) {
+            return false;
+        }
+        out.candidate.artifact_id = catalog.artifact_id;
+        out.candidate.record = catalog.record;
+        out.candidate.availability = catalog.avail;
+        out.candidate.release_ops = catalog.release_ops;
+        out.candidate.identity_known = true;
+        out.candidate.lease = inventory.lease;
+        out.kind = common_retention_artifact_kind::checkpoint;
+        out.owner_slot = context.slot_id;
+        out.pool = catalog.record.stamp.pool;
+        out.mandatory_anchor =
+            catalog.record.stamp.mandatory_anchor;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+void emit_checkpoint_destruction(
+        const server_cache_checkpoint_authority_context & context,
+        const common_cache_plan_destruction_receipt & receipt,
+        uint64_t projected_bytes,
+        uint64_t price_us,
+        uint32_t weight_milli,
+        uint32_t ordinal) noexcept {
+    if (!context.debug_observability) {
+        return;
+    }
+    try {
+        json payload = server_cache_destruction_receipt_json(
+            receipt, projected_bytes, "checkpoint_drop");
+        payload["price_us"] = price_us;
+        payload["retention_weight_milli"] = weight_milli;
+        payload["rank_ordinal"] = ordinal;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
+                payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb checkpoint ownership.
+    }
+}
+
+bool checkpoint_drop_certified(
+        server_cache_checkpoint_authority_context & context,
+        server_cache_checkpoint_iterator victim,
+        server_cache_checkpoint_iterator recovery,
+        server_cache_destruction_reason reason,
+        uint64_t price_us,
+        uint32_t weight_milli,
+        uint32_t ordinal,
+        server_cache_checkpoint_iterator & next) noexcept {
+    if (!context.authority || !context.retention || !context.destruction ||
+        victim == context.checkpoints.end() ||
+        recovery == context.checkpoints.end() || victim == recovery) {
+        return false;
+    }
+    auto & authority = *context.authority;
+    const uint64_t sequence = ++authority.destruction_quote_sequence;
+    const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
+                            common_cache_plan_destruction_reason why) {
+        context.thinning_refusal = why;
+        if (!server_cache_checkpoint_refusal_state_changed(context, why)) {
+            return;
+        }
+        common_cache_plan_destruction_receipt receipt = existing
+            ? std::move(*existing)
+            : common_cache_plan_destruction_receipt{};
+        receipt.state = common_cache_plan_destruction_state::refused;
+        receipt.reason = why;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop);
+        receipt.admission_sequence = sequence;
+        authority.observe_host_destruction(receipt, true);
+        context.destruction->note_checkpoint_thin_refused();
+        emit_checkpoint_destruction(context,
+            receipt, 0, price_us, weight_milli, ordinal);
+    };
+
+    server_cache_destruction_artifact victim_artifact;
+    server_cache_destruction_artifact recovery_artifact;
+    if (!build_checkpoint_destruction_artifact(context,
+            victim, victim_artifact) ||
+        !build_checkpoint_destruction_artifact(context,
+            recovery, recovery_artifact)) {
+        refuse(nullptr,
+               common_cache_plan_destruction_reason::manifest_incomplete);
+        return false;
+    }
+    const auto recovery_key =
+        server_retention_instance_key::for_checkpoint(context.slot_id, &*recovery);
+    auto pin = context.retention->acquire_recovery_pin(recovery_key);
+    if (!pin.valid() || !pin.binds_exact(
+            recovery_artifact.candidate.artifact_id,
+            recovery_artifact.candidate.release_ops)) {
+        refuse(nullptr,
+               common_cache_plan_destruction_reason::recovery_unavailable);
+        return false;
+    }
+
+    const auto preview = [&](const auto & ops, uint64_t serial,
+                             auto & released) {
+        return authority.ledger.preview_release_set(
+            ops, serial, released);
+    };
+    const auto project = [&](const auto & released, auto & domains) {
+        return authority.project_release(released, domains);
+    };
+    const auto snapshot = authority.ledger.snapshot();
+    auto quote = server_cache_destruction_quote_single_artifact(
+        victim_artifact,
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop),
+        snapshot.serial, sequence,
+        preview, project);
+    if (quote.receipt.state !=
+            common_cache_plan_destruction_state::quoted) {
+        const auto why = quote.receipt.reason;
+        refuse(&quote.receipt, why);
+        return false;
+    }
+    authority.observe_host_destruction(quote.receipt, false);
+    std::vector<server_cache_destruction_artifact> current;
+    try {
+        current.push_back(std::move(victim_artifact));
+    } catch (...) {
+        refuse(&quote.receipt,
+               common_cache_plan_destruction_reason::internal_fault);
+        return false;
+    }
+    const auto fresh = authority.ledger.snapshot();
+    auto prepared = server_cache_prepare_release_set(
+        quote, current, authority.ledger, fresh.serial,
+        project, std::move(pin));
+    if (prepared.status !=
+            server_cache_prepare_release_status::prepared) {
+        refuse(&quote.receipt, prepared.reason);
+        return false;
+    }
+    uint64_t projected_bytes = 0;
+    for (const auto & row : quote.projected_domains) {
+        if (row.projected_release_bytes.state !=
+                llama_cache_acct_known::known ||
+            row.projected_release_bytes.value >
+                std::numeric_limits<uint64_t>::max() - projected_bytes) {
+            refuse(&quote.receipt,
+                   common_cache_plan_destruction_reason::
+                       accounting_unavailable);
+            return false;
+        }
+        projected_bytes += row.projected_release_bytes.value;
+    }
+    quote.receipt.displaced_fate =
+        common_cache_plan_displaced_fate::exact_replay_recipe;
+    quote.receipt.recovery_citation =
+        common_cache_plan_recovery_citation::resolved;
+    quote.receipt.recovery_source_artifact_id =
+        recovery_artifact.candidate.artifact_id;
+    quote.receipt.recovery_source_manifest_digest =
+        server_cache_destruction_recovery_source_digest(
+            recovery_artifact.candidate.artifact_id,
+            recovery_artifact.candidate.release_ops);
+    quote.receipt.state =
+        common_cache_plan_destruction_state::certified;
+    authority.observe_host_destruction(quote.receipt, true);
+    emit_checkpoint_destruction(context,
+        quote.receipt, projected_bytes,
+        price_us, weight_milli, ordinal);
+
+    const auto victim_key =
+        server_retention_instance_key::for_checkpoint(context.slot_id, &*victim);
+    const auto admission = server_cache_checkpoint_observe_drop(context,
+        reason, current.front().candidate.artifact_id);
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+    GGML_ASSERT(context.raw_owner && context.raw_drop);
+    next = context.raw_drop(
+        context.raw_owner, victim, std::next(victim));
+    // The typed raw_drop adapter is pinned to the slot's X-macro _impl door;
+    // that door only advances the ring latch and erases this list node. The
+    // node destructor frees checkpoint-owned vectors and shadow metadata and
+    // cannot write C, so no ledger producer can interleave before commit.
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    server_cache_recovery_pin retained_pin;
+    const auto committed = prepared.capability.commit(retained_pin);
+    GGML_ASSERT(committed ==
+                common_cache_plan_destruction_reason::none);
+    context.retention->retire_after_committed_release(victim_key);
+    quote.receipt.state =
+        common_cache_plan_destruction_state::executed;
+    quote.receipt.actual_accounting_serial =
+        authority.ledger.snapshot().serial;
+    authority.observe_host_destruction(quote.receipt, false);
+    emit_checkpoint_destruction(context,
+        quote.receipt, projected_bytes,
+        price_us, weight_milli, ordinal);
+    context.destruction->note_checkpoint_thin_executed(
+        admission.sequence, projected_bytes);
+    return true;
+}
+
+} // namespace
+
+bool server_cache_checkpoint_thin_priced(
+        server_cache_checkpoint_authority_context & context,
+        int checkpoint_task_id,
+        uint64_t max_replay_tokens,
+        const common_prompt_checkpoint * seam_heuristic,
+        bool capacity_mode,
+        bool attempt_claimed) noexcept {
+    if (!context.authority || !context.retention || !context.leases ||
+        context.checkpoints.size() < 2) {
+        return false;
+    }
+    if (!attempt_claimed &&
+        !server_cache_checkpoint_thinning_attempt_begin(context, capacity_mode)) {
+        return false;
+    }
+    context.thinning_refusal =
+        common_cache_plan_destruction_reason::none;
+    context.leases->lifecycle_point();
+    struct local_candidate {
+        server_cache_checkpoint_iterator victim;
+        server_cache_checkpoint_iterator recovery;
+        server_cache_checkpoint_trade_input price;
+    };
+    struct member_inventory {
+        server_cache_checkpoint_iterator member;
+        server_retention_checkpoint_inventory catalog;
+        bool found = false;
+    };
+    std::vector<local_candidate> local;
+    std::vector<server_cache_checkpoint_trade_input> prices;
+    try {
+        local.reserve(context.checkpoints.size());
+        prices.reserve(context.checkpoints.size());
+        std::vector<member_inventory> inventory;
+        inventory.reserve(context.checkpoints.size());
+        for (auto it = context.checkpoints.begin();
+             it != context.checkpoints.end(); ++it) {
+            member_inventory member;
+            member.member = it;
+            member.found = context.retention->checkpoint_inventory(
+                server_retention_instance_key::for_checkpoint(context.slot_id, &*it),
+                member.catalog);
+            inventory.push_back(std::move(member));
+        }
+
+        size_t previous_index = 0;
+        for (size_t index = 1; index < inventory.size(); ++index) {
+            auto it = inventory[index].member;
+            auto previous = inventory[previous_index].member;
+            const bool close = it->n_tokens >= previous->n_tokens &&
+                uint64_t(it->n_tokens - previous->n_tokens) <=
+                    max_replay_tokens;
+            if ((!capacity_mode && !close) ||
+                it->id_task == checkpoint_task_id) {
+                previous_index = index;
+                continue;
+            }
+
+            local_candidate candidate;
+            candidate.victim = it;
+            candidate.recovery = previous;
+            candidate.price.ordinal = uint32_t(index);
+            candidate.price.recovery_ordinal =
+                uint32_t(previous_index);
+            candidate.price.payload_bytes = it->size();
+            candidate.price.replay_tokens =
+                it->n_tokens >= previous->n_tokens
+                    ? uint64_t(it->n_tokens - previous->n_tokens)
+                    : UINT64_MAX;
+            candidate.price.seam_heuristic_protected =
+                seam_heuristic == &*it;
+            const bool same_replay_lineage =
+                server_cache_checkpoint_bounded_replay(
+                    *previous, *it, max_replay_tokens);
+            candidate.price.recovery_available =
+                same_replay_lineage &&
+                inventory[previous_index].found &&
+                inventory[previous_index].catalog.identity_known &&
+                inventory[previous_index].catalog.release_owned;
+            const auto & victim_catalog = inventory[index].catalog;
+            if (inventory[index].found &&
+                victim_catalog.identity_known &&
+                victim_catalog.release_owned) {
+                candidate.price.artifact =
+                    victim_catalog.artifact_id;
+                candidate.price.stable_id =
+                    victim_catalog.stable_id;
+                candidate.price.identity_known = true;
+                candidate.price.mandatory_anchor =
+                    victim_catalog.mandatory_anchor;
+                candidate.price.hard_leased = server_cache_lease_is_hard(
+                    victim_catalog.lease);
+                uint32_t weight = 0;
+                GGML_ASSERT(server_cache_retention_weight_milli(
+                    victim_catalog.lease.cls ==
+                        server_cache_lease_class::soft,
+                    context.main_family,
+                    SERVER_CACHE_HOST_WEIGHT_SCALE, weight));
+                candidate.price.weight_milli = weight;
+            }
+            local.push_back(std::move(candidate));
+            prices.push_back(local.back().price);
+            if (!close) {
+                previous_index = index;
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    if (local.empty()) {
+        return false;
+    }
+
+    const auto * calib = common_cache_plan_calib_find(
+        context.authority->calibration_profile);
+    while (!local.empty()) {
+        const auto plan = server_cache_plan_checkpoint_thinning(
+            prices, calib);
+        if (!plan.selected) {
+            context.thinning_refusal = plan.reason;
+            if (!server_cache_checkpoint_refusal_state_changed(context, plan.reason)) {
+                return false;
+            }
+            common_cache_plan_destruction_receipt receipt;
+            receipt.state = common_cache_plan_destruction_state::refused;
+            receipt.reason = plan.reason;
+            receipt.effects = common_cache_plan_destruction_effect_bit(
+                common_cache_plan_destruction_effect::
+                    checkpoint_member_drop);
+            receipt.admission_sequence =
+                ++context.authority->destruction_quote_sequence;
+            context.authority->observe_host_destruction(receipt, true);
+            if (context.destruction) {
+                context.destruction->note_checkpoint_thin_refused();
+                if (plan.protection !=
+                        server_cache_checkpoint_protection::none) {
+                    switch (plan.protection) {
+                        case server_cache_checkpoint_protection::
+                                 seam_heuristic:
+                            context.destruction->
+                                note_checkpoint_thin_heuristic_refused();
+                            break;
+                        case server_cache_checkpoint_protection::
+                                 mandatory_anchor:
+                            context.destruction->
+                                note_checkpoint_thin_mandatory_refused();
+                            break;
+                        case server_cache_checkpoint_protection::
+                                 hard_lease:
+                            context.destruction->
+                                note_checkpoint_thin_hard_lease_refused();
+                            break;
+                        case server_cache_checkpoint_protection::none:
+                        case server_cache_checkpoint_protection::_count:
+                            break;
+                    }
+                }
+            }
+            emit_checkpoint_destruction(context,
+                receipt, 0, 0,
+                SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+            return false;
+        }
+        const auto chosen = std::find_if(
+            local.begin(), local.end(), [&](const auto & candidate) {
+                return candidate.price.ordinal == plan.ordinal;
+            });
+        if (chosen == local.end()) {
+            return false;
+        }
+        const auto chosen_index = size_t(chosen - local.begin());
+        server_cache_checkpoint_iterator next;
+        if (checkpoint_drop_certified(context,
+                chosen->victim, chosen->recovery,
+                capacity_mode
+                    ? server_cache_destruction_reason::checkpoint_capacity
+                    : server_cache_destruction_reason::checkpoint_thin,
+                plan.price_us, plan.weight_milli,
+                plan.ordinal, next)) {
+            return true;
+        }
+        local.erase(chosen);
+        prices.erase(prices.begin() + chosen_index);
+    }
+    return false;
+}
+
+bool server_cache_checkpoint_capacity_floor(
+        server_cache_checkpoint_authority_context & context,
+        int checkpoint_task_id,
+        const common_prompt_checkpoint * seam_heuristic,
+        server_cache_checkpoint_iterator & victim,
+        common_cache_plan_destruction_reason & refusal) noexcept {
+    victim = context.checkpoints.end();
+    refusal = context.floor_refusal;
+    if (!context.attempts.begin(
+            server_cache_checkpoint_attempt_lane::capacity_floor)) {
+        return false;
+    }
+    refusal = common_cache_plan_destruction_reason::mandatory_anchor;
+    if (context.leases) {
+        context.leases->lifecycle_point();
+    }
+    std::vector<server_cache_checkpoint_floor_input> inputs;
+    std::vector<server_cache_checkpoint_iterator> members;
+    try {
+        inputs.reserve(context.checkpoints.size());
+        members.reserve(context.checkpoints.size());
+        uint32_t ordinal = 0;
+        for (auto it = context.checkpoints.begin();
+             it != context.checkpoints.end(); ++it, ++ordinal) {
+            server_cache_checkpoint_floor_input input;
+            input.ordinal = ordinal;
+            const auto key =
+                server_retention_instance_key::for_checkpoint(context.slot_id, &*it);
+            server_retention_checkpoint_inventory catalog;
+            const bool catalog_found = context.retention &&
+                context.retention->checkpoint_inventory(key, catalog);
+            input.recovery_pinned = catalog_found &&
+                catalog.recovery_pinned;
+            if (it->id_task == checkpoint_task_id ||
+                input.recovery_pinned) {
+                input.protection =
+                    server_cache_checkpoint_protection::mandatory_anchor;
+            } else if (seam_heuristic == &*it) {
+                input.protection =
+                    server_cache_checkpoint_protection::seam_heuristic;
+            }
+            if (catalog_found) {
+                if (catalog.mandatory_anchor) {
+                    input.protection =
+                        server_cache_checkpoint_protection::
+                            mandatory_anchor;
+                }
+                if (catalog.identity_known &&
+                    server_cache_lease_is_hard(catalog.lease)) {
+                    input.protection =
+                        server_cache_checkpoint_protection::hard_lease;
+                }
+            }
+            inputs.push_back(input);
+            members.push_back(it);
+        }
+    } catch (...) {
+        refusal = common_cache_plan_destruction_reason::internal_fault;
+        context.floor_refusal = refusal;
+        return false;
+    }
+    const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
+    refusal = plan.reason;
+    context.floor_refusal = refusal;
+    if (!plan.selected || plan.ordinal >= members.size()) {
+        return false;
+    }
+    victim = members[plan.ordinal];
+    return true;
+}
+
+void server_cache_checkpoint_publication_skipped(
+        server_cache_checkpoint_authority_context & context,
+        common_cache_plan_destruction_reason reason) noexcept {
+    if (!context.authority ||
+        !server_cache_checkpoint_refusal_state_changed(context, reason, true)) {
+        return;
+    }
+    common_cache_plan_destruction_receipt receipt;
+    receipt.state = common_cache_plan_destruction_state::refused;
+    receipt.reason = reason;
+    receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::checkpoint_member_drop);
+    receipt.admission_sequence =
+        ++context.authority->destruction_quote_sequence;
+    context.authority->observe_host_destruction(receipt, true);
+    if (context.destruction) {
+        context.destruction->note_checkpoint_publication_skip();
+    }
+    emit_checkpoint_destruction(context,
+        receipt, 0, 0, SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+}
+
+
 namespace {
 
 bool checkpoint_payload_equal(

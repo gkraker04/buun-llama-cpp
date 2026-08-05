@@ -11,10 +11,12 @@
 
 #include <array>
 #include <cstdint>
+#include <list>
 #include <vector>
 
 struct server_prompt_cache_state;
 struct common_prompt_checkpoint;
+struct server_cache_authority;
 
 struct server_cache_live_checkpoint_admission {
     llama_cache_acct_artifact_id artifact;
@@ -208,6 +210,71 @@ private:
         common_cache_plan_destruction_reason::none,
     };
 };
+
+// D-A4 checkpoint ownership is prompt-cache authority work even though its
+// physical list belongs to a live slot. The slot supplies this narrow view and
+// retains only the raw X-macro eraser plus thin adapters; policy, quoting,
+// capability preparation, evidence, and ranking live beside the D-A2/D-A3
+// prompt-cache authority orchestration.
+struct server_cache_checkpoint_authority_context {
+    using checkpoint_list = std::list<common_prompt_checkpoint>;
+    using checkpoint_iterator = checkpoint_list::iterator;
+    using checkpoint_drop_fn = checkpoint_iterator (*)(
+        void * owner,
+        checkpoint_iterator first,
+        checkpoint_iterator last);
+
+    int32_t slot_id = -1;
+    checkpoint_list & checkpoints;
+    server_cache_authority * authority = nullptr;
+    server_retention_sidecar_store * retention = nullptr;
+    server_cache_destruction_observer * destruction = nullptr;
+    server_cache_lease_table * leases = nullptr;
+    server_cache_checkpoint_attempt_latch & attempts;
+    const common_prompt_checkpoint *& seam_heuristic;
+    common_cache_plan_destruction_reason & thinning_refusal;
+    common_cache_plan_destruction_reason & floor_refusal;
+    bool main_family = false;
+    bool debug_observability = false;
+    void * raw_owner = nullptr;
+    checkpoint_drop_fn raw_drop = nullptr;
+};
+
+void server_cache_checkpoint_ring_changed(
+    server_cache_checkpoint_authority_context & context) noexcept;
+
+bool server_cache_checkpoint_thinning_attempt_begin(
+    server_cache_checkpoint_authority_context & context,
+    bool capacity_mode) noexcept;
+
+bool server_cache_checkpoint_refusal_state_changed(
+    server_cache_checkpoint_authority_context & context,
+    common_cache_plan_destruction_reason reason,
+    bool publication_skip = false) noexcept;
+
+server_cache_destruction_admission server_cache_checkpoint_observe_drop(
+    const server_cache_checkpoint_authority_context & context,
+    server_cache_destruction_reason reason,
+    llama_cache_acct_artifact_id artifact = {}) noexcept;
+
+bool server_cache_checkpoint_thin_priced(
+    server_cache_checkpoint_authority_context & context,
+    int checkpoint_task_id,
+    uint64_t max_replay_tokens,
+    const common_prompt_checkpoint * seam_heuristic,
+    bool capacity_mode,
+    bool attempt_claimed = false) noexcept;
+
+bool server_cache_checkpoint_capacity_floor(
+    server_cache_checkpoint_authority_context & context,
+    int checkpoint_task_id,
+    const common_prompt_checkpoint * seam_heuristic,
+    server_cache_checkpoint_authority_context::checkpoint_iterator & victim,
+    common_cache_plan_destruction_reason & refusal) noexcept;
+
+void server_cache_checkpoint_publication_skipped(
+    server_cache_checkpoint_authority_context & context,
+    common_cache_plan_destruction_reason reason) noexcept;
 
 using server_cache_host_retention_weight_fn = bool (*)(
     void * context,

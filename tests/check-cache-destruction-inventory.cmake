@@ -202,7 +202,8 @@ endif()
 # do not recursively admit.
 list(REMOVE_DUPLICATES admission_owners)
 list(LENGTH admission_owners admission_owner_count)
-set(server_retention_source "${server_context}\n${server_task}")
+set(server_retention_source
+    "${server_context}\n${server_task}\n${authority_source}")
 count_literal("${server_retention_source}" "server_cache_retention_admit(" admission_calls)
 if (NOT admission_calls EQUAL admission_owner_count)
     message(FATAL_ERROR
@@ -699,9 +700,51 @@ contract_find_forbidden(
     "release("
     "retire("
     "server_cache_retention_admit(")
+
+# A1 extraction: policy/certification lives in server-task.cpp,
+# while the only typed raw adapter must still terminate at the censused slot
+# _impl door. This is deliberately narrower than a general callback seam.
+function(da_a1_checkpoint_adapter_valid source output)
+    contract_extract_region(
+        "${source}"
+        "static checkpoint_iterator checkpoint_drop_authority_adapter("
+        "server_cache_checkpoint_authority_context checkpoint_authority_context()"
+        adapter_region adapter_found)
+    string(FIND "${adapter_region}"
+        "server_cache_checkpoint_drop_impl(first, last);" adapter_raw)
+    contract_extract_region(
+        "${source}"
+        "server_cache_checkpoint_authority_context checkpoint_authority_context()"
+        "void checkpoint_ring_changed()"
+        context_region context_found)
+    string(FIND "${context_region}"
+        "checkpoint_drop_authority_adapter," context_binding)
+    if (adapter_found AND context_found AND
+        NOT adapter_raw EQUAL -1 AND NOT context_binding EQUAL -1)
+        set(${output} TRUE PARENT_SCOPE)
+    else()
+        set(${output} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+
+da_a1_checkpoint_adapter_valid("${server_context}" da_a1_adapter_valid)
+if (NOT da_a1_adapter_valid)
+    message(FATAL_ERROR
+        "A1 checkpoint authority adapter escaped the censused raw _impl door")
+endif()
+string(REPLACE
+    "server_cache_checkpoint_drop_impl(first, last);"
+    "checkpoint_drop_joined_impl(first, last);"
+    da_a1_adapter_negative "${server_context}")
+da_a1_checkpoint_adapter_valid(
+    "${da_a1_adapter_negative}" da_a1_adapter_negative_valid)
+if (da_a1_adapter_negative_valid)
+    message(FATAL_ERROR "A1 checkpoint adapter negative control did not trip")
+endif()
+
 contract_extract_region(
-    "${server_context}"
-    "next = server_cache_checkpoint_drop_impl("
+    "${server_task}"
+    "next = context.raw_drop("
     "prepared.capability.commit(retained_pin);"
     da4_commit_gap da4_commit_gap_found)
 contract_find_forbidden(
@@ -738,7 +781,7 @@ foreach(pin
         "checkpoint_frontier_is_current("
         "CACHE_HOST_DESTRUCTION")
     string(FIND
-        "${server_context}${sidecar_source}${authority_source}"
+        "${server_context}${server_task}${sidecar_source}${authority_source}"
         "${pin}" da4_pin)
     if (da4_pin EQUAL -1)
         message(FATAL_ERROR "D-A4 checkpoint authority pin missing: ${pin}")
@@ -773,11 +816,11 @@ endif()
 string(FIND "${server_context}"
     "const bool optional_thinning_attempt =\n                            slot.lifecycle_authority &&\n                            slot.checkpoint_thinning_attempt_begin(false);"
     da4_attempt_lifecycle_gate)
-string(FIND "${server_context}"
-    "if (!attempt_claimed &&\n            !checkpoint_thinning_attempt_begin(capacity_mode)) {\n            return false;\n        }\n        checkpoint_thinning_refusal"
+string(FIND "${server_task}"
+    "if (!attempt_claimed &&\n        !server_cache_checkpoint_thinning_attempt_begin(context, capacity_mode)) {\n        return false;\n    }\n    context.thinning_refusal"
     da4_priced_attempt_early_out)
-string(FIND "${server_context}"
-    "if (!checkpoint_attempts.begin(\n                server_cache_checkpoint_attempt_lane::capacity_floor)) {\n            return false;\n        }\n        refusal = common_cache_plan_destruction_reason::mandatory_anchor;"
+string(FIND "${server_task}"
+    "if (!context.attempts.begin(\n            server_cache_checkpoint_attempt_lane::capacity_floor)) {\n        return false;\n    }\n    refusal = common_cache_plan_destruction_reason::mandatory_anchor;"
     da4_floor_attempt_early_out)
 if (da4_attempt_lifecycle_gate EQUAL -1 OR
     da4_priced_attempt_early_out EQUAL -1 OR
@@ -793,14 +836,14 @@ if (da4_bounded_publication_skip EQUAL -1)
         "D-A4 failed optional thin no longer suppresses bounded redundant publication")
 endif()
 contract_extract_region(
-    "${server_context}"
-    "bool checkpoint_thin_priced("
-    "bool checkpoint_capacity_floor("
+    "${server_task}"
+    "bool server_cache_checkpoint_thin_priced("
+    "bool server_cache_checkpoint_capacity_floor("
     da4_priced_inventory da4_priced_inventory_found)
 contract_extract_region(
-    "${server_context}"
-    "bool checkpoint_capacity_floor("
-    "void checkpoint_publication_skipped("
+    "${server_task}"
+    "bool server_cache_checkpoint_capacity_floor("
+    "void server_cache_checkpoint_publication_skipped("
     da4_floor_inventory da4_floor_inventory_found)
 contract_find_forbidden(
     "${da4_priced_inventory}${da4_floor_inventory}"
@@ -828,12 +871,12 @@ if (NOT da4_admit_live_checkpoint_count EQUAL 2 OR
         "D-A4 live-checkpoint ownership admission census drifted: expected single definition + creation adapter and batch definition + single adapter + restore, found single=${da4_admit_live_checkpoint_count} batch=${da4_admit_live_checkpoints_count}")
 endif()
 string(REPLACE
-    "next = server_cache_checkpoint_drop_impl("
-    "next = server_cache_checkpoint_drop_impl( acct->release({});"
-    da4_gap_negative "${server_context}")
+    "next = context.raw_drop("
+    "next = context.raw_drop( authority.ledger.release({});"
+    da4_gap_negative "${server_task}")
 contract_extract_region(
     "${da4_gap_negative}"
-    "next = server_cache_checkpoint_drop_impl("
+    "next = context.raw_drop("
     "prepared.capability.commit(retained_pin);"
     da4_negative_gap da4_negative_found)
 contract_find_forbidden(
