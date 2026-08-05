@@ -36,8 +36,9 @@ function(forbid_token text token label)
     endif()
 endfunction()
 
-# The only production execution door is the scheduler switch. No route may
-# construct a control task before E1.2.
+# The only production execution door is the scheduler switch. E1.2 constructs
+# the contiguous typed task through one path-derived scheduler enqueue; no
+# route may invoke the authority itself or spell a second per-operation door.
 string(REGEX MATCHALL "cache_control_authority->execute\\(" calls "${context}")
 list(LENGTH calls n_calls)
 if(NOT n_calls EQUAL 1)
@@ -68,8 +69,11 @@ foreach(task_name
         message(FATAL_ERROR "scheduler task ${task_name} became assignable in production")
     endif()
 endforeach()
-forbid_token("${context}" "POST /cache/holders" "no E1.2 route")
-forbid_token("${context}" "POST /cache/leases" "no E1.2 route")
+require_token("${context}"
+    "server_task::cache_control_task(operation)"
+    "E1.2 contiguous task construction")
+require_token("${context}" "res->rd.post_task(std::move(task));"
+    "E1.2 scheduler enqueue")
 
 # One lease table remains authoritative. The control object receives a pointer
 # and becomes its one proof provider; it may not own a parallel table/evaluator.
@@ -99,6 +103,14 @@ require_token("${leases}" "!leases[i].explicit_hard" "hard timer skip")
 require_token("${control}" "orphan_owner(holder.id)" "holder orphan transition")
 require_token("${control}" "server_cache_control_status::partially_stale" "frontier typing")
 require_token("${control}" "server_cache_control_status::subject_lost" "subject-lost typing")
+require_token("${context}" "const bool append_continuity =" "append-stable subject identity")
+require_token("${context}" "retained_prefix == slot.prompt.tokens.size()" "full-prefix continuity gate")
+require_token("${context}" "identity_known && prior_artifact.v != 0" "replacement frontier gate")
+require_token("${leases}" "server_cache_lease_table::artifact_replaced(" "append lease migration")
+require_token("${context}" "server_cache_context_scope_id implicit_soft_lease_scope;"
+    "one implicit soft scope per slot")
+require_token("${context}" "server_cache_lease_scope::from(implicit_soft_lease_scope)"
+    "implicit soft renewal scope")
 require_token("${control}" "server_cache_control_subject_kind::live_checkpoint" "checkpoint reject")
 require_token("${control}" "return server_cache_control_status::not_supported;" "checkpoint fallback closed")
 require_token("${context}" "cache_control_authority->lifecycle_point();" "scheduler lifecycle wiring")
@@ -168,6 +180,41 @@ function(subject_lost_contract_valid lease control_text output)
         set(${output} TRUE PARENT_SCOPE)
     endif()
 endfunction()
+function(append_continuity_contract_valid context_text output)
+    string(FIND "${context_text}" "const bool append_continuity =" append_gate)
+    string(FIND "${context_text}"
+        "retained_prefix == slot.prompt.tokens.size()" full_prefix)
+    string(FIND "${context_text}"
+        "identity_known && prior_artifact.v != 0" replacement_gate)
+    if(append_gate EQUAL -1 OR full_prefix EQUAL -1 OR
+       replacement_gate EQUAL -1)
+        set(${output} FALSE PARENT_SCOPE)
+    else()
+        set(${output} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+function(append_replacement_contract_valid lease_text output)
+    string(FIND "${lease_text}"
+        "server_cache_lease_table::artifact_replaced(" replacement)
+    string(FIND "${lease_text}"
+        "lease.proven_frontier.sequence_epoch" epoch_guard)
+    if(replacement EQUAL -1 OR epoch_guard EQUAL -1)
+        set(${output} FALSE PARENT_SCOPE)
+    else()
+        set(${output} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+function(implicit_soft_scope_contract_valid context_text output)
+    string(FIND "${context_text}"
+        "server_cache_context_scope_id implicit_soft_lease_scope;" scope_member)
+    string(FIND "${context_text}"
+        "server_cache_lease_scope::from(implicit_soft_lease_scope)" scope_use)
+    if(scope_member EQUAL -1 OR scope_use EQUAL -1)
+        set(${output} FALSE PARENT_SCOPE)
+    else()
+        set(${output} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
 
 # Negative controls rerun the same predicates after mutation.
 string(REPLACE "case SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE:" "case SERVER_TASK_TYPE_COMPLETION:"
@@ -209,6 +256,29 @@ string(REPLACE "mark_subject_lost(" "mark_subject_missing_removed("
 subject_lost_contract_valid("${bad_lease}" "${control}" bad_lost_valid)
 if(bad_lost_valid)
     message(FATAL_ERROR "subject-lost negative control did not trip")
+endif()
+string(REPLACE "retained_prefix == slot.prompt.tokens.size()"
+    "retained_prefix != slot.prompt.tokens.size()"
+    bad_append_context "${context}")
+append_continuity_contract_valid("${bad_append_context}" bad_append_valid)
+if(bad_append_valid)
+    message(FATAL_ERROR "append-continuity negative control did not trip")
+endif()
+string(REPLACE "server_cache_lease_table::artifact_replaced("
+    "server_cache_lease_table::artifact_replaced_removed("
+    bad_replacement_leases "${leases}")
+append_replacement_contract_valid(
+    "${bad_replacement_leases}" bad_replacement_valid)
+if(bad_replacement_valid)
+    message(FATAL_ERROR "append-replacement negative control did not trip")
+endif()
+string(REPLACE "server_cache_lease_scope::from(implicit_soft_lease_scope)"
+    "server_cache_lease_scope::from(lease_obs->new_context_scope())"
+    bad_implicit_scope_context "${context}")
+implicit_soft_scope_contract_valid(
+    "${bad_implicit_scope_context}" bad_implicit_scope_valid)
+if(bad_implicit_scope_valid)
+    message(FATAL_ERROR "implicit-soft-scope negative control did not trip")
 endif()
 set(bad_headers "${all_server_headers}\nserver_cache_lease_table leases;")
 string(REGEX MATCHALL "server_cache_lease_table leases"

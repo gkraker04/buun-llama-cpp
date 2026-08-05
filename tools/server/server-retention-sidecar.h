@@ -130,7 +130,8 @@ public:
         uint64_t turn_token_count,
         uint64_t coverage_tokens,
         bool coverage_valid,
-        const server_cache_lease_identity * checkpoint_identity = nullptr) noexcept;
+        const server_cache_lease_identity * checkpoint_identity = nullptr,
+        const server_cache_lease_frontier * replacement_frontier = nullptr) noexcept;
     bool clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
@@ -210,7 +211,8 @@ private:
     bool install(
         const server_retention_instance_key & key,
         common_retention_artifact_record && record,
-        const server_cache_lease_identity * checkpoint_identity) noexcept;
+        const server_cache_lease_identity * checkpoint_identity,
+        const server_cache_lease_frontier * replacement_frontier) noexcept;
     void retire_catalog_entry(catalog_map::iterator entry) noexcept;
     void retire_association(association_map::iterator it) noexcept;
     static void release_recovery_pin(void * context) noexcept;

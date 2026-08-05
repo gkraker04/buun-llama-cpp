@@ -26,7 +26,11 @@ foreach(path IN LISTS server_production_tus)
     file(READ "${path}" source)
     string(APPEND server_production_source "\n${source}")
     get_filename_component(name "${path}" NAME)
-    if (NOT name STREQUAL "server-cache-control.cpp")
+    # The scheduler authority and its E1.2 wire serializer are the reviewed
+    # declared-family surfaces. Every other production TU remains forbidden
+    # from constructing or projecting a declared binding directly.
+    if (NOT name STREQUAL "server-cache-control.cpp" AND
+            NOT name STREQUAL "server-cache-control-wire.cpp")
         string(APPEND pre_family_production_source "\n${source}")
     endif()
     if (NOT name STREQUAL "server-cache-lease.cpp" AND
@@ -83,7 +87,6 @@ endfunction()
 
 function(no_declared_family_construction source output)
     foreach(token
-            "common_cache_family_role::"
             ".cache_family.family"
             ".cache_family.role")
         string(FIND "${source}" "${token}" found)
@@ -183,13 +186,12 @@ if (NOT classifier_callers_valid)
     message(FATAL_ERROR "E1.0 hard-seal classifier gained a premature caller")
 endif()
 
-# E1.1a/E1.1b deliberately add scheduler-only control/family tasks. Routes,
-# CLI flags, VBR enforcement, and public llama.h remain outside these units.
+# E1.2 deliberately adds the reviewed HTTP/flag surface. VBR enforcement and
+# public llama.h remain outside this unit.
 function(surface_contract_valid source output)
     foreach(token
-            "/cache/lease"
-            "/cache/family"
-            "--cache-family")
+            "vbr_hard_seal_classify("
+            "vbr_classify_hard_seal(")
         string(FIND "${source}" "${token}" found)
         if (NOT found EQUAL -1)
             set(${output} FALSE PARENT_SCOPE)
@@ -220,7 +222,7 @@ if (family_negative_valid)
 endif()
 
 set(declared_negative
-    "${pre_family_production_source}\ncommon_cache_family_role::main")
+    "${pre_family_production_source}\nentry.cache_family.role = common_cache_family_role::main;")
 no_declared_family_construction(
     "${declared_negative}" declared_negative_valid)
 if (declared_negative_valid)
@@ -241,10 +243,10 @@ if (classifier_negative_valid)
     message(FATAL_ERROR "E1.0 classifier-caller negative control did not trip")
 endif()
 
-set(surface_negative "${surface_sources}\nPOST /cache/lease")
+set(surface_negative "${surface_sources}\nvbr_hard_seal_classify(candidate)")
 surface_contract_valid("${surface_negative}" surface_negative_valid)
 if (surface_negative_valid)
-    message(FATAL_ERROR "E1.0 route negative control did not trip")
+    message(FATAL_ERROR "E1.0 VBR surface negative control did not trip")
 endif()
 
 message(STATUS "E1.0 behavior-neutral foundation contracts passed")

@@ -130,14 +130,21 @@ struct server_cache_control_authority::impl {
     enum class holder_state : uint8_t { active, orphaned_hard, closed };
 
     struct lease_record {
+        server_cache_control_token handle;
         uint64_t handle_digest = 0;
         server_cache_lease_id table_lease;
         server_cache_lease_class cls = server_cache_lease_class::none;
         server_cache_control_selector subject;
         server_cache_control_selector fallback;
+        common_cache_family_binding cache_family;
         server_cache_lease_frontier lease_frontier;
         server_cache_lease_frontier proven_frontier;
         uint64_t expires_at_ns = 0;
+        bool protected_bytes_known = false;
+        bool fallback_pinned_bytes_known = false;
+        uint64_t protected_bytes = 0;
+        uint64_t fallback_pinned_bytes = 0;
+        bool shared_fallback = false;
         bool orphaned = false;
         bool subject_lost = false;
         bool released = false;
@@ -145,8 +152,10 @@ struct server_cache_control_authority::impl {
     };
 
     struct family_record {
+        server_cache_control_token handle;
         uint64_t handle_digest = 0;
         common_cache_family_id id;
+        std::string label;
     };
 
     struct family_binding_record {
@@ -163,6 +172,8 @@ struct server_cache_control_authority::impl {
         std::vector<family_record> families;
         std::vector<family_binding_record> family_bindings;
         std::vector<lease_record> leases;
+        uint64_t next_event_ordinal = 1;
+        uint64_t last_dropped_event_ordinal = 0;
     };
 
     struct event_record {
@@ -187,6 +198,8 @@ struct server_cache_control_authority::impl {
     server_cache_control_config::resolve_vbr_fn resolve_vbr = nullptr;
     void * host_proof_context = nullptr;
     server_cache_control_config::acquire_host_proof_fn acquire_host_proof = nullptr;
+    void * selector_evidence_context = nullptr;
+    server_cache_control_config::selector_evidence_fn selector_evidence = nullptr;
     size_t max_holders = 0;
     size_t max_leases = 0;
     size_t max_families = 0;
@@ -196,7 +209,6 @@ struct server_cache_control_authority::impl {
     bool test_fail_remember = false;
     uint64_t next_holder_id = 1;
     uint64_t next_family_id = 1;
-    uint64_t next_event = 1;
     std::vector<holder_record> holders;
     std::vector<event_record> events;
     std::vector<replay_record> replays;
@@ -237,21 +249,98 @@ struct server_cache_control_authority::impl {
     void note(server_cache_control_operation operation,
               server_cache_control_status status,
               server_cache_lease_class cls,
-              server_cache_lease_owner_id holder) noexcept {
+              server_cache_lease_owner_id holder,
+              const server_cache_control_request & request,
+              server_cache_control_token lease) noexcept {
         if (note_attempts++ >= test_fail_note_after) {
             grant_path_available = false;
             return;
         }
         try {
             if (events.size() == SERVER_CACHE_LEASE_EVENT_RING) {
+                const auto dropped = events.front();
+                const auto owner = std::find_if(
+                    holders.begin(), holders.end(), [&](const holder_record & value) {
+                        return value.id == dropped.holder;
+                    });
+                if (owner != holders.end()) {
+                    owner->last_dropped_event_ordinal = dropped.view.ordinal;
+                }
                 events.erase(events.begin());
             }
-            events.push_back({
-                { next_event++, operation, status, cls }, holder,
-            });
+            auto owner = std::find_if(
+                holders.begin(), holders.end(), [&](const holder_record & value) {
+                    return value.id == holder;
+                });
+            if (owner == holders.end()) {
+                return;
+            }
+            server_cache_control_event_kind kind =
+                server_cache_control_event_kind::refuse;
+            if (status == server_cache_control_status::ok ||
+                status == server_cache_control_status::already_released) {
+                if (operation == server_cache_control_operation::lease_renew) {
+                    kind = server_cache_control_event_kind::renew;
+                } else if (operation == server_cache_control_operation::lease_release ||
+                           operation == server_cache_control_operation::holder_close) {
+                    kind = server_cache_control_event_kind::release;
+                } else {
+                    kind = server_cache_control_event_kind::grant;
+                }
+            }
+            const bool lease_operation =
+                operation == server_cache_control_operation::lease_acquire ||
+                operation == server_cache_control_operation::lease_renew ||
+                operation == server_cache_control_operation::lease_release;
+            auto subject_kind = lease_operation
+                ? request.subject.kind
+                : server_cache_control_subject_kind::_count;
+            auto family_role = request.family_role;
+            if (lease_operation && lease) {
+                const uint64_t lease_digest = digest(lease);
+                const auto record = std::find_if(
+                    owner->leases.begin(), owner->leases.end(),
+                    [lease_digest](const lease_record & value) {
+                        return value.handle_digest == lease_digest;
+                    });
+                if (record != owner->leases.end()) {
+                    subject_kind = record->subject.kind;
+                    family_role = record->cache_family.declared()
+                        ? record->cache_family.role
+                        : common_cache_family_role::_count;
+                }
+            }
+            events.push_back({ {
+                owner->next_event_ordinal++, now() / 1000000ULL, kind,
+                status, cls, subject_kind, family_role, lease,
+            }, holder });
         } catch (...) {
             grant_path_available = false;
         }
+    }
+
+    void note_expire(holder_record & holder, const lease_record & lease) noexcept {
+        server_cache_control_request request;
+        request.subject = lease.subject;
+        request.family_role = lease.cache_family.declared()
+            ? lease.cache_family.role : common_cache_family_role::_count;
+        note(server_cache_control_operation::lease_release,
+             server_cache_control_status::lease_expired, lease.cls,
+             holder.id, request, lease.handle);
+        if (!events.empty() && events.back().holder == holder.id) {
+            events.back().view.kind = server_cache_control_event_kind::expire;
+        }
+    }
+
+    void scrub_replays(const holder_record & holder) noexcept {
+        replays.erase(std::remove_if(
+            replays.begin(), replays.end(), [&](const replay_record & replay) {
+                return replay.holder_digest == holder.id.v ||
+                    (replay.result.holder &&
+                     digest(replay.result.holder) == holder.session_digest) ||
+                    (replay.result.holder_recovery &&
+                     digest(replay.result.holder_recovery) == holder.recovery_digest);
+            }), replays.end());
     }
 
     size_t lease_count() const noexcept {
@@ -396,6 +485,15 @@ struct server_cache_control_authority::impl {
                 return family.handle_digest == digest;
             });
         return found == holder.families.end() ? nullptr : &*found;
+    }
+
+    const std::string * family_label(
+            const holder_record & holder,
+            common_cache_family_id id) const noexcept {
+        const auto found = std::find_if(
+            holder.families.begin(), holder.families.end(),
+            [id](const family_record & family) { return family.id == id; });
+        return found == holder.families.end() ? nullptr : &found->label;
     }
 
     class staged_proof {
@@ -594,6 +692,8 @@ server_cache_control_authority::server_cache_control_authority(
             : resolve_vbr_from_store;
         state_->host_proof_context = config.host_proof_context;
         state_->acquire_host_proof = config.acquire_host_proof;
+        state_->selector_evidence_context = config.selector_evidence_context;
+        state_->selector_evidence = config.selector_evidence;
         state_->max_holders = config.max_holders;
         state_->max_leases = config.max_leases;
         state_->max_families = config.max_families;
@@ -695,6 +795,7 @@ void server_cache_control_authority::lifecycle_point() noexcept {
                 lease.orphaned = true;
                 (void) state_->table->orphan_owned_scope(
                     { lease.handle_digest }, holder.id);
+                state_->note_expire(holder, lease);
             }
         }
         if (holder.state != impl::holder_state::active ||
@@ -709,8 +810,11 @@ void server_cache_control_authority::lifecycle_point() noexcept {
             if (lease.cls == server_cache_lease_class::hard) {
                 lease.orphaned = true;
                 hard = true;
+                state_->note_expire(holder, lease);
             } else {
-                (void) state_->release_record(holder, lease);
+                if (state_->release_record(holder, lease)) {
+                    state_->note_expire(holder, lease);
+                }
             }
         }
         if (hard) {
@@ -719,6 +823,7 @@ void server_cache_control_authority::lifecycle_point() noexcept {
         } else {
             holder.state = impl::holder_state::closed;
         }
+        state_->scrub_replays(holder);
         holder.session_digest = 0;
     }
     state_->table->lifecycle_point();
@@ -742,7 +847,8 @@ server_cache_control_result server_cache_control_authority::execute(
         if (operation != server_cache_control_operation::lease_inspect &&
             operation != server_cache_control_operation::events &&
             event_owner) {
-            state_->note(operation, status, cls, event_owner);
+            const auto lease = out.lease ? out.lease : request.lease;
+            state_->note(operation, status, cls, event_owner, request, lease);
         }
         return out;
     };
@@ -785,6 +891,9 @@ server_cache_control_result server_cache_control_authority::execute(
             out.holder = session;
             out.holder_recovery = recovery;
             out.expires_at_ns = deadline;
+            out.max_leases = uint32_t(std::min(
+                state_->max_leases,
+                size_t(std::numeric_limits<uint32_t>::max())));
             out.status = server_cache_control_status::ok;
             if (!state_->remember(
                     operation, request.idempotency_key, 0, out)) {
@@ -815,6 +924,16 @@ server_cache_control_result server_cache_control_authority::execute(
             event_owner = holder->id;
             out.holder = session;
             out.expires_at_ns = deadline;
+            for (const auto & lease : holder->leases) {
+                if (!lease.released && lease.orphaned && lease.handle) {
+                    out.orphaned_leases.push_back({
+                        lease.handle, lease.subject.kind, lease.proven_frontier,
+                    });
+                }
+            }
+            for (const auto & family : holder->families) {
+                out.families.push_back({ family.handle, family.label });
+            }
             return finish(server_cache_control_status::ok);
         }
 
@@ -842,12 +961,17 @@ server_cache_control_result server_cache_control_authority::execute(
                 }
             }
             holder->state = impl::holder_state::closed;
+            state_->scrub_replays(*holder);
             holder->session_digest = 0;
             return finish(server_cache_control_status::ok);
         }
         if (operation == server_cache_control_operation::events) {
+            out.events_overflowed = holder->last_dropped_event_ordinal != 0 &&
+                request.after_ordinal <= holder->last_dropped_event_ordinal;
             for (const auto & event : state_->events) {
-                if (event.holder == holder->id) {
+                if (event.holder == holder->id &&
+                    event.view.ordinal > request.after_ordinal &&
+                    out.events.size() < request.event_limit) {
                     out.events.push_back(event.view);
                 }
             }
@@ -867,10 +991,13 @@ server_cache_control_result server_cache_control_authority::execute(
                 return finish(server_cache_control_status::internal_fault);
             }
             impl::family_record family;
+            family.handle = handle;
             family.handle_digest = state_->digest(handle);
             family.id = { state_->next_family_id++ };
+            family.label = request.family_label;
             holder->families.push_back(family);
             out.family = handle;
+            out.families.push_back({ handle, request.family_label });
             out.status = server_cache_control_status::ok;
             if (!state_->remember(
                     operation, request.idempotency_key,
@@ -925,6 +1052,20 @@ server_cache_control_result server_cache_control_authority::execute(
                 return finish(server_cache_control_status::capacity_refused,
                               request.requested_class);
             }
+            common_cache_family_binding cache_family;
+            if (request.family_binding) {
+                const uint64_t digest = state_->digest(request.family_binding);
+                const auto found = std::find_if(
+                    holder->family_bindings.begin(), holder->family_bindings.end(),
+                    [digest](const impl::family_binding_record & value) {
+                        return value.handle_digest == digest;
+                    });
+                if (found == holder->family_bindings.end()) {
+                    return finish(server_cache_control_status::not_found,
+                                  request.requested_class);
+                }
+                cache_family = found->binding;
+            }
             server_cache_lease_subject subject;
             server_cache_lease_identity identity;
             server_cache_lease_frontier frontier;
@@ -944,28 +1085,36 @@ server_cache_control_result server_cache_control_authority::execute(
                 return finish(server_cache_control_status::internal_fault,
                               request.requested_class);
             }
+            server_cache_lease_class granted_class = request.requested_class;
             server_cache_lease_id table_lease;
-            if (request.requested_class == server_cache_lease_class::hard) {
+            if (granted_class == server_cache_lease_class::hard) {
                 server_cache_durable_fallback_proof proof;
                 status = state_->resolve_fallback(
                     request.fallback, subject.artifact, identity, frontier,
                     proof);
                 if (status != server_cache_control_status::ok) {
-                    return finish(status, request.requested_class);
+                    if (!request.allow_soft_fallback) {
+                        return finish(status, request.requested_class);
+                    }
+                    subject_pin = {};
+                    granted_class = server_cache_lease_class::soft;
                 }
-                impl::staged_proof staged(
-                    *state_, subject, identity, std::move(proof));
-                table_lease = state_->table->grant_hard_owned(
-                    subject,
-                    server_cache_lease_scope::from(
-                        server_cache_explicit_lease_scope_id {
-                            state_->digest(handle) }),
-                    identity, holder->id, frontier, request.ttl_ns);
-                if (!table_lease) {
-                    return finish(server_cache_control_status::hard_lease_blocked,
-                                  request.requested_class);
+                if (granted_class == server_cache_lease_class::hard) {
+                    impl::staged_proof staged(
+                        *state_, subject, identity, std::move(proof));
+                    table_lease = state_->table->grant_hard_owned(
+                        subject,
+                        server_cache_lease_scope::from(
+                            server_cache_explicit_lease_scope_id {
+                                state_->digest(handle) }),
+                        identity, holder->id, frontier, request.ttl_ns);
+                    if (!table_lease) {
+                        return finish(server_cache_control_status::hard_lease_blocked,
+                                      request.requested_class);
+                    }
                 }
-            } else {
+            }
+            if (granted_class == server_cache_lease_class::soft) {
                 table_lease = state_->table->grant_soft(
                     subject,
                     server_cache_lease_scope::from(
@@ -974,37 +1123,73 @@ server_cache_control_result server_cache_control_authority::execute(
                     identity, request.ttl_ns);
                 if (!table_lease) {
                     return finish(server_cache_control_status::capacity_refused,
-                                  request.requested_class);
+                                  granted_class);
                 }
             }
             impl::lease_record record;
+            record.handle = handle;
             record.handle_digest = state_->digest(handle);
             record.table_lease = table_lease;
-            record.cls = request.requested_class;
+            record.cls = granted_class;
             record.subject = request.subject;
-            record.fallback = request.fallback;
+            record.fallback = granted_class == server_cache_lease_class::hard
+                ? request.fallback : server_cache_control_selector{};
+            if (granted_class != server_cache_lease_class::hard) {
+                record.fallback.kind = server_cache_control_subject_kind::_count;
+            }
+            record.cache_family = cache_family;
             record.lease_frontier = frontier;
             record.proven_frontier = frontier;
             record.expires_at_ns = deadline;
             record.subject_pin = std::move(subject_pin);
+            if (state_->selector_evidence) {
+                record.protected_bytes_known = state_->selector_evidence(
+                    state_->selector_evidence_context, request.subject,
+                    record.protected_bytes, record.shared_fallback);
+                bool fallback_shared = false;
+                if (granted_class == server_cache_lease_class::hard) {
+                    record.fallback_pinned_bytes_known =
+                        state_->selector_evidence(
+                            state_->selector_evidence_context,
+                            request.fallback,
+                            record.fallback_pinned_bytes, fallback_shared);
+                    record.shared_fallback = fallback_shared;
+                }
+            }
+            out.protected_bytes_known = record.protected_bytes_known;
+            out.fallback_pinned_bytes_known =
+                record.fallback_pinned_bytes_known;
+            out.protected_bytes = record.protected_bytes;
+            out.fallback_pinned_bytes = record.fallback_pinned_bytes;
+            out.shared_fallback = record.shared_fallback;
             try {
                 holder->leases.push_back(std::move(record));
             } catch (...) {
-                if (request.requested_class == server_cache_lease_class::hard) {
+                if (granted_class == server_cache_lease_class::hard) {
                     (void) state_->table->release_owned_scope(
                         { state_->digest(handle) }, holder->id);
                 } else {
                     (void) state_->table->release(table_lease);
                 }
                 return finish(server_cache_control_status::internal_fault,
-                              request.requested_class);
+                              granted_class);
             }
             out.lease = handle;
-            out.granted_class = request.requested_class;
+            out.granted_class = granted_class;
+            out.cache_family = cache_family;
+            if (cache_family.declared()) {
+                if (const auto * label = state_->family_label(
+                        *holder, cache_family.family)) {
+                    out.family_label = *label;
+                }
+            }
             out.protection = server_cache_control_protection_state::current;
             out.lease_frontier = frontier;
             out.proven_frontier = frontier;
             out.expires_at_ns = deadline;
+            out.fallback_kind = granted_class == server_cache_lease_class::hard
+                ? request.fallback.kind
+                : server_cache_control_subject_kind::_count;
             out.status = server_cache_control_status::ok;
             if (!state_->remember(
                     operation, request.idempotency_key,
@@ -1014,7 +1199,7 @@ server_cache_control_result server_cache_control_authority::execute(
                 state_->grant_path_available = false;
             }
             return finish(server_cache_control_status::ok,
-                          request.requested_class);
+                          granted_class);
         }
 
         auto * lease = state_->find_lease(*holder, request.lease);
@@ -1032,6 +1217,21 @@ server_cache_control_result server_cache_control_authority::execute(
             }
             return finish(server_cache_control_status::ok, lease->cls);
         }
+
+        out.lease = request.lease;
+        out.fallback_kind = lease->fallback.kind;
+        out.cache_family = lease->cache_family;
+        if (lease->cache_family.declared()) {
+            if (const auto * label = state_->family_label(
+                    *holder, lease->cache_family.family)) {
+                out.family_label = *label;
+            }
+        }
+        out.protected_bytes_known = lease->protected_bytes_known;
+        out.fallback_pinned_bytes_known = lease->fallback_pinned_bytes_known;
+        out.protected_bytes = lease->protected_bytes;
+        out.fallback_pinned_bytes = lease->fallback_pinned_bytes;
+        out.shared_fallback = lease->shared_fallback;
 
         server_cache_lease_subject current_subject;
         server_cache_lease_identity current_identity;
@@ -1117,7 +1317,11 @@ server_cache_control_result server_cache_control_authority::execute(
                 request.fallback, current_subject.artifact, current_identity,
                 current_frontier, proof);
             if (fallback != server_cache_control_status::ok) {
-                return finish(fallback, lease->cls);
+                return finish(
+                    fallback == server_cache_control_status::not_found
+                        ? server_cache_control_status::fallback_unavailable
+                        : fallback,
+                    lease->cls);
             }
             impl::staged_proof staged(
                 *state_, current_subject, current_identity,
@@ -1139,6 +1343,16 @@ server_cache_control_result server_cache_control_authority::execute(
         lease->orphaned = false;
         if (lease->cls == server_cache_lease_class::hard) {
             lease->fallback = request.fallback;
+            lease->fallback_pinned_bytes_known = false;
+            lease->fallback_pinned_bytes = 0;
+            lease->shared_fallback = false;
+            if (state_->selector_evidence) {
+                lease->fallback_pinned_bytes_known =
+                    state_->selector_evidence(
+                        state_->selector_evidence_context,
+                        request.fallback, lease->fallback_pinned_bytes,
+                        lease->shared_fallback);
+            }
         }
         if (refreshed_subject_pin.available()) {
             lease->subject_pin = std::move(refreshed_subject_pin);
@@ -1147,6 +1361,10 @@ server_cache_control_result server_cache_control_authority::execute(
         out.proven_frontier = current_frontier;
         out.expires_at_ns = deadline;
         out.protection = server_cache_control_protection_state::current;
+        out.fallback_kind = lease->fallback.kind;
+        out.fallback_pinned_bytes_known = lease->fallback_pinned_bytes_known;
+        out.fallback_pinned_bytes = lease->fallback_pinned_bytes;
+        out.shared_fallback = lease->shared_fallback;
         return finish(server_cache_control_status::ok, lease->cls);
     } catch (...) {
         state_->pending = false;

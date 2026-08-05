@@ -220,6 +220,14 @@ struct server_task {
     // construct this from HTTP; until then production has no caller.
     std::shared_ptr<const server_cache_control_request> cache_control;
 
+    // E1.2 wire selectors carry semantic inputs only. The scheduler resolves
+    // these into exact retention keys before invoking the E1.1a authority.
+    struct cache_control_semantic_selector {
+        int32_t slot_id = -1;
+        std::shared_ptr<const server_tokens> tokens;
+        std::map<int, float> lora;
+    } cache_control_subject, cache_control_fallback;
+
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
 
@@ -229,6 +237,13 @@ struct server_task {
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
+
+    static server_task cache_control_task(
+            server_cache_control_operation operation) {
+        GGML_ASSERT(operation < server_cache_control_operation::_count);
+        return server_task(static_cast<server_task_type>(
+            SERVER_TASK_TYPE_CACHE_HOLDER_CREATE + int(operation)));
+    }
 
     int32_t n_tokens() const {
         return tokens.size();
@@ -692,6 +707,8 @@ struct server_task_result_cache_plan_preflight : server_task_result {
 };
 
 struct server_task_result_cache_control : server_task_result {
+    server_cache_control_operation operation =
+        server_cache_control_operation::_count;
     server_cache_control_result result;
 
     virtual json to_json() override;
@@ -953,6 +970,9 @@ struct server_prompt_cache {
     bool debug_observability = false;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
+    uint64_t debug_recovery_pin_exclusions = 0;
+    uint64_t debug_host_pressure_floor_outcomes = 0;
+    llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
     bool host_trade_substrate_warned = false;
 
     ~server_prompt_cache() {
@@ -983,7 +1003,8 @@ private:
             server_cache_destruction_reason reason,
             iterator incoming,
             iterator & legacy_floor,
-            common_cache_plan_destruction_reason & floor_reason);
+            common_cache_plan_destruction_reason & floor_reason,
+            bool & recovery_pin_excluded);
     bool evict_front_under_pressure(
             server_cache_destruction_reason reason,
             iterator incoming);

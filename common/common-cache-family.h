@@ -68,12 +68,15 @@ constexpr bool common_cache_family_allows_additional_weight(
     return !binding.declared();
 }
 
-// Family provenance follows the retained immutable content. A zero-overlap
-// launch replaces the conversation lineage with the incoming declaration (or
-// the undeclared default); any retained prefix keeps the existing lineage.
+// Family provenance follows the retained immutable conversation. Only an
+// append/exact continuation keeps the existing lineage. A trim, branch, or
+// replacement adopts the incoming declaration (or the undeclared default),
+// even when tokenizer-global BOS/system-prefix tokens happen to overlap.
 constexpr common_cache_family_binding common_cache_family_follow_lineage(
         const common_cache_family_binding & current,
         const common_cache_family_binding & incoming,
-        size_t retained_prefix) noexcept {
-    return retained_prefix == 0 ? incoming : current;
+        size_t retained_prefix,
+        size_t current_tokens) noexcept {
+    return current_tokens != 0 && retained_prefix == current_tokens
+        ? current : incoming;
 }

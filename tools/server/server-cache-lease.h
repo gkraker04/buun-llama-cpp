@@ -347,6 +347,16 @@ public:
         const server_cache_lease_subject & source,
         const server_cache_lease_subject & destination,
         const server_cache_lease_identity & destination_identity) noexcept;
+    // Move lease ownership across a new immutable observer artifact for the
+    // same physical live slot. Identity and proven-frontier containment are
+    // checked before any entry changes; a false result leaves the source
+    // untouched so the caller can retire it through the normal fail-closed
+    // subject_lost terminal.
+    bool artifact_replaced(
+        const server_cache_lease_subject & source,
+        const server_cache_lease_subject & destination,
+        const server_cache_lease_identity & destination_identity,
+        const server_cache_lease_frontier & current_frontier) noexcept;
     bool artifact_rebound(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity) noexcept;

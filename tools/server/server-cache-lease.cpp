@@ -725,6 +725,57 @@ bool server_cache_lease_table::artifact_cloned(
     }
 }
 
+bool server_cache_lease_table::artifact_replaced(
+        const server_cache_lease_subject & source,
+        const server_cache_lease_subject & destination,
+        const server_cache_lease_identity & destination_identity,
+        const server_cache_lease_frontier & current_frontier) noexcept {
+    const uint64_t now = sample_now();
+    expire_due(now);
+    if (!source.valid() || !destination.valid() ||
+        source.artifact == destination.artifact ||
+        !destination_identity.valid() || !current_frontier.valid()) {
+        return false;
+    }
+
+    // Validate the complete replacement set before mutating one entry. Token
+    // content is represented by the stable sequence epoch and the proven
+    // frontier; it is deliberately not folded into the execution/adapter/
+    // media identity. A trim or rebind therefore fails this containment test.
+    for (const auto & lease : leases) {
+        if (lease.subject.artifact != source.artifact || lease.subject_lost) {
+            continue;
+        }
+        const auto identity = std::find_if(
+            identities.begin(), identities.end(), [&](const auto & value) {
+                return value.id == lease.identity_id;
+            });
+        if (identity == identities.end() ||
+            identity->value != destination_identity ||
+            (lease.proven_frontier.valid() &&
+             (lease.proven_frontier.sequence_epoch !=
+                  current_frontier.sequence_epoch ||
+              lease.proven_frontier.token_count >
+                  current_frontier.token_count ||
+              lease.proven_frontier.next_position >
+                  current_frontier.next_position))) {
+            return false;
+        }
+    }
+    for (auto & lease : leases) {
+        if (lease.subject.artifact == source.artifact &&
+            !lease.subject_lost) {
+            lease.subject = destination;
+        }
+    }
+    // The source association is gone after the caller commits this atomic
+    // replacement. Do not retain a diagnostic marker that can only name the
+    // destroyed observer artifact.
+    clear_identity_unavailable(source.artifact);
+    clear_identity_unavailable(destination.artifact);
+    return true;
+}
+
 bool server_cache_lease_table::artifact_rebound(
         llama_cache_acct_artifact_id artifact,
         const server_cache_lease_identity & expected_identity) noexcept {

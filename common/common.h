@@ -811,6 +811,11 @@ struct common_params {
     // state merely because it is enabled.
     bool cache_plan_preflight = false;
 
+    // Trusted-local, single-principal E1 cache-control HTTP surface. The
+    // scheduler authority remains unavailable unless cache lifecycle is also
+    // enabled; this flag only registers the reviewed routes.
+    bool cache_control_api = false;
+
     // B-A graduated authority request. B-A0b dual-runs every non-off level but
     // still executes legacy unconditionally; later ratchets consume the same
     // closed spelling without another flag migration.

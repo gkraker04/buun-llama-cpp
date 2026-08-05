@@ -555,6 +555,59 @@ if (NOT da2_debug_emit_region_found OR da2_debug_emit_gate EQUAL -1 OR
     message(FATAL_ERROR "D-A2 debug-only maintenance evidence gate drifted")
 endif()
 
+# E1 debug-plane observability: a recovery-pinned host artifact is excluded
+# before victim quoting, and the same pressure attempt reports its eventual
+# floor terminal. These are CACHE_HOST_DESTRUCTION metadata only; neither key
+# may migrate into the public cache-control serializer.
+function(e1_pin_exclusion_observability_valid source output)
+    foreach(needle
+            "void emit_recovery_pin_excluded("
+            "if (!cache.debug_observability) {"
+            "payload[\"evidence_event\"] = \"recovery_pin_excluded\";"
+            "payload[\"recovery_pin_excluded\"] = {"
+            "payload[\"floor_outcome\"] = \"pending\";"
+            "void emit_host_pressure_floor_outcome("
+            "payload[\"evidence_event\"] = \"floor_outcome\";"
+            "payload[\"floor_outcome\"] = outcome;"
+            "if (it->recovery_pins != 0) {"
+            "emit_recovery_pin_excluded(*this, *it);"
+            "emit_host_pressure_floor_outcome(")
+        string(FIND "${source}" "${needle}" found)
+        if (found EQUAL -1)
+            set(${output} FALSE PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${output} TRUE PARENT_SCOPE)
+endfunction()
+
+e1_pin_exclusion_observability_valid(
+    "${server_task}" e1_pin_exclusion_observability)
+if (NOT e1_pin_exclusion_observability)
+    message(FATAL_ERROR
+        "E1 recovery-pin exclusion/floor debug evidence contract drifted")
+endif()
+string(REPLACE
+    "payload[\"recovery_pin_excluded\"] = {"
+    "payload[\"recovery_pin_hidden\"] = {"
+    e1_pin_exclusion_negative "${server_task}")
+e1_pin_exclusion_observability_valid(
+    "${e1_pin_exclusion_negative}" e1_pin_exclusion_negative_valid)
+if (e1_pin_exclusion_negative_valid)
+    message(FATAL_ERROR
+        "E1 recovery-pin exclusion evidence negative control did not trip")
+endif()
+
+file(READ "${SOURCE_ROOT}/tools/server/server-cache-control-wire.cpp"
+    cache_control_wire)
+foreach(private_key "recovery_pin_excluded" "floor_outcome")
+    string(FIND "${cache_control_wire}" "${private_key}" private_key_leak)
+    if (NOT private_key_leak EQUAL -1)
+        message(FATAL_ERROR
+            "E1 debug destruction metadata leaked into cache-control wire: ${private_key}")
+    endif()
+endforeach()
+
 # D-A3 routes both bounded host-pressure loops through one pressure terminal,
 # which owns the fitted-price attempt and the historical FIFO all-refused
 # fallback. A successful trade uses the same shared capability terminal as

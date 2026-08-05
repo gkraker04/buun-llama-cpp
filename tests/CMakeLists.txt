@@ -232,6 +232,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(
         test-cache-control.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control-wire.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
@@ -243,6 +244,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-cache-control PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-cache-control PRIVATE
+        CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-control-v1.json")
     add_test(
         NAME test-e1-control-contract
         COMMAND ${CMAKE_COMMAND}
@@ -253,6 +256,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-family.cmake)
+    add_test(
+        NAME test-e1-http-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-http.cmake)
 
     llama_build_and_test(test-cache-plan-estimate.cpp)
     target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)

@@ -399,7 +399,7 @@ endforeach()
 
 function(body_redaction_valid source output)
     foreach(required
-            "static constexpr char route[] = \"/cache/plan\";"
+            "\"/cache/plan\""
             "server_http_redacts_request_bodies(req.path)"
             "request:  [body redacted]"
             "response: [body redacted]")
@@ -426,10 +426,11 @@ endif()
 
 function(route_no_store_valid source output)
     foreach(required
-            "if (params.cache_receipt || params.cache_plan_preflight)"
-            "const bool e0_route = cache_plan_preflight &&"
+            "if (params.cache_receipt || params.cache_plan_preflight ||"
+            "const bool cache_oracle_route ="
+            "(cache_plan_preflight || cache_control_api) &&"
             "server_http_redacts_request_bodies(req.path)"
-            "if (e0_route ||"
+            "if (cache_oracle_route ||"
             "res.set_header(\"Cache-Control\", \"no-store\")")
         string(FIND "${source}" "${required}" found)
         if (found EQUAL -1)
@@ -445,8 +446,8 @@ if (NOT route_no_store_ok)
         "E0.2 middleware-error responses lost their route-local no-store backstop")
 endif()
 string(REPLACE
-    "const bool e0_route = cache_plan_preflight &&"
-    "const bool e0_route = false && cache_plan_preflight &&"
+    "(cache_plan_preflight || cache_control_api) &&"
+    "(cache_plan_preflight && cache_control_api) &&"
     route_no_store_negative "${http_source}")
 route_no_store_valid("${route_no_store_negative}" route_no_store_negative_ok)
 if (route_no_store_negative_ok)
@@ -455,7 +456,7 @@ endif()
 
 function(gcp_exclusion_valid header source output)
     foreach(required
-            "return path != \"/cache/plan\";"
+            "return path != \"/cache/plan\" &&"
             "if (server_http_gcp_predict_dispatch_allowed(path))"
             "server_http_gcp_predict_dispatch_allowed(format) &&")
         string(FIND "${header}${source}" "${required}" found)
@@ -471,8 +472,8 @@ if (NOT gcp_exclusion_ok)
     message(FATAL_ERROR "E0.2 /predict dispatch exclusion missing")
 endif()
 string(REPLACE
-    "return path != \"/cache/plan\";"
-    "return true;"
+    "return path != \"/cache/plan\" &&"
+    "return true &&"
     gcp_header_negative "${http_header}")
 gcp_exclusion_valid(
     "${gcp_header_negative}" "${http_source}" gcp_exclusion_negative_ok)

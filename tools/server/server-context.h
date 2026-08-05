@@ -18,6 +18,9 @@ class server_cache_control_authority;
 // verifies that host/checkpoint carriers are sourced from that same slot.
 struct server_cache_family_slot_round_trip_result {
     bool resolved = false;
+    bool second_resolved = false;
+    bool roles_distinct = false;
+    bool host_roles_distinct = false;
     bool no_restore_resume = false;
     bool binding_intact = false;
     bool host_save_carries = false;
@@ -27,7 +30,8 @@ struct server_cache_family_slot_round_trip_result {
 server_cache_family_slot_round_trip_result
 server_cache_family_slot_round_trip_for_test(
         server_cache_control_authority & authority,
-        server_cache_control_token binding_token);
+        server_cache_control_token binding_token,
+        server_cache_control_token second_binding_token = {});
 
 struct server_context_meta {
     std::string build_info;
@@ -161,6 +165,7 @@ struct server_routes {
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t post_cache_plan;
+    server_http_context::handler_t post_cache_control;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "server-cache-control.h"
+
 #include <atomic>
 #include <functional>
 #include <map>
@@ -16,9 +18,9 @@ struct common_params;
 // Vertex /predict is a compatibility dispatcher, not an alternate security
 // boundary. Cache-plan preflight is intentionally reachable only through its
 // reviewed route so its no-store and body-redaction contracts cannot be lost.
-constexpr bool server_http_gcp_predict_dispatch_allowed(
+inline bool server_http_gcp_predict_dispatch_allowed(
         std::string_view path) noexcept {
-    return path != "/cache/plan";
+    return path != "/cache/plan" && !server_cache_control_is_route(path);
 }
 
 // generator-like API for HTTP response generation

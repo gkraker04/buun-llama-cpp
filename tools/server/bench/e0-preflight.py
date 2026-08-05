@@ -13,10 +13,9 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import time
-import urllib.error
-import urllib.request
+
+from server_gate_common import ManagedServerArm, header, request, write_bench_stamp
 
 
 # Deliberate live-gate subset. The exhaustive canonical private-key oracle is
@@ -39,37 +38,6 @@ PLANNER_IF_CURRENT_FALLBACK_REASONS = frozenset({
 	"budget_or_lease_unavailable",
 	"destruction_not_certified",
 })
-
-
-def request(base, path, body=None, timeout=600):
-	headers = {}
-	data = None
-	if body is not None:
-		data = json.dumps(body).encode("utf-8")
-		headers["Content-Type"] = "application/json"
-	req = urllib.request.Request(
-		base + path, data=data, headers=headers,
-		method="POST" if data is not None else "GET")
-	try:
-		with urllib.request.urlopen(req, timeout=timeout) as response:
-			payload = response.read()
-			return (response.status,
-				json.loads(payload) if payload else None,
-				dict(response.headers.items()))
-	except urllib.error.HTTPError as error:
-		payload = error.read()
-		try:
-			decoded = json.loads(payload) if payload else None
-		except Exception:
-			decoded = {"raw": payload.decode(errors="replace")}
-		return error.code, decoded, dict(error.headers.items())
-
-
-def header(headers, name):
-	for key, value in headers.items():
-		if key.lower() == name.lower():
-			return value
-	return None
 
 
 def walk_keys(value):
@@ -141,12 +109,11 @@ def cache_plan_slot_evidence(base):
 	return [entry.get("cache_plan") for entry in slots]
 
 
-class ServerArm:
+class ServerArm(ManagedServerArm):
 	def __init__(self, args, name, port, *, preflight, debug, lifecycle,
 			prompt_log_dir=None):
-		self.name = name
-		self.base = f"http://127.0.0.1:{port}"
-		self.log_path = os.path.join(args.workdir, f"server-{name}.log")
+		base = f"http://127.0.0.1:{port}"
+		log_path = os.path.join(args.workdir, f"server-{name}.log")
 		self.vbr_kv = any(
 			value and value.lower() == "vbr" for value in (args.ctk, args.ctv))
 		cmd = [
@@ -171,34 +138,7 @@ class ServerArm:
 			cmd += ["--log-prompts-dir", prompt_log_dir]
 		for extra in args.extra_server_arg:
 			cmd += shlex.split(extra)
-		self.log = open(self.log_path, "w")
-		self.proc = subprocess.Popen(
-			cmd, stdout=self.log, stderr=subprocess.STDOUT)
-
-	def wait_healthy(self, deadline=360):
-		started = time.time()
-		while time.time() - started < deadline:
-			try:
-				status, _, _ = request(self.base, "/health", timeout=5)
-				if status == 200:
-					return
-			except Exception:
-				pass
-			if self.proc.poll() is not None:
-				raise RuntimeError(
-					f"arm {self.name} exited early; see {self.log_path}")
-			time.sleep(1)
-		raise RuntimeError(f"arm {self.name} never became healthy")
-
-	def stop(self):
-		if self.proc.poll() is None:
-			self.proc.terminate()
-			try:
-				self.proc.wait(timeout=30)
-			except subprocess.TimeoutExpired:
-				self.proc.kill()
-				self.proc.wait(timeout=30)
-		self.log.close()
+		super().__init__(name, base, log_path, cmd)
 
 
 def completion(base, prompt, slot, args):
@@ -494,14 +434,8 @@ def cell_log_absence_and_lifecycle_only(args, latencies):
 
 def stamp_workdir(args):
 	os.makedirs(args.workdir, exist_ok=True)
-	stamp = os.path.join(args.workdir, "BENCH_STAMP")
-	with open(stamp, "w") as handle:
-		handle.write(json.dumps({
-			"gate": "e0-preflight",
-			"created_unix": int(time.time()),
-			"server_bin": os.path.abspath(args.server_bin),
-			"model": os.path.abspath(args.model),
-		}, sort_keys=True) + "\n")
+	write_bench_stamp(
+		args.workdir, "e0-preflight", args.model, args.server_bin)
 
 
 def main():

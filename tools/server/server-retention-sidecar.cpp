@@ -109,7 +109,8 @@ void server_retention_sidecar_store::mark_unavailable() noexcept {
 bool server_retention_sidecar_store::install(
         const server_retention_instance_key & key,
         common_retention_artifact_record && record,
-        const server_cache_lease_identity * checkpoint_identity) noexcept {
+        const server_cache_lease_identity * checkpoint_identity,
+        const server_cache_lease_frontier * replacement_frontier) noexcept {
     try {
         if (catalog.size() >= MAX_CATALOG_ARTIFACTS) {
             mark_unavailable();
@@ -128,9 +129,8 @@ bool server_retention_sidecar_store::install(
             return false;
         }
         auto old = associations.find(key);
-        if (old != associations.end()) {
-            retire_association(old);
-        }
+        const auto old_artifact = old == associations.end()
+            ? llama_cache_acct_artifact_id{} : old->second;
 
         catalog_entry entry;
         entry.record = std::move(record);
@@ -140,11 +140,7 @@ bool server_retention_sidecar_store::install(
         }
         entry.encoded_size = bytes;
         auto inserted = catalog.emplace(artifact.v, std::move(entry));
-        if (!inserted.second ||
-            !associations.emplace(key, artifact).second) {
-            if (inserted.second) {
-                catalog.erase(inserted.first);
-            }
+        if (!inserted.second) {
             mark_unavailable();
             return false;
         }
@@ -165,7 +161,6 @@ bool server_retention_sidecar_store::install(
                 bytes,
                 bytes);
             if (!installed.accounting_op) {
-                associations.erase(key);
                 catalog.erase(inserted.first);
                 return false;
             }
@@ -173,6 +168,47 @@ bool server_retention_sidecar_store::install(
         if (!checked_add(bytes_live, bytes)) {
             bytes_live = std::numeric_limits<uint64_t>::max();
             mark_unavailable();
+        }
+
+        // Publish all new backing/accounting state before changing the one
+        // association. A same-key append replacement can then migrate leases
+        // without exposing a missing-artifact interval on the scheduler
+        // thread. New-key insertion is the only throwing step after charge;
+        // roll its complete catalog entry back on failure.
+        if (old != associations.end()) {
+            old->second = artifact;
+        } else {
+            try {
+                if (!associations.emplace(key, artifact).second) {
+                    retire_catalog_entry(inserted.first);
+                    mark_unavailable();
+                    return false;
+                }
+            } catch (...) {
+                retire_catalog_entry(inserted.first);
+                throw;
+            }
+        }
+
+        if (old_artifact.v != 0) {
+            bool continued = false;
+            if (leases && checkpoint_identity && replacement_frontier) {
+                continued = leases->artifact_replaced(
+                    { old_artifact, key.kind, key.owner_slot },
+                    { artifact, key.kind, key.owner_slot },
+                    *checkpoint_identity, *replacement_frontier);
+            }
+            if (leases && !continued) {
+                leases->artifact_retired(old_artifact);
+            }
+            const auto old_entry = catalog.find(old_artifact.v);
+            if (old_entry == catalog.end()) {
+                mark_unavailable();
+            } else if (old_entry->second.recovery_pins != 0) {
+                old_entry->second.retire_pending = true;
+            } else {
+                retire_catalog_entry(old_entry);
+            }
         }
         n_publish_ok++;
         return true;
@@ -190,7 +226,8 @@ bool server_retention_sidecar_store::publish(
         uint64_t turn_token_count,
         uint64_t coverage_tokens,
         bool coverage_valid,
-        const server_cache_lease_identity * checkpoint_identity) noexcept {
+        const server_cache_lease_identity * checkpoint_identity,
+        const server_cache_lease_frontier * replacement_frontier) noexcept {
     common_retention_artifact_record record;
     record.kind = key.kind;
     if (!allocator.issue(pool, record.stamp)) {
@@ -210,7 +247,9 @@ bool server_retention_sidecar_store::publish(
         record.stamp.mapped_turn_ordinal = 0;
         record.stamp.anchor_rank = 0;
     }
-    if (!install(key, std::move(record), checkpoint_identity)) {
+    if (!install(
+            key, std::move(record), checkpoint_identity,
+            replacement_frontier)) {
         retire(key);
         return false;
     }
@@ -247,7 +286,8 @@ bool server_retention_sidecar_store::clone(
             return false;
         }
         if (!install(
-                destination, std::move(record), checkpoint_identity_ptr)) {
+                destination, std::move(record), checkpoint_identity_ptr,
+                nullptr)) {
             retire(destination);
             return false;
         }

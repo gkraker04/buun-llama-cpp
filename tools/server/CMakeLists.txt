@@ -12,6 +12,7 @@ add_library(${TARGET} STATIC
     server-cache-authority.cpp
     server-cache-authority.h
     server-cache-control.cpp
+    server-cache-control-wire.cpp
     server-cache-control.h
     server-cache-destruction-quote.cpp
     server-cache-destruction-quote.h

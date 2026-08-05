@@ -25,11 +25,7 @@
 using json = nlohmann::ordered_json;
 
 json server_task_result_cache_control::to_json() {
-    // E1.1a is scheduler-internal. E1.2 owns the redacted public serializer;
-    // this deliberately contains no holder, lease, content, or proof handle.
-    return json {
-        { "status", server_cache_control_status_name(result.status) },
-    };
+    return server_cache_control_json(operation, result);
 }
 
 //
@@ -2847,6 +2843,7 @@ struct host_trade_ranking {
     llama_cache_acct_artifact_id artifact_id;
     bool zero_destruction = false;
     bool zero_destruction_tie_break = false;
+    common_cache_family_role family_role = common_cache_family_role::_count;
 };
 
 struct host_destruction_certification {
@@ -2889,6 +2886,13 @@ void server_prompt_cache_observe_host_destruction(
             ? json(ranking->zero_destruction) : unavailable;
         payload["zero_destruction_tie_break"] = ranking
             ? json(ranking->zero_destruction_tie_break) : json(false);
+        payload["declared_family_role"] = ranking &&
+                ranking->family_role < common_cache_family_role::_count
+            ? json(ranking->family_role == common_cache_family_role::main
+                ? "main" : ranking->family_role ==
+                    common_cache_family_role::branch
+                    ? "branch" : "background")
+            : json(nullptr);
         payload["legacy_fallbacks"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
         payload["publication_skips"] = cache.destruction_obs
@@ -2897,6 +2901,77 @@ void server_prompt_cache_observe_host_destruction(
         SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
     } catch (...) {
         // Debug evidence must never perturb maintenance or destruction.
+    }
+}
+
+llama_cache_acct_artifact_id host_entry_artifact_id(
+        const server_prompt_cache & cache,
+        const server_prompt_cache_state & state) noexcept {
+    return cache.retention_obs
+        ? cache.retention_obs->artifact_id(
+              server_retention_instance_key::for_host_entry(&state))
+        : llama_cache_acct_artifact_id {};
+}
+
+void emit_recovery_pin_excluded(
+        server_prompt_cache & cache,
+        const server_prompt_cache_state & state) noexcept {
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        const auto artifact = host_entry_artifact_id(cache, state);
+        common_cache_plan_destruction_receipt receipt;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+        json payload = server_cache_destruction_receipt_json(receipt, 0);
+        payload["evidence_event"] = "recovery_pin_excluded";
+        payload["recovery_pin_excluded"] = {
+            { "artifact_id", artifact.v },
+            { "source_id", state.cache_plan_source_id },
+            { "pin_count", state.recovery_pins },
+        };
+        payload["floor_outcome"] = "pending";
+        cache.debug_recovery_pin_exclusions++;
+        cache.debug_last_recovery_pin_excluded = artifact;
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb victim selection or pressure.
+    }
+}
+
+void emit_host_pressure_floor_outcome(
+        server_prompt_cache & cache,
+        const char * outcome,
+        llama_cache_acct_artifact_id victim_artifact,
+        int32_t victim_source_id) noexcept {
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        common_cache_plan_destruction_receipt receipt;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+        json payload = server_cache_destruction_receipt_json(receipt, 0);
+        payload["evidence_event"] = "floor_outcome";
+        payload["recovery_pin_excluded"] = nullptr;
+        payload["floor_outcome"] = outcome;
+        payload["floor_victim_artifact_id"] = victim_artifact.v != 0
+            ? json(victim_artifact.v)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+        payload["floor_victim_source_id"] = victim_source_id >= 0
+            ? json(victim_source_id)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+        cache.debug_host_pressure_floor_outcomes++;
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb the already-chosen terminal.
     }
 }
 
@@ -3152,6 +3227,8 @@ bool host_trade_price(
     out.ranking.ordinal = ordinal;
     out.ranking.source_id = victim->cache_plan_source_id;
     out.ranking.zero_destruction = out.recovery != cache.states.end();
+    out.ranking.family_role = victim->cache_family.declared()
+        ? victim->cache_family.role : common_cache_family_role::_count;
     out.main_family = victim->main_family;
     try {
         auto & authority = *cache.publish_authority;
@@ -3331,9 +3408,11 @@ bool server_prompt_cache::destroy_priced_host_entry(
         server_cache_destruction_reason reason,
         iterator incoming,
         iterator & legacy_floor,
-        common_cache_plan_destruction_reason & floor_reason) {
+        common_cache_plan_destruction_reason & floor_reason,
+        bool & recovery_pin_excluded) {
     legacy_floor = states.end();
     floor_reason = common_cache_plan_destruction_reason::capacity_refused;
+    recovery_pin_excluded = false;
     if (!publish_authority ||
         (reason != server_cache_destruction_reason::host_capacity &&
          reason != server_cache_destruction_reason::host_token_limit)) {
@@ -3351,10 +3430,16 @@ bool server_prompt_cache::destroy_priced_host_entry(
                     "host retention pricing unavailable: lifecycle lease/accounting substrate is incomplete");
         }
         for (auto it = states.begin(); it != states.end(); ++it) {
-            if (it != incoming && it->recovery_pins == 0) {
-                legacy_floor = it;
-                break;
+            if (it == incoming) {
+                continue;
             }
+            if (it->recovery_pins != 0) {
+                recovery_pin_excluded = true;
+                emit_recovery_pin_excluded(*this, *it);
+                continue;
+            }
+            legacy_floor = it;
+            break;
         }
         const uint64_t sequence =
             ++publish_authority->destruction_quote_sequence;
@@ -3375,7 +3460,12 @@ bool server_prompt_cache::destroy_priced_host_entry(
         candidates.reserve(states.size());
         uint32_t ordinal = 0;
         for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
-            if (it == incoming || it->recovery_pins != 0) {
+            if (it == incoming) {
+                continue;
+            }
+            if (it->recovery_pins != 0) {
+                recovery_pin_excluded = true;
+                emit_recovery_pin_excluded(*this, *it);
                 continue;
             }
             host_trade_candidate candidate;
@@ -3507,6 +3597,11 @@ bool server_prompt_cache::destroy_priced_host_entry(
                 chosen->soft_leased,
                 chosen->ranking.zero_destruction_tie_break);
         }
+        if (recovery_pin_excluded) {
+            emit_host_pressure_floor_outcome(
+                *this, "priced_evicted", chosen->ranking.artifact_id,
+                chosen->ranking.source_id);
+        }
         return true;
     }
 
@@ -3557,8 +3652,10 @@ bool server_prompt_cache::evict_front_under_pressure(
     iterator legacy_floor = states.end();
     common_cache_plan_destruction_reason floor_reason =
         common_cache_plan_destruction_reason::capacity_refused;
+    bool recovery_pin_excluded = false;
     if (destroy_priced_host_entry(
-            reason, incoming, legacy_floor, floor_reason)) {
+            reason, incoming, legacy_floor, floor_reason,
+            recovery_pin_excluded)) {
         return true;
     }
 
@@ -3569,11 +3666,18 @@ bool server_prompt_cache::evict_front_under_pressure(
         legacy_floor = states.begin();
     }
     if (legacy_floor != states.end()) {
+        const auto floor_artifact = host_entry_artifact_id(
+            *this, *legacy_floor);
+        const int32_t floor_source_id = legacy_floor->cache_plan_source_id;
         SRV_WRN(
             " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
             legacy_floor->cache_plan_source_id,
             legacy_floor->size() / (1024.0 * 1024.0));
         destroy_entry(legacy_floor, reason);
+        if (recovery_pin_excluded) {
+            emit_host_pressure_floor_outcome(
+                *this, "legacy_evicted", floor_artifact, floor_source_id);
+        }
         return true;
     }
 
@@ -3591,6 +3695,10 @@ bool server_prompt_cache::evict_front_under_pressure(
     }
     if (incoming != states.end()) {
         destroy_entry(incoming, reason);
+    }
+    if (recovery_pin_excluded) {
+        emit_host_pressure_floor_outcome(
+            *this, "publication_skipped", {}, -1);
     }
     return false;
 }

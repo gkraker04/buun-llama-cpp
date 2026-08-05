@@ -161,6 +161,9 @@ server_cache_control_status resolve_control_vbr_fixture(
 struct control_host_refresh_fixture {
     server_prompt_cache * cache = nullptr;
     const std::string * execution_identity = nullptr;
+    const server_prompt * live_prompt = nullptr;
+    int32_t live_slot = -1;
+    std::string live_adapter_identity;
 };
 
 bool refresh_control_host_fixture(
@@ -169,6 +172,24 @@ bool refresh_control_host_fixture(
         server_cache_lease_identity & identity,
         server_cache_lease_frontier & frontier) noexcept {
     auto * fixture = static_cast<control_host_refresh_fixture *>(context);
+    if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+        if (!fixture->live_prompt ||
+            !(selector.retention_key ==
+                server_retention_instance_key::for_slot(fixture->live_slot)) ||
+            !server_cache_lease_build_identity(
+                *fixture->execution_identity,
+                fixture->live_adapter_identity,
+                fixture->live_prompt->tokens,
+                fixture->live_prompt->n_tokens(), identity)) {
+            return false;
+        }
+        frontier = {
+            fixture->live_prompt->sequence_epoch,
+            uint64_t(fixture->live_prompt->n_tokens()),
+            fixture->live_prompt->n_tokens(),
+        };
+        return frontier.valid();
+    }
     const auto * wanted = reinterpret_cast<const server_prompt_cache_state *>(
         selector.retention_key.instance);
     const auto found = std::find_if(
@@ -387,15 +408,18 @@ void test_declared_family_round_trip_and_price() {
     CHECK(!common_cache_family_allows_additional_weight(declared_branch));
 
     // One lineage rule covers slot reuse, undeclared append, and an explicit
-    // declaration joining retained content.
+    // declaration branching from retained content. A tokenizer-global BOS or
+    // shared system prefix is not by itself conversation continuity.
     CHECK(common_cache_family_follow_lineage(
-              declared_main, undeclared, 0) == undeclared);
+              declared_main, undeclared, 0, 3) == undeclared);
     CHECK(common_cache_family_follow_lineage(
-              declared_main, declared_branch, 0) == declared_branch);
+              declared_main, declared_branch, 0, 3) == declared_branch);
     CHECK(common_cache_family_follow_lineage(
-              declared_main, undeclared, 2) == declared_main);
+              declared_main, undeclared, 3, 3) == declared_main);
     CHECK(common_cache_family_follow_lineage(
-              declared_main, declared_branch, 2) == declared_main);
+              declared_main, declared_branch, 3, 3) == declared_main);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 1, 3) == declared_branch);
 
     server_task parent(SERVER_TASK_TYPE_COMPLETION);
     parent.cache_family_binding_token = { 17, 29 };
@@ -428,14 +452,26 @@ void test_declared_family_round_trip_and_price() {
     const auto binding = control.execute(
         server_cache_control_operation::family_bind, binding_request);
     CHECK(binding.status == server_cache_control_status::ok);
+    auto branch_request = binding_request;
+    branch_request.family_role = common_cache_family_role::branch;
+    branch_request.idempotency_key = 3;
+    const auto branch_binding = control.execute(
+        server_cache_control_operation::family_bind, branch_request);
+    CHECK(branch_binding.status == server_cache_control_status::ok);
+    CHECK(!(branch_binding.family_binding == binding.family_binding));
     const auto slot_round_trip =
         server_cache_family_slot_round_trip_for_test(
-            control, binding.family_binding);
+            control, binding.family_binding, branch_binding.family_binding);
     CHECK(slot_round_trip.resolved);
+    CHECK(slot_round_trip.second_resolved);
+    CHECK(slot_round_trip.roles_distinct);
+    CHECK(slot_round_trip.host_roles_distinct);
     CHECK(slot_round_trip.no_restore_resume);
     CHECK(slot_round_trip.binding_intact);
     CHECK(slot_round_trip.host_save_carries);
     CHECK(slot_round_trip.checkpoint_carries);
+    std::puts(
+        "E1_FAMILY two_slot_save PASS main=1 branch=1 distinct=1");
     std::puts(
         "E1_FAMILY actual_slot_resume PASS binding_intact=1 host=1 checkpoint=1");
     std::puts("E1_FAMILY round_trip PASS main_price_equal no_stack");
@@ -482,12 +518,15 @@ void test_lifecycle_full_cache_rotates() {
 void test_lifecycle_restore_retains_immutable_source() {
     server_cache_authority authority;
     configure_host_accounting(authority, true);
+    const std::string execution = "restore-retained-hard-fallback";
 
     server_prompt_cache cache(/* limit_size_mib */ 0, /* limit_tokens */ 0);
     cache.acct = &authority.ledger;
     cache.publish_authority = &authority;
     cache.destruction_obs = &authority.destruction;
     cache.retention_obs = &authority.retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &execution;
 
     auto entry = make_prompt_entry("same", { 1, 2, 3 });
     const common_cache_family_binding declared_branch {
@@ -495,6 +534,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     };
     server_prompt_cache_apply_family(
         entry.front(), declared_branch, true);
+    entry.front().prompt.sequence_epoch = 17;
     entry.front().data.main.assign(32, 7);
     entry.front().prompt.checkpoints.emplace_back();
     entry.front().prompt.checkpoints.back().n_tokens = 2;
@@ -571,6 +611,132 @@ void test_lifecycle_restore_retains_immutable_source() {
     CHECK(authority.destruction.host_restores_retained == 1);
     CHECK(authority.destruction.host_restores_consumed == 0);
 
+    // The HTTP selector is exact. Model the real completion shape: {1,2} is
+    // the submitted request prefix and 3 is the deterministic sampled suffix
+    // stored in both the retained host source and the resumed live slot.
+    // Looking up only the submitted prefix fails before lease admission; the
+    // complete state is the selector that reaches the proof/disjointness door.
+    auto prefix_entry = make_prompt_entry("same", { 1, 2 });
+    CHECK(!cache.acquire_durable_recovery(
+        prefix_entry.front().prompt.tokens, "same",
+        durable_artifact, durable_ops, durable_pin));
+    CHECK(cache.acquire_durable_recovery(
+        live_first.tokens, "same",
+        durable_artifact, durable_ops, durable_pin));
+    durable_pin = {};
+
+    // Exact production shape: a non-consuming restore leaves the source host
+    // node and creates a distinct live-slot sidecar artifact for the same
+    // lineage/frontier. The hard lease must bind the retained physical copy,
+    // not confuse shared lineage with shared storage.
+    const auto host_key = server_retention_instance_key::for_host_entry(
+        &cache.states.front());
+    const auto live_key = server_retention_instance_key::for_slot(4);
+    const auto host_artifact = authority.retention.artifact_id(host_key);
+    const auto live_artifact = authority.retention.artifact_id(live_key);
+    CHECK(host_artifact.v != 0);
+    CHECK(live_artifact.v != 0);
+    CHECK(host_artifact != live_artifact);
+
+    control_host_refresh_fixture refresh {
+        &cache, &execution, &live_first, 4, "same",
+    };
+    server_cache_control_config control_config;
+    control_config.leases = &authority.leases;
+    control_config.retention = &authority.retention;
+    control_config.refresh_context = &refresh;
+    control_config.refresh_subject = refresh_control_host_fixture;
+    control_config.host_proof_context = &cache;
+    control_config.acquire_host_proof = [](void * context,
+        const server_cache_control_selector & selector) noexcept {
+        return server_prompt_cache_host_fallback_proof(
+            *static_cast<server_prompt_cache *>(context), selector);
+    };
+    server_cache_control_authority control(control_config);
+    server_cache_control_request holder_request;
+    holder_request.ttl_ns = 1000000000ULL;
+    const auto holder = control.execute(
+        server_cache_control_operation::holder_create, holder_request);
+    CHECK(holder.status == server_cache_control_status::ok);
+    server_cache_control_request acquire;
+    acquire.holder = holder.holder;
+    acquire.requested_class = server_cache_lease_class::hard;
+    acquire.ttl_ns = holder_request.ttl_ns;
+    acquire.subject.kind = server_cache_control_subject_kind::live_prefix;
+    acquire.subject.retention_key = live_key;
+    acquire.fallback.kind = server_cache_control_subject_kind::host_snapshot;
+    acquire.fallback.retention_key = host_key;
+    const auto hard = control.execute(
+        server_cache_control_operation::lease_acquire, acquire);
+    CHECK(hard.status == server_cache_control_status::ok);
+    CHECK(cache.states.front().recovery_pins == 1);
+
+    // A decoded append preserves the live artifact identity. Only the
+    // frontier advances. Drive the real release-time sidecar publication: it
+    // mints a new immutable record, migrates the lease from the old physical
+    // record, and leaves the range beyond its proof partially stale.
+    live_first.tokens.insert(llama_tokens { 4 });
+    server_cache_lease_identity append_identity;
+    CHECK(server_cache_lease_build_identity(
+        execution, "same", live_first.tokens,
+        live_first.n_tokens(), append_identity));
+    const server_cache_lease_frontier append_frontier {
+        live_first.sequence_epoch,
+        uint64_t(live_first.n_tokens()),
+        live_first.n_tokens(),
+    };
+    CHECK(authority.retention.publish(
+        live_key, common_retention_pool::attention, checkpoint_spans,
+        false, uint64_t(live_first.n_tokens()),
+        uint64_t(live_first.n_tokens()), true,
+        &append_identity, &append_frontier));
+    const auto appended_artifact = authority.retention.artifact_id(live_key);
+    CHECK(appended_artifact.v != 0);
+    CHECK(appended_artifact != live_artifact);
+    CHECK(!server_cache_lease_is_hard(
+        authority.leases.inspect(live_artifact, append_identity)));
+    CHECK(server_cache_lease_is_hard(
+        authority.leases.inspect(appended_artifact, append_identity)));
+    server_cache_control_request inspect;
+    inspect.holder = holder.holder;
+    inspect.lease = hard.lease;
+    const auto partial = control.execute(
+        server_cache_control_operation::lease_inspect, inspect);
+    CHECK(partial.status ==
+          server_cache_control_status::partially_stale);
+    CHECK(partial.proven_frontier.token_count == 3);
+    CHECK(partial.lease_frontier.token_count == 4);
+    // The migrated hard lease must still own its retained-host proof before
+    // explicit release. The terminal zero check alone would not detect a pin
+    // accidentally dropped during artifact replacement.
+    CHECK(cache.states.front().recovery_pins == 1);
+
+    // Adapter/media/execution changes are identity changes, not frontier
+    // growth. The real lease-table rebound terminal must still fail closed.
+    server_cache_lease_identity changed_identity;
+    CHECK(server_cache_lease_build_identity(
+        execution, "different-adapter", live_first.tokens,
+        live_first.n_tokens(), changed_identity));
+    CHECK(authority.leases.artifact_rebound(
+        appended_artifact, changed_identity));
+    CHECK(control.execute(
+        server_cache_control_operation::lease_inspect,
+        inspect).status == server_cache_control_status::subject_lost);
+
+    server_cache_control_request lease_release;
+    lease_release.holder = holder.holder;
+    lease_release.lease = hard.lease;
+    CHECK(control.execute(
+        server_cache_control_operation::lease_release,
+        lease_release).status == server_cache_control_status::ok);
+    CHECK(cache.states.front().recovery_pins == 0);
+    std::printf(
+        "E1_TWO_COPIES restored_host_fallback PASS live=%" PRIu64
+        " appended=%" PRIu64 " host=%" PRIu64
+        " distinct=1 prefix_lookup=0 append=partially_stale"
+        " adapter_rebind=subject_lost\n",
+        live_artifact.v, appended_artifact.v, host_artifact.v);
+
     server_prompt_cache_restore_delivery second;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), second));
     CHECK(second.cache_family == declared_branch);
@@ -619,6 +785,84 @@ void test_lifecycle_restore_retains_immutable_source() {
     authority.retention.retire_slot(5);
     CHECK(authority.ledger.snapshot().live_ops == 0);
     CHECK(authority.destruction.prepared_release_commits == 1);
+}
+
+void test_implicit_soft_append_chain_is_bounded() {
+    server_cache_authority authority;
+    configure_host_accounting(authority, true);
+    const std::string execution = "implicit-soft-append-bound";
+    const auto key = server_retention_instance_key::for_slot(19);
+    const auto scope = authority.leases.new_context_scope();
+    CHECK(scope.v != 0);
+    common_chat_msg_spans spans;
+    server_tokens tokens(llama_tokens { 31 }, false);
+    const uint64_t sequence_epoch = 91;
+    server_cache_lease_id first_lease;
+
+    for (size_t turn = 0; turn < 32; ++turn) {
+        const auto source_artifact = authority.retention.artifact_id(key);
+        if (turn == 1) {
+            const server_cache_lease_subject stale_marker {
+                source_artifact,
+                common_retention_artifact_kind::live_slot,
+                19,
+            };
+            authority.leases.artifact_identity_unavailable(stale_marker);
+            server_cache_lease_replay_result marked;
+            CHECK(server_cache_lease_table::replay(
+                authority.leases.event_snapshot(), marked));
+            CHECK(std::any_of(
+                marked.identity_unavailable.begin(),
+                marked.identity_unavailable.end(),
+                [&](const auto & value) {
+                    return value.artifact == source_artifact;
+                }));
+        }
+
+        server_cache_lease_identity identity;
+        CHECK(server_cache_lease_build_identity(
+            execution, "append-adapter", tokens, tokens.size(), identity));
+        const server_cache_lease_frontier frontier {
+            sequence_epoch, uint64_t(tokens.size()), int64_t(tokens.size()),
+        };
+        CHECK(authority.retention.publish(
+            key, common_retention_pool::attention, spans, false,
+            uint64_t(tokens.size()), uint64_t(tokens.size()), true,
+            &identity, source_artifact.v != 0 ? &frontier : nullptr));
+        const auto artifact = authority.retention.artifact_id(key);
+        CHECK(artifact.v != 0);
+        const auto lease = authority.leases.grant_soft(
+            { artifact, common_retention_artifact_kind::live_slot, 19 },
+            server_cache_lease_scope::from(scope), identity,
+            server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+        CHECK(bool(lease));
+        if (turn == 0) {
+            first_lease = lease;
+        } else {
+            CHECK(lease == first_lease);
+        }
+        server_cache_lease_replay_result replayed;
+        CHECK(server_cache_lease_table::replay(
+            authority.leases.event_snapshot(), replayed));
+        CHECK(replayed.active.size() == 1);
+        if (source_artifact.v != 0) {
+            CHECK(std::none_of(
+                replayed.identity_unavailable.begin(),
+                replayed.identity_unavailable.end(),
+                [&](const auto & value) {
+                    return value.artifact == source_artifact;
+                }));
+        }
+        tokens.insert(llama_tokens { llama_token(32 + turn) });
+    }
+
+    authority.retention.retire(key);
+    server_cache_lease_replay_result retired;
+    CHECK(server_cache_lease_table::replay(
+        authority.leases.event_snapshot(), retired));
+    CHECK(retired.active.empty());
+    CHECK(authority.ledger.snapshot().live_ops == 0);
+    std::puts("E1_FAMILY implicit_soft_append_bound PASS turns=32 leases=1");
 }
 
 void test_durable_recovery_binds_exact_published_peer() {
@@ -1528,7 +1772,9 @@ void test_host_trade_zero_destruction_tie_break() {
     CHECK(authority.destruction.host_trade_attempted == 1);
     CHECK(authority.destruction.host_trade_refused == 0);
     CHECK(authority.destruction.host_trade_zero_destruction_ties == 1);
-    CHECK(cache.debug_destruction_emissions == 3);
+    CHECK(cache.debug_recovery_pin_exclusions == 1);
+    CHECK(cache.debug_host_pressure_floor_outcomes == 1);
+    CHECK(cache.debug_destruction_emissions == 5);
 }
 
 void test_host_trade_all_refuse_falls_back_to_legacy() {
@@ -1647,7 +1893,9 @@ void test_host_trade_floor_skips_recovery_pin() {
         pinned->prompt.n_tokens(),
     };
     control_vbr_fixture vbr { identity, frontier };
-    control_host_refresh_fixture refresh { &cache, &execution };
+    control_host_refresh_fixture refresh;
+    refresh.cache = &cache;
+    refresh.execution_identity = &execution;
     server_cache_control_config config;
     config.leases = &authority.leases;
     config.retention = &authority.retention;
@@ -1683,6 +1931,10 @@ void test_host_trade_floor_skips_recovery_pin() {
         server_cache_control_operation::lease_acquire, acquire);
     CHECK(granted.status == server_cache_control_status::ok);
     CHECK(pinned->recovery_pins == 1);
+    const auto pinned_artifact = authority.retention.artifact_id(
+        server_retention_instance_key::for_host_entry(&*pinned));
+    CHECK(pinned_artifact.v != 0);
+    cache.debug_observability = true;
 
     cache.limit_tokens = 3;
     cache.update();
@@ -1690,6 +1942,10 @@ void test_host_trade_floor_skips_recovery_pin() {
     CHECK(!host_source_present(cache, 22));
     CHECK(authority.destruction.host_trade_refused == 1);
     CHECK(authority.destruction.host_trade_legacy_fallbacks == 1);
+    CHECK(cache.debug_recovery_pin_exclusions == 1);
+    CHECK(cache.debug_host_pressure_floor_outcomes == 1);
+    CHECK(cache.debug_last_recovery_pin_excluded == pinned_artifact);
+    CHECK(cache.debug_destruction_emissions == 3);
     std::printf(
         "E1_TWO_COPIES floor_vs_pinned_fallback PASS pinned=%d open=%d pins=%u\n",
         host_source_present(cache, 21) ? 1 : 0,
@@ -1724,7 +1980,9 @@ void test_cache_control_shutdown_drains_host_pin() {
         fallback->prompt.n_tokens(),
     };
     control_vbr_fixture vbr { identity, frontier };
-    control_host_refresh_fixture refresh { &cache, &execution };
+    control_host_refresh_fixture refresh;
+    refresh.cache = &cache;
+    refresh.execution_identity = &execution;
     server_cache_control_config config;
     config.leases = &authority.leases;
     config.retention = &authority.retention;
@@ -2229,6 +2487,7 @@ int main(int argc, char ** argv) {
     test_lifecycle_full_cache_rotates();
     test_declared_family_round_trip_and_price();
     test_lifecycle_restore_retains_immutable_source();
+    test_implicit_soft_append_chain_is_bounded();
     test_durable_recovery_binds_exact_published_peer();
     test_unlaunched_disarm_releases_recovery_pin();
     test_displacement_save_order_preserves_prefix_recovery();

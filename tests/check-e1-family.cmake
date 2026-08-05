@@ -3,6 +3,7 @@ if(NOT DEFINED SOURCE_ROOT)
 endif()
 
 file(READ "${SOURCE_ROOT}/common/common.h" common_header)
+file(READ "${SOURCE_ROOT}/common/common-cache-family.h" family_header)
 file(READ "${SOURCE_ROOT}/common/common-checkpoint-shadow.cpp" checkpoint_source)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.h" task_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.cpp" task_source)
@@ -95,6 +96,16 @@ function(single_carrier_valid task context output)
     endif()
 endfunction()
 
+function(lineage_boundary_valid source output)
+    string(FIND "${source}"
+        "retained_prefix == current_tokens" full_prefix)
+    if(full_prefix EQUAL -1)
+        set(${output} FALSE PARENT_SCOPE)
+    else()
+        set(${output} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(task_strong_binding_absent task output)
     string(FIND "${task}"
         "common_cache_family_binding cache_family;" found)
@@ -131,6 +142,11 @@ endif()
 single_carrier_valid("${task_source}" "${context_source}" carrier_price_ok)
 if(NOT carrier_price_ok)
     message(FATAL_ERROR "E1.1b single pricing carrier contract failed")
+endif()
+
+lineage_boundary_valid("${family_header}" lineage_boundary_ok)
+if(NOT lineage_boundary_ok)
+    message(FATAL_ERROR "E1.1b append-stable lineage boundary missing")
 endif()
 
 require_token("${control_source}" "holder.family_bindings"
@@ -255,6 +271,13 @@ set(bad_task_struct
 task_strong_binding_absent("${bad_task_struct}" bad_task_absent)
 if(bad_task_absent)
     message(FATAL_ERROR "task-strong-binding negative control did not trip")
+endif()
+
+string(REPLACE "retained_prefix == current_tokens"
+    "retained_prefix != 0" bad_family_header "${family_header}")
+lineage_boundary_valid("${bad_family_header}" bad_lineage_boundary_ok)
+if(bad_lineage_boundary_ok)
+    message(FATAL_ERROR "lineage-boundary negative control did not trip")
 endif()
 
 set(bad_production

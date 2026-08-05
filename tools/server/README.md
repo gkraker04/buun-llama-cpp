@@ -226,6 +226,7 @@ is forced when `-np > 1`.
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--cache-plan-preflight` | expose trusted-local `POST /cache/plan` point-in-time previews (default: disabled)<br/>(env: LLAMA_ARG_CACHE_PLAN_PREFLIGHT) |
+| `--cache-control-api` | expose the trusted-local E1 holder/family/lease control routes; requires `--cache-lifecycle` (default: disabled)<br/>(env: LLAMA_ARG_CACHE_CONTROL_API) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
@@ -941,6 +942,46 @@ curl --request POST http://127.0.0.1:8080/cache/plan \
   --header "Content-Type: application/json" \
   --data '{"prompt":"Hello","cache_prompt":true}'
 ```
+
+### POST `/cache/...`: Trusted-local cache control
+
+`--cache-control-api --cache-lifecycle` registers the E1 holder, family, and
+lease routes under `/cache/holders/*`, `/cache/families/*`,
+`/cache/leases/*`, and `/cache/events/query`. The surface has the same
+single-model, loopback/Unix-socket, at-most-one-key boundary as cache-plan
+preflight. All operations run on the scheduler thread; HTTP workers cannot
+directly grant a lease or resolve cache content.
+
+With `--cache-debug`, host-pressure destruction evidence uses
+`recovery_pin_excluded` to name artifacts omitted before quoting and
+`floor_outcome` to report the resulting pressure terminal; these fields are
+debug log metadata, not cache-control wire fields.
+
+Create a holder, register/bind a family role, or acquire a soft/hard lease by
+POSTing the strict JSON objects documented by each response. Every result uses
+`{"object":"cache_control","schema_version":1,"status":...,"result":...}`.
+Opaque holder, recovery, family, binding, and lease strings are bearer handles;
+they must not be logged or placed in URLs. Wrong-holder and unknown handles are
+both reported as `not_found`.
+
+Declared family identity follows retained content. An exact/full-prefix append
+keeps the current declaration; a ledger trim, context shift, branch, or
+replacement adopts the incoming role for that turn. Clients that want a
+declare-once role to remain sticky across those lineage changes must resend the
+family binding token.
+
+Soft leases price retention but never veto eviction. Hard leases require an
+already-durable retained-host or sealed-artifact fallback; the server never
+auto-captures one. Release is explicit, does not itself erase content, and only
+reprices later choices. The v1 hard floor is `t4`; stricter VBR enforcement is
+not exposed until its separately gated controller unit lands. On a VBR live
+prefix, hard acquire therefore returns `not_supported` in this sequencing
+window, or explicitly returns `granted_class:"soft"` when the request opted
+into `allow_soft_fallback:true`.
+
+Every cache-control response carries `Cache-Control: no-store`. Route bodies
+and bearer handles bypass request-body and prompt-file logging. These routes are
+trusted-local controls, not a tenant-partitioned remote API.
 
 ### GET `/slots`: Returns the current slots processing state
 

@@ -138,6 +138,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }
+    if (params.cache_control_api &&
+        (!params.cache_lifecycle || is_router_server ||
+         !server_cache_plan_preflight_exposure_allowed(
+             params.hostname, params.api_keys.size()))) {
+        SRV_ERR("%s", "--cache-control-api requires --cache-lifecycle and a single-model, trusted-local, single-principal server\n");
+        return 1;
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
@@ -273,6 +280,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     ctx_http.post("/cache/plan",                ex_wrapper(routes.post_cache_plan));
+    if (params.cache_control_api) {
+        for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
+            ctx_http.post(std::string(route.path),
+                          ex_wrapper(routes.post_cache_control));
+        }
+    }
 
     // resumable streaming, the conversation_id is the session identity end to end. router and
     // child wire different handlers under the same paths: a child binds the local session

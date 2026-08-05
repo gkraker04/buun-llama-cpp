@@ -461,6 +461,10 @@ struct server_slot {
     server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
     server_cache_lease_table * lease_obs = nullptr;
+    // One scheduler-owned context scope follows this slot across immutable
+    // append replacements. Reusing it lets grant_soft renew the migrated
+    // implicit lease instead of accumulating one lease per completion turn.
+    server_cache_context_scope_id implicit_soft_lease_scope;
     const std::string * lease_execution_identity = nullptr;
     server_cache_authority * lifecycle_authority = nullptr;
     bool cache_debug_observability = false;
@@ -1474,35 +1478,58 @@ struct server_slot {
 
             if (retention_obs) {
                 if (!task->is_child() && prompt.n_tokens() > 0) {
+                    const auto live_key =
+                        server_retention_instance_key::for_slot(id);
+                    const auto prior_artifact =
+                        retention_obs->artifact_id(live_key);
+                    server_cache_lease_identity identity;
+                    const bool identity_known = lease_obs &&
+                        lease_execution_identity &&
+                        server_cache_lease_build_identity(
+                            *lease_execution_identity,
+                            lora_config_identity(lora), prompt.tokens,
+                            prompt.n_tokens(), identity);
+                    const server_cache_lease_frontier frontier {
+                        prompt.sequence_epoch,
+                        uint64_t(prompt.n_tokens()),
+                        prompt.n_tokens(),
+                    };
+                    // launch_slot_with_task leaves the prior association in
+                    // place only for exact append continuity. Publication
+                    // still refreshes the immutable retention record, then
+                    // atomically migrates matching leases to its fresh
+                    // artifact after checking identity and proven-frontier
+                    // containment. A trim/rebind has no prior association and
+                    // therefore reaches the normal subject_lost terminal.
                     const bool published = retention_obs->publish(
-                        server_retention_instance_key::for_slot(id),
-                        retention_pool,
-                        task->params.message_spans,
-                        !task->params.message_spans.spans.empty(),
-                        uint64_t(prompt.n_tokens()),
-                        uint64_t(prompt.n_tokens()),
-                        prompt.n_tokens() >= 0);
+                            live_key,
+                            retention_pool,
+                            task->params.message_spans,
+                            !task->params.message_spans.spans.empty(),
+                            uint64_t(prompt.n_tokens()),
+                            uint64_t(prompt.n_tokens()),
+                            prompt.n_tokens() >= 0,
+                            identity_known ? &identity : nullptr,
+                            identity_known && prior_artifact.v != 0
+                                ? &frontier : nullptr);
                     if (published && lease_obs) {
-                        server_cache_lease_identity identity;
                         const auto artifact = retention_obs->artifact_id(
-                            server_retention_instance_key::for_slot(id));
-                        const auto scope = lease_obs->new_context_scope();
+                            live_key);
+                        if (!implicit_soft_lease_scope.v) {
+                            implicit_soft_lease_scope =
+                                lease_obs->new_context_scope();
+                        }
                         const server_cache_lease_subject subject {
                             artifact,
                             common_retention_artifact_kind::live_slot,
                             id,
                         };
-                        if (lease_execution_identity &&
-                            server_cache_lease_build_identity(
-                                *lease_execution_identity,
-                                lora_config_identity(lora),
-                                prompt.tokens,
-                                prompt.n_tokens(),
-                                identity) &&
-                            subject.valid() && scope.v != 0) {
+                        if (identity_known &&
+                            subject.valid() &&
+                            implicit_soft_lease_scope.v != 0) {
                             (void) lease_obs->grant_soft(
                                 subject,
-                                server_cache_lease_scope::from(scope),
+                                server_cache_lease_scope::from(implicit_soft_lease_scope),
                                 identity,
                                 server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
                         } else if (subject.valid()) {
@@ -1973,7 +2000,8 @@ struct server_slot {
 server_cache_family_slot_round_trip_result
 server_cache_family_slot_round_trip_for_test(
         server_cache_control_authority & authority,
-        server_cache_control_token binding_token) {
+        server_cache_control_token binding_token,
+        server_cache_control_token second_binding_token) {
     server_cache_family_slot_round_trip_result result;
     common_cache_family_binding incoming;
     result.resolved = server_cache_family_resolve_for_launch(
@@ -1986,7 +2014,7 @@ server_cache_family_slot_round_trip_for_test(
     server_slot slot {};
     slot.id = 0;
     slot.cache_family = common_cache_family_follow_lineage(
-        {}, incoming, 0);
+        {}, incoming, 0, 0);
     slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
     slot.prompt.sequence_epoch = 1;
 
@@ -2017,6 +2045,39 @@ server_cache_family_slot_round_trip_for_test(
     common_prompt_checkpoint checkpoint;
     checkpoint.cache_family = slot.cache_family;
     result.checkpoint_carries = checkpoint.cache_family == incoming;
+
+    if (second_binding_token) {
+        common_cache_family_binding second;
+        result.second_resolved = server_cache_family_resolve_for_launch(
+            &authority, second_binding_token, second) ==
+                server_cache_control_status::ok;
+        result.roles_distinct = result.second_resolved &&
+            incoming.family == second.family && incoming.role != second.role;
+        if (result.roles_distinct) {
+            server_slot second_slot {};
+            second_slot.id = 1;
+            second_slot.cache_family = common_cache_family_follow_lineage(
+                {}, second, 0, 0);
+            second_slot.prompt.tokens = server_tokens(
+                llama_tokens { 5, 6, 7 }, false);
+            second_slot.prompt.sequence_epoch = 2;
+
+            server_prompt_cache two_slot_cache(0, 0);
+            auto first_staged = two_slot_cache.stage(
+                slot.prompt, 8, 0, "family-pair-first");
+            auto second_staged = two_slot_cache.stage(
+                second_slot.prompt, 8, 0, "family-pair-second");
+            if (!first_staged.empty() && !second_staged.empty()) {
+                server_prompt_cache_apply_family(
+                    first_staged.front(), slot.cache_family, true);
+                server_prompt_cache_apply_family(
+                    second_staged.front(), second_slot.cache_family, true);
+                result.host_roles_distinct =
+                    first_staged.front().cache_family == incoming &&
+                    second_staged.front().cache_family == second;
+            }
+        }
+    }
     return result;
 }
 
@@ -7628,18 +7689,30 @@ private:
             task.tokens = server_tokens(toks, task.tokens.has_mtmd);
         }
 
-        if (slot.retention_obs) {
+        // The binding follows retained immutable content. Only a full-prefix
+        // append/resume keeps the existing lineage; a branch/replacement
+        // adopts the incoming declaration even when BOS or a shared system
+        // prefix overlaps. Children carry the opaque token and later copy the
+        // parent's resolved slot binding.
+        const size_t retained_prefix =
+            slot.prompt.tokens.get_common_prefix(task.tokens);
+        // A live-prefix lease binds the execution/adapter/media identity while
+        // its proven token boundary lives in the lease frontier. Preserve the
+        // sidecar artifact only when the entire decoded ledger is an exact
+        // prefix of the incoming request. That is an append of the same
+        // physical live copy: inspect must report partially_stale until renew.
+        // A trim, branch, or zero-overlap replacement retires the artifact and
+        // keeps subject_lost as the fail-closed identity-change terminal.
+        const bool append_continuity =
+            !slot.prompt.tokens.empty() &&
+            retained_prefix == slot.prompt.tokens.size();
+        if (slot.retention_obs && !append_continuity) {
             slot.retention_obs->retire(
                 server_retention_instance_key::for_slot(slot.id));
         }
-        // The binding follows retained immutable content. A new conversation
-        // (zero prefix) adopts the incoming declaration or the undeclared
-        // default; an append/resume keeps the existing lineage. Children carry
-        // the opaque token and later copy the parent's resolved slot binding.
-        const size_t retained_prefix =
-            slot.prompt.tokens.get_common_prefix(task.tokens);
         slot.cache_family = common_cache_family_follow_lineage(
-            slot.cache_family, incoming_family, retained_prefix);
+            slot.cache_family, incoming_family, retained_prefix,
+            slot.prompt.tokens.size());
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -8245,6 +8318,63 @@ private:
         return false;
     }
 
+    server_cache_control_status cache_control_resolve_semantic_selector(
+            server_cache_control_selector & selector,
+            const server_task::cache_control_semantic_selector & semantic) noexcept {
+        if (selector.kind == server_cache_control_subject_kind::vbr_reference ||
+            selector.kind == server_cache_control_subject_kind::live_checkpoint) {
+            return server_cache_control_status::ok;
+        }
+        if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+            const auto slot = std::find_if(
+                slots.begin(), slots.end(), [&](const server_slot & value) {
+                    return value.id == semantic.slot_id;
+                });
+            if (slot == slots.end() || slot->prompt.n_tokens() == 0) {
+                return server_cache_control_status::not_found;
+            }
+            if (slot->is_processing()) {
+                return server_cache_control_status::subject_busy;
+            }
+            selector.retention_key =
+                server_retention_instance_key::for_slot(slot->id);
+            return cache_control_refresh_prompt(
+                slot->prompt, lora_config_identity(slot->lora),
+                selector.identity, selector.frontier)
+                    ? server_cache_control_status::ok
+                    : server_cache_control_status::identity_unavailable;
+        }
+        if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+            if (!prompt_cache || !semantic.tokens) {
+                return server_cache_control_status::not_found;
+            }
+            const auto requested_lora = semantic.lora.empty()
+                ? params_base.lora_adapters
+                : construct_lora_list(semantic.lora);
+            const std::string adapter_identity =
+                lora_config_identity(requested_lora);
+            const auto state = std::find_if(
+                prompt_cache->states.begin(), prompt_cache->states.end(),
+                [&](const server_prompt_cache_state & value) {
+                    return value.adapter_config_key == adapter_identity &&
+                        value.prompt.tokens.size() == semantic.tokens->size() &&
+                        value.prompt.tokens.get_common_prefix(*semantic.tokens) ==
+                            semantic.tokens->size();
+                });
+            if (state == prompt_cache->states.end()) {
+                return server_cache_control_status::not_found;
+            }
+            selector.retention_key =
+                server_retention_instance_key::for_host_entry(&*state);
+            return cache_control_refresh_prompt(
+                state->prompt, state->adapter_config_key,
+                selector.identity, selector.frontier)
+                    ? server_cache_control_status::ok
+                    : server_cache_control_status::identity_unavailable;
+        }
+        return server_cache_control_status::not_supported;
+    }
+
     bool cache_plan_preflight_inputs_current(
             const common_cache_plan_record & rec,
             const server_slot & legacy_target,
@@ -8775,6 +8905,7 @@ private:
                     const auto operation = static_cast<
                         server_cache_control_operation>(
                             task.type - SERVER_TASK_TYPE_CACHE_HOLDER_CREATE);
+                    res->operation = operation;
                     const auto precheck = server_cache_control_task_precheck(
                         task.cache_control != nullptr,
                         params_base.cache_lifecycle,
@@ -8806,11 +8937,104 @@ private:
                                             *cache, selector)
                                         : server_cache_durable_fallback_proof{};
                                 };
+                                config.selector_evidence_context = prompt_cache.get();
+                                config.selector_evidence = [](void *,
+                                    const server_cache_control_selector & selector,
+                                    uint64_t & bytes, bool & shared) noexcept {
+                                    bytes = 0;
+                                    shared = false;
+                                    if (selector.kind !=
+                                            server_cache_control_subject_kind::host_snapshot ||
+                                        selector.retention_key.kind !=
+                                            common_retention_artifact_kind::host_entry ||
+                                        selector.retention_key.instance == 0) {
+                                        return false;
+                                    }
+                                    const auto * state = reinterpret_cast<
+                                        const server_prompt_cache_state *>(
+                                            selector.retention_key.instance);
+                                    bytes = state->size();
+                                    shared = state->recovery_pins > 1;
+                                    return true;
+                                };
                                 cache_control_authority = std::make_unique<
                                     server_cache_control_authority>(config);
                             }
-                            res->result = cache_control_authority->execute(
-                                operation, *task.cache_control);
+                            server_cache_control_request request =
+                                *task.cache_control;
+                            server_cache_control_status selector_status =
+                                server_cache_control_status::ok;
+                            if (operation ==
+                                    server_cache_control_operation::lease_acquire) {
+                                // E1.1c owns VBR controller enforcement and
+                                // the three legacy reclaim-door guards. Until
+                                // that unit lands, never publish a hard live
+                                // promise that those paths cannot yet honor.
+                                if (request.requested_class ==
+                                        server_cache_lease_class::hard &&
+                                    request.subject.kind ==
+                                        server_cache_control_subject_kind::live_prefix &&
+                                    params_base.vbr_enabled()) {
+                                    if (request.allow_soft_fallback) {
+                                        request.requested_class =
+                                            server_cache_lease_class::soft;
+                                    } else {
+                                        selector_status =
+                                            server_cache_control_status::not_supported;
+                                    }
+                                }
+                                if (selector_status ==
+                                        server_cache_control_status::ok) {
+                                    selector_status =
+                                        cache_control_resolve_semantic_selector(
+                                            request.subject,
+                                            task.cache_control_subject);
+                                }
+                                if (selector_status ==
+                                        server_cache_control_status::ok &&
+                                    request.requested_class ==
+                                        server_cache_lease_class::hard) {
+                                    selector_status =
+                                        cache_control_resolve_semantic_selector(
+                                            request.fallback,
+                                            task.cache_control_fallback);
+                                    if (selector_status !=
+                                            server_cache_control_status::ok &&
+                                        request.allow_soft_fallback) {
+                                        // Keep the unresolved exact selector:
+                                        // the authority remains the sole policy
+                                        // point for an explicitly authorized
+                                        // hard->soft downgrade and reports the
+                                        // effective class.
+                                        selector_status =
+                                            server_cache_control_status::ok;
+                                    } else if (selector_status ==
+                                            server_cache_control_status::not_found) {
+                                        selector_status =
+                                            server_cache_control_status::fallback_unavailable;
+                                    }
+                                }
+                            } else if (operation ==
+                                    server_cache_control_operation::lease_renew &&
+                                request.fallback.kind <
+                                    server_cache_control_subject_kind::_count) {
+                                selector_status =
+                                    cache_control_resolve_semantic_selector(
+                                        request.fallback,
+                                        task.cache_control_fallback);
+                                if (selector_status ==
+                                        server_cache_control_status::not_found) {
+                                    selector_status =
+                                        server_cache_control_status::fallback_unavailable;
+                                }
+                            }
+                            if (selector_status !=
+                                    server_cache_control_status::ok) {
+                                res->result.status = selector_status;
+                            } else {
+                                res->result = cache_control_authority->execute(
+                                    operation, request);
+                            }
                         } catch (...) {
                             res->result.status =
                                 server_cache_control_status::internal_fault;
@@ -13447,6 +13671,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
         delimiters.tokenize(ctx_server.vocab);
 
+        server_cache_control_token family_binding_token;
+        if (data.contains("family_binding")) {
+            if (!params.cache_control_api ||
+                !data.at("family_binding").is_string() ||
+                !server_cache_control_decode_handle(
+                    server_cache_control_handle_kind::family_binding,
+                    data.at("family_binding").get<std::string>(),
+                    family_binding_token)) {
+                throw std::runtime_error(
+                    "family_binding requires --cache-control-api and a valid opaque binding");
+            }
+        }
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
@@ -13463,6 +13700,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.cache_family_binding_token = family_binding_token;
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -13993,6 +14231,186 @@ void server_routes::init_routes() {
             server_task_result_cache_plan_preflight *>(result.get());
         GGML_ASSERT(preview != nullptr);
         res->ok(preview->to_json());
+        return res;
+    };
+
+    this->post_cache_control = [this](const server_http_req & req) {
+        auto res = create_response();
+        res->headers["Cache-Control"] = "no-store";
+
+        server_cache_control_operation operation =
+            server_cache_control_operation::_count;
+        GGML_ASSERT(params.cache_control_api &&
+                    server_cache_control_operation_for_path(req.path, operation));
+
+        auto request = std::make_shared<server_cache_control_request>();
+        server_task task = server_task::cache_control_task(operation);
+        task.id = res->rd.get_new_id();
+
+        const auto typed_status = [&](server_cache_control_status status,
+                                      int http_status = 200) {
+            server_cache_control_result result;
+            result.status = status;
+            const auto body = server_cache_control_json(operation, result);
+            if (http_status == 400) {
+                res->status = 400;
+                res->data = safe_json_to_str(body);
+            } else {
+                res->ok(body);
+            }
+        };
+        const auto parse_selector = [&](const json & value,
+                                        server_cache_control_selector & selector,
+                                        server_task::cache_control_semantic_selector & semantic) {
+            if (!value.is_object() || !value.contains("kind") ||
+                !value.at("kind").is_string()) {
+                return false;
+            }
+            const std::string kind = value.at("kind").get<std::string>();
+            if (!server_cache_control_parse_subject_kind(kind, selector.kind)) {
+                return false;
+            }
+            // Authorize the complete shape before prompt tokenization. No
+            // rejected field may consume tokenizer/model work on the worker.
+            for (const auto & field : value.items()) {
+                if (!server_cache_control_selector_field_allowed(
+                        selector.kind, field.key())) {
+                    return false;
+                }
+            }
+            if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+                if (!value.contains("slot_id") ||
+                    !value.at("slot_id").is_number_integer()) {
+                    return false;
+                }
+                const int64_t slot_id = value.at("slot_id").get<int64_t>();
+                if (slot_id < std::numeric_limits<int32_t>::min() ||
+                    slot_id > std::numeric_limits<int32_t>::max()) {
+                    return false;
+                }
+                semantic.slot_id = int32_t(slot_id);
+            } else if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+                if (!value.contains("prompt")) {
+                    return false;
+                }
+                auto inputs = tokenize_input_prompts(
+                    ctx_server.vocab, ctx_server.mctx,
+                    value.at("prompt"), true, true);
+                if (inputs.size() != 1) {
+                    return false;
+                }
+                if (value.contains("lora")) {
+                    if (!value.at("lora").is_array()) {
+                        return false;
+                    }
+                    semantic.lora = parse_lora_request(value.at("lora"));
+                }
+                if (value.contains("message_delimiters") &&
+                    !value.at("message_delimiters").is_array()) {
+                    return false;
+                }
+                semantic.tokens = std::make_shared<const server_tokens>(
+                    std::move(inputs.front()));
+            } else if (selector.kind == server_cache_control_subject_kind::vbr_reference) {
+                if (!value.contains("reference") ||
+                    !value.at("reference").is_string()) {
+                    return false;
+                }
+                selector.reference = value.at("reference").get<std::string>();
+                selector.tenant_key = server_cache_capture_tenant_key(req);
+            }
+            return true;
+        };
+
+        try {
+            if (!req.files.empty()) {
+                throw std::runtime_error("cache-control routes do not accept multipart files");
+            }
+            const json body = json::parse(req.body);
+            const auto prepared = server_cache_control_prepare_request(
+                operation, body, *request);
+            if (prepared != server_cache_control_status::ok) {
+                typed_status(prepared, 400);
+                return res;
+            }
+            bool valid = false;
+            switch (operation) {
+                case server_cache_control_operation::holder_create:
+                case server_cache_control_operation::holder_reattach:
+                case server_cache_control_operation::holder_close:
+                case server_cache_control_operation::family_register:
+                case server_cache_control_operation::family_bind:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::lease_acquire: {
+                    valid = true;
+                    if (valid) {
+                        valid = parse_selector(
+                            body.at("subject"), request->subject,
+                            task.cache_control_subject);
+                    }
+                    if (valid && body.contains("fallback")) {
+                        valid = parse_selector(
+                            body.at("fallback"), request->fallback,
+                            task.cache_control_fallback);
+                    } else if (valid && request->requested_class ==
+                            server_cache_lease_class::hard) {
+                        valid = false;
+                    } else if (valid) {
+                        request->fallback.kind =
+                            server_cache_control_subject_kind::_count;
+                    }
+                    if (valid) {
+                        valid = !request->allow_soft_fallback ||
+                            request->requested_class ==
+                                server_cache_lease_class::hard;
+                    }
+                } break;
+                case server_cache_control_operation::lease_inspect:
+                case server_cache_control_operation::lease_release:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::lease_renew:
+                    valid = true;
+                    request->fallback.kind =
+                        server_cache_control_subject_kind::_count;
+                    if (valid && body.contains("fallback")) {
+                        valid = parse_selector(
+                            body.at("fallback"), request->fallback,
+                            task.cache_control_fallback);
+                    }
+                    break;
+                case server_cache_control_operation::events:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::_count:
+                    valid = false;
+                    break;
+            }
+            if (!valid) {
+                typed_status(server_cache_control_status::invalid_request, 400);
+                return res;
+            }
+            task.cache_control = std::move(request);
+            res->rd.post_task(std::move(task));
+        } catch (const std::exception &) {
+            typed_status(server_cache_control_status::invalid_request, 400);
+            return res;
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * controlled = dynamic_cast<
+            server_task_result_cache_control *>(result.get());
+        GGML_ASSERT(controlled != nullptr);
+        res->ok(controlled->to_json());
         return res;
     };
 

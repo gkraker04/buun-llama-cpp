@@ -2,11 +2,13 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-cache-control.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
 
 #include <functional>
+#include <array>
 #include <future>
 #include <memory>
 #include <string>
@@ -25,11 +27,16 @@ public:
 // generic httplib logger is enabled in a future build, cache-plan prompts and
 // cache-oracle responses are never eligible for body logging. api_prefix may
 // precede the registered route, hence the suffix match on a path boundary.
+static bool server_http_is_cache_control_route(const std::string & path) {
+    return server_cache_control_is_route(path);
+}
+
 static bool server_http_redacts_request_bodies(const std::string & path) {
-    static constexpr char route[] = "/cache/plan";
-    return path.size() >= sizeof(route) - 1 &&
-           path.compare(path.size() - (sizeof(route) - 1),
-                        sizeof(route) - 1, route) == 0;
+    static constexpr std::string_view cache_plan = "/cache/plan";
+    return server_http_is_cache_control_route(path) ||
+        (path.size() >= cache_plan.size() &&
+         path.compare(path.size() - cache_plan.size(),
+                      cache_plan.size(), cache_plan) == 0);
 }
 
 server_http_context::server_http_context()
@@ -158,8 +165,25 @@ bool server_http_context::init(const common_params & params) {
         SRV_ERR("got exception: %s\n", message.c_str());
     });
 
-    srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
+    srv->set_error_handler([
+            cache_control_api = params.cache_control_api](
+            const httplib::Request & req, httplib::Response & res) {
         if (res.status == 404) {
+            if (!cache_control_api &&
+                server_http_is_cache_control_route(req.path)) {
+                res.status = 501;
+                res.set_header("Cache-Control", "no-store");
+                res.set_content(
+                    safe_json_to_str(json {
+                        {"error", {
+                            {"message", "Cache control API is disabled"},
+                            {"type", "not_supported_error"},
+                            {"code", 501}
+                        }}
+                    }),
+                    "application/json; charset=utf-8");
+                return;
+            }
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {
@@ -295,14 +319,17 @@ bool server_http_context::init(const common_params & params) {
     // narrower but must also cover middleware-generated 401/503 responses,
     // which never reach its handler. Install this hook only when one feature
     // needs it so both features remain zero-work while disabled.
-    if (params.cache_receipt || params.cache_plan_preflight) {
+    if (params.cache_receipt || params.cache_plan_preflight ||
+        params.cache_control_api) {
         srv->set_post_routing_handler([
                 cache_receipt = params.cache_receipt,
-                cache_plan_preflight = params.cache_plan_preflight](
+                cache_plan_preflight = params.cache_plan_preflight,
+                cache_control_api = params.cache_control_api](
                 const httplib::Request & req, httplib::Response & res) {
-            const bool e0_route = cache_plan_preflight &&
-                                  server_http_redacts_request_bodies(req.path);
-            if (e0_route ||
+            const bool cache_oracle_route =
+                (cache_plan_preflight || cache_control_api) &&
+                server_http_redacts_request_bodies(req.path);
+            if (cache_oracle_route ||
                 (cache_receipt && !frontend_paths.count(req.path))) {
                 res.set_header("Cache-Control", "no-store");
             }

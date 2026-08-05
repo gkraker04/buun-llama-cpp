@@ -3,8 +3,14 @@
 #include "server-vbr-artifact-store.h"
 #include "llama-cache-authority.h"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 
 static int failures = 0;
@@ -47,6 +53,16 @@ static server_cache_durable_fallback_proof acquire_host_proof(
     auto * resolver = static_cast<host_test_resolver *>(context);
     return server_cache_durable_fallback_proof_for_test(
         server_cache_lease_fallback_state::available, resolver->owner);
+}
+
+static bool selector_evidence(
+        void *, const server_cache_control_selector & selector,
+        uint64_t & bytes, bool & shared) noexcept {
+    bytes = selector.retention_key.kind ==
+            common_retention_artifact_kind::host_entry ? 96 : 64;
+    shared = selector.retention_key.kind ==
+        common_retention_artifact_kind::host_entry;
+    return selector.retention_key.instance != 0;
 }
 
 static server_cache_control_status resolve_vbr(
@@ -237,6 +253,7 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     host_test_resolver host;
     config.host_proof_context = &host;
     config.acquire_host_proof = acquire_host_proof;
+    config.selector_evidence = selector_evidence;
     server_cache_control_authority authority(config);
     CHECK(authority.available());
 
@@ -244,11 +261,25 @@ static void test_holder_hard_orphan_frontier_and_proof() {
         authority, server_cache_control_operation::holder_create,
         create_holder(100));
     CHECK(holder.status == server_cache_control_status::ok);
+    server_cache_control_request register_family;
+    register_family.holder = holder.holder;
+    register_family.family_label = "main-agent";
+    const auto family = execute(
+        authority, server_cache_control_operation::family_register,
+        register_family);
+    server_cache_control_request bind_family;
+    bind_family.holder = holder.holder;
+    bind_family.family = family.family;
+    bind_family.family_role = common_cache_family_role::main;
+    const auto family_binding = execute(
+        authority, server_cache_control_operation::family_bind, bind_family);
+    CHECK(family_binding.status == server_cache_control_status::ok);
     server_cache_control_request acquire;
     acquire.holder = holder.holder;
     acquire.requested_class = server_cache_lease_class::hard;
     acquire.ttl_ns = 50;
     acquire.idempotency_key = 44;
+    acquire.family_binding = family_binding.family_binding;
     acquire.subject = selector(
         server_cache_control_subject_kind::live_prefix,
         live, identity, { 7, 8, 8 });
@@ -263,17 +294,41 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     CHECK(replayed.status == server_cache_control_status::ok);
     CHECK(replayed.lease == granted.lease);
     CHECK(granted.granted_class == server_cache_lease_class::hard);
+    CHECK(granted.cache_family.declared());
+    CHECK(granted.cache_family.role == common_cache_family_role::main);
+    CHECK(granted.protected_bytes_known && granted.protected_bytes == 64);
+    CHECK(granted.fallback_pinned_bytes_known &&
+          granted.fallback_pinned_bytes == 96);
+    CHECK(granted.shared_fallback);
     CHECK(host.owner.use_count() > 1);
     CHECK(server_cache_lease_is_hard(
         leases.inspect_range(retention.artifact_id(live), identity, 7, 0, 8)));
     CHECK(!server_cache_lease_is_hard(
         leases.inspect_range(retention.artifact_id(live), identity, 7, 8, 4)));
+    server_cache_control_request lease_events_request;
+    lease_events_request.holder = holder.holder;
+    lease_events_request.event_limit = SERVER_CACHE_LEASE_EVENT_RING;
+    const auto lease_events = execute(
+        authority, server_cache_control_operation::events,
+        lease_events_request);
+    const auto grant_event = std::find_if(
+        lease_events.events.begin(), lease_events.events.end(),
+        [&](const server_cache_control_event_view & event) {
+            return event.kind == server_cache_control_event_kind::grant &&
+                   event.lease == granted.lease;
+        });
+    CHECK(grant_event != lease_events.events.end());
+    CHECK(grant_event->subject_kind ==
+          server_cache_control_subject_kind::live_prefix);
+    CHECK(grant_event->family_role == common_cache_family_role::main);
 
     server_cache_control_request inspect;
     inspect.holder = holder.holder;
     inspect.lease = granted.lease;
     CHECK(execute(authority, server_cache_control_operation::lease_inspect,
                   inspect).status == server_cache_control_status::ok);
+    CHECK(execute(authority, server_cache_control_operation::lease_inspect,
+                  inspect).cache_family == granted.cache_family);
     frontiers.values[live.instance] = { 7, 12, 12 };
     const auto partial = execute(
         authority, server_cache_control_operation::lease_inspect, inspect);
@@ -333,6 +388,12 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     const auto resumed = execute(
         authority, server_cache_control_operation::holder_reattach, reattach);
     CHECK(resumed.status == server_cache_control_status::ok);
+    CHECK(resumed.orphaned_leases.size() == 1);
+    CHECK(resumed.orphaned_leases.front().lease == granted.lease);
+    CHECK(resumed.orphaned_leases.front().subject_kind ==
+          server_cache_control_subject_kind::live_prefix);
+    CHECK(resumed.families.size() == 1);
+    CHECK(resumed.families.front().label == "main-agent");
     inspect.holder = resumed.holder;
     CHECK(execute(authority, server_cache_control_operation::lease_inspect,
                   inspect).status == server_cache_control_status::subject_lost);
@@ -385,6 +446,8 @@ static void test_refusals_soft_expiry_and_ownership() {
         authority, server_cache_control_operation::events, own_events);
     CHECK(second_events.status == server_cache_control_status::ok);
     CHECK(second_events.events.size() == 1);
+    CHECK(second_events.events.front().ordinal == 1);
+    CHECK(second_events.events.front().timestamp_ms == 0);
 
     const auto fallback = server_retention_instance_key::for_host_entry(
         reinterpret_cast<const server_prompt_cache_state *>(uintptr_t(5)));
@@ -416,6 +479,16 @@ static void test_refusals_soft_expiry_and_ownership() {
     acquire.holder = first.holder;
     acquire.requested_class = server_cache_lease_class::hard;
     acquire.ttl_ns = 20;
+    // Storage disjointness is artifact identity, not lineage/frontier
+    // inequality. A subject and fallback naming the exact same physical host
+    // node must remain invalid even though its proof is otherwise available.
+    acquire.subject = selector(
+        server_cache_control_subject_kind::host_snapshot,
+        fallback, identity, { 1, 8, 8 });
+    acquire.fallback = acquire.subject;
+    CHECK(execute(authority, server_cache_control_operation::lease_acquire,
+                  acquire).status ==
+          server_cache_control_status::fallback_invalid);
     acquire.subject = selector(
         server_cache_control_subject_kind::live_prefix,
         live, identity, { 1, 8, 8 });
@@ -435,6 +508,14 @@ static void test_refusals_soft_expiry_and_ownership() {
     CHECK(execute(authority, server_cache_control_operation::lease_acquire,
                   acquire).status ==
           server_cache_control_status::fallback_unavailable);
+    acquire.allow_soft_fallback = true;
+    const auto downgraded = execute(
+        authority, server_cache_control_operation::lease_acquire, acquire);
+    CHECK(downgraded.status == server_cache_control_status::ok);
+    CHECK(downgraded.granted_class == server_cache_lease_class::soft);
+    CHECK(downgraded.fallback_kind ==
+          server_cache_control_subject_kind::_count);
+    acquire.allow_soft_fallback = false;
     acquire.fallback = {};
     acquire.fallback.kind = server_cache_control_subject_kind::vbr_reference;
     acquire.fallback.reference = "fallback";
@@ -562,6 +643,157 @@ static void test_task_lifecycle_gate() {
           server_cache_control_status::ok);
 }
 
+static void assert_control_redacted(const nlohmann::ordered_json & value) {
+    static const std::array<const char *, 8> forbidden = {
+        "artifact_id", "op_id", "manifest_digest", "accounting_serial",
+        "retention_key", "tenant_key", "identity", "reference",
+    };
+    if (value.is_object()) {
+        for (const auto & item : value.items()) {
+            for (const char * key : forbidden) {
+                CHECK(item.key() != key);
+            }
+            assert_control_redacted(item.value());
+        }
+    } else if (value.is_array()) {
+        for (const auto & item : value) {
+            assert_control_redacted(item);
+        }
+    }
+}
+
+static void test_http_codec_and_golden() {
+    const server_cache_control_token token {
+        0x0123456789abcdefULL, 0xfedcba9876543210ULL,
+    };
+    for (const auto kind : {
+            server_cache_control_handle_kind::holder,
+            server_cache_control_handle_kind::holder_recovery,
+            server_cache_control_handle_kind::lease,
+            server_cache_control_handle_kind::family,
+            server_cache_control_handle_kind::family_binding }) {
+        const auto text = server_cache_control_encode_handle(kind, token);
+        server_cache_control_token decoded;
+        CHECK(server_cache_control_decode_handle(kind, text, decoded));
+        CHECK(decoded == token);
+        const auto wrong = kind == server_cache_control_handle_kind::holder
+            ? server_cache_control_handle_kind::lease
+            : server_cache_control_handle_kind::holder;
+        CHECK(!server_cache_control_decode_handle(wrong, text, decoded));
+    }
+    CHECK(server_cache_control_idempotency_digest("retry-1") != 0);
+    CHECK(server_cache_control_idempotency_digest("retry-1") ==
+          server_cache_control_idempotency_digest("retry-1"));
+    CHECK(server_cache_control_idempotency_digest("") == 0);
+
+    CHECK(server_cache_control_request_field_allowed(
+        server_cache_control_operation::lease_acquire, "subject"));
+    CHECK(!server_cache_control_request_field_allowed(
+        server_cache_control_operation::lease_acquire, "artifact_id"));
+    CHECK(!server_cache_control_request_field_allowed(
+        server_cache_control_operation::holder_close, "lease"));
+    for (const char * reserved : {
+            "ticket", "claim", "preview_id", "nonce",
+            "artifact_id", "manifest_digest", "accounting_serial" }) {
+        CHECK(!server_cache_control_request_field_allowed(
+            server_cache_control_operation::lease_acquire, reserved));
+    }
+    CHECK(server_cache_control_selector_field_allowed(
+        server_cache_control_subject_kind::host_snapshot, "prompt"));
+    CHECK(!server_cache_control_selector_field_allowed(
+        server_cache_control_subject_kind::host_snapshot, "artifact_id"));
+    CHECK(!server_cache_control_selector_field_allowed(
+        server_cache_control_subject_kind::vbr_reference, "tenant_key"));
+    for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
+        server_cache_control_operation parsed;
+        CHECK(server_cache_control_operation_for_path(route.path, parsed));
+        CHECK(parsed == route.operation);
+        CHECK(server_cache_control_is_route(route.path));
+    }
+
+    nlohmann::ordered_json parsed_body = {
+        { "holder", server_cache_control_encode_handle(
+            server_cache_control_handle_kind::holder, token) },
+        { "class", "hard" },
+        { "ttl_ms", uint64_t(50) },
+        { "floor", "t4" },
+        { "subject", { { "kind", "live_prefix" }, { "slot_id", 2 } } },
+        { "fallback", { { "kind", "host_snapshot" }, { "prompt", "x" } } },
+    };
+    server_cache_control_request parsed_request;
+    CHECK(server_cache_control_prepare_request(
+              server_cache_control_operation::lease_acquire,
+              parsed_body, parsed_request) == server_cache_control_status::ok);
+    CHECK(parsed_request.requested_class == server_cache_lease_class::hard);
+    parsed_body["artifact_id"] = 7;
+    CHECK(server_cache_control_prepare_request(
+              server_cache_control_operation::lease_acquire,
+              parsed_body, parsed_request) ==
+          server_cache_control_status::invalid_request);
+
+    server_cache_control_result result;
+    result.status = server_cache_control_status::ok;
+    result.lease = token;
+    result.granted_class = server_cache_lease_class::hard;
+    result.protection = server_cache_control_protection_state::current;
+    result.lease_frontier = { 71, 12, 12 };
+    result.proven_frontier = { 71, 12, 12 };
+    result.expires_at_ns = 123456789000000ULL;
+    result.fallback_kind =
+        server_cache_control_subject_kind::host_snapshot;
+    result.protected_bytes_known = true;
+    result.fallback_pinned_bytes_known = true;
+    result.protected_bytes = 64;
+    result.fallback_pinned_bytes = 96;
+    result.shared_fallback = true;
+    const auto wire = server_cache_control_json(
+        server_cache_control_operation::lease_acquire, result);
+    CHECK(wire["object"] == "cache_control");
+    CHECK(wire["schema_version"] == 1);
+    CHECK(wire["status"] == "ok");
+    CHECK(wire["result"]["granted_class"] == "hard");
+    CHECK(wire["result"]["fallback"]["kind"] == "retained_host");
+    result.cache_family = { { 7 }, common_cache_family_role::main };
+    result.family_label = "main-agent";
+    const auto inspect_wire = server_cache_control_json(
+        server_cache_control_operation::lease_inspect, result);
+    CHECK(inspect_wire["result"]["family_role"] == "main");
+    CHECK(inspect_wire["result"]["family_label"] == "main-agent");
+    CHECK(!wire["result"].contains("content"));
+    server_cache_control_result refused;
+    refused.status = server_cache_control_status::fallback_unavailable;
+    refused.granted_class = server_cache_lease_class::hard;
+    CHECK(server_cache_control_json(
+              server_cache_control_operation::lease_acquire,
+              refused)["result"].empty());
+    server_cache_control_result soft = result;
+    soft.granted_class = server_cache_lease_class::soft;
+    soft.fallback_kind = server_cache_control_subject_kind::_count;
+    CHECK(server_cache_control_json(
+              server_cache_control_operation::lease_acquire,
+              soft)["result"]["fallback"].is_null());
+    assert_control_redacted(inspect_wire);
+    assert_control_redacted(wire);
+    const nlohmann::ordered_json golden_payload = {
+        { "acquire", wire },
+        { "inspect", inspect_wire },
+    };
+    const std::string encoded = golden_payload.dump(2) + "\n";
+    if (std::getenv("CACHE_CONTROL_PRINT_GOLDEN")) {
+        std::fputs(encoded.c_str(), stdout);
+        std::fflush(stdout);
+        std::exit(EXIT_SUCCESS);
+    }
+#ifdef CACHE_CONTROL_GOLDEN_PATH
+    std::ifstream golden(CACHE_CONTROL_GOLDEN_PATH);
+    CHECK(golden.good());
+    std::ostringstream expected;
+    expected << golden.rdbuf();
+    CHECK(encoded == expected.str());
+#endif
+    std::puts("E1_HTTP codec_golden PASS redacted=1");
+}
+
 static void test_family_registry_and_binding() {
     control_test_clock clock;
     control_test_tokens tokens;
@@ -582,12 +814,15 @@ static void test_family_registry_and_binding() {
 
     server_cache_control_request register_family;
     register_family.holder = holder.holder;
+    register_family.family_label = "declared-main";
     register_family.idempotency_key = 901;
     const auto family = execute(
         authority, server_cache_control_operation::family_register,
         register_family);
     CHECK(family.status == server_cache_control_status::ok);
     CHECK(bool(family.family));
+    CHECK(family.families.size() == 1);
+    CHECK(family.families.front().label == "declared-main");
     const auto family_replay = execute(
         authority, server_cache_control_operation::family_register,
         register_family);
@@ -613,6 +848,40 @@ static void test_family_registry_and_binding() {
               binding.family_binding, resolved) ==
           server_cache_control_status::ok);
     CHECK(resolved == binding.cache_family);
+
+    auto bind_branch = bind;
+    bind_branch.family_role = common_cache_family_role::branch;
+    bind_branch.idempotency_key = 903;
+    const auto branch_binding = execute(
+        authority, server_cache_control_operation::family_bind, bind_branch);
+    CHECK(branch_binding.status == server_cache_control_status::ok);
+    CHECK(!(branch_binding.family_binding == binding.family_binding));
+    CHECK(branch_binding.cache_family.family == binding.cache_family.family);
+    CHECK(branch_binding.cache_family.role == common_cache_family_role::branch);
+    common_cache_family_binding resolved_branch;
+    CHECK(authority.resolve_family_binding(
+              branch_binding.family_binding, resolved_branch) ==
+          server_cache_control_status::ok);
+    CHECK(resolved_branch == branch_binding.cache_family);
+    CHECK(resolved_branch.role != resolved.role);
+    std::puts("E1_FAMILY two_roles_one_family PASS main=1 branch=1");
+
+    for (uint64_t i = 0; i < SERVER_CACHE_LEASE_EVENT_RING + 2; ++i) {
+        server_cache_control_request extra;
+        extra.holder = holder.holder;
+        extra.idempotency_key = 1000 + i;
+        CHECK(execute(authority,
+                      server_cache_control_operation::family_register,
+                      extra).status == server_cache_control_status::ok);
+    }
+    server_cache_control_request events;
+    events.holder = holder.holder;
+    events.after_ordinal = 1;
+    events.event_limit = SERVER_CACHE_LEASE_EVENT_RING;
+    const auto overflowed = execute(
+        authority, server_cache_control_operation::events, events);
+    CHECK(overflowed.status == server_cache_control_status::ok);
+    CHECK(overflowed.events_overflowed);
 
     const auto other = execute(
         authority, server_cache_control_operation::holder_create,
@@ -652,6 +921,33 @@ static void test_family_registry_and_binding() {
         poisoned, server_cache_control_operation::family_register,
         poisoned_family).status ==
             server_cache_control_status::internal_fault);
+
+    // Holder close bounds raw idempotency replay lifetime. Reusing the same
+    // key after close must mint a fresh holder rather than replay its secrets.
+    control_test_clock replay_clock;
+    control_test_tokens replay_tokens;
+    server_cache_lease_table replay_leases(&replay_clock);
+    server_retention_sidecar_store replay_retention;
+    auto replay_config = config;
+    replay_config.leases = &replay_leases;
+    replay_config.retention = &replay_retention;
+    replay_config.clock = &replay_clock;
+    replay_config.tokens = &replay_tokens;
+    server_cache_control_authority replay_authority(replay_config);
+    auto replay_create = create_holder(1000);
+    replay_create.idempotency_key = 0xabc;
+    const auto replay_first = execute(
+        replay_authority, server_cache_control_operation::holder_create,
+        replay_create);
+    server_cache_control_request close;
+    close.holder = replay_first.holder;
+    CHECK(execute(replay_authority,
+                  server_cache_control_operation::holder_close,
+                  close).status == server_cache_control_status::ok);
+    const auto replay_second = execute(
+        replay_authority, server_cache_control_operation::holder_create,
+        replay_create);
+    CHECK(!(replay_second.holder == replay_first.holder));
     std::puts("E1_FAMILY registry_binding PASS role=main expired=not_found");
 }
 
@@ -733,6 +1029,7 @@ int main() {
     test_refusals_soft_expiry_and_ownership();
     test_poisoned_evidence_still_releases();
     test_task_lifecycle_gate();
+    test_http_codec_and_golden();
     test_family_registry_and_binding();
     test_production_store_resolver_leg();
     if (failures != 0) {
