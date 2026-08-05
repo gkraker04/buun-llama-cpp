@@ -5,6 +5,7 @@
 #include "../../src/llama-cache-authority.h"
 
 #include <functional>
+#include <nlohmann/json_fwd.hpp>
 #include <thread>
 #include <vector>
 
@@ -34,6 +35,14 @@ struct server_cache_destruction_quote_options {
     uint64_t admission_sequence = 0;
 };
 
+// One tooling-visible JSON core for both host-entry and live-checkpoint
+// maintenance receipts. Callers append only class-specific ranking/counter
+// fields; state/reason/effects/victims/recovery/projected bytes cannot drift.
+nlohmann::ordered_json server_cache_destruction_receipt_json(
+    const common_cache_plan_destruction_receipt & receipt,
+    uint64_t projected_bytes,
+    const char * action_class = nullptr);
+
 // D-A0a's bounded pre-minimization shadow pass. `artifacts` is one normalized
 // retention inventory: identities and leases were each inspected exactly once.
 // Quotes are memoized by canonical victim-manifest digest; no mutation, lease
@@ -55,6 +64,17 @@ bool server_cache_destruction_quote_all(
 common_cache_plan_destruction_quote
 server_cache_destruction_quote_redundant_host(
     const server_cache_destruction_artifact & victim,
+    uint64_t accounting_serial,
+    uint64_t admission_sequence,
+    const server_cache_destruction_preview_callback & preview,
+    const server_cache_destruction_projection_callback & project) noexcept;
+
+// D-A4 and later independently-owned artifacts reuse the exact single-victim
+// quote without inheriting the host-consumption effect spelling.
+common_cache_plan_destruction_quote
+server_cache_destruction_quote_single_artifact(
+    const server_cache_destruction_artifact & victim,
+    common_cache_plan_destruction_effect_set effects,
     uint64_t accounting_serial,
     uint64_t admission_sequence,
     const server_cache_destruction_preview_callback & preview,

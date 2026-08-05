@@ -168,9 +168,7 @@ server_cache_yield_result server_cache_yield_plan(
                 continue;
             }
             if (candidate.record.stamp.mandatory_anchor ||
-                candidate.lease.cls == server_cache_lease_class::hard ||
-                candidate.lease.eligibility ==
-                    server_cache_lease_eligibility::hard_blocked) {
+                server_cache_lease_is_hard(candidate.lease)) {
                 continue;
             }
             if (candidate.release_ops.empty()) {

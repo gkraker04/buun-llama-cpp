@@ -164,6 +164,7 @@ const char * common_cache_plan_destruction_reason_name(
         case common_cache_plan_destruction_reason::effect_drift: return "effect_drift";
         case common_cache_plan_destruction_reason::release_evidence_unavailable: return "release_evidence_unavailable";
         case common_cache_plan_destruction_reason::recovery_unavailable: return "recovery_unavailable";
+        case common_cache_plan_destruction_reason::profile_unfitted: return "profile_unfitted";
         case common_cache_plan_destruction_reason::capacity_refused: return "capacity_refused";
         case common_cache_plan_destruction_reason::mutation_failed: return "mutation_failed";
         case common_cache_plan_destruction_reason::internal_fault: return "internal_fault";
@@ -180,6 +181,7 @@ const char * common_cache_plan_destruction_effect_name(
         case common_cache_plan_destruction_effect::destructive_similarity_retarget: return "destructive_similarity_retarget";
         case common_cache_plan_destruction_effect::same_target_cold_replacement: return "same_target_cold_replacement";
         case common_cache_plan_destruction_effect::different_host_source_consumption: return "different_host_source_consumption";
+        case common_cache_plan_destruction_effect::checkpoint_member_drop: return "checkpoint_member_drop";
         case common_cache_plan_destruction_effect::_count: break;
     }
     return "invalid";

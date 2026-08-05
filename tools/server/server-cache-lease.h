@@ -140,6 +140,12 @@ struct server_cache_lease_evaluation {
         server_cache_lease_eligibility::eligible;
 };
 
+inline bool server_cache_lease_is_hard(
+        const server_cache_lease_evaluation & lease) noexcept {
+    return lease.cls == server_cache_lease_class::hard ||
+           lease.eligibility == server_cache_lease_eligibility::hard_blocked;
+}
+
 struct server_cache_lease_event {
     server_cache_lease_event_kind kind = server_cache_lease_event_kind::grant_soft;
     server_cache_lease_id lease;

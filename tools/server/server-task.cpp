@@ -2320,76 +2320,29 @@ void server_prompt_cache_observe_host_destruction(
         return;
     }
     try {
-        json effects = json::array();
-        for (uint8_t raw =
-                 uint8_t(common_cache_plan_destruction_effect::none) + 1;
-             raw < uint8_t(common_cache_plan_destruction_effect::_count);
-             ++raw) {
-            const auto effect = common_cache_plan_destruction_effect(raw);
-            if (common_cache_plan_destruction_effect_has(
-                    receipt.effects, effect)) {
-                effects.push_back(
-                    common_cache_plan_destruction_effect_name(effect));
-            }
-        }
-        json victims = json::array();
-        for (const auto artifact : receipt.selected_attention) {
-            victims.push_back(artifact.v);
-        }
-        for (const auto artifact : receipt.selected_recurrent) {
-            victims.push_back(artifact.v);
-        }
-        json recovery_source = common_cache_acct_known_name(
-            llama_cache_acct_known::unavailable);
-        if (receipt.recovery_source_artifact_id.v != 0 &&
-            receipt.recovery_source_manifest_digest.valid()) {
-            recovery_source = json {
-                { "artifact_id", receipt.recovery_source_artifact_id.v },
-                { "manifest_digest", common_cache_plan_sha256_hex_digest(
-                      receipt.recovery_source_manifest_digest.bytes()) },
-            };
-        }
         const json unavailable = common_cache_acct_known_name(
             llama_cache_acct_known::unavailable);
-        const json payload = {
-            { "state", common_cache_plan_destruction_state_name(
-                  receipt.state) },
-            { "reason", common_cache_plan_destruction_reason_name(
-                  receipt.reason) },
-            { "effects", std::move(effects) },
-            { "victim_ids", std::move(victims) },
-            { "recovery_source", std::move(recovery_source) },
-            { "projected_bytes", projected_bytes },
-            { "price_us", ranking && ranking->price_known
-                  ? json(ranking->price_us)
-                  : unavailable },
-            { "retention_weight_milli", ranking
-                  ? json(ranking->weight_milli)
-                  : unavailable },
-            { "rank_ordinal", ranking
-                  ? json(ranking->ordinal)
-                  : unavailable },
-            { "victim_source_id", ranking && ranking->source_id >= 0
-                  ? json(ranking->source_id)
-                  : unavailable },
-            { "victim_artifact_id", ranking && ranking->artifact_id.v != 0
-                  ? json(ranking->artifact_id.v)
-                  : unavailable },
-            { "zero_destruction", ranking
-                  ? json(ranking->zero_destruction)
-                  : unavailable },
-            { "zero_destruction_tie_break", ranking
-                  ? json(ranking->zero_destruction_tie_break)
-                  : json(false) },
-            { "legacy_fallbacks",
-                  cache.destruction_obs
-                      ? cache.destruction_obs->host_trade_legacy_fallbacks
-                      : uint64_t(0) },
-            { "publication_skips",
-                  cache.destruction_obs
-                      ? cache.destruction_obs->host_trade_publication_skips
-                      : uint64_t(0) },
-        };
+        json payload = server_cache_destruction_receipt_json(
+            receipt, projected_bytes);
+        payload["price_us"] = ranking && ranking->price_known
+            ? json(ranking->price_us) : unavailable;
+        payload["retention_weight_milli"] = ranking
+            ? json(ranking->weight_milli) : unavailable;
+        payload["rank_ordinal"] = ranking
+            ? json(ranking->ordinal) : unavailable;
+        payload["victim_source_id"] = ranking && ranking->source_id >= 0
+            ? json(ranking->source_id) : unavailable;
+        payload["victim_artifact_id"] = ranking &&
+                ranking->artifact_id.v != 0
+            ? json(ranking->artifact_id.v) : unavailable;
+        payload["zero_destruction"] = ranking
+            ? json(ranking->zero_destruction) : unavailable;
+        payload["zero_destruction_tie_break"] = ranking
+            ? json(ranking->zero_destruction_tie_break) : json(false);
+        payload["legacy_fallbacks"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
+        payload["publication_skips"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_publication_skips : uint64_t(0);
         cache.debug_destruction_emissions++;
         SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
     } catch (...) {
@@ -2671,38 +2624,29 @@ bool host_trade_price(
         out.lease_known = true;
         out.soft_leased = artifact.candidate.lease.cls ==
             server_cache_lease_class::soft;
-        out.hard_leased = artifact.candidate.lease.cls ==
-                server_cache_lease_class::hard ||
-            artifact.candidate.lease.eligibility ==
-                server_cache_lease_eligibility::hard_blocked;
+        out.hard_leased = server_cache_lease_is_hard(
+            artifact.candidate.lease);
         if (out.hard_leased || !calib) {
             return false;
         }
 
-        uint64_t weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
-        const auto multiply_weight = [&](uint32_t factor) {
-            if (factor == 0 || weight >
-                    std::numeric_limits<uint64_t>::max() / factor) {
-                return false;
-            }
-            weight = (weight * factor +
-                      SERVER_CACHE_HOST_WEIGHT_SCALE - 1) /
-                     SERVER_CACHE_HOST_WEIGHT_SCALE;
-            return weight <= std::numeric_limits<uint32_t>::max();
-        };
+        uint32_t weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
         if (out.soft_leased &&
-            !multiply_weight(SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) {
+            !server_cache_multiply_retention_weight(
+                weight, SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT)) {
             return false;
         }
         if (out.main_family &&
-            !multiply_weight(SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) {
+            !server_cache_multiply_retention_weight(
+                weight, SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT)) {
             return false;
         }
         if (authority.host_retention_weight) {
             uint32_t custom = 0;
             if (!authority.host_retention_weight(
                     authority.host_retention_weight_context,
-                    *victim, custom) || !multiply_weight(custom)) {
+                    *victim, custom) ||
+                !server_cache_multiply_retention_weight(weight, custom)) {
                 return false;
             }
         }
@@ -2713,15 +2657,13 @@ bool host_trade_price(
                 *calib, victim->size(), restore_us, workspace_us)) {
             return false;
         }
-        const long double base = restore_us + workspace_us;
-        const long double price = base * (long double) weight /
-            SERVER_CACHE_HOST_WEIGHT_SCALE;
-        if (!std::isfinite((double) price) || price < 0.0L ||
-            price > (long double) std::numeric_limits<long long>::max()) {
+        uint64_t price = 0;
+        if (!server_cache_weighted_price_us(
+                restore_us + workspace_us, weight, price)) {
             return false;
         }
-        out.ranking.weight_milli = uint32_t(weight);
-        out.ranking.price_us = uint64_t(std::llround(price));
+        out.ranking.weight_milli = weight;
+        out.ranking.price_us = price;
         out.ranking.price_known = true;
         return true;
     } catch (...) {
@@ -3311,6 +3253,58 @@ static void server_prompt_cache_mirror_restore_retention(
         destination, source->adapter_config_key,
         destination.n_tokens());
 
+    const auto admit_restored_checkpoints = [&]() {
+        if (!cache.publish_authority || !cache.retention_obs) {
+            return;
+        }
+        try {
+            std::vector<server_retention_instance_key> keys;
+            std::vector<server_cache_live_checkpoint_admission> batch;
+            keys.reserve(destination.checkpoints.size());
+            batch.reserve(destination.checkpoints.size());
+            for (const auto & checkpoint : destination.checkpoints) {
+                const auto key =
+                    server_retention_instance_key::for_checkpoint(
+                        id_slot, &checkpoint);
+                llama_cache_acct_artifact_id artifact;
+                if (!cache.retention_obs->checkpoint_admission_artifact(
+                        key, artifact)) {
+                    continue;
+                }
+                const uint64_t accelerator_bytes = checkpoint.accel.size();
+                server_cache_live_checkpoint_admission member;
+                member.artifact = artifact;
+                member.checkpoint_bytes =
+                    checkpoint.size() >= accelerator_bytes
+                        ? checkpoint.size() - accelerator_bytes
+                        : 0;
+                member.accelerator_bytes = accelerator_bytes;
+                keys.push_back(key);
+                batch.push_back(std::move(member));
+            }
+            if (batch.empty()) {
+                return;
+            }
+            if (!cache.publish_authority->admit_live_checkpoints(batch)) {
+                SRV_WRN(
+                    "restored checkpoint ownership batch admission failed; "
+                    "%zu members remain fail-closed\n", batch.size());
+                return;
+            }
+            GGML_ASSERT(keys.size() == batch.size());
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (!cache.retention_obs->attach_release_ops(
+                        keys[i], std::move(batch[i].committed))) {
+                    SRV_WRN("%s\n",
+                        "restored checkpoint ownership attach failed; member remains fail-closed");
+                }
+            }
+        } catch (...) {
+            SRV_WRN("%s\n",
+                "restored checkpoint ownership batch setup failed; ring remains fail-closed");
+        }
+    };
+
     if (!retained_source) {
         // std::list's equal allocator move transfers the original nodes, so
         // destination checkpoint addresses are the historical host keys.
@@ -3335,6 +3329,7 @@ static void server_prompt_cache_mirror_restore_retention(
                 destination, source->adapter_config_key,
                 checkpoint.n_tokens);
         }
+        admit_restored_checkpoints();
         return;
     }
 
@@ -3359,6 +3354,7 @@ static void server_prompt_cache_mirror_restore_retention(
     }
     GGML_ASSERT(source_checkpoint == source->prompt.checkpoints.end());
     GGML_ASSERT(destination_checkpoint == destination.checkpoints.end());
+    admit_restored_checkpoints();
 }
 
 void server_prompt_cache::commit_restore_delivery(

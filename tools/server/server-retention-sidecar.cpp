@@ -1,5 +1,6 @@
 #include "server-retention-sidecar.h"
 #include "server-cache-lease.h"
+#include "server-cache-destruction-quote.h"
 
 #include <algorithm>
 #include <limits>
@@ -107,7 +108,8 @@ void server_retention_sidecar_store::mark_unavailable() noexcept {
 
 bool server_retention_sidecar_store::install(
         const server_retention_instance_key & key,
-        common_retention_artifact_record && record) noexcept {
+        common_retention_artifact_record && record,
+        const server_cache_lease_identity * checkpoint_identity) noexcept {
     try {
         if (catalog.size() >= MAX_CATALOG_ARTIFACTS) {
             mark_unavailable();
@@ -132,6 +134,10 @@ bool server_retention_sidecar_store::install(
 
         catalog_entry entry;
         entry.record = std::move(record);
+        if (checkpoint_identity && checkpoint_identity->valid()) {
+            entry.checkpoint_identity = *checkpoint_identity;
+            entry.checkpoint_identity_known = true;
+        }
         entry.encoded_size = bytes;
         auto inserted = catalog.emplace(artifact.v, std::move(entry));
         if (!inserted.second ||
@@ -142,6 +148,8 @@ bool server_retention_sidecar_store::install(
             mark_unavailable();
             return false;
         }
+        inserted.first->second.owner = this;
+        inserted.first->second.artifact = artifact;
 
         auto & installed = inserted.first->second;
         if (ledger) {
@@ -181,7 +189,8 @@ bool server_retention_sidecar_store::publish(
         bool source_known,
         uint64_t turn_token_count,
         uint64_t coverage_tokens,
-        bool coverage_valid) noexcept {
+        bool coverage_valid,
+        const server_cache_lease_identity * checkpoint_identity) noexcept {
     common_retention_artifact_record record;
     record.kind = key.kind;
     if (!allocator.issue(pool, record.stamp)) {
@@ -201,7 +210,7 @@ bool server_retention_sidecar_store::publish(
         record.stamp.mapped_turn_ordinal = 0;
         record.stamp.anchor_rank = 0;
     }
-    if (!install(key, std::move(record))) {
+    if (!install(key, std::move(record), checkpoint_identity)) {
         retire(key);
         return false;
     }
@@ -225,13 +234,20 @@ bool server_retention_sidecar_store::clone(
             return false;
         }
         auto record = item->second.record;
+        server_cache_lease_identity checkpoint_identity;
+        const server_cache_lease_identity * checkpoint_identity_ptr = nullptr;
+        if (item->second.checkpoint_identity_known) {
+            checkpoint_identity = item->second.checkpoint_identity;
+            checkpoint_identity_ptr = &checkpoint_identity;
+        }
         record.kind = destination.kind;
         if (!allocator.issue(record.stamp.pool, record.stamp)) {
             retire(destination);
             mark_unavailable();
             return false;
         }
-        if (!install(destination, std::move(record))) {
+        if (!install(
+                destination, std::move(record), checkpoint_identity_ptr)) {
             retire(destination);
             return false;
         }
@@ -283,14 +299,51 @@ bool server_retention_sidecar_store::rebind(
 void server_retention_sidecar_store::retire_association(
         association_map::iterator it) noexcept {
     const auto artifact = it->second;
+    const auto entry = catalog.find(artifact.v);
+    if (entry == catalog.end()) {
+        associations.erase(it);
+        if (leases) {
+            leases->artifact_retired(artifact);
+        }
+        mark_unavailable();
+        return;
+    }
+    // The policy inventory excludes pinned entries. If latent catalog drift
+    // reaches this legacy terminal anyway, fail soft: surface unavailable,
+    // detach the stale association, and defer catalog/accounting retirement
+    // until the final pin closes. The pin callback owns that terminal.
+    if (entry->second.recovery_pins != 0) {
+        entry->second.retire_pending = true;
+        associations.erase(it);
+        if (leases) {
+            leases->artifact_retired(artifact);
+        }
+        mark_unavailable();
+        return;
+    }
     associations.erase(it);
     if (leases) {
         leases->artifact_retired(artifact);
     }
-    const auto entry = catalog.find(artifact.v);
-    if (entry == catalog.end()) {
-        mark_unavailable();
-        return;
+    retire_catalog_entry(entry);
+}
+
+void server_retention_sidecar_store::retire_catalog_entry(
+        catalog_map::iterator entry) noexcept {
+    if (ledger && !entry->second.release_ops.empty()) {
+        auto release = llama_cache_prepare_release_set(
+            *ledger, entry->second.release_ops,
+            ledger->snapshot().serial);
+        if (!release.ready() || release.commit() !=
+                llama_cache_conditional_release_status::released) {
+            // A failed conditional commit never releases a member. The
+            // legacy drop has already won, so discharge each still-live op
+            // and mark the catalog unavailable rather than aborting.
+            mark_unavailable();
+            for (const auto op : entry->second.release_ops) {
+                (void) ledger->release(op);
+            }
+        }
     }
     if (entry->second.accounting_op && ledger) {
         if (!ledger->release(entry->second.accounting_op)) {
@@ -300,6 +353,16 @@ void server_retention_sidecar_store::retire_association(
     const uint64_t bytes = entry->second.encoded_size;
     bytes_live = bytes <= bytes_live ? bytes_live - bytes : 0;
     catalog.erase(entry);
+}
+
+bool server_retention_sidecar_store::recovery_pinned(
+        const server_retention_instance_key & key) const noexcept {
+    const auto association = associations.find(key);
+    if (association == associations.end()) {
+        return false;
+    }
+    const auto item = catalog.find(association->second.v);
+    return item != catalog.end() && item->second.recovery_pins != 0;
 }
 
 void server_retention_sidecar_store::retire(
@@ -344,12 +407,169 @@ bool server_retention_sidecar_store::candidate_for_instance(
         out.instance_key = key;
         out.record = item->second.record;
         out.provenance_op = item->second.accounting_op;
+        out.release_ops = item->second.release_ops;
         out.avail = server_retention_candidate_availability::available;
         return true;
     } catch (...) {
         out = {};
         return false;
     }
+}
+
+bool server_retention_sidecar_store::checkpoint_admission_artifact(
+        const server_retention_instance_key & key,
+        llama_cache_acct_artifact_id & artifact) const noexcept {
+    artifact = {};
+    if (key.kind != common_retention_artifact_kind::checkpoint) {
+        return false;
+    }
+    const auto association = associations.find(key);
+    if (association == associations.end()) {
+        return false;
+    }
+    const auto item = catalog.find(association->second.v);
+    if (item == catalog.end() || !item->second.release_ops.empty()) {
+        return false;
+    }
+    artifact = association->second;
+    return artifact.v != 0;
+}
+
+bool server_retention_sidecar_store::checkpoint_inventory(
+        const server_retention_instance_key & key,
+        server_retention_checkpoint_inventory & out) const noexcept {
+    out = {};
+    if (key.kind != common_retention_artifact_kind::checkpoint) {
+        return false;
+    }
+    const auto association = associations.find(key);
+    if (association == associations.end()) {
+        return false;
+    }
+    const auto item = catalog.find(association->second.v);
+    if (item == catalog.end() ||
+        item->second.record.kind != common_retention_artifact_kind::checkpoint) {
+        return false;
+    }
+    out.artifact_id = association->second;
+    out.pool = item->second.record.stamp.pool;
+    out.stable_id = item->second.record.stamp.stable_id;
+    out.mandatory_anchor = item->second.record.stamp.mandatory_anchor;
+    out.release_owned = !item->second.release_ops.empty();
+    out.recovery_pinned = item->second.recovery_pins != 0;
+    out.identity_known = leases &&
+        item->second.checkpoint_identity_known &&
+        item->second.checkpoint_identity.valid();
+    if (out.identity_known) {
+        out.lease = leases->inspect(
+            out.artifact_id, item->second.checkpoint_identity);
+    }
+    return out.artifact_id.v != 0;
+}
+
+bool server_retention_sidecar_store::attach_release_ops(
+        const server_retention_instance_key & key,
+        std::vector<llama_cache_acct_op_id> ops) noexcept {
+    const auto release_supplied = [&]() noexcept {
+        if (!ledger) {
+            return;
+        }
+        for (const auto op : ops) {
+            if (op && !ledger->release(op)) {
+                mark_unavailable();
+            }
+        }
+    };
+    try {
+        if (ops.empty() || std::any_of(ops.begin(), ops.end(),
+                [](const auto op) { return !op; })) {
+            release_supplied();
+            return false;
+        }
+        std::sort(ops.begin(), ops.end());
+        ops.erase(std::unique(ops.begin(), ops.end()), ops.end());
+        const auto association = associations.find(key);
+        if (association == associations.end()) {
+            release_supplied();
+            return false;
+        }
+        const auto item = catalog.find(association->second.v);
+        if (item == catalog.end() || !item->second.release_ops.empty()) {
+            release_supplied();
+            return false;
+        }
+        item->second.release_ops = std::move(ops);
+        return true;
+    } catch (...) {
+        release_supplied();
+        mark_unavailable();
+        return false;
+    }
+}
+
+void server_retention_sidecar_store::release_recovery_pin(
+        void * context) noexcept {
+    auto * entry = static_cast<catalog_entry *>(context);
+    if (!entry || entry->recovery_pins == 0) {
+        return;
+    }
+    entry->recovery_pins--;
+    if (entry->recovery_pins == 0 && entry->retire_pending &&
+        entry->owner && entry->artifact.v != 0) {
+        auto * owner = entry->owner;
+        const auto found = owner->catalog.find(entry->artifact.v);
+        if (found != owner->catalog.end() && &found->second == entry) {
+            owner->retire_catalog_entry(found);
+        } else {
+            owner->mark_unavailable();
+        }
+    }
+}
+
+server_cache_recovery_pin
+server_retention_sidecar_store::acquire_recovery_pin(
+        const server_retention_instance_key & key) noexcept {
+    try {
+        const auto association = associations.find(key);
+        if (association == associations.end()) {
+            return {};
+        }
+        const auto item = catalog.find(association->second.v);
+        if (item == catalog.end() || item->second.release_ops.empty() ||
+            item->second.recovery_pins == UINT32_MAX) {
+            return {};
+        }
+        item->second.recovery_pins++;
+        auto pin = server_cache_recovery_pin::acquire(
+            &item->second,
+            release_recovery_pin,
+            { association->second },
+            item->second.release_ops);
+        if (!pin.valid()) {
+            item->second.recovery_pins--;
+        }
+        return pin;
+    } catch (...) {
+        mark_unavailable();
+        return {};
+    }
+}
+
+void server_retention_sidecar_store::retire_after_committed_release(
+        const server_retention_instance_key & key) noexcept {
+    const auto association = associations.find(key);
+    if (association == associations.end()) {
+        mark_unavailable();
+        return;
+    }
+    const auto item = catalog.find(association->second.v);
+    if (item == catalog.end() || item->second.recovery_pins != 0 ||
+        item->second.release_ops.empty()) {
+        mark_unavailable();
+        return;
+    }
+    item->second.release_ops.clear();
+    retire_association(association);
 }
 
 std::vector<server_retention_candidate>
@@ -365,6 +585,7 @@ server_retention_sidecar_store::candidate_snapshot() const noexcept {
             if (item != catalog.end()) {
                 candidate.record = item->second.record;
                 candidate.provenance_op = item->second.accounting_op;
+                candidate.release_ops = item->second.release_ops;
                 candidate.avail =
                     server_retention_candidate_availability::available;
             }

@@ -5,13 +5,23 @@
 #include "server-cache-yield.h"
 #include "server-retention-sidecar.h"
 #include "../../common/common-cache-plan.h"
+#include "../../common/common-cache-plan-estimate.h"
 #include "../../src/llama-cache-authority.h"
 #include "ggml-backend.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
 struct server_prompt_cache_state;
+struct common_prompt_checkpoint;
+
+struct server_cache_live_checkpoint_admission {
+    llama_cache_acct_artifact_id artifact;
+    uint64_t checkpoint_bytes = 0;
+    uint64_t accelerator_bytes = 0;
+    std::vector<llama_cache_acct_op_id> committed;
+};
 
 // D-A3's process-local policy seams. The weight callback is deliberately a
 // dimensionless fixed-point multiplier: fitted B restore cost remains the
@@ -24,6 +34,165 @@ struct server_prompt_cache_state;
 constexpr uint32_t SERVER_CACHE_HOST_WEIGHT_SCALE = 1000;
 constexpr uint32_t SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT = 2000;
 constexpr uint32_t SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT = 2000;
+
+inline bool server_cache_multiply_retention_weight(
+        uint32_t & weight_milli,
+        uint32_t factor_milli) noexcept {
+    if (factor_milli == 0) {
+        return false;
+    }
+    const uint64_t weighted =
+        (uint64_t(weight_milli) * factor_milli +
+         SERVER_CACHE_HOST_WEIGHT_SCALE - 1) /
+        SERVER_CACHE_HOST_WEIGHT_SCALE;
+    if (weighted > UINT32_MAX) {
+        return false;
+    }
+    weight_milli = uint32_t(weighted);
+    return true;
+}
+
+bool server_cache_weighted_price_us(
+    long double base_us,
+    uint32_t weight_milli,
+    uint64_t & out) noexcept;
+
+enum class server_cache_checkpoint_protection : uint8_t {
+    none = 0,
+    seam_heuristic,
+    mandatory_anchor,
+    hard_lease,
+    _count,
+};
+
+struct server_cache_checkpoint_trade_input {
+    uint32_t ordinal = 0;
+    uint32_t recovery_ordinal = UINT32_MAX;
+    llama_cache_acct_artifact_id artifact;
+    uint64_t stable_id = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t replay_tokens = 0;
+    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
+    bool identity_known = false;
+    bool recovery_available = false;
+    bool seam_heuristic_protected = false;
+    bool mandatory_anchor = false;
+    bool hard_leased = false;
+};
+
+struct server_cache_checkpoint_trade_plan {
+    bool selected = false;
+    uint32_t ordinal = UINT32_MAX;
+    uint32_t recovery_ordinal = UINT32_MAX;
+    uint64_t price_us = 0;
+    uint64_t stable_id = 0;
+    uint32_t weight_milli = SERVER_CACHE_HOST_WEIGHT_SCALE;
+    server_cache_checkpoint_protection protection =
+        server_cache_checkpoint_protection::none;
+    common_cache_plan_destruction_reason reason =
+        common_cache_plan_destruction_reason::recovery_unavailable;
+};
+
+// D-A4's policy-free checkpoint-member optimum. Inputs already encode the
+// ownership/recovery relation; the pure chooser refuses incomplete evidence,
+// protects the best-effort seam heuristic and the mandatory/hard rows, and
+// uses B's fitted replay plus restore formula with the same fixed-point
+// retention weights as D-A3. Bounded same-lineage replay, not this heuristic,
+// is the correctness guarantee for a selected thinning.
+server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
+    const std::vector<server_cache_checkpoint_trade_input> & candidates,
+    const common_cache_plan_calib * calib) noexcept;
+
+// A later checkpoint may be omitted after an optional thinning refusal only
+// when the retained predecessor is a same-lineage recovery point within the
+// configured marginal replay bound.
+bool server_cache_checkpoint_bounded_replay(
+    const common_prompt_checkpoint & recovery,
+    const common_prompt_checkpoint & later,
+    uint64_t max_replay_tokens) noexcept;
+
+struct server_cache_checkpoint_floor_input {
+    uint32_t ordinal = 0;
+    server_cache_checkpoint_protection protection =
+        server_cache_checkpoint_protection::none;
+    bool recovery_pinned = false;
+};
+
+struct server_cache_checkpoint_floor_plan {
+    bool selected = false;
+    uint32_t ordinal = UINT32_MAX;
+    common_cache_plan_destruction_reason reason =
+        common_cache_plan_destruction_reason::mandatory_anchor;
+};
+
+// Capacity's legacy-order floor. Heuristic members remain eligible when every
+// unprotected member is gone; hard/mandatory/current-task/pinned members never
+// are. No selection means the incoming checkpoint publication must be skipped.
+server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
+    const std::vector<server_cache_checkpoint_floor_input> & candidates) noexcept;
+
+// A protected/fail-closed ring has no new evidence until its membership
+// changes.  Keep the three expensive creation-time policy passes independently
+// latched so an unchanged ring pays one integer comparison per pass rather than
+// rebuilding identities, leases, and quotes for every attempted publication.
+// A committed member erase or publication advances the generation and re-arms
+// every lane.
+enum class server_cache_checkpoint_attempt_lane : uint8_t {
+    optional_thinning = 0,
+    capacity_thinning,
+    capacity_floor,
+    _count,
+};
+
+class server_cache_checkpoint_attempt_latch {
+public:
+    bool begin(server_cache_checkpoint_attempt_lane lane) noexcept {
+        const size_t index = size_t(lane);
+        if (index >= attempted_generation_.size() ||
+            attempted_generation_[index] == generation_) {
+            return false;
+        }
+        attempted_generation_[index] = generation_;
+        return true;
+    }
+
+    bool refusal_changed(
+            common_cache_plan_destruction_reason reason,
+            bool publication_skip = false) noexcept {
+        const size_t lane = publication_skip ? 1 : 0;
+        if (refusal_generation_[lane] == generation_ &&
+            refusal_reason_[lane] == reason) {
+            return false;
+        }
+        refusal_generation_[lane] = generation_;
+        refusal_reason_[lane] = reason;
+        return true;
+    }
+
+    void ring_changed() noexcept {
+        generation_++;
+        if (generation_ == 0) {
+            generation_ = 1;
+            attempted_generation_ = {};
+            refusal_generation_ = {};
+        }
+    }
+
+    uint64_t generation() const noexcept {
+        return generation_;
+    }
+
+private:
+    uint64_t generation_ = 1;
+    std::array<uint64_t,
+        size_t(server_cache_checkpoint_attempt_lane::_count)>
+        attempted_generation_ = {};
+    std::array<uint64_t, 2> refusal_generation_ = {};
+    std::array<common_cache_plan_destruction_reason, 2> refusal_reason_ = {
+        common_cache_plan_destruction_reason::none,
+        common_cache_plan_destruction_reason::none,
+    };
+};
 
 using server_cache_host_retention_weight_fn = bool (*)(
     void * context,
@@ -95,6 +264,22 @@ struct server_cache_authority {
     // F0b's first authoritative producer: admit/stage/commit all host-entry payload leaves as one
     // all-or-nothing server transaction. Publication itself remains the caller's no-throw splice.
     bool admit_host_entry(server_prompt_cache_state & entry) noexcept;
+
+    // D-A4: charge independently owned live-checkpoint payloads. The caller
+    // publishes sidecar identities first, then attaches these exact operations
+    // in the same scheduler turn before any planner can observe the members.
+    // The batch is one all-or-nothing reservation transaction; host-entry
+    // checkpoint copies never call this door.
+    bool admit_live_checkpoints(
+        std::vector<server_cache_live_checkpoint_admission> & batch) noexcept;
+
+    // Single-member creation adapter. Restore paths must use the batch door so
+    // one ring incurs one budget sample and one reservation transaction.
+    bool admit_live_checkpoint(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t checkpoint_bytes,
+        uint64_t accelerator_bytes,
+        std::vector<llama_cache_acct_op_id> & committed) noexcept;
 
     // Bounded process-local D-A receipt publication for destruction work that
     // occurs during host-cache maintenance rather than one B request record.

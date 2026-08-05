@@ -16,7 +16,7 @@
     X(slot_drop,                server_cache_slot_drop_impl,                observe_full_slot,                   none) \
     X(live_range_drop,          server_cache_live_range_drop_impl,          observe_live_range_drop,             none) \
     X(host_artifact_drop,       server_prompt_cache_destroy_entry_impl,     server_prompt_cache_observe_drop,     legacy_wrapper_or_capability) \
-    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          checkpoint_drop,                     none) \
+    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          observe_checkpoint_drop,             legacy_wrapper_or_capability) \
     X(token_ledger_truncate,    server_cache_token_ledger_truncate_impl,    token_ledger_truncate,               none) \
     X(mandatory_recovery_reset, server_cache_mandatory_recovery_reset_impl, observe_full_slot,                   none)
 
@@ -82,6 +82,10 @@ enum class server_cache_destruction_execution : uint8_t {
     // D-A3: B-priced host capacity/token victim, certified against a
     // disjoint retained or pre-authorized durable recovery source.
     priced_host_eviction,
+    // D-A4: one independently accounted live checkpoint member was removed
+    // under a pinned replay-source certificate. Host-entry checkpoint rings
+    // remain aggregate-owned and can never reach this terminal.
+    priced_checkpoint_thinning,
     _count,
 };
 
@@ -225,6 +229,15 @@ struct server_cache_destruction_observer {
     uint64_t host_trade_soft_lease_evictions = 0;
     uint64_t host_trade_zero_destruction_ties = 0;
     uint64_t host_trade_release_bytes = 0;
+    uint64_t checkpoint_thin_attempted = 0;
+    uint64_t checkpoint_thin_certified = 0;
+    uint64_t checkpoint_thin_executed = 0;
+    uint64_t checkpoint_thin_refused = 0;
+    uint64_t checkpoint_thin_heuristic_refusals = 0;
+    uint64_t checkpoint_thin_mandatory_refusals = 0;
+    uint64_t checkpoint_thin_hard_lease_refusals = 0;
+    uint64_t checkpoint_publication_skips = 0;
+    uint64_t checkpoint_thin_release_bytes = 0;
     void * lease_context = nullptr;
     server_cache_lease_evaluator lease_evaluator = nullptr;
 
@@ -342,6 +355,41 @@ struct server_cache_destruction_observer {
         if (auto * event = event_for_sequence(sequence)) {
             event->execution =
                 server_cache_destruction_execution::priced_host_eviction;
+        }
+    }
+
+    void note_checkpoint_thin_refused() noexcept {
+        checkpoint_thin_attempted++;
+        checkpoint_thin_refused++;
+    }
+
+    void note_checkpoint_thin_heuristic_refused() noexcept {
+        checkpoint_thin_heuristic_refusals++;
+    }
+
+    void note_checkpoint_thin_mandatory_refused() noexcept {
+        checkpoint_thin_mandatory_refusals++;
+    }
+
+    void note_checkpoint_thin_hard_lease_refused() noexcept {
+        checkpoint_thin_hard_lease_refusals++;
+    }
+
+    void note_checkpoint_publication_skip() noexcept {
+        checkpoint_publication_skips++;
+    }
+
+    void note_checkpoint_thin_executed(
+            uint64_t sequence,
+            uint64_t released_bytes) noexcept {
+        checkpoint_thin_attempted++;
+        checkpoint_thin_certified++;
+        checkpoint_thin_executed++;
+        checkpoint_thin_release_bytes += released_bytes;
+        if (auto * event = event_for_sequence(sequence)) {
+            event->execution =
+                server_cache_destruction_execution::
+                    priced_checkpoint_thinning;
         }
     }
 };

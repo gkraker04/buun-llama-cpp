@@ -1,6 +1,8 @@
 #include "common-retention-sidecar.h"
 #include "server-cache-lease.h"
+#include "server-cache-destruction-quote.h"
 #include "server-retention-sidecar.h"
+#include "llama-cache-authority.h"
 
 #include <cstdio>
 #include <cstring>
@@ -222,9 +224,13 @@ static void test_observer_store_accounting() {
     CHECK(ledger.configure_required_producers(&requirement, 1));
     for (const auto measure : {
             llama_cache_acct_measure::logical_payload,
-            llama_cache_acct_measure::resident_allocated }) {
+            llama_cache_acct_measure::resident_allocated,
+            llama_cache_acct_measure::reserved }) {
         ledger.gauge_set(
             llama_cache_acct_category::artifact_descriptor_metadata,
+            domain, measure, 0);
+        ledger.gauge_set(
+            llama_cache_acct_category::checkpoint_state_payload,
             domain, measure, 0);
     }
     CHECK(ledger.certify_complete(
@@ -234,15 +240,24 @@ static void test_observer_store_accounting() {
     server_cache_lease_table leases(&clock);
     server_retention_sidecar_store store;
     store.configure(&ledger, domain, &leases);
-    const auto live = server_retention_instance_key::for_slot(3);
-    CHECK(store.publish(
-        live, common_retention_pool::recurrent, make_spans(), true,
-        44, 30, true));
-    CHECK(store.artifact_id(live).v != 0);
-    const auto live_artifact = store.artifact_id(live);
     const server_cache_lease_identity lease_identity = {
         "execution", "adapter", "media",
     };
+    const auto live = server_retention_instance_key::for_slot(3);
+    CHECK(store.publish(
+        live, common_retention_pool::recurrent, make_spans(), true,
+        44, 30, true, &lease_identity));
+    CHECK(store.artifact_id(live).v != 0);
+    const auto live_artifact = store.artifact_id(live);
+    const auto live_payload_op = server_cache_acct_charge_shadow(
+        ledger,
+        llama_cache_acct_category::checkpoint_state_payload,
+        domain,
+        llama_cache_acct_producer::retention_sidecar,
+        { llama_cache_acct_attr_kind::artifact, -1, live_artifact },
+        32, 32);
+    CHECK(live_payload_op);
+    CHECK(store.attach_release_ops(live, { live_payload_op }));
     const auto lease = leases.grant_soft(
         {
             live_artifact,
@@ -270,6 +285,33 @@ static void test_observer_store_accounting() {
     CHECK(store.rebind(host_checkpoint, rebound));
     CHECK(store.artifact_id(rebound) == host_id);
     CHECK(store.artifact_id(host_checkpoint).v == 0);
+    server_retention_candidate aggregate_clone;
+    CHECK(store.candidate_for_instance(rebound, aggregate_clone));
+    CHECK(aggregate_clone.release_ops.empty());
+    const auto payload_op = server_cache_acct_charge_shadow(
+        ledger,
+        llama_cache_acct_category::checkpoint_state_payload,
+        domain,
+        llama_cache_acct_producer::retention_sidecar,
+        { llama_cache_acct_attr_kind::artifact, -1, host_id },
+        64, 64);
+    CHECK(payload_op);
+    CHECK(store.attach_release_ops(rebound, { payload_op }));
+    server_retention_checkpoint_inventory inventory;
+    CHECK(store.checkpoint_inventory(rebound, inventory));
+    CHECK(inventory.artifact_id == host_id);
+    CHECK(inventory.identity_known);
+    CHECK(inventory.release_owned);
+    CHECK(!inventory.recovery_pinned);
+    {
+        auto pin = store.acquire_recovery_pin(rebound);
+        CHECK(pin.valid());
+        CHECK(pin.binds_exact(host_id, { payload_op }));
+        CHECK(store.checkpoint_inventory(rebound, inventory));
+        CHECK(inventory.recovery_pinned);
+    }
+    CHECK(store.checkpoint_inventory(rebound, inventory));
+    CHECK(!inventory.recovery_pinned);
 
     std::vector<uint8_t> exported;
     CHECK(store.export_bytes(exported));
@@ -284,21 +326,115 @@ static void test_observer_store_accounting() {
         CHECK(candidate.artifact_id.v != 0);
         CHECK(candidate.record.valid());
         CHECK(candidate.provenance_op);
-        CHECK(candidate.release_ops.empty()); // server assembler owns payload join
+        if (candidate.artifact_id == live_artifact) {
+            CHECK(candidate.release_ops ==
+                  std::vector<llama_cache_acct_op_id> { live_payload_op });
+        } else {
+            CHECK(candidate.release_ops ==
+                  std::vector<llama_cache_acct_op_id> { payload_op });
+        }
         CHECK(candidate.avail ==
               server_retention_candidate_availability::available);
         CHECK(store.artifact_id(candidate.instance_key) ==
               candidate.artifact_id);
     }
 
-    store.retire(rebound);
+    server_retention_candidate victim_candidate;
+    CHECK(store.candidate_for_instance(rebound, victim_candidate));
+    server_cache_destruction_artifact victim;
+    victim.candidate.artifact_id = victim_candidate.artifact_id;
+    victim.candidate.record = victim_candidate.record;
+    victim.candidate.availability = victim_candidate.avail;
+    victim.candidate.release_ops = victim_candidate.release_ops;
+    victim.candidate.identity_known = true;
+    victim.candidate.lease = {
+        server_cache_lease_eval_state::known,
+        server_cache_lease_class::none,
+        server_cache_lease_eligibility::eligible,
+    };
+    victim.kind = common_retention_artifact_kind::checkpoint;
+    victim.pool = victim_candidate.record.stamp.pool;
+    const auto preview = [&](const auto & cited, uint64_t serial, auto & out) {
+        return ledger.preview_release_set(cited, serial, out);
+    };
+    const auto project = [](const auto & released, auto & out) {
+        out.clear();
+        for (const auto & row : released.rows) {
+            common_cache_plan_yield_domain domain_row;
+            domain_row.domain = row.domain;
+            domain_row.current_resident_bytes =
+                llama_cache_acct_value::measured(row.resident_allocated);
+            domain_row.fit_before_bytes =
+                domain_row.current_resident_bytes;
+            domain_row.projected_release_bytes =
+                llama_cache_acct_value::measured(row.resident_allocated);
+            domain_row.projected_reserve_bytes =
+                llama_cache_acct_value::measured(0);
+            domain_row.projected_after_bytes =
+                llama_cache_acct_value::measured(0);
+            out.push_back(domain_row);
+        }
+        return !out.empty();
+    };
+    auto quote = server_cache_destruction_quote_single_artifact(
+        victim, 0, ledger.snapshot().serial, 1, preview, project);
+    CHECK(quote.receipt.state ==
+          common_cache_plan_destruction_state::quoted);
+    auto same_member_pin = store.acquire_recovery_pin(rebound);
+    CHECK(same_member_pin.valid());
+    auto disjoint_refusal = server_cache_prepare_release_set(
+        quote, { victim }, ledger, ledger.snapshot().serial,
+        project, std::move(same_member_pin));
+    CHECK(disjoint_refusal.status ==
+          server_cache_prepare_release_status::recovery_unavailable);
+    same_member_pin = {};
+    auto recovery_pin = store.acquire_recovery_pin(live);
+    CHECK(recovery_pin.valid());
+    auto prepared = server_cache_prepare_release_set(
+        quote, { victim }, ledger, ledger.snapshot().serial,
+        project, std::move(recovery_pin));
+    CHECK(prepared.status == server_cache_prepare_release_status::prepared);
+    server_cache_recovery_pin retained_pin;
+    CHECK(prepared.capability.commit(retained_pin) ==
+          common_cache_plan_destruction_reason::none);
+    store.retire_after_committed_release(rebound);
+    retained_pin = {};
+
+    // A latent legacy drop racing a recovery pin must fail soft, not abort or
+    // invalidate the pin callback. Retirement is deferred until the pin
+    // closes, at which point both descriptor and payload ops are discharged.
+    const auto * pinned_ptr =
+        reinterpret_cast<const common_prompt_checkpoint *>(uintptr_t(100));
+    const auto pinned_key =
+        server_retention_instance_key::for_checkpoint(9, pinned_ptr);
+    CHECK(store.clone(live, pinned_key));
+    const auto pinned_artifact = store.artifact_id(pinned_key);
+    const auto pinned_op = server_cache_acct_charge_shadow(
+        ledger,
+        llama_cache_acct_category::checkpoint_state_payload,
+        domain,
+        llama_cache_acct_producer::retention_sidecar,
+        { llama_cache_acct_attr_kind::artifact, -1, pinned_artifact },
+        16, 16);
+    CHECK(pinned_op);
+    CHECK(store.attach_release_ops(pinned_key, { pinned_op }));
+    auto latent_pin = store.acquire_recovery_pin(pinned_key);
+    CHECK(latent_pin.valid());
+    const auto live_ops_before_pinned_drop = ledger.snapshot().live_ops;
+    store.retire(pinned_key);
+    CHECK(store.artifact_id(pinned_key).v == 0);
+    CHECK(store.unavailable() == 1);
+    CHECK(ledger.snapshot().live_ops == live_ops_before_pinned_drop);
+    latent_pin = {};
+    CHECK(ledger.snapshot().live_ops + 2 == live_ops_before_pinned_drop);
+
     store.retire(live);
     CHECK(leases.evaluate(live_artifact, lease_identity).cls ==
           server_cache_lease_class::none);
     CHECK(store.live_bytes() == 0);
     CHECK(ledger.snapshot().allocations.empty());
-    CHECK(store.publish_ok() == 2);
-    CHECK(store.unavailable() == 0);
+    CHECK(store.publish_ok() == 3);
+    CHECK(store.unavailable() == 1);
 }
 
 int main() {

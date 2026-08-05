@@ -319,6 +319,7 @@ enum class common_cache_plan_destruction_reason : uint8_t {
     effect_drift,
     release_evidence_unavailable,
     recovery_unavailable,
+    profile_unfitted,
     capacity_refused,
     mutation_failed,
     internal_fault,
@@ -334,6 +335,8 @@ enum class common_cache_plan_destruction_effect : uint8_t {
     // spelling; D-A2's maintenance receipt distinguishes certified redundant
     // eviction with displaced_fate=exact_duplicate and a resolved citation.
     different_host_source_consumption,
+    // D-A4 owns one independently accounted member of a live checkpoint ring.
+    checkpoint_member_drop,
     _count,
 };
 
@@ -416,19 +419,44 @@ constexpr bool common_cache_plan_destruction_effect_has(
 constexpr common_cache_plan_destruction_class
 common_cache_plan_destruction_class_for_effect(
         common_cache_plan_destruction_effect effect) noexcept {
-    return effect == common_cache_plan_destruction_effect::
-                         different_host_source_consumption
-        ? common_cache_plan_destruction_class::host_artifact_drop
-        : common_cache_plan_destruction_class::slot_drop;
+    switch (effect) {
+        case common_cache_plan_destruction_effect::
+                 different_host_source_consumption:
+            return common_cache_plan_destruction_class::host_artifact_drop;
+        case common_cache_plan_destruction_effect::checkpoint_member_drop:
+            return common_cache_plan_destruction_class::checkpoint_drop;
+        case common_cache_plan_destruction_effect::none:
+        case common_cache_plan_destruction_effect::cross_target_displacement:
+        case common_cache_plan_destruction_effect::
+                 destructive_similarity_retarget:
+        case common_cache_plan_destruction_effect::
+                 same_target_cold_replacement:
+        case common_cache_plan_destruction_effect::_count:
+            return common_cache_plan_destruction_class::slot_drop;
+    }
+    return common_cache_plan_destruction_class::slot_drop;
 }
 
 constexpr common_cache_plan_destruction_physical_reason
 common_cache_plan_destruction_physical_reason_for_effect(
         common_cache_plan_destruction_effect effect) noexcept {
-    return effect == common_cache_plan_destruction_effect::
-                         different_host_source_consumption
-        ? common_cache_plan_destruction_physical_reason::cache_update
-        : common_cache_plan_destruction_physical_reason::slot_rebind;
+    switch (effect) {
+        case common_cache_plan_destruction_effect::
+                 different_host_source_consumption:
+            return common_cache_plan_destruction_physical_reason::cache_update;
+        case common_cache_plan_destruction_effect::checkpoint_member_drop:
+            return common_cache_plan_destruction_physical_reason::
+                checkpoint_replace;
+        case common_cache_plan_destruction_effect::none:
+        case common_cache_plan_destruction_effect::cross_target_displacement:
+        case common_cache_plan_destruction_effect::
+                 destructive_similarity_retarget:
+        case common_cache_plan_destruction_effect::
+                 same_target_cold_replacement:
+        case common_cache_plan_destruction_effect::_count:
+            return common_cache_plan_destruction_physical_reason::slot_rebind;
+    }
+    return common_cache_plan_destruction_physical_reason::slot_rebind;
 }
 
 struct common_cache_plan_destruction_manifest_digest_tag;

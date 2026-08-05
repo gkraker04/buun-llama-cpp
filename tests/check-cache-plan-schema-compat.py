@@ -50,6 +50,11 @@ assert schema6[0]["destruction"]["effects"] == [
         "action_class": "host_artifact_drop",
         "physical_reason": "cache_update",
     },
+    {
+        "effect": "checkpoint_member_drop",
+        "action_class": "checkpoint_drop",
+        "physical_reason": "checkpoint_replace",
+    },
 ]
 assert schema6[0]["destruction"]["admission_sequence"] > 0
 assert schema6[0]["destruction"]["quote_duration_us"] >= 0

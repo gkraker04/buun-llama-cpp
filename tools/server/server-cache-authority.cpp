@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 namespace {
@@ -21,6 +23,197 @@ bool add_checked(uint64_t a, uint64_t b, uint64_t & out) noexcept {
 }
 
 } // namespace
+
+bool server_cache_weighted_price_us(
+        long double base_us,
+        uint32_t weight_milli,
+        uint64_t & out) noexcept {
+    out = 0;
+    const long double weighted = base_us * weight_milli /
+        SERVER_CACHE_HOST_WEIGHT_SCALE;
+    if (!std::isfinite((double) weighted) || weighted < 0.0L ||
+        weighted > (long double) std::numeric_limits<long long>::max()) {
+        return false;
+    }
+    out = uint64_t(std::llround(weighted));
+    return true;
+}
+
+server_cache_checkpoint_trade_plan server_cache_plan_checkpoint_thinning(
+        const std::vector<server_cache_checkpoint_trade_input> & candidates,
+        const common_cache_plan_calib * calib) noexcept {
+    server_cache_checkpoint_trade_plan out;
+    if (!calib || !std::isfinite(calib->replay_us_per_token) ||
+        calib->replay_us_per_token < 0.0) {
+        out.reason = common_cache_plan_destruction_reason::profile_unfitted;
+        return out;
+    }
+    common_cache_plan_destruction_reason refusal =
+        common_cache_plan_destruction_reason::recovery_unavailable;
+    server_cache_checkpoint_protection protection =
+        server_cache_checkpoint_protection::none;
+    try {
+        for (const auto & candidate : candidates) {
+            if (candidate.artifact.v == 0 || !candidate.identity_known ||
+                candidate.payload_bytes == 0 ||
+                candidate.weight_milli == 0) {
+                refusal =
+                    common_cache_plan_destruction_reason::manifest_incomplete;
+                continue;
+            }
+            if (candidate.seam_heuristic_protected ||
+                candidate.mandatory_anchor) {
+                refusal =
+                    common_cache_plan_destruction_reason::mandatory_anchor;
+                if (candidate.seam_heuristic_protected) {
+                    protection =
+                        server_cache_checkpoint_protection::seam_heuristic;
+                } else if (protection !=
+                        server_cache_checkpoint_protection::seam_heuristic) {
+                    protection =
+                        server_cache_checkpoint_protection::mandatory_anchor;
+                }
+                continue;
+            }
+            if (candidate.hard_leased) {
+                refusal =
+                    common_cache_plan_destruction_reason::hard_lease_blocked;
+                if (protection ==
+                        server_cache_checkpoint_protection::none) {
+                    protection =
+                        server_cache_checkpoint_protection::hard_lease;
+                }
+                continue;
+            }
+            if (!candidate.recovery_available ||
+                candidate.recovery_ordinal == UINT32_MAX) {
+                refusal =
+                    common_cache_plan_destruction_reason::recovery_unavailable;
+                continue;
+            }
+            double restore_us = 0.0;
+            double workspace_us = 0.0;
+            if (!common_cache_plan_restore_us(
+                    *calib, candidate.payload_bytes,
+                    restore_us, workspace_us)) {
+                refusal =
+                    common_cache_plan_destruction_reason::capacity_refused;
+                continue;
+            }
+            const long double replay_us =
+                (long double) candidate.replay_tokens *
+                calib->replay_us_per_token;
+            const long double base = replay_us + restore_us + workspace_us;
+            uint64_t price = 0;
+            if (!server_cache_weighted_price_us(
+                    base, candidate.weight_milli, price)) {
+                refusal =
+                    common_cache_plan_destruction_reason::capacity_refused;
+                continue;
+            }
+            const auto key = std::make_tuple(
+                price, candidate.stable_id, candidate.ordinal);
+            const auto best = std::make_tuple(
+                out.price_us, out.stable_id, out.ordinal);
+            if (!out.selected || key < best) {
+                out.selected = true;
+                out.ordinal = candidate.ordinal;
+                out.recovery_ordinal = candidate.recovery_ordinal;
+                out.price_us = price;
+                out.stable_id = candidate.stable_id;
+                out.weight_milli = candidate.weight_milli;
+                out.protection =
+                    server_cache_checkpoint_protection::none;
+                out.reason = common_cache_plan_destruction_reason::none;
+            }
+        }
+    } catch (...) {
+        out = {};
+        out.reason = common_cache_plan_destruction_reason::internal_fault;
+    }
+    if (!out.selected) {
+        out.protection = protection;
+        out.reason = refusal;
+        switch (protection) {
+            case server_cache_checkpoint_protection::seam_heuristic:
+            case server_cache_checkpoint_protection::mandatory_anchor:
+                out.reason =
+                    common_cache_plan_destruction_reason::mandatory_anchor;
+                break;
+            case server_cache_checkpoint_protection::hard_lease:
+                out.reason =
+                    common_cache_plan_destruction_reason::hard_lease_blocked;
+                break;
+            case server_cache_checkpoint_protection::none:
+            case server_cache_checkpoint_protection::_count:
+                break;
+        }
+    }
+    return out;
+}
+
+bool server_cache_checkpoint_bounded_replay(
+        const common_prompt_checkpoint & recovery,
+        const common_prompt_checkpoint & later,
+        uint64_t max_replay_tokens) noexcept {
+    return recovery.computation_frontier.valid() &&
+           later.computation_frontier.valid() &&
+           later.n_tokens >= recovery.n_tokens &&
+           uint64_t(later.n_tokens - recovery.n_tokens) <= max_replay_tokens &&
+           recovery.computation_frontier.sequence_epoch ==
+               later.computation_frontier.sequence_epoch &&
+           recovery.computation_frontier.execution_identity ==
+               later.computation_frontier.execution_identity &&
+           recovery.computation_frontier.adapter_config_identity ==
+               later.computation_frontier.adapter_config_identity &&
+           recovery.computation_frontier.media_content_identity ==
+               later.computation_frontier.media_content_identity &&
+           recovery.representation_epoch == later.representation_epoch &&
+           recovery.representation_epoch_swa ==
+               later.representation_epoch_swa;
+}
+
+server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
+        const std::vector<server_cache_checkpoint_floor_input> & candidates) noexcept {
+    server_cache_checkpoint_floor_plan out;
+    uint32_t heuristic = UINT32_MAX;
+    try {
+        for (const auto & candidate : candidates) {
+            if (candidate.recovery_pinned ||
+                candidate.protection ==
+                    server_cache_checkpoint_protection::mandatory_anchor ||
+                candidate.protection ==
+                    server_cache_checkpoint_protection::hard_lease) {
+                if (candidate.protection ==
+                        server_cache_checkpoint_protection::hard_lease) {
+                    out.reason =
+                        common_cache_plan_destruction_reason::hard_lease_blocked;
+                }
+                continue;
+            }
+            if (candidate.protection ==
+                    server_cache_checkpoint_protection::seam_heuristic) {
+                if (heuristic == UINT32_MAX) {
+                    heuristic = candidate.ordinal;
+                }
+                continue;
+            }
+            out.selected = true;
+            out.ordinal = candidate.ordinal;
+            out.reason = common_cache_plan_destruction_reason::none;
+            return out;
+        }
+        if (heuristic != UINT32_MAX) {
+            out.selected = true;
+            out.ordinal = heuristic;
+            out.reason = common_cache_plan_destruction_reason::none;
+        }
+    } catch (...) {
+        out = {};
+        out.reason = common_cache_plan_destruction_reason::internal_fault;
+    }
+    return out;
+}
 
 bool server_cache_authority::sample_budget(
         llama_cache_budget_config & config,
@@ -289,6 +482,140 @@ bool server_cache_authority::admit_host_entry(
     }
     admission_commits++;
     return true;
+}
+
+bool server_cache_authority::admit_live_checkpoints(
+        std::vector<server_cache_live_checkpoint_admission> & batch) noexcept {
+    const uint64_t refusal_count = std::max<size_t>(batch.size(), 1);
+    const auto refuse = [&]() noexcept {
+        for (auto & member : batch) {
+            member.committed.clear();
+        }
+        admission_refusals += refusal_count;
+        return false;
+    };
+
+    uint64_t pending = 0;
+    if (!configured || batch.empty()) {
+        return refuse();
+    }
+    try {
+        for (auto & member : batch) {
+            member.committed.clear();
+            member.committed.reserve(member.accelerator_bytes > 0 ? 2 : 1);
+            uint64_t member_bytes = 0;
+            if (member.artifact.v == 0 || member.checkpoint_bytes == 0 ||
+                !add_checked(member.checkpoint_bytes,
+                             member.accelerator_bytes, member_bytes) ||
+                !add_checked(pending, member_bytes, pending)) {
+                return refuse();
+            }
+        }
+    } catch (...) {
+        return refuse();
+    }
+
+    llama_cache_budget_config config;
+    if (!sample_budget(config, pending)) {
+        SRV_WRN("%s\n",
+                "CACHE_AUTHORITY checkpoint ownership refused: budget sample unavailable");
+        return refuse();
+    }
+
+    std::vector<std::array<llama_cache_acct_op_id, 2>> outputs;
+    std::vector<llama_cache_transaction_leaf> leaves;
+    try {
+        outputs.resize(batch.size());
+        leaves.reserve(batch.size() * 2);
+        for (size_t i = 0; i < batch.size(); ++i) {
+            const auto add_leaf = [&](llama_cache_acct_category category,
+                                      uint64_t bytes,
+                                      llama_cache_acct_op_id * output) {
+                if (bytes == 0) {
+                    return;
+                }
+                llama_cache_transaction_leaf leaf;
+                leaf.category = category;
+                leaf.domain = llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pageable_host);
+                leaf.attribution = {
+                    llama_cache_acct_attr_kind::artifact, -1,
+                    batch[i].artifact,
+                };
+                leaf.expected_logical = bytes;
+                leaf.reserve_resident = bytes;
+                leaf.stage_resident = bytes;
+                leaf.artifact = batch[i].artifact;
+                leaf.committed_op = output;
+                leaves.push_back(leaf);
+            };
+            add_leaf(
+                llama_cache_acct_category::checkpoint_state_payload,
+                batch[i].checkpoint_bytes, &outputs[i][0]);
+            add_leaf(
+                llama_cache_acct_category::typed_accelerator_payload,
+                batch[i].accelerator_bytes, &outputs[i][1]);
+        }
+    } catch (...) {
+        return refuse();
+    }
+
+    const auto transaction = llama_cache_execute_reservation_transaction(
+        ledger, config, leaves);
+    admission_retries += transaction.serial_retries;
+    admission_rollbacks += transaction.rolled_back;
+    if (transaction.status != llama_cache_transaction_status::committed) {
+        SRV_WRN(
+            "CACHE_AUTHORITY checkpoint ownership refused: status=%s admission=%s\n",
+            llama_cache_transaction_status_name(transaction.status),
+            llama_cache_admission_status_name(transaction.admission_status));
+        return refuse();
+    }
+    try {
+        for (size_t i = 0; i < batch.size(); ++i) {
+            for (const auto op : outputs[i]) {
+                if (op) {
+                    batch[i].committed.push_back(op);
+                }
+            }
+        }
+    } catch (...) {
+        for (const auto & member : outputs) {
+            for (const auto op : member) {
+                if (op) {
+                    (void) ledger.release(op);
+                }
+            }
+        }
+        admission_rollbacks += leaves.size();
+        return refuse();
+    }
+    // Preserve the established per-checkpoint admission counter semantics
+    // even though the accounting terminal is now one batch transaction.
+    admission_commits += batch.size();
+    return true;
+}
+
+bool server_cache_authority::admit_live_checkpoint(
+        llama_cache_acct_artifact_id artifact,
+        uint64_t checkpoint_bytes,
+        uint64_t accelerator_bytes,
+        std::vector<llama_cache_acct_op_id> & committed) noexcept {
+    committed.clear();
+    try {
+        std::vector<server_cache_live_checkpoint_admission> batch(1);
+        batch[0].artifact = artifact;
+        batch[0].checkpoint_bytes = checkpoint_bytes;
+        batch[0].accelerator_bytes = accelerator_bytes;
+        if (!admit_live_checkpoints(batch)) {
+            return false;
+        }
+        committed = std::move(batch[0].committed);
+        return !committed.empty();
+    } catch (...) {
+        admission_refusals++;
+        return false;
+    }
 }
 
 void server_cache_authority::observe_host_destruction(

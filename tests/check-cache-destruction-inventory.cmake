@@ -13,6 +13,8 @@ file(READ "${SOURCE_ROOT}/tools/server/server-task.cpp" server_task)
 file(READ "${SOURCE_ROOT}/tests/test-server-prompt-cache.cpp" server_task_test)
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-destruction-quote.h" quote_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-destruction-quote.cpp" quote_source)
+file(READ "${SOURCE_ROOT}/tools/server/server-retention-sidecar.cpp" sidecar_source)
+file(READ "${SOURCE_ROOT}/tools/server/server-cache-authority.cpp" authority_source)
 
 # Parse the one X-macro rather than maintaining a second function allowlist in CI.
 string(REGEX MATCHALL
@@ -114,7 +116,7 @@ if (lifecycle_negative_valid)
 endif()
 
 set(expected_release_owners
-    "slot_drop:none;live_range_drop:none;host_artifact_drop:legacy_wrapper_or_capability;checkpoint_drop:none;token_ledger_truncate:none;mandatory_recovery_reset:none")
+    "slot_drop:none;live_range_drop:none;host_artifact_drop:legacy_wrapper_or_capability;checkpoint_drop:legacy_wrapper_or_capability;token_ledger_truncate:none;mandatory_recovery_reset:none")
 if (NOT release_owners STREQUAL expected_release_owners)
     message(FATAL_ERROR
         "D-A0b accounting release-owner inventory drifted: ${release_owners}")
@@ -243,7 +245,7 @@ endif()
 
 # Negative control B: removing one class from the one X-macro must fail exact cardinality.
 string(REPLACE
-    "    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          checkpoint_drop,                     none) \\\n"
+    "    X(checkpoint_drop,          server_cache_checkpoint_drop_impl,          observe_checkpoint_drop,             legacy_wrapper_or_capability) \\\n"
     "" inventory_negative "${inventory_header}")
 string(REGEX MATCHALL
     "X\\([a-z_]+,[ \t]+[a-z0-9_]+,[ \t]+[a-z0-9_]+,[ \t]+[a-z_]+\\)"
@@ -683,6 +685,164 @@ foreach(test_pin
     endif()
 endforeach()
 
+# D-A4 independently owns only live checkpoint payloads. The physical eraser
+# stays release-free; a certified member erase is immediately followed by the
+# same prepared-capability terminal used by D-A2/3, while cloned host
+# checkpoints retain aggregate ownership (clone never copies release_ops).
+contract_extract_region(
+    "${server_context}"
+    "checkpoint_iterator server_cache_checkpoint_drop_impl("
+    "checkpoint_iterator checkpoint_drop_joined_impl("
+    da4_raw_checkpoint da4_raw_checkpoint_found)
+contract_find_forbidden(
+    "${da4_raw_checkpoint}" da4_raw_checkpoint_forbidden
+    "retention_obs"
+    "release("
+    "retire("
+    "server_cache_retention_admit(")
+contract_extract_region(
+    "${server_context}"
+    "next = server_cache_checkpoint_drop_impl("
+    "prepared.capability.commit(retained_pin);"
+    da4_commit_gap da4_commit_gap_found)
+contract_find_forbidden(
+    "${da4_commit_gap}" da4_commit_gap_forbidden
+    "gauge_set("
+    "reserve("
+    "stage("
+    "preview_release_set("
+    "release("
+    "clone("
+    "retire("
+    "server_cache_retention_admit("
+    "server_fault("
+    "std::function")
+contract_extract_region(
+    "${sidecar_source}"
+    "bool server_retention_sidecar_store::clone("
+    "bool server_retention_sidecar_store::rebind("
+    da4_clone_region da4_clone_region_found)
+string(FIND "${da4_clone_region}" "release_ops" da4_clone_ops)
+foreach(pin
+        "admit_live_checkpoint("
+        "attach_release_ops("
+        "checkpoint_admission_artifact("
+        "checkpoint_inventory("
+        "acquire_recovery_pin("
+        "retire_after_committed_release("
+        "server_cache_plan_checkpoint_thinning("
+        "server_cache_checkpoint_bounded_replay("
+        "server_cache_multiply_retention_weight("
+        "server_cache_weighted_price_us("
+        "server_cache_destruction_receipt_json("
+        "server_cache_plan_evaluate_checkpoint("
+        "checkpoint_frontier_is_current("
+        "CACHE_HOST_DESTRUCTION")
+    string(FIND
+        "${server_context}${sidecar_source}${authority_source}"
+        "${pin}" da4_pin)
+    if (da4_pin EQUAL -1)
+        message(FATAL_ERROR "D-A4 checkpoint authority pin missing: ${pin}")
+    endif()
+endforeach()
+foreach(test_pin
+        "test_checkpoint_thinning_policy"
+        "seam_heuristic_protected = true"
+        "server_cache_checkpoint_protection::seam_heuristic"
+        "recovery_available = false"
+        "hard_leased = true"
+        "test_checkpoint_capacity_floor"
+        "test_checkpoint_attempt_latch_rearms_on_ring_change"
+        "test_checkpoint_effect_matrix_consistency"
+        "test_live_checkpoint_batch_admission"
+        "test_lifecycle_restore_batch_timing"
+        "test_checkpoint_creation_churn_timing"
+        "test_checkpoint_bounded_publication_skip_predicate"
+        "test_consuming_rebind_mints_checkpoint_ownership"
+        "retire_after_committed_release(victim_key)")
+    string(FIND "${server_task_test}" "${test_pin}" da4_test_pin)
+    if (da4_test_pin EQUAL -1)
+        message(FATAL_ERROR "D-A4 checkpoint regression missing: ${test_pin}")
+    endif()
+endforeach()
+if (NOT da4_raw_checkpoint_found OR da4_raw_checkpoint_forbidden OR
+    NOT da4_commit_gap_found OR da4_commit_gap_forbidden OR
+    NOT da4_clone_region_found OR NOT da4_clone_ops EQUAL -1)
+    message(FATAL_ERROR
+        "D-A4 live-checkpoint ownership/commit-gap/host-clone contract drifted")
+endif()
+string(FIND "${server_context}"
+    "const bool optional_thinning_attempt =\n                            slot.lifecycle_authority &&\n                            slot.checkpoint_thinning_attempt_begin(false);"
+    da4_attempt_lifecycle_gate)
+string(FIND "${server_context}"
+    "if (!attempt_claimed &&\n            !checkpoint_thinning_attempt_begin(capacity_mode)) {\n            return false;\n        }\n        checkpoint_thinning_refusal"
+    da4_priced_attempt_early_out)
+string(FIND "${server_context}"
+    "if (!checkpoint_attempts.begin(\n                server_cache_checkpoint_attempt_lane::capacity_floor)) {\n            return false;\n        }\n        refusal = common_cache_plan_destruction_reason::mandatory_anchor;"
+    da4_floor_attempt_early_out)
+if (da4_attempt_lifecycle_gate EQUAL -1 OR
+    da4_priced_attempt_early_out EQUAL -1 OR
+    da4_floor_attempt_early_out EQUAL -1)
+    message(FATAL_ERROR
+        "D-A4 generation latch escaped the pre-inventory policy boundary")
+endif()
+string(FIND "${server_context}"
+    "slot.checkpoint_publication_skipped(\n                                    slot.checkpoint_thinning_refusal);"
+    da4_bounded_publication_skip)
+if (da4_bounded_publication_skip EQUAL -1)
+    message(FATAL_ERROR
+        "D-A4 failed optional thin no longer suppresses bounded redundant publication")
+endif()
+contract_extract_region(
+    "${server_context}"
+    "bool checkpoint_thin_priced("
+    "bool checkpoint_capacity_floor("
+    da4_priced_inventory da4_priced_inventory_found)
+contract_extract_region(
+    "${server_context}"
+    "bool checkpoint_capacity_floor("
+    "void checkpoint_publication_skipped("
+    da4_floor_inventory da4_floor_inventory_found)
+contract_find_forbidden(
+    "${da4_priced_inventory}${da4_floor_inventory}"
+    da4_identity_rebuild_forbidden
+    "server_cache_lease_build_identity("
+    "media_content_identity("
+    "candidate_for_instance("
+    "lora_config_identity(")
+if (NOT da4_priced_inventory_found OR NOT da4_floor_inventory_found OR
+    da4_identity_rebuild_forbidden)
+    message(FATAL_ERROR
+        "D-A4 creation inventory rebuilt immutable checkpoint identity")
+endif()
+count_literal(
+    "${authority_source}${server_context}${server_task}"
+    "admit_live_checkpoint("
+    da4_admit_live_checkpoint_count)
+count_literal(
+    "${authority_source}${server_context}${server_task}"
+    "admit_live_checkpoints("
+    da4_admit_live_checkpoints_count)
+if (NOT da4_admit_live_checkpoint_count EQUAL 2 OR
+    NOT da4_admit_live_checkpoints_count EQUAL 3)
+    message(FATAL_ERROR
+        "D-A4 live-checkpoint ownership admission census drifted: expected single definition + creation adapter and batch definition + single adapter + restore, found single=${da4_admit_live_checkpoint_count} batch=${da4_admit_live_checkpoints_count}")
+endif()
+string(REPLACE
+    "next = server_cache_checkpoint_drop_impl("
+    "next = server_cache_checkpoint_drop_impl( acct->release({});"
+    da4_gap_negative "${server_context}")
+contract_extract_region(
+    "${da4_gap_negative}"
+    "next = server_cache_checkpoint_drop_impl("
+    "prepared.capability.commit(retained_pin);"
+    da4_negative_gap da4_negative_found)
+contract_find_forbidden(
+    "${da4_negative_gap}" da4_negative_forbidden "release(")
+if (NOT da4_negative_found OR NOT da4_negative_forbidden)
+    message(FATAL_ERROR "D-A4 commit-gap negative control did not trip")
+endif()
+
 message(STATUS
     "D-S4 destruction inventory scan passed: 6 classes, ${admission_owner_count} admission owners, "
-    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2/D-A3 commit-gap/debug-emission negative controls")
+    "raw-call + missing-class + D-A0b release-owner + D-A1/D-A2/D-A3/D-A4 commit-gap/debug-emission negative controls")

@@ -1,13 +1,14 @@
 #pragma once
 
 #include "common-retention-sidecar.h"
+#include "server-cache-lease.h"
 #include "../../src/llama-cache-accounting.h"
 
 #include <unordered_map>
 
 struct common_prompt_checkpoint;
 struct server_prompt_cache_state;
-class server_cache_lease_table;
+class server_cache_recovery_pin;
 
 struct server_retention_instance_key {
     common_retention_artifact_kind kind =
@@ -69,10 +70,27 @@ struct server_retention_candidate {
     // D-S3's descriptor charge is provenance only. It is excluded from the D-S2
     // budget and must never be credited as eviction yield.
     llama_cache_acct_op_id provenance_op;
-    // Filled by D-S6's server assembler from the validated backing object.
+    // Exact physical release ownership. Host rows are joined by D-S6's
+    // backing resolver; D-A4 live checkpoints carry it in the catalog itself.
     std::vector<llama_cache_acct_op_id> release_ops;
     server_retention_candidate_availability avail =
         server_retention_candidate_availability::backing_missing_or_stale;
+};
+
+// Allocation-free D-A4 creation-path view. The three comparison strings are
+// stored in the catalog once when the immutable checkpoint member is
+// published (and copied once when that member is cloned). Repeated thinning
+// scans consume only scalar fields plus the lease-table result; they never
+// rebuild media/adapter identities or copy the serialized retention record.
+struct server_retention_checkpoint_inventory {
+    llama_cache_acct_artifact_id artifact_id;
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t stable_id = 0;
+    bool mandatory_anchor = false;
+    bool release_owned = false;
+    bool recovery_pinned = false;
+    bool identity_known = false;
+    server_cache_lease_evaluation lease;
 };
 
 void server_cache_acct_mark_shadow_unavailable(
@@ -111,7 +129,8 @@ public:
         bool source_known,
         uint64_t turn_token_count,
         uint64_t coverage_tokens,
-        bool coverage_valid) noexcept;
+        bool coverage_valid,
+        const server_cache_lease_identity * checkpoint_identity = nullptr) noexcept;
     bool clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;
@@ -128,6 +147,30 @@ public:
     bool candidate_for_instance(
         const server_retention_instance_key & key,
         server_retention_candidate & out) const noexcept;
+    // Restore-time no-copy lookup: return an independently unowned checkpoint
+    // artifact without copying its potentially large turn-boundary record.
+    bool checkpoint_admission_artifact(
+        const server_retention_instance_key & key,
+        llama_cache_acct_artifact_id & artifact) const noexcept;
+    bool checkpoint_inventory(
+        const server_retention_instance_key & key,
+        server_retention_checkpoint_inventory & out) const noexcept;
+    // D-A4 live-checkpoint payload ownership. Host-entry checkpoint clones
+    // intentionally never inherit these operations: their bytes remain part
+    // of the host entry's aggregate three-leaf allocation. A restore mints a
+    // fresh independent set only after the clone/rebind reaches its live key.
+    // Takes ownership on entry; failure releases every supplied operation.
+    bool attach_release_ops(
+        const server_retention_instance_key & key,
+        std::vector<llama_cache_acct_op_id> ops) noexcept;
+    server_cache_recovery_pin acquire_recovery_pin(
+        const server_retention_instance_key & key) noexcept;
+    bool recovery_pinned(
+        const server_retention_instance_key & key) const noexcept;
+    // The prepared capability already released the payload operations. Drop
+    // only the sidecar descriptor/association after the physical mutation.
+    void retire_after_committed_release(
+        const server_retention_instance_key & key) noexcept;
     std::vector<server_retention_candidate> candidate_snapshot() const noexcept;
 
     common_retention_sidecar_snapshot snapshot() const noexcept;
@@ -141,9 +184,17 @@ public:
 private:
     struct catalog_entry {
         common_retention_artifact_record record;
+        server_cache_lease_identity checkpoint_identity;
         uint64_t encoded_size = 0;
         llama_cache_acct_op_id accounting_op;
+        std::vector<llama_cache_acct_op_id> release_ops;
+        uint32_t recovery_pins = 0;
+        server_retention_sidecar_store * owner = nullptr;
+        llama_cache_acct_artifact_id artifact;
+        bool checkpoint_identity_known = false;
+        bool retire_pending = false;
     };
+    using catalog_map = std::unordered_map<uint64_t, catalog_entry>;
     using association_map = std::unordered_map<
         server_retention_instance_key,
         llama_cache_acct_artifact_id,
@@ -151,8 +202,11 @@ private:
 
     bool install(
         const server_retention_instance_key & key,
-        common_retention_artifact_record && record) noexcept;
+        common_retention_artifact_record && record,
+        const server_cache_lease_identity * checkpoint_identity) noexcept;
+    void retire_catalog_entry(catalog_map::iterator entry) noexcept;
     void retire_association(association_map::iterator it) noexcept;
+    static void release_recovery_pin(void * context) noexcept;
     void mark_unavailable() noexcept;
     static llama_cache_acct_artifact_id qualified_artifact_id(
         common_retention_pool pool, uint64_t stable_id) noexcept;
@@ -162,7 +216,7 @@ private:
     llama_cache_acct_resource_domain domain;
     common_retention_allocator allocator;
     association_map associations;
-    std::unordered_map<uint64_t, catalog_entry> catalog;
+    catalog_map catalog;
     uint64_t bytes_live = 0;
     uint64_t n_publish_ok = 0;
     uint64_t n_unavailable = 0;

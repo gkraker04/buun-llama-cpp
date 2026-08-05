@@ -233,7 +233,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(
         test-retention-sidecar.cpp
         ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
     target_include_directories(test-retention-sidecar PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)

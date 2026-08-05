@@ -404,6 +404,17 @@ foreach(destruction_recovery_pin
             "schema-v6 recovery-source citation drifted: '${destruction_recovery_pin}'")
     endif()
 endforeach()
+foreach(checkpoint_effect_pin
+        "checkpoint_member_drop"
+        "return common_cache_plan_destruction_class::checkpoint_drop;"
+        "checkpoint_replace;")
+    string(FIND "${all_source}" "${checkpoint_effect_pin}"
+        checkpoint_effect_found)
+    if (checkpoint_effect_found EQUAL -1)
+        message(FATAL_ERROR
+            "schema-v6 checkpoint destruction effect drifted: '${checkpoint_effect_pin}'")
+    endif()
+endforeach()
 file(READ "${SOURCE_ROOT}/common/common-cache-plan.cpp" recovery_plan_source)
 count_literal("${recovery_plan_source}"
     "{ \"recovery_source\", std::move(recovery_source) }"

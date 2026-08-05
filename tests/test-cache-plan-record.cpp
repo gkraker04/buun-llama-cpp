@@ -420,7 +420,9 @@ static void test_json_serialization() {
         common_cache_plan_destruction_effect::same_target_cold_replacement) |
         common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::
-                different_host_source_consumption);
+                different_host_source_consumption) |
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop);
     rec.destruction.plan_candidate = 2;
     rec.destruction.admission_sequence = 12;
     rec.destruction.quote_duration_us = 37;
@@ -473,13 +475,19 @@ static void test_json_serialization() {
     CHECK(!j["authority"]["disagreed"]);
     CHECK(j["destruction"]["state"] == "refused");
     CHECK(j["destruction"]["reason"] == "effect_drift");
-    CHECK(j["destruction"]["effects"].size() == 2);
+    CHECK(j["destruction"]["effects"].size() == 3);
     CHECK(j["destruction"]["effects"][0]["effect"] ==
           "same_target_cold_replacement");
     CHECK(j["destruction"]["effects"][1]["effect"] ==
           "different_host_source_consumption");
     CHECK(j["destruction"]["effects"][1]["action_class"] ==
           "host_artifact_drop");
+    CHECK(j["destruction"]["effects"][2]["effect"] ==
+          "checkpoint_member_drop");
+    CHECK(j["destruction"]["effects"][2]["action_class"] ==
+          "checkpoint_drop");
+    CHECK(j["destruction"]["effects"][2]["physical_reason"] ==
+          "checkpoint_replace");
     CHECK(j["destruction"]["plan_candidate"] == 2);
     CHECK(j["destruction"]["admission_sequence"] == 12);
     CHECK(j["destruction"]["quote_duration_us"] == 37);

@@ -444,7 +444,15 @@ struct server_slot {
     server_retention_sidecar_store * retention_obs = nullptr;
     server_cache_lease_table * lease_obs = nullptr;
     const std::string * lease_execution_identity = nullptr;
+    server_cache_authority * lifecycle_authority = nullptr;
+    bool cache_debug_observability = false;
     common_retention_pool retention_pool = common_retention_pool::attention;
+    server_cache_checkpoint_attempt_latch checkpoint_attempts;
+    const common_prompt_checkpoint * checkpoint_seam_heuristic = nullptr;
+    common_cache_plan_destruction_reason checkpoint_floor_refusal =
+        common_cache_plan_destruction_reason::mandatory_anchor;
+    common_cache_plan_destruction_reason checkpoint_thinning_refusal =
+        common_cache_plan_destruction_reason::none;
 
     // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
     // (for /slots emission only)
@@ -604,9 +612,34 @@ struct server_slot {
                                      adapter_config_key, obs, required_source_id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (lifecycle_authority) {
+            checkpoint_ring_changed();
         }
 
         return res;
+    }
+
+    void checkpoint_ring_changed() noexcept {
+        checkpoint_attempts.ring_changed();
+        checkpoint_seam_heuristic = nullptr;
+        checkpoint_thinning_refusal =
+            common_cache_plan_destruction_reason::none;
+        checkpoint_floor_refusal =
+            common_cache_plan_destruction_reason::mandatory_anchor;
+    }
+
+    bool checkpoint_thinning_attempt_begin(bool capacity_mode) noexcept {
+        return checkpoint_attempts.begin(
+            capacity_mode
+                ? server_cache_checkpoint_attempt_lane::capacity_thinning
+                : server_cache_checkpoint_attempt_lane::optional_thinning);
+    }
+
+    bool checkpoint_refusal_state_changed(
+            common_cache_plan_destruction_reason reason,
+            bool publication_skip = false) noexcept {
+        return checkpoint_attempts.refusal_changed(
+            reason, publication_skip);
     }
 
     void server_cache_slot_drop_impl() {
@@ -628,6 +661,9 @@ struct server_slot {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
 
+        if (lifecycle_authority && !prompt.checkpoints.empty()) {
+            checkpoint_ring_changed();
+        }
         prompt.clear();
     }
 
@@ -737,6 +773,9 @@ struct server_slot {
         if (retention_obs) {
             retention_obs->retire_slot(id);
         }
+        if (lifecycle_authority && !prompt.checkpoints.empty()) {
+            checkpoint_ring_changed();
+        }
         prompt.clear();
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
@@ -752,6 +791,9 @@ struct server_slot {
         if (retention_obs) {
             retention_obs->retire_slot(id);
         }
+        if (lifecycle_authority && !prompt.checkpoints.empty()) {
+            checkpoint_ring_changed();
+        }
         prompt.clear();
         prompt.tokens.insert(retained_tokens);
     }
@@ -761,6 +803,15 @@ struct server_slot {
     checkpoint_iterator server_cache_checkpoint_drop_impl(
             checkpoint_iterator first,
             checkpoint_iterator last) {
+        if (lifecycle_authority && first != last) {
+            checkpoint_ring_changed();
+        }
+        return prompt.checkpoints.erase(first, last);
+    }
+
+    checkpoint_iterator checkpoint_drop_joined_impl(
+            checkpoint_iterator first,
+            checkpoint_iterator last) {
         if (retention_obs) {
             for (auto it = first; it != last; ++it) {
                 retention_obs->retire(
@@ -768,7 +819,21 @@ struct server_slot {
                         id, &*it));
             }
         }
-        return prompt.checkpoints.erase(first, last);
+        return server_cache_checkpoint_drop_impl(first, last);
+    }
+
+    server_cache_destruction_admission observe_checkpoint_drop(
+            server_cache_destruction_reason reason,
+            llama_cache_acct_artifact_id artifact = {}) const {
+        server_cache_destruction_request request;
+        request.cls = server_cache_destruction_class::checkpoint_drop;
+        request.reason = reason;
+        request.add_target(
+            server_cache_destruction_target_kind::checkpoint_ring,
+            id, artifact);
+        request.add_yield(
+            llama_cache_acct_category::checkpoint_state_payload);
+        return server_cache_retention_admit(destruction_obs, request);
     }
 
     checkpoint_iterator checkpoint_drop(
@@ -776,21 +841,515 @@ struct server_slot {
             checkpoint_iterator last,
             server_cache_destruction_reason reason) {
         if (destruction_obs && first != last) {
-            server_cache_destruction_request request;
-            request.cls    = server_cache_destruction_class::checkpoint_drop;
-            request.reason = reason;
-            request.add_target(
-                server_cache_destruction_target_kind::checkpoint_ring,
-                id,
+            (void) observe_checkpoint_drop(
+                reason,
                 retention_obs ? retention_obs->artifact_id(
                     server_retention_instance_key::for_checkpoint(
                         id, &*first))
                     : llama_cache_acct_artifact_id{});
-            request.add_yield(
-                llama_cache_acct_category::checkpoint_state_payload);
-            (void) server_cache_retention_admit(destruction_obs, request);
         }
-        return server_cache_checkpoint_drop_impl(first, last);
+        // Legacy/pass-through release owner. D-A4's certified path calls the
+        // raw list eraser first, commits the prepared exact release, then
+        // retires only the descriptor through retire_after_committed_release.
+        return checkpoint_drop_joined_impl(first, last);
+    }
+
+    bool checkpoint_destruction_artifact(
+            checkpoint_iterator checkpoint,
+            server_cache_destruction_artifact & out) const noexcept {
+        out = {};
+        try {
+            if (!retention_obs || !lease_obs ||
+                checkpoint == prompt.checkpoints.end()) {
+                return false;
+            }
+            const auto key = server_retention_instance_key::for_checkpoint(
+                id, &*checkpoint);
+            server_retention_checkpoint_inventory inventory;
+            server_retention_candidate catalog;
+            if (!retention_obs->checkpoint_inventory(key, inventory) ||
+                !inventory.identity_known || !inventory.release_owned ||
+                !retention_obs->candidate_for_instance(key, catalog) ||
+                catalog.artifact_id.v == 0 ||
+                catalog.record.kind !=
+                    common_retention_artifact_kind::checkpoint ||
+                catalog.release_ops.empty()) {
+                return false;
+            }
+            out.candidate.artifact_id = catalog.artifact_id;
+            out.candidate.record = catalog.record;
+            out.candidate.availability = catalog.avail;
+            out.candidate.release_ops = catalog.release_ops;
+            out.candidate.identity_known = true;
+            out.candidate.lease = inventory.lease;
+            out.kind = common_retention_artifact_kind::checkpoint;
+            out.owner_slot = id;
+            out.pool = catalog.record.stamp.pool;
+            out.mandatory_anchor =
+                catalog.record.stamp.mandatory_anchor;
+            return true;
+        } catch (...) {
+            out = {};
+            return false;
+        }
+    }
+
+    void emit_checkpoint_destruction(
+            const common_cache_plan_destruction_receipt & receipt,
+            uint64_t projected_bytes,
+            uint64_t price_us,
+            uint32_t weight_milli,
+            uint32_t ordinal) const noexcept {
+        if (!cache_debug_observability) {
+            return;
+        }
+        try {
+            json payload = server_cache_destruction_receipt_json(
+                receipt, projected_bytes, "checkpoint_drop");
+            payload["price_us"] = price_us;
+            payload["retention_weight_milli"] = weight_milli;
+            payload["rank_ordinal"] = ordinal;
+            SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
+                    payload.dump().c_str());
+        } catch (...) {
+            // Debug evidence must never perturb checkpoint ownership.
+        }
+    }
+
+    bool checkpoint_drop_certified(
+            checkpoint_iterator victim,
+            checkpoint_iterator recovery,
+            server_cache_destruction_reason reason,
+            uint64_t price_us,
+            uint32_t weight_milli,
+            uint32_t ordinal,
+            checkpoint_iterator & next) noexcept {
+        if (!lifecycle_authority || !retention_obs || !destruction_obs ||
+            victim == prompt.checkpoints.end() ||
+            recovery == prompt.checkpoints.end() || victim == recovery) {
+            return false;
+        }
+        auto & authority = *lifecycle_authority;
+        const uint64_t sequence = ++authority.destruction_quote_sequence;
+        const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
+                                common_cache_plan_destruction_reason why) {
+            checkpoint_thinning_refusal = why;
+            if (!checkpoint_refusal_state_changed(why)) {
+                return;
+            }
+            common_cache_plan_destruction_receipt receipt = existing
+                ? std::move(*existing)
+                : common_cache_plan_destruction_receipt{};
+            receipt.state = common_cache_plan_destruction_state::refused;
+            receipt.reason = why;
+            receipt.effects = common_cache_plan_destruction_effect_bit(
+                common_cache_plan_destruction_effect::checkpoint_member_drop);
+            receipt.admission_sequence = sequence;
+            authority.observe_host_destruction(receipt, true);
+            destruction_obs->note_checkpoint_thin_refused();
+            emit_checkpoint_destruction(
+                receipt, 0, price_us, weight_milli, ordinal);
+        };
+
+        server_cache_destruction_artifact victim_artifact;
+        server_cache_destruction_artifact recovery_artifact;
+        if (!checkpoint_destruction_artifact(
+                victim, victim_artifact) ||
+            !checkpoint_destruction_artifact(
+                recovery, recovery_artifact)) {
+            refuse(nullptr,
+                   common_cache_plan_destruction_reason::manifest_incomplete);
+            return false;
+        }
+        const auto recovery_key =
+            server_retention_instance_key::for_checkpoint(id, &*recovery);
+        auto pin = retention_obs->acquire_recovery_pin(recovery_key);
+        if (!pin.valid() || !pin.binds_exact(
+                recovery_artifact.candidate.artifact_id,
+                recovery_artifact.candidate.release_ops)) {
+            refuse(nullptr,
+                   common_cache_plan_destruction_reason::recovery_unavailable);
+            return false;
+        }
+
+        const auto preview = [&](const auto & ops, uint64_t serial,
+                                 auto & released) {
+            return authority.ledger.preview_release_set(
+                ops, serial, released);
+        };
+        const auto project = [&](const auto & released, auto & domains) {
+            return authority.project_release(released, domains);
+        };
+        const auto snapshot = authority.ledger.snapshot();
+        auto quote = server_cache_destruction_quote_single_artifact(
+            victim_artifact,
+            common_cache_plan_destruction_effect_bit(
+                common_cache_plan_destruction_effect::checkpoint_member_drop),
+            snapshot.serial, sequence,
+            preview, project);
+        if (quote.receipt.state !=
+                common_cache_plan_destruction_state::quoted) {
+            const auto why = quote.receipt.reason;
+            refuse(&quote.receipt, why);
+            return false;
+        }
+        authority.observe_host_destruction(quote.receipt, false);
+        std::vector<server_cache_destruction_artifact> current;
+        try {
+            current.push_back(std::move(victim_artifact));
+        } catch (...) {
+            refuse(&quote.receipt,
+                   common_cache_plan_destruction_reason::internal_fault);
+            return false;
+        }
+        const auto fresh = authority.ledger.snapshot();
+        auto prepared = server_cache_prepare_release_set(
+            quote, current, authority.ledger, fresh.serial,
+            project, std::move(pin));
+        if (prepared.status !=
+                server_cache_prepare_release_status::prepared) {
+            refuse(&quote.receipt, prepared.reason);
+            return false;
+        }
+        uint64_t projected_bytes = 0;
+        for (const auto & row : quote.projected_domains) {
+            if (row.projected_release_bytes.state !=
+                    llama_cache_acct_known::known ||
+                row.projected_release_bytes.value >
+                    std::numeric_limits<uint64_t>::max() - projected_bytes) {
+                refuse(&quote.receipt,
+                       common_cache_plan_destruction_reason::
+                           accounting_unavailable);
+                return false;
+            }
+            projected_bytes += row.projected_release_bytes.value;
+        }
+        quote.receipt.displaced_fate =
+            common_cache_plan_displaced_fate::exact_replay_recipe;
+        quote.receipt.recovery_citation =
+            common_cache_plan_recovery_citation::resolved;
+        quote.receipt.recovery_source_artifact_id =
+            recovery_artifact.candidate.artifact_id;
+        quote.receipt.recovery_source_manifest_digest =
+            server_cache_destruction_recovery_source_digest(
+                recovery_artifact.candidate.artifact_id,
+                recovery_artifact.candidate.release_ops);
+        quote.receipt.state =
+            common_cache_plan_destruction_state::certified;
+        authority.observe_host_destruction(quote.receipt, true);
+        emit_checkpoint_destruction(
+            quote.receipt, projected_bytes,
+            price_us, weight_milli, ordinal);
+
+        const auto victim_key =
+            server_retention_instance_key::for_checkpoint(id, &*victim);
+        const auto admission = observe_checkpoint_drop(
+            reason, current.front().candidate.artifact_id);
+        const std::thread::id scheduler_owner = std::this_thread::get_id();
+        next = server_cache_checkpoint_drop_impl(
+            victim, std::next(victim));
+        // The list-node destructor only frees checkpoint-owned vectors and
+        // shadow metadata. It has no callback and cannot write C. The owner
+        // thread therefore reaches the single-shot capability commit with no
+        // interleaving ledger producer between physical mutation and release.
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        server_cache_recovery_pin retained_pin;
+        const auto committed = prepared.capability.commit(retained_pin);
+        GGML_ASSERT(committed ==
+                    common_cache_plan_destruction_reason::none);
+        retention_obs->retire_after_committed_release(victim_key);
+        quote.receipt.state =
+            common_cache_plan_destruction_state::executed;
+        quote.receipt.actual_accounting_serial =
+            authority.ledger.snapshot().serial;
+        authority.observe_host_destruction(quote.receipt, false);
+        emit_checkpoint_destruction(
+            quote.receipt, projected_bytes,
+            price_us, weight_milli, ordinal);
+        destruction_obs->note_checkpoint_thin_executed(
+            admission.sequence, projected_bytes);
+        return true;
+    }
+
+    bool checkpoint_thin_priced(
+            int checkpoint_task_id,
+            uint64_t max_replay_tokens,
+            const common_prompt_checkpoint * seam_heuristic,
+            bool capacity_mode,
+            bool attempt_claimed = false) noexcept {
+        if (!lifecycle_authority || !retention_obs || !lease_obs ||
+            prompt.checkpoints.size() < 2) {
+            return false;
+        }
+        if (!attempt_claimed &&
+            !checkpoint_thinning_attempt_begin(capacity_mode)) {
+            return false;
+        }
+        checkpoint_thinning_refusal =
+            common_cache_plan_destruction_reason::none;
+        lease_obs->lifecycle_point();
+        struct local_candidate {
+            checkpoint_iterator victim;
+            checkpoint_iterator recovery;
+            server_cache_checkpoint_trade_input price;
+        };
+        struct member_inventory {
+            checkpoint_iterator member;
+            server_retention_checkpoint_inventory catalog;
+            bool found = false;
+        };
+        std::vector<local_candidate> local;
+        std::vector<server_cache_checkpoint_trade_input> prices;
+        try {
+            local.reserve(prompt.checkpoints.size());
+            prices.reserve(prompt.checkpoints.size());
+            std::vector<member_inventory> inventory;
+            inventory.reserve(prompt.checkpoints.size());
+            for (auto it = prompt.checkpoints.begin();
+                 it != prompt.checkpoints.end(); ++it) {
+                member_inventory member;
+                member.member = it;
+                member.found = retention_obs->checkpoint_inventory(
+                    server_retention_instance_key::for_checkpoint(id, &*it),
+                    member.catalog);
+                inventory.push_back(std::move(member));
+            }
+
+            size_t previous_index = 0;
+            for (size_t index = 1; index < inventory.size(); ++index) {
+                auto it = inventory[index].member;
+                auto previous = inventory[previous_index].member;
+                const bool close = it->n_tokens >= previous->n_tokens &&
+                    uint64_t(it->n_tokens - previous->n_tokens) <=
+                        max_replay_tokens;
+                if ((!capacity_mode && !close) ||
+                    it->id_task == checkpoint_task_id) {
+                    previous_index = index;
+                    continue;
+                }
+
+                local_candidate candidate;
+                candidate.victim = it;
+                candidate.recovery = previous;
+                candidate.price.ordinal = uint32_t(index);
+                candidate.price.recovery_ordinal =
+                    uint32_t(previous_index);
+                candidate.price.payload_bytes = it->size();
+                candidate.price.replay_tokens =
+                    it->n_tokens >= previous->n_tokens
+                        ? uint64_t(it->n_tokens - previous->n_tokens)
+                        : UINT64_MAX;
+                candidate.price.seam_heuristic_protected =
+                    seam_heuristic == &*it;
+                const bool same_replay_lineage =
+                    server_cache_checkpoint_bounded_replay(
+                        *previous, *it, max_replay_tokens);
+                candidate.price.recovery_available =
+                    same_replay_lineage &&
+                    inventory[previous_index].found &&
+                    inventory[previous_index].catalog.identity_known &&
+                    inventory[previous_index].catalog.release_owned;
+                const auto & victim_catalog = inventory[index].catalog;
+                if (inventory[index].found &&
+                    victim_catalog.identity_known &&
+                    victim_catalog.release_owned) {
+                    candidate.price.artifact =
+                        victim_catalog.artifact_id;
+                    candidate.price.stable_id =
+                        victim_catalog.stable_id;
+                    candidate.price.identity_known = true;
+                    candidate.price.mandatory_anchor =
+                        victim_catalog.mandatory_anchor;
+                    candidate.price.hard_leased = server_cache_lease_is_hard(
+                        victim_catalog.lease);
+                    uint32_t weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
+                    if (victim_catalog.lease.cls ==
+                            server_cache_lease_class::soft) {
+                        (void) server_cache_multiply_retention_weight(
+                            weight, SERVER_CACHE_HOST_SOFT_LEASE_WEIGHT);
+                    }
+                    if (task && !task->is_child()) {
+                        (void) server_cache_multiply_retention_weight(
+                            weight, SERVER_CACHE_HOST_MAIN_FAMILY_WEIGHT);
+                    }
+                    candidate.price.weight_milli = weight;
+                }
+                local.push_back(std::move(candidate));
+                prices.push_back(local.back().price);
+                if (!close) {
+                    previous_index = index;
+                }
+            }
+        } catch (...) {
+            return false;
+        }
+        if (local.empty()) {
+            return false;
+        }
+
+        const auto * calib = common_cache_plan_calib_find(
+            lifecycle_authority->calibration_profile);
+        while (!local.empty()) {
+            const auto plan = server_cache_plan_checkpoint_thinning(
+                prices, calib);
+            if (!plan.selected) {
+                checkpoint_thinning_refusal = plan.reason;
+                if (!checkpoint_refusal_state_changed(plan.reason)) {
+                    return false;
+                }
+                common_cache_plan_destruction_receipt receipt;
+                receipt.state = common_cache_plan_destruction_state::refused;
+                receipt.reason = plan.reason;
+                receipt.effects = common_cache_plan_destruction_effect_bit(
+                    common_cache_plan_destruction_effect::
+                        checkpoint_member_drop);
+                receipt.admission_sequence =
+                    ++lifecycle_authority->destruction_quote_sequence;
+                lifecycle_authority->observe_host_destruction(receipt, true);
+                if (destruction_obs) {
+                    destruction_obs->note_checkpoint_thin_refused();
+                    if (plan.protection !=
+                            server_cache_checkpoint_protection::none) {
+                        switch (plan.protection) {
+                            case server_cache_checkpoint_protection::
+                                     seam_heuristic:
+                                destruction_obs->
+                                    note_checkpoint_thin_heuristic_refused();
+                                break;
+                            case server_cache_checkpoint_protection::
+                                     mandatory_anchor:
+                                destruction_obs->
+                                    note_checkpoint_thin_mandatory_refused();
+                                break;
+                            case server_cache_checkpoint_protection::
+                                     hard_lease:
+                                destruction_obs->
+                                    note_checkpoint_thin_hard_lease_refused();
+                                break;
+                            case server_cache_checkpoint_protection::none:
+                            case server_cache_checkpoint_protection::_count:
+                                break;
+                        }
+                    }
+                }
+                emit_checkpoint_destruction(
+                    receipt, 0, 0,
+                    SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+                return false;
+            }
+            const auto chosen = std::find_if(
+                local.begin(), local.end(), [&](const auto & candidate) {
+                    return candidate.price.ordinal == plan.ordinal;
+                });
+            if (chosen == local.end()) {
+                return false;
+            }
+            const auto chosen_index = size_t(chosen - local.begin());
+            checkpoint_iterator next;
+            if (checkpoint_drop_certified(
+                    chosen->victim, chosen->recovery,
+                    capacity_mode
+                        ? server_cache_destruction_reason::checkpoint_capacity
+                        : server_cache_destruction_reason::checkpoint_thin,
+                    plan.price_us, plan.weight_milli,
+                    plan.ordinal, next)) {
+                return true;
+            }
+            local.erase(chosen);
+            prices.erase(prices.begin() + chosen_index);
+        }
+        return false;
+    }
+
+    bool checkpoint_capacity_floor(
+            int checkpoint_task_id,
+            const common_prompt_checkpoint * seam_heuristic,
+            checkpoint_iterator & victim,
+            common_cache_plan_destruction_reason & refusal) noexcept {
+        victim = prompt.checkpoints.end();
+        refusal = checkpoint_floor_refusal;
+        if (!checkpoint_attempts.begin(
+                server_cache_checkpoint_attempt_lane::capacity_floor)) {
+            return false;
+        }
+        refusal = common_cache_plan_destruction_reason::mandatory_anchor;
+        if (lease_obs) {
+            lease_obs->lifecycle_point();
+        }
+        std::vector<server_cache_checkpoint_floor_input> inputs;
+        std::vector<checkpoint_iterator> members;
+        try {
+            inputs.reserve(prompt.checkpoints.size());
+            members.reserve(prompt.checkpoints.size());
+            uint32_t ordinal = 0;
+            for (auto it = prompt.checkpoints.begin();
+                 it != prompt.checkpoints.end(); ++it, ++ordinal) {
+                server_cache_checkpoint_floor_input input;
+                input.ordinal = ordinal;
+                const auto key =
+                    server_retention_instance_key::for_checkpoint(id, &*it);
+                server_retention_checkpoint_inventory catalog;
+                const bool catalog_found = retention_obs &&
+                    retention_obs->checkpoint_inventory(key, catalog);
+                input.recovery_pinned = catalog_found &&
+                    catalog.recovery_pinned;
+                if (it->id_task == checkpoint_task_id ||
+                    input.recovery_pinned) {
+                    input.protection =
+                        server_cache_checkpoint_protection::mandatory_anchor;
+                } else if (seam_heuristic == &*it) {
+                    input.protection =
+                        server_cache_checkpoint_protection::seam_heuristic;
+                }
+                if (catalog_found) {
+                    if (catalog.mandatory_anchor) {
+                        input.protection =
+                            server_cache_checkpoint_protection::
+                                mandatory_anchor;
+                    }
+                    if (catalog.identity_known &&
+                        server_cache_lease_is_hard(catalog.lease)) {
+                        input.protection =
+                            server_cache_checkpoint_protection::hard_lease;
+                    }
+                }
+                inputs.push_back(input);
+                members.push_back(it);
+            }
+        } catch (...) {
+            refusal = common_cache_plan_destruction_reason::internal_fault;
+            checkpoint_floor_refusal = refusal;
+            return false;
+        }
+        const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
+        refusal = plan.reason;
+        checkpoint_floor_refusal = refusal;
+        if (!plan.selected || plan.ordinal >= members.size()) {
+            return false;
+        }
+        victim = members[plan.ordinal];
+        return true;
+    }
+
+    void checkpoint_publication_skipped(
+            common_cache_plan_destruction_reason reason) noexcept {
+        if (!lifecycle_authority ||
+            !checkpoint_refusal_state_changed(reason, true)) {
+            return;
+        }
+        common_cache_plan_destruction_receipt receipt;
+        receipt.state = common_cache_plan_destruction_state::refused;
+        receipt.reason = reason;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop);
+        receipt.admission_sequence =
+            ++lifecycle_authority->destruction_quote_sequence;
+        lifecycle_authority->observe_host_destruction(receipt, true);
+        if (destruction_obs) {
+            destruction_obs->note_checkpoint_publication_skip();
+        }
+        emit_checkpoint_destruction(
+            receipt, 0, 0, SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
     }
 
     void server_cache_token_ledger_truncate_impl(size_t n_tokens) {
@@ -2365,9 +2924,9 @@ private:
                         break;
                     }
                     case common_retention_artifact_kind::checkpoint: {
-                        // Checkpoint payloads are currently embedded in either the
-                        // live aggregate or a host-entry allocation. Neither gives a
-                        // checkpoint an exact independently releasable op set.
+                        // D-A4 live members publish exact independently releasable
+                        // payload operations. Host-entry checkpoint clones remain
+                        // aggregate-owned and therefore stay fail-closed here.
                         candidate.availability =
                             server_retention_candidate_availability::
                                 backing_missing_or_stale;
@@ -2402,6 +2961,11 @@ private:
                                     candidate.availability =
                                         server_retention_candidate_availability::
                                             in_flight_mutation;
+                                } else if (!source.release_ops.empty()) {
+                                    candidate.availability =
+                                        server_retention_candidate_availability::
+                                            available;
+                                    candidate.has_unsupported_host_spill = false;
                                 }
                                 break;
                             }
@@ -3538,7 +4102,7 @@ private:
                 server_cache_destruction_execution::pass_through) {
             return n_past;
         }
-        (void) slot.server_cache_checkpoint_drop_impl(
+        (void) slot.checkpoint_drop_joined_impl(
             slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end());
         return 0;
     }
@@ -4639,6 +5203,10 @@ private:
                 slot.retention_obs = &cache_authority->retention;
                 slot.lease_obs = &cache_authority->leases;
                 slot.lease_execution_identity = &frontier_execution_identity;
+                slot.lifecycle_authority = params_base.cache_lifecycle
+                    ? cache_authority.get()
+                    : nullptr;
+                slot.cache_debug_observability = params_base.cache_debug;
                 slot.retention_pool =
                     (llama_model_is_recurrent(model_tgt) ||
                      llama_model_is_hybrid(model_tgt))
@@ -9032,7 +9600,7 @@ private:
                                             if (!slot.prompt.checkpoints.empty()) {
                                                 SLT_WRN(slot, "cache-reuse splice invalidates %zu context checkpoint(s)\n",
                                                         slot.prompt.checkpoints.size());
-                                                (void) slot.server_cache_checkpoint_drop_impl(
+                                                (void) slot.checkpoint_drop_joined_impl(
                                                     slot.prompt.checkpoints.begin(),
                                                     slot.prompt.checkpoints.end());
                                             }
@@ -10845,7 +11413,93 @@ private:
                         // checkpoint_min_step of the previous KEPT one (redundantly close), never
                         // evicting the current task's own -- this keeps early anchors alive across
                         // edited/compacted agentic histories instead of FIFO-dropping the oldest.
-                        {
+                        // Best-effort noise reduction only: D-A4 correctness
+                        // comes from the bounded same-lineage replay proof in
+                        // checkpoint_thin_priced, not from reproducing B's
+                        // planner-selected checkpoint here.
+                        const common_prompt_checkpoint *
+                            seam_heuristic_checkpoint =
+                                slot.checkpoint_seam_heuristic;
+                        bool checkpoint_publication_allowed = true;
+                        const bool optional_thinning_attempt =
+                            slot.lifecycle_authority &&
+                            slot.checkpoint_thinning_attempt_begin(false);
+                        if (optional_thinning_attempt) {
+                            seam_heuristic_checkpoint = nullptr;
+                            const llama_pos seam_next =
+                                slot.prompt.tokens.pos_next();
+                            const bool has_new_tokens =
+                                slot.prompt.n_tokens() < slot.task->n_tokens();
+                            const llama_pos seam_min = std::max(
+                                0, seam_next - n_swa -
+                                    (has_new_tokens ? 0 : 1));
+                            const bool recurrent =
+                                llama_model_is_recurrent(model_tgt) ||
+                                llama_model_is_hybrid(model_tgt);
+                            const auto adapter = lora_config_identity(slot.lora);
+                            for (auto it = slot.prompt.checkpoints.rbegin();
+                                 it != slot.prompt.checkpoints.rend(); ++it) {
+                                const bool frontier_current =
+                                    checkpoint_frontier_is_current(
+                                        slot, *it, adapter);
+                                const bool representation_matches =
+                                    it->representation_epoch ==
+                                        vbr_now.representation_epoch &&
+                                    it->representation_epoch_swa ==
+                                        vbr_now.representation_epoch_swa;
+                                const auto evaluation =
+                                    server_cache_plan_evaluate_checkpoint(
+                                        !it->empty(), frontier_current,
+                                        recurrent, representation_matches,
+                                        it->pos_min, it->pos_max,
+                                        seam_next, seam_min, it->size());
+                                if (evaluation.reason ==
+                                        COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL) {
+                                    seam_heuristic_checkpoint = &*it;
+                                    break;
+                                }
+                            }
+                            // The pointer remains valid while the ring generation
+                            // is unchanged. A committed erase/publication clears it
+                            // in checkpoint_ring_changed(). The heuristic is only
+                            // noise reduction; bounded replay is the proof.
+                            slot.checkpoint_seam_heuristic =
+                                seam_heuristic_checkpoint;
+                        }
+                        if (optional_thinning_attempt) {
+                            bool attempt_claimed = true;
+                            while (slot.checkpoint_thin_priced(
+                                    ckpt_id_task,
+                                    uint64_t(std::max(
+                                        0, params_base.checkpoint_min_step)),
+                                    seam_heuristic_checkpoint,
+                                    false,
+                                    attempt_claimed)) {
+                                // Rebuild after every committed member removal;
+                                // recovery-source pins never leak into the next union.
+                                attempt_claimed = false;
+                            }
+                            // A failed D-A proof may not delete the incumbent,
+                            // but appending a same-lineage checkpoint within the
+                            // bounded replay window would retain another ~full
+                            // state image on every turn. Keep the immutable older
+                            // recovery point and refuse the redundant incoming
+                            // publication instead. The ring is unchanged, the
+                            // refusal remains typed/auditable, and the same
+                            // bounded-replay relation used by the thinning proof
+                            // limits the marginal replay cost.
+                            if (slot.checkpoint_thinning_refusal !=
+                                    common_cache_plan_destruction_reason::none &&
+                                !slot.prompt.checkpoints.empty() &&
+                                server_cache_checkpoint_bounded_replay(
+                                    slot.prompt.checkpoints.back(), staged.back(),
+                                    uint64_t(std::max(
+                                        0, params_base.checkpoint_min_step)))) {
+                                slot.checkpoint_publication_skipped(
+                                    slot.checkpoint_thinning_refusal);
+                                checkpoint_publication_allowed = false;
+                            }
+                        } else if (!slot.lifecycle_authority) {
                             int64_t last = -1;
                             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                                 if (it->id_task != ckpt_id_task && last >= 0 &&
@@ -10863,45 +11517,120 @@ private:
                             }
                         }
 
-                        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-                            // make room for the new checkpoint, if needed (FIFO fallback after thinning)
-                            const auto & cur = slot.prompt.checkpoints.front();
+                        while (checkpoint_publication_allowed &&
+                               slot.prompt.checkpoints.size() >=
+                                   (size_t) params_base.n_ctx_checkpoints) {
+                            if (slot.lifecycle_authority &&
+                                slot.checkpoint_thin_priced(
+                                    ckpt_id_task,
+                                    uint64_t(std::max(
+                                        0, params_base.checkpoint_min_step)),
+                                    seam_heuristic_checkpoint,
+                                    true)) {
+                                continue;
+                            }
+                            auto victim = slot.prompt.checkpoints.begin();
+                            if (slot.lifecycle_authority) {
+                                common_cache_plan_destruction_reason refusal;
+                                if (!slot.checkpoint_capacity_floor(
+                                        ckpt_id_task,
+                                        seam_heuristic_checkpoint,
+                                        victim, refusal)) {
+                                    slot.checkpoint_publication_skipped(refusal);
+                                    checkpoint_publication_allowed = false;
+                                    break;
+                                }
+                            }
+                            // Make room for the new checkpoint in legacy order
+                            // among members not protected by the D-A floor.
+                            const auto & cur = *victim;
 
                             SLT_WRN(slot,
                                     "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
                                     ", size = %.3f MiB)\n",
                                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data_tgt.size() / 1024 / 1024);
 
+                            if (seam_heuristic_checkpoint == &cur) {
+                                seam_heuristic_checkpoint = nullptr;
+                            }
+
                             (void) slot.checkpoint_drop(
-                                slot.prompt.checkpoints.begin(),
-                                std::next(slot.prompt.checkpoints.begin()),
+                                victim, std::next(victim),
                                 server_cache_destruction_reason::checkpoint_capacity);
                         }
 
-                        slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), staged);
-                        const auto & cur = slot.prompt.checkpoints.back();
-                        if (slot.retention_obs) {
-                            const bool frontier_valid =
-                                cur.computation_frontier.valid() &&
-                                cur.computation_frontier.token_count == cur.n_tokens &&
-                                cur.n_tokens >= 0 &&
-                                cur.n_tokens <= slot.task->n_tokens();
-                            (void) slot.retention_obs->publish(
-                                server_retention_instance_key::for_checkpoint(
-                                    slot.id, &cur),
-                                slot.retention_pool,
-                                slot.task->params.message_spans,
-                                !slot.task->params.message_spans.spans.empty(),
-                                uint64_t(slot.task->n_tokens()),
-                                cur.n_tokens >= 0 ? uint64_t(cur.n_tokens) : 0,
-                                frontier_valid);
-                        }
+                        if (!checkpoint_publication_allowed) {
+                            staged.clear();
+                        } else {
+                            slot.prompt.checkpoints.splice(
+                                slot.prompt.checkpoints.end(), staged);
+                            if (slot.lifecycle_authority) {
+                                slot.checkpoint_ring_changed();
+                            }
+                            const auto & cur = slot.prompt.checkpoints.back();
+                            if (slot.retention_obs) {
+                                const bool frontier_valid =
+                                    cur.computation_frontier.valid() &&
+                                    cur.computation_frontier.token_count ==
+                                        cur.n_tokens &&
+                                    cur.n_tokens >= 0 &&
+                                    cur.n_tokens <= slot.task->n_tokens();
+                                server_cache_lease_identity checkpoint_identity;
+                                if (frontier_valid) {
+                                    checkpoint_identity.execution_identity =
+                                        cur.computation_frontier.execution_identity;
+                                    checkpoint_identity.adapter_config_identity =
+                                        cur.computation_frontier.adapter_config_identity;
+                                    checkpoint_identity.media_content_identity =
+                                        cur.computation_frontier.media_content_identity;
+                                }
+                                const bool published =
+                                    slot.retention_obs->publish(
+                                        server_retention_instance_key::
+                                            for_checkpoint(slot.id, &cur),
+                                        slot.retention_pool,
+                                        slot.task->params.message_spans,
+                                        !slot.task->params.message_spans.spans.empty(),
+                                        uint64_t(slot.task->n_tokens()),
+                                        cur.n_tokens >= 0
+                                            ? uint64_t(cur.n_tokens)
+                                            : 0,
+                                        frontier_valid,
+                                        checkpoint_identity.valid()
+                                            ? &checkpoint_identity : nullptr);
+                                if (published && slot.lifecycle_authority) {
+                                    const auto key =
+                                        server_retention_instance_key::
+                                            for_checkpoint(slot.id, &cur);
+                                    const auto artifact =
+                                        slot.retention_obs->artifact_id(key);
+                                    std::vector<llama_cache_acct_op_id> ops;
+                                    const uint64_t accel_bytes =
+                                        cur.accel.size();
+                                    const uint64_t checkpoint_bytes =
+                                        cur.size() >= accel_bytes
+                                            ? cur.size() - accel_bytes
+                                            : 0;
+                                    if (slot.lifecycle_authority->
+                                            admit_live_checkpoint(
+                                                artifact,
+                                                checkpoint_bytes,
+                                                accel_bytes,
+                                                ops) &&
+                                        !slot.retention_obs->attach_release_ops(
+                                            key, std::move(ops))) {
+                                        SLT_WRN(slot, "%s\n",
+                                            "checkpoint payload ownership attach failed; member remains fail-closed");
+                                    }
+                                }
+                            }
 
-                        SLT_WRN(slot,
-                                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
-                                ", size = %.3f MiB)\n",
-                                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024.0 / 1024.0);
+                            SLT_WRN(slot,
+                                    "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                    ", size = %.3f MiB)\n",
+                                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                                    cur.pos_max, cur.n_tokens, (float) cur.size() / 1024.0 / 1024.0);
+                        }
                     }
                 }
 

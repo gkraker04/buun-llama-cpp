@@ -1,11 +1,13 @@
 #include "server-cache-destruction-quote.h"
 
 #include "ggml.h"
+#include "../../common/common-cache-plan-estimate.h"
 
 #include "../../src/llama-sha256.h"
 
 #include <algorithm>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,9 +66,7 @@ common_cache_plan_destruction_reason artifact_refusal_base(
         lease = common_cache_plan_destruction_lease_verdict::unavailable;
         return common_cache_plan_destruction_reason::lease_unavailable;
     }
-    if (artifact.candidate.lease.cls == server_cache_lease_class::hard ||
-        artifact.candidate.lease.eligibility ==
-            server_cache_lease_eligibility::hard_blocked) {
+    if (server_cache_lease_is_hard(artifact.candidate.lease)) {
         lease = common_cache_plan_destruction_lease_verdict::hard_leased;
         return common_cache_plan_destruction_reason::hard_lease_blocked;
     }
@@ -204,6 +204,53 @@ bool effect_equivalent(
 }
 
 } // namespace
+
+nlohmann::ordered_json server_cache_destruction_receipt_json(
+        const common_cache_plan_destruction_receipt & receipt,
+        uint64_t projected_bytes,
+        const char * action_class) {
+    using json = nlohmann::ordered_json;
+    json effects = json::array();
+    for (uint8_t raw =
+             uint8_t(common_cache_plan_destruction_effect::none) + 1;
+         raw < uint8_t(common_cache_plan_destruction_effect::_count);
+         ++raw) {
+        const auto effect = common_cache_plan_destruction_effect(raw);
+        if (common_cache_plan_destruction_effect_has(
+                receipt.effects, effect)) {
+            effects.push_back(common_cache_plan_destruction_effect_name(effect));
+        }
+    }
+    json victims = json::array();
+    for (const auto artifact : receipt.selected_attention) {
+        victims.push_back(artifact.v);
+    }
+    for (const auto artifact : receipt.selected_recurrent) {
+        victims.push_back(artifact.v);
+    }
+    json recovery_source = common_cache_acct_known_name(
+        llama_cache_acct_known::unavailable);
+    if (receipt.recovery_source_artifact_id.v != 0 &&
+        receipt.recovery_source_manifest_digest.valid()) {
+        recovery_source = json {
+            { "artifact_id", receipt.recovery_source_artifact_id.v },
+            { "manifest_digest", common_cache_plan_sha256_hex_digest(
+                  receipt.recovery_source_manifest_digest.bytes()) },
+        };
+    }
+    json out = {
+        { "state", common_cache_plan_destruction_state_name(receipt.state) },
+        { "reason", common_cache_plan_destruction_reason_name(receipt.reason) },
+    };
+    if (action_class) {
+        out["action_class"] = action_class;
+    }
+    out["effects"] = std::move(effects);
+    out["victim_ids"] = std::move(victims);
+    out["recovery_source"] = std::move(recovery_source);
+    out["projected_bytes"] = projected_bytes;
+    return out;
+}
 
 common_cache_plan_destruction_effect_digest
 server_cache_destruction_union_effect_digest(
@@ -752,16 +799,16 @@ bool server_cache_destruction_quote_all(
 }
 
 common_cache_plan_destruction_quote
-server_cache_destruction_quote_redundant_host(
+server_cache_destruction_quote_single_artifact(
         const server_cache_destruction_artifact & victim,
+        common_cache_plan_destruction_effect_set effects,
         uint64_t accounting_serial,
         uint64_t admission_sequence,
         const server_cache_destruction_preview_callback & preview,
         const server_cache_destruction_projection_callback & project) noexcept {
     common_cache_plan_destruction_quote out;
     auto & receipt = out.receipt;
-    receipt.effects = common_cache_plan_destruction_effect_bit(
-        common_cache_plan_destruction_effect::different_host_source_consumption);
+    receipt.effects = effects;
     receipt.plan_candidate = -1;
     receipt.admission_sequence = admission_sequence;
     receipt.quote_accounting_serial = accounting_serial;
@@ -806,14 +853,28 @@ server_cache_destruction_quote_redundant_host(
         return out;
     } catch (...) {
         out = {};
-        out.receipt.effects = common_cache_plan_destruction_effect_bit(
-            common_cache_plan_destruction_effect::different_host_source_consumption);
+        out.receipt.effects = effects;
         out.receipt.state = common_cache_plan_destruction_state::failed;
         out.receipt.reason =
             common_cache_plan_destruction_reason::internal_fault;
         out.receipt.admission_sequence = admission_sequence;
         return out;
     }
+}
+
+common_cache_plan_destruction_quote
+server_cache_destruction_quote_redundant_host(
+        const server_cache_destruction_artifact & victim,
+        uint64_t accounting_serial,
+        uint64_t admission_sequence,
+        const server_cache_destruction_preview_callback & preview,
+        const server_cache_destruction_projection_callback & project) noexcept {
+    return server_cache_destruction_quote_single_artifact(
+        victim,
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption),
+        accounting_serial, admission_sequence, preview, project);
 }
 
 void server_cache_destruction_select_quote(
