@@ -33,6 +33,7 @@ HOP_BY_HOP = {
 SECRET_HEADERS = {"authorization", "x-api-key", "api-key", "cookie"}
 BLOCK = 4096
 TEXT_CAP = 2 << 20
+RESPONSE_CAP = 1 << 20
 
 
 def now_ms():
@@ -321,6 +322,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 		if final_payload:
 			record["server"] = final_payload
 
+		# The harness echoes each answer back inside the NEXT request, so inputs
+		# alone almost reconstruct the session — but the final turn, anything the
+		# harness rewrites, and all tool-call structure would be lost. Keep the
+		# raw reply (capped) so the session is fully reconstructable offline:
+		# compaction detection, tool-call structure and provenance all read from
+		# it, and nothing has to be noted by hand during the run.
+		if not self.server.drop_response_body and text_buffer:
+			record["response_raw"] = text_buffer[:RESPONSE_CAP]
+			record["response_truncated_in_trace"] = len(text_buffer) > RESPONSE_CAP
+
 		trace.emit(record)
 
 
@@ -340,6 +351,8 @@ def main():
 		help="JSONL output path (keep private: contains project content)")
 	parser.add_argument("--tag", default="capture")
 	parser.add_argument("--timeout", type=float, default=1800.0)
+	parser.add_argument("--no-response-body", action="store_true",
+		help="record metrics only, not the generated text")
 	args = parser.parse_args()
 
 	host, _, port = args.upstream.rpartition(":")
@@ -352,6 +365,7 @@ def main():
 	server.upstream_host = host
 	server.upstream_port = int(port)
 	server.timeout_s = args.timeout
+	server.drop_response_body = args.no_response_body
 
 	print(f"CAPTURE_PROXY listening {args.bind}:{args.listen} "
 		f"-> {args.upstream}, trace {args.trace}")
