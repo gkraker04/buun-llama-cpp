@@ -41,12 +41,24 @@ def main():
 	with open(args.arm) as handle:
 		arm = json.load(handle)
 
+	base_line = base.get("timeline") or {}
+	arm_line = arm.get("timeline") or {}
 	headline = {
 		"baseline_label": base.get("label"),
 		"arm_label": arm.get("label"),
 		"trace": arm.get("trace"),
 		"requests_scored": arm.get("requests_scored"),
-		"wall_clock_speedup_x": ratio(base.get("wall_clock_ms"), arm.get("wall_clock_ms")),
+		"project_speedup_x": ratio(base.get("wall_clock_ms"), arm.get("wall_clock_ms")),
+		"server_time_speedup_x": ratio(base_line.get("server_ms"), arm_line.get("server_ms")),
+		"tool_and_idle_share_of_project": base_line.get("tool_gap_share"),
+		"server_time_fraction": {
+			"baseline": base_line.get("server_time_fraction"),
+			"arm": arm_line.get("server_time_fraction"),
+		},
+		"timeline_faithful": {
+			"baseline": base_line.get("faithful"),
+			"arm": arm_line.get("faithful"),
+		},
 		"ttft_p50_speedup_x": ratio(base.get("ttft_p50_ms"), arm.get("ttft_p50_ms")),
 		"ttft_p95_speedup_x": ratio(base.get("ttft_p95_ms"), arm.get("ttft_p95_ms")),
 		"ttft_weighted_p95_speedup_x": ratio(
@@ -125,9 +137,18 @@ def main():
 
 	print(f"=== {base.get('label')} -> {arm.get('label')} "
 		f"({arm.get('requests_scored')} scored requests) ===")
-	print(f"wall clock          {base.get('wall_clock_ms'):>12.0f} -> "
+	print(f"project wall clock  {base.get('wall_clock_ms'):>12.0f} -> "
 		f"{arm.get('wall_clock_ms'):>12.0f} ms  "
-		f"({headline['wall_clock_speedup_x']}x)")
+		f"({headline['project_speedup_x']}x)")
+	print(f"server time only    {(base_line.get('server_ms') or 0):>12.0f} -> "
+		f"{(arm_line.get('server_ms') or 0):>12.0f} ms  "
+		f"({headline['server_time_speedup_x']}x)")
+	print(f"  harness+tool gaps {(base_line.get('harness_gap_ms_slept') or 0):>12.0f} ms"
+		f"  (tool share of gaps: {base_line.get('tool_gap_share')};"
+		f" server = {base_line.get('server_time_fraction')} of project)")
+	if not (base_line.get("faithful") and arm_line.get("faithful")):
+		print("  NOTE: timeline not faithful (think time scaled/capped/dropped) —"
+			" project wall clock is NOT a claim-grade number for these runs")
 	print(f"TTFT p50            {str(base.get('ttft_p50_ms')):>12} -> "
 		f"{str(arm.get('ttft_p50_ms')):>12} ms  "
 		f"({headline['ttft_p50_speedup_x']}x)")

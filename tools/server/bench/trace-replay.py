@@ -96,6 +96,31 @@ def classify(row, dominant, args):
 	return "foreground_subagent"
 
 
+def tool_message_count(body):
+	"""Tool results the harness has fed back into the conversation.
+
+	A gap that ends with new tool results is tool-execution time (a script ran,
+	a build happened); a gap with none is harness overhead or human idle. Both
+	are arm-independent, but the split is what makes the headline honest: a 2x
+	server speedup on a project that is 85% tool time is not a 2x project."""
+	if not isinstance(body, dict):
+		return 0
+	count = 0
+	for message in body.get("messages") or []:
+		if not isinstance(message, dict):
+			continue
+		if message.get("role") == "tool":
+			count += 1
+			continue
+		content = message.get("content")
+		if isinstance(content, list):
+			for block in content:
+				if isinstance(block, dict) and block.get("type") in (
+						"tool_result", "tool_use"):
+					count += 1
+	return count
+
+
 def overlap_groups(records):
 	"""Split the trace into dependency-chained groups.
 
@@ -123,13 +148,19 @@ def overlap_groups(records):
 	if current:
 		groups.append({"rows": current, "end_ms": current_end})
 	previous_end = None
+	previous_tools = None
 	for group in groups:
 		first_arrival = min(row.get("t_arrival_ms") or 0.0 for row in group["rows"])
 		group["think_ms"] = (max(0.0, first_arrival - previous_end)
 			if previous_end is not None else 0.0)
 		group["spread_ms"] = [
 			(row.get("t_arrival_ms") or 0.0) - first_arrival for row in group["rows"]]
+		tools = max(tool_message_count(row.get("body")) for row in group["rows"])
+		group["tool_gap"] = (previous_tools is not None and tools > previous_tools)
+		group["new_tool_results"] = (max(0, tools - previous_tools)
+			if previous_tools is not None else 0)
 		previous_end = group["end_ms"]
+		previous_tools = tools
 	return groups
 
 
@@ -275,7 +306,7 @@ def fire(row, args, results, lock):
 		results.append(result)
 
 
-def summarize(results, args, wall_ms):
+def summarize(results, args, wall_ms, timeline):
 	scored = [row for row in results if (row.get("seq") or 0) >= args.warmup]
 	ok = [row for row in scored if row.get("status") == 200]
 	weights = {
@@ -311,9 +342,29 @@ def summarize(results, args, wall_ms):
 		row["ttft_ms"] * weights.get(row.get("class"), 1.0)
 		for row in ok if row.get("ttft_ms") is not None]
 
+	server_ms = max(0.0, wall_ms - timeline["think_ms_slept"])
+	recorded_total = timeline["think_ms_recorded"]
 	return {
 		"label": args.label,
 		"target": args.target,
+		"timeline": {
+			"groups": timeline["groups"],
+			"wall_clock_ms": round(wall_ms, 3),
+			"harness_gap_ms_slept": round(timeline["think_ms_slept"], 3),
+			"harness_gap_ms_recorded": round(recorded_total, 3),
+			"tool_gap_ms_recorded": round(timeline["think_ms_tool"], 3),
+			"other_gap_ms_recorded": round(timeline["think_ms_other"], 3),
+			"tool_gap_share": (round(timeline["think_ms_tool"] / recorded_total, 4)
+				if recorded_total else None),
+			"server_ms": round(server_ms, 3),
+			"server_time_fraction": (round(server_ms / wall_ms, 4)
+				if wall_ms else None),
+			"gaps_capped": timeline["gaps_capped"],
+			"think_ms_dropped_by_cap": round(timeline["think_ms_dropped_by_cap"], 3),
+			"think_speed": args.think_speed,
+			"faithful": (not args.no_think_time and args.think_speed == 1.0
+				and timeline["gaps_capped"] == 0),
+		},
 		"requests_total": len(results),
 		"requests_scored": len(scored),
 		"requests_ok": len(ok),
@@ -351,7 +402,11 @@ def main():
 	parser.add_argument("--think-speed", type=float, default=1.0,
 		help="chained mode: divide recorded harness think time by this")
 	parser.add_argument("--no-think-time", action="store_true",
-		help="chained mode: drop harness think time, measure server time only")
+		help="chained mode: drop harness/tool time, measure server time only")
+	parser.add_argument("--max-think-ms", type=float, default=0.0,
+		help="chained mode: cap any single gap (0 = faithful). Capping is "
+			"disclosed in the scorecard; it suppresses idle-driven cache work "
+			"(idle reclaim, TTL expiry) so use only for absurd outliers")
 	parser.add_argument("--warmup", type=int, default=0,
 		help="skip the first N recorded requests when scoring")
 	parser.add_argument("--timeout", type=float, default=900.0)
@@ -378,11 +433,41 @@ def main():
 	lock = threading.Lock()
 	base = now_ms()
 
+	timeline = {
+		"groups": 0,
+		"think_ms_recorded": 0.0,
+		"think_ms_slept": 0.0,
+		"think_ms_tool": 0.0,
+		"think_ms_other": 0.0,
+		"gaps_capped": 0,
+		"think_ms_dropped_by_cap": 0.0,
+	}
+
 	if args.mode == "chained":
 		groups = overlap_groups(records)
+		timeline["groups"] = len(groups)
 		for group in groups:
-			if group["think_ms"] > 0 and not args.no_think_time:
-				time.sleep((group["think_ms"] / args.think_speed) / 1000.0)
+			recorded = group["think_ms"]
+			timeline["think_ms_recorded"] += recorded
+			if group["tool_gap"]:
+				timeline["think_ms_tool"] += recorded
+			else:
+				timeline["think_ms_other"] += recorded
+			slept = 0.0
+			if recorded > 0 and not args.no_think_time:
+				# Tool execution and human idle are arm-independent, but they are
+				# NOT inert: idle-slot reclaim, TTL expiry and displacement saves
+				# all happen in these gaps, so they are replayed faithfully by
+				# default. The cap exists only for absurd outliers (a 30-minute
+				# training job) and is disclosed in the scorecard.
+				capped = recorded
+				if args.max_think_ms and capped > args.max_think_ms:
+					timeline["gaps_capped"] += 1
+					timeline["think_ms_dropped_by_cap"] += capped - args.max_think_ms
+					capped = args.max_think_ms
+				slept = capped / args.think_speed
+				time.sleep(slept / 1000.0)
+			timeline["think_ms_slept"] += slept
 			group_start = now_ms()
 			threads = []
 			for row, spread in zip(group["rows"], group["spread_ms"]):
@@ -413,7 +498,7 @@ def main():
 	wall_ms = now_ms() - base
 
 	results.sort(key=lambda row: row.get("seq") or 0)
-	scorecard = summarize(results, args, wall_ms)
+	scorecard = summarize(results, args, wall_ms, timeline)
 	scorecard["mode"] = args.mode
 	scorecard["think_time"] = (not args.no_think_time) and args.mode == "chained"
 	scorecard["trace"] = args.trace
@@ -425,6 +510,12 @@ def main():
 		json.dump(scorecard, handle, indent=2)
 		handle.write("\n")
 
+	line = scorecard["timeline"]
+	print(f"TRACE_REPLAY {args.label} timeline wall={line['wall_clock_ms']:.0f}ms"
+		f" server={line['server_ms']:.0f}ms ({line['server_time_fraction']})"
+		f" gaps={line['harness_gap_ms_slept']:.0f}ms"
+		f" tool_share={line['tool_gap_share']}"
+		f" faithful={line['faithful']}")
 	print(f"TRACE_REPLAY {args.label} requests={scorecard['requests_ok']}"
 		f"/{scorecard['requests_scored']} wall={scorecard['wall_clock_ms']:.0f}ms"
 		f" ttft_p50={scorecard['ttft_p50_ms']} ttft_p95={scorecard['ttft_p95_ms']}"
