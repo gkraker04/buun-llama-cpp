@@ -332,6 +332,8 @@ class ProxyServer(ThreadingHTTPServer):
 def main():
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--listen", type=int, required=True)
+	parser.add_argument("--bind", default="127.0.0.1",
+		help="bind address; use 0.0.0.0 when the harness connects over the LAN")
 	parser.add_argument("--upstream", required=True,
 		help="host:port of the unmodified llama-server")
 	parser.add_argument("--trace", required=True,
@@ -345,13 +347,13 @@ def main():
 		parser.error("--upstream must be host:port")
 
 	trace = TraceWriter(args.trace, args.tag)
-	server = ProxyServer(("127.0.0.1", args.listen), ProxyHandler)
+	server = ProxyServer((args.bind, args.listen), ProxyHandler)
 	server.trace = trace
 	server.upstream_host = host
 	server.upstream_port = int(port)
 	server.timeout_s = args.timeout
 
-	print(f"CAPTURE_PROXY listening 127.0.0.1:{args.listen} "
+	print(f"CAPTURE_PROXY listening {args.bind}:{args.listen} "
 		f"-> {args.upstream}, trace {args.trace}")
 	sys.stdout.flush()
 	try:
