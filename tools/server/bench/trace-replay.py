@@ -222,6 +222,19 @@ def server_metrics(text, streaming):
 	return found
 
 
+def generated_tokens(metrics):
+	timings = metrics.get("timings") or {}
+	for key in ("predicted_n", "n_predicted"):
+		value = timings.get(key)
+		if isinstance(value, (int, float)):
+			return int(value)
+	usage = metrics.get("usage") or {}
+	value = usage.get("completion_tokens")
+	if isinstance(value, (int, float)):
+		return int(value)
+	return None
+
+
 def fresh_prefill_tokens(metrics):
 	"""Prompt tokens this server actually had to evaluate. Every reuse path
 	(prefix hit, checkpoint restore, host entry) shows up here as a smaller
@@ -249,8 +262,56 @@ def prompt_tokens_total(metrics):
 	return None
 
 
+def recorded_generation(row):
+	server = row.get("server") or {}
+	timings = server.get("timings") or {}
+	for key in ("predicted_n", "n_predicted"):
+		value = timings.get(key)
+		if isinstance(value, (int, float)) and value > 0:
+			return int(value)
+	usage = server.get("usage") or {}
+	value = usage.get("completion_tokens")
+	if isinstance(value, (int, float)) and value > 0:
+		return int(value)
+	return None
+
+
+def prepare_body(row, args):
+	"""Apply comparability overrides. Prompts are never touched — only how the
+	arm is asked to sample and how much it is asked to generate."""
+	body = dict(row.get("body") or {})
+	notes = []
+
+	if args.greedy:
+		# Removes sampling variance so a re-replay after policy tuning differs
+		# only by the tuning. It does NOT make two arms emit identical text:
+		# quantized KV and speculative decoding perturb logits enough to flip an
+		# argmax, after which continuations diverge. That is what --pin-generation
+		# is for.
+		body["temperature"] = 0.0
+		body["top_k"] = 1
+		body["top_p"] = 1.0
+		body["seed"] = args.seed
+		notes.append("greedy")
+
+	if args.pin_generation:
+		target = recorded_generation(row)
+		if target:
+			if "max_tokens" in body or row.get("path", "").startswith("/v1/"):
+				body["max_tokens"] = target
+			else:
+				body["n_predict"] = target
+			body["ignore_eos"] = True
+			notes.append(f"pinned:{target}")
+		else:
+			notes.append("pin_unavailable")
+
+	return body, notes
+
+
 def fire(row, args, results, lock):
-	body = json.dumps(row["body"]).encode()
+	body_obj, notes = prepare_body(row, args)
+	body = json.dumps(body_obj).encode()
 	url = f"http://{args.target}{row['path']}"
 	request = urllib.request.Request(url, data=body, method=row.get("method", "POST"))
 	request.add_header("Content-Type", "application/json")
@@ -299,7 +360,11 @@ def fire(row, args, results, lock):
 		"total_ms": round(end - start, 3),
 		"fresh_prefill_tokens": fresh_prefill_tokens(metrics),
 		"prompt_tokens": prompt_tokens_total(metrics),
+		"generated_tokens": generated_tokens(metrics),
+		"generated_recorded": recorded_generation(row),
 	}
+	if notes:
+		result["overrides"] = notes
 	if error:
 		result["error"] = error
 	with lock:
@@ -331,6 +396,12 @@ def summarize(results, args, wall_ms, timeline):
 				if row.get("fresh_prefill_tokens") is not None),
 		}
 
+	generated_known = [row for row in ok if row.get("generated_tokens") is not None]
+	generated_total = sum(row["generated_tokens"] for row in generated_known)
+	pin_matched = sum(
+		1 for row in generated_known
+		if row.get("generated_recorded")
+		and row["generated_tokens"] == row["generated_recorded"])
 	fresh_known = [row for row in ok if row.get("fresh_prefill_tokens") is not None]
 	total_fresh = sum(row["fresh_prefill_tokens"] for row in fresh_known)
 	total_prompt = sum(row["prompt_tokens"] for row in ok
@@ -376,6 +447,14 @@ def summarize(results, args, wall_ms, timeline):
 		"ttft_weighted_p50_ms": percentile(weighted_ttft, 0.50),
 		"ttft_weighted_p95_ms": percentile(weighted_ttft, 0.95),
 		"latency_ms_total": round(sum(row["total_ms"] for row in ok), 3),
+		"generated_tokens_total": generated_total,
+		"generated_reported_for": len(generated_known),
+		"generated_matched_capture": pin_matched,
+		"sampling": {
+			"greedy": bool(args.greedy),
+			"seed": args.seed if args.greedy else None,
+			"pinned_generation": bool(args.pin_generation),
+		},
 		"fresh_prefill_tokens": total_fresh,
 		"fresh_prefill_reported_for": len(fresh_known),
 		"prompt_tokens_total": total_prompt or None,
@@ -411,6 +490,15 @@ def main():
 		help="skip the first N recorded requests when scoring")
 	parser.add_argument("--timeout", type=float, default=900.0)
 	parser.add_argument("--api-key", default=None)
+	parser.add_argument("--greedy", action="store_true",
+		help="force temperature 0 / top_k 1 / fixed seed: removes sampling "
+			"variance so a re-replay differs only by what you changed")
+	parser.add_argument("--seed", type=int, default=7)
+	parser.add_argument("--pin-generation", action="store_true",
+		help="generate exactly as many tokens as the capture did (ignore_eos). "
+			"Decode work becomes identical across arms by construction, which "
+			"is what makes wall clock comparable when the arms are numerically "
+			"different (quantized KV, speculative decoding)")
 	parser.add_argument("--tooled-system-chars", type=int, default=1500)
 	parser.add_argument("--tooled-tools", type=int, default=3)
 	parser.add_argument("--background-predict", type=int, default=256)
@@ -516,6 +604,11 @@ def main():
 		f" gaps={line['harness_gap_ms_slept']:.0f}ms"
 		f" tool_share={line['tool_gap_share']}"
 		f" faithful={line['faithful']}")
+	print(f"TRACE_REPLAY {args.label} decode gen_tokens="
+		f"{scorecard['generated_tokens_total']}"
+		f" matched_capture={scorecard['generated_matched_capture']}"
+		f"/{scorecard['generated_reported_for']}"
+		f" greedy={bool(args.greedy)} pinned={bool(args.pin_generation)}")
 	print(f"TRACE_REPLAY {args.label} requests={scorecard['requests_ok']}"
 		f"/{scorecard['requests_scored']} wall={scorecard['wall_clock_ms']:.0f}ms"
 		f" ttft_p50={scorecard['ttft_p50_ms']} ttft_p95={scorecard['ttft_p95_ms']}"

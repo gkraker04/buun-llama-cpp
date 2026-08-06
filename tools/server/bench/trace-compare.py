@@ -72,6 +72,14 @@ def main():
 			"baseline": base.get("prefix_reuse_ratio"),
 			"arm": arm.get("prefix_reuse_ratio"),
 		},
+		"decode_comparability": {
+			"baseline_generated_tokens": base.get("generated_tokens_total"),
+			"arm_generated_tokens": arm.get("generated_tokens_total"),
+			"generated_delta_pct": percent_drop(
+				base.get("generated_tokens_total"), arm.get("generated_tokens_total")),
+			"baseline_sampling": base.get("sampling"),
+			"arm_sampling": arm.get("sampling"),
+		},
 	}
 
 	by_class = {}
@@ -146,6 +154,16 @@ def main():
 	print(f"  harness+tool gaps {(base_line.get('harness_gap_ms_slept') or 0):>12.0f} ms"
 		f"  (tool share of gaps: {base_line.get('tool_gap_share')};"
 		f" server = {base_line.get('server_time_fraction')} of project)")
+	decode = headline["decode_comparability"]
+	base_gen = decode["baseline_generated_tokens"] or 0
+	arm_gen = decode["arm_generated_tokens"] or 0
+	skew = abs(base_gen - arm_gen) / base_gen if base_gen else 0.0
+	print(f"decode work         {base_gen:>12} -> {arm_gen:>12} tokens"
+		f"  (skew {skew * 100:.1f}%)")
+	if skew > 0.02 and not (base.get("sampling") or {}).get("pinned_generation"):
+		print("  WARNING: arms did unequal decode work — wall clock and total "
+			"latency are polluted by generation-length divergence. Re-run with "
+			"--greedy --pin-generation for a claim-grade wall clock.")
 	if not (base_line.get("faithful") and arm_line.get("faithful")):
 		print("  NOTE: timeline not faithful (think time scaled/capped/dropped) —"
 			" project wall clock is NOT a claim-grade number for these runs")
