@@ -14,6 +14,7 @@ enabled when you want the planner's reasoning for a specific request.
 """
 
 import argparse
+import hashlib
 import json
 import statistics
 import threading
@@ -191,6 +192,42 @@ def sse_first_content_offset(text):
 	return False
 
 
+def response_content(text, streaming):
+	"""Concatenated generated text, for cross-arm output-identity checking."""
+	pieces = []
+	blobs = []
+	if streaming:
+		for line in text.splitlines():
+			line = line.strip()
+			if line.startswith("data:"):
+				data = line[5:].strip()
+				if data and data != "[DONE]":
+					blobs.append(data)
+	else:
+		blobs.append(text)
+	for blob in blobs:
+		try:
+			payload = json.loads(blob)
+		except ValueError:
+			continue
+		if not isinstance(payload, dict):
+			continue
+		if isinstance(payload.get("content"), str):
+			pieces.append(payload["content"])
+		for choice in payload.get("choices") or []:
+			if not isinstance(choice, dict):
+				continue
+			delta = choice.get("delta")
+			if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+				pieces.append(delta["content"])
+			message = choice.get("message")
+			if isinstance(message, dict) and isinstance(message.get("content"), str):
+				pieces.append(message["content"])
+			if isinstance(choice.get("text"), str):
+				pieces.append(choice["text"])
+	return "".join(pieces)
+
+
 def server_metrics(text, streaming):
 	found = {}
 	blobs = []
@@ -283,11 +320,14 @@ def prepare_body(row, args):
 	notes = []
 
 	if args.greedy:
-		# Removes sampling variance so a re-replay after policy tuning differs
-		# only by the tuning. It does NOT make two arms emit identical text:
-		# quantized KV and speculative decoding perturb logits enough to flip an
-		# argmax, after which continuations diverge. That is what --pin-generation
-		# is for.
+		# Removes sampling variance so a re-replay differs only by what changed.
+		# With a STATIC KV type on both arms this should also make the two arms
+		# emit identical text: static quantization is deterministic and
+		# speculative decoding is lossless (verify accepts only the target's own
+		# tokens). VBR is the exception — tier assignment follows VRAM pressure,
+		# and the branches spend VRAM differently, so its schedule and therefore
+		# its logits are branch-dependent. --pin-generation equalizes decode work
+		# regardless.
 		body["temperature"] = 0.0
 		body["top_k"] = 1
 		body["top_p"] = 1.0
@@ -362,6 +402,9 @@ def fire(row, args, results, lock):
 		"prompt_tokens": prompt_tokens_total(metrics),
 		"generated_tokens": generated_tokens(metrics),
 		"generated_recorded": recorded_generation(row),
+		"output_sha": hashlib.sha256(
+			response_content(text, streaming).encode("utf-8", "replace")
+		).hexdigest()[:16],
 	}
 	if notes:
 		result["overrides"] = notes
@@ -492,13 +535,14 @@ def main():
 	parser.add_argument("--api-key", default=None)
 	parser.add_argument("--greedy", action="store_true",
 		help="force temperature 0 / top_k 1 / fixed seed: removes sampling "
-			"variance so a re-replay differs only by what you changed")
+			"variance, and with a static KV type on both arms should yield "
+			"identical text (a mismatch is then a real determinism finding)")
 	parser.add_argument("--seed", type=int, default=7)
 	parser.add_argument("--pin-generation", action="store_true",
 		help="generate exactly as many tokens as the capture did (ignore_eos). "
-			"Decode work becomes identical across arms by construction, which "
-			"is what makes wall clock comparable when the arms are numerically "
-			"different (quantized KV, speculative decoding)")
+			"Decode work becomes identical across arms by construction — "
+			"required when an arm runs VBR, whose pressure-driven tier schedule "
+			"is branch-dependent; belt-and-braces on static-KV cells")
 	parser.add_argument("--tooled-system-chars", type=int, default=1500)
 	parser.add_argument("--tooled-tools", type=int, default=3)
 	parser.add_argument("--background-predict", type=int, default=256)

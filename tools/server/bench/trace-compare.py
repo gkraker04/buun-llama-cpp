@@ -72,6 +72,7 @@ def main():
 			"baseline": base.get("prefix_reuse_ratio"),
 			"arm": arm.get("prefix_reuse_ratio"),
 		},
+		"output_identity": None,
 		"decode_comparability": {
 			"baseline_generated_tokens": base.get("generated_tokens_total"),
 			"arm_generated_tokens": arm.get("generated_tokens_total"),
@@ -98,6 +99,17 @@ def main():
 
 	base_rows = index_requests(base)
 	arm_rows = index_requests(arm)
+	shared = [seq for seq in arm_rows if seq in base_rows]
+	hashed = [seq for seq in shared
+		if base_rows[seq].get("output_sha") and arm_rows[seq].get("output_sha")]
+	matched = [seq for seq in hashed
+		if base_rows[seq]["output_sha"] == arm_rows[seq]["output_sha"]]
+	headline["output_identity"] = {
+		"compared": len(hashed),
+		"identical": len(matched),
+		"first_divergence_seq": next(
+			(seq for seq in sorted(hashed) if seq not in matched), None),
+	}
 	deltas = []
 	for seq, arm_row in arm_rows.items():
 		base_row = base_rows.get(seq)
@@ -154,6 +166,15 @@ def main():
 	print(f"  harness+tool gaps {(base_line.get('harness_gap_ms_slept') or 0):>12.0f} ms"
 		f"  (tool share of gaps: {base_line.get('tool_gap_share')};"
 		f" server = {base_line.get('server_time_fraction')} of project)")
+	identity = headline["output_identity"]
+	if identity and identity["compared"]:
+		print(f"output identity     {identity['identical']:>12}"
+			f" / {identity['compared']} requests byte-identical")
+		if identity["identical"] < identity["compared"]:
+			print("  NOTE: outputs diverged. Expected when an arm runs VBR "
+				"(pressure-driven tiers are branch-dependent). On a static-KV "
+				f"cell this is a determinism finding — first at seq "
+				f"{identity['first_divergence_seq']}.")
 	decode = headline["decode_comparability"]
 	base_gen = decode["baseline_generated_tokens"] or 0
 	arm_gen = decode["arm_generated_tokens"] or 0
