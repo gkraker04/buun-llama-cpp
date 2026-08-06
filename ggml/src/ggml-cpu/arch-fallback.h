@@ -74,10 +74,9 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
 // quants.c
-// arch/arm/quants.c only provides ggml_vec_dot_q2_0_q8_0 — do NOT rename the
-// generic, or we get a duplicate symbol with the ARM version.
-// All other quant functions are NOT in the ARM file, so the generic must be
-// renamed to bare names to satisfy callers.
+// arch/arm/quants.c provides ggml_vec_dot_q2_0_q8_0 — do NOT rename the generic,
+// or we get a duplicate symbol with the ARM version.
+// q2_0_g128 is NOT provided by the ARM file, so the generic must be renamed.
 #define ggml_vec_dot_q2_0_g128_q8_0_generic ggml_vec_dot_q2_0_g128_q8_0
 // repack.cpp
 // arch/arm/repack.cpp provides 4x4 variants of iq4_nl/mxfp4 and 8x4/8x8 of
