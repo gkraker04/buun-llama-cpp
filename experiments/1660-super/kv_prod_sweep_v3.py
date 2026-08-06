@@ -66,6 +66,7 @@ MAX_RETRIES_PER_POINT       = 3
 MAX_CONSECUTIVE_FAILURES    = 5
 MAX_CONSECUTIVE_EXIT9       = 3
 MAX_RUNTIME_SECONDS         = 8 * 3600  # 8 hours
+MAX_RUNTIME_HOURS           = 8
 MAX_CONFIGS                 = 20
 
 EXIT9_WAIT          = 120  # seconds to wait after exit 9 before retry
