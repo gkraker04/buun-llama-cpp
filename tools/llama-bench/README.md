@@ -54,6 +54,7 @@ test parameters:
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
   -ub, --ubatch-size <n>                    (default: 512)
+  --no-ub-gt-b                              skip runs where ubatch size > batch size (default: disabled)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
   -t, --threads <n>                         (default: system dependent)

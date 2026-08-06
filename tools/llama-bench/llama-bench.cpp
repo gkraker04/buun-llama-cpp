@@ -362,6 +362,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             ub_gt_b;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -410,6 +411,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* ub_gt_b              */ true,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -453,6 +455,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                           (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                        (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  --no-ub-gt-b                                skip runs where ubatch size > batch size (default: disabled)\n");
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>  arm dynamic VBR (F16 entry, both sides), aggregate floor tier\n");
@@ -550,6 +553,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.ub_gt_b              = cmd_params_defaults.ub_gt_b;
     params.offline              = cmd_params_defaults.offline;
     params.vbr                  = cmd_params_defaults.vbr;
     params.vbr_floor            = cmd_params_defaults.vbr_floor;
@@ -644,6 +648,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
+            } else if (arg == "--ub-gt-b") {
+                params.ub_gt_b = true;
+            } else if (arg == "--no-ub-gt-b") {
+                params.ub_gt_b = false;
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1367,7 +1375,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
-    for (const auto & nub : params.n_ubatch)
+    // --no-ub-gt-b: skip (batch, ubatch) pairs where ubatch would exceed batch
+    for (const auto & nub : params.n_ubatch) if (params.ub_gt_b || nub <= nb)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
