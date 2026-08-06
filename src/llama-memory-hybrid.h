@@ -112,6 +112,16 @@ public:
     bool vbr_ledger_tree_active() const override {
         return mem_attn->vbr_ledger_tree_active();
     }
+    void vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) override {
+        mem_attn->vbr_hard_seal_guard_set(std::move(guard));
+    }
+    bool vbr_hard_seal_blocked_take(bool decode_failed) override {
+        return mem_attn->vbr_hard_seal_blocked_take(decode_failed);
+    }
+    void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & out) override {
+        mem_attn->vbr_hard_seal_evidence_take(out);
+    }
 
     void clear(bool data) override;
 

@@ -167,23 +167,29 @@ if (NOT proof_calls_valid)
     message(FATAL_ERROR "E1.0 production called a private proof adapter")
 endif()
 
-# The classifier is read-only and has no context/server caller until E1.1c.
+# The classifier remains read-only and E1.1c wires it only through the KV
+# transaction. Server code supplies a generic range verdict callback; it may
+# not call or fork the tier classifier.
 require_token("${seal_source}" "uint8_t seal_tier"
     "caller-owned seal tier")
 require_token("${seal_header}" "VBR_HARD_SEAL_DEFAULT_FLOOR"
     "frozen default floor")
-string(REGEX MATCHALL "vbr_hard_seal_classify\\(" seal_hooks "${kv_source}")
+string(REGEX MATCHALL
+    "bool llama_kv_cache::vbr_hard_seal_classify\\("
+    seal_hooks "${kv_source}")
 list(LENGTH seal_hooks seal_hook_count)
 if (NOT seal_hook_count EQUAL 1)
     message(FATAL_ERROR
         "E1.0 controller must expose exactly one read-only hook definition, found ${seal_hook_count}")
 endif()
+require_token("${kv_source}" "vbr_hard_seal_step_blocked("
+    "E1.1c transaction classifier consult")
 set(forbidden_classifier_callers
     "${llama_context_source}\n${server_production_source}")
 no_classifier_callers(
     "${forbidden_classifier_callers}" classifier_callers_valid)
 if (NOT classifier_callers_valid)
-    message(FATAL_ERROR "E1.0 hard-seal classifier gained a premature caller")
+    message(FATAL_ERROR "E1.1c hard-seal classifier escaped the KV transaction")
 endif()
 
 # E1.2 deliberately adds the reviewed HTTP/flag surface. VBR enforcement and

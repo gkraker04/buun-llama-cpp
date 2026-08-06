@@ -50,13 +50,13 @@ def write_bench_stamp(workdir, gate, model, server_bin):
 class ManagedServerArm:
 	"""Server process whose context-manager terminal always drains the child."""
 
-	def __init__(self, name, base, log_path, command):
+	def __init__(self, name, base, log_path, command, env=None):
 		self.name = name
 		self.base = base
 		self.log_path = log_path
 		self.log = open(log_path, "w")
 		self.proc = subprocess.Popen(
-			command, stdout=self.log, stderr=subprocess.STDOUT)
+			command, stdout=self.log, stderr=subprocess.STDOUT, env=env)
 
 	def wait_healthy(self, timeout=360):
 		deadline = time.time() + timeout

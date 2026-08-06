@@ -110,6 +110,20 @@ public:
     bool vbr_ledger_tree_active() const override {
         return kv_vbr_root != nullptr && kv_vbr_root->vbr_ledger_tree_active();
     }
+    void vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) override {
+        kv_base->vbr_hard_seal_guard_set(guard);
+        kv_swa->vbr_hard_seal_guard_set(std::move(guard));
+    }
+    bool vbr_hard_seal_blocked_take(bool decode_failed) override {
+        const bool base = kv_base->vbr_hard_seal_blocked_take(decode_failed);
+        const bool swa = kv_swa->vbr_hard_seal_blocked_take(decode_failed);
+        return base || swa;
+    }
+    void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & out) override {
+        kv_base->vbr_hard_seal_evidence_take(out);
+        kv_swa->vbr_hard_seal_evidence_take(out);
+    }
 
     void vbr_shared_scratch_detach() override {
         kv_base->vbr_shared_scratch_detach();

@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 #include "llama-vbr-operation.h"
+#include "llama-vbr-hard-seal.h"
 
 #include <map>
 #include <memory>
@@ -209,6 +210,14 @@ struct llama_memory_i {
     // True for the single root that owns a live dynamic-VBR ledger controller.
     // Composite memories forward this once for the whole tree.
     virtual bool vbr_ledger_tree_active() const { return false; }
+
+    // E1 hard-seal enforcement. Non-VBR memories remain inert. The callback
+    // is scheduler-owned and read-only; implementations invoke it before any
+    // transcode, mapping, cursor publication, or backend mutation.
+    virtual void vbr_hard_seal_guard_set(vbr_hard_seal_guard /*guard*/) {}
+    virtual bool vbr_hard_seal_blocked_take(bool /*decode_failed*/) { return false; }
+    virtual void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & /*out*/) {}
 
     // Drop any non-owning registrations that refer to compute backends owned by the
     // enclosing llama_context. llama_context calls this before those backends are

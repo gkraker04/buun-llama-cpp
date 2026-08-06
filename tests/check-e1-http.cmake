@@ -104,8 +104,9 @@ require_token("${route_body}" "server_cache_capture_tenant_key(req)" "F tenant a
 require_token("${route_body}" "result->is_error()" "error-before-cast guard")
 require_token("${route_body}" "res->status = 400;" "parse HTTP 400 convention")
 require_token("${route_body}" "std::numeric_limits<int32_t>::max()" "slot range check")
-require_token("${context_source}" "params_base.vbr_enabled()) {"
-    "pre-E1.1c hard-live VBR refusal")
+forbid_token("${context_source}"
+    "E1.1c owns VBR controller enforcement"
+    "obsolete pre-E1.1c hard-live VBR refusal")
 
 string(FIND "${route_body}"
     "const auto prepared = server_cache_control_prepare_request(" common_parse)

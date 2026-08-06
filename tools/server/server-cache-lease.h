@@ -376,6 +376,7 @@ public:
         uint64_t sequence_epoch,
         uint64_t first_token,
         uint64_t token_count) const noexcept;
+    bool has_hard_lease() const noexcept;
     server_cache_destruction_verdict admit(
         const server_cache_destruction_request & request) noexcept;
 
@@ -477,3 +478,15 @@ private:
 server_cache_destruction_verdict server_cache_lease_evaluate_request(
     void * context,
     const server_cache_destruction_request & request) noexcept;
+
+// Thin range-qualified door used by VBR enforcement and legacy skip guards.
+// It delegates to the single lease table; it is not a second evaluator.
+bool server_cache_hard_lease_blocks_range(
+    const server_cache_lease_table * leases,
+    llama_cache_acct_artifact_id artifact,
+    const server_cache_lease_identity & identity,
+    uint64_t sequence_epoch,
+    uint64_t first_token,
+    uint64_t token_count) noexcept;
+bool server_cache_has_hard_lease(
+    const server_cache_lease_table * leases) noexcept;

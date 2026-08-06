@@ -256,6 +256,7 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     config.selector_evidence = selector_evidence;
     server_cache_control_authority authority(config);
     CHECK(authority.available());
+    CHECK(!leases.has_hard_lease());
 
     const auto holder = execute(
         authority, server_cache_control_operation::holder_create,
@@ -294,6 +295,8 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     CHECK(replayed.status == server_cache_control_status::ok);
     CHECK(replayed.lease == granted.lease);
     CHECK(granted.granted_class == server_cache_lease_class::hard);
+    CHECK(leases.has_hard_lease());
+    CHECK(server_cache_has_hard_lease(&leases));
     CHECK(granted.cache_family.declared());
     CHECK(granted.cache_family.role == common_cache_family_role::main);
     CHECK(granted.protected_bytes_known && granted.protected_bytes == 64);
@@ -301,10 +304,13 @@ static void test_holder_hard_orphan_frontier_and_proof() {
           granted.fallback_pinned_bytes == 96);
     CHECK(granted.shared_fallback);
     CHECK(host.owner.use_count() > 1);
-    CHECK(server_cache_lease_is_hard(
-        leases.inspect_range(retention.artifact_id(live), identity, 7, 0, 8)));
-    CHECK(!server_cache_lease_is_hard(
-        leases.inspect_range(retention.artifact_id(live), identity, 7, 8, 4)));
+    CHECK(server_cache_hard_lease_blocks_range(
+        &leases, retention.artifact_id(live), identity, 7, 0, 8));
+    CHECK(!server_cache_hard_lease_blocks_range(
+        &leases, retention.artifact_id(live), identity, 7, 8, 4));
+    CHECK(!server_cache_hard_lease_blocks_range(
+        nullptr, retention.artifact_id(live), identity, 7, 0, 8));
+    std::puts("E1_VBR_RANGE hard=blocked beyond_frontier=allowed absent=allowed");
     server_cache_control_request lease_events_request;
     lease_events_request.holder = holder.holder;
     lease_events_request.event_limit = SERVER_CACHE_LEASE_EVENT_RING;
@@ -401,6 +407,7 @@ static void test_holder_hard_orphan_frontier_and_proof() {
     server_cache_control_request release = inspect;
     CHECK(execute(authority, server_cache_control_operation::lease_release,
                   release).status == server_cache_control_status::ok);
+    CHECK(!leases.has_hard_lease());
     CHECK(host.owner.use_count() == 1);
     CHECK(!server_cache_lease_is_hard(
         leases.inspect(cloned_artifact, identity)));

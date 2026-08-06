@@ -553,6 +553,35 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // Read-only E1 range qualification shared by the VBR controller and the
+    // three legacy reclaim skip guards. A missing sidecar/identity cannot
+    // correspond to a granted hard lease, so the legacy behavior remains the
+    // neutral result. The lease table remains the one evaluator.
+    bool hard_lease_blocks_live_range(
+            uint64_t first_token, uint64_t token_count) const {
+        if (!lifecycle_authority || !lease_obs || !retention_obs ||
+            !lease_execution_identity ||
+            prompt.n_tokens() <= 0 || token_count == 0) {
+            return false;
+        }
+        const auto artifact = retention_obs->artifact_id(
+            server_retention_instance_key::for_slot(id));
+        server_cache_lease_identity identity;
+        if (artifact.v == 0 || !server_cache_lease_build_identity(
+                *lease_execution_identity, lora_config_identity(lora),
+                prompt.tokens, prompt.n_tokens(), identity)) {
+            return false;
+        }
+        return server_cache_hard_lease_blocks_range(
+            lease_obs, artifact, identity, prompt.sequence_epoch,
+            first_token, token_count);
+    }
+
+    bool hard_lease_blocks_live_prefix() const {
+        return hard_lease_blocks_live_range(
+            0, static_cast<uint64_t>(std::max(0, prompt.n_tokens())));
+    }
+
     prompt_save_result prompt_save(
             server_prompt_cache & prompt_cache,
             bool refresh_exact = false,
@@ -4025,6 +4054,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (ctx_tgt) {
+            llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
+        }
         // E1 host-fallback proofs call back into prompt-cache list nodes, and
         // F subject/fallback proofs retain the artifact store. Close every
         // holder/lease/proof explicitly while both owners are still alive;
@@ -4192,6 +4224,12 @@ private:
             if (s.id == except_id || s.is_processing() || s.prompt.n_tokens() == 0) {
                 continue;
             }
+            // E1.1c approved guard, not D-A certification: the legacy eraser
+            // simply does not consider a hard-leased live prefix.
+            if (s.hard_lease_blocks_live_prefix()) {
+                SLT_INF(s, "vbr reclaim (%s): kept — hard lease seals the live prefix\n", reason);
+                continue;
+            }
             if (queue_tasks.has_deferred_for_slot(s.id)) {
                 SLT_INF(s, "vbr reclaim (%s): kept — a deferred id_slot task pins this slot\n", reason);
                 continue;
@@ -4250,6 +4288,13 @@ private:
         auto st = llama_memory_vbr_state(mem, slot.id, 0);
         if (st.cursor < 2) {
             return n_past; // pristine or one transient step — a full re-prefill buys ~nothing
+        }
+        // E1.1c approved guard, not a destructive capability. The range is
+        // exactly the prefix this recovery path would discard.
+        if (slot.hard_lease_blocks_live_range(
+                0, static_cast<uint64_t>(std::max(0, n_past)))) {
+            SLT_INF(slot, "%s", "vbr reset blocked: hard lease seals the reusable prefix\n");
+            return n_past;
         }
         vbr_clear_idle_slots(slot.id, "reset-recovery");
         st = llama_memory_vbr_state(mem, slot.id, 0);
@@ -5385,6 +5430,32 @@ private:
                 prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
+            }
+            if (params_base.cache_lifecycle) {
+                llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
+                    vbr_hard_seal_guard {
+                        [this]() {
+                            return cache_authority != nullptr &&
+                                server_cache_has_hard_lease(
+                                    &cache_authority->leases);
+                        },
+                        [this](const vbr_hard_seal_subject &,
+                               const std::vector<vbr_hard_seal_range> & ranges) {
+                            for (const auto & range : ranges) {
+                                const auto slot = std::find_if(
+                                    slots.begin(), slots.end(),
+                                    [&](const server_slot & value) {
+                                        return value.id == range.sequence;
+                                    });
+                                if (slot != slots.end() &&
+                                    slot->hard_lease_blocks_live_range(
+                                        range.first_token, range.token_count)) {
+                                    return vbr_hard_seal_guard_result::hard_lease_blocked;
+                                }
+                            }
+                            return vbr_hard_seal_guard_result::allow;
+                        },
+                    });
             }
         }
 
@@ -7393,6 +7464,11 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
+                // E1.1c approved guard, not D-A certification.
+                if (slot.hard_lease_blocks_live_prefix()) {
+                    SLT_INF(slot, "%s", "idle purge skipped: hard lease seals the live prefix\n");
+                    continue;
+                }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear(
@@ -8966,23 +9042,6 @@ private:
                                 server_cache_control_status::ok;
                             if (operation ==
                                     server_cache_control_operation::lease_acquire) {
-                                // E1.1c owns VBR controller enforcement and
-                                // the three legacy reclaim-door guards. Until
-                                // that unit lands, never publish a hard live
-                                // promise that those paths cannot yet honor.
-                                if (request.requested_class ==
-                                        server_cache_lease_class::hard &&
-                                    request.subject.kind ==
-                                        server_cache_control_subject_kind::live_prefix &&
-                                    params_base.vbr_enabled()) {
-                                    if (request.allow_soft_fallback) {
-                                        request.requested_class =
-                                            server_cache_lease_class::soft;
-                                    } else {
-                                        selector_status =
-                                            server_cache_control_status::not_supported;
-                                    }
-                                }
                                 if (selector_status ==
                                         server_cache_control_status::ok) {
                                     selector_status =
@@ -12453,7 +12512,39 @@ private:
 
         metrics.on_decoded(slots);
 
+        auto * memory = llama_get_memory(ctx_tgt);
+        std::vector<vbr_hard_seal_subject> hard_seal_evidence;
+        memory->vbr_hard_seal_evidence_take(hard_seal_evidence);
+        if (params_base.cache_debug) {
+            for (const auto & step : hard_seal_evidence) {
+                const json payload = {
+                    {"evidence_event", "sealed_step"},
+                    {"order_ordinal", step.order_ordinal},
+                    {"layer", step.il},
+                    {"side", step.is_v ? "v" : "k"},
+                };
+                SRV_INF("CACHE_VBR_HARD_SEAL %s\n", payload.dump().c_str());
+            }
+        }
+        const bool hard_seal_terminal =
+            memory->vbr_hard_seal_blocked_take(ret != 0);
         if (ret != 0) {
+            if (ret == 1 && hard_seal_terminal) {
+                constexpr const char * refusal = "hard_lease_blocked";
+                SRV_WRN("VBR pressure refused at the hard-lease seal; completing the in-flight request with %s\n",
+                        refusal);
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, refusal, ERROR_TYPE_HARD_LEASE_BLOCKED);
+                        // prepare() failed before committing this batch. Keep
+                        // the proven live prefix and its lease intact; unlike
+                        // an ordinary cache-placement failure this must never
+                        // clear an idle leased slot or retry forever.
+                        slot.release();
+                    }
+                }
+                throw std::runtime_error(refusal);
+            }
             {
                 std::string err;
 

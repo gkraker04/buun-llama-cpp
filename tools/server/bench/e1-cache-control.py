@@ -12,6 +12,7 @@ from server_gate_common import ManagedServerArm, header, request, write_bench_st
 
 
 DESTRUCTION_RE = re.compile(r"CACHE_HOST_DESTRUCTION (\{.*\})")
+VBR_HARD_SEAL_RE = re.compile(r"CACHE_VBR_HARD_SEAL (\{.*\})")
 
 
 def wait_for_log_since(arm, offset, token, timeout=10):
@@ -34,6 +35,159 @@ def destruction_records_since(path, offset):
 			if match:
 				records.append(json.loads(match.group(1)))
 	return records
+
+
+def vbr_hard_seal_records_since(path, offset):
+	records = []
+	with open(path, errors="replace") as handle:
+		handle.seek(offset)
+		for line in handle:
+			match = VBR_HARD_SEAL_RE.search(line)
+			if match:
+				records.append(json.loads(match.group(1)))
+	return records
+
+
+def vbr_hard_seal_units(records):
+	units = set()
+	for row in records:
+		ordinal = row.get("order_ordinal")
+		layer = row.get("layer")
+		side = row.get("side")
+		if (row.get("evidence_event") != "sealed_step" or
+			not isinstance(ordinal, int) or ordinal < 0 or
+			not isinstance(layer, int) or layer < 0 or
+			side not in ("k", "v")):
+			raise RuntimeError(f"malformed VBR sealed-step evidence: {row}")
+		units.add((ordinal, layer, side))
+	return units
+
+
+def vbr_trace_paths(prefix):
+	return [path for path in (prefix, prefix + ".base", prefix + ".swa")
+		if os.path.exists(path)]
+
+
+def vbr_trace_records(path):
+	records = []
+	with open(path, errors="replace") as handle:
+		for line in handle:
+			if not line.strip() or line.startswith("#"):
+				continue
+			fields = line.rstrip("\n").split("\t")
+			if len(fields) != 7:
+				raise RuntimeError(f"malformed VBR schedule trace row: {line!r}")
+			records.append({
+				"phase": fields[0],
+				"boundary": int(fields[1]),
+				"cursor": int(fields[2]),
+				"tier_fnv": fields[3],
+				"watermark": int(fields[4]),
+				"used": int(fields[5]),
+				"mapped_bytes": int(fields[6]),
+			})
+	return records
+
+
+def vbr_trace_snapshot(prefix):
+	return {path: vbr_trace_records(path) for path in vbr_trace_paths(prefix)}
+
+
+def vbr_trace_degrades_since(prefix, before):
+	degrades = []
+	for path in vbr_trace_paths(prefix):
+		records = vbr_trace_records(path)
+		prior = before.get(path, [])
+		if len(records) < len(prior):
+			raise RuntimeError(f"VBR schedule trace was truncated: {path}")
+		window = records[max(0, len(prior) - 1):]
+		for old, new in zip(window, window[1:]):
+			if (old["tier_fnv"] == new["tier_fnv"] or
+					new["cursor"] <= old["cursor"]):
+				continue
+			degrades.append({
+				"path": path,
+				"from_cursor": old["cursor"],
+				"to_cursor": new["cursor"],
+				"ordinals": tuple(range(old["cursor"], new["cursor"])),
+			})
+	return degrades
+
+
+def vbr_trace_state_changes_since(prefix, before):
+	changes = []
+	for path in vbr_trace_paths(prefix):
+		records = vbr_trace_records(path)
+		prior = before.get(path, [])
+		if len(records) < len(prior):
+			raise RuntimeError(f"VBR schedule trace was truncated: {path}")
+		window = records[max(0, len(prior) - 1):]
+		for old, new in zip(window, window[1:]):
+			# Occupancy/watermark growth alone is not a retier/reset. Only the
+			# controller cursor or representation digest is epoch-change evidence.
+			fields = ("cursor", "tier_fnv")
+			if any(old[field] != new[field] for field in fields):
+				changes.append({"path": path, "before": old, "after": new})
+	return changes
+
+
+def assert_vbr_unified_hold_frozen(degrades):
+	if degrades:
+		raise RuntimeError(
+			"hard-leased unified-KV VBR transitioned below T4 during hold")
+
+
+def assert_vbr_release_thawed(degrades, sealed_records):
+	if not degrades:
+		raise RuntimeError(
+			"released VBR lease did not thaw a deferred below-T4 transition")
+	if sealed_records:
+		raise RuntimeError(
+			"released VBR lease continued emitting sealed-step evidence")
+
+
+def vbr_renew_disposition(before_epoch, after_epoch, status, trace_changes):
+	if before_epoch == after_epoch:
+		if status != "partially_stale":
+			raise RuntimeError(
+				"append-stable VBR frontier did not remain partially_stale")
+		return "renew"
+	if status != "subject_lost" or not trace_changes:
+		raise RuntimeError(
+			"VBR epoch change lacked typed subject_lost/WS-0 transition evidence")
+	return "reacquire"
+
+
+def make_prompt_tokens(base, tag, wanted):
+	text = " ".join(
+		f"E1 {tag} calibrated VBR pressure row {index}."
+		for index in range(wanted))
+	status, payload, _ = request(base, "/tokenize", {
+		"content": text, "add_special": True,
+	})
+	if (status != 200 or not isinstance(payload, dict) or
+			not isinstance(payload.get("tokens"), list)):
+		raise RuntimeError(f"tokenize failed: {status} {payload}")
+	tokens = payload["tokens"]
+	if len(tokens) < wanted:
+		raise RuntimeError(f"tokenize returned {len(tokens)} < {wanted}")
+	return tokens[:wanted]
+
+
+def completion_error_type(payload):
+	if not isinstance(payload, dict):
+		return None
+	error = payload.get("error", payload)
+	return error.get("type") if isinstance(error, dict) else None
+
+
+def bounded_pressure_sizes(initial, step, cap):
+	current = initial
+	while current <= cap:
+		yield current
+		if current == cap:
+			return
+		current = min(cap, current + step)
 
 
 def cache_plan_preview(arm, prompt, slot):
@@ -162,6 +316,60 @@ def acquire_hard(arm, holder, prompt, slot, key):
 	return lease
 
 
+def capture_vbr_reference(arm, slot):
+	status, payload, _ = request(
+		arm.base, f"/slots/{slot}?action=capture", {})
+	if (status != 200 or not isinstance(payload, dict) or
+			payload.get("status") != "ok" or not payload.get("reference")):
+		raise RuntimeError(f"VBR fallback capture failed: {status} {payload}")
+	return payload["reference"]
+
+
+def acquire_hard_vbr(arm, holder, slot, reference, key):
+	lease = control(arm.base, "/cache/leases/acquire", {
+		"holder": holder, "class": "hard", "ttl_ms": 300000,
+		"floor": "t4", "subject": {"kind": "live_prefix", "slot_id": slot},
+		"fallback": {"kind": "vbr_reference", "reference": reference},
+		"allow_soft_fallback": False, "idempotency_key": key,
+	})
+	if (lease.get("granted_class") != "hard" or
+			(lease.get("fallback") or {}).get("state") != "resolved"):
+		raise RuntimeError(f"VBR hard lease did not bind sealed fallback: {lease}")
+	return lease
+
+
+def prime_vbr_hard(arm, args, tag, slot=0, token_count=None):
+	prompt = (make_prompt_tokens(arm.base, tag, token_count)
+		if token_count is not None else
+		f"E1 {tag} VBR hard prefix " + " ".join(
+			f"{tag}-vbr-{index}" for index in range(160)))
+	frontier, receipt = vbr_completion_frontier(
+		arm, args, prompt, slot)
+	return frontier, capture_vbr_reference(arm, slot), receipt
+
+
+def vbr_completion_frontier(arm, args, prompt, slot):
+	status, payload, _ = request(arm.base, "/completion", {
+		"prompt": prompt, "cache_prompt": True,
+		"n_predict": args.n_predict, "temperature": 0,
+		"seed": 7, "id_slot": slot, "return_tokens": True,
+	})
+	if status != 200 or not isinstance(payload, dict):
+		raise RuntimeError(f"VBR frontier completion failed: {status} {payload}")
+	tokens = payload.get("tokens")
+	receipt = payload.get("cache_receipt")
+	if (not isinstance(tokens, list) or not tokens or
+		not isinstance(receipt, dict) or
+		not isinstance(receipt.get("sequence_epoch"), int) or
+		not isinstance(receipt.get("token_count"), int)):
+		raise RuntimeError(f"VBR frontier evidence missing: {payload}")
+	# The final sampled token is returned but is not decoded into KV. Preserve
+	# the exact mixed frontier so an append cannot accidentally become a branch.
+	frontier = (list(prompt) if isinstance(prompt, list) else [prompt])
+	frontier.extend(tokens[:-1])
+	return frontier, receipt
+
+
 def control_response(base, path, body):
 	status, payload, headers = request(base, path, body)
 	if status != 200:
@@ -205,6 +413,14 @@ class Arm(ManagedServerArm):
 	def __init__(self, args, name, port, enabled, prompt_log=None):
 		base = f"http://127.0.0.1:{port}"
 		log_path = os.path.join(args.workdir, f"server-{name}.log")
+		self.trace_prefix = os.path.join(
+			args.workdir, f"server-{name}.vbrtrace")
+		for path in (self.trace_prefix, self.trace_prefix + ".base",
+				self.trace_prefix + ".swa"):
+			try:
+				os.unlink(path)
+			except FileNotFoundError:
+				pass
 		cmd = [
 			args.server_bin, "-m", args.model, "--host", "127.0.0.1",
 			"--port", str(port), "-ngl", str(args.ngl), "-c", str(args.ctx),
@@ -221,7 +437,15 @@ class Arm(ManagedServerArm):
 			cmd += ["--log-prompts-dir", prompt_log]
 		for extra in args.extra_server_arg:
 			cmd += shlex.split(extra)
-		super().__init__(name, base, log_path, cmd)
+		env = os.environ.copy()
+		if args.ctk == "vbr" or args.ctv == "vbr":
+			# Freeze the controller on the fitted F5-downward budget. The gate
+			# also passes --vbr-vram so the process command remains self-describing.
+			env["VBR_FREEZE"] = "1"
+			env["VBR_BUDGET_MIB"] = str(args.vbr_budget_mib)
+			env["VBR_TRACE"] = self.trace_prefix
+			cmd += ["--cache-receipt", "--cache-receipt-key", "e1-vbr-epoch-gate"]
+		super().__init__(name, base, log_path, cmd, env=env)
 
 	def wait(self, timeout=360):
 		self.wait_healthy(timeout)
@@ -233,9 +457,9 @@ def cell_holder_and_lease(arm, args):
 	})
 	prompt = "E1 lease subject " + " ".join(f"row-{i}" for i in range(48))
 	completion(arm.base, prompt, 0, args.n_predict)
-	# E1.1c is deliberately not in this unit. Exercise the real lease table with
-	# a soft lease; the fallback field is a hard-only proof input and the wire
-	# serializer must report its absence as JSON null here.
+	# Exercise the soft-class wire independently of the hard VBR and retained
+	# fallback cells below. The fallback field is a hard-only proof input and
+	# the wire serializer must report its absence as JSON null here.
 	lease = control(arm.base, "/cache/leases/acquire", {
 		"holder": holder["holder"], "class": "soft", "ttl_ms": 300000,
 		"subject": {"kind": "live_prefix", "slot_id": 0},
@@ -260,7 +484,95 @@ def cell_holder_and_lease(arm, args):
 
 def cell_hard_lease_pressure(arm, args):
 	if args.ctk == "vbr" or args.ctv == "vbr":
-		print("E1_CACHE_CONTROL CELL hard_lease_pressure PASS (vbr not-applicable)")
+		holder = control(arm.base, "/cache/holders/create", {
+			"ttl_ms": 300000, "idempotency_key": "vbr-hard-pressure-holder",
+		})
+		_, reference, _ = prime_vbr_hard(
+			arm, args, "hard-pressure", 0, args.vbr_prime_tokens)
+		lease = acquire_hard_vbr(
+			arm, holder["holder"], 0, reference, "vbr-hard-pressure-lease")
+		held_offset = os.path.getsize(arm.log_path)
+		held_trace = vbr_trace_snapshot(arm.trace_prefix)
+		pressure = make_prompt_tokens(
+			arm.base, "hard-pressure-load", args.vbr_pressure_total_token_cap)
+		# Unified KV is mandatory for dynamic VBR. Every layer/side unit therefore
+		# contains the leased slot's range, so the range-qualified hard seal freezes
+		# the entire below-T4 band while held; there cannot be an "unleased unit"
+		# transcode in this live shape. T8->T4 remains outside the seal, and an
+		# unmeetable all-hard wave has the separately unit-proven typed terminal.
+		# Match the fitted F5-downward shape: a 1791-token protected prefix,
+		# 767-token initial pressure, and 125 MiB. Grow the unleased slot until
+		# the first structural sealed-step row appears. The total-token cap—not a
+		# fixed request count—is the honest bound; live forcing of the all-hard
+		# terminal would require exhausting hundreds of 27B transcodes and is
+		# deliberately left to the model-free termination matrix.
+		sealed_records = []
+		pressure_tokens = args.vbr_pressure_tokens
+		for pressure_tokens in bounded_pressure_sizes(
+				args.vbr_pressure_tokens, args.vbr_pressure_step_tokens,
+				args.vbr_pressure_total_token_cap):
+			status, payload, _ = request(arm.base, "/completion", {
+				"prompt": pressure[:pressure_tokens], "cache_prompt": True,
+				"n_predict": args.n_predict, "temperature": 0,
+				"seed": 7, "id_slot": 1,
+			})
+			if (status != 200 and
+					completion_error_type(payload) != "hard_lease_blocked"):
+				raise RuntimeError(
+					f"VBR pressure returned unexpected error: {status} {payload}")
+			sealed_records = vbr_hard_seal_records_since(
+				arm.log_path, held_offset)
+			if sealed_records:
+				break
+		if not sealed_records:
+			raise RuntimeError(
+				"VBR pressure exhausted its token cap before a sealed step")
+		with open(arm.log_path, errors="replace") as handle:
+			handle.seek(held_offset)
+			held_log = handle.read()
+		vbr_hard_seal_units(sealed_records)
+		# Live "VBR degrade" lines are -v-gated (the fork CLAUDE.md fact), and
+		# CACHE_BUDGET residency is arena-level/tier-invariant. Neither is gate
+		# currency. VBR_FREEZE arms the WS-0 schedule trace used by the F5/L2
+		# gates: the held window must remain tier-frozen, then the same trace must
+		# show a cursor/digest transition immediately after explicit release.
+		trace_degrades = vbr_trace_degrades_since(
+			arm.trace_prefix, held_trace)
+		assert_vbr_unified_hold_frozen(trace_degrades)
+		if "hard lease seals the live prefix" not in held_log:
+			raise RuntimeError(
+				"VBR pressure did not prove reclaim guard and the unified-KV held freeze")
+		current = control(arm.base, "/cache/leases/inspect", {
+			"holder": holder["holder"], "lease": lease["lease"],
+		})
+		if current.get("protection_state") != "current":
+			raise RuntimeError(f"VBR pressure lost hard protection: {current}")
+		control(arm.base, "/cache/leases/release", {
+			"holder": holder["holder"], "lease": lease["lease"],
+		})
+		released_offset = os.path.getsize(arm.log_path)
+		released_trace = vbr_trace_snapshot(arm.trace_prefix)
+		# Post-release the cache can settle just under the budget ceiling
+		# (observed: ~124MiB/125M), so a single fixed round may never attempt
+		# a crossing. Grow fresh pressure progressively until the trace shows
+		# the thaw transition, mirroring the held-phase grower. Bounded so
+		# failure stays honest.
+		thawed = []
+		for round_index in range(6):
+			grow = (f"E1 vbr thaw pressure round {round_index} " +
+				" ".join(f"thaw-{round_index}-{i}" for i in range(192)))
+			completion(arm.base, grow, 1, args.n_predict)
+			thawed = vbr_trace_degrades_since(arm.trace_prefix, released_trace)
+			if thawed:
+				break
+		released_records = vbr_hard_seal_records_since(
+			arm.log_path, released_offset)
+		assert_vbr_release_thawed(thawed, released_records)
+		control(arm.base, "/cache/holders/close", {
+			"holder": holder["holder"],
+		})
+		print("E1_CACHE_CONTROL CELL hard_lease_pressure PASS (vbr enforced)")
+		print("E1_CACHE_CONTROL CELL vbr_reclaim_guard PASS")
 		return
 	holder = control(arm.base, "/cache/holders/create", {
 		"ttl_ms": 300000, "idempotency_key": "hard-pressure-holder",
@@ -305,7 +617,26 @@ def cell_hard_lease_pressure(arm, args):
 
 def cell_reattach(arm, args):
 	if args.ctk == "vbr" or args.ctv == "vbr":
-		print("E1_CACHE_CONTROL CELL reattach PASS (vbr not-applicable)")
+		_, reference, _ = prime_vbr_hard(arm, args, "reattach", 0)
+		holder = control(arm.base, "/cache/holders/create", {
+			"ttl_ms": 250, "idempotency_key": "vbr-reattach-holder",
+		})
+		lease = acquire_hard_vbr(
+			arm, holder["holder"], 0, reference, "vbr-reattach-lease")
+		time.sleep(0.35)
+		control(arm.base, "/cache/events/query", {
+			"holder": holder["holder"], "after_ordinal": 0, "limit": 8,
+		}, expected="not_found")
+		reattached = control(arm.base, "/cache/holders/reattach", {
+			"holder_recovery": holder["holder_recovery"], "ttl_ms": 300000,
+		})
+		if not any(item.get("lease") == lease["lease"]
+				for item in reattached.get("orphaned_leases") or []):
+			raise RuntimeError("VBR reattach omitted orphaned hard lease")
+		control(arm.base, "/cache/leases/release", {
+			"holder": reattached["holder"], "lease": lease["lease"],
+		})
+		print("E1_CACHE_CONTROL CELL reattach PASS (vbr hard)")
 		return
 	_, fallback_prompt = retained_pair(arm, args, "reattach", 0)
 	holder = control(arm.base, "/cache/holders/create", {
@@ -336,7 +667,75 @@ def cell_reattach(arm, args):
 
 def cell_renew_new_fallback(arm, args):
 	if args.ctk == "vbr" or args.ctv == "vbr":
-		print("E1_CACHE_CONTROL CELL renew_new_fallback PASS (vbr not-applicable)")
+		holder = control(arm.base, "/cache/holders/create", {
+			"ttl_ms": 300000, "idempotency_key": "vbr-renew-holder",
+		})
+		prompt, reference, before_receipt = prime_vbr_hard(
+			arm, args, "renew", 0)
+		lease = acquire_hard_vbr(
+			arm, holder["holder"], 0, reference, "vbr-renew-lease")
+		before = control(arm.base, "/cache/leases/inspect", {
+			"holder": holder["holder"], "lease": lease["lease"],
+		})
+		before_epoch = before_receipt["sequence_epoch"]
+		if (before.get("proven_frontier", {}).get("token_count") !=
+				before_receipt["token_count"]):
+			raise RuntimeError(
+				f"VBR lease/receipt frontier mismatch: {before} {before_receipt}")
+		growth_trace = vbr_trace_snapshot(arm.trace_prefix)
+		# Extend the exact decoded frontier. Reusing the original user prompt here
+		# omits the sampled suffix and correctly looks like an identity-changing
+		# branch—the same driver bug the f16 cell previously caught.
+		grown_prompt = list(prompt) + [prompt[-1]]
+		_, after_receipt = vbr_completion_frontier(
+			arm, args, grown_prompt, 0)
+		after_status, _ = control_response(
+			arm.base, "/cache/leases/inspect", {
+				"holder": holder["holder"], "lease": lease["lease"],
+			})
+		after_epoch = after_receipt["sequence_epoch"]
+		trace_changes = vbr_trace_state_changes_since(
+			arm.trace_prefix, growth_trace)
+		disposition = vbr_renew_disposition(
+			before_epoch, after_epoch, after_status, trace_changes)
+		print("E1_CACHE_CONTROL EPOCH renew "
+			f"before={before_epoch} after={after_epoch} "
+			f"status={after_status} trace_changes={len(trace_changes)}")
+		grown_reference = capture_vbr_reference(arm, 0)
+		if disposition == "reacquire":
+			control(arm.base, "/cache/leases/release", {
+				"holder": holder["holder"], "lease": lease["lease"],
+			})
+			reacquired = acquire_hard_vbr(
+				arm, holder["holder"], 0, grown_reference,
+				"vbr-renew-reacquire")
+			current = control(arm.base, "/cache/leases/inspect", {
+				"holder": holder["holder"], "lease": reacquired["lease"],
+			})
+			if current.get("protection_state") != "current":
+				raise RuntimeError(
+					f"VBR epoch-change reacquire was not current: {current}")
+			control(arm.base, "/cache/leases/release", {
+				"holder": holder["holder"], "lease": reacquired["lease"],
+			})
+			print("E1_CACHE_CONTROL CELL renew_new_fallback PASS "
+				"(vbr subject_lost+reacquire)")
+			return
+		renewed = control(arm.base, "/cache/leases/renew", {
+			"holder": holder["holder"], "lease": lease["lease"],
+			"ttl_ms": 300000,
+			"fallback": {
+				"kind": "vbr_reference", "reference": grown_reference,
+			},
+		})
+		if (renewed.get("proven_frontier", {}).get("token_count", 0) <=
+				before.get("proven_frontier", {}).get("token_count", 0)):
+			raise RuntimeError("VBR renew did not advance the proven frontier")
+		control(arm.base, "/cache/leases/release", {
+			"holder": holder["holder"], "lease": lease["lease"],
+		})
+		print("E1_CACHE_CONTROL CELL renew_new_fallback PASS "
+			"(vbr partially_stale+renew)")
 		return
 	holder = control(arm.base, "/cache/holders/create", {
 		"ttl_ms": 300000, "idempotency_key": "renew-holder",
@@ -596,8 +995,18 @@ def main():
 	parser.add_argument("--ctk", default="f16")
 	parser.add_argument("--ctv", default="f16")
 	parser.add_argument("--n-predict", type=int, default=8)
+	parser.add_argument("--vbr-budget-mib", type=int,
+		default=int(os.environ.get("VBR_BUDGET_MIB", "125")))
+	parser.add_argument("--vbr-prime-tokens", type=int, default=1791)
+	parser.add_argument("--vbr-pressure-tokens", type=int, default=767)
+	parser.add_argument("--vbr-pressure-step-tokens", type=int, default=256)
+	parser.add_argument("--vbr-pressure-total-token-cap", type=int, default=3584)
 	parser.add_argument("--extra-server-arg", action="append", default=[])
 	args = parser.parse_args()
+	if (args.vbr_pressure_tokens <= 0 or args.vbr_pressure_step_tokens <= 0 or
+		args.vbr_pressure_tokens > args.vbr_pressure_total_token_cap or
+		args.vbr_pressure_total_token_cap + args.n_predict >= args.ctx):
+		parser.error("VBR pressure token bounds must fit inside --ctx")
 	os.makedirs(args.workdir, exist_ok=True)
 	write_bench_stamp(
 		args.workdir, "e1-cache-control", args.model, args.server_bin)

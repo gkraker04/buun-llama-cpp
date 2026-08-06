@@ -973,11 +973,22 @@ family binding token.
 Soft leases price retention but never veto eviction. Hard leases require an
 already-durable retained-host or sealed-artifact fallback; the server never
 auto-captures one. Release is explicit, does not itself erase content, and only
-reprices later choices. The v1 hard floor is `t4`; stricter VBR enforcement is
-not exposed until its separately gated controller unit lands. On a VBR live
-prefix, hard acquire therefore returns `not_supported` in this sequencing
-window, or explicitly returns `granted_class:"soft"` when the request opted
-into `allow_soft_fallback:true`.
+reprices later choices. The v1 `t4` hard floor is enforced by the dynamic
+controller. A hard-leased live prefix may not cross
+from the restorable T8 band into T4: the cursor tries other units and an
+all-sealed pressure wave fails the in-flight completion with the typed
+`hard_lease_blocked` error rather than stalling. Releasing the lease returns
+deferred units to the normal ladder. V1 refuses every protected crossing even
+when the hard lease holds a durable fallback; proof-backed crossing with a
+transaction-held recovery pin is planned as the separately gated E1.1c-b
+follow-up. `allow_soft_fallback:true` remains an
+explicit client choice when the durable proof cannot support a hard grant.
+Because dynamic VBR uses unified, per-layer/side KV units, one live-prefix hard
+lease freezes the server-wide below-T4 band while held; unrelated slots still
+use T8→T4 but cannot drive any shared unit below T4 until release.
+With `--cache-debug`, `CACHE_VBR_HARD_SEAL` records each blocked step's order
+ordinal, layer, and K/V side without depending on verbose controller logs; it
+contains no lease, slot, artifact, prompt, or family identity.
 
 Every cache-control response carries `Cache-Control: no-store`. Route bodies
 and bearer handles bypass request-body and prompt-file logging. These routes are

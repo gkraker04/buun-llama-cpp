@@ -313,6 +313,10 @@ public:
     // controller concern; this hook cannot change controller decisions.
     bool vbr_hard_seal_classify(
         vbr_hard_seal_classification & out) const noexcept;
+    void vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) override;
+    bool vbr_hard_seal_blocked_take(bool decode_failed) override;
+    void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & out) override;
 
     bool get_has_shift() const;
 
@@ -483,7 +487,8 @@ private:
     bool vbr_policy_priced_steps(
         std::vector<ggml_type> & sim, size_t start_cursor,
         int demanded_device, uint32_t watermark, bool fixed_watermark,
-        bool fail_closed, llama_vbr_policy::child & output) const;
+        bool fail_closed, llama_vbr_policy::child & output,
+        vbr_hard_seal_consult_session * seal_session = nullptr) const;
     bool vbr_downward_bind_target_unit(
         ggml_type source_type,
         const vbr_downward_policy_projection & projection,
@@ -824,6 +829,7 @@ private:
         uint64_t start_epoch = 0;
         std::vector<ggml_type> types_before;
         std::vector<ggml_type> types_after;
+        std::vector<size_t> sealed_deferred;
     };
     struct vbr_tx_step {
         size_t child_idx = 0;
@@ -891,6 +897,7 @@ private:
     };
     bool vbr_tx_settle_tree();
     bool vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const;
+    bool vbr_tx_hard_seal_allowed(vbr_shed_tx & tx);
     bool vbr_tx_preflight(vbr_shed_tx & tx);
     bool vbr_tx_map_endpoints(vbr_shed_tx & tx);
     bool vbr_tx_prepare_commit(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
@@ -907,6 +914,15 @@ private:
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    vbr_hard_seal_guard vbr_hard_seal_guard_;
+    bool vbr_hard_seal_blocked_ = false;
+    std::vector<vbr_hard_seal_subject> vbr_hard_seal_evidence_;
+    std::vector<size_t> vbr_hard_seal_deferred_;
+    std::vector<uint8_t> vbr_hard_seal_attempted_;
+    bool vbr_hard_seal_step_blocked(
+            size_t order_ordinal,
+            vbr_hard_seal_consult_session & session) const;
+    void vbr_hard_seal_evidence_record(size_t order_ordinal);
     // A recoverable ordinary boundary reserve failed during this boundary/tick. prepare() fails the
     // batch instead of executing over budget; idle breathe() retains the exact cursor and retries
     // on a later tick after physical capacity changes. Transaction retry suppression is separate.
@@ -1242,7 +1258,7 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    enum class vbr_degrade_result { applied, exhausted, reserve_failed };
+    enum class vbr_degrade_result { applied, exhausted, reserve_failed, hard_lease_blocked };
     vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)

@@ -228,6 +228,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-foundations.cmake)
+    add_test(
+        NAME test-e1-vbr-enforcement-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-vbr-enforcement.cmake)
 
     llama_build_and_test(
         test-cache-control.cpp

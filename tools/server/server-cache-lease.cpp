@@ -985,6 +985,35 @@ server_cache_lease_evaluation server_cache_lease_table::inspect_range(
     return result;
 }
 
+bool server_cache_lease_table::has_hard_lease() const noexcept {
+    if (!available) {
+        return false;
+    }
+    const uint64_t now = clock->now_ns();
+    return std::any_of(leases.begin(), leases.end(), [&](const entry & lease) {
+        return lease.cls == server_cache_lease_class::hard &&
+            !lease.subject_lost &&
+            (lease.explicit_hard || lease.expires_at_ns > now);
+    });
+}
+
+bool server_cache_hard_lease_blocks_range(
+        const server_cache_lease_table * leases,
+        llama_cache_acct_artifact_id artifact,
+        const server_cache_lease_identity & identity,
+        uint64_t sequence_epoch,
+        uint64_t first_token,
+        uint64_t token_count) noexcept {
+    return leases != nullptr && server_cache_lease_is_hard(
+        leases->inspect_range(
+            artifact, identity, sequence_epoch, first_token, token_count));
+}
+
+bool server_cache_has_hard_lease(
+        const server_cache_lease_table * leases) noexcept {
+    return leases != nullptr && leases->has_hard_lease();
+}
+
 bool server_cache_lease_table::admit_checkpoint_ring(
         const server_cache_destruction_target & target,
         bool & saw_soft,

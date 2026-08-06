@@ -48,6 +48,128 @@ bool llama_kv_cache::vbr_hard_seal_classify(
         vbr_degrade_order_, VBR_TIER_T4, out);
 }
 
+void llama_kv_cache::vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) {
+    vbr_hard_seal_guard_ = std::move(guard);
+    vbr_hard_seal_blocked_ = false;
+    vbr_hard_seal_evidence_.clear();
+    if (vbr_hard_seal_guard_) {
+        vbr_hard_seal_deferred_.reserve(vbr_degrade_order_.size());
+        vbr_hard_seal_attempted_.assign(vbr_degrade_order_.size(), 0);
+    } else {
+        vbr_hard_seal_deferred_.clear();
+        vbr_hard_seal_attempted_.clear();
+    }
+}
+
+bool llama_kv_cache::vbr_hard_seal_blocked_take(bool decode_failed) {
+    return vbr_hard_seal_take_decode_terminal(
+        decode_failed, vbr_hard_seal_blocked_);
+}
+
+void llama_kv_cache::vbr_hard_seal_evidence_take(
+        std::vector<vbr_hard_seal_subject> & out) {
+    out.insert(out.end(), vbr_hard_seal_evidence_.begin(),
+            vbr_hard_seal_evidence_.end());
+    vbr_hard_seal_evidence_.clear();
+}
+
+void llama_kv_cache::vbr_hard_seal_evidence_record(size_t order_ordinal) {
+    if (order_ordinal >= vbr_degrade_order_.size()) {
+        return;
+    }
+    const auto & step = vbr_degrade_order_[order_ordinal];
+    const vbr_hard_seal_subject evidence {
+        step.il, step.is_v != 0, order_ordinal,
+    };
+    if (std::find(vbr_hard_seal_evidence_.begin(),
+            vbr_hard_seal_evidence_.end(), evidence) ==
+            vbr_hard_seal_evidence_.end()) {
+        vbr_hard_seal_evidence_.push_back(evidence);
+    }
+}
+
+bool llama_kv_cache::vbr_hard_seal_step_blocked(
+        size_t order_ordinal,
+        vbr_hard_seal_consult_session & session) const {
+    if (!vbr_hard_seal_guard_) {
+        return false;
+    }
+
+    // The common lifecycle-on/no-hard-lease case stops before classifying the
+    // ladder, walking cells, or hashing live identities.
+    if (!session.any_hard_sampled) {
+        session.any_hard_sampled = true;
+        session.any_hard = vbr_hard_seal_guard_.any_hard_lease();
+    }
+    if (!session.any_hard) {
+        return false;
+    }
+    if (!session.classified) {
+        session.classified = true;
+        if (!vbr_hard_seal_classify(session.classification)) {
+            session.classification_failed = true;
+            session.verdict_sampled = true;
+            session.verdict = vbr_hard_seal_guard_result::hard_lease_blocked;
+            return true;
+        }
+    }
+    if (session.classification_failed) {
+        return true;
+    }
+    const auto * protected_step = vbr_hard_seal_subject_for_step(
+        session.classification, order_ordinal);
+    if (protected_step == nullptr) {
+        return false;
+    }
+
+    if (!session.ranges_built) {
+        session.ranges_built = true;
+        std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> occupied;
+        for (const auto & cells : v_cells) {
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+                const llama_pos pos = cells.pos_get(cell);
+                cells.seq_for_each(cell, [&](llama_seq_id sequence) {
+                    auto [it, inserted] = occupied.emplace(
+                        sequence, std::make_pair(pos, pos));
+                    if (!inserted) {
+                        it->second.first = std::min(it->second.first, pos);
+                        it->second.second = std::max(it->second.second, pos);
+                    }
+                });
+            }
+        }
+        session.ranges.reserve(occupied.size());
+        for (const auto & [sequence, extent] : occupied) {
+            if (extent.first < 0 || extent.second < extent.first ||
+                static_cast<uint64_t>(extent.second - extent.first) >= UINT32_MAX) {
+                // Fail closed if live geometry cannot be represented by the
+                // range-qualified lease door.
+                session.verdict_sampled = true;
+                session.verdict =
+                    vbr_hard_seal_guard_result::hard_lease_blocked;
+                return true;
+            }
+            session.ranges.push_back({ sequence, static_cast<uint32_t>(extent.first),
+                static_cast<uint32_t>(extent.second - extent.first + 1) });
+        }
+    }
+    const auto verdict = vbr_hard_seal_guard_.inspect(
+        *protected_step, session.ranges);
+    // The installed guard evaluates occupied lease ranges, not layer/side.
+    // Subject-uniformity is the contract that makes policy filtering and the
+    // transaction-boundary recheck consistent across custom ladder orders.
+    if (session.verdict_sampled) {
+        GGML_ASSERT(session.verdict == verdict);
+    } else {
+        session.verdict_sampled = true;
+        session.verdict = verdict;
+    }
+    return verdict == vbr_hard_seal_guard_result::hard_lease_blocked;
+}
+
 // a type the degrade ladder can move: the five turbo tiers plus F16, which is the dynamic
 // entry tier (full-quality until budget pressure; the measured orders' first band is
 // fp16->t8). Anything else living in a VMM pool — an explicitly non-vbr side of a mixed
@@ -2591,6 +2713,16 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     auto sinfos = plan_slots(ubatches);
     if (sinfos.empty()) {
+        // plan_slots() can refuse before prepare_with_slots() reaches its
+        // boundary reset. Do not let a prior donor-side seal refusal retype a
+        // later unrelated cell-exhaustion terminal.
+        llama_kv_cache * root = vbr_tree_root();
+        root->vbr_hard_seal_blocked_ = false;
+        root->vbr_hard_seal_evidence_.clear();
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            root->vbr_ledger_sibling_->vbr_hard_seal_blocked_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_evidence_.clear();
+        }
         return {};
     }
 
@@ -2616,8 +2748,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // retried after another process releases capacity.
         llama_kv_cache * root = vbr_tree_root();
         root->vbr_reserve_failed_ = false;
+        root->vbr_hard_seal_blocked_ = false;
+        root->vbr_hard_seal_evidence_.clear();
         if (root->vbr_ledger_sibling_ != nullptr) {
             root->vbr_ledger_sibling_->vbr_reserve_failed_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_blocked_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_evidence_.clear();
         }
         // S5: release the tail pages queued by the PREVIOUS wave first — their transcodes are long
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
@@ -2734,6 +2870,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                                 "failing this batch recoverably\n", __func__);
                         // Earlier successful steps in this boundary remain committed. Fence their
                         // side-stream waves before returning without a graph to carry the normal wait.
+                        vbr_tree_force();
+                        vbr_arm_wave_fences();
+                        return {};
+                    }
+                    if (degrade == vbr_degrade_result::hard_lease_blocked) {
+                        LLAMA_LOG_WARN("%s: VBR pressure reached the hard-lease seal; "
+                                "failing this batch recoverably\n", __func__);
                         vbr_tree_force();
                         vbr_arm_wave_fences();
                         return {};
@@ -4520,7 +4663,8 @@ static uint64_t vbr_policy_endpoint_bytes(
 bool llama_kv_cache::vbr_policy_priced_steps(
         std::vector<ggml_type> & sim, size_t start_cursor,
         int demanded_device, uint32_t watermark, bool fixed_watermark,
-        bool fail_closed, llama_vbr_policy::child & out) const {
+        bool fail_closed, llama_vbr_policy::child & out,
+        vbr_hard_seal_consult_session * seal_session) const {
     int64_t terminal = out.initial_progress;
     for (size_t i = start_cursor; i < vbr_demand_limit(); ++i) {
         size_t slot = 0;
@@ -4566,6 +4710,11 @@ bool llama_kv_cache::vbr_policy_priced_steps(
                 return false;
             }
             GGML_ABORT("VBR policy progress overflow or invalid geometry");
+        }
+        if (seal_session != nullptr &&
+            vbr_hard_seal_step_blocked(i, *seal_session)) {
+            out.blocked_order_indices.push_back(i);
+            continue;
         }
         out.steps.push_back({
             i, slot, int32_t(sim[slot]), int32_t(type_b), gain,
@@ -4613,9 +4762,11 @@ llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
         }
     }
 
+    vbr_hard_seal_consult_session seal_session;
     GGML_ASSERT(vbr_policy_priced_steps(
         sim, vbr_degrade_cursor_, demanded_device, wm_next,
-        false, false, out));
+        false, false, out,
+        vbr_hard_seal_guard_ ? &seal_session : nullptr));
     return out;
 }
 
@@ -6851,6 +7002,7 @@ void llama_kv_cache::vbr_full_reset() {
         mapped += pool.be->vmm_pool_mapped(pool.vmm);
     }
     vbr_degrade_cursor_    = 0;
+    vbr_hard_seal_deferred_.clear();
     vbr_budget_warned_     = false;
     vbr_stash_dirty_       = false;
     vbr_quiet_boundaries_  = 0;
@@ -7105,11 +7257,38 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         return vbr_degrade_result::exhausted;
     }
     const size_t cursor_entry = vbr_degrade_cursor_;
-    while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
-        const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
+    bool saw_hard_lease_block = false;
+    vbr_hard_seal_consult_session seal_session;
+    GGML_ASSERT(!vbr_hard_seal_guard_ ||
+        vbr_hard_seal_attempted_.size() == vbr_degrade_order_.size());
+    bool attempted_ready = !vbr_hard_seal_deferred_.empty();
+    if (attempted_ready) {
+        std::fill(vbr_hard_seal_attempted_.begin(),
+                  vbr_hard_seal_attempted_.end(), 0);
+    }
+    while (true) {
+        size_t order_ordinal = 0;
+        bool from_deferred = false;
+        if (!vbr_hard_seal_next_order_step(
+                vbr_degrade_cursor_,
+                std::min(vbr_degrade_order_.size(), vbr_degrade_limit_),
+                vbr_hard_seal_deferred_, vbr_hard_seal_attempted_,
+                order_ordinal, from_deferred)) {
+            break;
+        }
+        const auto & st = vbr_degrade_order_[order_ordinal];
+
+        const auto retire_deferred = [&]() {
+            if (!from_deferred) {
+                return;
+            }
+            vbr_hard_seal_retire_step(
+                vbr_hard_seal_deferred_, order_ordinal);
+        };
 
         const auto it = map_layer_ids.find(st.il);
         if (it == map_layer_ids.end()) {
+            retire_deferred();
             continue;
         }
         const int32_t ikv = it->second;
@@ -7118,9 +7297,11 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         // shard) under -sm tensor. The tier flip is a property of the UNIT — all pools move together.
         const auto & units = vbr_units_of(ikv, st.is_v != 0);
         if (t == nullptr || units.empty()) {
+            retire_deferred();
             continue;
         }
         if (!vbr_unit_movable(t->type, st.is_v != 0)) {
+            retire_deferred();
             continue; // PINNED unit (explicit non-vbr side): the ladder never touches it
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -7130,8 +7311,34 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
             const size_t rA = ggml_row_size(t->type, t->ne[0]);
             const size_t rB = ggml_row_size(type_B,  t->ne[0]);
             if (t->type == type_B || rB >= rA) {
+                retire_deferred();
                 continue; // not a real degrade from the current tier (e.g. F16 band on a t8 static start)
             }
+        }
+
+        if (vbr_hard_seal_guard_) {
+            if (vbr_hard_seal_step_blocked(order_ordinal, seal_session)) {
+                saw_hard_lease_block = true;
+                vbr_hard_seal_evidence_record(order_ordinal);
+                if (!from_deferred) {
+                    if (!attempted_ready) {
+                        std::fill(vbr_hard_seal_attempted_.begin(),
+                                  vbr_hard_seal_attempted_.end(), 0);
+                        attempted_ready = true;
+                    }
+                    vbr_hard_seal_defer_step(
+                        vbr_hard_seal_deferred_, order_ordinal,
+                        &vbr_hard_seal_attempted_);
+                }
+                LLAMA_LOG_INFO("%s: hard lease sealed VBR order step %zu (L%d %c); trying the next unit\n",
+                        __func__, order_ordinal, (int) st.il, st.is_v ? 'V' : 'K');
+                continue;
+            }
+        }
+
+        if (from_deferred) {
+            LLAMA_LOG_INFO("%s: hard-lease release reopened VBR order step %zu (L%d %c)\n",
+                    __func__, order_ordinal, (int) st.il, st.is_v ? 'V' : 'K');
         }
 
         // Determine and land every stash page this unit can touch before starting any side stream,
@@ -7290,7 +7497,12 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     vbr_mutation_registrant::degrade_next,
                     vbr_cited_op()));
         }
+        retire_deferred();
         return vbr_degrade_result::applied;
+    }
+    if (saw_hard_lease_block) {
+        vbr_hard_seal_blocked_ = true;
+        return vbr_degrade_result::hard_lease_blocked;
     }
     return vbr_degrade_result::exhausted;
 }
@@ -8774,6 +8986,23 @@ bool llama_kv_cache::vbr_tx_preflight(vbr_shed_tx & tx) {
     return true;
 }
 
+bool llama_kv_cache::vbr_tx_hard_seal_allowed(vbr_shed_tx & tx) {
+    std::map<size_t, vbr_hard_seal_consult_session> sessions;
+    for (const auto & step : tx.steps) {
+        llama_kv_cache * child = tx.children[step.child_idx].cache;
+        if (!child->vbr_hard_seal_guard_) {
+            continue;
+        }
+        if (child->vbr_hard_seal_step_blocked(
+                step.order_idx, sessions[step.child_idx])) {
+            child->vbr_hard_seal_blocked_ = true;
+            child->vbr_hard_seal_evidence_record(step.order_idx);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::vbr_tx_prepare_commit(
         vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
     tx.gross_by_pool.clear();
@@ -9101,6 +9330,10 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_i
 
     for (auto & state : tx.children) {
         llama_kv_cache * child = state.cache;
+        vbr_hard_seal_defer_jumped_steps(
+            child->vbr_hard_seal_deferred_,
+            state.sealed_deferred,
+            state.final_cursor);
         child->vbr_degrade_cursor_ = state.final_cursor;
         for (auto & p : child->vbr_pools_) {
             if (p.vmm != nullptr) {
@@ -9180,9 +9413,11 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
 
     std::vector<llama_vbr_policy::child> policy_children;
     policy_children.reserve(tx.children.size());
-    for (const auto & state : tx.children) {
-        policy_children.push_back(state.cache->vbr_policy_child_stream(
-                tx.demanded_device, state.incoming_wm));
+    for (size_t i = 0; i < tx.children.size(); ++i) {
+        auto policy = tx.children[i].cache->vbr_policy_child_stream(
+            tx.demanded_device, tx.children[i].incoming_wm);
+        tx.children[i].sealed_deferred = policy.blocked_order_indices;
+        policy_children.push_back(std::move(policy));
     }
 
     if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
@@ -9212,6 +9447,10 @@ llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
     }
     GGML_ASSERT(planned);
 
+    if (!root->vbr_tx_hard_seal_allowed(tx)) {
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
     if (!root->vbr_tx_preflight(tx) ||
         !root->vbr_tx_reprice(tx, /* actual = */ true) ||
         !llama_vbr_transaction::prefix_feasible(
