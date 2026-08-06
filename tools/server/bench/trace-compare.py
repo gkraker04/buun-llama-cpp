@@ -73,6 +73,10 @@ def main():
 			"arm": arm.get("prefix_reuse_ratio"),
 		},
 		"output_identity": None,
+		"context_overflow": {
+			"baseline_truncated": base.get("truncated_requests"),
+			"arm_truncated": arm.get("truncated_requests"),
+		},
 		"decode_comparability": {
 			"baseline_generated_tokens": base.get("generated_tokens_total"),
 			"arm_generated_tokens": arm.get("generated_tokens_total"),
@@ -166,6 +170,14 @@ def main():
 	print(f"  harness+tool gaps {(base_line.get('harness_gap_ms_slept') or 0):>12.0f} ms"
 		f"  (tool share of gaps: {base_line.get('tool_gap_share')};"
 		f" server = {base_line.get('server_time_fraction')} of project)")
+	overflow = headline["context_overflow"]
+	if (overflow.get("baseline_truncated") or overflow.get("arm_truncated")):
+		print(f"context truncation  {overflow['baseline_truncated']:>12} -> "
+			f"{overflow['arm_truncated']:>12} requests")
+		if overflow["baseline_truncated"] != overflow["arm_truncated"]:
+			print("  NOTE: arms truncated different numbers of prompts — this is a "
+				"capability difference, not just a speed one. Report it beside "
+				"the timing table.")
 	identity = headline["output_identity"]
 	if identity and identity["compared"]:
 		print(f"output identity     {identity['identical']:>12}"

@@ -402,6 +402,7 @@ def fire(row, args, results, lock):
 		"prompt_tokens": prompt_tokens_total(metrics),
 		"generated_tokens": generated_tokens(metrics),
 		"generated_recorded": recorded_generation(row),
+		"truncated": bool(metrics.get("truncated")),
 		"output_sha": hashlib.sha256(
 			response_content(text, streaming).encode("utf-8", "replace")
 		).hexdigest()[:16],
@@ -439,6 +440,7 @@ def summarize(results, args, wall_ms, timeline):
 				if row.get("fresh_prefill_tokens") is not None),
 		}
 
+	truncated_rows = [row for row in ok if row.get("truncated")]
 	generated_known = [row for row in ok if row.get("generated_tokens") is not None]
 	generated_total = sum(row["generated_tokens"] for row in generated_known)
 	pin_matched = sum(
@@ -490,6 +492,7 @@ def summarize(results, args, wall_ms, timeline):
 		"ttft_weighted_p50_ms": percentile(weighted_ttft, 0.50),
 		"ttft_weighted_p95_ms": percentile(weighted_ttft, 0.95),
 		"latency_ms_total": round(sum(row["total_ms"] for row in ok), 3),
+		"truncated_requests": len(truncated_rows),
 		"generated_tokens_total": generated_total,
 		"generated_reported_for": len(generated_known),
 		"generated_matched_capture": pin_matched,
