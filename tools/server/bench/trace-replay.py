@@ -165,6 +165,13 @@ def overlap_groups(records):
 	return groups
 
 
+# Thinking models stream reasoning before (or instead of) content. Those tokens reach
+# the user, so they are the real time-to-first-token and are real generated output --
+# counting only "content" leaves TTFT null and hashes the empty string on any
+# reasoning-only turn (11/25 rows on the first real trace).
+OUTPUT_FIELDS = ("content", "reasoning_content")
+
+
 def sse_first_content_offset(text):
 	for line in text.splitlines():
 		line = line.strip()
@@ -177,7 +184,7 @@ def sse_first_content_offset(text):
 			payload = json.loads(data)
 		except ValueError:
 			continue
-		if payload.get("content"):
+		if any(payload.get(f) for f in OUTPUT_FIELDS):
 			return True
 		choices = payload.get("choices")
 		if isinstance(choices, list):
@@ -185,7 +192,8 @@ def sse_first_content_offset(text):
 				if not isinstance(choice, dict):
 					continue
 				delta = choice.get("delta")
-				if isinstance(delta, dict) and delta.get("content"):
+				if isinstance(delta, dict) and any(
+						delta.get(f) for f in OUTPUT_FIELDS):
 					return True
 				if choice.get("text"):
 					return True
@@ -212,17 +220,21 @@ def response_content(text, streaming):
 			continue
 		if not isinstance(payload, dict):
 			continue
-		if isinstance(payload.get("content"), str):
-			pieces.append(payload["content"])
+		def take(obj):
+			for field in OUTPUT_FIELDS:
+				value = obj.get(field)
+				if isinstance(value, str):
+					pieces.append(value)
+		take(payload)
 		for choice in payload.get("choices") or []:
 			if not isinstance(choice, dict):
 				continue
 			delta = choice.get("delta")
-			if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-				pieces.append(delta["content"])
+			if isinstance(delta, dict):
+				take(delta)
 			message = choice.get("message")
-			if isinstance(message, dict) and isinstance(message.get("content"), str):
-				pieces.append(message["content"])
+			if isinstance(message, dict):
+				take(message)
 			if isinstance(choice.get("text"), str):
 				pieces.append(choice["text"])
 	return "".join(pieces)
