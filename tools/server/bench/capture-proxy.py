@@ -156,11 +156,16 @@ class TraceWriter:
 		self.write_header(tag)
 
 	def write_header(self, tag):
+		# argv makes a trace self-documenting: months later the runbook needs the
+		# exact listen/upstream/bind the capture ran with, and reconstructing it
+		# from memory is guesswork. Costs one line, removes a whole class of it.
 		header = {
 			"record": "capture_header",
 			"schema": "capture_trace/v1",
 			"tag": tag,
 			"started_unix": time.time(),
+			"argv": sys.argv,
+			"cwd": os.getcwd(),
 		}
 		with self.lock:
 			self.handle.write(json.dumps(header) + "\n")
