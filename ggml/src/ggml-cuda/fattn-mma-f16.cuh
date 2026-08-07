@@ -586,7 +586,13 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
                 cn_h[c] = __float2half(d_turbo_centroids_4bit_fattn[c] * norm);
             }
 
+// RDNA4's full unroll of this 64-iteration loader exhausts VGPRs and spills heavily.
+// Sixteen is the measured runtime optimum; it reduces or removes spills depending on shape.
+#if defined(RDNA4)
+#pragma unroll 16
+#else
 #pragma unroll
+#endif
             for (int b = 0; b < 64; ++b) {
                 const uint8_t byte = blk->qs[b];
                 tile_KV[row * stride_tile + blk_idx * 64 + b] = __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
