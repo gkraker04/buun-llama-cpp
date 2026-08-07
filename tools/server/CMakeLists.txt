@@ -25,6 +25,8 @@ add_library(${TARGET} STATIC
     server-cache-lease.h
     server-cache-retention-proof.cpp
     server-cache-retention-proof.h
+    server-cache-retention-policy.cpp
+    server-cache-retention-policy.h
     server-cache-vbr-proof.cpp
     server-cache-vbr-proof.h
     server-cache-yield.cpp
@@ -110,4 +112,25 @@ if (LLAMA_BUILD_TESTS)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
         LABELS main
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
+
+    add_executable(test-server-retention-policy
+        ${CMAKE_SOURCE_DIR}/tests/test-server-retention-policy.cpp)
+    target_link_libraries(test-server-retention-policy PRIVATE server-context)
+    target_include_directories(test-server-retention-policy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(test-server-retention-policy PRIVATE cxx_std_17)
+    add_test(NAME test-server-retention-policy COMMAND test-server-retention-policy)
+    set_property(TEST test-server-retention-policy PROPERTY LABELS main)
+
+    add_executable(zc1-retention-grid bench/zc1-retention-grid.cpp)
+    target_link_libraries(zc1-retention-grid PRIVATE server-context)
+    target_include_directories(zc1-retention-grid PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(zc1-retention-grid PRIVATE cxx_std_17)
+    find_program(ZC1_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
+    add_test(NAME test-zc1-retention-tools
+        COMMAND ${ZC1_PYTHON_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/test-zc1-retention-tools.py
+            --grid $<TARGET_FILE:zc1-retention-grid>)
+    set_property(TEST test-zc1-retention-tools PROPERTY LABELS main)
 endif()

@@ -48,7 +48,7 @@ require_token("${context}" "case SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE:" "schedul
 require_token("${control}" "cache control authority must run on scheduler thread" "scheduler assertion")
 require_token("${context}" "cache_control_authority.reset();" "shutdown proof drain")
 require_token("${context}" "server_cache_control_task_precheck(" "lifecycle task gate")
-require_token("${context}" "params_base.cache_lifecycle," "lifecycle task gate input")
+require_token("${context}" "params_base.cache_optimizer.cache_lifecycle," "lifecycle task gate input")
 require_token("${control}" "if (!lifecycle_available || !substrate_available)" "debug-only refusal")
 foreach(task_name
         CACHE_HOLDER_CREATE CACHE_HOLDER_CLOSE CACHE_HOLDER_REATTACH

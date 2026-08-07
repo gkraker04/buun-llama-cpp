@@ -60,8 +60,8 @@ endif()
 # D-A0b wiring: policy objects and lease inspection are live under debug OR
 # lifecycle, while the cache-plan serialization observer remains debug-only.
 function(da0b_lifecycle_wiring_valid source output)
-    string(FIND "${source}" "if (params_base.cache_debug) {\n            cache_plan_obs =" debug_emit_gate)
-    string(FIND "${source}" "if (params_base.cache_debug || params_base.cache_lifecycle) {" lifecycle_gate)
+    string(FIND "${source}" "if (params_base.cache_optimizer.cache_debug) {\n            cache_plan_obs =" debug_emit_gate)
+    string(FIND "${source}" "if (params_base.cache_optimizer.cache_debug ||\n            params_base.cache_optimizer.cache_lifecycle) {" lifecycle_gate)
     string(FIND "${source}" "cache_authority->destruction.lease_evaluator =" lease_wiring)
     if (debug_emit_gate EQUAL -1 OR lifecycle_gate EQUAL -1 OR
         lease_wiring LESS_EQUAL lifecycle_gate)
@@ -107,8 +107,8 @@ if (idle_reason EQUAL -1 OR tagged_idle EQUAL -1 OR
     message(FATAL_ERROR "D-A0b destruction-reason attribution drifted")
 endif()
 string(REPLACE
-    "if (params_base.cache_debug || params_base.cache_lifecycle) {"
-    "if (params_base.cache_debug) {"
+    "if (params_base.cache_optimizer.cache_debug ||\n            params_base.cache_optimizer.cache_lifecycle) {"
+    "if (params_base.cache_optimizer.cache_debug) {"
     lifecycle_negative "${server_context}")
 da0b_lifecycle_wiring_valid("${lifecycle_negative}" lifecycle_negative_valid)
 if (lifecycle_negative_valid)
@@ -515,7 +515,7 @@ endif()
 # CACHE_HOST_LIFECYCLE is debug evidence, not an Observed-template signal:
 # B authority also supplies a record when --cache-debug is absent.
 string(FIND "${server_context}"
-    "prompt_cache->debug_observability = params_base.cache_debug;"
+    "prompt_cache->debug_observability = params_base.cache_optimizer.cache_debug;"
     da1_debug_wiring)
 contract_extract_region(
     "${server_task}"

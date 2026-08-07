@@ -376,7 +376,7 @@ struct server_shadow_global_state {
 
 // B0 shadow cache-plan observer state [P2 §7.7]. Debug-only record/serialization layer over the
 // authority substrate: records are allocated, populated, and serialized only under
-// params_base.cache_debug. Observer faults are caught outside the shipped decision path and become
+// params_base.cache_optimizer.cache_debug. Observer faults are caught outside the shipped decision path and become
 // shadow_unavailable — never a changed live choice. Both counters are surfaced on every record.
 struct server_cache_plan_observer {
     uint64_t records_finalized  = 0;
@@ -2297,7 +2297,7 @@ private:
     // forcing any sibling feature object to exist.
     std::string cache_plan_calibration_profile;
 
-    // B0 shadow cache-plan observer [P2]. Constructed ONLY under params_base.cache_debug (B-a
+    // B0 shadow cache-plan observer [P2]. Constructed ONLY under the effective cache-debug input (B-a
     // literal: no observer object, no record init, no hook work of any kind on the disabled path
     // — absence IS the disabled state). References cache_authority for the substrate it records.
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
@@ -3027,7 +3027,7 @@ private:
             if (!server_cache_destruction_has_effect(
                     rec, legacy_candidate,
                     server_cache_plan_nonconsuming_host_effects(
-                        params_base.cache_lifecycle))) {
+                        params_base.cache_optimizer.cache_lifecycle))) {
                 return;
             }
 
@@ -3119,7 +3119,7 @@ private:
             // inside the normative 2 ms launch-path bound.
             const auto * calib = common_cache_plan_calib_find(
                 rec.calibration_profile);
-            if (params_base.cache_lifecycle && calib) {
+            if (params_base.cache_optimizer.cache_lifecycle && calib) {
                 std::unordered_map<int32_t, llama_cache_acct_value>
                     victim_state_sizes;
                 for (const auto & quote : rec.destruction_quotes) {
@@ -3212,7 +3212,7 @@ private:
             server_slot & legacy_target,
             common_cache_plan_record & rec) noexcept {
         live_displacement_certification out;
-        if (!params_base.cache_lifecycle || !cache_authority ||
+        if (!params_base.cache_optimizer.cache_lifecycle || !cache_authority ||
             !prompt_cache || !server_cache_plan_shadow_choice_valid(rec) ||
             rec.destruction_legacy_plan_candidate < 0 ||
             !cache_plan_authority ||
@@ -5539,24 +5539,27 @@ private:
         // (cache_debug || cache_lifecycle). Neither flag remains the strictly-zero-work legacy
         // path; debug alone observes the shared substrate, while lifecycle enables publication
         // admission without allocating or emitting a cache-plan observer.
-        if (params_base.cache_debug) {
+        if (params_base.cache_optimizer.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
         }
-        if (params_base.cache_debug || params_base.cache_lifecycle) {
+        if (params_base.cache_optimizer.cache_debug ||
+            params_base.cache_optimizer.cache_lifecycle) {
             cache_authority = std::make_unique<server_cache_authority>();
         }
 
-        // B0 shadow observer [P2]: constructed only under params_base.cache_debug — the observer
+        // B0 shadow observer [P2]: constructed only under the effective debug input — the observer
         // object and both surfaces exist iff the flag is set. Off = strictly zero observer work
         // (B-a). It records the shared authority substrate above (owned by server_context).
-        const auto plan_authority_level = params_base.cache_plan_authority;
-        if (params_base.cache_debug ||
+        const auto plan_authority_level =
+            params_base.cache_optimizer.landed_authority_level;
+        if (params_base.cache_optimizer.cache_debug ||
             plan_authority_level != common_cache_plan_authority_level::off) {
             cache_plan_authority =
                 std::make_unique<server_cache_plan_authority>(plan_authority_level);
         }
 
-        if (params_base.cache_debug || params_base.cache_lifecycle) {
+        if (params_base.cache_optimizer.cache_debug ||
+            params_base.cache_optimizer.cache_lifecycle) {
             // Policy substrate is live under either gate. CACHE_PLAN JSON/log
             // emission remains below behind cache_plan_obs/cache_debug, but
             // lifecycle-only operation must still inspect WS-D leases before
@@ -5569,10 +5572,10 @@ private:
                 slot.retention_obs = &cache_authority->retention;
                 slot.lease_obs = &cache_authority->leases;
                 slot.lease_execution_identity = &frontier_execution_identity;
-                slot.lifecycle_authority = params_base.cache_lifecycle
+                slot.lifecycle_authority = params_base.cache_optimizer.cache_lifecycle
                     ? cache_authority.get()
                     : nullptr;
-                slot.cache_debug_observability = params_base.cache_debug;
+                slot.cache_debug_observability = params_base.cache_optimizer.cache_debug;
                 slot.retention_pool =
                     (llama_model_is_recurrent(model_tgt) ||
                      llama_model_is_hybrid(model_tgt))
@@ -5580,14 +5583,14 @@ private:
                         : common_retention_pool::attention;
             }
             if (prompt_cache) {
-                prompt_cache->debug_observability = params_base.cache_debug;
+                prompt_cache->debug_observability = params_base.cache_optimizer.cache_debug;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
                 prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
             }
-            if (params_base.cache_lifecycle) {
+            if (params_base.cache_optimizer.cache_lifecycle) {
                 llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
                     vbr_hard_seal_guard {
                         [this]() {
@@ -5626,7 +5629,7 @@ private:
         uint32_t capture_attention_children = 0;
         bool capture_manifest_enabled = false;
         const bool capture_requested =
-            params_base.cache_lifecycle &&
+            params_base.cache_optimizer.cache_lifecycle &&
             server_vbr_dynamic_active(params_base);
         int ngl_eff = 0;
         if (cache_authority) {
@@ -6031,7 +6034,7 @@ private:
 
             if (prompt_cache) {
                 prompt_cache->acct = &cache_authority->ledger;
-                if (params_base.cache_lifecycle) {
+                if (params_base.cache_optimizer.cache_lifecycle) {
                     prompt_cache->publish_authority =
                         cache_authority.get();
                 }
@@ -6039,7 +6042,7 @@ private:
         }
 
         if (cache_plan_obs || cache_plan_authority || cache_authority ||
-            params_base.cache_plan_preflight) {
+            params_base.cache_optimizer.cache_plan_preflight) {
             // B-2: compose the stable calibration-profile id ONCE. The model class comes
             // from loaded-model CONTENT (llama_model_desc: arch + params + quant class),
             // never a filesystem label — renaming a different file to the same basename
@@ -7219,7 +7222,7 @@ private:
                 ? &cache_authority->destruction_quote_sequence
                 : nullptr;
         const bool preview_lifecycle_available =
-            params_base.cache_lifecycle;
+            params_base.cache_optimizer.cache_lifecycle;
         const bool quote_lifecycle_available = mode.preflight
             ? preview_lifecycle_available
             : true;
@@ -7231,7 +7234,7 @@ private:
                 semantics.recovery_citation,
                 0,
                 server_cache_plan_nonconsuming_host_effects(
-                    params_base.cache_lifecycle),
+                    params_base.cache_optimizer.cache_lifecycle),
                 mode.preflight,
             };
             cache_plan_quote_destruction(
@@ -7265,7 +7268,7 @@ private:
                 rec, *destruction_counters, legacy_candidate,
                 preview_lifecycle_available,
                 server_cache_plan_nonconsuming_host_effects(
-                    params_base.cache_lifecycle));
+                    params_base.cache_optimizer.cache_lifecycle));
         }
     }
 
@@ -7350,7 +7353,7 @@ private:
                         host_lookup_enabled,
                         planned_adapter_matches,
                         server_cache_plan_nonconsuming_host_effects(
-                            params_base.cache_lifecycle) |
+                            params_base.cache_optimizer.cache_lifecycle) |
                         (displacement.ready ? displacement.effects : 0));
                     if (execution.authoritative() &&
                         server_cache_plan_retarget_currency_required(
@@ -8639,7 +8642,8 @@ private:
             // because a preflight exists. Reuse an already-composed lifecycle
             // profile when present; otherwise the local planner reports the
             // typed no_profile refusal.
-            local_authority.emplace(params_base.cache_plan_authority);
+            local_authority.emplace(
+                params_base.cache_optimizer.landed_authority_level);
             local_authority->calibration_profile =
                 cache_plan_calibration_profile;
             plan_authority = &*local_authority;
@@ -9140,7 +9144,7 @@ private:
                     res->operation = operation;
                     const auto precheck = server_cache_control_task_precheck(
                         task.cache_control != nullptr,
-                        params_base.cache_lifecycle,
+                        params_base.cache_optimizer.cache_lifecycle,
                         cache_authority != nullptr);
                     if (precheck != server_cache_control_status::ok) {
                         res->result.status = precheck;
@@ -12671,7 +12675,7 @@ private:
         auto * memory = llama_get_memory(ctx_tgt);
         std::vector<vbr_hard_seal_subject> hard_seal_evidence;
         memory->vbr_hard_seal_evidence_take(hard_seal_evidence);
-        if (params_base.cache_debug) {
+        if (params_base.cache_optimizer.cache_debug) {
             for (const auto & step : hard_seal_evidence) {
                 const json payload = {
                     {"evidence_event", "sealed_step"},
@@ -13920,7 +13924,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         server_cache_control_token family_binding_token;
         if (data.contains("family_binding")) {
-            if (!params.cache_control_api ||
+            if (!params.cache_optimizer.cache_control_api ||
                 !data.at("family_binding").is_string() ||
                 !server_cache_control_decode_handle(
                     server_cache_control_handle_kind::family_binding,
@@ -14377,7 +14381,7 @@ void server_routes::init_routes() {
         res->headers["Cache-Control"] = "no-store";
 
         // Disabled means zero tokenization/planning work and no cache oracle.
-        if (!params.cache_plan_preflight) {
+        if (!params.cache_optimizer.cache_plan_preflight) {
             res->error(format_error_response(
                 "This server does not support cache-plan preflight. Start it with `--cache-plan-preflight`",
                 ERROR_TYPE_NOT_SUPPORTED));
@@ -14487,7 +14491,7 @@ void server_routes::init_routes() {
 
         server_cache_control_operation operation =
             server_cache_control_operation::_count;
-        GGML_ASSERT(params.cache_control_api &&
+        GGML_ASSERT(params.cache_optimizer.cache_control_api &&
                     server_cache_control_operation_for_path(req.path, operation));
 
         auto request = std::make_shared<server_cache_control_request>();

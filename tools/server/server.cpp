@@ -127,19 +127,30 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // Presets may have changed raw cache controls after CLI parsing. Resolve
+    // once more before any runtime consumer; below this point only the
+    // effective object is authoritative.
+    std::string cache_optimizer_error;
+    if (!common_cache_optimizer_resolve_params(params, &cache_optimizer_error)) {
+        SRV_ERR("invalid cache optimizer configuration: %s\n",
+                cache_optimizer_error.c_str());
+        return 1;
+    }
+    const auto & cache_optimizer = params.cache_optimizer;
+
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
 
-    if (params.cache_plan_preflight &&
+    if (cache_optimizer.cache_plan_preflight &&
         (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
              params.hostname, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }
-    if (params.cache_control_api &&
-        (!params.cache_lifecycle || is_router_server ||
+    if (cache_optimizer.cache_control_api &&
+        (!cache_optimizer.cache_lifecycle || is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
              params.hostname, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-control-api requires --cache-lifecycle and a single-model, trusted-local, single-principal server\n");
@@ -280,7 +291,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     ctx_http.post("/cache/plan",                ex_wrapper(routes.post_cache_plan));
-    if (params.cache_control_api) {
+    if (cache_optimizer.cache_control_api) {
         for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
             ctx_http.post(std::string(route.path),
                           ex_wrapper(routes.post_cache_control));

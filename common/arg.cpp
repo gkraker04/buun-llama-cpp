@@ -1919,6 +1919,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
                         "Pass -ub 512 -b 2048 for ~30%% faster prompt prefill at +2-3 GB VRAM.\n");
             }
         }
+
+        std::string cache_optimizer_error;
+        if (!common_cache_optimizer_resolve_params(params, &cache_optimizer_error)) {
+            throw std::invalid_argument(
+                "invalid cache optimizer configuration: " + cache_optimizer_error);
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -4264,10 +4270,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
+        {"--cache-optimizer"}, "MODE",
+        "zero-config cache optimizer mode: off, baseline, learn, or auto (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.cache_optimizer_mode = common_cache_optimizer_mode_parse(value);
+            params.cache_optimizer_mode_explicit = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_OPTIMIZER"));
+    add_opt(common_arg(
         {"--cache-debug"},
         string_format("emit one shadow cache-plan decision record per request as a JSON log line and expose the last record in /slots (default: %s)", params.cache_debug ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_debug = true;
+            params.cache_debug_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
     add_opt(common_arg(
@@ -4275,6 +4290,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("expose trusted-local POST /cache/plan previews (default: %s)", params.cache_plan_preflight ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_plan_preflight = true;
+            params.cache_plan_preflight_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_PREFLIGHT"));
     add_opt(common_arg(
@@ -4282,6 +4298,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("expose trusted-local cache-control routes (default: %s)", params.cache_control_api ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_control_api = true;
+            params.cache_control_api_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_CONTROL_API"));
     add_opt(common_arg(
@@ -4290,6 +4307,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.cache_plan_authority =
                 common_cache_plan_authority_level_parse(value);
+            params.cache_plan_authority_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_AUTHORITY"));
     add_opt(common_arg(
@@ -4297,6 +4315,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("enable the P2 cache-lifecycle authority substrate (accounting-gated admission); no observer serialization, independent of --cache-debug (default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
         [](common_params & params) {
             params.cache_lifecycle = true;
+            params.cache_lifecycle_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_LIFECYCLE"));
     add_opt(common_arg(

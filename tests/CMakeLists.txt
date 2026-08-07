@@ -480,6 +480,32 @@ add_test(
 )
 
 add_test(
+    NAME test-cache-optimizer-config-contract
+    COMMAND ${CMAKE_COMMAND}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-optimizer-config.cmake
+)
+
+add_test(
+    NAME test-zc1-retention-policy-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc1-retention-policy.cmake
+)
+
+find_program(CAPSTONE_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
+add_test(
+    NAME test-capstone-truth
+    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-capstone-truth.py
+)
+add_test(
+    NAME test-capstone-truth-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-capstone-truth.cmake
+)
+
+add_test(
     NAME test-cache-plan-fixtures-source
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
@@ -539,6 +565,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-cache-optimizer-config.cpp)
 llama_build_and_test(test-vbr-policy.cpp)
 llama_build_and_test(test-vbr-downward.cpp)
 llama_build_and_test(test-vbr-physical.cpp)

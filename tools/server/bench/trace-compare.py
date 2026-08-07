@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Diff two trace-replay scorecards into headline numbers and a regression list.
+"""Diff capstone scorecards into headline numbers and a regression list.
 
 	./trace-compare.py --baseline master.scorecard.json --arm ours.scorecard.json
 
-Prints the claim-grade summary (both arms scored by the same instrument on the
-same request stream) and the per-request rows that moved most, which is the
-input to policy tuning.
+Ordinary two-file use is exploratory. ``--claim-grade`` is deliberately a
+closed six-scorecard proof: intentional baseline, branch-with-features-disabled
+parity, active arm, a concurrent baseline null, and a serialized baseline null
+pair. It also consumes a separate debug probe proving the active planner was
+fitted and actually authoritative.
 """
 
 import argparse
 import json
+
+from cache_plan_common import iter_cache_plan_records
 
 
 def ratio(baseline, arm):
@@ -28,18 +32,194 @@ def index_requests(scorecard):
 	return {row.get("seq"): row for row in scorecard.get("requests") or []}
 
 
+CONCURRENT_EXACT_FIELDS = (
+	"status", "generated_tokens", "generated_recorded", "truncated",
+)
+SERIAL_EXACT_FIELDS = CONCURRENT_EXACT_FIELDS + (
+	"fresh_prefill_tokens", "prompt_tokens",
+)
+
+
+def load_scorecard(path):
+	with open(path) as handle:
+		return json.load(handle)
+
+
+def scorecard_claim_reasons(name, scorecard):
+	claim = scorecard.get("claim_validation") or {}
+	if not claim.get("requested"):
+		return [f"{name}:replay:claim_grade_not_requested"]
+	if not claim.get("valid"):
+		return [f"{name}:replay:" + reason
+			for reason in claim.get("reasons") or ["claim_validation_missing"]]
+	return []
+
+
+def parity_reasons(name, left, right, require_output=False, fields=SERIAL_EXACT_FIELDS):
+	"""Compare behavior evidence, not concurrent floating-point output hashes."""
+	reasons = []
+	left_rows = index_requests(left)
+	right_rows = index_requests(right)
+	if set(left_rows) != set(right_rows):
+		reasons.append(f"{name}:request_set_mismatch")
+	for seq in sorted(set(left_rows) & set(right_rows)):
+		for field in fields:
+			if left_rows[seq].get(field) != right_rows[seq].get(field):
+				reasons.append(f"{name}:seq={seq}:{field}")
+		if require_output and left_rows[seq].get("output_sha") != right_rows[seq].get("output_sha"):
+			reasons.append(f"{name}:seq={seq}:output_sha")
+	return reasons
+
+
+def aggregate(rows, field):
+	values = [row.get(field) for row in rows.values() if row.get(field) is not None]
+	return len(values), sum(values)
+
+
+def concurrent_parity_reasons(baseline, parity, null_concurrent):
+	"""Branch-off drift must not exceed the cache noise measured by the null."""
+	reasons = parity_reasons(
+		"branch_no_features", baseline, parity, fields=CONCURRENT_EXACT_FIELDS)
+	reasons.extend(parity_reasons(
+		"null_concurrent", baseline, null_concurrent,
+		fields=CONCURRENT_EXACT_FIELDS))
+	base_rows = index_requests(baseline)
+	parity_rows = index_requests(parity)
+	null_rows = index_requests(null_concurrent)
+	for field in ("fresh_prefill_tokens", "prompt_tokens"):
+		base_known, base_total = aggregate(base_rows, field)
+		parity_known, parity_total = aggregate(parity_rows, field)
+		null_known, null_total = aggregate(null_rows, field)
+		if parity_known != base_known or null_known != base_known:
+			reasons.append(f"concurrent:{field}:coverage_mismatch")
+			continue
+		if abs(parity_total - base_total) > abs(null_total - base_total):
+			reasons.append(f"branch_no_features:{field}:outside_null_envelope")
+	return reasons
+
+
+def workload_reasons(name, baseline, other):
+	reasons = []
+	if not baseline.get("trace_tag") or baseline.get("trace_tag") != other.get("trace_tag"):
+		reasons.append(f"{name}:trace_tag_mismatch")
+	base_rows = index_requests(baseline)
+	other_rows = index_requests(other)
+	if set(base_rows) != set(other_rows):
+		reasons.append(f"{name}:request_set_mismatch")
+	for seq in sorted(set(base_rows) & set(other_rows)):
+		if base_rows[seq].get("generated_recorded") != other_rows[seq].get("generated_recorded"):
+			reasons.append(f"{name}:seq={seq}:captured_generation_mismatch")
+	return reasons
+
+
+def planner_evidence(paths):
+	statuses = {}
+	authoritative = []
+	total = 0
+	for rec in iter_cache_plan_records(paths):
+		total += 1
+		status = rec.get("planner_status", "missing")
+		statuses[status] = statuses.get(status, 0) + 1
+		authority = rec.get("authority") or {}
+		if (status == "ok" and authority.get("state") == "authoritative"
+				and isinstance(authority.get("executed_plan_candidate"), int)
+				and authority.get("decision_tier") not in (None, "none")):
+			authoritative.append({
+				"id_task": rec.get("id_task"),
+				"decision_tier": authority.get("decision_tier"),
+				"executed_plan_candidate": authority.get("executed_plan_candidate"),
+			})
+	return {
+		"records": total,
+		"planner_status": statuses,
+		"authoritative_count": len(authoritative),
+		"authoritative_examples": authoritative[:8],
+	}
+
+
+def validate_claim_arms(base, parity, arm, null_concurrent,
+		serialized_base, serialized_null, evidence):
+	reasons = []
+	for name, scorecard in (
+			("baseline", base), ("branch_no_features", parity), ("active", arm),
+			("null_concurrent", null_concurrent),
+			("null_serialized_baseline", serialized_base),
+			("null_serialized_repeat", serialized_null)):
+		reasons.extend(scorecard_claim_reasons(name, scorecard))
+		if not (scorecard.get("timeline") or {}).get("faithful"):
+			reasons.append(f"{name}:timeline_not_faithful")
+		if name != "baseline":
+			reasons.extend(workload_reasons(name, base, scorecard))
+	for name, scorecard in (
+			("baseline", base), ("branch_no_features", parity), ("active", arm),
+			("null_concurrent", null_concurrent)):
+		execution = scorecard.get("execution") or {}
+		if execution.get("serialize_overlap"):
+			reasons.append(f"{name}:unexpected_serialized_execution")
+		if (execution.get("server_parallel_observed") or 0) < 2:
+			reasons.append(f"{name}:concurrent_server_has_fewer_than_two_slots")
+	for name, scorecard in (
+			("null_serialized_baseline", serialized_base),
+			("null_serialized_repeat", serialized_null)):
+		execution = scorecard.get("execution") or {}
+		if not execution.get("serialize_overlap"):
+			reasons.append(f"{name}:overlap_not_serialized")
+		if execution.get("server_parallel_observed") != 1:
+			reasons.append(f"{name}:server_not_np1")
+	reasons.extend(concurrent_parity_reasons(base, parity, null_concurrent))
+	reasons.extend(parity_reasons(
+		"null_serialized", serialized_base, serialized_null, require_output=True))
+	if evidence.get("planner_status", {}).get("ok", 0) == 0:
+		reasons.append("active_evidence:planner_status_not_ok")
+	if evidence.get("authoritative_count", 0) == 0:
+		reasons.append("active_evidence:no_authoritative_execution")
+	return reasons
+
+
 def main():
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--baseline", required=True)
 	parser.add_argument("--arm", required=True)
+	parser.add_argument("--claim-grade", action="store_true",
+		help="require branch-no-feature parity, concurrent and serialized nulls, "
+			"and separate fitted authoritative planner evidence")
+	parser.add_argument("--parity", help="branch scorecard with cache features disabled")
+	parser.add_argument("--null-concurrent", help="repeat baseline under scoring concurrency")
+	parser.add_argument("--serialized-baseline", help="baseline replay at -np 1")
+	parser.add_argument("--serialized-null", help="repeat baseline replay at -np 1")
+	parser.add_argument("--planner-evidence", action="append", default=[],
+		help="CACHE_PLAN debug log from a separate active-arm probe (repeatable)")
 	parser.add_argument("--out", default=None)
 	parser.add_argument("--top", type=int, default=15)
 	args = parser.parse_args()
 
-	with open(args.baseline) as handle:
-		base = json.load(handle)
-	with open(args.arm) as handle:
-		arm = json.load(handle)
+	base = load_scorecard(args.baseline)
+	arm = load_scorecard(args.arm)
+	claim = {
+		"requested": bool(args.claim_grade),
+		"valid": False,
+		"reasons": [],
+	}
+	if args.claim_grade:
+		missing = [name for name, value in (
+			("--parity", args.parity),
+			("--null-concurrent", args.null_concurrent),
+			("--serialized-baseline", args.serialized_baseline),
+			("--serialized-null", args.serialized_null),
+			("--planner-evidence", args.planner_evidence),
+		) if not value]
+		if missing:
+			raise SystemExit("claim-grade comparison requires " + ", ".join(missing))
+		parity = load_scorecard(args.parity)
+		null_concurrent = load_scorecard(args.null_concurrent)
+		serialized_base = load_scorecard(args.serialized_baseline)
+		serialized_null = load_scorecard(args.serialized_null)
+		evidence = planner_evidence(args.planner_evidence)
+		claim["reasons"] = validate_claim_arms(
+			base, parity, arm, null_concurrent, serialized_base, serialized_null,
+			evidence)
+		claim["valid"] = not claim["reasons"]
+		claim["planner_evidence"] = evidence
 
 	base_line = base.get("timeline") or {}
 	arm_line = arm.get("timeline") or {}
@@ -147,6 +327,7 @@ def main():
 		key=lambda row: -(row.get("fresh_delta") or 0))[:args.top]
 
 	report = {
+		"claim_validation": claim,
 		"headline": headline,
 		"by_class": by_class,
 		"top_ttft_regressions": regressions,
@@ -183,10 +364,11 @@ def main():
 		print(f"output identity     {identity['identical']:>12}"
 			f" / {identity['compared']} requests byte-identical")
 		if identity["identical"] < identity["compared"]:
-			print("  NOTE: outputs diverged. Expected when an arm runs VBR "
-				"(pressure-driven tiers are branch-dependent). On a static-KV "
-				f"cell this is a determinism finding — first at seq "
-				f"{identity['first_divergence_seq']}.")
+			print("  NOTE: concurrent output bytes are diagnostic only: batch "
+				"composition can flip near-ties even in a static-KV null replay, "
+				"and VBR adds pressure-driven tier differences. The mandatory "
+				"serialized null is the determinism oracle — first divergence "
+				f"here was seq {identity['first_divergence_seq']}.")
 	decode = headline["decode_comparability"]
 	base_gen = decode["baseline_generated_tokens"] or 0
 	arm_gen = decode["arm_generated_tokens"] or 0
@@ -219,6 +401,12 @@ def main():
 		print(f"top TTFT regressions (seq, class, +ms): " + ", ".join(
 			f"{row['seq']}/{row['class']}/+{row['ttft_delta_ms']:.0f}"
 			for row in regressions[:5]))
+	if args.claim_grade:
+		print("claim validation    " + ("PASS" if claim["valid"] else "FAIL"))
+		for reason in claim["reasons"]:
+			print(f"  {reason}")
+		if not claim["valid"]:
+			raise SystemExit(2)
 
 
 if __name__ == "__main__":
