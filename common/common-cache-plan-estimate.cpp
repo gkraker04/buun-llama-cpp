@@ -466,9 +466,6 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     if (rec.n_prompt_tokens.state != llama_cache_acct_known::known) {
         return common_cache_plan_planner_status::incomplete_evidence;
     }
-    if (!cache_plan_lru_stratum_complete(rec)) {
-        return common_cache_plan_planner_status::incomplete_evidence;
-    }
     const uint64_t n_prompt = rec.n_prompt_tokens.value;
 
     // pass 0 (verify-r1 finding 2): a visited candidate whose shipped phase established
@@ -554,6 +551,13 @@ common_cache_plan_planner_status common_cache_plan_choose_preestimated(
     // Final shared chooser: callers must have populated every viable row, not
     // merely the rows they expect to win. This keeps missing local evidence
     // fail-closed and preserves the existing all-candidate contract.
+    // The LRU speculation stratum is part of that same complete domain, not
+    // an estimator-specific precondition: both checked-in and local fits must
+    // refuse before filtering when any participating target lacks its live
+    // speculation carrier.
+    if (!cache_plan_lru_stratum_complete(rec)) {
+        return common_cache_plan_planner_status::incomplete_evidence;
+    }
     for (uint32_t i = 0; i < rec.n_inventory; ++i) {
         const auto & candidate = rec.inventory[i];
         if (candidate.viable() &&

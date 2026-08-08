@@ -1359,7 +1359,7 @@ static void test_local_by_id_certification_and_currency() {
     checkpoint->lcp_tokens = llama_cache_acct_value::measured(90);
     checkpoint->payload_bytes = llama_cache_acct_value::measured(1024);
     auto * host = add_viable(
-        rec, common_cache_plan_provider::host_cache_entry, 0, 7);
+        rec, common_cache_plan_provider::host_cache_entry, 7, 0);
     host->lcp_tokens = llama_cache_acct_value::measured(80);
     host->payload_bytes = llama_cache_acct_value::measured(2048);
     const uint32_t live_id = uint32_t(live - rec.inventory.data());
@@ -1518,6 +1518,27 @@ static void test_local_by_id_certification_and_currency() {
     CHECK(rec.optimizer.local_authority.state ==
           common_cache_optimizer_authority_state::executed);
 
+    // A certified latch is bound to the exact legacy baseline ordinal used by
+    // its economic proof. A changed execution-time baseline must consume the
+    // capability through the stale-currency fallback, never reuse the proof.
+    auto baseline_mismatch = original_rec;
+    server_cache_plan_local_authority_latch baseline_mismatch_latch;
+    authority.plan_local_before_mutation(
+        baseline_mismatch, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &baseline_mismatch_latch);
+    CHECK(baseline_mismatch.authority_prequalified);
+    baseline_mismatch.optimizer.baseline_plan_candidate = int32_t(host_id);
+    auto baseline_mismatch_execution = authority.authorize(
+        baseline_mismatch, 0, true, true, 0,
+        std::move(baseline_mismatch_latch));
+    CHECK(!baseline_mismatch_execution.authoritative());
+    CHECK(baseline_mismatch.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::stale_capability);
+    CHECK(baseline_mismatch.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::fallback);
+    CHECK(baseline_mismatch.optimizer.local_authority.reason ==
+          common_cache_optimizer_fallback_reason::currency_changed);
+
     // The strict zero policy margin never promotes equality. Identical
     // baseline/challenger features cancel before the confidence radius.
     server_cache_calibration_contribution equal_terms[2];
@@ -1656,7 +1677,18 @@ static void test_local_by_id_certification_and_currency() {
         common_cache_plan_authority_level::similarity,
         &similarity_observations);
     CHECK(similarity_authority.set_profile_display_salt(display_salt));
+    const auto set_host_legacy = [&](common_cache_plan_record & value) {
+        value.inventory[live_id].f_keep = 0.4;
+        value.inventory[live_id].f_keep_known = true;
+        value.inventory[live_id].sim = 0.8;
+        value.inventory[live_id].sim_known = true;
+        value.inventory[host_id].f_keep = 0.8;
+        value.inventory[host_id].f_keep_known = true;
+        value.inventory[host_id].sim = 0.9;
+        value.inventory[host_id].sim_known = true;
+    };
     auto similarity_rec = original_rec;
+    set_host_legacy(similarity_rec);
     similarity_rec.selection = common_cache_plan_selection::similarity;
     similarity_rec.inventory[live_id].origin_tier =
         common_cache_plan_selection::similarity;
@@ -1696,6 +1728,7 @@ static void test_local_by_id_certification_and_currency() {
     // historical host restore, while the prior similarity ceiling refuses
     // the identical route-home record before planning.
     auto route_rec = original_rec;
+    set_host_legacy(route_rec);
     route_rec.selection = common_cache_plan_selection::route_home;
     route_rec.inventory[live_id].origin_tier =
         common_cache_plan_selection::route_home;
@@ -1729,6 +1762,72 @@ static void test_local_by_id_certification_and_currency() {
         route_rec, &route_execution.local_authority);
     CHECK(route_rec.optimizer.local_authority.state ==
           common_cache_optimizer_authority_state::executed);
+
+    // ZC5d completes the graduated local ceiling. The same mature capability
+    // may act on an LRU record, while the completed ZC5c route-home ceiling
+    // remains a hard boundary for the identical evidence and choice.
+    auto lru_rec = original_rec;
+    set_host_legacy(lru_rec);
+    lru_rec.selection = common_cache_plan_selection::lru;
+    lru_rec.inventory[live_id].origin_tier =
+        common_cache_plan_selection::lru;
+    lru_rec.inventory[host_id].origin_tier =
+        common_cache_plan_selection::lru;
+    lru_rec.inventory[checkpoint_id].origin_tier =
+        common_cache_plan_selection::lru;
+    lru_rec.inventory[live_id].spec_capable_known = true;
+    lru_rec.inventory[live_id].spec_capable = false;
+    auto lru_lower = lru_rec;
+    route_authority.plan_local_before_mutation(
+        lru_lower, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms);
+    CHECK(!lru_lower.authority_prequalified);
+    CHECK(lru_lower.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::not_attempted);
+
+    server_cache_plan_authority lru_authority(
+        common_cache_plan_authority_level::lru,
+        &similarity_observations);
+    CHECK(lru_authority.set_profile_display_salt(display_salt));
+    server_cache_plan_local_authority_latch lru_latch;
+    lru_authority.plan_local_before_mutation(
+        lru_rec, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms, 0, &lru_latch);
+    CHECK(lru_rec.authority_prequalified);
+    CHECK(lru_rec.shadow_choice == int32_t(live_id));
+    auto lru_execution = lru_authority.authorize(
+        lru_rec, 0, true, true, 0, std::move(lru_latch));
+    CHECK(lru_execution.kind ==
+          server_cache_plan_execution_kind::live_replay);
+    CHECK(lru_execution.target == 0);
+    lru_rec.shipped_plan_candidate = int32_t(live_id);
+    lru_authority.finalize_execution(
+        lru_rec, &lru_execution.local_authority);
+    CHECK(lru_rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::executed);
+
+    // Local fits share the exact LRU hard-stratum completeness rule with the
+    // checked-in estimator. Unknown speculation on the selected target, or a
+    // viable target with no live/spec carrier, refuses before an optimum.
+    auto lru_unknown_spec = lru_rec;
+    lru_unknown_spec.clear_planner_outputs();
+    lru_unknown_spec.inventory[live_id].spec_capable_known = false;
+    lru_authority.plan_local_before_mutation(
+        lru_unknown_spec, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms);
+    CHECK(!lru_unknown_spec.authority_prequalified);
+    CHECK(lru_unknown_spec.optimizer.local_fallback_reason ==
+          common_cache_optimizer_fallback_reason::incomplete_evidence);
+
+    auto lru_missing_target = lru_rec;
+    lru_missing_target.clear_planner_outputs();
+    lru_missing_target.inventory[host_id].target_slot_id = 1;
+    lru_authority.plan_local_before_mutation(
+        lru_missing_target, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms);
+    CHECK(!lru_missing_target.authority_prequalified);
+    CHECK(lru_missing_target.optimizer.local_fallback_reason ==
+          common_cache_optimizer_fallback_reason::incomplete_evidence);
 
     // A copyable receipt is diagnostic only. Without the move-only capability
     // produced by this exact planning invocation it cannot authorize.

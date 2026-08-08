@@ -80,13 +80,13 @@ common_cache_optimizer_effective_config common_cache_optimizer_resolve(
         return out;
     }
 
-    // ZC5c lands the route-home local ratchet. An explicit higher ceiling is
+    // ZC5d lands the LRU local ratchet. An explicit higher ceiling is
     // a ceiling, not a request to enable unlanded tiers; explicit off remains
     // a complete local-authority kill switch.
     out.local_authority_ceiling = raw.cache_plan_authority_explicit
         ? std::min(raw.cache_plan_authority,
-                   common_cache_plan_authority_level::route_home)
-        : common_cache_plan_authority_level::route_home;
+                   common_cache_plan_authority_level::lru)
+        : common_cache_plan_authority_level::lru;
     return out;
 }
 

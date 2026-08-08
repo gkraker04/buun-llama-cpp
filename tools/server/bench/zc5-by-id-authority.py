@@ -15,6 +15,9 @@ artifacts are unavailable by construction and ordinary historical traffic can
 honestly train both replay alternatives.  Hybrid checkpoint models retain the
 counterfactual live alternative fail-closed rather than introducing hidden
 exploration merely to satisfy the gate.
+LRU uses that same host/live crossover with dynamic VBR disabled and a strict
+similarity threshold, so ordinary unforced traffic reaches the final idle-slot
+tier and retains the same persisted replay/restore evidence currencies.
 """
 
 import argparse
@@ -238,7 +241,8 @@ def training_similarity_crossover(base, seed, cycle):
 
 
 def training_cycle(args, base, cycle):
-    if args.scenario in ("similarity_crossover", "route_home_crossover"):
+    if args.scenario in (
+            "similarity_crossover", "route_home_crossover", "lru_crossover"):
         return training_similarity_crossover(base, args.seed, cycle)
     if args.scenario == "host":
         return training_host(base, args.seed, cycle)
@@ -319,7 +323,8 @@ def tier_execution(row, tier, scenario):
             isinstance(economic_id, int) and baseline_id != economic_id and
             row.get("shipped_plan_candidate") == economic_id):
         return False
-    if scenario not in ("similarity_crossover", "route_home_crossover"):
+    if scenario not in (
+            "similarity_crossover", "route_home_crossover", "lru_crossover"):
         return True
     if scenario == "route_home_crossover":
         baseline = candidate(row, baseline_id)
@@ -332,6 +337,16 @@ def tier_execution(row, tier, scenario):
             row.get("chosen") == "live_slot")
     baseline = candidate(row, baseline_id)
     economic = candidate(row, economic_id)
+    if scenario == "lru_crossover":
+        return bool(
+            baseline and economic and
+            baseline.get("provider") == "host_cache_entry" and
+            economic.get("provider") == "live_slot" and
+            isinstance(baseline.get("lcp_tokens"), int) and
+            baseline.get("lcp_tokens") > 1 and
+            isinstance(economic.get("lcp_tokens"), int) and
+            economic.get("lcp_tokens") > 1 and
+            row.get("chosen") == "live_slot")
     return bool(
         baseline and economic and
         baseline.get("provider") == "host_cache_entry" and
@@ -384,12 +399,24 @@ def self_test():
         "shipped_plan_candidate": 0,
         "candidates": [
             {"id": 0, "provider": "live_slot", "lcp_tokens": 64},
-            {"id": 1, "provider": "host_cache_entry"},
+            {"id": 1, "provider": "host_cache_entry", "lcp_tokens": 65},
         ],
     }
     assert tier_execution(row, "similarity", "similarity_crossover")
     row["selection"] = "route_home"
     assert tier_execution(row, "route_home", "route_home_crossover")
+    row["selection"] = "lru"
+    assert tier_execution(row, "lru", "lru_crossover")
+    row["candidates"][1]["lcp_tokens"] = 1
+    assert not tier_execution(row, "lru", "lru_crossover")
+    row["candidates"][1]["lcp_tokens"] = 65
+    row["candidates"][0]["lcp_tokens"] = 1
+    assert not tier_execution(row, "lru", "lru_crossover")
+    row["candidates"][0]["lcp_tokens"] = 64
+    del row["candidates"][1]["lcp_tokens"]
+    assert not tier_execution(row, "lru", "lru_crossover")
+    row["candidates"][1]["lcp_tokens"] = 65
+    row["selection"] = "route_home"
     row["authority"]["disagreed"] = False
     assert not tier_execution(row, "route_home", "route_home_crossover")
     row["authority"]["disagreed"] = True
@@ -476,10 +503,11 @@ def main():
     parser.add_argument("--ctx-checkpoints", type=int, default=0)
     parser.add_argument(
         "--scenario", choices=("replay", "host", "host_long", "oversized_host",
-                               "similarity_crossover", "route_home_crossover"),
+                               "similarity_crossover", "route_home_crossover",
+                               "lru_crossover"),
                         default="replay")
     parser.add_argument(
-        "--decision-tier", choices=("by_id", "similarity", "route_home"),
+        "--decision-tier", choices=("by_id", "similarity", "route_home", "lru"),
         default="by_id")
     parser.add_argument("--slot-prompt-similarity", type=float, default=0.1)
     parser.add_argument("--expect", choices=("execute", "preserve"),

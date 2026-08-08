@@ -1441,6 +1441,15 @@ server_cache_plan_execution server_cache_plan_authority::authorize(
     const int32_t legacy_plan_candidate = server_cache_plan_legacy_candidate(
         rec, legacy_target_slot_id, host_lookup_enabled);
     rec.authority.legacy_plan_candidate = legacy_plan_candidate;
+    // The local confidence proof is denominated against the exact baseline
+    // ordinal captured before mutation. Re-derive it at execution, but never
+    // let a different current legacy plan inherit that proof or its D-A
+    // envelope. The consuming stale-capability door terminalizes the latch.
+    if (local && legacy_plan_candidate !=
+            rec.optimizer.baseline_plan_candidate) {
+        refuse(common_cache_plan_authority_fallback::stale_capability);
+        return execution;
+    }
     if (!server_cache_plan_candidate_prequalified(rec)) {
         refuse(
             rec.authority.fallback_reason !=

@@ -15,6 +15,7 @@ file(READ "${SOURCE_ROOT}/tools/server/server-cache-plan-authority.cpp" AUTHORIT
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-plan-authority.h" AUTHORITY_H)
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" CONTEXT_CPP)
 file(READ "${SOURCE_ROOT}/src/llama-model.cpp" MODEL_LOADER_CPP)
+file(READ "${SOURCE_ROOT}/common/common-cache-plan-estimate.cpp" ESTIMATE_CPP)
 
 foreach(REQUIRED IN ITEMS
         "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
@@ -28,6 +29,32 @@ foreach(REQUIRED IN ITEMS
     contract_require_token("${BACKEND_H}${CUDA_CPP}${FINGERPRINT_CPP}"
         "${REQUIRED}" "ZC5a exact hardware identity")
 endforeach()
+
+contract_extract_region("${AUTHORITY_CPP}"
+    "server_cache_plan_execution server_cache_plan_authority::authorize("
+    "void server_cache_plan_authority::fallback_legacy("
+    LOCAL_AUTHORIZE LOCAL_AUTHORIZE_FOUND)
+if (NOT LOCAL_AUTHORIZE_FOUND)
+    message(FATAL_ERROR "ZC5 local authorize owner is missing")
+endif()
+foreach(REQUIRED IN ITEMS
+        "legacy_plan_candidate !="
+        "rec.optimizer.baseline_plan_candidate"
+        "common_cache_plan_authority_fallback::stale_capability")
+    contract_require_token("${LOCAL_AUTHORIZE}" "${REQUIRED}"
+        "ZC5d local baseline currency fence")
+endforeach()
+
+contract_extract_region("${ESTIMATE_CPP}"
+    "common_cache_plan_planner_status common_cache_plan_choose_preestimated("
+    "common_cache_plan_planner_status common_cache_plan_estimate_and_choose("
+    SHARED_CHOOSER SHARED_CHOOSER_FOUND)
+if (NOT SHARED_CHOOSER_FOUND)
+    message(FATAL_ERROR "ZC5 shared preestimated chooser is missing")
+endif()
+contract_require_token("${SHARED_CHOOSER}"
+    "if (!cache_plan_lru_stratum_complete(rec))"
+    "ZC5d shared LRU hard-stratum completeness")
 foreach(REQUIRED IN ITEMS
         "while (params.tensor_buft_overrides.size() < ntbo)"
         "has_active_tensor_buft_override(params)"
@@ -130,9 +157,9 @@ endif()
 
 foreach(REQUIRED IN ITEMS
         "out.local_authority_ceiling = raw.cache_plan_authority_explicit"
-        "common_cache_plan_authority_level::route_home")
+        "common_cache_plan_authority_level::lru")
     contract_require_token("${OPTIMIZER_CPP}" "${REQUIRED}"
-        "ZC5c route-home ceiling resolver")
+        "ZC5d LRU ceiling resolver")
 endforeach()
 foreach(REQUIRED IN ITEMS
         "const auto decision_level = server_cache_plan_level_of(rec.selection);"
@@ -274,6 +301,28 @@ if (NOT MOVED_FROM_RESET EQUAL -1)
     message(FATAL_ERROR
         "ZC5a destructive-move negative control did not trip")
 endif()
+set(MUTATED_BASELINE "${LOCAL_AUTHORIZE}")
+string(REPLACE
+    "legacy_plan_candidate !=\n            rec.optimizer.baseline_plan_candidate"
+    "false"
+    MUTATED_BASELINE "${MUTATED_BASELINE}")
+string(FIND "${MUTATED_BASELINE}"
+    "legacy_plan_candidate !=" MUTATED_BASELINE_FENCE)
+if (NOT MUTATED_BASELINE_FENCE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC5d local baseline-fence negative control did not trip")
+endif()
+set(MUTATED_LRU_STRATUM "${SHARED_CHOOSER}")
+string(REPLACE
+    "if (!cache_plan_lru_stratum_complete(rec))"
+    "if (false)"
+    MUTATED_LRU_STRATUM "${MUTATED_LRU_STRATUM}")
+string(FIND "${MUTATED_LRU_STRATUM}"
+    "cache_plan_lru_stratum_complete(rec)" MUTATED_LRU_STRATUM_GATE)
+if (NOT MUTATED_LRU_STRATUM_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC5d LRU-stratum negative control did not trip")
+endif()
 set(MUTATED_REDUCTION "${PROFILE_REDUCTION}")
 string(REPLACE
     "coverage = common_cache_optimizer_coverage_class::out_of_coverage;"
@@ -286,4 +335,4 @@ if (NOT MUTATED_FLEET_TERMINAL)
         "ZC5a unselected-terminal negative control did not trip")
 endif()
 
-message(STATUS "ZC5a-c local-authority contract checks passed")
+message(STATUS "ZC5a-d local-authority contract checks passed")
