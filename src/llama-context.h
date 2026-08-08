@@ -428,6 +428,9 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+    llama_sync_fence_info sync_fence_info() const noexcept;
+    void set_sync_fence_observer(bool enabled) noexcept;
+    void arm_sync_fence_observer() noexcept;
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -497,6 +500,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    bool is_warmup() const noexcept { return cparams.warmup; }
 
     bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -778,6 +782,12 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+
+    // Updated only after the existing backend scheduler fence completes.
+    // Observation reads are passive and never call synchronize().
+    mutable llama_sync_fence_info sync_fence_info_ = {};
+    bool sync_fence_observer_enabled_ = false;
+    bool sync_fence_observer_armed_ = false;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

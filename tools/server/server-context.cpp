@@ -7,6 +7,7 @@
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-plan-preflight-internal.h"
+#include "server-cache-observer.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
 #include "server-task.h"
@@ -471,6 +472,7 @@ struct server_slot {
     const std::string * lease_execution_identity = nullptr;
     server_cache_authority * lifecycle_authority = nullptr;
     bool cache_debug_observability = false;
+    server_cache_observation_store * cache_observations = nullptr;
     common_retention_pool retention_pool = common_retention_pool::attention;
     server_cache_checkpoint_attempt_latch checkpoint_attempts;
     const common_prompt_checkpoint * checkpoint_seam_heuristic = nullptr;
@@ -494,6 +496,9 @@ struct server_slot {
     // D-A5 recovery source remains pinned through the dependent B execution.
     // reset() closes it after the request, allowing later priced retention.
     server_cache_recovery_pin cache_plan_destruction_recovery_pin;
+    // ZC2 process-local observation state. It is armed only in learn/auto,
+    // contains no authority, and closes on an already-required context fence.
+    server_cache_calibration_epoch cache_observation_epoch;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -686,9 +691,38 @@ struct server_slot {
         // with the live lineage; a committed host restore overwrites it with
         // delivery.retention_lineage inside load_impl.
         common_cache_retention_lineage restored_lineage = retention_lineage;
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
-                                     adapter_config_key, obs, required_source_id,
-                                     &restored_lineage);
+        bool res = false;
+        if (cache_observations) {
+            server_prompt_cache_load_observation load_observation;
+            res = prompt_cache.load(
+                prompt, tokens, ctx_tgt, ctx_dft, id,
+                adapter_config_key, obs, required_source_id,
+                &restored_lineage, &load_observation);
+            auto key = server_cache_observation_cpu_key(
+                server_cache_observation_operation::restore,
+                common_cache_plan_provider::host_cache_entry, 0);
+            if (load_observation.restored) {
+                cache_observation_epoch.arm(
+                    id, key, load_observation.owned_cpu_us);
+                cache_observation_epoch.bind_provider(
+                    key, load_observation.payload_bytes,
+                    load_observation.owned_cpu_us);
+            } else if (load_observation.attempted) {
+                cache_observation_epoch.arm(
+                    id, key, load_observation.owned_cpu_us);
+                server_cache_observation_record record;
+                (void) cache_observation_epoch.abandon(
+                    server_cache_observation_reason::operation_failed,
+                    *cache_observations, &record);
+                server_cache_emit_observation_noexcept(
+                    record, cache_debug_observability);
+            }
+        } else {
+            res = prompt_cache.load(
+                prompt, tokens, ctx_tgt, ctx_dft, id,
+                adapter_config_key, obs, required_source_id,
+                &restored_lineage, nullptr);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
@@ -733,6 +767,7 @@ struct server_slot {
                 task && !task->is_child()),
             retention_lineage.declaration,
             retention_lineage.automatic_provenance,
+            cache_observations,
             cache_debug_observability,
             this,
             checkpoint_drop_authority_adapter,
@@ -742,6 +777,26 @@ struct server_slot {
     void checkpoint_ring_changed() noexcept {
         auto context = checkpoint_authority_context();
         server_cache_checkpoint_ring_changed(context);
+    }
+
+    void observe_cache_cpu_operation(
+            server_cache_observation_operation operation,
+            uint8_t prepare_shape,
+            uint64_t extent_bytes,
+            int64_t start_us,
+            bool success) noexcept {
+        if (!cache_observations) {
+            return;
+        }
+        const int64_t end_us = ggml_time_us();
+        const auto key = server_cache_observation_cpu_key(
+            operation, common_cache_plan_provider::live_slot, prepare_shape);
+        server_cache_observation_record record;
+        (void) server_cache_observe_cpu_operation(
+            cache_observations, key, id, extent_bytes,
+            start_us, end_us, success, &record);
+        server_cache_emit_observation_noexcept(
+            record, cache_debug_observability);
     }
 
     bool checkpoint_thinning_attempt_begin(bool capacity_mode) noexcept {
@@ -799,6 +854,25 @@ struct server_slot {
         // contains no callback and no ledger writer: seq removal, prompt
         // clearing, and the ring-generation latch are physical/local only.
         const auto scheduler_owner = std::this_thread::get_id();
+        uint64_t apply_extent_bytes = 0;
+        bool apply_extent_known = false;
+        if (cache_observations) {
+            const uint64_t target_extent = uint64_t(
+                llama_state_seq_get_size_ext(
+                    ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE));
+            const uint64_t draft_extent = ctx_dft
+                ? uint64_t(llama_state_seq_get_size_ext(
+                      ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE))
+                : 0;
+            apply_extent_known =
+                draft_extent <= UINT64_MAX - target_extent;
+            apply_extent_bytes = apply_extent_known
+                ? target_extent + draft_extent
+                : 0;
+        }
+        const int64_t apply_start_us = cache_observations
+            ? ggml_time_us()
+            : 0;
         server_cache_slot_drop_impl(false);
         GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
         const auto released = capability.commit(
@@ -809,6 +883,12 @@ struct server_slot {
             id,
             quote.receipt.selected_attention,
             quote.receipt.selected_recurrent));
+        if (apply_extent_known) {
+            observe_cache_cpu_operation(
+                server_cache_observation_operation::destruction_apply,
+                /*prepare_shape=*/0, apply_extent_bytes,
+                apply_start_us, true);
+        }
 
         quote.receipt.state =
             common_cache_plan_destruction_state::executed;
@@ -1240,6 +1320,15 @@ struct server_slot {
         n_prompt_tokens_cache = 0;
         cache_plan_execution.clear();
         cache_plan_destruction_recovery_pin = {};
+        if (cache_observations && cache_observation_epoch.active()) {
+            server_cache_observation_record record;
+            (void) cache_observation_epoch.abandon(
+                server_cache_observation_reason::no_completion_fence,
+                *cache_observations, &record);
+            server_cache_emit_observation_noexcept(
+                record, cache_debug_observability);
+        }
+        cache_observation_epoch.reset();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2312,6 +2401,229 @@ private:
     // literal: no observer object, no record init, no hook work of any kind on the disabled path
     // — absence IS the disabled state). References cache_authority for the substrate it records.
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
+    // Fixed-size, process-local ZC2 sufficient state. ZC3 replaces the
+    // provisional identity with the stable multi-artifact profile; until then
+    // production rows remain diagnostic and no planner can read this object.
+    std::unique_ptr<server_cache_observation_store> cache_optimizer_observations;
+    std::vector<uint32_t> cache_observation_batch_tokens;
+    std::vector<llama_pos> cache_observation_first_pos;
+
+    static server_cache_observation_key cache_observation_provider_key(
+            common_cache_plan_provider provider) noexcept {
+        server_cache_observation_key key;
+        key.provider = provider;
+        key.operation = provider ==
+                common_cache_plan_provider::live_context_checkpoint
+            ? server_cache_observation_operation::restore
+            : provider == common_cache_plan_provider::host_cache_entry
+                ? server_cache_observation_operation::restore
+                : server_cache_observation_operation::replay;
+        key.feature_dim = key.operation == server_cache_observation_operation::restore
+            ? 2 : 4;
+        // ZC3a fills stable execution/representation digests. Until then the
+        // real row is bounded diagnostic evidence and can never become fit.
+        key.identity_complete = false;
+        return key;
+    }
+
+    void cache_observation_begin_provider_cpu(server_slot & slot) noexcept {
+        if (!cache_optimizer_observations) {
+            return;
+        }
+        if (!slot.cache_observation_epoch.active()) {
+            const auto provider = slot.n_prompt_tokens_cache > 0
+                ? common_cache_plan_provider::live_slot
+                : common_cache_plan_provider::cold_replay;
+            slot.cache_observation_epoch.arm(
+                slot.id, cache_observation_provider_key(provider));
+        }
+        if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
+            slot.cache_observation_epoch.mark_mixed(
+                server_cache_observation_reason::mixed_slots);
+        }
+        slot.cache_observation_epoch.begin_owned_cpu(ggml_time_us());
+    }
+
+    void cache_observation_abandon(
+            server_slot & slot,
+            server_cache_observation_reason reason) noexcept {
+        if (!cache_optimizer_observations) {
+            return;
+        }
+        server_cache_observation_record record;
+        if (slot.cache_observation_epoch.abandon(
+                reason, *cache_optimizer_observations, &record)) {
+            server_cache_emit_observation_noexcept(
+                record, params_base.cache_optimizer.cache_debug);
+        }
+    }
+
+    static server_cache_sync_fence_snapshot cache_observation_fence(
+            const llama_context * ctx) noexcept {
+        const auto value = llama_get_sync_fence_info(ctx);
+        return { value.serial, value.completed_us };
+    }
+
+    static uint8_t cache_observation_start_bucket(llama_pos pos) noexcept {
+        if (pos < 4096) return 0;
+        if (pos < 32768) return 1;
+        if (pos < 131072) return 2;
+        return 3;
+    }
+
+    static uint8_t cache_observation_batch_bucket(uint32_t n) noexcept {
+        if (n <= 32) return 0;
+        if (n <= 128) return 1;
+        if (n <= 512) return 2;
+        return 3;
+    }
+
+    void cache_observation_note_submission(
+            const llama_batch & batch_view) noexcept {
+        if (!cache_optimizer_observations || batch_view.n_tokens <= 0) {
+            return;
+        }
+        // End every owned CPU segment before attribution scans. Observer
+        // bookkeeping and other slots' work belong to neither side of the
+        // CPU/backend boundary.
+        const int64_t submission_us = ggml_time_us();
+        bool observed_submission = false;
+        for (auto & slot : slots) {
+            slot.cache_observation_epoch.pause_owned_cpu(submission_us);
+        }
+        const auto fence_before = cache_observation_fence(ctx_tgt);
+        uint32_t active_slots = 0;
+        for (const auto & slot : slots) {
+            active_slots += slot.is_processing() ? 1u : 0u;
+        }
+        GGML_ASSERT(cache_observation_batch_tokens.size() == slots.size());
+        GGML_ASSERT(cache_observation_first_pos.size() == slots.size());
+        std::fill(cache_observation_batch_tokens.begin(),
+                  cache_observation_batch_tokens.end(), 0);
+        std::fill(cache_observation_first_pos.begin(),
+                  cache_observation_first_pos.end(),
+                  std::numeric_limits<llama_pos>::max());
+        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+            for (int32_t j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                const llama_seq_id id = batch_view.seq_id[i][j];
+                if (id < 0 || size_t(id) >= slots.size()) {
+                    continue;
+                }
+                ++cache_observation_batch_tokens[size_t(id)];
+                cache_observation_first_pos[size_t(id)] = std::min(
+                    cache_observation_first_pos[size_t(id)],
+                    batch_view.pos[i]);
+            }
+        }
+        uint32_t prompt_slots = 0;
+        for (const auto & slot : slots) {
+            if (slot.id < 0 || size_t(slot.id) >= slots.size() ||
+                cache_observation_batch_tokens[size_t(slot.id)] == 0) {
+                continue;
+            }
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                slot.state == SLOT_STATE_DONE_PROMPT) {
+                ++prompt_slots;
+            }
+        }
+        for (auto & slot : slots) {
+            if (!slot.cache_observation_epoch.active() || slot.id < 0 ||
+                size_t(slot.id) >= slots.size()) {
+                continue;
+            }
+            const uint32_t owned_tokens =
+                cache_observation_batch_tokens[size_t(slot.id)];
+            const llama_pos first_pos =
+                cache_observation_first_pos[size_t(slot.id)];
+            if (owned_tokens == 0) {
+                continue;
+            }
+
+            std::array<double, 4> feature = {};
+            uint8_t size_family = 0;
+            bool feature_ok = false;
+            if (slot.cache_observation_epoch.operation() ==
+                    server_cache_observation_operation::restore) {
+                feature_ok = server_cache_observation_byte_feature(
+                    slot.cache_observation_epoch.payload_bytes(),
+                    size_family, feature);
+            } else {
+                feature_ok = server_cache_observation_replay_feature(
+                    owned_tokens, size_family, feature);
+            }
+            if (!feature_ok) {
+                slot.cache_observation_epoch.mark_mixed(
+                    server_cache_observation_reason::invalid_geometry);
+            }
+            server_cache_observation_submission attribution;
+            attribution.submission_us = submission_us;
+            attribution.fence_before = fence_before;
+            attribution.prompt_slots = prompt_slots;
+            attribution.active_slots = active_slots;
+            attribution.tokens = owned_tokens;
+            attribution.payload_bytes =
+                slot.cache_observation_epoch.payload_bytes();
+            attribution.start_position =
+                first_pos == std::numeric_limits<llama_pos>::max()
+                    ? -1 : int64_t(first_pos);
+            attribution.effective_batch = uint32_t(batch_view.n_tokens);
+            attribution.effective_ubatch =
+                uint32_t(std::max(1, params_base.n_ubatch));
+            attribution.target_participates = true;
+            attribution.draft_participates = ctx_dft != nullptr;
+            attribution.speculative_participates = slot.can_speculate();
+            attribution.warmup = llama_context_is_warmup(ctx_tgt);
+            attribution.contention_bucket = active_slots == 1 ? 0 : 1;
+            attribution.start_bucket = cache_observation_start_bucket(
+                first_pos == std::numeric_limits<llama_pos>::max()
+                    ? 0 : first_pos);
+            attribution.batch_bucket = cache_observation_batch_bucket(
+                uint32_t(batch_view.n_tokens));
+            attribution.ubatch_bucket = cache_observation_batch_bucket(
+                uint32_t(std::max(1, params_base.n_ubatch)));
+            attribution.size_family = size_family;
+            attribution.feature = feature;
+            slot.cache_observation_epoch.note_submission(attribution);
+            observed_submission = true;
+        }
+        // Arm after all attribution work and immediately before decode. The
+        // first already-required synchronize latches this submission; later
+        // sampler/getter synchronizations cannot move the completion stamp.
+        if (observed_submission) {
+            llama_arm_sync_fence_observer(ctx_tgt);
+        }
+    }
+
+    void cache_observation_close_fence() noexcept {
+        if (!cache_optimizer_observations) {
+            return;
+        }
+        const auto fence = cache_observation_fence(ctx_tgt);
+        for (auto & slot : slots) {
+            (void) slot.cache_observation_epoch.latch_fence(fence);
+            if (slot.cache_observation_epoch.terminal_ready()) {
+                server_cache_observation_record record;
+                if (slot.cache_observation_epoch.finish(
+                        *cache_optimizer_observations, &record)) {
+                    server_cache_emit_observation_noexcept(
+                        record, params_base.cache_optimizer.cache_debug);
+                }
+            }
+        }
+    }
+
+    void cache_observation_finish(server_slot & slot) noexcept {
+        if (!cache_optimizer_observations) {
+            return;
+        }
+        slot.cache_observation_epoch.mark_operation_terminal();
+        server_cache_observation_record record;
+        if (slot.cache_observation_epoch.finish(
+                *cache_optimizer_observations, &record)) {
+            server_cache_emit_observation_noexcept(
+                record, params_base.cache_optimizer.cache_debug);
+        }
+    }
 
     void cache_authority_config_failed(bool mirror_to_shadow) noexcept {
         cache_authority->configured = false;
@@ -3270,6 +3582,10 @@ private:
             return out;
         }
         out.quote = *quote_it;
+        bool prepare_observation_active = false;
+        int64_t prepare_start_us = 0;
+        uint64_t prepare_extent_bytes = 0;
+        const uint8_t prepare_shape = &legacy_target == &victim ? 2 : 3;
         const auto emit_refusal = [&](bool observe_transition) {
             rec.destruction = out.quote.receipt;
             if (observe_transition) {
@@ -3288,6 +3604,13 @@ private:
             }
         };
         const auto refuse = [&](common_cache_plan_destruction_reason reason) {
+            if (prepare_observation_active) {
+                victim.observe_cache_cpu_operation(
+                    server_cache_observation_operation::durability_prepare,
+                    prepare_shape, prepare_extent_bytes,
+                    prepare_start_us, false);
+                prepare_observation_active = false;
+            }
             out.quote.receipt.state =
                 common_cache_plan_destruction_state::refused;
             out.quote.receipt.reason = reason;
@@ -3304,6 +3627,10 @@ private:
         // legacy-prefix publication can then neither dedup the victim nor
         // leave the shorter legacy frontier without an exact durable copy.
         server_prompt_cache::iterator saved_victim;
+        prepare_start_us = victim.cache_observations
+            ? ggml_time_us()
+            : 0;
+        prepare_observation_active = true;
         const auto saved = victim.prompt_save(
             *prompt_cache, true, &saved_victim);
         if (saved != prompt_save_result::published ||
@@ -3311,6 +3638,7 @@ private:
             refuse(common_cache_plan_destruction_reason::recovery_unavailable);
             return out;
         }
+        prepare_extent_bytes = uint64_t(saved_victim->size());
 
         llama_cache_acct_artifact_id recovery_artifact;
         std::vector<llama_cache_acct_op_id> recovery_ops;
@@ -3323,7 +3651,18 @@ private:
         }
         prompt_cache->update();
         if (&legacy_target != &victim) {
-            const auto legacy_saved = legacy_target.prompt_save(*prompt_cache);
+            server_prompt_cache::iterator saved_legacy;
+            const auto legacy_saved = legacy_target.prompt_save(
+                *prompt_cache, false, &saved_legacy);
+            if (saved_legacy != prompt_cache->states.end()) {
+                const uint64_t legacy_bytes = uint64_t(saved_legacy->size());
+                if (legacy_bytes <= UINT64_MAX - prepare_extent_bytes) {
+                    prepare_extent_bytes += legacy_bytes;
+                } else {
+                    refuse(common_cache_plan_destruction_reason::internal_fault);
+                    return out;
+                }
+            }
             prompt_cache->update();
             if (!prompt_save_durable(legacy_saved) ||
                 !recovery_pin.valid() ||
@@ -3354,6 +3693,12 @@ private:
             refuse(prepared.reason);
             return out;
         }
+
+        victim.observe_cache_cpu_operation(
+            server_cache_observation_operation::durability_prepare,
+            prepare_shape, prepare_extent_bytes,
+            prepare_start_us, true);
+        prepare_observation_active = false;
 
         server_cache_destruction_certify_receipt(
             out.quote.receipt,
@@ -3545,6 +3890,9 @@ private:
     // there is no first generated token, so TTFT stays typed unavailable. Every observer
     // fault is caught here, outside the shipped decision path.
     void cache_plan_finalize(server_slot & slot, bool ttft_known = true) {
+        // ZC2's provider operation ends at the same already-landed prompt
+        // terminal, independently of whether the B shadow record exists.
+        cache_observation_finish(slot);
         if (!slot.cache_plan) {
             return;
         }
@@ -5580,6 +5928,14 @@ private:
         if (params_base.cache_optimizer.cache_debug) {
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
         }
+        if (params_base.cache_optimizer.observer_store_enabled) {
+            cache_optimizer_observations =
+                std::make_unique<server_cache_observation_store>();
+            cache_observation_batch_tokens.assign(slots.size(), 0);
+            cache_observation_first_pos.assign(
+                slots.size(), std::numeric_limits<llama_pos>::max());
+            llama_set_sync_fence_observer(ctx_tgt, true);
+        }
         if (params_base.cache_optimizer.cache_debug ||
             params_base.cache_optimizer.cache_lifecycle) {
             cache_authority = std::make_unique<server_cache_authority>();
@@ -5618,6 +5974,7 @@ private:
                     ? cache_authority.get()
                     : nullptr;
                 slot.cache_debug_observability = params_base.cache_optimizer.cache_debug;
+                slot.cache_observations = cache_optimizer_observations.get();
                 slot.retention_pool =
                     (llama_model_is_recurrent(model_tgt) ||
                      llama_model_is_hybrid(model_tgt))
@@ -5626,6 +5983,8 @@ private:
             }
             if (prompt_cache) {
                 prompt_cache->debug_observability = params_base.cache_optimizer.cache_debug;
+                prompt_cache->cache_observations =
+                    cache_optimizer_observations.get();
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
                 prompt_cache->lease_obs = &cache_authority->leases;
@@ -8976,6 +9335,9 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        cache_observation_abandon(
+                            *slot,
+                            server_cache_observation_reason::operation_failed);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -8989,6 +9351,9 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            cache_observation_abandon(
+                                *slot,
+                                server_cache_observation_reason::mixed_slots);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -8997,6 +9362,9 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            cache_observation_abandon(
+                                *slot,
+                                server_cache_observation_reason::operation_failed);
                             break; // drop the task
                         }
                     } else {
@@ -9022,6 +9390,9 @@ private:
                                         slot->cache_plan_execution,
                                         slot->cache_plan,
                                         slot->cache_plan_destruction_recovery_pin);
+                                    cache_observation_abandon(
+                                        *slot,
+                                        server_cache_observation_reason::operation_failed);
                                     break; // drop the task
                                 }
                                 SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
@@ -9030,6 +9401,9 @@ private:
                                     slot->cache_plan_execution,
                                     slot->cache_plan,
                                     slot->cache_plan_destruction_recovery_pin);
+                                cache_observation_abandon(
+                                    *slot,
+                                    server_cache_observation_reason::operation_failed);
                                 queue_tasks.defer(std::move(task));
                                 break;
                             }
@@ -9050,6 +9424,9 @@ private:
                             server_cache_plan_disarm_unlaunched(
                                 slot->cache_plan_execution, slot->cache_plan,
                                 slot->cache_plan_destruction_recovery_pin);
+                            cache_observation_abandon(
+                                *slot,
+                                server_cache_observation_reason::operation_failed);
                             break; // drop the task
                         }
                     }
@@ -10120,6 +10497,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
+                cache_observation_note_submission(batch_view);
                 bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
@@ -10145,6 +10523,10 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
+                // post_decode's sampling/embedding access is the already-
+                // required fence. Reading its completion metadata adds no
+                // synchronization and charges the batch fence exactly once.
+                cache_observation_close_fence();
             } catch (const std::exception & e) {
                 cycle_failed = true;
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -10493,6 +10875,9 @@ private:
                     bool checkpoint_tgt_recurrent_installed = false;
                     bool checkpoint_dft_recurrent_installed = false;
                     llama_pos checkpoint_installed_pos = -1;
+                    bool checkpoint_observation_attempted = false;
+                    uint64_t checkpoint_observation_payload_bytes = 0;
+                    uint64_t checkpoint_observation_owned_cpu_us = 0;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -11652,11 +12037,20 @@ private:
                                         }
                                         slot.dflash_window_identity.clear();
                                         const size_t checkpoint_size = it->data_tgt.size();
+                                        checkpoint_observation_attempted = true;
+                                        checkpoint_observation_payload_bytes =
+                                            uint64_t(it->size_without_shadow());
+                                        uint64_t checkpoint_target_us = 0;
                                         const size_t n = do_reset ? 0 :
-                                            llama_state_seq_set_data_ext(
+                                            llama_state_seq_set_data_observed_ext(
                                                 ctx_tgt, it->data_tgt.data(),
                                                 checkpoint_size, slot.id,
-                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                                                cache_optimizer_observations
+                                                    ? &checkpoint_target_us
+                                                    : nullptr);
+                                        checkpoint_observation_owned_cpu_us =
+                                            checkpoint_target_us;
 
                                         if (!do_reset && n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
@@ -11669,9 +12063,36 @@ private:
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         } else if (!do_reset) {
-                                            // restore the draft-side state, if any (draft-model checkpoints)
-                                            it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            // Restore the draft side through the same observed
+                                            // install seam. The pre-existing synchronize remains
+                                            // outside owned CPU attribution.
+                                            if (ctx_dft && !it->data_dft.empty()) {
+                                                uint64_t checkpoint_draft_us = 0;
+                                                const size_t n_dft =
+                                                    llama_state_seq_set_data_observed_ext(
+                                                        ctx_dft.get(), it->data_dft.data(),
+                                                        it->data_dft.size(), slot.id,
+                                                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                                                        cache_optimizer_observations
+                                                            ? &checkpoint_draft_us
+                                                            : nullptr);
+                                                if (n_dft != it->data_dft.size()) {
+                                                    GGML_ABORT(
+                                                        "checkpoint size mismatch: expected %zu, got %zu\n",
+                                                        it->data_dft.size(), n_dft);
+                                                }
+                                                if (checkpoint_draft_us <=
+                                                        UINT64_MAX - checkpoint_observation_owned_cpu_us) {
+                                                    checkpoint_observation_owned_cpu_us +=
+                                                        checkpoint_draft_us;
+                                                } else {
+                                                    checkpoint_observation_owned_cpu_us = UINT64_MAX;
+                                                }
+                                            }
 
+                                            const int64_t checkpoint_aux_start_us =
+                                                cache_optimizer_observations
+                                                    ? ggml_time_us() : 0;
                                             // restore the drafter's speculative state (per-slot spec or shared)
                                             common_speculative_set_state(slot.get_spec(), slot.id, it->accel.spec);
 
@@ -11735,6 +12156,30 @@ private:
 
                                                 SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                                 slot.cache_status = "restored context checkpoint";
+                                                if (cache_optimizer_observations) {
+                                                    const int64_t checkpoint_aux_end_us =
+                                                        ggml_time_us();
+                                                    if (checkpoint_aux_end_us >=
+                                                            checkpoint_aux_start_us &&
+                                                        uint64_t(checkpoint_aux_end_us -
+                                                            checkpoint_aux_start_us) <=
+                                                            UINT64_MAX -
+                                                                checkpoint_observation_owned_cpu_us) {
+                                                        checkpoint_observation_owned_cpu_us +=
+                                                            uint64_t(checkpoint_aux_end_us -
+                                                                checkpoint_aux_start_us);
+                                                    } else {
+                                                        checkpoint_observation_owned_cpu_us = UINT64_MAX;
+                                                    }
+                                                    auto key = cache_observation_provider_key(
+                                                        common_cache_plan_provider::live_context_checkpoint);
+                                                    slot.cache_observation_epoch.arm(
+                                                        slot.id, key,
+                                                        checkpoint_observation_owned_cpu_us);
+                                                    slot.cache_observation_epoch.bind_provider(
+                                                        key, uint64_t(it->size_without_shadow()),
+                                                        checkpoint_observation_owned_cpu_us);
+                                                }
                                                 // B0 stage-3 [B-a]: transport the shipped
                                                 // restore's own values into the observer row.
                                                 // This site IS the delivery point — recorded
@@ -11769,6 +12214,22 @@ private:
                                     }
 
                                     if (do_reset) {
+                                        if (cache_optimizer_observations &&
+                                            checkpoint_observation_attempted &&
+                                            !slot.cache_observation_epoch.active()) {
+                                            auto key = cache_observation_provider_key(
+                                                common_cache_plan_provider::live_context_checkpoint);
+                                            slot.cache_observation_epoch.arm(
+                                                slot.id, key,
+                                                checkpoint_observation_owned_cpu_us);
+                                            slot.cache_observation_epoch.bind_provider(
+                                                key,
+                                                checkpoint_observation_payload_bytes,
+                                                checkpoint_observation_owned_cpu_us);
+                                            cache_observation_abandon(
+                                                slot,
+                                                server_cache_observation_reason::operation_failed);
+                                        }
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
@@ -11987,6 +12448,11 @@ private:
                         }
                     }
 
+                    // The actual provider is now known and every fallible
+                    // lookup/restore decision is behind us. Time only the
+                    // owned trim/batch-construction tail up to submission.
+                    cache_observation_begin_provider_cpu(slot);
+
                     const int64_t t_now = ggml_time_us();
                     slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
                     slot.print_timings_pp();
@@ -12031,6 +12497,14 @@ private:
                     }
 
                     if (!trim_ok) {
+                        if (cache_optimizer_observations &&
+                            slot.cache_observation_epoch.active()) {
+                            slot.cache_observation_epoch.pause_owned_cpu(
+                                ggml_time_us());
+                            cache_observation_abandon(
+                                slot,
+                                server_cache_observation_reason::operation_failed);
+                        }
                         SLT_WRN(slot, "memory_seq_rm [%d, end) rejected; falling back to full prompt re-processing\n", p0);
 
                         // Full removal is infallible for memory implementations and retains
@@ -12069,6 +12543,7 @@ private:
                             slot.cache_plan->revoke_deliveries();
                             slot.cache_plan->restore_attempt_failed = true;
                         }
+                        cache_observation_begin_provider_cpu(slot);
                     }
 
                     // Retiering resumes only after the coordinated restore+trim transaction.

@@ -518,7 +518,7 @@ endif()
 contract_extract_region(
     "${server_task}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner, nullptr,"
     da2_commit_gap da2_commit_gap_found)
 contract_find_forbidden(
     "${da2_commit_gap}" da2_gap_forbidden
@@ -550,7 +550,7 @@ string(REPLACE
 contract_extract_region(
     "${da2_gap_negative}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner, nullptr,"
     da2_negative_gap da2_negative_found)
 contract_find_forbidden(
     "${da2_negative_gap}" da2_negative_forbidden "release(")
@@ -685,7 +685,7 @@ contract_extract_region(
 contract_extract_region(
     "${da3_trade_body}"
     "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
-    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking,"
     da3_commit_gap da3_commit_gap_found)
 contract_find_forbidden(
     "${da3_commit_gap}" da3_gap_forbidden
@@ -759,7 +759,7 @@ string(REPLACE
 contract_extract_region(
     "${da3_gap_negative}"
     "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
-    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking,"
     da3_negative_gap da3_negative_found)
 contract_find_forbidden(
     "${da3_negative_gap}" da3_negative_forbidden "release(")

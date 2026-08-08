@@ -9,6 +9,33 @@
 #include <cstdint>
 #include <map>
 
+// Internal, passive completion metadata for an explicitly armed server
+// observation.  Arming never synchronizes; the first already-required
+// synchronize after an owned submission latches the completion and disarms
+// the capture.  Later sampler/getter synchronizations cannot move it.
+struct llama_sync_fence_info {
+    uint64_t serial;
+    int64_t  completed_us;
+};
+
+LLAMA_API llama_sync_fence_info llama_get_sync_fence_info(
+        const llama_context * ctx);
+LLAMA_API void llama_set_sync_fence_observer(
+        llama_context * ctx, bool enabled);
+LLAMA_API void llama_arm_sync_fence_observer(llama_context * ctx);
+LLAMA_API bool llama_context_is_warmup(const llama_context * ctx);
+
+// Like llama_state_seq_set_data_ext(), but reports only the causally-owned
+// state install after that API's pre-existing synchronize. No new fence is
+// introduced and a null duration preserves the public API's exact path.
+LLAMA_API size_t llama_state_seq_set_data_observed_ext(
+        llama_context * ctx,
+        const uint8_t * src,
+        size_t size,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        uint64_t * owned_cpu_us);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

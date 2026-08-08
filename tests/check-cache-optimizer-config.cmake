@@ -69,11 +69,12 @@ endif()
 
 # ZC1 consumes retention_policy at its host/checkpoint adapters, the one
 # save-time lineage resolver, record/preflight serialization, and
-# initialization wiring. The remaining future fields stay descriptive until
-# their own ratchets.
+# initialization wiring. ZC2 consumes observer_store_enabled only at observer
+# construction and slot wiring. The authority ceiling remains descriptive
+# until its own ratchet.
 function(assert_no_future_policy_reads text label)
     string(REGEX MATCHALL
-        "(\\.|->)(observer_store_enabled|local_authority_ceiling)"
+        "(\\.|->)local_authority_ceiling"
         future_hits "${text}")
     if (future_hits)
         message(FATAL_ERROR
@@ -94,6 +95,13 @@ foreach(path IN LISTS production_cpp)
     file(READ "${path}" text)
     string(APPEND all_production "${text}")
 endforeach()
+
+count_literal("${all_production}" ".observer_store_enabled"
+    observer_store_enabled_reads)
+if (NOT observer_store_enabled_reads EQUAL 1)
+    message(FATAL_ERROR
+        "ZC2 observer-store consumer census drifted: ${observer_store_enabled_reads}")
+endif()
 count_literal("${all_production}" ".retention_policy" retention_policy_reads)
 if (NOT retention_policy_reads EQUAL 6)
     message(FATAL_ERROR
@@ -104,10 +112,16 @@ endif()
 # retention-policy consumer must fail the exact census.
 set(future_mutation "void probe(const auto & effective) { (void) effective.local_authority_ceiling; }")
 string(REGEX MATCHALL
-    "(\\.|->)(observer_store_enabled|local_authority_ceiling)"
+    "(\\.|->)local_authority_ceiling"
     future_mutation_hits "${future_mutation}")
 if (NOT future_mutation_hits)
     message(FATAL_ERROR "future-policy member-read negative control did not trip")
+endif()
+set(observer_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.observer_store_enabled; }")
+count_literal("${observer_mutation}" ".observer_store_enabled"
+    observer_mutation_reads)
+if (observer_mutation_reads EQUAL 1)
+    message(FATAL_ERROR "observer-store consumer negative control did not trip")
 endif()
 set(retention_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.retention_policy; }")
 count_literal("${retention_mutation}" ".retention_policy" retention_mutation_reads)

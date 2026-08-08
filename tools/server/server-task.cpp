@@ -1,5 +1,6 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
+#include "server-cache-observer.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-retention-policy.h"
 
@@ -14,6 +15,7 @@
 #include "common.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
@@ -2269,6 +2271,30 @@ void emit_checkpoint_destruction(
     }
 }
 
+void observe_checkpoint_cpu_operation(
+        const server_cache_checkpoint_authority_context & context,
+        server_cache_observation_operation operation,
+        uint8_t prepare_shape,
+        uint64_t extent_bytes,
+        int64_t start_us,
+        bool success,
+        int64_t owned_end_us = 0) noexcept {
+    if (!context.observations) {
+        return;
+    }
+    const int64_t end_us = owned_end_us != 0
+        ? owned_end_us : ggml_time_us();
+    const auto key = server_cache_observation_cpu_key(
+        operation, common_cache_plan_provider::live_context_checkpoint,
+        prepare_shape);
+    server_cache_observation_record record;
+    (void) server_cache_observe_cpu_operation(
+        context.observations, key, context.slot_id, extent_bytes,
+        start_us, end_us, success, &record);
+    server_cache_emit_observation_noexcept(
+        record, context.debug_observability);
+}
+
 bool checkpoint_drop_certified(
         server_cache_checkpoint_authority_context & context,
         server_cache_checkpoint_iterator victim,
@@ -2357,11 +2383,21 @@ bool checkpoint_drop_certified(
         return false;
     }
     const auto fresh = authority.ledger.snapshot();
+    const int64_t prepare_start_us = context.observations
+        ? ggml_time_us()
+        : 0;
     auto prepared = server_cache_prepare_release_set(
         quote, current, authority.ledger, fresh.serial,
         project, std::move(pin));
+    const int64_t prepare_end_us = context.observations
+        ? ggml_time_us() : 0;
     if (prepared.status !=
             server_cache_prepare_release_status::prepared) {
+        observe_checkpoint_cpu_operation(
+            context,
+            server_cache_observation_operation::durability_prepare,
+            /*prepare_shape=*/1, /*extent_bytes=*/0,
+            prepare_start_us, false, prepare_end_us);
         refuse(&quote.receipt, prepared.reason);
         return false;
     }
@@ -2390,6 +2426,11 @@ bool checkpoint_drop_certified(
             recovery_artifact.candidate.release_ops);
     quote.receipt.state =
         common_cache_plan_destruction_state::certified;
+    observe_checkpoint_cpu_operation(
+        context,
+        server_cache_observation_operation::durability_prepare,
+        /*prepare_shape=*/1, /*extent_bytes=*/0,
+        prepare_start_us, true, prepare_end_us);
     authority.observe_host_destruction(quote.receipt, true);
     emit_checkpoint_destruction(context,
         quote.receipt, projected_bytes,
@@ -2397,9 +2438,13 @@ bool checkpoint_drop_certified(
 
     const auto victim_key =
         server_retention_instance_key::for_checkpoint(context.slot_id, &*victim);
+    const uint64_t apply_extent_bytes = uint64_t(victim->size());
     const auto admission = server_cache_checkpoint_observe_drop(context,
         reason, current.front().candidate.artifact_id);
     const std::thread::id scheduler_owner = std::this_thread::get_id();
+    const int64_t apply_start_us = context.observations
+        ? ggml_time_us()
+        : 0;
     GGML_ASSERT(context.raw_owner && context.raw_drop);
     next = context.raw_drop(
         context.raw_owner, victim, std::next(victim));
@@ -2413,6 +2458,11 @@ bool checkpoint_drop_certified(
     GGML_ASSERT(committed ==
                 common_cache_plan_destruction_reason::none);
     context.retention->retire_after_committed_release(victim_key);
+    observe_checkpoint_cpu_operation(
+        context,
+        server_cache_observation_operation::destruction_apply,
+        /*prepare_shape=*/0, apply_extent_bytes,
+        apply_start_us, true);
     quote.receipt.state =
         common_cache_plan_destruction_state::executed;
     quote.receipt.actual_accounting_serial =
@@ -2855,6 +2905,30 @@ void server_cache_checkpoint_publication_skipped(
 
 namespace {
 
+void server_prompt_cache_observe_cpu_operation(
+        server_prompt_cache & cache,
+        server_cache_observation_operation operation,
+        uint8_t prepare_shape,
+        uint64_t extent_bytes,
+        int64_t start_us,
+        bool success,
+        int64_t owned_end_us = 0) noexcept {
+    if (!cache.cache_observations) {
+        return;
+    }
+    const int64_t end_us = owned_end_us != 0
+        ? owned_end_us : ggml_time_us();
+    const auto key = server_cache_observation_cpu_key(
+        operation, common_cache_plan_provider::host_cache_entry,
+        prepare_shape);
+    server_cache_observation_record record;
+    (void) server_cache_observe_cpu_operation(
+        cache.cache_observations, key, -1, extent_bytes,
+        start_us, end_us, success, &record);
+    server_cache_emit_observation_noexcept(
+        record, cache.debug_observability);
+}
+
 bool checkpoint_payload_equal(
         const common_prompt_checkpoint & a,
         const common_prompt_checkpoint & b) noexcept {
@@ -3287,6 +3361,9 @@ host_destruction_certification certify_host_destruction(
             std::move(victim),
         };
         const auto fresh = cache.acct->snapshot();
+        const int64_t prepare_start_us = cache.cache_observations
+            ? ggml_time_us()
+            : 0;
         auto prepared = server_cache_prepare_release_set(
             out.quote,
             current,
@@ -3294,8 +3371,15 @@ host_destruction_certification certify_host_destruction(
             fresh.serial,
             project,
             std::move(out.pin));
+        const int64_t prepare_end_us = cache.cache_observations
+            ? ggml_time_us() : 0;
         if (prepared.status !=
                 server_cache_prepare_release_status::prepared) {
+            server_prompt_cache_observe_cpu_operation(
+                cache,
+                server_cache_observation_operation::durability_prepare,
+                /*prepare_shape=*/1, /*extent_bytes=*/0,
+                prepare_start_us, false, prepare_end_us);
             refuse_certified(prepared.reason);
             return out;
         }
@@ -3313,6 +3397,11 @@ host_destruction_certification certify_host_destruction(
         server_cache_destruction_certify_receipt(
             out.quote.receipt, recovery_fate,
             recovery_artifact, recovery_ops);
+        server_prompt_cache_observe_cpu_operation(
+            cache,
+            server_cache_observation_operation::durability_prepare,
+            /*prepare_shape=*/1, /*extent_bytes=*/0,
+            prepare_start_us, true, prepare_end_us);
         server_prompt_cache_observe_host_destruction(
             cache, out.quote.receipt, true, out.projected_bytes, ranking);
         out.capability = std::move(prepared.capability);
@@ -3333,7 +3422,8 @@ void commit_certified_host_destruction(
         server_prompt_cache & cache,
         host_destruction_certification & certified,
         const std::thread::id & scheduler_owner,
-        const host_trade_ranking * ranking = nullptr) noexcept {
+        const host_trade_ranking * ranking = nullptr,
+        int64_t * apply_terminal_us = nullptr) noexcept {
     GGML_ASSERT(certified.ready);
     GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
     const auto release_status =
@@ -3341,6 +3431,9 @@ void commit_certified_host_destruction(
     GGML_ASSERT(release_status ==
                 common_cache_plan_destruction_reason::none);
     server_prompt_cache_retire_manifest(cache, certified.retirement);
+    if (apply_terminal_us) {
+        *apply_terminal_us = ggml_time_us();
+    }
     certified.quote.receipt.state =
         common_cache_plan_destruction_state::executed;
     certified.quote.receipt.actual_accounting_serial =
@@ -3746,17 +3839,27 @@ bool server_prompt_cache::destroy_priced_host_entry(
         const auto admission = server_prompt_cache_observe_drop(
             *this, *chosen->victim, reason);
         const std::thread::id scheduler_owner = std::this_thread::get_id();
+        const uint64_t apply_extent_bytes = uint64_t(chosen->victim->size());
         SRV_WRN(
             " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
             chosen->victim->cache_plan_source_id,
             chosen->victim->size() / (1024.0 * 1024.0));
+        const int64_t apply_start_us = cache_observations
+            ? ggml_time_us()
+            : 0;
         server_prompt_cache_destroy_entry_impl(*this, chosen->victim);
         // D-A3 uses the same no-interleaving terminal as D-A2. Pricing and all
         // fallible recovery work completed before the physical erase; the raw
         // list mutation has no callback/C writer, and capability commit is the
         // immediately following operation on update_slots' owner thread.
+        int64_t apply_terminal_us = 0;
         commit_certified_host_destruction(
-            *this, certified, scheduler_owner, &chosen->ranking);
+            *this, certified, scheduler_owner, &chosen->ranking,
+            cache_observations ? &apply_terminal_us : nullptr);
+        server_prompt_cache_observe_cpu_operation(
+            *this, server_cache_observation_operation::destruction_apply,
+            /*prepare_shape=*/0, apply_extent_bytes,
+            apply_start_us, true, apply_terminal_us);
         if (destruction_obs) {
             destruction_obs->note_host_trade_executed(
                 admission.sequence,
@@ -4133,13 +4236,30 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     }
 
     const uint64_t serial = acct->snapshot().serial;
+    const int64_t prepare_start_us = cache_observations
+        ? ggml_time_us()
+        : 0;
     auto prepared = llama_cache_prepare_release_set(*acct, ops, serial);
     if (!prepared.ready()) {
+        server_prompt_cache_observe_cpu_operation(
+            *this,
+            server_cache_observation_operation::durability_prepare,
+            /*prepare_shape=*/1, /*extent_bytes=*/0,
+            prepare_start_us, false);
         return false;
     }
+    server_prompt_cache_observe_cpu_operation(
+        *this,
+        server_cache_observation_operation::durability_prepare,
+        /*prepare_shape=*/1, /*extent_bytes=*/0,
+        prepare_start_us, true);
 
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     const std::thread::id scheduler_owner = std::this_thread::get_id();
+    const uint64_t apply_extent_bytes = uint64_t(it->size());
+    const int64_t apply_start_us = cache_observations
+        ? ggml_time_us()
+        : 0;
     (void) server_prompt_cache_destroy_entry_impl(*this, it);
     // ZC's exact-release door is scheduler-owned. The observer above only
     // previews existing operations; the raw list erase has no callback or C
@@ -4149,6 +4269,9 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     GGML_ASSERT(commit_status ==
                 llama_cache_conditional_release_status::released);
     server_prompt_cache_retire_manifest(*this, retirement);
+    server_prompt_cache_observe_cpu_operation(
+        *this, server_cache_observation_operation::destruction_apply,
+        /*prepare_shape=*/0, apply_extent_bytes, apply_start_us, true);
     if (destruction_obs) {
         destruction_obs->note_prepared_release(admission.sequence, true);
     }
@@ -4208,6 +4331,10 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     if (!capability_ready && !redundant.ready) {
         server_prompt_cache_retire_entry(*this, it);
     }
+    const uint64_t redundant_apply_extent = redundant.ready
+        ? uint64_t(it->size()) : 0;
+    const int64_t redundant_apply_start = redundant.ready && cache_observations
+        ? ggml_time_us() : 0;
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
     if (redundant.ready) {
         // D-A2 certify→mutate→commit boundary. Like D-A1, publication and
@@ -4216,8 +4343,14 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         // only ledger terminal, so no ledger write can interleave. The
         // recovery pin remains live across both operations and prevents the
         // cited survivor from entering this raw primitive.
+        int64_t redundant_apply_end = 0;
         commit_certified_host_destruction(
-            *this, redundant, scheduler_owner);
+            *this, redundant, scheduler_owner, nullptr,
+            cache_observations ? &redundant_apply_end : nullptr);
+        server_prompt_cache_observe_cpu_operation(
+            *this, server_cache_observation_operation::destruction_apply,
+            /*prepare_shape=*/0, redundant_apply_extent,
+            redundant_apply_start, true, redundant_apply_end);
         if (destruction_obs) {
             destruction_obs->note_redundant_host_executed(
                 admission.sequence, redundant.projected_bytes);
@@ -4635,8 +4768,14 @@ void server_prompt_cache::retention_event_begin() noexcept {
 // The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer
 // off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
-template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage) {
+template <bool Observed, bool Measure>
+bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage, server_prompt_cache_load_observation * observation) {
+    if constexpr (Measure) {
+        GGML_ASSERT(observation != nullptr);
+        *observation = {};
+    } else {
+        (void) observation;
+    }
     if constexpr (!Observed) {
         (void) rec;
         (void) required_source_id;
@@ -4784,14 +4923,37 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
+    if constexpr (Measure) {
+        observation->attempted = true;
+    }
+    uint64_t observed_owned_cpu_us = 0;
+    auto observe_span = [&](int64_t start_us) noexcept {
+        if constexpr (Measure) {
+            const int64_t end_us = ggml_time_us();
+            if (end_us < start_us ||
+                uint64_t(end_us - start_us) >
+                    UINT64_MAX - observed_owned_cpu_us) {
+                observed_owned_cpu_us = UINT64_MAX;
+            } else {
+                observed_owned_cpu_us += uint64_t(end_us - start_us);
+            }
+            observation->owned_cpu_us = observed_owned_cpu_us;
+        } else {
+            (void) start_us;
+        }
+    };
+
     // D-A1 stages the immutable source copy before either main or draft
     // context is touched. Allocation failure therefore leaves the source and
     // both target contexts at the caller-owned pre-restore boundary.
+    const int64_t prepare_start_us = Measure ? ggml_time_us() : 0;
     server_prompt_cache_restore_delivery delivery;
     if (!prepare_restore_delivery(it_best, delivery)) {
+        observe_span(prepare_start_us);
         SRV_ERR("%s\n", "failed to stage non-consuming host restore");
         return false;
     }
+    observe_span(prepare_start_us);
 
     // Source bytes remain immutable throughout both restores. Lifecycle mode
     // keeps the entry after success too; legacy mode consumes it only after
@@ -4799,7 +4961,18 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     // the caller resets both target sequences, never leaving a half-restore.
     {
         const size_t size_tgt = it_best->data.main.size();
-        size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0);
+        uint64_t install_us = 0;
+        size_t n_tgt = llama_state_seq_set_data_observed_ext(
+            ctx_tgt, it_best->data.main.data(), size_tgt, id_slot, 0,
+            Measure ? &install_us : nullptr);
+        if constexpr (Measure) {
+            if (install_us > UINT64_MAX - observed_owned_cpu_us) {
+                observed_owned_cpu_us = UINT64_MAX;
+            } else {
+                observed_owned_cpu_us += install_us;
+            }
+            observation->owned_cpu_us = observed_owned_cpu_us;
+        }
         if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // [P0 gate]
         if (n_tgt != size_tgt) {
             SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
@@ -4816,7 +4989,18 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     if (ctx_dft && !it_best->data.drft.empty()) {
         const size_t size_dft = it_best->data.drft.size();
-        const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, it_best->data.drft.data(), size_dft, id_slot, 0);
+        uint64_t install_us = 0;
+        const size_t n_dft = llama_state_seq_set_data_observed_ext(
+            ctx_dft, it_best->data.drft.data(), size_dft, id_slot, 0,
+            Measure ? &install_us : nullptr);
+        if constexpr (Measure) {
+            if (install_us > UINT64_MAX - observed_owned_cpu_us) {
+                observed_owned_cpu_us = UINT64_MAX;
+            } else {
+                observed_owned_cpu_us += install_us;
+            }
+            observation->owned_cpu_us = observed_owned_cpu_us;
+        }
         if (n_dft != size_dft) {
             SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);
             if constexpr (Observed) {
@@ -4838,21 +5022,40 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     if (restored_lineage) {
         *restored_lineage = delivery.retention_lineage;
     }
+    // The restore extent is the full retained entry, including the snapshot,
+    // checkpoint ring, and typed accelerator payloads. Token coverage or the
+    // main snapshot alone is not an honest restore-size proxy.
+    const uint64_t restored_payload_bytes = uint64_t(it_best->size());
+    const int64_t commit_start_us = Measure ? ggml_time_us() : 0;
     commit_restore_delivery(
         it_best, std::move(delivery), prompt, id_slot, obs_source_best);
+    observe_span(commit_start_us);
+
+    if constexpr (Measure) {
+        observation->restored = true;
+        observation->payload_bytes = restored_payload_bytes;
+        observation->owned_cpu_us = observed_owned_cpu_us;
+    }
 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *);
+template bool server_prompt_cache::load_impl<false, false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *, server_prompt_cache_load_observation *);
+template bool server_prompt_cache::load_impl<false, true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *, server_prompt_cache_load_observation *);
+template bool server_prompt_cache::load_impl<true, false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *, server_prompt_cache_load_observation *);
+template bool server_prompt_cache::load_impl<true, true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *, server_prompt_cache_load_observation *);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage, server_prompt_cache_load_observation * observation) {
     GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
-    return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_lineage)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_lineage);
+    if (rec != nullptr) {
+        return observation
+            ? load_impl<true, true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_lineage, observation)
+            : load_impl<true, false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_lineage, nullptr);
+    }
+    return observation
+        ? load_impl<false, true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_lineage, observation)
+        : load_impl<false, false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_lineage, nullptr);
 }
 
 void server_prompt_cache::update() {

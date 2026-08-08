@@ -831,6 +831,13 @@ struct server_prompt_cache_state {
     }
 };
 
+struct server_prompt_cache_load_observation {
+    bool attempted = false;
+    bool restored = false;
+    uint64_t payload_bytes = 0;
+    uint64_t owned_cpu_us = 0;
+};
+
 inline void server_prompt_cache_apply_retention_lineage(
         server_prompt_cache_state & state,
         common_cache_retention_lineage lineage,
@@ -843,6 +850,7 @@ inline void server_prompt_cache_apply_retention_lineage(
 
 struct server_cache_authority;
 class server_cache_recovery_pin;
+class server_cache_observation_store;
 
 struct server_prompt_cache_payload_leaf {
     llama_cache_acct_category category =
@@ -929,10 +937,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_retention_lineage * restored_lineage = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_retention_lineage * restored_lineage = nullptr, server_prompt_cache_load_observation * observation = nullptr);
 
-    template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage);
+    template <bool Observed, bool Measure>
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage, server_prompt_cache_load_observation * observation);
 
     // D-A1's two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.
@@ -979,6 +987,7 @@ struct server_prompt_cache {
     // Explicit emission gate. An observed load also exists under B authority,
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
+    server_cache_observation_store * cache_observations = nullptr;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;

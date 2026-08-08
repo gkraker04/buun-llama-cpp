@@ -18,6 +18,7 @@
 struct server_prompt_cache_state;
 struct common_prompt_checkpoint;
 struct server_cache_authority;
+class server_cache_observation_store;
 
 struct server_cache_live_checkpoint_admission {
     llama_cache_acct_artifact_id artifact;
@@ -252,6 +253,7 @@ struct server_cache_checkpoint_authority_context {
     common_cache_family_binding cache_family;
     common_cache_retention_provenance retention_provenance =
         common_cache_retention_provenance::neutral;
+    server_cache_observation_store * observations = nullptr;
     bool debug_observability = false;
     void * raw_owner = nullptr;
     checkpoint_drop_fn raw_drop = nullptr;

@@ -492,6 +492,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc1-retention-policy.cmake
 )
 
+add_test(
+    NAME test-zc2-observer-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc2-observer.cmake
+)
+
 find_program(CAPSTONE_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
 add_test(
     NAME test-capstone-truth
