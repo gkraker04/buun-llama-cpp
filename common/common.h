@@ -669,6 +669,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
+    bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
     std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
     std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size

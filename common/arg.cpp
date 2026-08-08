@@ -824,9 +824,10 @@ static void common_params_postprocess_vbr(common_params & params) {
 
     if (!params.vbr_cache_type_k && !params.vbr_cache_type_v) {
         // --vbr-* without -ctk/-ctv vbr implies both sides — but never silently overwrite a cache
-        // type the user explicitly set to something else (f16 counts as unset: it is the default)
-        const bool k_free = params.cache_type_k == GGML_TYPE_F16;
-        const bool v_free = params.cache_type_v == GGML_TYPE_F16;
+        // type the user explicitly selected. Value alone cannot distinguish default F16 from
+        // an explicit F16 pin, so use the argument-presence bits maintained by -ct/-ctk/-ctv.
+        const bool k_free = !params.cache_type_k_explicit && params.cache_type_k == GGML_TYPE_F16;
+        const bool v_free = !params.cache_type_v_explicit && params.cache_type_v == GGML_TYPE_F16;
         if (!k_free && !v_free) {
             throw std::invalid_argument(
                 "--vbr-* flags need a VBR cache side: use -ctk vbr / -ctv vbr, or drop the explicit non-vbr cache types");
@@ -915,15 +916,16 @@ static void common_params_postprocess_vbr(common_params & params) {
                     "(per-seq KV streams) — forcing --kv-unified\n", params.n_parallel);
             params.kv_unified = true;
         }
-        // one-sided vbr with the opposite side untouched (still the f16 default) means half
-        // the cache would never degrade — treat "vbr" as the mode it is and imply it on the
-        // free side (the one-flag quickstart intent). An explicitly non-default opposite side
-        // stays PINNED at that type: the runtime skips its degrade steps.
+        // One-sided VBR with the opposite side untouched means half the cache would never
+        // degrade — treat "vbr" as the mode it is and imply it on that free side (the one-flag
+        // quickstart intent). Any explicitly selected opposite type, including F16, stays
+        // PINNED: the runtime skips its degrade steps.
         if (params.vbr_cache_type_k != params.vbr_cache_type_v) {
             const bool k_is_vbr = params.vbr_cache_type_k;
-            ggml_type & other_type = k_is_vbr ? params.cache_type_v     : params.cache_type_k;
-            bool &      other_vbr  = k_is_vbr ? params.vbr_cache_type_v : params.vbr_cache_type_k;
-            if (other_type == GGML_TYPE_F16) {
+            ggml_type & other_type     = k_is_vbr ? params.cache_type_v          : params.cache_type_k;
+            bool &      other_vbr      = k_is_vbr ? params.vbr_cache_type_v      : params.vbr_cache_type_k;
+            const bool  other_explicit = k_is_vbr ? params.cache_type_v_explicit : params.cache_type_k_explicit;
+            if (!other_explicit && other_type == GGML_TYPE_F16) {
                 other_vbr = true;
                 LOG_INF("VBR dynamic: applying vbr to the %s cache as well (it was unset); set "
                         "-ct%s to a concrete type to pin it instead\n",
@@ -3046,6 +3048,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
+            params.cache_type_k_explicit = true;
+            params.cache_type_v_explicit = true;
             params.vbr_cache_type_k = common_vbr_is_alias(value);
             params.vbr_cache_type_v = params.vbr_cache_type_k;
             params.vbr_cache_type_k_explicit = params.vbr_cache_type_k;
@@ -3064,6 +3068,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vbr_cache_type_k ? "vbr (implicit t4 floor)" : ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
+            params.cache_type_k_explicit = true;
             params.vbr_cache_type_k = common_vbr_is_alias(value);
             params.vbr_cache_type_k_explicit = params.vbr_cache_type_k;
             params.cache_type_k = kv_cache_type_from_str(value);
@@ -3079,6 +3084,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vbr_cache_type_v ? "vbr (implicit t4 floor)" : ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
+            params.cache_type_v_explicit = true;
             params.vbr_cache_type_v = common_vbr_is_alias(value);
             params.vbr_cache_type_v_explicit = params.vbr_cache_type_v;
             params.cache_type_v = kv_cache_type_from_str(value);
