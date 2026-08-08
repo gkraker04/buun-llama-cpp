@@ -613,7 +613,10 @@ void server_cache_plan_authority::plan_local_before_mutation(
                 common_cache_plan_authority_fallback::stale_capability);
             return;
         }
-        if (rec.selection != common_cache_plan_selection::by_id) {
+        const auto decision_level = server_cache_plan_level_of(rec.selection);
+        if (decision_level == common_cache_plan_authority_level::off ||
+            decision_level == common_cache_plan_authority_level::_count ||
+            !server_cache_plan_level_enabled(configured_level, decision_level)) {
             rec.clear_planner_outputs();
             rec.planner_status = common_cache_plan_planner_status::profile_unfitted;
             local_refuse(rec,
@@ -683,16 +686,21 @@ void server_cache_plan_authority::plan_local_before_mutation(
                    COMMON_CACHE_PLAN_MAX_CANDIDATES> lookups = {};
         std::array<std::array<server_cache_calibration_snapshot_lookup, 3>,
                    COMMON_CACHE_PLAN_MAX_CANDIDATES> consequence_lookups = {};
+        std::array<bool, COMMON_CACHE_PLAN_MAX_CANDIDATES>
+            consequence_points_complete = {};
+        consequence_points_complete.fill(true);
         local_profile_reduction reduction;
         const auto price_consequences = [&](
                 uint32_t i, common_cache_plan_candidate & row) {
             const auto & candidate_evidence = evidence.candidates[i];
             if (candidate_evidence.requires_d_consequences &&
                 candidate_evidence.consequence_count == 0) {
+                consequence_points_complete[i] = false;
                 return false;
             }
             if (candidate_evidence.consequence_count >
                     candidate_evidence.consequences.size()) {
+                consequence_points_complete[i] = false;
                 return false;
             }
             bool complete = true;
@@ -707,7 +715,6 @@ void server_cache_plan_authority::plan_local_before_mutation(
                     lookup.state =
                         server_cache_calibration_instance_state::unseen;
                 }
-                reduction.note(lookup);
                 if (!lookup.point_available) {
                     complete = false;
                     continue;
@@ -738,6 +745,7 @@ void server_cache_plan_authority::plan_local_before_mutation(
                     SERVER_CACHE_CALIBRATION_ESTIMATOR_VERSION;
                 row.predicted_total_us.value += estimate;
             }
+            consequence_points_complete[i] = complete;
             return complete;
         };
         for (uint32_t i = 0; i < rec.n_inventory; ++i) {
@@ -772,8 +780,7 @@ void server_cache_plan_authority::plan_local_before_mutation(
                 lookups[i].point_available = false;
                 reduction.all_points = false;
             }
-            reduction.all_points =
-                price_consequences(i, row) && reduction.all_points;
+            (void) price_consequences(i, row);
         }
 
         if (reduction.all_points) {
@@ -785,9 +792,8 @@ void server_cache_plan_authority::plan_local_before_mutation(
         if (reduction.all_points) {
             for (uint32_t i = 0; i < rec.n_inventory; ++i) {
                 auto & row = rec.inventory[i];
-                if (row.viable() && row.is_chain() &&
-                    !price_consequences(i, row)) {
-                    reduction.all_points = false;
+                if (row.viable() && row.is_chain()) {
+                    (void) price_consequences(i, row);
                 }
             }
         }
@@ -838,6 +844,26 @@ void server_cache_plan_authority::plan_local_before_mutation(
         rec.optimizer.benefit_estimate_us =
             double(rec.inventory[size_t(legacy_plan_candidate)].predicted_total_us.value) -
             double(rec.inventory[size_t(challenger)].predicted_total_us.value);
+
+        // A missing destruction consequence is a nonnegative cost. Price it
+        // as zero during the exhaustive chooser, which is the most favorable
+        // possible value for that candidate. A fully evidenced challenger
+        // that still wins is therefore not selected by hiding an immature
+        // competitor. The optimistic candidate itself remains ineligible:
+        // it must acquire every required D term before authority can execute
+        // it. This avoids a counterfactual bootstrapping cycle without ever
+        // treating missing evidence as proof of a cheap destructive plan.
+        if (!consequence_points_complete[size_t(challenger)]) {
+            local_refuse(rec,
+                common_cache_optimizer_fallback_reason::incomplete_evidence,
+                common_cache_optimizer_coverage_class::point_estimate_incomplete,
+                common_cache_optimizer_profile_state::learning,
+                common_cache_optimizer_disposition::learning, latch);
+            common_cache_plan_derive_shadow_authority(
+                rec, configured_level,
+                common_cache_plan_authority_fallback::incomplete_evidence);
+            return;
+        }
 
         if (reduction.reason != common_cache_optimizer_fallback_reason::none) {
             local_refuse(rec,

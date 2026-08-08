@@ -80,13 +80,13 @@ common_cache_optimizer_effective_config common_cache_optimizer_resolve(
         return out;
     }
 
-    // ZC5a lands only the by-id local ratchet. An explicit higher ceiling is
+    // ZC5b lands the similarity local ratchet. An explicit higher ceiling is
     // a ceiling, not a request to enable unlanded tiers; explicit off remains
     // a complete local-authority kill switch.
     out.local_authority_ceiling = raw.cache_plan_authority_explicit
         ? std::min(raw.cache_plan_authority,
-                   common_cache_plan_authority_level::by_id)
-        : common_cache_plan_authority_level::by_id;
+                   common_cache_plan_authority_level::similarity)
+        : common_cache_plan_authority_level::similarity;
     return out;
 }
 

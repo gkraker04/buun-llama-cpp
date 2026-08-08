@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common-cache-plan.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -119,12 +120,14 @@ static void test_nonoff_modes() {
         CHECK(out.local_authority_ceiling ==
               (raw.cache_plan_authority == common_cache_plan_authority_level::off
                   ? common_cache_plan_authority_level::off
-                  : common_cache_plan_authority_level::by_id));
+                  : std::min(raw.cache_plan_authority,
+                             common_cache_plan_authority_level::similarity)));
     }
     raw.cache_plan_authority_explicit = false;
     raw.cache_plan_authority = common_cache_plan_authority_level::lru;
     out = common_cache_optimizer_resolve(raw);
-    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::by_id);
+    CHECK(out.local_authority_ceiling ==
+          common_cache_plan_authority_level::similarity);
 }
 
 static std::vector<char *> argv_for(std::vector<std::string> & args) {
@@ -161,7 +164,7 @@ static void test_parser_explicitness() {
     CHECK(params.cache_optimizer.landed_authority_level ==
           common_cache_plan_authority_level::off);
     CHECK(params.cache_optimizer.local_authority_ceiling ==
-          common_cache_plan_authority_level::by_id);
+          common_cache_plan_authority_level::similarity);
 
     std::vector<std::string> absent_args { "test-cache-optimizer-config" };
     auto absent_argv = argv_for(absent_args);

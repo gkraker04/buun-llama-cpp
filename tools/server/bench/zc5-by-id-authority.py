@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused ZC5a live gate: learn exact families, restart, exercise by-id.
+"""Focused ZC5 live gate: learn exact families, restart, exercise one tier.
 
 The replay scenario proves either certified execution or an active-profile
 baseline-preservation decision over live/cold replay. The host scenario trains
@@ -7,6 +7,9 @@ the lifecycle-owned preparation/apply/recovery terms where host restore wins.
 The oversized-host scenario creates the natural opposite regime: historical
 selection restores a long saved subject for a short-prefix request, while cold
 replay processes only that short request.
+The similarity-crossover scenario creates a long live continuation plus an
+exact shorter host artifact: historical policy restores the host object while
+calibrated similarity authority may rewind the resident tail in place.
 """
 
 import argparse
@@ -52,6 +55,7 @@ class Arm:
             "--cache-plan-authority", authority,
             "--cache-ram", str(args.cache_ram),
             "--ctx-checkpoints", str(args.ctx_checkpoints),
+            "--slot-prompt-similarity", str(args.slot_prompt_similarity),
             "--seed", str(args.seed),
         ]
         for value in args.extra_server_arg:
@@ -90,12 +94,15 @@ class Arm:
         self.log.close()
 
 
-def completion(base, prompt, seed):
-    status, payload = request(base, "/completion", {
-        "prompt": prompt, "id_slot": 0, "cache_prompt": True,
+def completion(base, prompt, seed, forced=True):
+    body = {
+        "prompt": prompt, "cache_prompt": True,
         "n_predict": 2, "temperature": 0, "seed": seed,
-    })
-    if status != 200 or payload.get("id_slot") != 0:
+    }
+    if forced:
+        body["id_slot"] = 0
+    status, payload = request(base, "/completion", body)
+    if status != 200 or (forced and payload.get("id_slot") != 0):
         raise RuntimeError(f"completion failed: {status} {payload}")
     return payload.get("content") or ""
 
@@ -176,7 +183,58 @@ def training_oversized_host(base, seed, cycle):
     return 7
 
 
+def training_similarity_crossover(base, seed, cycle):
+    rows = [
+        f"Similarity durable row {i}: bucket {i % 13} contains {i * 7} units."
+        for i in range(112)
+    ]
+    common = "Similarity durable conversation. " + " ".join(rows)
+    alpha = common + " Alpha terminal remains canonical."
+    long_tail = " ".join(
+        f"Beta continuation {i}: branch {i % 17} remains deliberately long."
+        for i in range(256))
+    beta = (common + f" Beta terminal {cycle % 2} remains distinct. " +
+            long_tail)
+    rewind_base = (
+        f"Natural rewind family {cycle}. " + " ".join(
+            f"Rewind row {i}: bucket {i % 11} is stable."
+            for i in range(112)))
+    rewind_long = rewind_base + " " + " ".join(
+        f"Discardable tail {i}: branch {i % 19}." for i in range(256))
+    # Alternate around the gate's short replay tail so authority uses
+    # interpolation inside observed coverage, never a one-token extrapolation.
+    rewind_return = rewind_base + (
+        " Return through the short branch. Extra padding."
+        if cycle % 2 else " Return.")
+    displacement = " ".join(
+        f"Similarity displacement {cycle}-{i} is unrelated."
+        for i in range(112))
+
+    # First execute the same deep-rewind geometry naturally while no matching
+    # host artifact exists.  This is ordinary historical traffic, not forced
+    # counterfactual exploration, and supplies the live-replay observations
+    # needed to price the later alternative.
+    erase_slot(base)
+    completion(base, rewind_base, seed)
+    completion(base, rewind_long, seed)
+    completion(base, rewind_return, seed, forced=False)
+
+    # A->displacement publishes the exact A host artifact.  B shares nearly
+    # all of A but has a tail more than twice A's extent.  The final unforced A
+    # request therefore selects B by strict similarity while f_keep < 0.5,
+    # which enables the shipped host lookup.  Historical policy restores A;
+    # calibrated similarity authority may instead rewind B's tail in place.
+    erase_slot(base)
+    completion(base, alpha, seed)
+    completion(base, displacement, seed)
+    completion(base, beta, seed)
+    completion(base, alpha, seed, forced=False)
+    return 7
+
+
 def training_cycle(args, base, cycle):
+    if args.scenario == "similarity_crossover":
+        return training_similarity_crossover(base, args.seed, cycle)
     if args.scenario == "host":
         return training_host(base, args.seed, cycle)
     if args.scenario == "host_long":
@@ -225,17 +283,53 @@ def fingerprint_exact(path):
         return any(pattern.search(line) for line in handle)
 
 
+def candidate(row, candidate_id):
+    if not isinstance(candidate_id, int):
+        return None
+    for value in row.get("candidates") or []:
+        if value.get("id") == candidate_id:
+            return value
+    return None
+
+
+def tier_execution(row, tier, scenario):
+    optimizer = row.get("optimizer") or {}
+    local = optimizer.get("local_authority") or {}
+    authority = row.get("authority") or {}
+    if not (row.get("selection") == tier and
+            optimizer.get("request_execution_policy") ==
+                "local_online_authority" and
+            local.get("state") == "executed"):
+        return False
+    if scenario != "similarity_crossover":
+        return True
+    baseline = candidate(row, optimizer.get("baseline_plan_candidate"))
+    economic = candidate(row, optimizer.get("economic_plan_candidate"))
+    return bool(
+        authority.get("disagreed") and baseline and economic and
+        baseline.get("provider") == "host_cache_entry" and
+        economic.get("provider") == "live_slot" and
+        row.get("chosen") == "live_slot")
+
+
 def self_test():
     row = {
         "optimizer": {
             "local_authority": {"state": "executed"},
             "request_execution_policy": "local_online_authority",
+            "baseline_plan_candidate": 1,
+            "economic_plan_candidate": 0,
         },
-        "selection": "by_id", "shipped_plan_candidate": 0,
+        "authority": {"disagreed": True},
+        "selection": "similarity", "chosen": "live_slot",
+        "candidates": [
+            {"id": 0, "provider": "live_slot"},
+            {"id": 1, "provider": "host_cache_entry"},
+        ],
     }
-    assert row["optimizer"]["local_authority"]["state"] == "executed"
-    assert row["optimizer"]["request_execution_policy"] == \
-        "local_online_authority"
+    assert tier_execution(row, "similarity", "similarity_crossover")
+    row["authority"]["disagreed"] = False
+    assert not tier_execution(row, "similarity", "similarity_crossover")
 
 
 def sealed_model(path):
@@ -272,8 +366,12 @@ def main():
     parser.add_argument("--cache-ram", type=int, default=0)
     parser.add_argument("--ctx-checkpoints", type=int, default=0)
     parser.add_argument(
-        "--scenario", choices=("replay", "host", "host_long", "oversized_host"),
+        "--scenario", choices=("replay", "host", "host_long", "oversized_host",
+                               "similarity_crossover"),
                         default="replay")
+    parser.add_argument(
+        "--decision-tier", choices=("by_id", "similarity"), default="by_id")
+    parser.add_argument("--slot-prompt-similarity", type=float, default=0.1)
     parser.add_argument("--expect", choices=("execute", "preserve"),
                         default="execute")
     parser.add_argument("--seed", type=int, default=7)
@@ -313,7 +411,7 @@ def main():
         learn.stop()
 
     auto_log = os.path.join(args.workdir, "auto.log")
-    auto = Arm(args, "auto", "by_id", args.port + 1, auto_log)
+    auto = Arm(args, "auto", args.decision_tier, args.port + 1, auto_log)
     executed = False
     outputs = []
     auto_requests = 0
@@ -329,13 +427,8 @@ def main():
             time.sleep(1.05)
             auto.log.flush()
             rows = parse_plans(auto_log)
-            executed = any(
-                row.get("selection") == "by_id" and
-                (row.get("optimizer") or {}).get("request_execution_policy") ==
-                    "local_online_authority" and
-                ((row.get("optimizer") or {}).get("local_authority") or {}).get(
-                    "state") == "executed"
-                for row in rows)
+            executed = any(tier_execution(
+                row, args.decision_tier, args.scenario) for row in rows)
             outputs = rows
     finally:
         auto.stop()
@@ -344,8 +437,7 @@ def main():
     auto_observations = parse_observations(auto_log)
     executed_rows = [
         row for row in outputs
-        if ((row.get("optimizer") or {}).get("local_authority") or {}).get(
-            "state") == "executed"
+        if tier_execution(row, args.decision_tier, args.scenario)
     ]
     active_preserve_rows = [
         row for row in outputs
@@ -375,11 +467,16 @@ def main():
     def evidence(row):
         optimizer = row.get("optimizer") or {}
         local = optimizer.get("local_authority") or {}
+        baseline = candidate(row, optimizer.get("baseline_plan_candidate"))
+        economic = candidate(row, optimizer.get("economic_plan_candidate"))
         return {
+            "selection": row.get("selection"),
             "prompt_tokens": row.get("n_prompt_tokens"),
             "chosen_provider": row.get("chosen"),
             "baseline_candidate": optimizer.get("baseline_plan_candidate"),
+            "baseline_provider": baseline.get("provider") if baseline else None,
             "economic_candidate": optimizer.get("economic_plan_candidate"),
+            "economic_provider": economic.get("provider") if economic else None,
             "profile_state": optimizer.get("profile_state"),
             "authority_state": local.get("state"),
             "authority_reason": local.get("reason"),
@@ -393,7 +490,8 @@ def main():
         if (row.get("optimizer") or {}).get("profile_state") == "active"]
     exact_inputs = fingerprint_exact(learn_log) and fingerprint_exact(auto_log)
     result = {
-        "schema": "zc5-by-id-authority/v2",
+        "schema": "zc5-local-authority/v3",
+        "decision_tier": args.decision_tier,
         "learn_requests": learn_requests,
         "auto_requests": auto_requests,
         "auto_records": len(outputs),
@@ -416,11 +514,11 @@ def main():
     pathlib.Path(args.workdir, "result.json").write_text(encoded + "\n")
     print(encoded)
     if not exact_inputs:
-        raise SystemExit("ZC5a exact fingerprint inputs were not observed")
+        raise SystemExit("ZC5 exact fingerprint inputs were not observed")
     if args.expect == "execute" and not executed:
-        raise SystemExit("ZC5a by-id authority did not execute")
+        raise SystemExit(f"ZC5 {args.decision_tier} authority did not execute")
     if args.expect == "preserve" and (executed or not active_preserve):
-        raise SystemExit("ZC5a active profile did not preserve the baseline")
+        raise SystemExit("ZC5 active profile did not preserve the baseline")
 
 
 if __name__ == "__main__":

@@ -1637,6 +1637,60 @@ static void test_local_by_id_certification_and_currency() {
     CHECK(higher_tier.optimizer.local_authority.state ==
           common_cache_optimizer_authority_state::not_attempted);
 
+    // ZC5b raises only the graduated ceiling. The same estimator, receipt,
+    // and move-only latch can certify a strict-similarity same-target replay
+    // over the historical host restore; a by-id authority above already
+    // refused this identical decision tier.
+    server_cache_observation_store similarity_observations;
+    similarity_observations.set_execution_fingerprint(fingerprint);
+    similarity_observations.set_calibration_claim_identity(true, 3, 5);
+    auto similarity_instances = instances;
+    similarity_instances[3].n_validation = 8;
+    similarity_instances[3].validation_region_count = 3;
+    CHECK(similarity_observations.restore_persisted_instances(
+        similarity_instances, 1));
+    similarity_observations.set_calibration_claim_identity(true, 3, 5);
+    similarity_observations.set_committed_profile_mutation_generation(
+        UINT64_MAX);
+    server_cache_plan_authority similarity_authority(
+        common_cache_plan_authority_level::similarity,
+        &similarity_observations);
+    CHECK(similarity_authority.set_profile_display_salt(display_salt));
+    auto similarity_rec = original_rec;
+    similarity_rec.selection = common_cache_plan_selection::similarity;
+    similarity_rec.inventory[live_id].origin_tier =
+        common_cache_plan_selection::similarity;
+    similarity_rec.inventory[host_id].origin_tier =
+        common_cache_plan_selection::similarity;
+    auto similarity_evidence = evidence;
+    // Production always retains a cold control. Replacing the live slot with
+    // that control has a nonnegative D cost whose local preparation class may
+    // be immature. Its optimistic zero-cost total is still far above the
+    // mature live replay, so it cannot block the safe challenger. If this
+    // missing-D candidate itself wins, the existing missing_d case above
+    // proves that execution still refuses incomplete evidence.
+    similarity_evidence.candidates[checkpoint_id].
+        requires_d_consequences = true;
+    server_cache_plan_local_authority_latch similarity_latch;
+    similarity_authority.plan_local_before_mutation(
+        similarity_rec, similarity_evidence, similarity_observations,
+        int32_t(host_id),
+        9, 9, now_ms, 0, &similarity_latch);
+    CHECK(similarity_rec.authority_prequalified);
+    CHECK(similarity_rec.shadow_choice == int32_t(live_id));
+    CHECK(similarity_rec.optimizer.economic_disposition ==
+          common_cache_optimizer_disposition::certified_improvement);
+    auto similarity_execution = similarity_authority.authorize(
+        similarity_rec, 0, true, true, 0, std::move(similarity_latch));
+    CHECK(similarity_execution.kind ==
+          server_cache_plan_execution_kind::live_replay);
+    CHECK(similarity_execution.target == 0);
+    similarity_rec.shipped_plan_candidate = int32_t(live_id);
+    similarity_authority.finalize_execution(
+        similarity_rec, &similarity_execution.local_authority);
+    CHECK(similarity_rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::executed);
+
     // A copyable receipt is diagnostic only. Without the move-only capability
     // produced by this exact planning invocation it cannot authorize.
     auto stale = receipt_only;

@@ -113,6 +113,8 @@ foreach(REQUIRED IN ITEMS
         "common_cache_plan_compose_preestimated_chains("
         "price_consequences(i, row)"
         "candidate_evidence.requires_d_consequences"
+        "consequence_points_complete[size_t(challenger)]"
+        "most favorable"
         "rec.inventory[size_t(legacy_plan_candidate)].is_chain()"
         "common_cache_optimizer_disposition::certified_improvement"
         "rec.authority_prequalified = true;")
@@ -128,9 +130,15 @@ endif()
 
 foreach(REQUIRED IN ITEMS
         "out.local_authority_ceiling = raw.cache_plan_authority_explicit"
-        "common_cache_plan_authority_level::by_id")
+        "common_cache_plan_authority_level::similarity")
     contract_require_token("${OPTIMIZER_CPP}" "${REQUIRED}"
-        "ZC5a by-id ceiling resolver")
+        "ZC5b similarity ceiling resolver")
+endforeach()
+foreach(REQUIRED IN ITEMS
+        "const auto decision_level = server_cache_plan_level_of(rec.selection);"
+        "!server_cache_plan_level_enabled(configured_level, decision_level)")
+    contract_require_token("${LOCAL_PLAN}" "${REQUIRED}"
+        "ZC5b graduated local planner")
 endforeach()
 foreach(REQUIRED IN ITEMS
         "out->local.candidates[index].feature"
@@ -207,6 +215,16 @@ string(FIND "${MUTATED_LOCAL}" "bound.benefit_lower_us > 0.0" STRICT_MARGIN)
 if (NOT STRICT_MARGIN EQUAL -1)
     message(FATAL_ERROR "ZC5a strict-margin negative control did not trip")
 endif()
+set(MUTATED_OPTIMISTIC_D "${LOCAL_PLAN}")
+string(REPLACE "if (!consequence_points_complete[size_t(challenger)])"
+               "if (false)"
+               MUTATED_OPTIMISTIC_D "${MUTATED_OPTIMISTIC_D}")
+string(FIND "${MUTATED_OPTIMISTIC_D}"
+    "consequence_points_complete[size_t(challenger)]" OPTIMISTIC_D_GATE)
+if (NOT OPTIMISTIC_D_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC5b optimistic missing-D selection negative control did not trip")
+endif()
 set(MUTATED_ENVELOPE "${MODEL_CPP}")
 string(REPLACE "PROVISIONAL_AUTHORITY_ENVELOPE_MULTIPLIER = 3.0"
                "PROVISIONAL_AUTHORITY_ENVELOPE_MULTIPLIER = 1.0"
@@ -268,4 +286,4 @@ if (NOT MUTATED_FLEET_TERMINAL)
         "ZC5a unselected-terminal negative control did not trip")
 endif()
 
-message(STATUS "ZC5a local-authority contract checks passed")
+message(STATUS "ZC5a/b local-authority contract checks passed")
