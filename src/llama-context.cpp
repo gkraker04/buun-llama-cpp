@@ -9092,6 +9092,14 @@ bool llama_context_is_warmup(const llama_context * ctx) {
     return ctx && ctx->is_warmup();
 }
 
+bool llama_context_pipeline_parallel_active(const llama_context * ctx) {
+    return ctx && ctx->pipeline_parallel_active();
+}
+
+bool llama_context_vbr_vmm_active(const llama_context * ctx) {
+    return ctx && ctx->vbr_vmm_active();
+}
+
 float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 

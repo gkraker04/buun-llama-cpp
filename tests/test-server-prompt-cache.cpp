@@ -389,6 +389,8 @@ void test_declared_family_round_trip_and_price() {
     checkpoint.pos_min = 0;
     checkpoint.pos_max = 1;
     checkpoint.id_task_referenced = 17;
+    checkpoint.adapter_application_digest[0] = 0xa5;
+    checkpoint.adapter_application_complete = true;
     checkpoint.retention_lineage.declaration = declared_main;
     checkpoint.data_tgt.assign(4, 7);
 
@@ -399,9 +401,12 @@ void test_declared_family_round_trip_and_price() {
     assigned = checkpoint;
     CHECK(assigned.retention_lineage.declaration == declared_main);
     CHECK(assigned.id_task_referenced == 17);
+    CHECK(assigned.adapter_application_complete);
+    CHECK(assigned.adapter_application_digest[0] == 0xa5);
     copied.clear();
     CHECK(!copied.retention_lineage.declaration.declared());
     CHECK(copied.id_task_referenced == -1);
+    CHECK(!copied.adapter_application_complete);
 
     common_prompt_checkpoint automatic_checkpoint;
     automatic_checkpoint.retention_lineage.automatic_provenance =
@@ -421,10 +426,18 @@ void test_declared_family_round_trip_and_price() {
     CHECK(cloned.checkpoints.front().retention_lineage.declaration == declared_main);
 
     server_prompt_cache cache(0, 0);
-    auto staged = cache.stage(source, 8, 0, "family-adapter");
+    std::array<uint8_t, 32> host_adapter_digest = {};
+    host_adapter_digest[0] = 0x5a;
+    auto staged = cache.stage(
+        source, 8, 0, "family-adapter", host_adapter_digest, true);
     CHECK(staged.size() == 1);
     CHECK(staged.front().prompt.checkpoints.front().retention_lineage.declaration ==
           declared_main);
+    CHECK(staged.front().adapter_application_complete);
+    CHECK(staged.front().adapter_application_digest[0] == 0x5a);
+    CHECK(staged.front().prompt.checkpoints.front().adapter_application_complete);
+    CHECK(staged.front().prompt.checkpoints.front().adapter_application_digest[0] ==
+          0xa5);
     server_prompt_cache_apply_retention_lineage(
         staged.front(), { declared_main, {} }, true, false);
     CHECK(staged.front().retention_lineage.declaration == declared_main);

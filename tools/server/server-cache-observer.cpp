@@ -182,10 +182,29 @@ bool server_cache_observation_key::operator==(
         ubatch_bucket == other.ubatch_bucket &&
         size_family == other.size_family &&
         feature_dim == other.feature_dim &&
+        profile_execution_digest == other.profile_execution_digest &&
         participant_execution_digest == other.participant_execution_digest &&
+        adapter_application_digest == other.adapter_application_digest &&
         representation_digest == other.representation_digest &&
-        effect_action_shape_digest == other.effect_action_shape_digest &&
-        identity_complete == other.identity_complete;
+        effect_action_shape_digest == other.effect_action_shape_digest;
+}
+
+void server_cache_observation_store::set_execution_fingerprint(
+        const server_cache_execution_fingerprint & value) noexcept {
+    execution_fingerprint_ = value;
+}
+
+void server_cache_observation_store::apply_execution_fingerprint(
+        server_cache_observation_key & key) const noexcept {
+    if (!execution_fingerprint_.complete) {
+        return;
+    }
+    key.profile_execution_digest = execution_fingerprint_.execution_root;
+    // Participant and representation identity are operation-local facts.
+    // ZC3a only supplies the profile root and immutable adapter carrier, so
+    // observations remain diagnostic until ZC4 binds those two digests.
+    key.identity_complete = false;
+    key.identity_exact = execution_fingerprint_.exact;
 }
 
 bool server_cache_observation_store::observe(

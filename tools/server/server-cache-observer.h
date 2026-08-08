@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common-cache-plan.h"
+#include "server-cache-fingerprint.h"
 
 #include <array>
 #include <cstdint>
@@ -71,10 +72,17 @@ struct server_cache_observation_key {
     uint8_t ubatch_bucket = 0;
     uint8_t size_family = 0;
     uint8_t feature_dim = 0;
+    // Process/profile identity is deliberately separate from the operated-on
+    // state. ZC4 supplies participant and representation digests at the real
+    // provider seam; a global execution root must never impersonate either.
+    std::array<uint8_t, 32> profile_execution_digest = {};
     std::array<uint8_t, 32> participant_execution_digest = {};
+    std::array<uint8_t, 32> adapter_application_digest = {};
     std::array<uint8_t, 32> representation_digest = {};
     std::array<uint8_t, 32> effect_action_shape_digest = {};
+    bool adapter_application_complete = false;
     bool identity_complete = false;
+    bool identity_exact = false;
 
     bool operator==(const server_cache_observation_key & other) const noexcept;
 };
@@ -150,12 +158,20 @@ public:
         return recent_records_;
     }
     uint64_t records_seen() const noexcept { return records_seen_; }
+    void set_execution_fingerprint(
+        const server_cache_execution_fingerprint & value) noexcept;
+    void apply_execution_fingerprint(
+        server_cache_observation_key & key) const noexcept;
+    const server_cache_execution_fingerprint & execution_fingerprint() const noexcept {
+        return execution_fingerprint_;
+    }
 
 private:
     std::array<server_cache_observation_instance, instance_capacity> instances_ = {};
     std::array<server_cache_observation_record, diagnostic_capacity> recent_records_ = {};
     server_cache_observation_counters counters_;
     uint64_t records_seen_ = 0;
+    server_cache_execution_fingerprint execution_fingerprint_;
 };
 
 server_cache_observation_key server_cache_observation_cpu_key(

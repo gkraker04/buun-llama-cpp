@@ -197,6 +197,8 @@ common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoin
     representation_epoch_swa(other.representation_epoch_swa),
     computation_frontier(other.computation_frontier),
     retention_lineage(other.retention_lineage),
+    adapter_application_digest(other.adapter_application_digest),
+    adapter_application_complete(other.adapter_application_complete),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
     accel(other.accel),
@@ -237,6 +239,8 @@ void common_prompt_checkpoint::clear() {
 
     computation_frontier.clear();
     retention_lineage = {};
+    adapter_application_digest = {};
+    adapter_application_complete = false;
 
     data_tgt.clear();
     data_dft.clear();

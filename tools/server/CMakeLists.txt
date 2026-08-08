@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-cache-plan-preflight-internal.h
     server-cache-observer.cpp
     server-cache-observer.h
+    server-cache-fingerprint.cpp
+    server-cache-fingerprint.h
     server-cache-lease.cpp
     server-cache-lease.h
     server-cache-retention-proof.cpp
@@ -132,6 +134,15 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-cache-observer PRIVATE cxx_std_17)
     add_test(NAME test-server-cache-observer COMMAND test-server-cache-observer)
     set_property(TEST test-server-cache-observer PROPERTY LABELS main)
+
+    add_executable(test-server-cache-fingerprint
+        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-fingerprint.cpp)
+    target_link_libraries(test-server-cache-fingerprint PRIVATE server-context)
+    target_include_directories(test-server-cache-fingerprint PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(test-server-cache-fingerprint PRIVATE cxx_std_17)
+    add_test(NAME test-server-cache-fingerprint COMMAND test-server-cache-fingerprint)
+    set_property(TEST test-server-cache-fingerprint PROPERTY LABELS main)
 
     add_executable(zc1-retention-grid bench/zc1-retention-grid.cpp)
     target_link_libraries(zc1-retention-grid PRIVATE server-context)

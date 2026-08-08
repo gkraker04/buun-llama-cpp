@@ -804,6 +804,8 @@ struct server_prompt_cache_state {
     // E1 declared identity replaces this heuristic rather than stacking with it.
     bool main_family = false;
     common_cache_retention_lineage retention_lineage;
+    std::array<uint8_t, 32> adapter_application_digest = {};
+    bool adapter_application_complete = false;
 
     // ZC1 process-local retention identity. A list splice preserves both;
     // independently materialized nodes receive a fresh generation at publish.
@@ -926,7 +928,13 @@ struct server_prompt_cache {
     // published entry, never an eviction that bought nothing. Under lifecycle hard-lease pressure,
     // publish() may also return false after removing only its just-spliced incoming node; every
     // previously retained hard-leased/recovery-pinned entry remains untouched.
-    std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
+    std::list<server_prompt_cache_state> stage(
+        const server_prompt & prompt,
+        size_t state_size_main,
+        size_t state_size_drft,
+        std::string adapter_config_key,
+        std::array<uint8_t, 32> adapter_application_digest = {},
+        bool adapter_application_complete = false);
     bool publish(
             std::list<server_prompt_cache_state> entry,
             const server_prompt * source_prompt = nullptr,

@@ -71,6 +71,13 @@ enum class common_cache_plan_vbr_value_grammar : uint8_t {
     inline_or_path,
 };
 
+struct common_cache_plan_vbr_override_row {
+    uint16_t census_id = 0;
+    common_cache_plan_vbr_value_grammar grammar =
+        common_cache_plan_vbr_value_grammar::scalar;
+    std::string value;
+};
+
 // CLOSED CENSUS of every quoted VBR_* name in src/common/tools/ggml (D-pins r6).
 // The CI scan is reader-agnostic: wrapper reads, direct reads, programmatic producers,
 // diagnostics, and scripts all have to be classified here. `affects_cost` controls
@@ -130,6 +137,7 @@ struct common_cache_plan_vbr_regime {
     float       reclaim_floor_bpv = 0.0f;
     float       reset_keep_frac   = 0.0f;
     std::string overrides;           // canonical env-override tokens, empty when none
+    std::vector<common_cache_plan_vbr_override_row> override_rows;
     bool        unrepresented_override = false;
 };
 

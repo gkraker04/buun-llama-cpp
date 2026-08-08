@@ -69,9 +69,9 @@ endif()
 
 # ZC1 consumes retention_policy at its host/checkpoint adapters, the one
 # save-time lineage resolver, record/preflight serialization, and
-# initialization wiring. ZC2 consumes observer_store_enabled only at observer
-# construction and slot wiring. The authority ceiling remains descriptive
-# until its own ratchet.
+# initialization wiring. ZC2/ZC3 consume observer_store_enabled exactly at
+# loader descriptor capture and observer construction. The authority ceiling
+# remains descriptive until its own ratchet.
 function(assert_no_future_policy_reads text label)
     string(REGEX MATCHALL
         "(\\.|->)local_authority_ceiling"
@@ -98,7 +98,7 @@ endforeach()
 
 count_literal("${all_production}" ".observer_store_enabled"
     observer_store_enabled_reads)
-if (NOT observer_store_enabled_reads EQUAL 1)
+if (NOT observer_store_enabled_reads EQUAL 2)
     message(FATAL_ERROR
         "ZC2 observer-store consumer census drifted: ${observer_store_enabled_reads}")
 endif()
@@ -120,7 +120,7 @@ endif()
 set(observer_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.observer_store_enabled; }")
 count_literal("${observer_mutation}" ".observer_store_enabled"
     observer_mutation_reads)
-if (observer_mutation_reads EQUAL 1)
+if (observer_mutation_reads EQUAL 2)
     message(FATAL_ERROR "observer-store consumer negative control did not trip")
 endif()
 set(retention_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.retention_policy; }")

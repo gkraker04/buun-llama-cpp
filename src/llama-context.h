@@ -501,6 +501,12 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     bool is_warmup() const noexcept { return cparams.warmup; }
+    bool pipeline_parallel_active() const noexcept {
+        return cparams.pipeline_parallel;
+    }
+    bool vbr_vmm_active() const noexcept {
+        return memory && memory->vbr_ledger_tree_active();
+    }
 
     bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 

@@ -173,7 +173,9 @@ common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
         return vbr;
     }
 
+    uint16_t census_id = 0;
 #define COMMON_CACHE_PLAN_VBR_ENV_FOLD(NAME, AFFECTS, GRAMMAR)                         \
+    ++census_id;                                                                        \
     if (AFFECTS) {                                                                     \
         if (const char * val = getenv_fn(NAME)) {                                      \
             std::string token;                                                         \
@@ -182,6 +184,10 @@ common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
                 vbr.unrepresented_override = true;                                     \
             } else {                                                                   \
                 vbr.overrides += (vbr.overrides.empty() ? "" : " ") + token;          \
+                const size_t separator = token.find('=');                              \
+                vbr.override_rows.push_back({ census_id,                               \
+                    common_cache_plan_vbr_value_grammar::GRAMMAR,                      \
+                    token.substr(separator + 1) });                                    \
             }                                                                          \
         }                                                                              \
     }

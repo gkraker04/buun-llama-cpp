@@ -1,6 +1,7 @@
 #include "llama-mmap.h"
 
 #include "llama-impl.h"
+#include "llama-ext.h"
 
 #include "ggml.h"
 
@@ -15,6 +16,10 @@
         #include <unistd.h>
         #include <fcntl.h>
         #include <sys/stat.h>
+        #if defined(__linux__)
+            #include <sys/ioctl.h>
+            #include <linux/fs.h>
+        #endif
         #if defined(_POSIX_MAPPED_FILES)
             #include <sys/mman.h>
         #endif
@@ -65,7 +70,27 @@ static std::string llama_format_win_err(DWORD err) {
 
 // llama_file
 
+static bool llama_file_integrity_exact(int fd) {
+#if !defined(_WIN32) && defined(F_GET_SEALS)
+    const int seals = fcntl(fd, F_GET_SEALS);
+    constexpr int required = F_SEAL_SEAL | F_SEAL_SHRINK |
+                             F_SEAL_GROW | F_SEAL_WRITE;
+    if (seals >= 0 && (seals & required) == required) {
+        return true;
+    }
+#endif
+#if defined(__linux__) && defined(FS_IOC_GETFLAGS) && defined(FS_VERITY_FL)
+    long flags = 0;
+    if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 &&
+        (flags & FS_VERITY_FL) != 0) {
+        return true;
+    }
+#endif
+    return false;
+}
+
 struct llama_file::impl {
+    bool integrity_exact = false;
 #if defined(_WIN32)
     HANDLE fp_win32;
     std::string GetErrorMessageWin32(DWORD error_code) const {
@@ -291,6 +316,11 @@ struct llama_file::impl {
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
                         auto curr_off = tell();
+                        // The buffered fallback reopens by path. Even if the
+                        // original descriptor was immutable, this is no
+                        // longer the same loader object and cannot confer an
+                        // exact cross-restart fingerprint.
+                        integrity_exact = false;
                         close(fd);
                         fd = -1;
                         alignment = 1;
@@ -396,9 +426,15 @@ struct llama_file::impl {
 };
 
 llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
-    pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
+    pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {
+    pimpl->integrity_exact = llama_model_artifact_capture_enabled() &&
+                             llama_file_integrity_exact(file_id());
+}
 
-llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {
+    pimpl->integrity_exact = llama_model_artifact_capture_enabled() &&
+                             llama_file_integrity_exact(file_id());
+}
 
 llama_file::~llama_file() = default;
 
@@ -421,6 +457,10 @@ int llama_file::file_id() const {
     return ::fileno(pimpl->fp);
 #endif
 #endif
+}
+
+bool llama_file::integrity_exact_at_open() const {
+    return pimpl->integrity_exact;
 }
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }

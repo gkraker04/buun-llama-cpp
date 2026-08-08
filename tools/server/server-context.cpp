@@ -637,7 +637,13 @@ struct server_slot {
             // returned the exact declared length BEFORE publishing; a short write (e.g. a dynamic VBR
             // state_write refusal after a degrade) aborts the save without touching the cache,
             // instead of publishing a truncated entry [I10]. On any failure the state is NOT durable.
-            auto staged = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, adapter_key);
+            std::array<uint8_t, 32> adapter_application_digest = {};
+            const bool adapter_application_complete = cache_observations &&
+                server_cache_adapter_application_digest_v1(
+                    lora, adapter_application_digest);
+            auto staged = prompt_cache.stage(
+                prompt, cur_size_tgt, cur_size_dft, adapter_key,
+                adapter_application_digest, adapter_application_complete);
             if (staged.empty()) {
                 return prompt_save_result::failed;
             }
@@ -701,6 +707,16 @@ struct server_slot {
             auto key = server_cache_observation_cpu_key(
                 server_cache_observation_operation::restore,
                 common_cache_plan_provider::host_cache_entry, 0);
+            if (!cache_observations->execution_fingerprint().complete) {
+                key.identity_complete = false;
+            } else if (!server_cache_adapter_application_digest_v1(
+                    lora, key.adapter_application_digest)) {
+                key.identity_complete = false;
+                key.identity_exact = false;
+            } else {
+                key.adapter_application_complete = true;
+                cache_observations->apply_execution_fingerprint(key);
+            }
             if (load_observation.restored) {
                 cache_observation_epoch.arm(
                     id, key, load_observation.owned_cpu_us);
@@ -791,9 +807,20 @@ struct server_slot {
         const int64_t end_us = ggml_time_us();
         const auto key = server_cache_observation_cpu_key(
             operation, common_cache_plan_provider::live_slot, prepare_shape);
+        auto observed_key = key;
+        if (!cache_observations->execution_fingerprint().complete) {
+            observed_key.identity_complete = false;
+        } else if (!server_cache_adapter_application_digest_v1(
+                lora, observed_key.adapter_application_digest)) {
+            observed_key.identity_complete = false;
+            observed_key.identity_exact = false;
+        } else {
+            observed_key.adapter_application_complete = true;
+            cache_observations->apply_execution_fingerprint(observed_key);
+        }
         server_cache_observation_record record;
         (void) server_cache_observe_cpu_operation(
-            cache_observations, key, id, extent_bytes,
+            cache_observations, observed_key, id, extent_bytes,
             start_us, end_us, success, &record);
         server_cache_emit_observation_noexcept(
             record, cache_debug_observability);
@@ -2405,11 +2432,15 @@ private:
     // provisional identity with the stable multi-artifact profile; until then
     // production rows remain diagnostic and no planner can read this object.
     std::unique_ptr<server_cache_observation_store> cache_optimizer_observations;
+    std::unique_ptr<server_cache_fingerprint_worker> cache_fingerprint_worker;
+    bool cache_fingerprint_ready_logged = false;
+    bool cache_fingerprint_scheduler_busy = false;
     std::vector<uint32_t> cache_observation_batch_tokens;
     std::vector<llama_pos> cache_observation_first_pos;
 
-    static server_cache_observation_key cache_observation_provider_key(
-            common_cache_plan_provider provider) noexcept {
+    server_cache_observation_key cache_observation_provider_key(
+            common_cache_plan_provider provider,
+            const std::vector<common_adapter_lora_info> & adapters) noexcept {
         server_cache_observation_key key;
         key.provider = provider;
         key.operation = provider ==
@@ -2423,7 +2454,122 @@ private:
         // ZC3a fills stable execution/representation digests. Until then the
         // real row is bounded diagnostic evidence and can never become fit.
         key.identity_complete = false;
+        if (!cache_optimizer_observations->execution_fingerprint().complete) {
+            key.identity_complete = false;
+        } else if (!server_cache_adapter_application_digest_v1(
+                adapters, key.adapter_application_digest)) {
+            key.identity_complete = false;
+            key.identity_exact = false;
+        } else {
+            key.adapter_application_complete = true;
+            cache_optimizer_observations->apply_execution_fingerprint(key);
+        }
         return key;
+    }
+
+    void cache_fingerprint_start() noexcept {
+        if (!cache_optimizer_observations || !model_tgt ||
+            // mtmd currently exposes only a path-reopening loader. Until it
+            // can duplicate the descriptor actually consumed by inference,
+            // a multimodal execution fingerprint is honestly unavailable.
+            !params_base.mmproj.path.empty()) {
+            return;
+        }
+        std::vector<server_cache_fingerprint_field> fields;
+        std::vector<server_cache_fingerprint_descriptor> descriptors;
+        std::vector<server_cache_fingerprint_artifact> fixed_artifacts;
+        try {
+            const auto vbr = common_cache_plan_vbr_regime_from_params(
+                params_base,
+                [](const char * name) { return std::getenv(name); });
+            const uint32_t effective_n_gpu_layers =
+                params_base.n_gpu_layers >= 0
+                    ? uint32_t(params_base.n_gpu_layers)
+                    : uint32_t(llama_model_n_layer(model_tgt) + 1);
+            if (!server_cache_fingerprint_fields_v1(
+                    params_base, vbr, effective_n_gpu_layers,
+                    uint16_t(llama_context_pipeline_parallel_active(ctx_tgt)),
+                    uint16_t(llama_context_vbr_vmm_active(ctx_tgt)), fields)) {
+                return;
+            }
+
+            auto append_model = [&](const llama_model * model,
+                                    server_cache_fingerprint_artifact_role role) {
+                std::vector<llama_model_artifact_descriptor> source;
+                if (!llama_model_dup_artifact_descriptors(model, source)) {
+                    return false;
+                }
+                try {
+                    for (uint32_t i = 0; i < source.size(); ++i) {
+                        descriptors.push_back({
+                            role, i, source[i].descriptor,
+                            source[i].byte_length, source[i].integrity_exact });
+                        source[i].descriptor = -1;
+                    }
+                    return true;
+                } catch (...) {
+                    llama_model_artifact_descriptors_close(source);
+                    return false;
+                }
+            };
+            if (!append_model(model_tgt,
+                              server_cache_fingerprint_artifact_role::target) ||
+                (model_dft && !append_model(
+                    model_dft.get(),
+                    server_cache_fingerprint_artifact_role::draft))) {
+                server_cache_fingerprint_descriptors_close(descriptors);
+                return;
+            }
+            fixed_artifacts.reserve(params_base.lora_adapters.size());
+            for (uint32_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                std::array<uint8_t, 32> content = {};
+                if (!params_base.lora_adapters[i].ptr) {
+                    server_cache_fingerprint_descriptors_close(descriptors);
+                    return;
+                }
+                llama_adapter_meta_digest(
+                    params_base.lora_adapters[i].ptr, content.data());
+                fixed_artifacts.push_back({
+                    server_cache_fingerprint_artifact_role::adapter,
+                    i, 0, content,
+                    // The loaded content is immutable, but the current adapter
+                    // API does not expose its exact serialized byte extent.
+                    false });
+            }
+            cache_fingerprint_worker =
+                std::make_unique<server_cache_fingerprint_worker>();
+            cache_fingerprint_worker->set_scheduler_demand(
+                cache_fingerprint_scheduler_busy ||
+                std::any_of(slots.begin(), slots.end(),
+                    [](const server_slot & slot) {
+                        return slot.is_processing();
+                    }));
+            if (!cache_fingerprint_worker->start(
+                    std::move(descriptors), std::move(fields),
+                    std::move(fixed_artifacts))) {
+                cache_fingerprint_worker.reset();
+            }
+        } catch (...) {
+            server_cache_fingerprint_descriptors_close(descriptors);
+            cache_fingerprint_worker.reset();
+        }
+    }
+
+    void cache_fingerprint_lifecycle_point() noexcept {
+        if (!cache_fingerprint_worker || !cache_optimizer_observations) {
+            return;
+        }
+        server_cache_execution_fingerprint result;
+        if (cache_fingerprint_worker->poll(result)) {
+            cache_optimizer_observations->set_execution_fingerprint(result);
+            if (result.complete && !cache_fingerprint_ready_logged) {
+                cache_fingerprint_ready_logged = true;
+                SRV_INF("cache optimizer: stable execution fingerprint ready (%s)\n",
+                        result.exact ? "exact" : "shadow-only");
+            }
+            cache_fingerprint_worker->stop();
+            cache_fingerprint_worker.reset();
+        }
     }
 
     void cache_observation_begin_provider_cpu(server_slot & slot) noexcept {
@@ -2435,7 +2581,7 @@ private:
                 ? common_cache_plan_provider::live_slot
                 : common_cache_plan_provider::cold_replay;
             slot.cache_observation_epoch.arm(
-                slot.id, cache_observation_provider_key(provider));
+                slot.id, cache_observation_provider_key(provider, slot.lora));
         }
         if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
             slot.cache_observation_epoch.mark_mixed(
@@ -4440,6 +4586,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // ZC3a hashes loader-owned descriptor duplicates only. Join before
+        // model/context teardown; cancellation never publishes a partial root.
+        if (cache_fingerprint_worker) {
+            cache_fingerprint_worker->stop();
+            cache_fingerprint_worker.reset();
+        }
         if (ctx_tgt) {
             llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
         }
@@ -4805,6 +4957,15 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        const bool prior_artifact_capture = llama_model_artifact_capture_set(
+            params_base.cache_optimizer.observer_store_enabled);
+        struct artifact_capture_scope {
+            bool prior;
+            ~artifact_capture_scope() {
+                (void) llama_model_artifact_capture_set(prior);
+            }
+        } artifact_capture_guard { prior_artifact_capture };
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -5515,6 +5676,7 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
+
             mmproj_gpu_swap = params_base.mmproj_gpu_swap && !model_dft;
             // Note: ctx_dft is NOT required here. Without MTP, the swap simply
             // keeps mmproj on CPU until an image arrives, loads it to GPU for
@@ -5935,6 +6097,7 @@ private:
             cache_observation_first_pos.assign(
                 slots.size(), std::numeric_limits<llama_pos>::max());
             llama_set_sync_fence_observer(ctx_tgt, true);
+            cache_fingerprint_start();
         }
         if (params_base.cache_optimizer.cache_debug ||
             params_base.cache_optimizer.cache_lifecycle) {
@@ -6544,6 +6707,12 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task) {
+            // New-task dispatch performs scheduler-owned selection and restore
+            // before update_slots(). Pause the background verifier first.
+            cache_fingerprint_scheduler_busy = true;
+            if (cache_fingerprint_worker) {
+                cache_fingerprint_worker->set_scheduler_demand(true);
+            }
             process_single_task(std::move(task));
         });
         queue_tasks.on_update_slots([this]() {
@@ -10302,6 +10471,10 @@ private:
                     }
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
                     params_base.lora_adapters = new_loras;
+                    // Scale/application changes are request identity, not a
+                    // loaded artifact-catalog replacement. The stable model
+                    // fingerprint therefore remains valid; the request key's
+                    // adapter-application digest changes independently.
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
                     queue_results.send(std::move(res));
@@ -10408,6 +10581,28 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        struct fingerprint_scheduler_scope {
+            server_context_impl & context;
+            explicit fingerprint_scheduler_scope(server_context_impl & value)
+                : context(value) {
+                context.cache_fingerprint_scheduler_busy = true;
+                if (context.cache_fingerprint_worker) {
+                    context.cache_fingerprint_worker->set_scheduler_demand(true);
+                }
+            }
+            ~fingerprint_scheduler_scope() {
+                context.cache_fingerprint_scheduler_busy = false;
+                if (!context.cache_fingerprint_worker) {
+                    return;
+                }
+                const bool demand = std::any_of(
+                    context.slots.begin(), context.slots.end(),
+                    [](const server_slot & slot) { return slot.is_processing(); });
+                context.cache_fingerprint_worker->set_scheduler_demand(demand);
+            }
+        } fingerprint_demand_guard(*this);
+        cache_fingerprint_lifecycle_point();
 
         // E1 holder/lease expiry is scheduler-owned even when no further E1
         // task arrives. This is the existing update-slots lifecycle point;
@@ -12172,7 +12367,8 @@ private:
                                                         checkpoint_observation_owned_cpu_us = UINT64_MAX;
                                                     }
                                                     auto key = cache_observation_provider_key(
-                                                        common_cache_plan_provider::live_context_checkpoint);
+                                                        common_cache_plan_provider::live_context_checkpoint,
+                                                        slot.lora);
                                                     slot.cache_observation_epoch.arm(
                                                         slot.id, key,
                                                         checkpoint_observation_owned_cpu_us);
@@ -12218,7 +12414,8 @@ private:
                                             checkpoint_observation_attempted &&
                                             !slot.cache_observation_epoch.active()) {
                                             auto key = cache_observation_provider_key(
-                                                common_cache_plan_provider::live_context_checkpoint);
+                                                common_cache_plan_provider::live_context_checkpoint,
+                                                slot.lora);
                                             slot.cache_observation_epoch.arm(
                                                 slot.id, key,
                                                 checkpoint_observation_owned_cpu_us);
@@ -12895,6 +13092,11 @@ private:
                             next.representation_epoch_swa = vbr_now.representation_epoch_swa;
                             next.computation_frontier = ckpt_frontier;
                             next.retention_lineage = slot.retention_lineage;
+                            next.adapter_application_complete =
+                                slot.cache_observations &&
+                                server_cache_adapter_application_digest_v1(
+                                    slot.lora,
+                                    next.adapter_application_digest);
 
                             const size_t checkpoint_size =
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

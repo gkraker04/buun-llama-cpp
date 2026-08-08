@@ -300,6 +300,9 @@ static void test_vbr_file_override_identity() {
     const auto refused = common_cache_plan_vbr_regime_from_params(params, getenv_map);
     CHECK(refused.unrepresented_override);
     CHECK(refused.overrides == "VBR_BUDGET_MIB=4096 VBR_MODE=1");
+    CHECK(refused.override_rows.size() == 2);
+    CHECK(refused.override_rows[0].census_id == 2);
+    CHECK(refused.override_rows[0].value == "4096");
     CHECK(common_cache_plan_calib_profile(
         "m", "gpu", 1, common_cache_plan_calib_kv(refused, "f16", "f16")).empty());
 
@@ -312,6 +315,10 @@ static void test_vbr_file_override_identity() {
     CHECK(!selected.unrepresented_override);
     CHECK(selected.schedule.empty());
     CHECK(selected.overrides == b);
+    CHECK(selected.override_rows.size() == 1);
+    CHECK(selected.override_rows[0].census_id == 12);
+    CHECK(selected.override_rows[0].grammar ==
+          common_cache_plan_vbr_value_grammar::inline_or_path);
     const size_t first_hash = selected.overrides.find("sha256-");
     CHECK(first_hash != std::string::npos);
     CHECK(selected.overrides.find("sha256-", first_hash + 1) == std::string::npos);

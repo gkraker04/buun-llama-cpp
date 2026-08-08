@@ -332,6 +332,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        // Preserve duplicates of the exact loader-owned descriptors only for
+        // an explicitly armed internal load scope. Failure only makes ZC3
+        // identity unavailable; model loading and inference remain unchanged.
+        if (llama_model_artifact_capture_enabled()) {
+            (void) model->capture_artifact_descriptors(ml);
+        }
+
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
@@ -459,6 +466,12 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     std::string path_model;
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
+}
+
+bool llama_model_dup_artifact_descriptors(
+        const llama_model * model,
+        std::vector<llama_model_artifact_descriptor> & out) {
+    return model && model->duplicate_artifact_descriptors(out);
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

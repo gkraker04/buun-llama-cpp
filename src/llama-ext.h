@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Internal, passive completion metadata for an explicitly armed server
 // observation.  Arming never synchronizes; the first already-required
@@ -24,6 +25,31 @@ LLAMA_API void llama_set_sync_fence_observer(
         llama_context * ctx, bool enabled);
 LLAMA_API void llama_arm_sync_fence_observer(llama_context * ctx);
 LLAMA_API bool llama_context_is_warmup(const llama_context * ctx);
+LLAMA_API bool llama_context_pipeline_parallel_active(
+        const llama_context * ctx);
+LLAMA_API bool llama_context_vbr_vmm_active(const llama_context * ctx);
+
+// Duplicates of the exact descriptors opened by the model loader. The caller
+// owns descriptor and must close it. integrity_exact means the backing object
+// was immutable before loading (sealed object or fs-verity); hashing a normal
+// mutable file remains a shadow-only compatibility seed.
+struct llama_model_artifact_descriptor {
+    int descriptor;
+    uint64_t byte_length;
+    bool integrity_exact;
+};
+
+LLAMA_API bool llama_model_dup_artifact_descriptors(
+        const llama_model * model,
+        std::vector<llama_model_artifact_descriptor> & out);
+LLAMA_API void llama_model_artifact_descriptors_close(
+        std::vector<llama_model_artifact_descriptor> & descriptors);
+
+// Internal load-scope switch. The server enables descriptor retention only
+// while loading a model for an active optimizer observation store. Returning
+// the prior value makes nested common fit/probe loads restore the exact state.
+LLAMA_API bool llama_model_artifact_capture_set(bool enabled);
+LLAMA_API bool llama_model_artifact_capture_enabled(void);
 
 // Like llama_state_seq_set_data_ext(), but reports only the causally-owned
 // state install after that API's pre-existing synchronize. No new fence is

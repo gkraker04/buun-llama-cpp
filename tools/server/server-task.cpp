@@ -1806,7 +1806,13 @@ bool server_prompt_cache::cache_plan_get_source_id(
         state.cache_plan_source_id, cache_plan_next_source_id, source_id);
 }
 
-std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
+std::list<server_prompt_cache_state> server_prompt_cache::stage(
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft,
+        std::string adapter_config_key,
+        std::array<uint8_t, 32> adapter_application_digest,
+        bool adapter_application_complete) {
     // calculate checkpoints size to see if it will fit with the prompt. This prices the
     // invalidate-first COPY made below (checkpoint copies drop their generation-record shadow),
     // so admission and eviction stay byte-identical to pre-shadow accounting.
@@ -1840,6 +1846,8 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
         entry.prompt.checkpoints = prompt.checkpoints;
         entry.prompt.sequence_epoch = prompt.sequence_epoch;
         entry.adapter_config_key = std::move(adapter_config_key);
+        entry.adapter_application_digest = adapter_application_digest;
+        entry.adapter_application_complete = adapter_application_complete;
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
         return {};
@@ -2278,15 +2286,20 @@ void observe_checkpoint_cpu_operation(
         uint64_t extent_bytes,
         int64_t start_us,
         bool success,
-        int64_t owned_end_us = 0) noexcept {
+        int64_t owned_end_us = 0,
+        std::array<uint8_t, 32> adapter_application_digest = {},
+        bool adapter_application_complete = false) noexcept {
     if (!context.observations) {
         return;
     }
     const int64_t end_us = owned_end_us != 0
         ? owned_end_us : ggml_time_us();
-    const auto key = server_cache_observation_cpu_key(
+    auto key = server_cache_observation_cpu_key(
         operation, common_cache_plan_provider::live_context_checkpoint,
         prepare_shape);
+    key.adapter_application_digest = adapter_application_digest;
+    key.adapter_application_complete = adapter_application_complete;
+    context.observations->apply_execution_fingerprint(key);
     server_cache_observation_record record;
     (void) server_cache_observe_cpu_operation(
         context.observations, key, context.slot_id, extent_bytes,
@@ -2310,6 +2323,9 @@ bool checkpoint_drop_certified(
         return false;
     }
     auto & authority = *context.authority;
+    const auto victim_adapter_digest = victim->adapter_application_digest;
+    const bool victim_adapter_complete =
+        victim->adapter_application_complete;
     const uint64_t sequence = ++authority.destruction_quote_sequence;
     const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
                             common_cache_plan_destruction_reason why) {
@@ -2397,7 +2413,8 @@ bool checkpoint_drop_certified(
             context,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, false, prepare_end_us);
+            prepare_start_us, false, prepare_end_us,
+            victim_adapter_digest, victim_adapter_complete);
         refuse(&quote.receipt, prepared.reason);
         return false;
     }
@@ -2430,7 +2447,8 @@ bool checkpoint_drop_certified(
         context,
         server_cache_observation_operation::durability_prepare,
         /*prepare_shape=*/1, /*extent_bytes=*/0,
-        prepare_start_us, true, prepare_end_us);
+        prepare_start_us, true, prepare_end_us,
+        victim_adapter_digest, victim_adapter_complete);
     authority.observe_host_destruction(quote.receipt, true);
     emit_checkpoint_destruction(context,
         quote.receipt, projected_bytes,
@@ -2462,7 +2480,8 @@ bool checkpoint_drop_certified(
         context,
         server_cache_observation_operation::destruction_apply,
         /*prepare_shape=*/0, apply_extent_bytes,
-        apply_start_us, true);
+        apply_start_us, true, 0,
+        victim_adapter_digest, victim_adapter_complete);
     quote.receipt.state =
         common_cache_plan_destruction_state::executed;
     quote.receipt.actual_accounting_serial =
@@ -2912,15 +2931,20 @@ void server_prompt_cache_observe_cpu_operation(
         uint64_t extent_bytes,
         int64_t start_us,
         bool success,
-        int64_t owned_end_us = 0) noexcept {
+        int64_t owned_end_us = 0,
+        std::array<uint8_t, 32> adapter_application_digest = {},
+        bool adapter_application_complete = false) noexcept {
     if (!cache.cache_observations) {
         return;
     }
     const int64_t end_us = owned_end_us != 0
         ? owned_end_us : ggml_time_us();
-    const auto key = server_cache_observation_cpu_key(
+    auto key = server_cache_observation_cpu_key(
         operation, common_cache_plan_provider::host_cache_entry,
         prepare_shape);
+    key.adapter_application_digest = adapter_application_digest;
+    key.adapter_application_complete = adapter_application_complete;
+    cache.cache_observations->apply_execution_fingerprint(key);
     server_cache_observation_record record;
     (void) server_cache_observe_cpu_operation(
         cache.cache_observations, key, -1, extent_bytes,
@@ -3223,6 +3247,10 @@ host_destruction_certification certify_host_destruction(
         const host_trade_ranking * ranking = nullptr) noexcept {
     host_destruction_certification out;
     auto & authority = *cache.publish_authority;
+    const auto victim_adapter_digest =
+        victim_state->adapter_application_digest;
+    const bool victim_adapter_complete =
+        victim_state->adapter_application_complete;
 
     const auto refuse_initial = [&](common_cache_plan_destruction_reason reason) {
         out.quote = {};
@@ -3379,7 +3407,8 @@ host_destruction_certification certify_host_destruction(
                 cache,
                 server_cache_observation_operation::durability_prepare,
                 /*prepare_shape=*/1, /*extent_bytes=*/0,
-                prepare_start_us, false, prepare_end_us);
+                prepare_start_us, false, prepare_end_us,
+                victim_adapter_digest, victim_adapter_complete);
             refuse_certified(prepared.reason);
             return out;
         }
@@ -3401,7 +3430,8 @@ host_destruction_certification certify_host_destruction(
             cache,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, true, prepare_end_us);
+            prepare_start_us, true, prepare_end_us,
+            victim_adapter_digest, victim_adapter_complete);
         server_prompt_cache_observe_host_destruction(
             cache, out.quote.receipt, true, out.projected_bytes, ranking);
         out.capability = std::move(prepared.capability);
@@ -3838,6 +3868,10 @@ bool server_prompt_cache::destroy_priced_host_entry(
 
         const auto admission = server_prompt_cache_observe_drop(
             *this, *chosen->victim, reason);
+        const auto victim_adapter_digest =
+            chosen->victim->adapter_application_digest;
+        const bool victim_adapter_complete =
+            chosen->victim->adapter_application_complete;
         const std::thread::id scheduler_owner = std::this_thread::get_id();
         const uint64_t apply_extent_bytes = uint64_t(chosen->victim->size());
         SRV_WRN(
@@ -3859,7 +3893,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
         server_prompt_cache_observe_cpu_operation(
             *this, server_cache_observation_operation::destruction_apply,
             /*prepare_shape=*/0, apply_extent_bytes,
-            apply_start_us, true, apply_terminal_us);
+            apply_start_us, true, apply_terminal_us,
+            victim_adapter_digest, victim_adapter_complete);
         if (destruction_obs) {
             destruction_obs->note_host_trade_executed(
                 admission.sequence,
@@ -4216,6 +4251,9 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     if (!publish_authority || !acct || it == states.end()) {
         return false;
     }
+    const auto victim_adapter_digest = it->adapter_application_digest;
+    const bool victim_adapter_complete =
+        it->adapter_application_complete;
 
     server_prompt_cache_retirement_manifest retirement;
     if (!server_prompt_cache_capture_retirement(*this, it, retirement)) {
@@ -4245,14 +4283,16 @@ bool server_prompt_cache::try_destroy_entry_prepared(
             *this,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, false);
+            prepare_start_us, false, 0,
+            victim_adapter_digest, victim_adapter_complete);
         return false;
     }
     server_prompt_cache_observe_cpu_operation(
         *this,
         server_cache_observation_operation::durability_prepare,
         /*prepare_shape=*/1, /*extent_bytes=*/0,
-        prepare_start_us, true);
+        prepare_start_us, true, 0,
+        victim_adapter_digest, victim_adapter_complete);
 
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     const std::thread::id scheduler_owner = std::this_thread::get_id();
@@ -4271,7 +4311,8 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     server_prompt_cache_retire_manifest(*this, retirement);
     server_prompt_cache_observe_cpu_operation(
         *this, server_cache_observation_operation::destruction_apply,
-        /*prepare_shape=*/0, apply_extent_bytes, apply_start_us, true);
+        /*prepare_shape=*/0, apply_extent_bytes, apply_start_us, true, 0,
+        victim_adapter_digest, victim_adapter_complete);
     if (destruction_obs) {
         destruction_obs->note_prepared_release(admission.sequence, true);
     }
@@ -4288,6 +4329,9 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     // eviction order is unchanged, but the exact accounting terminal executes
     // through a freshly prepared capability.
     const auto release_ops = it->release_ops();
+    const auto victim_adapter_digest = it->adapter_application_digest;
+    const bool victim_adapter_complete =
+        it->adapter_application_complete;
     const std::thread::id scheduler_owner = std::this_thread::get_id();
 
     llama_cache_prepared_release_set prepared;
@@ -4350,7 +4394,8 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
         server_prompt_cache_observe_cpu_operation(
             *this, server_cache_observation_operation::destruction_apply,
             /*prepare_shape=*/0, redundant_apply_extent,
-            redundant_apply_start, true, redundant_apply_end);
+            redundant_apply_start, true, redundant_apply_end,
+            victim_adapter_digest, victim_adapter_complete);
         if (destruction_obs) {
             destruction_obs->note_redundant_host_executed(
                 admission.sequence, redundant.projected_bytes);

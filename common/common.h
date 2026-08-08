@@ -8,6 +8,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 
+#include <array>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1457,6 +1458,12 @@ struct common_prompt_checkpoint {
     // E1 declaration plus ZC proven-parent provenance. This policy metadata
     // follows checkpoint copies/restores but never enters payload bytes.
     common_cache_retention_lineage retention_lineage;
+
+    // Request-effective adapter identity for cost observations. This follows
+    // the immutable checkpoint payload across host clones; absence keeps the
+    // corresponding estimator row diagnostic rather than borrowing base cost.
+    std::array<uint8_t, 32> adapter_application_digest = {};
+    bool adapter_application_complete = false;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;

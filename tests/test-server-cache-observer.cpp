@@ -17,6 +17,7 @@ static server_cache_observation_key key(uint8_t identity) {
     out.operation = server_cache_observation_operation::replay;
     out.provider = common_cache_plan_provider::live_slot;
     out.feature_dim = 4;
+    out.adapter_application_complete = true;
     out.identity_complete = true;
     out.participant_execution_digest[0] = identity;
     return out;
@@ -60,6 +61,33 @@ static server_cache_observation_submission submission(
 int main() {
     static_assert(sizeof(server_cache_observation_store) <= 256 * 1024,
                   "ZC2 process-local store exceeded its fixed host bound");
+    {
+        auto shadow_key = key(9);
+        shadow_key.adapter_application_complete = false;
+        shadow_key.identity_complete = false;
+        shadow_key.identity_exact = false;
+        auto exact_key = key(9);
+        exact_key.identity_exact = true;
+        CHECK(shadow_key == exact_key);
+    }
+    {
+        server_cache_observation_store store;
+        server_cache_execution_fingerprint fingerprint;
+        fingerprint.complete = true;
+        fingerprint.exact = true;
+        fingerprint.execution_root[0] = 0xe3;
+        fingerprint.config_root[0] = 0xc3;
+        store.set_execution_fingerprint(fingerprint);
+
+        auto operation_key = key(8);
+        operation_key.identity_complete = true;
+        store.apply_execution_fingerprint(operation_key);
+        CHECK(operation_key.profile_execution_digest[0] == 0xe3);
+        CHECK(operation_key.participant_execution_digest[0] == 8);
+        CHECK(operation_key.representation_digest[0] == 0);
+        CHECK(!operation_key.identity_complete);
+        CHECK(operation_key.identity_exact);
+    }
     {
         std::array<double, 4> phi;
         uint8_t family = 99;

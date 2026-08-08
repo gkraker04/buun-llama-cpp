@@ -38,6 +38,47 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <unistd.h>
+#endif
+
+thread_local bool model_artifact_capture_enabled = false;
+
+namespace {
+
+void model_artifact_descriptor_close(int fd) noexcept {
+    if (fd < 0) {
+        return;
+    }
+#if defined(_WIN32)
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
+
+int model_artifact_descriptor_dup(int fd) noexcept {
+#if defined(_WIN32)
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+} // namespace
+
+bool llama_model_artifact_capture_enabled() {
+    return model_artifact_capture_enabled;
+}
+
+bool llama_model_artifact_capture_set(bool enabled) {
+    const bool previous = model_artifact_capture_enabled;
+    model_artifact_capture_enabled = enabled;
+    return previous;
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1036,7 +1077,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        for (auto & row : artifact_descriptors) {
+            model_artifact_descriptor_close(row.descriptor);
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1071,6 +1116,12 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // Duplicated from llama_model_loader before it closes. These descriptors
+    // identify the exact objects mapped/read by this model; ZC3a may duplicate
+    // them again for its cancelable background verifier without reopening a
+    // path.
+    std::vector<llama_model_artifact_descriptor> artifact_descriptors;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1747,6 +1798,70 @@ void llama_model::adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+bool llama_model::capture_artifact_descriptors(
+        llama_model_loader & ml) noexcept {
+    std::vector<llama_model_artifact_descriptor> captured;
+    try {
+        captured.reserve(ml.files.size());
+        for (const auto & file : ml.files) {
+            if (!file) {
+                throw std::runtime_error("invalid model artifact descriptor");
+            }
+            const int duplicate = model_artifact_descriptor_dup(file->file_id());
+            if (duplicate < 0) {
+                throw std::runtime_error("failed to duplicate model artifact descriptor");
+            }
+            captured.push_back({ duplicate, uint64_t(file->size()),
+                                 file->integrity_exact_at_open() });
+        }
+        for (auto & row : pimpl->artifact_descriptors) {
+            model_artifact_descriptor_close(row.descriptor);
+        }
+        pimpl->artifact_descriptors = std::move(captured);
+        return !pimpl->artifact_descriptors.empty();
+    } catch (...) {
+        for (auto & row : captured) {
+            model_artifact_descriptor_close(row.descriptor);
+        }
+        return false;
+    }
+}
+
+bool llama_model::duplicate_artifact_descriptors(
+        std::vector<llama_model_artifact_descriptor> & out) const noexcept {
+    std::vector<llama_model_artifact_descriptor> duplicates;
+    try {
+        duplicates.reserve(pimpl->artifact_descriptors.size());
+        for (const auto & source : pimpl->artifact_descriptors) {
+            const int duplicate = model_artifact_descriptor_dup(source.descriptor);
+            if (duplicate < 0) {
+                throw std::runtime_error("failed to duplicate model artifact descriptor");
+            }
+            duplicates.push_back({ duplicate, source.byte_length,
+                                   source.integrity_exact });
+        }
+        for (auto & row : out) {
+            model_artifact_descriptor_close(row.descriptor);
+            row.descriptor = -1;
+        }
+        out = std::move(duplicates);
+        return !out.empty();
+    } catch (...) {
+        for (auto & row : duplicates) {
+            model_artifact_descriptor_close(row.descriptor);
+        }
+        return false;
+    }
+}
+
+void llama_model_artifact_descriptors_close(
+        std::vector<llama_model_artifact_descriptor> & descriptors) {
+    for (auto & row : descriptors) {
+        model_artifact_descriptor_close(row.descriptor);
+        row.descriptor = -1;
+    }
 }
 
 uint32_t llama_model::n_gpu_layers() const {
