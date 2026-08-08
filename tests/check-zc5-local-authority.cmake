@@ -130,9 +130,9 @@ endif()
 
 foreach(REQUIRED IN ITEMS
         "out.local_authority_ceiling = raw.cache_plan_authority_explicit"
-        "common_cache_plan_authority_level::similarity")
+        "common_cache_plan_authority_level::route_home")
     contract_require_token("${OPTIMIZER_CPP}" "${REQUIRED}"
-        "ZC5b similarity ceiling resolver")
+        "ZC5c route-home ceiling resolver")
 endforeach()
 foreach(REQUIRED IN ITEMS
         "const auto decision_level = server_cache_plan_level_of(rec.selection);"
@@ -286,4 +286,4 @@ if (NOT MUTATED_FLEET_TERMINAL)
         "ZC5a unselected-terminal negative control did not trip")
 endif()
 
-message(STATUS "ZC5a/b local-authority contract checks passed")
+message(STATUS "ZC5a-c local-authority contract checks passed")

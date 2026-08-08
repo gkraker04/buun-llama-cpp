@@ -7,9 +7,14 @@ the lifecycle-owned preparation/apply/recovery terms where host restore wins.
 The oversized-host scenario creates the natural opposite regime: historical
 selection restores a long saved subject for a short-prefix request, while cold
 replay processes only that short request.
-The similarity-crossover scenario creates a long live continuation plus an
-exact shorter host artifact: historical policy restores the host object while
-calibrated similarity authority may rewind the resident tail in place.
+The similarity crossover creates a long live continuation plus an exact
+shorter host artifact: historical policy restores the host object while
+calibrated authority may rewind the resident tail in place.  Route-home uses
+the same nontrivial-prefix workload under dynamic unified-KV VBR, where host
+artifacts are unavailable by construction and ordinary historical traffic can
+honestly train both replay alternatives.  Hybrid checkpoint models retain the
+counterfactual live alternative fail-closed rather than introducing hidden
+exploration merely to satisfy the gate.
 """
 
 import argparse
@@ -233,7 +238,7 @@ def training_similarity_crossover(base, seed, cycle):
 
 
 def training_cycle(args, base, cycle):
-    if args.scenario == "similarity_crossover":
+    if args.scenario in ("similarity_crossover", "route_home_crossover"):
         return training_similarity_crossover(base, args.seed, cycle)
     if args.scenario == "host":
         return training_host(base, args.seed, cycle)
@@ -296,40 +301,144 @@ def tier_execution(row, tier, scenario):
     optimizer = row.get("optimizer") or {}
     local = optimizer.get("local_authority") or {}
     authority = row.get("authority") or {}
+    baseline_id = optimizer.get("baseline_plan_candidate")
+    economic_id = optimizer.get("economic_plan_candidate")
     if not (row.get("selection") == tier and
             optimizer.get("request_execution_policy") ==
                 "local_online_authority" and
-            local.get("state") == "executed"):
+            optimizer.get("profile_state") == "active" and
+            optimizer.get("economic_disposition") ==
+                "certified_improvement" and
+            optimizer.get("profile_resume_origin") == "persisted" and
+            local.get("state") == "executed" and
+            local.get("reason") == "none" and
+            local.get("certified_once") is True and
+            local.get("candidate") == economic_id and
+            authority.get("disagreed") is True and
+            isinstance(baseline_id, int) and
+            isinstance(economic_id, int) and baseline_id != economic_id and
+            row.get("shipped_plan_candidate") == economic_id):
         return False
-    if scenario != "similarity_crossover":
+    if scenario not in ("similarity_crossover", "route_home_crossover"):
         return True
-    baseline = candidate(row, optimizer.get("baseline_plan_candidate"))
-    economic = candidate(row, optimizer.get("economic_plan_candidate"))
+    if scenario == "route_home_crossover":
+        baseline = candidate(row, baseline_id)
+        economic = candidate(row, economic_id)
+        return bool(
+            baseline and economic and
+            economic.get("provider") == "live_slot" and
+            isinstance(economic.get("lcp_tokens"), int) and
+            economic.get("lcp_tokens") > 1 and
+            row.get("chosen") == "live_slot")
+    baseline = candidate(row, baseline_id)
+    economic = candidate(row, economic_id)
     return bool(
-        authority.get("disagreed") and baseline and economic and
+        baseline and economic and
         baseline.get("provider") == "host_cache_entry" and
         economic.get("provider") == "live_slot" and
         row.get("chosen") == "live_slot")
 
 
+def tier_active_preserve(row, tier, scenario):
+    optimizer = row.get("optimizer") or {}
+    local = optimizer.get("local_authority") or {}
+    authority = row.get("authority") or {}
+    baseline_id = optimizer.get("baseline_plan_candidate")
+    economic_id = optimizer.get("economic_plan_candidate")
+    if not (row.get("selection") == tier and
+            optimizer.get("profile_state") == "active" and
+            optimizer.get("profile_resume_origin") == "persisted" and
+            optimizer.get("request_execution_policy") == "historical_legacy" and
+            optimizer.get("economic_disposition") == "refused" and
+            local.get("state") == "fallback" and
+            local.get("reason") == "insufficient_confidence" and
+            local.get("certified_once") is False and
+            authority.get("disagreed") is False and
+            isinstance(economic_id, int) and economic_id == baseline_id and
+            row.get("shipped_plan_candidate") == economic_id):
+        return False
+    if scenario != "route_home_crossover":
+        return True
+    economic = candidate(row, economic_id)
+    return bool(
+        economic and economic.get("provider") == "live_slot" and
+        isinstance(economic.get("lcp_tokens"), int) and
+        economic.get("lcp_tokens") > 1 and row.get("chosen") == "live_slot")
+
+
 def self_test():
     row = {
         "optimizer": {
-            "local_authority": {"state": "executed"},
+            "local_authority": {
+                "state": "executed", "reason": "none",
+                "certified_once": True, "candidate": 0},
             "request_execution_policy": "local_online_authority",
+            "profile_state": "active",
+            "economic_disposition": "certified_improvement",
+            "profile_resume_origin": "persisted",
             "baseline_plan_candidate": 1,
             "economic_plan_candidate": 0,
         },
         "authority": {"disagreed": True},
         "selection": "similarity", "chosen": "live_slot",
+        "shipped_plan_candidate": 0,
         "candidates": [
-            {"id": 0, "provider": "live_slot"},
+            {"id": 0, "provider": "live_slot", "lcp_tokens": 64},
             {"id": 1, "provider": "host_cache_entry"},
         ],
     }
     assert tier_execution(row, "similarity", "similarity_crossover")
+    row["selection"] = "route_home"
+    assert tier_execution(row, "route_home", "route_home_crossover")
     row["authority"]["disagreed"] = False
-    assert not tier_execution(row, "similarity", "similarity_crossover")
+    assert not tier_execution(row, "route_home", "route_home_crossover")
+    row["authority"]["disagreed"] = True
+    row["shipped_plan_candidate"] = 1
+    assert not tier_execution(row, "route_home", "route_home_crossover")
+    row["shipped_plan_candidate"] = 0
+    row["optimizer"]["baseline_plan_candidate"] = 0
+    assert not tier_execution(row, "route_home", "route_home_crossover")
+    row["optimizer"]["baseline_plan_candidate"] = 1
+    row["candidates"][0]["lcp_tokens"] = 1
+    assert not tier_execution(row, "route_home", "route_home_crossover")
+    row["optimizer"]["local_authority"] = {
+        "state": "fallback", "reason": "insufficient_confidence",
+        "certified_once": False}
+    row["optimizer"]["profile_state"] = "active"
+    row["optimizer"]["request_execution_policy"] = "historical_legacy"
+    row["optimizer"]["economic_disposition"] = "refused"
+    row["optimizer"]["baseline_plan_candidate"] = 0
+    row["authority"]["disagreed"] = False
+    row["candidates"][0]["lcp_tokens"] = 64
+    assert tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["optimizer"]["profile_resume_origin"] = "current_process"
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["optimizer"]["profile_resume_origin"] = "persisted"
+    row["shipped_plan_candidate"] = 1
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["shipped_plan_candidate"] = 0
+    row["optimizer"]["local_authority"]["certified_once"] = True
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["optimizer"]["local_authority"]["certified_once"] = False
+    row["optimizer"]["local_authority"]["reason"] = "currency_changed"
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["optimizer"]["local_authority"]["reason"] = "insufficient_confidence"
+    row["optimizer"]["economic_disposition"] = "refused_internal"
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["optimizer"]["economic_disposition"] = "refused"
+    row["authority"]["disagreed"] = True
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
+    row["authority"]["disagreed"] = False
+    row["candidates"][0]["lcp_tokens"] = 1
+    assert not tier_active_preserve(
+        row, "route_home", "route_home_crossover")
 
 
 def sealed_model(path):
@@ -367,10 +476,11 @@ def main():
     parser.add_argument("--ctx-checkpoints", type=int, default=0)
     parser.add_argument(
         "--scenario", choices=("replay", "host", "host_long", "oversized_host",
-                               "similarity_crossover"),
+                               "similarity_crossover", "route_home_crossover"),
                         default="replay")
     parser.add_argument(
-        "--decision-tier", choices=("by_id", "similarity"), default="by_id")
+        "--decision-tier", choices=("by_id", "similarity", "route_home"),
+        default="by_id")
     parser.add_argument("--slot-prompt-similarity", type=float, default=0.1)
     parser.add_argument("--expect", choices=("execute", "preserve"),
                         default="execute")
@@ -441,13 +551,8 @@ def main():
     ]
     active_preserve_rows = [
         row for row in outputs
-        if (row.get("optimizer") or {}).get("profile_state") == "active" and
-        (row.get("optimizer") or {}).get("request_execution_policy") ==
-            "historical_legacy" and
-        isinstance((row.get("optimizer") or {}).get(
-            "economic_plan_candidate"), int) and
-        (row.get("optimizer") or {}).get("economic_plan_candidate") ==
-            (row.get("optimizer") or {}).get("baseline_plan_candidate")
+        if tier_active_preserve(
+            row, args.decision_tier, args.scenario)
     ]
     active_preserve = bool(active_preserve_rows)
     observation_counts = {}
@@ -473,13 +578,20 @@ def main():
             "selection": row.get("selection"),
             "prompt_tokens": row.get("n_prompt_tokens"),
             "chosen_provider": row.get("chosen"),
+            "disagreed": (row.get("authority") or {}).get("disagreed"),
             "baseline_candidate": optimizer.get("baseline_plan_candidate"),
             "baseline_provider": baseline.get("provider") if baseline else None,
+            "baseline_lcp_tokens": baseline.get("lcp_tokens") if baseline else None,
             "economic_candidate": optimizer.get("economic_plan_candidate"),
             "economic_provider": economic.get("provider") if economic else None,
+            "economic_lcp_tokens": economic.get("lcp_tokens") if economic else None,
+            "shipped_plan_candidate": row.get("shipped_plan_candidate"),
             "profile_state": optimizer.get("profile_state"),
+            "profile_resume_origin": optimizer.get("profile_resume_origin"),
+            "economic_disposition": optimizer.get("economic_disposition"),
             "authority_state": local.get("state"),
             "authority_reason": local.get("reason"),
+            "certified_once": local.get("certified_once"),
             "execution_policy": optimizer.get("request_execution_policy"),
             "benefit_estimate_us": optimizer.get("benefit_estimate_us"),
             "benefit_lower_us": optimizer.get("benefit_lower_us"),

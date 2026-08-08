@@ -121,13 +121,13 @@ static void test_nonoff_modes() {
               (raw.cache_plan_authority == common_cache_plan_authority_level::off
                   ? common_cache_plan_authority_level::off
                   : std::min(raw.cache_plan_authority,
-                             common_cache_plan_authority_level::similarity)));
+                             common_cache_plan_authority_level::route_home)));
     }
     raw.cache_plan_authority_explicit = false;
     raw.cache_plan_authority = common_cache_plan_authority_level::lru;
     out = common_cache_optimizer_resolve(raw);
     CHECK(out.local_authority_ceiling ==
-          common_cache_plan_authority_level::similarity);
+          common_cache_plan_authority_level::route_home);
 }
 
 static std::vector<char *> argv_for(std::vector<std::string> & args) {

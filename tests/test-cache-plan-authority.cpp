@@ -1691,6 +1691,45 @@ static void test_local_by_id_certification_and_currency() {
     CHECK(similarity_rec.optimizer.local_authority.state ==
           common_cache_optimizer_authority_state::executed);
 
+    // ZC5c graduates the same local capability one tier further. A nontrivial
+    // home prefix may use the mature same-target live replay instead of the
+    // historical host restore, while the prior similarity ceiling refuses
+    // the identical route-home record before planning.
+    auto route_rec = original_rec;
+    route_rec.selection = common_cache_plan_selection::route_home;
+    route_rec.inventory[live_id].origin_tier =
+        common_cache_plan_selection::route_home;
+    route_rec.inventory[host_id].origin_tier =
+        common_cache_plan_selection::route_home;
+    auto route_lower = route_rec;
+    similarity_authority.plan_local_before_mutation(
+        route_lower, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms);
+    CHECK(!route_lower.authority_prequalified);
+    CHECK(route_lower.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::not_attempted);
+
+    server_cache_plan_authority route_authority(
+        common_cache_plan_authority_level::route_home,
+        &similarity_observations);
+    CHECK(route_authority.set_profile_display_salt(display_salt));
+    server_cache_plan_local_authority_latch route_latch;
+    route_authority.plan_local_before_mutation(
+        route_rec, similarity_evidence, similarity_observations,
+        int32_t(host_id), 9, 9, now_ms, 0, &route_latch);
+    CHECK(route_rec.authority_prequalified);
+    CHECK(route_rec.shadow_choice == int32_t(live_id));
+    auto route_execution = route_authority.authorize(
+        route_rec, 0, true, true, 0, std::move(route_latch));
+    CHECK(route_execution.kind ==
+          server_cache_plan_execution_kind::live_replay);
+    CHECK(route_execution.target == 0);
+    route_rec.shipped_plan_candidate = int32_t(live_id);
+    route_authority.finalize_execution(
+        route_rec, &route_execution.local_authority);
+    CHECK(route_rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::executed);
+
     // A copyable receipt is diagnostic only. Without the move-only capability
     // produced by this exact planning invocation it cannot authorize.
     auto stale = receipt_only;
