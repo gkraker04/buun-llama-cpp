@@ -37,6 +37,7 @@ def main() -> int:
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
     extractor = root / "tools/server/bench/zc1-retention-extract.py"
+    reporter = root / "tools/server/bench/zc1-retention-report.py"
     fixture = root / "tools/server/bench/fixtures/zc1-retention-events.json"
 
     with tempfile.TemporaryDirectory(prefix="zc1-retention-tools-") as temp_dir:
@@ -138,6 +139,66 @@ def main() -> int:
         ], capture_output=True, text=True)
         assert failed.returncode != 0
         assert "duplicate trace request seed" in failed.stderr
+
+        # The live reporter joins deterministic outputs to measured schema-7
+        # records and rejects a silent/no-terminal intentional arm.
+        live_records = [{
+            "round": 0, "chain": 0, "reply_sha256": "a" * 64,
+        }]
+        historical_transcript = temp / "historical.json"
+        intentional_transcript = temp / "intentional.json"
+        for path, label in (
+                (historical_transcript, "historical"),
+                (intentional_transcript, "intentional")):
+            path.write_text(json.dumps({
+                "schema": "zc1_retention_shape_transcript/v1",
+                "label": label,
+                "records": live_records,
+            }) + "\n", encoding="utf-8")
+
+        def plan(mode: str, events: int) -> dict:
+            return {
+                "schema_version": 7,
+                "outcome": "replayed",
+                "n_reused_tokens": 10,
+                "n_replayed_tokens": 20,
+                "ttft_us": 30,
+                "optimizer": {
+                    "mode": mode,
+                    "retention_summary": {
+                        "outcome_counts": {
+                            "executed": events,
+                            "deferred": 0,
+                            "publication_skipped": 0,
+                            "blocked": 0,
+                        },
+                        "reason_counts": {"internal_fault": 0},
+                        "released_bytes": events * 40,
+                        "released_tokens": events * 20,
+                    },
+                },
+            }
+
+        historical_log = temp / "historical.log"
+        intentional_log = temp / "intentional.log"
+        historical_log.write_text(
+            "CACHE_PLAN " + json.dumps(plan("off", 0)) + "\n",
+            encoding="utf-8")
+        intentional_log.write_text(
+            "CACHE_PLAN " + json.dumps(plan("baseline", 1)) + "\n",
+            encoding="utf-8")
+        live_report = temp / "live-report.json"
+        subprocess.run([
+            sys.executable, str(reporter),
+            "--historical-transcript", str(historical_transcript),
+            "--historical-log", str(historical_log),
+            "--intentional-transcript", str(intentional_transcript),
+            "--intentional-log", str(intentional_log),
+            "--label", "synthetic", "--out", str(live_report),
+        ], check=True)
+        report = json.loads(live_report.read_text(encoding="utf-8"))
+        assert report["outputs_byte_identical"] is True
+        assert report["intentional"]["retention_events"] == 1
 
     print("ZC1_RETENTION_TOOLS_TEST PASS")
     return 0

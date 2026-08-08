@@ -1429,8 +1429,15 @@ struct common_checkpoint_shadow;
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
-    // (optional) id of the task that created the checkpoint
+    // Legacy created-or-adopted task affinity. The historical thinning and
+    // capacity paths intentionally preserve this landed meaning: restore may
+    // rebind it to the consuming task. ZC uses id_task_referenced instead.
     int id_task = -1;
+
+    // Task that actually restored from this member. Creation ownership is
+    // not a current-execution dependency: conflating the two protects every
+    // checkpoint produced by a long prefill and can freeze a finite ring.
+    int id_task_referenced = -1;
 
     llama_pos pos_min;
     llama_pos pos_max;
@@ -1447,9 +1454,9 @@ struct common_prompt_checkpoint {
     // during the Phase-1 migration. Legacy checkpoints have version == 0.
     common_computation_frontier computation_frontier;
 
-    // E1 declared-family provenance. This is policy metadata only: it follows
-    // checkpoint copies/restores but never enters checkpoint payload bytes.
-    common_cache_family_binding cache_family;
+    // E1 declaration plus ZC proven-parent provenance. This policy metadata
+    // follows checkpoint copies/restores but never enters payload bytes.
+    common_cache_retention_lineage retention_lineage;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;

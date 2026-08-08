@@ -3,9 +3,110 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <stdexcept>
 
 using json = nlohmann::ordered_json;
+
+namespace {
+template <typename Enum, size_t N>
+const char * closed_enum_name(
+        Enum value,
+        const std::array<const char *, N> & names) noexcept {
+    const size_t index = size_t(value);
+    return index < names.size() ? names[index] : "invalid";
+}
+}
+
+#define COMMON_CACHE_WIRE_NAME(sym, wire) wire,
+#define COMMON_CACHE_DEFINE_NAMES(fn, type, list) \
+    const char * fn(type value) { \
+        static constexpr std::array<const char *, size_t(type::_count)> names = { \
+            list(COMMON_CACHE_WIRE_NAME) \
+        }; \
+        return closed_enum_name(value, names); \
+    }
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_mode_wire_name,
+    common_cache_optimizer_mode_wire, COMMON_CACHE_OPTIMIZER_MODE_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_retention_wire_name,
+    common_cache_optimizer_retention_wire, COMMON_CACHE_OPTIMIZER_RETENTION_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_inventory_status_name,
+    common_cache_optimizer_inventory_status, COMMON_CACHE_OPTIMIZER_INVENTORY_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_execution_policy_name,
+    common_cache_optimizer_execution_policy, COMMON_CACHE_OPTIMIZER_EXECUTION_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_disposition_name,
+    common_cache_optimizer_disposition, COMMON_CACHE_OPTIMIZER_DISPOSITION_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_fallback_reason_name,
+    common_cache_optimizer_fallback_reason, COMMON_CACHE_OPTIMIZER_FALLBACK_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_profile_source_name,
+    common_cache_optimizer_profile_source, COMMON_CACHE_OPTIMIZER_PROFILE_SOURCE_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_resume_origin_name,
+    common_cache_optimizer_resume_origin, COMMON_CACHE_OPTIMIZER_RESUME_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_profile_state_name,
+    common_cache_optimizer_profile_state, COMMON_CACHE_OPTIMIZER_PROFILE_STATE_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_coverage_class_name,
+    common_cache_optimizer_coverage_class, COMMON_CACHE_OPTIMIZER_COVERAGE_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_optimizer_authority_state_name,
+    common_cache_optimizer_authority_state, COMMON_CACHE_OPTIMIZER_AUTHORITY_STATE_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_retention_outcome_name,
+    common_cache_retention_outcome, COMMON_CACHE_RETENTION_OUTCOME_LIST)
+COMMON_CACHE_DEFINE_NAMES(common_cache_retention_reason_name,
+    common_cache_retention_reason, COMMON_CACHE_RETENTION_REASON_LIST)
+#undef COMMON_CACHE_DEFINE_NAMES
+#undef COMMON_CACHE_WIRE_NAME
+
+void common_cache_retention_summary::note(
+        common_cache_retention_outcome outcome,
+        common_cache_retention_reason reason,
+        uint64_t bytes,
+        uint64_t tokens) noexcept {
+    const auto position = std::find(
+        std::begin(common_cache_retention_counted_outcomes),
+        std::end(common_cache_retention_counted_outcomes), outcome);
+    if (position == std::end(common_cache_retention_counted_outcomes)) {
+        return;
+    }
+    const size_t outcome_index = size_t(
+        position - std::begin(common_cache_retention_counted_outcomes));
+    outcome_counts[outcome_index]++;
+    if (size_t(reason) < reason_counts.size()) {
+        reason_counts[size_t(reason)]++;
+    }
+    if (outcome == common_cache_retention_outcome::executed) {
+        evictions++;
+        released_bytes = bytes > UINT64_MAX - released_bytes
+            ? UINT64_MAX : released_bytes + bytes;
+        released_tokens = tokens > UINT64_MAX - released_tokens
+            ? UINT64_MAX : released_tokens + tokens;
+    }
+}
+
+uint64_t common_cache_retention_summary::count(
+        common_cache_retention_outcome outcome) const noexcept {
+    const auto position = std::find(
+        std::begin(common_cache_retention_counted_outcomes),
+        std::end(common_cache_retention_counted_outcomes), outcome);
+    return position == std::end(common_cache_retention_counted_outcomes)
+        ? 0
+        : outcome_counts[size_t(
+              position - std::begin(common_cache_retention_counted_outcomes))];
+}
+
+common_cache_retention_outcome
+common_cache_retention_summary::state() const noexcept {
+    size_t classes = 0;
+    common_cache_retention_outcome selected =
+        common_cache_retention_outcome::not_attempted;
+    for (size_t i = 0; i < outcome_counts.size(); ++i) {
+        if (outcome_counts[i] != 0) {
+            classes++;
+            selected = common_cache_retention_counted_outcomes[i];
+        }
+    }
+    return classes == 0 ? common_cache_retention_outcome::not_attempted
+         : classes == 1 ? selected
+                        : common_cache_retention_outcome::mixed;
+}
 
 bool common_cache_plan_projected_release_bytes(
         const std::vector<common_cache_plan_yield_domain> & domains,
@@ -872,6 +973,108 @@ static json cache_plan_ordinal_json(int32_t ordinal) {
         ? json(ordinal)
         : json(common_cache_acct_known_name(llama_cache_acct_known::unavailable));
 }
+
+static json cache_plan_optimizer_json(
+        const common_cache_optimizer_record & optimizer) {
+    json reason_counts = json::object();
+#define COMMON_CACHE_REASON_JSON(sym, wire) \
+    reason_counts[wire] = optimizer.retention_summary.reason_counts[ \
+        size_t(common_cache_retention_reason::sym)];
+    COMMON_CACHE_RETENTION_REASON_LIST(COMMON_CACHE_REASON_JSON)
+#undef COMMON_CACHE_REASON_JSON
+
+    const auto optional_u64 = [](const llama_cache_acct_value & value) {
+        return value.state == llama_cache_acct_known::known
+            ? json(value.value)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+    };
+    const auto optional_double = [](bool known, double value) {
+        return known && std::isfinite(value)
+            ? json(value)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+    };
+    const auto optional_string = [](const std::string & value) {
+        return !value.empty()
+            ? json(value)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+    };
+
+    return {
+        { "policy_version", optimizer.policy_version },
+        { "mode", common_cache_optimizer_mode_wire_name(optimizer.mode) },
+        { "retention_policy", common_cache_optimizer_retention_wire_name(
+              optimizer.retention_policy) },
+        { "inventory_status", common_cache_optimizer_inventory_status_name(
+              optimizer.inventory_status) },
+        { "baseline_plan_candidate", cache_plan_ordinal_json(
+              optimizer.baseline_plan_candidate) },
+        { "economic_plan_candidate", cache_plan_ordinal_json(
+              optimizer.economic_plan_candidate) },
+        { "request_execution_policy", common_cache_optimizer_execution_policy_name(
+              optimizer.request_execution_policy) },
+        { "economic_disposition", common_cache_optimizer_disposition_name(
+              optimizer.economic_disposition) },
+        { "local_fallback_reason", common_cache_optimizer_fallback_reason_name(
+              optimizer.local_fallback_reason) },
+        { "profile_source", common_cache_optimizer_profile_source_name(
+              optimizer.profile_source) },
+        { "profile_resume_origin", common_cache_optimizer_resume_origin_name(
+              optimizer.profile_resume_origin) },
+        { "profile_state", common_cache_optimizer_profile_state_name(
+              optimizer.profile_state) },
+        { "profile_identity", optional_string(optimizer.profile_identity) },
+        { "coverage_class", common_cache_optimizer_coverage_class_name(
+              optimizer.coverage_class) },
+        { "benefit_estimate_us", optional_double(
+              optimizer.benefit_estimate_known,
+              optimizer.benefit_estimate_us) },
+        { "benefit_lower_us", optional_double(
+              optimizer.benefit_lower_known,
+              optimizer.benefit_lower_us) },
+        { "local_authority", {
+            { "state", common_cache_optimizer_authority_state_name(
+                  optimizer.local_authority.state) },
+            { "certified_once", optimizer.local_authority.certified_once },
+            { "coefficient_source", common_cache_optimizer_profile_source_name(
+                  optimizer.local_authority.coefficient_source) },
+            { "candidate", cache_plan_ordinal_json(
+                  optimizer.local_authority.candidate) },
+            { "boot_claim_ordinal", optional_u64(
+                  optimizer.local_authority.boot_claim_ordinal) },
+            { "profile_generation", optional_u64(
+                  optimizer.local_authority.profile_generation) },
+            { "authority_currency_serial", optional_u64(
+                  optimizer.local_authority.authority_currency_serial) },
+            { "instance_generation_digest", optional_string(
+                  optimizer.local_authority.instance_generation_digest) },
+            { "procedure_version", optimizer.local_authority.procedure_version },
+            { "reason", common_cache_optimizer_fallback_reason_name(
+                  optimizer.local_authority.reason) },
+        } },
+        { "retention_summary", {
+            { "state", common_cache_retention_outcome_name(
+                  optimizer.retention_summary.state()) },
+            { "outcome_counts", {
+                { "executed", optimizer.retention_summary.count(
+                      common_cache_retention_outcome::executed) },
+                { "deferred", optimizer.retention_summary.count(
+                      common_cache_retention_outcome::deferred) },
+                { "publication_skipped", optimizer.retention_summary.count(
+                      common_cache_retention_outcome::publication_skipped) },
+                { "blocked", optimizer.retention_summary.count(
+                      common_cache_retention_outcome::blocked) },
+            } },
+            { "reason_counts", std::move(reason_counts) },
+            { "evictions", optimizer.retention_summary.evictions },
+            { "released_bytes", optimizer.retention_summary.released_bytes },
+            { "released_tokens", optimizer.retention_summary.released_tokens },
+        } },
+    };
+}
+
 json common_cache_plan_record_json(const common_cache_plan_record & rec) {
     const bool finalized = rec.outcome != common_cache_plan_outcome::unknown;
 
@@ -1005,6 +1208,7 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
         { "n_reused_tokens",   common_cache_plan_value_json(rec.n_reused_tokens) },
         { "n_replayed_tokens", common_cache_plan_value_json(rec.n_replayed_tokens) },
         { "ttft_us",           common_cache_plan_value_json(rec.ttft_us) },
+        { "optimizer",         cache_plan_optimizer_json(rec.optimizer) },
     };
     if (!rec.calibration_profile.empty()) {
         out["calibration_profile"] = rec.calibration_profile;

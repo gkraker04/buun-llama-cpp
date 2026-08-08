@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-cache-retention-policy.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -453,8 +454,10 @@ static server_cache_control_status server_cache_family_resolve_for_launch(
 struct server_slot {
     int id;
 
-    // Optional E1 declared-family state, resolved by the scheduler at launch.
-    common_cache_family_binding cache_family;
+    // One E1 declaration/ZC proven-parent lineage carrier, resolved only by
+    // the scheduler and copied with retained conversation state.
+    common_cache_retention_lineage retention_lineage;
+    bool intentional_retention = false;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -638,8 +641,9 @@ struct server_slot {
             // historical automatic-main default. Checkpoint pricing below is
             // intentionally the opposite polarity: no request means no
             // provisional automatic-main claim. A declaration overrides both.
-            server_prompt_cache_apply_family(
-                entry, cache_family, !task || !task->is_child());
+            server_prompt_cache_apply_retention_lineage(
+                entry, retention_lineage, intentional_retention,
+                !task || !task->is_child());
 
             size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
             if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // [P0 gate]
@@ -680,18 +684,18 @@ struct server_slot {
         dflash_window_identity.clear();
         // No-restore is a successful identity operation. Seed the out-value
         // with the live lineage; a committed host restore overwrites it with
-        // delivery.cache_family inside load_impl.
-        common_cache_family_binding restored_family = cache_family;
+        // delivery.retention_lineage inside load_impl.
+        common_cache_retention_lineage restored_lineage = retention_lineage;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
                                      adapter_config_key, obs, required_source_id,
-                                     &restored_family);
+                                     &restored_lineage);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         } else {
             // A host image replaces the live frontier wholesale, including
             // its immutable family provenance. A declared current request may
             // deliberately override this later at the launch boundary.
-            cache_family = restored_family;
+            retention_lineage = restored_lineage;
             if (lifecycle_authority) {
                 checkpoint_ring_changed();
             }
@@ -724,9 +728,11 @@ struct server_slot {
             checkpoint_floor_refusal,
             // Unlike idle prompt_save(), an absent request does not
             // provisionally classify a checkpoint as automatic-main.
-            common_cache_family_main_family(
-                cache_family, task && !task->is_child()),
-            cache_family,
+            common_cache_retention_main_family(
+                retention_lineage, intentional_retention,
+                task && !task->is_child()),
+            retention_lineage.declaration,
+            retention_lineage.automatic_provenance,
             cache_debug_observability,
             this,
             checkpoint_drop_authority_adapter,
@@ -775,7 +781,7 @@ struct server_slot {
             checkpoint_ring_changed();
         }
         prompt.clear();
-        cache_family = {};
+        retention_lineage = {};
     }
 
     void prompt_clear_certified(
@@ -960,7 +966,7 @@ struct server_slot {
             checkpoint_ring_changed();
         }
         prompt.clear();
-        cache_family = {};
+        retention_lineage = {};
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
         }
@@ -981,7 +987,7 @@ struct server_slot {
         prompt.clear();
         prompt.tokens.insert(retained_tokens);
         if (prompt.tokens.empty()) {
-            cache_family = {};
+            retention_lineage = {};
         }
     }
 
@@ -1932,7 +1938,7 @@ struct server_slot {
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
         other.prompt = prompt.clone();
-        other.cache_family = cache_family;
+        other.retention_lineage = retention_lineage;
         other.init_sampler();
         return true;
     }
@@ -2042,8 +2048,8 @@ server_cache_family_slot_round_trip_for_test(
 
     server_slot slot {};
     slot.id = 0;
-    slot.cache_family = common_cache_family_follow_lineage(
-        {}, incoming, 0, 0);
+    slot.retention_lineage = common_cache_retention_follow_lineage(
+        {}, { incoming, common_cache_retention_provenance::neutral }, 0, 0);
     slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
     slot.prompt.sequence_epoch = 1;
 
@@ -2051,29 +2057,30 @@ server_cache_family_slot_round_trip_for_test(
     // current lineage. Drive the real cache selection path with no host rows;
     // this is the D1-1 identity terminal that previously returned a default.
     server_prompt_cache empty_cache(0, 0);
-    common_cache_family_binding restored = slot.cache_family;
+    common_cache_retention_lineage restored = slot.retention_lineage;
     const server_tokens resumed(
         llama_tokens { 1, 2, 3, 4 }, false);
     result.no_restore_resume = empty_cache.load(
         slot.prompt, resumed, nullptr, nullptr, slot.id, "", nullptr, -1,
         &restored);
     if (result.no_restore_resume) {
-        slot.cache_family = restored;
+        slot.retention_lineage = restored;
     }
-    result.binding_intact = slot.cache_family == incoming;
+    result.binding_intact = slot.retention_lineage.declaration == incoming;
 
     auto staged = empty_cache.stage(slot.prompt, 8, 0, "");
     if (!staged.empty()) {
-        server_prompt_cache_apply_family(
-            staged.front(), slot.cache_family, true);
+        server_prompt_cache_apply_retention_lineage(
+            staged.front(), slot.retention_lineage, true, true);
         result.host_save_carries =
-            staged.front().cache_family == incoming &&
+            staged.front().retention_lineage.declaration == incoming &&
             staged.front().main_family ==
                 common_cache_family_main_family(incoming, true);
     }
     common_prompt_checkpoint checkpoint;
-    checkpoint.cache_family = slot.cache_family;
-    result.checkpoint_carries = checkpoint.cache_family == incoming;
+    checkpoint.retention_lineage = slot.retention_lineage;
+    result.checkpoint_carries =
+        checkpoint.retention_lineage.declaration == incoming;
 
     if (second_binding_token) {
         common_cache_family_binding second;
@@ -2085,8 +2092,11 @@ server_cache_family_slot_round_trip_for_test(
         if (result.roles_distinct) {
             server_slot second_slot {};
             second_slot.id = 1;
-            second_slot.cache_family = common_cache_family_follow_lineage(
-                {}, second, 0, 0);
+            second_slot.retention_lineage =
+                common_cache_retention_follow_lineage(
+                    {}, { second,
+                          common_cache_retention_provenance::neutral },
+                    0, 0);
             second_slot.prompt.tokens = server_tokens(
                 llama_tokens { 5, 6, 7 }, false);
             second_slot.prompt.sequence_epoch = 2;
@@ -2097,13 +2107,14 @@ server_cache_family_slot_round_trip_for_test(
             auto second_staged = two_slot_cache.stage(
                 second_slot.prompt, 8, 0, "family-pair-second");
             if (!first_staged.empty() && !second_staged.empty()) {
-                server_prompt_cache_apply_family(
-                    first_staged.front(), slot.cache_family, true);
-                server_prompt_cache_apply_family(
-                    second_staged.front(), second_slot.cache_family, true);
+                server_prompt_cache_apply_retention_lineage(
+                    first_staged.front(), slot.retention_lineage, true, true);
+                server_prompt_cache_apply_retention_lineage(
+                    second_staged.front(), second_slot.retention_lineage,
+                    true, true);
                 result.host_roles_distinct =
-                    first_staged.front().cache_family == incoming &&
-                    second_staged.front().cache_family == second;
+                    first_staged.front().retention_lineage.declaration == incoming &&
+                    second_staged.front().retention_lineage.declaration == second;
             }
         }
     }
@@ -3170,9 +3181,11 @@ private:
                     // Child slots clear their prompts on release, so every
                     // retained non-empty idle conversation is provisionally
                     // main-family until E1 supplies declared identity.
-                    const bool main_family = common_cache_family_main_family(
-                        victim->cache_family,
-                        !victim->task || !victim->task->is_child());
+                    const bool main_family =
+                        common_cache_retention_main_family(
+                            victim->retention_lineage,
+                            victim->intentional_retention,
+                            !victim->task || !victim->task->is_child());
                     uint32_t weight = 0;
                     uint64_t price_us = 0;
                     if (!server_cache_host_retention_price_us(
@@ -3664,6 +3677,23 @@ private:
             } else {
                 common_cache_plan_finalize_shadow_authority(rec);
             }
+            rec.optimizer.inventory_status = rec.inventory_saturated()
+                ? common_cache_optimizer_inventory_status::capacity
+                : common_cache_optimizer_inventory_status::complete;
+            rec.optimizer.baseline_plan_candidate =
+                rec.optimizer.inventory_status ==
+                        common_cache_optimizer_inventory_status::complete
+                    ? rec.authority.legacy_plan_candidate : -1;
+            if (rec.authority.state ==
+                    common_cache_plan_authority_state::authoritative) {
+                rec.optimizer.request_execution_policy =
+                    common_cache_optimizer_execution_policy::
+                        landed_checked_in_authority;
+            } else if (rec.retarget_committed) {
+                rec.optimizer.request_execution_policy =
+                    common_cache_optimizer_execution_policy::
+                        landed_fallback_path;
+            }
 
             if (cache_plan_obs) {
                 json out = common_cache_plan_record_json(rec);
@@ -3917,38 +3947,46 @@ private:
         return prompt.sequence_epoch;
     }
 
-    static bool computation_frontiers_equal(
-            const common_computation_frontier & a,
-            const common_computation_frontier & b) {
-        return a.version == b.version &&
-               a.sequence_epoch == b.sequence_epoch &&
-               a.token_count == b.token_count &&
-               a.next_position == b.next_position &&
-               a.execution_identity == b.execution_identity &&
-               a.adapter_config_identity == b.adapter_config_identity &&
-               a.media_content_identity == b.media_content_identity;
-    }
+    struct checkpoint_frontier_evaluation {
+        bool current = false;
+        bool conclusive_mismatch = false;
+    };
 
-    bool checkpoint_frontier_is_current(
+    checkpoint_frontier_evaluation checkpoint_frontier_evaluate(
             const server_slot & slot,
             const common_prompt_checkpoint & checkpoint,
             const std::string & adapter_identity) const {
         const auto & frontier = checkpoint.computation_frontier;
-        if (!frontier.valid() ||
+        if (!frontier.valid()) {
+            return {};
+        }
+
+        const bool direct_mismatch =
             frontier.sequence_epoch != slot.prompt.sequence_epoch ||
             frontier.execution_identity != frontier_execution_identity ||
             frontier.adapter_config_identity != adapter_identity ||
             frontier.token_count != checkpoint.n_tokens ||
             checkpoint.pos_max < 0 ||
             frontier.next_position <= 0 ||
-            frontier.next_position - 1 != checkpoint.pos_max) {
-            return false;
-        }
-
+            frontier.next_position - 1 != checkpoint.pos_max;
         std::string media_identity;
-        return slot.prompt.tokens.media_content_identity(
-                   frontier.token_count, media_identity) &&
-               media_identity == frontier.media_content_identity;
+        const bool media_observed =
+            slot.prompt.tokens.media_content_identity(
+                frontier.token_count, media_identity);
+        const bool media_mismatch = media_observed &&
+            media_identity != frontier.media_content_identity;
+        return {
+            !direct_mismatch && media_observed && !media_mismatch,
+            direct_mismatch || media_mismatch,
+        };
+    }
+
+    bool checkpoint_frontier_is_current(
+            const server_slot & slot,
+            const common_prompt_checkpoint & checkpoint,
+            const std::string & adapter_identity) const {
+        return checkpoint_frontier_evaluate(
+            slot, checkpoint, adapter_identity).current;
     }
 
     int trace = 0;
@@ -5568,6 +5606,10 @@ private:
             cache_authority->destruction.lease_evaluator =
                 server_cache_lease_evaluate_request;
             for (auto & slot : slots) {
+                slot.intentional_retention =
+                    params_base.cache_optimizer.retention_policy ==
+                        common_cache_optimizer_retention_policy::
+                            intentional_baseline;
                 slot.destruction_obs = &cache_authority->destruction;
                 slot.retention_obs = &cache_authority->retention;
                 slot.lease_obs = &cache_authority->leases;
@@ -6034,6 +6076,8 @@ private:
 
             if (prompt_cache) {
                 prompt_cache->acct = &cache_authority->ledger;
+                prompt_cache->retention_policy =
+                    params_base.cache_optimizer.retention_policy;
                 if (params_base.cache_optimizer.cache_lifecycle) {
                     prompt_cache->publish_authority =
                         cache_authority.get();
@@ -6850,6 +6894,52 @@ private:
             try {
                 plan_rec = std::make_unique<common_cache_plan_record>();
                 plan_rec->id_task = task.id;
+                switch (params_base.cache_optimizer.mode) {
+                    case common_cache_optimizer_mode::off:
+                        plan_rec->optimizer.mode =
+                            common_cache_optimizer_mode_wire::off;
+                        break;
+                    case common_cache_optimizer_mode::baseline:
+                        plan_rec->optimizer.mode =
+                            common_cache_optimizer_mode_wire::baseline;
+                        break;
+                    case common_cache_optimizer_mode::learn:
+                        plan_rec->optimizer.mode =
+                            common_cache_optimizer_mode_wire::learn;
+                        plan_rec->optimizer.economic_disposition =
+                            common_cache_optimizer_disposition::learning;
+                        plan_rec->optimizer.local_fallback_reason =
+                            common_cache_optimizer_fallback_reason::
+                                profile_unfitted;
+                        plan_rec->optimizer.profile_state =
+                            common_cache_optimizer_profile_state::learning;
+                        plan_rec->optimizer.coverage_class =
+                            common_cache_optimizer_coverage_class::
+                                point_estimate_incomplete;
+                        break;
+                    case common_cache_optimizer_mode::auto_mode:
+                        plan_rec->optimizer.mode =
+                            common_cache_optimizer_mode_wire::auto_mode;
+                        plan_rec->optimizer.economic_disposition =
+                            common_cache_optimizer_disposition::learning;
+                        plan_rec->optimizer.local_fallback_reason =
+                            common_cache_optimizer_fallback_reason::
+                                profile_unfitted;
+                        plan_rec->optimizer.profile_state =
+                            common_cache_optimizer_profile_state::learning;
+                        plan_rec->optimizer.coverage_class =
+                            common_cache_optimizer_coverage_class::
+                                point_estimate_incomplete;
+                        break;
+                    case common_cache_optimizer_mode::_count:
+                        break;
+                }
+                plan_rec->optimizer.retention_policy =
+                    params_base.cache_optimizer.retention_policy ==
+                            common_cache_optimizer_retention_policy::
+                                intentional_baseline
+                        ? common_cache_optimizer_retention_wire::zc_v1
+                        : common_cache_optimizer_retention_wire::historical;
                 // B-2: the profile is composed once at init and copied here (inside the
                 // creation try — never from a selector hook)
                 plan_rec->calibration_profile =
@@ -7273,6 +7363,14 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+        if (prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            prompt_cache->retention_summary = nullptr;
+            if (prompt_cache->retention_policy !=
+                    common_cache_optimizer_retention_policy::
+                        historical_legacy) {
+                prompt_cache->retention_event_begin();
+            }
+        }
         auto stage1 = cache_plan_select_before_mutation(
             task, cache_plan_authority.get(), false);
         server_slot * ret = stage1.target;
@@ -7445,6 +7543,7 @@ private:
                             }
                         }
                         ret = planned_ret;
+                        plan_rec->retarget_committed = true;
                         incoming_adapter_matches = planned_adapter_matches;
                         update_cache = false;
                         SLT_INF(*ret,
@@ -7475,6 +7574,10 @@ private:
                                                        plan_rec->selection));
                 plan_rec->note_inventory_complete(common_cache_plan_provider::live_slot);
                 ret->cache_plan = std::move(plan_rec);
+            }
+            if (prompt_cache && ret->cache_plan) {
+                prompt_cache->retention_summary =
+                    &ret->cache_plan->optimizer.retention_summary;
             }
 
             recurrent_shrink_for_prefill("before prompt cache save/load");
@@ -7602,6 +7705,10 @@ private:
             }
         }
 
+        if (prompt_cache) {
+            prompt_cache->retention_summary = nullptr;
+        }
+
         return ret;
     }
 
@@ -7666,6 +7773,13 @@ private:
                 task, "cache family binding is unavailable",
                 ERROR_TYPE_INVALID_REQUEST);
             return false;
+        }
+        common_cache_retention_lineage incoming_lineage;
+        incoming_lineage.declaration = incoming_family;
+        if (slot.intentional_retention && !incoming_family.declared() &&
+            task.is_parent()) {
+            incoming_lineage.automatic_provenance =
+                common_cache_retention_provenance::proven_server_parent;
         }
 
         if (dflash_window_server_enabled() && task.tokens.has_media()) {
@@ -7945,8 +8059,8 @@ private:
             slot.retention_obs->retire(
                 server_retention_instance_key::for_slot(slot.id));
         }
-        slot.cache_family = common_cache_family_follow_lineage(
-            slot.cache_family, incoming_family, retained_prefix,
+        slot.retention_lineage = common_cache_retention_follow_lineage(
+            slot.retention_lineage, incoming_lineage, retained_prefix,
             slot.prompt.tokens.size());
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -9587,7 +9701,7 @@ private:
                             // v1 artifact metadata. A foreign import therefore
                             // starts undeclared rather than inheriting a stale
                             // binding from the destination slot.
-                            state->slot->cache_family = {};
+                            state->slot->retention_lineage = {};
                             state->ready = false;
                         };
 
@@ -11617,6 +11731,7 @@ private:
                                                 // the next min-step thinning pass could otherwise erase
                                                 // the exact anchor we just restored.
                                                 it->id_task = slot.task->id;
+                                                it->id_task_referenced = slot.task->id;
 
                                                 SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                                 slot.cache_status = "restored context checkpoint";
@@ -12190,6 +12305,9 @@ private:
                     const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
                     const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
                     llama_memory_vbr_state_data vbr_now = {};
+                    common_retention_stamp zc_checkpoint_stamp;
+                    bool zc_checkpoint_prepared = false;
+                    server_retention_instance_key zc_checkpoint_key;
                     if (do_checkpoint) {
                         vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
                     }
@@ -12255,9 +12373,7 @@ private:
                             last.pos_max                 == pos_max &&
                             last.representation_epoch     == vbr_now.representation_epoch &&
                             last.representation_epoch_swa == vbr_now.representation_epoch_swa &&
-                            computation_frontiers_equal(
-                                last.computation_frontier,
-                                ckpt_frontier)) {
+                            last.computation_frontier == ckpt_frontier) {
                             last.id_task = ckpt_id_task;
                             SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, VBR epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
                                     ckpt_n_tokens, ckpt_pos_min, pos_max,
@@ -12303,7 +12419,7 @@ private:
                             next.representation_epoch     = vbr_now.representation_epoch;
                             next.representation_epoch_swa = vbr_now.representation_epoch_swa;
                             next.computation_frontier = ckpt_frontier;
-                            next.cache_family = slot.cache_family;
+                            next.retention_lineage = slot.retention_lineage;
 
                             const size_t checkpoint_size =
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -12382,9 +12498,502 @@ private:
                             seam_heuristic_checkpoint =
                                 slot.checkpoint_seam_heuristic;
                         bool checkpoint_publication_allowed = true;
-                        const bool optional_thinning_attempt =
+                        common_cache_retention_reason zc_skip_reason =
+                            common_cache_retention_reason::
+                                publication_skipped_recovery_unavailable;
+                        bool zc_retention =
+                            params_base.cache_optimizer.retention_policy ==
+                                common_cache_optimizer_retention_policy::
+                                    intentional_baseline;
+                        bool optional_thinning_attempt = !zc_retention &&
                             slot.lifecycle_authority &&
                             slot.checkpoint_thinning_attempt_begin(false);
+                        // ZC is an intentional retention policy, not a new
+                        // availability requirement. If its accounting/catalog
+                        // preparation is unavailable, defer the policy and run
+                        // the landed checkpoint path below. Policy selection,
+                        // protection, and recovery-proof refusals remain typed
+                        // no-mutation terminals; only missing authority evidence
+                        // takes this historical fallback.
+                        const auto zc_fallback_to_historical = [&] (
+                                common_cache_retention_reason reason) {
+                            if (!zc_retention) {
+                                return;
+                            }
+                            zc_retention = false;
+                            checkpoint_publication_allowed = true;
+                            if (!optional_thinning_attempt &&
+                                slot.lifecycle_authority) {
+                                optional_thinning_attempt =
+                                    slot.checkpoint_thinning_attempt_begin(false);
+                            }
+                            if (slot.cache_plan) {
+                                slot.cache_plan->optimizer.retention_summary.note(
+                                    common_cache_retention_outcome::deferred,
+                                    reason);
+                            }
+                        };
+                        if (zc_retention) {
+                            const uint32_t capacity = uint32_t(std::max(
+                                0, params_base.n_ctx_checkpoints));
+                            if (!slot.lifecycle_authority ||
+                                !slot.retention_obs) {
+                                zc_fallback_to_historical(
+                                    common_cache_retention_reason::
+                                        accounting_unavailable);
+                            } else if (capacity == 0) {
+                                checkpoint_publication_allowed = false;
+                                zc_skip_reason =
+                                    common_cache_retention_reason::
+                                        publication_skipped_policy;
+                            } else {
+                                const auto retention_config =
+                                    server_cache_zc1_retention_config(
+                                        capacity,
+                                        uint64_t(std::max(
+                                            1, params_base.checkpoint_min_step)));
+                                const auto & policy = retention_config.policy;
+
+                                std::vector<server_cache_retention_member>
+                                    policy_members;
+                                struct zc_checkpoint_row {
+                                    server_slot::checkpoint_iterator checkpoint;
+                                    server_retention_checkpoint_inventory catalog;
+                                    bool catalog_found = false;
+                                };
+                                std::vector<zc_checkpoint_row> policy_rows;
+                                try {
+                                    policy_members.reserve(
+                                        slot.prompt.checkpoints.size() + 1);
+                                    policy_rows.reserve(
+                                        slot.prompt.checkpoints.size());
+                                    const auto adapter =
+                                        lora_config_identity(slot.lora);
+                                    uint32_t ordinal = 0;
+                                    for (auto it =
+                                             slot.prompt.checkpoints.begin();
+                                         it != slot.prompt.checkpoints.end();
+                                         ++it, ++ordinal) {
+                                        server_cache_retention_member member;
+                                        member.ordinal = ordinal;
+                                        member.frontier = it->n_tokens >= 0
+                                            ? uint64_t(it->n_tokens) : 0;
+                                        zc_checkpoint_row policy_row;
+                                        policy_row.checkpoint = it;
+                                        policy_row.catalog_found =
+                                            slot.retention_obs->
+                                                checkpoint_inventory(
+                                                    server_retention_instance_key::
+                                                        for_checkpoint(
+                                                            slot.id, &*it),
+                                                    policy_row.catalog);
+                                        const bool found =
+                                            policy_row.catalog_found;
+                                        const auto & catalog =
+                                            policy_row.catalog;
+                                        member.stable_id = found
+                                            ? catalog.stable_id : 0;
+                                        const auto frontier_evaluation =
+                                            checkpoint_frontier_evaluate(
+                                                slot, *it, adapter);
+                                        const bool representation_mismatch =
+                                            it->representation_epoch !=
+                                                vbr_now.representation_epoch ||
+                                            it->representation_epoch_swa !=
+                                                vbr_now.representation_epoch_swa;
+                                        const bool current = found &&
+                                            frontier_evaluation.current &&
+                                            !representation_mismatch;
+                                        member.identity = current
+                                            ? server_cache_retention_identity::
+                                                  current
+                                            : found &&
+                                                      catalog.identity_known &&
+                                                      (frontier_evaluation.
+                                                           conclusive_mismatch ||
+                                                       representation_mismatch)
+                                                ? server_cache_retention_identity::
+                                                      stale_conclusive_refused
+                                                : server_cache_retention_identity::
+                                                      identity_unknown;
+                                        if (found &&
+                                            server_cache_lease_is_hard(
+                                                catalog.lease)) {
+                                            member.protection =
+                                                server_cache_retention_protection::
+                                                    hard_lease;
+                                        } else if (found &&
+                                                   catalog.recovery_pinned) {
+                                            member.protection =
+                                                server_cache_retention_protection::
+                                                    recovery_pin;
+                                        } else if (found &&
+                                                   catalog.mandatory_anchor) {
+                                            member.protection =
+                                                server_cache_retention_protection::
+                                                    mandatory_anchor;
+                                        } else if (
+                                            server_cache_checkpoint_task_protected(
+                                                *it, ckpt_id_task,
+                                                server_cache_checkpoint_task_policy::
+                                                    current_reference)) {
+                                            member.protection =
+                                                server_cache_retention_protection::
+                                                    current_task;
+                                        }
+                                        policy_members.push_back(member);
+                                        policy_rows.push_back(
+                                            std::move(policy_row));
+                                    }
+
+                                    const auto drop_from_plan = [&] (
+                                            const server_cache_retention_policy_result & plan,
+                                            uint64_t current_frontier) {
+                                        std::vector<uint8_t> desired(
+                                            policy_rows.size(), 0);
+                                        for (const uint32_t ordinal :
+                                             plan.desired) {
+                                            if (ordinal < desired.size()) {
+                                                desired[ordinal] = 1;
+                                            }
+                                        }
+                                        for (const uint32_t victim_ordinal :
+                                             plan.exclusion_order) {
+                                            if (victim_ordinal >=
+                                                policy_rows.size()) {
+                                                continue;
+                                            }
+                                            auto victim =
+                                                policy_rows[victim_ordinal].
+                                                    checkpoint;
+                                            const uint64_t replay_cap =
+                                                server_cache_retention_replay_cap(
+                                                    retention_config,
+                                                    current_frontier,
+                                                    uint64_t(std::max<int64_t>(
+                                                        0, victim->n_tokens)));
+                                            auto recovery =
+                                                slot.prompt.checkpoints.end();
+                                            for (uint32_t recovery_ordinal = 0;
+                                                 recovery_ordinal <
+                                                     policy_rows.size();
+                                                 ++recovery_ordinal) {
+                                                if (recovery_ordinal ==
+                                                        victim_ordinal ||
+                                                    !desired[
+                                                        recovery_ordinal]) {
+                                                    continue;
+                                                }
+                                                const auto & recovery_row =
+                                                    policy_rows[
+                                                        recovery_ordinal];
+                                                auto candidate =
+                                                    recovery_row.checkpoint;
+                                                if (!recovery_row.catalog_found ||
+                                                    !recovery_row.catalog.
+                                                        identity_known ||
+                                                    !recovery_row.catalog.
+                                                        release_owned ||
+                                                    !server_cache_checkpoint_bounded_replay(
+                                                        *candidate, *victim,
+                                                        replay_cap)) {
+                                                    continue;
+                                                }
+                                                if (recovery ==
+                                                        slot.prompt.checkpoints.end() ||
+                                                    candidate->n_tokens >
+                                                        recovery->n_tokens) {
+                                                    recovery = candidate;
+                                                }
+                                            }
+                                            if (recovery ==
+                                                slot.prompt.checkpoints.end()) {
+                                                continue;
+                                            }
+                                            const uint64_t victim_bytes =
+                                                victim->size();
+                                            auto context =
+                                                slot.checkpoint_authority_context();
+                                            if (!server_cache_checkpoint_drop_with_recovery(
+                                                    context, victim, recovery,
+                                                    replay_cap,
+                                                    server_cache_destruction_reason::
+                                                        checkpoint_capacity)) {
+                                                continue;
+                                            }
+                                            if (slot.cache_plan) {
+                                                slot.cache_plan->optimizer.
+                                                    retention_summary.note(
+                                                        common_cache_retention_outcome::
+                                                            executed,
+                                                        common_cache_retention_reason::
+                                                            _count,
+                                                        victim_bytes, 0);
+                                            }
+                                            return true;
+                                        }
+                                        return false;
+                                    };
+
+                                    // Conclusive old-lineage state cannot
+                                    // restore this slot. Retire at most one
+                                    // such unprotected member through the
+                                    // exact-release door and defer this
+                                    // publication; a refusal carries the row
+                                    // into ordinary occupancy below.
+                                    size_t stale_ordinal = SIZE_MAX;
+                                    for (size_t i = 0;
+                                         i < policy_members.size(); ++i) {
+                                        const auto & member =
+                                            policy_members[i];
+                                        if (member.identity !=
+                                                server_cache_retention_identity::
+                                                    stale_conclusive_refused ||
+                                            member.protection !=
+                                                server_cache_retention_protection::
+                                                    none) {
+                                            continue;
+                                        }
+                                        if (stale_ordinal == SIZE_MAX ||
+                                            std::make_tuple(
+                                                member.frontier,
+                                                member.stable_id) <
+                                                std::make_tuple(
+                                                    policy_members[stale_ordinal].
+                                                        frontier,
+                                                    policy_members[stale_ordinal].
+                                                        stable_id)) {
+                                            stale_ordinal = i;
+                                        }
+                                    }
+                                    bool stale_retired = false;
+                                    if (stale_ordinal != SIZE_MAX) {
+                                        const uint64_t victim_bytes =
+                                            policy_rows[stale_ordinal].
+                                                checkpoint->size();
+                                        auto context =
+                                            slot.checkpoint_authority_context();
+                                        stale_retired =
+                                            server_cache_checkpoint_drop_stale(
+                                                context,
+                                                policy_rows[stale_ordinal].
+                                                    checkpoint,
+                                                server_cache_destruction_reason::
+                                                    checkpoint_thin);
+                                        if (stale_retired) {
+                                            checkpoint_publication_allowed =
+                                                false;
+                                            zc_skip_reason =
+                                                common_cache_retention_reason::
+                                                    stale_retirement_pending;
+                                            if (slot.cache_plan) {
+                                                slot.cache_plan->optimizer.
+                                                    retention_summary.note(
+                                                        common_cache_retention_outcome::
+                                                            executed,
+                                                        common_cache_retention_reason::
+                                                            _count,
+                                                        victim_bytes, 0);
+                                            }
+                                        } else if (slot.cache_plan) {
+                                            slot.cache_plan->optimizer.
+                                                retention_summary.note(
+                                                    common_cache_retention_outcome::
+                                                        deferred,
+                                                    common_cache_retention_reason::
+                                                        stale_retirement_refused);
+                                        }
+                                    }
+                                    bool zc_stamp_reserved = false;
+                                    if (!stale_retired) {
+                                        zc_stamp_reserved =
+                                            slot.retention_obs->reserve_stamp(
+                                                slot.retention_pool,
+                                                zc_checkpoint_stamp);
+                                        if (!zc_stamp_reserved) {
+                                            zc_fallback_to_historical(
+                                                common_cache_retention_reason::
+                                                    checkpoint_staging_unavailable);
+                                        }
+                                    }
+                                    bool shrink_handled = false;
+                                    if (zc_retention && !stale_retired &&
+                                        zc_stamp_reserved &&
+                                        slot.prompt.checkpoints.size() > capacity) {
+                                        // Configuration shrink is its own operation:
+                                        // retire at most one certified incumbent and
+                                        // never combine that mutation with publication
+                                        // of the staged checkpoint.
+                                        const auto shrink_plan =
+                                            server_cache_plan_retention_set(
+                                                policy,
+                                                uint64_t(std::max<int64_t>(
+                                                    0, ckpt_n_tokens)),
+                                                policy_members);
+                                        if (server_cache_retention_status_is_evidence_unavailable(
+                                                shrink_plan.status)) {
+                                            zc_fallback_to_historical(
+                                                common_cache_retention_reason::
+                                                    checkpoint_staging_unavailable);
+                                        } else {
+                                            const bool dropped = shrink_plan.status ==
+                                                server_cache_retention_policy_status::ok &&
+                                                drop_from_plan(
+                                                    shrink_plan,
+                                                    uint64_t(std::max<int64_t>(
+                                                        0, ckpt_n_tokens)));
+                                            checkpoint_publication_allowed = false;
+                                            shrink_handled = true;
+                                            zc_skip_reason = dropped
+                                                ? common_cache_retention_reason::
+                                                      publication_skipped_shrink_pending
+                                                : shrink_plan.status ==
+                                                          server_cache_retention_policy_status::
+                                                              protected_over_capacity
+                                                    ? common_cache_retention_reason::
+                                                          shrink_blocked_protected
+                                                    : common_cache_retention_reason::
+                                                          shrink_blocked_recovery_unavailable;
+                                            if (!dropped && slot.cache_plan) {
+                                                slot.cache_plan->optimizer.retention_summary.note(
+                                                    common_cache_retention_outcome::blocked, zc_skip_reason);
+                                            }
+                                        }
+                                    }
+                                    if (zc_retention && !stale_retired &&
+                                        !shrink_handled && zc_stamp_reserved) {
+                                        server_cache_retention_member incoming;
+                                        incoming.ordinal   = ordinal;
+                                        incoming.stable_id = zc_checkpoint_stamp.stable_id;
+                                        incoming.frontier  = uint64_t(std::max<int64_t>(0, ckpt_n_tokens));
+                                        incoming.incoming  = true;
+                                        policy_members.push_back(incoming);
+
+                                        const auto plan =
+                                            server_cache_plan_retention_set(policy, incoming.frontier, policy_members);
+                                        if (slot.cache_debug_observability &&
+                                            plan.status == server_cache_retention_policy_status::ok &&
+                                            !plan.incoming_selected) {
+                                            SLT_INF(slot,
+                                                    "CACHE_RETENTION_POLICY outcome=publication_skipped_policy "
+                                                    "frontier=%" PRIu64 " capacity=%u desired=%zu excluded=%zu\n",
+                                                    incoming.frontier, policy.capacity,
+                                                    plan.desired.size(), plan.exclusion_order.size());
+                                            for (const auto & member : policy_members) {
+                                                SLT_INF(slot,
+                                                        "CACHE_RETENTION_POLICY_MEMBER ordinal=%u stable_id=%" PRIu64
+                                                        " frontier=%" PRIu64 " identity=%u protection=%u incoming=%s selected=%s\n",
+                                                        member.ordinal, member.stable_id, member.frontier,
+                                                        unsigned(member.identity), unsigned(member.protection),
+                                                        member.incoming ? "true" : "false",
+                                                        std::find(plan.desired.begin(), plan.desired.end(), member.ordinal) !=
+                                                                plan.desired.end() ? "true" : "false");
+                                            }
+                                        }
+                                        if (server_cache_retention_status_is_evidence_unavailable(
+                                                plan.status)) {
+                                            zc_fallback_to_historical(
+                                                common_cache_retention_reason::
+                                                    checkpoint_staging_unavailable);
+                                        } else if (plan.status !=
+                                                       server_cache_retention_policy_status::ok ||
+                                                   !plan.incoming_selected) {
+                                            checkpoint_publication_allowed = false;
+                                            zc_skip_reason =
+                                                plan.status ==
+                                                        server_cache_retention_policy_status::protected_over_capacity ?
+                                                    common_cache_retention_reason::protected_over_capacity :
+                                                plan.status == server_cache_retention_policy_status::ok ?
+                                                    common_cache_retention_reason::publication_skipped_policy :
+                                                    common_cache_retention_reason::checkpoint_staging_unavailable;
+                                        } else {
+                                            // Prepare the incoming sidecar and
+                                            // accounting ownership while its list
+                                            // node is still detached. A list
+                                            // splice preserves the address/key.
+                                            // If any later victim proof refuses,
+                                            // retire this preparation before the
+                                            // staged node is destroyed, leaving
+                                            // the visible ring byte-identical.
+                                            const auto & incoming_checkpoint = staged.back();
+                                            const bool   frontier_valid =
+                                                incoming_checkpoint.computation_frontier.valid() &&
+                                                incoming_checkpoint.computation_frontier.token_count ==
+                                                    incoming_checkpoint.n_tokens &&
+                                                incoming_checkpoint.n_tokens >= 0 &&
+                                                incoming_checkpoint.n_tokens <= slot.task->n_tokens();
+                                            server_cache_lease_identity checkpoint_identity;
+                                            if (frontier_valid) {
+                                                checkpoint_identity.execution_identity =
+                                                    incoming_checkpoint.computation_frontier.execution_identity;
+                                                checkpoint_identity.adapter_config_identity =
+                                                    incoming_checkpoint.computation_frontier.adapter_config_identity;
+                                                checkpoint_identity.media_content_identity =
+                                                    incoming_checkpoint.computation_frontier.media_content_identity;
+                                            }
+                                            zc_checkpoint_key = server_retention_instance_key::for_checkpoint(
+                                                slot.id, &incoming_checkpoint);
+                                            bool prepared =
+                                                frontier_valid && checkpoint_identity.valid() &&
+                                                slot.retention_obs->publish_reserved(
+                                                    zc_checkpoint_key, zc_checkpoint_stamp,
+                                                    slot.task->params.message_spans,
+                                                    !slot.task->params.message_spans.spans.empty(),
+                                                    uint64_t(slot.task->n_tokens()),
+                                                    uint64_t(incoming_checkpoint.n_tokens), true,
+                                                    &checkpoint_identity, nullptr,
+                                                    server_retention_anchor_policy::
+                                                        checkpoint_desired_set);
+                                            if (prepared) {
+                                                const auto artifact =
+                                                    slot.retention_obs->artifact_id(zc_checkpoint_key);
+                                                std::vector<llama_cache_acct_op_id> ops;
+                                                const uint64_t accel_bytes = incoming_checkpoint.accel.size();
+                                                const uint64_t total_bytes = incoming_checkpoint.size();
+                                                prepared                   = total_bytes >= accel_bytes &&
+                                                           slot.lifecycle_authority->admit_live_checkpoint(
+                                                               artifact, total_bytes - accel_bytes, accel_bytes, ops) &&
+                                                           slot.retention_obs->attach_release_ops(zc_checkpoint_key,
+                                                                                                  std::move(ops));
+                                            }
+                                            if (!prepared) {
+                                                slot.retention_obs->retire(zc_checkpoint_key);
+                                                zc_fallback_to_historical(
+                                                    common_cache_retention_reason::
+                                                        checkpoint_staging_unavailable);
+                                            } else {
+                                                zc_checkpoint_prepared = true;
+                                            }
+                                        }
+                                        if (zc_retention &&
+                                            checkpoint_publication_allowed &&
+                                            slot.prompt.checkpoints.size() >= capacity) {
+                                            checkpoint_publication_allowed = drop_from_plan(plan, incoming.frontier);
+                                            if (!checkpoint_publication_allowed) {
+                                                zc_skip_reason = common_cache_retention_reason::
+                                                    publication_skipped_recovery_unavailable;
+                                            }
+                                        }
+                                    }
+                                } catch (...) {
+                                    checkpoint_publication_allowed = false;
+                                    zc_skip_reason                 = common_cache_retention_reason::internal_fault;
+                                }
+                            }
+                            if (!checkpoint_publication_allowed) {
+                                if (zc_checkpoint_prepared) {
+                                    slot.retention_obs->retire(zc_checkpoint_key);
+                                    zc_checkpoint_prepared = false;
+                                }
+                                if (slot.cache_plan) {
+                                    slot.cache_plan->optimizer.retention_summary.note(
+                                        common_cache_retention_outcome::publication_skipped, zc_skip_reason);
+                                }
+                                slot.checkpoint_publication_skipped(
+                                    common_cache_plan_destruction_reason::
+                                        recovery_unavailable);
+                            }
+                        }
                         if (optional_thinning_attempt) {
                             seam_heuristic_checkpoint = nullptr;
                             const llama_pos seam_next =
@@ -12460,7 +13069,8 @@ private:
                                     slot.checkpoint_thinning_refusal);
                                 checkpoint_publication_allowed = false;
                             }
-                        } else if (!slot.lifecycle_authority) {
+                        } else if (!zc_retention &&
+                                   !slot.lifecycle_authority) {
                             int64_t last = -1;
                             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                                 if (it->id_task != ckpt_id_task && last >= 0 &&
@@ -12478,7 +13088,8 @@ private:
                             }
                         }
 
-                        while (checkpoint_publication_allowed &&
+                        while (!zc_retention &&
+                               checkpoint_publication_allowed &&
                                slot.prompt.checkpoints.size() >=
                                    (size_t) params_base.n_ctx_checkpoints) {
                             if (slot.lifecycle_authority &&
@@ -12529,7 +13140,7 @@ private:
                                 slot.checkpoint_ring_changed();
                             }
                             const auto & cur = slot.prompt.checkpoints.back();
-                            if (slot.retention_obs) {
+                            if (slot.retention_obs && !zc_retention) {
                                 const bool frontier_valid =
                                     cur.computation_frontier.valid() &&
                                     cur.computation_frontier.token_count ==
@@ -12584,6 +13195,8 @@ private:
                                             "checkpoint payload ownership attach failed; member remains fail-closed");
                                     }
                                 }
+                            } else if (zc_retention) {
+                                GGML_ASSERT(zc_checkpoint_prepared);
                             }
 
                             SLT_WRN(slot,

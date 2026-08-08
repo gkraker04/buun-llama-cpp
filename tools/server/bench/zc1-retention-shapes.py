@@ -55,6 +55,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--workers", type=int, choices=(1, 3), default=3,
+        help="request concurrency; use 1 for deterministic output-parity arms",
+    )
     args = parser.parse_args()
 
     common = atoms(args.seed ^ 0xCACE, 2800, "shared_system")
@@ -72,7 +76,7 @@ def main() -> int:
 
     records = []
     started = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         for round_id in range(12):
             for chain in range(3):
                 if round_id == 7:
@@ -131,6 +135,7 @@ def main() -> int:
         "seed": args.seed,
         "chains": 3,
         "rounds": 12,
+        "workers": args.workers,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
         "records": records,
     }

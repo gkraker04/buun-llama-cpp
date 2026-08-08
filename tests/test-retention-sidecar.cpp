@@ -214,6 +214,75 @@ static void test_store_and_allocator_import() {
     CHECK(attention.stable_id == 1 && attention.recency_ordinal == 1);
 }
 
+static void test_checkpoint_desired_set_anchor_policy() {
+    retention_test_clock clock;
+    server_cache_lease_table leases(&clock);
+    server_retention_sidecar_store store;
+    const auto domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+    store.configure(nullptr, domain, &leases);
+
+    const server_cache_lease_identity lineage_a = {
+        "execution-a", "adapter", "media",
+    };
+    const server_cache_lease_identity lineage_b = {
+        "execution-b", "adapter", "media",
+    };
+    const auto publish_checkpoint = [&](uintptr_t address, int32_t owner,
+                                        const server_cache_lease_identity & identity,
+                                        server_retention_anchor_policy anchor_policy) {
+        common_retention_stamp stamp;
+        CHECK(store.reserve_stamp(common_retention_pool::recurrent, stamp));
+        const auto key = server_retention_instance_key::for_checkpoint(
+            owner, reinterpret_cast<const common_prompt_checkpoint *>(address));
+        CHECK(store.publish_reserved(
+            key, stamp, make_spans(), true, 44, 40, true,
+            &identity, nullptr, anchor_policy));
+        return key;
+    };
+
+    const auto first = publish_checkpoint(
+        501, 5, lineage_a,
+        server_retention_anchor_policy::checkpoint_desired_set);
+    const auto duplicate = publish_checkpoint(
+        502, 5, lineage_a,
+        server_retention_anchor_policy::checkpoint_desired_set);
+    const auto other_lineage = publish_checkpoint(
+        503, 5, lineage_b,
+        server_retention_anchor_policy::checkpoint_desired_set);
+    server_retention_checkpoint_inventory inventory;
+    CHECK(store.checkpoint_inventory(first, inventory));
+    CHECK(!inventory.mandatory_anchor);
+    CHECK(store.checkpoint_inventory(duplicate, inventory));
+    CHECK(!inventory.mandatory_anchor);
+    CHECK(store.checkpoint_inventory(other_lineage, inventory));
+    CHECK(!inventory.mandatory_anchor);
+
+    // The landed/non-ZC publication door does not coalesce anchors.
+    const auto legacy_first = publish_checkpoint(
+        601, 6, lineage_a, server_retention_anchor_policy::scored);
+    const auto legacy_second = publish_checkpoint(
+        602, 6, lineage_a, server_retention_anchor_policy::scored);
+    CHECK(store.checkpoint_inventory(legacy_first, inventory));
+    CHECK(inventory.mandatory_anchor);
+    CHECK(store.checkpoint_inventory(legacy_second, inventory));
+    CHECK(inventory.mandatory_anchor);
+
+    // Desired-set ownership is checkpoint-specific. A future caller cannot
+    // accidentally suppress score-derived anchors on another artifact kind.
+    common_retention_stamp invalid_stamp;
+    CHECK(store.reserve_stamp(common_retention_pool::recurrent, invalid_stamp));
+    const server_retention_instance_key host_key {
+        common_retention_artifact_kind::host_entry, -1, 701,
+    };
+    CHECK(!store.publish_reserved(
+        host_key, invalid_stamp, make_spans(), true, 44, 40, true,
+        nullptr, nullptr,
+        server_retention_anchor_policy::checkpoint_desired_set));
+    server_retention_candidate ignored;
+    CHECK(!store.candidate_for_instance(host_key, ignored));
+}
+
 static void test_observer_store_accounting() {
     const auto domain = llama_cache_acct_resource_domain::non_device(
         llama_cache_acct_residency::pageable_host);
@@ -441,6 +510,7 @@ int main() {
     test_turn_table_and_geometry();
     test_codec();
     test_store_and_allocator_import();
+    test_checkpoint_desired_set_anchor_policy();
     test_observer_store_accounting();
     if (failures != 0) {
         fprintf(stderr, "%d retention-sidecar test(s) failed\n", failures);

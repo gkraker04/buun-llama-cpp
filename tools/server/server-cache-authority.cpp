@@ -210,6 +210,15 @@ bool server_cache_checkpoint_bounded_replay(
                later.representation_epoch_swa;
 }
 
+bool server_cache_checkpoint_task_protected(
+        const common_prompt_checkpoint & checkpoint,
+        int checkpoint_task_id,
+        server_cache_checkpoint_task_policy policy) noexcept {
+    return policy == server_cache_checkpoint_task_policy::current_reference
+        ? checkpoint.id_task_referenced == checkpoint_task_id
+        : checkpoint.id_task == checkpoint_task_id;
+}
+
 server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(
         const std::vector<server_cache_checkpoint_floor_input> & candidates) noexcept {
     server_cache_checkpoint_floor_plan out;

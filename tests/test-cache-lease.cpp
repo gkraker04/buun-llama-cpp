@@ -172,6 +172,17 @@ static void test_declared_family_replaces_automatic_weight() {
     CHECK(!common_cache_family_main_family(declared_branch, true));
     CHECK(!common_cache_family_allows_additional_weight(declared_main));
     CHECK(!common_cache_family_allows_additional_weight(declared_branch));
+
+    common_cache_retention_lineage neutral;
+    CHECK(common_cache_retention_main_family(neutral, false, true));
+    CHECK(!common_cache_retention_main_family(neutral, true, true));
+    neutral.automatic_provenance =
+        common_cache_retention_provenance::proven_server_parent;
+    CHECK(common_cache_retention_main_family(neutral, true, false));
+    neutral.declaration = declared_branch;
+    CHECK(!common_cache_retention_main_family(neutral, true, true));
+    neutral.declaration = declared_main;
+    CHECK(common_cache_retention_main_family(neutral, true, false));
 }
 
 static void test_hard_proof_lifetime_across_clone() {

@@ -290,7 +290,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_definitions(test-cache-plan-preflight PRIVATE
-        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-plan-preflight-v1.json")
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-plan-preflight-v2.json")
     add_test(
         NAME test-cache-plan-preflight-contract
         COMMAND ${CMAKE_COMMAND}

@@ -83,6 +83,19 @@ enum class server_cache_checkpoint_protection : uint8_t {
     _count,
 };
 
+enum class server_cache_checkpoint_task_policy : uint8_t {
+    historical_affinity = 0,
+    current_reference,
+};
+
+// One explicit spelling of the intentionally different task-protection
+// contracts. Historical D-A4 retains its created-or-adopted affinity; ZC's
+// desired-set policy protects only a member referenced by the current task.
+bool server_cache_checkpoint_task_protected(
+    const common_prompt_checkpoint & checkpoint,
+    int checkpoint_task_id,
+    server_cache_checkpoint_task_policy policy) noexcept;
+
 struct server_cache_checkpoint_trade_input {
     uint32_t ordinal = 0;
     uint32_t recovery_ordinal = UINT32_MAX;
@@ -237,6 +250,8 @@ struct server_cache_checkpoint_authority_context {
     common_cache_plan_destruction_reason & floor_refusal;
     bool main_family = false;
     common_cache_family_binding cache_family;
+    common_cache_retention_provenance retention_provenance =
+        common_cache_retention_provenance::neutral;
     bool debug_observability = false;
     void * raw_owner = nullptr;
     checkpoint_drop_fn raw_drop = nullptr;
@@ -266,6 +281,25 @@ bool server_cache_checkpoint_thin_priced(
     const common_prompt_checkpoint * seam_heuristic,
     bool capacity_mode,
     bool attempt_claimed = false) noexcept;
+
+// ZC1 policy adapter: policy chooses an excluded victim and a disjoint earlier
+// bounded-replay source; this door owns the existing D-A4 quote, pin,
+// prepare, raw erase, commit, and evidence terminal.
+bool server_cache_checkpoint_drop_with_recovery(
+    server_cache_checkpoint_authority_context & context,
+    server_cache_checkpoint_authority_context::checkpoint_iterator victim,
+    server_cache_checkpoint_authority_context::checkpoint_iterator recovery,
+    uint64_t max_replay_tokens,
+    server_cache_destruction_reason reason) noexcept;
+
+// ZC1 conclusive stale-lineage pre-pass. The caller has proved that the
+// member cannot participate in the slot's current execution lineage. This
+// path still requires known non-hard lease state and an exact accounting
+// release, but deliberately has no recovery citation.
+bool server_cache_checkpoint_drop_stale(
+    server_cache_checkpoint_authority_context & context,
+    server_cache_checkpoint_authority_context::checkpoint_iterator victim,
+    server_cache_destruction_reason reason) noexcept;
 
 bool server_cache_checkpoint_capacity_floor(
     server_cache_checkpoint_authority_context & context,

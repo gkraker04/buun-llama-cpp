@@ -1,6 +1,7 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-destruction-quote.h"
+#include "server-cache-retention-policy.h"
 
 #include "../../common/common-cache-plan-estimate.h"
 
@@ -2231,7 +2232,8 @@ bool build_checkpoint_destruction_artifact(
         out.owner_slot = context.slot_id;
         out.pool = catalog.record.stamp.pool;
         out.mandatory_anchor =
-            catalog.record.stamp.mandatory_anchor;
+            catalog.record.stamp.mandatory_anchor ||
+            inventory.recovery_pinned;
         return true;
     } catch (...) {
         out = {};
@@ -2255,6 +2257,11 @@ void emit_checkpoint_destruction(
         payload["price_us"] = price_us;
         payload["retention_weight_milli"] = weight_milli;
         payload["rank_ordinal"] = ordinal;
+        common_cache_retention_lineage lineage;
+        lineage.declaration = context.cache_family;
+        lineage.automatic_provenance = context.retention_provenance;
+        payload["retention_lineage"] =
+            common_cache_retention_lineage_name(lineage);
         SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
                 payload.dump().c_str());
     } catch (...) {
@@ -2474,7 +2481,10 @@ bool server_cache_checkpoint_thin_priced(
                 uint64_t(it->n_tokens - previous->n_tokens) <=
                     max_replay_tokens;
             if ((!capacity_mode && !close) ||
-                it->id_task == checkpoint_task_id) {
+                server_cache_checkpoint_task_protected(
+                    *it, checkpoint_task_id,
+                    server_cache_checkpoint_task_policy::
+                        historical_affinity)) {
                 previous_index = index;
                 continue;
             }
@@ -2609,6 +2619,143 @@ bool server_cache_checkpoint_thin_priced(
     return false;
 }
 
+bool server_cache_checkpoint_drop_with_recovery(
+        server_cache_checkpoint_authority_context & context,
+        server_cache_checkpoint_authority_context::checkpoint_iterator victim,
+        server_cache_checkpoint_authority_context::checkpoint_iterator recovery,
+        uint64_t max_replay_tokens,
+        server_cache_destruction_reason reason) noexcept {
+    if (victim == context.checkpoints.end() ||
+        recovery == context.checkpoints.end() || victim == recovery ||
+        !server_cache_checkpoint_bounded_replay(
+            *recovery, *victim, max_replay_tokens)) {
+        return false;
+    }
+    const auto ordinal = uint32_t(std::distance(
+        context.checkpoints.begin(), victim));
+    server_cache_checkpoint_iterator next;
+    return checkpoint_drop_certified(
+        context, victim, recovery, reason, 0,
+        SERVER_CACHE_HOST_WEIGHT_SCALE, ordinal, next);
+}
+
+bool server_cache_checkpoint_drop_stale(
+        server_cache_checkpoint_authority_context & context,
+        server_cache_checkpoint_authority_context::checkpoint_iterator victim,
+        server_cache_destruction_reason reason) noexcept {
+    if (!context.authority || !context.retention || !context.destruction ||
+        victim == context.checkpoints.end()) {
+        return false;
+    }
+    auto & authority = *context.authority;
+    const uint64_t sequence = ++authority.destruction_quote_sequence;
+    const auto refuse = [&](common_cache_plan_destruction_receipt * existing,
+                            common_cache_plan_destruction_reason why) {
+        context.thinning_refusal = why;
+        common_cache_plan_destruction_receipt receipt = existing
+            ? std::move(*existing)
+            : common_cache_plan_destruction_receipt{};
+        receipt.state = common_cache_plan_destruction_state::refused;
+        receipt.reason = why;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop);
+        receipt.admission_sequence = sequence;
+        authority.observe_host_destruction(receipt, true);
+        context.destruction->note_checkpoint_thin_refused();
+        emit_checkpoint_destruction(
+            context, receipt, 0, 0,
+            SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+    };
+
+    server_cache_destruction_artifact artifact;
+    if (!build_checkpoint_destruction_artifact(
+            context, victim, artifact)) {
+        refuse(nullptr,
+               common_cache_plan_destruction_reason::manifest_incomplete);
+        return false;
+    }
+    const auto preview = [&](const auto & ops, uint64_t serial,
+                             auto & released) {
+        return authority.ledger.preview_release_set(
+            ops, serial, released);
+    };
+    const auto project = [&](const auto & released, auto & domains) {
+        return authority.project_release(released, domains);
+    };
+    const auto snapshot = authority.ledger.snapshot();
+    auto quote = server_cache_destruction_quote_single_artifact(
+        artifact,
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::checkpoint_member_drop),
+        snapshot.serial, sequence, preview, project);
+    if (quote.receipt.state !=
+            common_cache_plan_destruction_state::quoted) {
+        refuse(&quote.receipt, quote.receipt.reason);
+        return false;
+    }
+    authority.observe_host_destruction(quote.receipt, false);
+
+    const auto fresh = authority.ledger.snapshot();
+    auto prepared = llama_cache_prepare_release_set(
+        authority.ledger, artifact.candidate.release_ops, fresh.serial);
+    if (!prepared.ready()) {
+        const auto why = prepared.status() ==
+                llama_cache_prepare_release_status::serial_conflict
+            ? common_cache_plan_destruction_reason::effect_drift
+            : common_cache_plan_destruction_reason::accounting_unavailable;
+        refuse(&quote.receipt, why);
+        return false;
+    }
+    uint64_t projected_bytes = 0;
+    for (const auto & row : quote.projected_domains) {
+        if (row.projected_release_bytes.state !=
+                llama_cache_acct_known::known ||
+            row.projected_release_bytes.value >
+                UINT64_MAX - projected_bytes) {
+            refuse(&quote.receipt,
+                   common_cache_plan_destruction_reason::
+                       accounting_unavailable);
+            return false;
+        }
+        projected_bytes += row.projected_release_bytes.value;
+    }
+    quote.receipt.displaced_fate =
+        common_cache_plan_displaced_fate::destroyed_by_policy;
+    quote.receipt.recovery_citation =
+        common_cache_plan_recovery_citation::unavailable;
+    quote.receipt.state = common_cache_plan_destruction_state::certified;
+    authority.observe_host_destruction(quote.receipt, true);
+    emit_checkpoint_destruction(
+        context, quote.receipt, projected_bytes, 0,
+        SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+
+    const auto victim_key =
+        server_retention_instance_key::for_checkpoint(
+            context.slot_id, &*victim);
+    const auto admission = server_cache_checkpoint_observe_drop(
+        context, reason, artifact.candidate.artifact_id);
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+    GGML_ASSERT(context.raw_owner && context.raw_drop);
+    (void) context.raw_drop(
+        context.raw_owner, victim, std::next(victim));
+    // Same scheduler-owned, callback-free raw gap as D-A4. The stale proof
+    // changes recovery requirements, not the accounting terminal.
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    GGML_ASSERT(prepared.commit() ==
+                llama_cache_conditional_release_status::released);
+    context.retention->retire_after_committed_release(victim_key);
+    quote.receipt.state = common_cache_plan_destruction_state::executed;
+    quote.receipt.actual_accounting_serial =
+        authority.ledger.snapshot().serial;
+    authority.observe_host_destruction(quote.receipt, false);
+    emit_checkpoint_destruction(
+        context, quote.receipt, projected_bytes, 0,
+        SERVER_CACHE_HOST_WEIGHT_SCALE, UINT32_MAX);
+    context.destruction->note_checkpoint_thin_executed(
+        admission.sequence, projected_bytes);
+    return true;
+}
+
 bool server_cache_checkpoint_capacity_floor(
         server_cache_checkpoint_authority_context & context,
         int checkpoint_task_id,
@@ -2642,7 +2789,10 @@ bool server_cache_checkpoint_capacity_floor(
                 context.retention->checkpoint_inventory(key, catalog);
             input.recovery_pinned = catalog_found &&
                 catalog.recovery_pinned;
-            if (it->id_task == checkpoint_task_id ||
+            if (server_cache_checkpoint_task_protected(
+                    *it, checkpoint_task_id,
+                    server_cache_checkpoint_task_policy::
+                        historical_affinity) ||
                 input.recovery_pinned) {
                 input.protection =
                     server_cache_checkpoint_protection::mandatory_anchor;
@@ -2844,6 +2994,8 @@ struct host_trade_ranking {
     bool zero_destruction = false;
     bool zero_destruction_tie_break = false;
     common_cache_family_role family_role = common_cache_family_role::_count;
+    common_cache_retention_provenance retention_provenance =
+        common_cache_retention_provenance::neutral;
 };
 
 struct host_destruction_certification {
@@ -2893,6 +3045,18 @@ void server_prompt_cache_observe_host_destruction(
                     common_cache_family_role::branch
                     ? "branch" : "background")
             : json(nullptr);
+        if (ranking) {
+            common_cache_retention_lineage lineage;
+            if (ranking->family_role < common_cache_family_role::_count) {
+                lineage.declaration.family = { 1 };
+                lineage.declaration.role = ranking->family_role;
+            }
+            lineage.automatic_provenance = ranking->retention_provenance;
+            payload["retention_lineage"] =
+                common_cache_retention_lineage_name(lineage);
+        } else {
+            payload["retention_lineage"] = nullptr;
+        }
         payload["legacy_fallbacks"] = cache.destruction_obs
             ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
         payload["publication_skips"] = cache.destruction_obs
@@ -3227,8 +3391,11 @@ bool host_trade_price(
     out.ranking.ordinal = ordinal;
     out.ranking.source_id = victim->cache_plan_source_id;
     out.ranking.zero_destruction = out.recovery != cache.states.end();
-    out.ranking.family_role = victim->cache_family.declared()
-        ? victim->cache_family.role : common_cache_family_role::_count;
+    out.ranking.family_role = victim->retention_lineage.declaration.declared()
+        ? victim->retention_lineage.declaration.role
+        : common_cache_family_role::_count;
+    out.ranking.retention_provenance =
+        victim->retention_lineage.automatic_provenance;
     out.main_family = victim->main_family;
     try {
         auto & authority = *cache.publish_authority;
@@ -3252,7 +3419,8 @@ bool host_trade_price(
 
         uint32_t additional_weight = SERVER_CACHE_HOST_WEIGHT_SCALE;
         if (common_cache_family_allows_additional_weight(
-                victim->cache_family) && authority.host_retention_weight) {
+                victim->retention_lineage.declaration) &&
+            authority.host_retention_weight) {
             if (!authority.host_retention_weight(
                     authority.host_retention_weight_context,
                     *victim, additional_weight) ||
@@ -3645,10 +3813,246 @@ bool server_prompt_cache::destroy_priced_host_entry(
     return false;
 }
 
+bool server_prompt_cache::evict_zc_soft_floor(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        uint64_t need) {
+    GGML_ASSERT(retention_policy ==
+                common_cache_optimizer_retention_policy::intentional_baseline);
+    const bool publication = incoming != states.end();
+    const auto refuse = [&] (
+            common_cache_retention_reason publication_reason,
+            common_cache_retention_reason maintenance_reason) {
+        if (retention_summary) {
+            retention_summary->note(
+                publication
+                    ? common_cache_retention_outcome::publication_skipped
+                    : common_cache_retention_outcome::blocked,
+                publication ? publication_reason : maintenance_reason);
+        }
+        if (publication) {
+            destroy_entry(incoming, reason);
+        }
+        return false;
+    };
+    if (!retention_identity_available || !publish_authority || !acct ||
+        !retention_obs || !lease_obs || !lease_execution_identity ||
+        need == 0) {
+        const auto failure = !retention_identity_available
+            ? retention_identity_failure
+            : common_cache_retention_reason::accounting_unavailable;
+        return refuse(failure, failure);
+    }
+
+    lease_obs->lifecycle_point();
+    const auto resource = reason == server_cache_destruction_reason::host_capacity
+        ? server_cache_host_pressure_resource::bytes
+        : server_cache_host_pressure_resource::tokens;
+    std::vector<server_cache_host_retention_member> inventory;
+    std::vector<iterator> rows;
+    std::vector<size_t> redundancy_sources;
+    std::vector<bool> row_live;
+    // Zero-destruction is an ordered tie key. Record the concrete survivor,
+    // not just a bool, so a multi-victim pressure wave can invalidate only
+    // rows whose proof source was just erased instead of rebuilding the
+    // complete inventory. Removing a row cannot create new redundancy.
+    const auto refresh_redundancy = [&](size_t index) {
+        inventory[index].exactly_redundant = false;
+        redundancy_sources[index] = SIZE_MAX;
+        if (!inventory[index].eligible) {
+            return;
+        }
+        for (size_t candidate = 0; candidate < rows.size(); ++candidate) {
+            if (candidate != index && row_live[candidate] &&
+                server_prompt_cache::exactly_redundant(
+                    *rows[index], *rows[candidate])) {
+                inventory[index].exactly_redundant = true;
+                redundancy_sources[index] = candidate;
+                return;
+            }
+        }
+    };
+    try {
+        inventory.reserve(states.size());
+        rows.reserve(states.size());
+        redundancy_sources.reserve(states.size());
+        row_live.reserve(states.size());
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (inventory.size() >= size_t(UINT32_MAX)) {
+                return refuse(
+                    common_cache_retention_reason::internal_fault,
+                    common_cache_retention_reason::internal_fault);
+            }
+            server_cache_host_retention_member row;
+            row.ordinal = uint32_t(inventory.size());
+            row.stable_id = it->retention_generation_id;
+            row.last_use_epoch = it->retention_last_use_epoch;
+            row.release_bytes = it->size();
+            row.release_tokens = uint64_t(it->prompt.n_tokens());
+            row.main_family = it->main_family;
+            row.incoming = it == incoming;
+
+            server_cache_destruction_artifact artifact;
+            const bool artifact_known =
+                build_host_destruction_artifact(*this, *it, artifact);
+            const bool lease_known = artifact_known &&
+                artifact.candidate.lease.state ==
+                    server_cache_lease_eval_state::known;
+            row.soft_leased = lease_known &&
+                artifact.candidate.lease.cls ==
+                    server_cache_lease_class::soft;
+            row.eligible = artifact_known && lease_known &&
+                !artifact.mandatory_anchor &&
+                !server_cache_lease_is_hard(artifact.candidate.lease) &&
+                it->recovery_pins == 0 && !row.incoming;
+            inventory.push_back(row);
+            rows.push_back(it);
+            redundancy_sources.push_back(SIZE_MAX);
+            row_live.push_back(true);
+        }
+
+        for (size_t index = 0; index < inventory.size(); ++index) {
+            refresh_redundancy(index);
+        }
+    } catch (...) {
+        return refuse(
+            common_cache_retention_reason::internal_fault,
+            common_cache_retention_reason::internal_fault);
+    }
+
+    // Publication refusal is an all-or-nothing terminal. Prove that the
+    // complete immutable victim set can satisfy this pressure wave before
+    // the first irreversible erase; otherwise preserve every incumbent and
+    // discard only the staged incoming node. Exact-release preparation for
+    // each admitted row is deterministic on this scheduler-owned ledger
+    // interval, so the loop below cannot discover ordinary insufficiency
+    // after partial progress.
+    uint64_t eligible_release = 0;
+    for (const auto & row : inventory) {
+        if (!row.eligible) {
+            continue;
+        }
+        const uint64_t release =
+            resource == server_cache_host_pressure_resource::bytes
+                ? row.release_bytes : row.release_tokens;
+        eligible_release = release > UINT64_MAX - eligible_release
+            ? UINT64_MAX : eligible_release + release;
+    }
+    if (eligible_release < need) {
+        return refuse(
+            common_cache_retention_reason::publication_skipped_protected,
+            common_cache_retention_reason::bound_blocked_protected);
+    }
+
+    uint64_t remaining = need;
+    while (remaining != 0) {
+        const auto selected = server_cache_plan_host_retention_victim(
+            resource, remaining, inventory);
+        if (selected.status != server_cache_host_retention_status::selected) {
+            const auto failure = selected.status ==
+                    server_cache_host_retention_status::incomplete_evidence
+                ? common_cache_retention_reason::accounting_unavailable
+                : common_cache_retention_reason::publication_skipped_protected;
+            return refuse(
+                failure,
+                failure == common_cache_retention_reason::
+                               publication_skipped_protected
+                    ? common_cache_retention_reason::bound_blocked_protected
+                    : failure);
+        }
+
+        // The policy returns a stable ordinal, not a vector subscript. Keep
+        // that distinction explicit so a future filtered inventory cannot
+        // silently erase the wrong list node.
+        const auto selected_row = std::find_if(
+            inventory.begin(), inventory.end(), [&](const auto & row) {
+                return row.ordinal == selected.ordinal;
+            });
+        if (selected_row == inventory.end()) {
+            return refuse(
+                common_cache_retention_reason::internal_fault,
+                common_cache_retention_reason::internal_fault);
+        }
+        const size_t selected_index = size_t(selected_row - inventory.begin());
+        auto victim = rows[selected_index];
+        const uint64_t released_bytes = victim->size();
+        const uint64_t released_tokens = uint64_t(victim->prompt.n_tokens());
+        const uint64_t stable_id = victim->retention_generation_id;
+        const bool soft_leased = selected_row->soft_leased;
+        const bool main_family = selected_row->main_family;
+        const auto retention_lineage = victim->retention_lineage;
+        if (!try_destroy_entry_prepared(victim, reason)) {
+            // Exact-release preparation is part of eligibility. A transient
+            // or row-local refusal advances through the immutable inventory;
+            // no raw erase has occurred.
+            selected_row->eligible = false;
+            selected_row->exactly_redundant = false;
+            redundancy_sources[selected_index] = SIZE_MAX;
+            continue;
+        }
+
+        selected_row->eligible = false;
+        selected_row->exactly_redundant = false;
+        row_live[selected_index] = false;
+        for (size_t index = 0; index < redundancy_sources.size(); ++index) {
+            if (redundancy_sources[index] != selected_index) {
+                continue;
+            }
+            inventory[index].exactly_redundant = false;
+            redundancy_sources[index] = SIZE_MAX;
+            refresh_redundancy(index);
+        }
+
+        SRV_WRN(
+            " - removing zc soft-floor host entry stable_id=%" PRIu64
+            " (%.3f MiB, %" PRIu64 " tokens)\n",
+            stable_id, released_bytes / (1024.0 * 1024.0),
+            released_tokens);
+        if (debug_observability) {
+            SRV_INF(
+                "CACHE_HOST_DESTRUCTION {\"schema_version\":7,"
+                "\"effect\":\"soft_host_capacity_floor\","
+                "\"policy\":\"zc_soft_floor\","
+                "\"resource\":\"%s\",\"floor_outcome\":\"executed\","
+                "\"stable_id\":%" PRIu64 ","
+                "\"soft_leased\":%s,\"main_family\":%s,"
+                "\"retention_lineage\":\"%s\","
+                "\"projected_release_bytes\":%" PRIu64 ","
+                "\"actual_release_bytes\":%" PRIu64 ","
+                "\"projected_release_tokens\":%" PRIu64 ","
+                "\"actual_release_tokens\":%" PRIu64 "}\n",
+                resource == server_cache_host_pressure_resource::bytes
+                    ? "bytes" : "tokens",
+                stable_id,
+                soft_leased ? "true" : "false",
+                main_family ? "true" : "false",
+                common_cache_retention_lineage_name(retention_lineage),
+                released_bytes, released_bytes,
+                released_tokens, released_tokens);
+        }
+        if (retention_summary) {
+            retention_summary->note(
+                common_cache_retention_outcome::executed,
+                common_cache_retention_reason::_count,
+                released_bytes, released_tokens);
+        }
+        const uint64_t released =
+            resource == server_cache_host_pressure_resource::bytes
+                ? released_bytes : released_tokens;
+        remaining = released >= remaining ? 0 : remaining - released;
+    }
+    return true;
+}
+
 bool server_prompt_cache::evict_front_under_pressure(
         server_cache_destruction_reason reason,
-        iterator incoming) {
+        iterator incoming,
+        uint64_t need) {
     GGML_ASSERT(!states.empty());
+    if (retention_policy ==
+            common_cache_optimizer_retention_policy::intentional_baseline) {
+        return evict_zc_soft_floor(reason, incoming, need);
+    }
     iterator legacy_floor = states.end();
     common_cache_plan_destruction_reason floor_reason =
         common_cache_plan_destruction_reason::capacity_refused;
@@ -3701,6 +4105,54 @@ bool server_prompt_cache::evict_front_under_pressure(
             *this, "publication_skipped", {}, -1);
     }
     return false;
+}
+
+bool server_prompt_cache::try_destroy_entry_prepared(
+        iterator it,
+        server_cache_destruction_reason reason) {
+    if (!publish_authority || !acct || it == states.end()) {
+        return false;
+    }
+
+    server_prompt_cache_retirement_manifest retirement;
+    if (!server_prompt_cache_capture_retirement(*this, it, retirement)) {
+        return false;
+    }
+    std::vector<llama_cache_acct_op_id> ops;
+    try {
+        const auto release_ops = it->release_ops();
+        ops.reserve(release_ops.size());
+        for (const auto op : release_ops) {
+            if (!op) {
+                return false;
+            }
+            ops.push_back(op);
+        }
+    } catch (...) {
+        return false;
+    }
+
+    const uint64_t serial = acct->snapshot().serial;
+    auto prepared = llama_cache_prepare_release_set(*acct, ops, serial);
+    if (!prepared.ready()) {
+        return false;
+    }
+
+    const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+    (void) server_prompt_cache_destroy_entry_impl(*this, it);
+    // ZC's exact-release door is scheduler-owned. The observer above only
+    // previews existing operations; the raw list erase has no callback or C
+    // producer, and capability commit is the immediately following operation.
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    const auto commit_status = prepared.commit();
+    GGML_ASSERT(commit_status ==
+                llama_cache_conditional_release_status::released);
+    server_prompt_cache_retire_manifest(*this, retirement);
+    if (destruction_obs) {
+        destruction_obs->note_prepared_release(admission.sequence, true);
+    }
+    return true;
 }
 
 server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
@@ -3843,6 +4295,33 @@ bool server_prompt_cache::publish(
         return false;
     }
 
+    if (retention_policy ==
+            common_cache_optimizer_retention_policy::intentional_baseline &&
+        retention_identity_available) {
+        if (retention_current_use_epoch == 0) {
+            retention_event_begin();
+        }
+        if (retention_identity_available) {
+            auto & staged = entry.front();
+            if (retention_next_generation_id == 0 ||
+                retention_next_generation_id == UINT64_MAX ||
+                retention_current_use_epoch == 0) {
+                retention_identity_available = false;
+                retention_identity_failure =
+                    retention_current_use_epoch == 0
+                        ? common_cache_retention_reason::
+                              retention_epoch_exhausted
+                        : common_cache_retention_reason::
+                              retention_id_exhausted;
+            } else {
+                staged.retention_generation_id =
+                    retention_next_generation_id++;
+                staged.retention_last_use_epoch =
+                    retention_current_use_epoch;
+            }
+        }
+    }
+
     // F0b authority boundary: the detached entry is complete, but no shipped cache state has
     // changed yet. Refusal drops only this detached node; the live slot remains the sole copy.
     // The callback commits all accounting leaves before returning true, and states.splice below
@@ -3901,6 +4380,16 @@ bool server_prompt_cache::publish(
         }
     }
 
+    // ZC must decide whether the staged publication can fit before dedup can
+    // erase an incumbent prefix. Otherwise an ultimately-refused grown save
+    // could delete its predecessor and then delete itself. Historical mode
+    // retains the landed dedup-before-limit order byte-for-byte.
+    const bool zc_pressure_checked = retention_policy ==
+        common_cache_optimizer_retention_policy::intentional_baseline;
+    if (zc_pressure_checked && !update_impl(self)) {
+        return false;
+    }
+
     for (auto it = states.begin(); it != states.end();) {
         if (it != self && it->adapter_config_key == self->adapter_config_key) {
             const int len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
@@ -3928,7 +4417,7 @@ bool server_prompt_cache::publish(
     // are already committed, so a local make-room loop would prevent no memory spike and, being
     // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
     // preserving the just-added entry.
-    if (!update_impl(self)) {
+    if (!zc_pressure_checked && !update_impl(self)) {
         return false;
     }
     if (published) {
@@ -3941,7 +4430,7 @@ bool server_prompt_cache::prepare_restore_delivery(
         iterator source,
         server_prompt_cache_restore_delivery & delivery) const noexcept {
     delivery = {};
-    delivery.cache_family = source->cache_family;
+    delivery.retention_lineage = source->retention_lineage;
     if (!publish_authority) {
         return true;
     }
@@ -4107,6 +4596,11 @@ void server_prompt_cache::commit_restore_delivery(
                     ? destruction_obs->host_restores_retained
                     : uint64_t(0));
         }
+        if (retention_policy ==
+                common_cache_optimizer_retention_policy::intentional_baseline &&
+            retention_identity_available) {
+            source->retention_last_use_epoch = retention_current_use_epoch;
+        }
         return;
     }
 
@@ -4121,11 +4615,28 @@ void server_prompt_cache::commit_restore_delivery(
         source, server_cache_destruction_reason::host_consumed_restore);
 }
 
+void server_prompt_cache::retention_event_begin() noexcept {
+    if (retention_policy !=
+            common_cache_optimizer_retention_policy::intentional_baseline ||
+        !retention_identity_available) {
+        return;
+    }
+    if (retention_next_use_epoch == 0 ||
+        retention_next_use_epoch == UINT64_MAX) {
+        retention_identity_available = false;
+        retention_identity_failure =
+            common_cache_retention_reason::retention_epoch_exhausted;
+        retention_current_use_epoch = 0;
+        return;
+    }
+    retention_current_use_epoch = retention_next_use_epoch++;
+}
+
 // The observed/unobserved split is a compile-time instantiation (F8/B-a): with the observer
 // off, load() runs the pre-B0 candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage) {
     if constexpr (!Observed) {
         (void) rec;
         (void) required_source_id;
@@ -4324,8 +4835,8 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             sel->delivered = true; // recorded at the delivery point, never inferred [B0]
         }
     }
-    if (restored_family) {
-        *restored_family = delivery.cache_family;
+    if (restored_lineage) {
+        *restored_lineage = delivery.retention_lineage;
     }
     commit_restore_delivery(
         it_best, std::move(delivery), prompt, id_slot, obs_source_best);
@@ -4333,15 +4844,15 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_retention_lineage *);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage) {
     GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // one dispatch outside every loop: the off path is the pre-B0 loop [F8/B-a]
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_lineage)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_lineage);
 }
 
 void server_prompt_cache::update() {
@@ -4356,7 +4867,8 @@ bool server_prompt_cache::update_impl(iterator incoming) {
 
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_capacity,
-                    incoming)) {
+                    incoming,
+                    uint64_t(size() - limit_size))) {
                 return false;
             }
         }
@@ -4376,7 +4888,8 @@ bool server_prompt_cache::update_impl(iterator incoming) {
 
             if (!evict_front_under_pressure(
                     server_cache_destruction_reason::host_token_limit,
-                    incoming)) {
+                    incoming,
+                    uint64_t(n_tokens() - limit_tokens_cur))) {
                 return false;
             }
         }

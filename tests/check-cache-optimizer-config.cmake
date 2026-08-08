@@ -67,10 +67,13 @@ if (NOT old_default EQUAL -1)
     message(FATAL_ERROR "absent-default negative control did not trip")
 endif()
 
-# ZC0b computes future policy intent but may not attach behavior to it.
+# ZC1 consumes retention_policy at its host/checkpoint adapters, the one
+# save-time lineage resolver, record/preflight serialization, and
+# initialization wiring. The remaining future fields stay descriptive until
+# their own ratchets.
 function(assert_no_future_policy_reads text label)
     string(REGEX MATCHALL
-        "(\\.|->)(observer_store_enabled|retention_policy|local_authority_ceiling)"
+        "(\\.|->)(observer_store_enabled|local_authority_ceiling)"
         future_hits "${text}")
     if (future_hits)
         message(FATAL_ERROR
@@ -86,14 +89,30 @@ foreach(path IN LISTS production_cpp)
     assert_no_future_policy_reads("${text}" "${path}")
 endforeach()
 
-# Negative control: type names may describe a future policy, but an actual
-# member read is the behavior-opening seam this foundation must reject.
-set(future_mutation "void probe(const auto & effective) { (void) effective.retention_policy; }")
+set(all_production "")
+foreach(path IN LISTS production_cpp)
+    file(READ "${path}" text)
+    string(APPEND all_production "${text}")
+endforeach()
+count_literal("${all_production}" ".retention_policy" retention_policy_reads)
+if (NOT retention_policy_reads EQUAL 6)
+    message(FATAL_ERROR
+        "ZC1 retention-policy consumer census drifted: ${retention_policy_reads}")
+endif()
+
+# Negative controls: future member reads remain forbidden, and an extra
+# retention-policy consumer must fail the exact census.
+set(future_mutation "void probe(const auto & effective) { (void) effective.local_authority_ceiling; }")
 string(REGEX MATCHALL
-    "(\\.|->)(observer_store_enabled|retention_policy|local_authority_ceiling)"
+    "(\\.|->)(observer_store_enabled|local_authority_ceiling)"
     future_mutation_hits "${future_mutation}")
 if (NOT future_mutation_hits)
     message(FATAL_ERROR "future-policy member-read negative control did not trip")
+endif()
+set(retention_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.retention_policy; }")
+count_literal("${retention_mutation}" ".retention_policy" retention_mutation_reads)
+if (retention_mutation_reads EQUAL 6)
+    message(FATAL_ERROR "retention-policy consumer negative control did not trip")
 endif()
 
 contract_require_token("${optimizer_cpp}"

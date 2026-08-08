@@ -386,10 +386,10 @@ foreach(retired_shape "llama_sha256 hash" "staged_now" "find_staged")
     endif()
 endforeach()
 
-# Record schema 6 embeds accounting schema 2. The compile-time table is the authority; these
+# Record schema 7 embeds accounting schema 2. The compile-time table is the authority; these
 # source pins ensure the JSON schema could not move while either side's version stayed put.
 foreach(schema_pin
-        "constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 6"
+        "constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 7"
         "common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION)"
         "LLAMA_CACHE_ACCT_SCHEMA_VERSION          = 2")
     count_literal("${all_source}" "${schema_pin}" schema_pin_count)
@@ -398,9 +398,9 @@ foreach(schema_pin
     endif()
 endforeach()
 file(READ "${SOURCE_ROOT}/tools/server/bench/cache_plan_common.py" cache_plan_reader)
-string(FIND "${cache_plan_reader}" "SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6)" schema_reader_pin)
+string(FIND "${cache_plan_reader}" "SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6, 7)" schema_reader_pin)
 if (schema_reader_pin EQUAL -1)
-    message(FATAL_ERROR "cache-plan reader does not explicitly accept v1/v2/v3/v4/v5/v6")
+    message(FATAL_ERROR "cache-plan reader does not explicitly accept v1/v2/v3/v4/v5/v6/v7")
 endif()
 
 # B-A0a schema-v5 evidence is atomic: every executable candidate is target-qualified,

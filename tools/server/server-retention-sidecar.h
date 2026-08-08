@@ -63,6 +63,15 @@ enum class server_retention_candidate_availability : uint8_t {
     _count,
 };
 
+// A named publication policy keeps the checkpoint lane's desired-set
+// ownership distinct from ordinary score-derived anchoring. The latter is the
+// default for every landed/non-ZC publication.
+enum class server_retention_anchor_policy : uint8_t {
+    scored = 0,
+    checkpoint_desired_set,
+    _count,
+};
+
 struct server_retention_candidate {
     llama_cache_acct_artifact_id artifact_id;
     server_retention_instance_key instance_key;
@@ -122,6 +131,12 @@ public:
         llama_cache_acct_ledger * ledger,
         const llama_cache_acct_resource_domain & domain,
         server_cache_lease_table * leases = nullptr) noexcept;
+    // ZC1 staged-checkpoint identity. Reservation burns the nonzero process-
+    // local stamp even if publication is later skipped, so a staged key can
+    // never alias a live or future catalog member.
+    bool reserve_stamp(
+        common_retention_pool pool,
+        common_retention_stamp & stamp) noexcept;
     bool publish(
         const server_retention_instance_key & key,
         common_retention_pool pool,
@@ -132,6 +147,18 @@ public:
         bool coverage_valid,
         const server_cache_lease_identity * checkpoint_identity = nullptr,
         const server_cache_lease_frontier * replacement_frontier = nullptr) noexcept;
+    bool publish_reserved(
+        const server_retention_instance_key & key,
+        const common_retention_stamp & reserved,
+        const common_chat_msg_spans & spans,
+        bool source_known,
+        uint64_t turn_token_count,
+        uint64_t coverage_tokens,
+        bool coverage_valid,
+        const server_cache_lease_identity * checkpoint_identity = nullptr,
+        const server_cache_lease_frontier * replacement_frontier = nullptr,
+        server_retention_anchor_policy anchor_policy =
+            server_retention_anchor_policy::scored) noexcept;
     bool clone(
         const server_retention_instance_key & source,
         const server_retention_instance_key & destination) noexcept;

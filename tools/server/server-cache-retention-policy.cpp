@@ -351,6 +351,107 @@ server_cache_retention_policy_result server_cache_plan_retention_set(
     }
 }
 
+server_cache_host_retention_result server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource resource,
+        uint64_t need,
+        const std::vector<server_cache_host_retention_member> & members) noexcept {
+    server_cache_host_retention_result out;
+    if (need == 0) {
+        out.status = server_cache_host_retention_status::no_eligible_progress;
+        return out;
+    }
+    try {
+        std::set<uint32_t> ordinals;
+        std::set<uint64_t> stable_ids;
+        bool selected = false;
+        std::tuple<bool, bool, bool, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>
+            selected_key;
+        for (const auto & member : members) {
+            if (member.stable_id == 0 || member.last_use_epoch == 0 ||
+                !ordinals.insert(member.ordinal).second ||
+                !stable_ids.insert(member.stable_id).second) {
+                return out;
+            }
+            if (!member.eligible || member.incoming) {
+                continue;
+            }
+            const uint64_t release =
+                resource == server_cache_host_pressure_resource::bytes
+                    ? member.release_bytes
+                    : member.release_tokens;
+            if (release == 0) {
+                continue;
+            }
+            const uint64_t steps = need / release + (need % release != 0);
+            const auto key = std::make_tuple(
+                member.soft_leased,
+                member.main_family,
+                !member.exactly_redundant,
+                member.last_use_epoch,
+                steps,
+                std::numeric_limits<uint64_t>::max() - member.release_bytes,
+                std::numeric_limits<uint64_t>::max() - member.release_tokens,
+                member.stable_id);
+            if (!selected || key < selected_key) {
+                selected = true;
+                selected_key = key;
+                out.ordinal = member.ordinal;
+                out.projected_pressure_steps = steps;
+            }
+        }
+        out.status = selected
+            ? server_cache_host_retention_status::selected
+            : server_cache_host_retention_status::no_eligible_progress;
+        return out;
+    } catch (...) {
+        return out;
+    }
+}
+
+server_cache_retention_sim_config server_cache_zc1_retention_config(
+        uint32_t capacity,
+        uint64_t minimum_step) noexcept {
+    server_cache_retention_sim_config out;
+    const uint64_t step = std::max<uint64_t>(1, minimum_step);
+    out.policy.capacity = capacity;
+    out.policy.recent_floor = 3;
+    out.policy.minimum_historical = 1;
+    out.policy.bucket_base = step;
+    out.policy.bucket_growth = 4;
+    out.recent_replay_cap = step;
+    out.historical_replay_cap = saturated_multiply(step, 4);
+    return out;
+}
+
+uint64_t server_cache_retention_replay_cap(
+        const server_cache_retention_sim_config & config,
+        uint64_t current_frontier,
+        uint64_t victim_frontier) noexcept {
+    if (config.policy.bucket_base == 0 ||
+        config.policy.bucket_growth < 2 ||
+        current_frontier < victim_frontier) {
+        return 0;
+    }
+    const uint64_t age = current_frontier - victim_frontier;
+    if (age < config.policy.bucket_base) {
+        return std::min(
+            config.recent_replay_cap,
+            config.policy.bucket_base);
+    }
+    uint64_t replay_cap = config.historical_replay_cap;
+    const uint32_t bucket = historical_bucket(
+        age, config.policy.bucket_base, config.policy.bucket_growth);
+    uint64_t lower = config.policy.bucket_base;
+    for (uint32_t i = 1; i < bucket; ++i) {
+        lower = saturated_multiply(lower, config.policy.bucket_growth);
+    }
+    const uint64_t upper = saturated_multiply(
+        lower, config.policy.bucket_growth);
+    const uint64_t width = upper == UINT64_MAX
+        ? UINT64_MAX : upper - lower;
+    return std::min(replay_cap, width);
+}
+
 server_cache_retention_sim_score server_cache_simulate_retention(
     const server_cache_retention_sim_config &             config,
     const std::vector<server_cache_retention_sim_event> & events) noexcept {
@@ -470,22 +571,9 @@ server_cache_retention_sim_score server_cache_simulate_retention(
                     }
                     const auto     victim_node     = victim_it->second.node;
                     const uint64_t victim_frontier = nodes.at(victim_node).frontier;
-                    const uint64_t age             = event.frontier - victim_frontier;
-                    uint64_t       replay_cap      = config.recent_replay_cap;
-                    if (age >= config.policy.bucket_base) {
-                        replay_cap = config.historical_replay_cap;
-                        const uint32_t bucket =
-                            historical_bucket(age, config.policy.bucket_base, config.policy.bucket_growth);
-                        uint64_t lower = config.policy.bucket_base;
-                        for (uint32_t i = 1; i < bucket; ++i) {
-                            lower = saturated_multiply(lower, config.policy.bucket_growth);
-                        }
-                        const uint64_t upper = saturated_multiply(lower, config.policy.bucket_growth);
-                        const uint64_t width = upper == UINT64_MAX ? UINT64_MAX : upper - lower;
-                        replay_cap           = std::min(replay_cap, width);
-                    } else {
-                        replay_cap = std::min(replay_cap, config.policy.bucket_base);
-                    }
+                    const uint64_t replay_cap =
+                        server_cache_retention_replay_cap(
+                            config, event.frontier, victim_frontier);
 
                     for (const auto & recovery : ring) {
                         if (recovery.node == victim_node || !is_ancestor(recovery.node, victim_node)) {

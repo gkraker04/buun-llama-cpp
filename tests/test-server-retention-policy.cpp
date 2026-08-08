@@ -36,7 +36,33 @@ server_cache_retention_policy_config config(uint32_t capacity = 4, uint32_t rece
     return out;
 }
 
+server_cache_host_retention_member host_member(
+        uint32_t ordinal,
+        uint64_t last_use_epoch,
+        uint64_t release_bytes = 100,
+        uint64_t release_tokens = 10) {
+    server_cache_host_retention_member out;
+    out.ordinal        = ordinal;
+    out.stable_id      = uint64_t(ordinal) + 1;
+    out.last_use_epoch = last_use_epoch;
+    out.release_bytes  = release_bytes;
+    out.release_tokens = release_tokens;
+    out.eligible       = true;
+    return out;
+}
+
 void test_config_and_lane_quota() {
+    CHECK(!server_cache_retention_status_is_evidence_unavailable(
+        server_cache_retention_policy_status::ok));
+    CHECK(!server_cache_retention_status_is_evidence_unavailable(
+        server_cache_retention_policy_status::invalid_config));
+    CHECK(server_cache_retention_status_is_evidence_unavailable(
+        server_cache_retention_policy_status::incomplete_evidence));
+    CHECK(!server_cache_retention_status_is_evidence_unavailable(
+        server_cache_retention_policy_status::protected_over_capacity));
+    CHECK(server_cache_retention_status_is_evidence_unavailable(
+        server_cache_retention_policy_status::capacity_unavailable));
+
     auto invalid               = config();
     invalid.minimum_historical = 0;
     CHECK(server_cache_plan_retention_set(invalid, 1000, {}).status ==
@@ -285,6 +311,159 @@ void test_tiny_ring_and_over_capacity_totality() {
     CHECK(result.incoming_selected);
 }
 
+void test_host_retention_ordering() {
+    auto oldest = host_member(0, 10);
+    auto newer  = host_member(1, 20);
+    auto result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { newer, oldest });
+    CHECK(result.status == server_cache_host_retention_status::selected);
+    CHECK(result.ordinal == oldest.ordinal);
+    CHECK(result.projected_pressure_steps == 1);
+
+    // Soft lease and main-family flags form priority strata, not vetoes.
+    oldest.soft_leased = true;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { oldest, newer });
+    CHECK(result.ordinal == newer.ordinal);
+    oldest.soft_leased = false;
+    oldest.main_family = true;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { oldest, newer });
+    CHECK(result.ordinal == newer.ordinal);
+
+    // Exact redundancy is preferred before recency. The server adapter still
+    // has to certify the exact release before it mutates storage.
+    oldest.main_family      = false;
+    newer.exactly_redundant = true;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { oldest, newer });
+    CHECK(result.ordinal == newer.ordinal);
+}
+
+void test_host_retention_pressure_resource_and_ties() {
+    auto byte_progress = host_member(0, 10, 1000, 1);
+    auto token_progress = host_member(1, 10, 100, 100);
+
+    auto result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 500, { token_progress, byte_progress });
+    CHECK(result.ordinal == byte_progress.ordinal);
+    CHECK(result.projected_pressure_steps == 1);
+
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::tokens, 50, { token_progress, byte_progress });
+    CHECK(result.ordinal == token_progress.ordinal);
+    CHECK(result.projected_pressure_steps == 1);
+
+    // If all earlier keys tie, larger release wins, then stable identity.
+    auto small = host_member(2, 30, 100, 10);
+    auto large = host_member(3, 30, 200, 20);
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { small, large });
+    CHECK(result.ordinal == large.ordinal);
+
+    small.release_bytes = large.release_bytes;
+    small.release_tokens = large.release_tokens;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 50, { large, small });
+    CHECK(result.ordinal == small.ordinal);
+}
+
+void test_host_retention_exclusions_and_evidence() {
+    auto ineligible = host_member(0, 10);
+    auto incoming   = host_member(1, 20);
+    auto zero       = host_member(2, 30, 0, 0);
+    ineligible.eligible = false;
+    incoming.incoming   = true;
+
+    auto result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 1, { ineligible, incoming, zero });
+    CHECK(result.status == server_cache_host_retention_status::no_eligible_progress);
+    CHECK(result.ordinal == UINT32_MAX);
+
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 0, { host_member(3, 40) });
+    CHECK(result.status == server_cache_host_retention_status::no_eligible_progress);
+
+    auto invalid = host_member(4, 0);
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 1, { invalid });
+    CHECK(result.status == server_cache_host_retention_status::incomplete_evidence);
+
+    auto first  = host_member(5, 50);
+    auto second = host_member(6, 60);
+    second.ordinal = first.ordinal;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 1, { first, second });
+    CHECK(result.status == server_cache_host_retention_status::incomplete_evidence);
+
+    second           = host_member(6, 60);
+    second.stable_id = first.stable_id;
+    result = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 1, { first, second });
+    CHECK(result.status == server_cache_host_retention_status::incomplete_evidence);
+}
+
+void test_host_retention_permutation_determinism() {
+    std::vector<server_cache_host_retention_member> members = {
+        host_member(0, 40, 100, 10),
+        host_member(1, 30, 200, 20),
+        host_member(2, 20, 300, 30),
+        host_member(3, 10, 400, 40),
+    };
+    members[0].soft_leased       = true;
+    members[1].main_family       = true;
+    members[2].exactly_redundant = true;
+    const auto reference = server_cache_plan_host_retention_victim(
+        server_cache_host_pressure_resource::bytes, 500, members);
+    CHECK(reference.status == server_cache_host_retention_status::selected);
+
+    std::sort(members.begin(), members.end(), [](const auto & a, const auto & b) {
+        return a.ordinal < b.ordinal;
+    });
+    do {
+        const auto result = server_cache_plan_host_retention_victim(
+            server_cache_host_pressure_resource::bytes, 500, members);
+        CHECK(result.status == reference.status);
+        CHECK(result.ordinal == reference.ordinal);
+        CHECK(result.projected_pressure_steps == reference.projected_pressure_steps);
+    } while (std::next_permutation(members.begin(), members.end(), [](const auto & a, const auto & b) {
+        return a.ordinal < b.ordinal;
+    }));
+}
+
+void test_lane_replay_cap_boundaries() {
+    server_cache_retention_sim_config cfg;
+    cfg.policy = config(4, 3, 1);
+    cfg.policy.bucket_growth = 4;
+    cfg.recent_replay_cap = 100;
+    cfg.historical_replay_cap = 400;
+    CHECK(server_cache_retention_replay_cap(cfg, 1000, 950) == 100);
+    CHECK(server_cache_retention_replay_cap(cfg, 1000, 900) == 300);
+    CHECK(server_cache_retention_replay_cap(cfg, 1000, 600) == 400);
+    CHECK(server_cache_retention_replay_cap(cfg, 999, 1000) == 0);
+}
+
+void test_frozen_zc1_config() {
+    const auto cfg = server_cache_zc1_retention_config(7, 100);
+    CHECK(cfg.policy.capacity == 7);
+    CHECK(cfg.policy.recent_floor == 3);
+    CHECK(cfg.policy.minimum_historical == 1);
+    CHECK(cfg.policy.bucket_base == 100);
+    CHECK(cfg.policy.bucket_growth == 4);
+    CHECK(cfg.recent_replay_cap == 100);
+    CHECK(cfg.historical_replay_cap == 400);
+
+    const auto normalized = server_cache_zc1_retention_config(0, 0);
+    CHECK(normalized.policy.capacity == 0);
+    CHECK(normalized.policy.bucket_base == 1);
+    CHECK(normalized.recent_replay_cap == 1);
+    CHECK(normalized.historical_replay_cap == 4);
+
+    const auto saturated = server_cache_zc1_retention_config(
+        4, UINT64_MAX);
+    CHECK(saturated.historical_replay_cap == UINT64_MAX);
+}
+
 }  // namespace
 
 int main() {
@@ -296,6 +475,12 @@ int main() {
     test_exhaustive_protection_preservation();
     test_counterfactual_simulator();
     test_tiny_ring_and_over_capacity_totality();
+    test_host_retention_ordering();
+    test_host_retention_pressure_resource_and_ties();
+    test_host_retention_exclusions_and_evidence();
+    test_host_retention_permutation_determinism();
+    test_lane_replay_cap_boundaries();
+    test_frozen_zc1_config();
     std::puts("ZC1_RETENTION_POLICY_TEST PASS");
     return 0;
 }

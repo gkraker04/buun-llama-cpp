@@ -99,11 +99,14 @@ struct server_cache_plan_preflight_view {
         common_cache_plan_default_cost_terms();
     server_cache_plan_preflight_destruction destruction;
     std::vector<server_cache_plan_preflight_miss_reason> miss_reasons;
+    common_cache_optimizer_record optimizer;
 };
 
-// E0 v1 public projection. This is deliberately independent of the schema-6
-// debug serializer: identities, digests, accounting rows, ordinals, serials,
-// leases, and recovery-source handles have no representation here.
+// E0/ZC v2 public projection. This is deliberately independent of the schema-7
+// debug serializer: stable/internal identities, full digests, accounting rows,
+// ordinals, serials, leases, and recovery-source handles have no representation
+// here. The optional short profile label is a process-local salted display
+// digest: it cannot be replayed as a lookup, join, or authority claim.
 nlohmann::ordered_json server_cache_plan_preflight_json(
     const server_cache_plan_preflight_view & view);
 

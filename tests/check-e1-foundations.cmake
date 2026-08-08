@@ -60,7 +60,8 @@ function(family_contract_valid family task authority context task_cpp output)
             "enum class common_cache_family_role"
             "struct common_cache_family_binding"
             "common_cache_family_main_family("
-            "common_cache_family_allows_additional_weight(")
+            "common_cache_family_allows_additional_weight("
+            "common_cache_retention_main_family(")
         string(FIND "${family}" "${token}" found)
         if (found EQUAL -1)
             set(${output} FALSE PARENT_SCOPE)
@@ -72,10 +73,10 @@ function(family_contract_valid family task authority context task_cpp output)
     string(FIND "${authority}"
         "common_cache_family_binding cache_family;" policy_field)
     string(REGEX MATCH
-        "common_cache_family_main_family\\([^;]*cache_family[^;]*\\)"
+        "common_cache_retention_main_family\\([^;]*retention_lineage[^;]*\\)"
         checkpoint_resolver "${context}")
     string(REGEX MATCH
-        "common_cache_family_allows_additional_weight\\([^;]*victim->cache_family[^;]*\\)"
+        "common_cache_family_allows_additional_weight\\([^;]*victim->retention_lineage[.]declaration[^;]*\\)"
         callback_guard "${task_cpp}")
     if (task_field EQUAL -1 OR policy_field EQUAL -1 OR
         checkpoint_resolver STREQUAL "" OR callback_guard STREQUAL "")
@@ -126,7 +127,8 @@ if (NOT family_valid)
 endif()
 require_token("${common_header}" "common-cache-family.h"
     "checkpoint family include")
-require_token("${common_header}" "common_cache_family_binding cache_family;"
+require_token("${common_header}"
+    "common_cache_retention_lineage retention_lineage;"
     "checkpoint family carrier")
 no_declared_family_construction(
     "${pre_family_production_source}" no_declared_construction)
@@ -225,6 +227,17 @@ family_contract_valid(
     "${context_source}" "${callback_negative}" family_negative_valid)
 if (family_negative_valid)
     message(FATAL_ERROR "E1.0 callback-neutrality negative control did not trip")
+endif()
+
+string(REPLACE
+    "common_cache_retention_main_family("
+    "common_cache_retention_main_family_removed("
+    resolver_negative "${context_source}")
+family_contract_valid(
+    "${family_header}" "${task_header}" "${authority_header}"
+    "${resolver_negative}" "${task_source}" resolver_negative_valid)
+if (resolver_negative_valid)
+    message(FATAL_ERROR "E1/ZC retention resolver negative control did not trip")
 endif()
 
 set(declared_negative
