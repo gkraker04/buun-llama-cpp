@@ -1,4 +1,5 @@
 #include "server-cache-fingerprint.h"
+#include "server-cache-calibration-model.h"
 
 #include "../../src/llama-sha256.h"
 #include "../../common/build-info.h"
@@ -14,6 +15,11 @@
 #include <cstring>
 #include <limits>
 #include <tuple>
+
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#  include <cpuid.h>
+#endif
 
 #if defined(_WIN32)
 #  include <io.h>
@@ -612,6 +618,7 @@ struct config_root_builder {
     llama_sha256 hash;
     uint16_t next_id = 1;
     bool exact = true;
+    uint32_t inexact_fields = 0;
 
     config_root_builder() {
         hash.update(CONFIG_DOMAIN, sizeof(CONFIG_DOMAIN));
@@ -629,6 +636,7 @@ struct config_root_builder {
         hash_u32(hash, uint32_t(size));
         hash.update(data, size);
         exact = exact && field_exact;
+        if (!field_exact) inexact_fields |= uint32_t(1) << (id - 1);
         ++next_id;
         return true;
     }
@@ -657,6 +665,168 @@ std::array<uint8_t, 32> digest_parts(
     return hash.finish();
 }
 
+struct canonical_device_identity {
+    ggml_backend_dev_t device = nullptr;
+    ggml_backend_device_identity_v1 identity = {};
+    uint32_t input_ordinal = 0;
+};
+
+bool cpu_backend_identity_v1(char * out, size_t capacity,
+                             size_t & size) noexcept {
+    size = 0;
+#if (defined(__i386__) || defined(__x86_64__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+    unsigned eax = 0;
+    unsigned ebx = 0;
+    unsigned ecx = 0;
+    unsigned edx = 0;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx) ||
+        __get_cpuid_max(0x80000000u, nullptr) < 0x80000004u) {
+        return false;
+    }
+    char brand[49] = {};
+    for (unsigned leaf = 0; leaf != 3; ++leaf) {
+        unsigned words[4] = {};
+        __cpuid(0x80000002u + leaf,
+                words[0], words[1], words[2], words[3]);
+        std::memcpy(brand + 16 * leaf, words, 16);
+    }
+    const char * features = llama_print_system_info();
+    const int written = std::snprintf(
+        out, capacity, "cpuid-v1|signature=%08x|brand=%s|features=%s",
+        eax, brand, features ? features : "");
+    if (written < 0 || size_t(written) >= capacity) return false;
+    size = size_t(written);
+    return true;
+#else
+    GGML_UNUSED(out);
+    GGML_UNUSED(capacity);
+    return false;
+#endif
+}
+
+bool resolve_canonical_devices(
+        const common_params & params,
+        std::array<canonical_device_identity, 128> & devices,
+        size_t & count,
+        uint32_t & driver_version,
+        uint32_t & runtime_version,
+        bool & exact) noexcept {
+    count = 0;
+    driver_version = 0;
+    runtime_version = 0;
+    exact = true;
+    auto admit = [&](ggml_backend_dev_t device) {
+        if (!device || count == devices.size()) {
+            exact = false;
+            return;
+        }
+        auto & row = devices[count];
+        row = {};
+        row.device = device;
+        row.input_ordinal = uint32_t(count);
+        row.identity.struct_size = sizeof(row.identity);
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        const auto query = reinterpret_cast<ggml_backend_device_identity_v1_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_DEVICE_IDENTITY_V1_PROC));
+        bool nonzero_uuid = false;
+        if (!query || !query(device, &row.identity) ||
+            row.identity.struct_size != sizeof(row.identity) ||
+            row.identity.driver_version == 0 ||
+            row.identity.runtime_version == 0 ||
+            row.identity.backend_kind == GGML_BACKEND_IDENTITY_KIND_UNKNOWN ||
+            row.identity.arch_major == 0) {
+            nonzero_uuid = false;
+        } else {
+            for (const uint8_t byte : row.identity.uuid) {
+                nonzero_uuid |= byte != 0;
+            }
+        }
+        if (!nonzero_uuid) {
+            const char * name = ggml_backend_dev_name(device);
+            const char * description = ggml_backend_dev_description(device);
+            const char newline[] = "\n";
+            const auto pseudo_uuid = digest_parts({
+                { name, std::strlen(name) }, { newline, 1 },
+                { description, std::strlen(description) },
+            });
+            row.identity = {};
+            row.identity.struct_size = sizeof(row.identity);
+            std::memcpy(row.identity.uuid, pseudo_uuid.data(), 16);
+            exact = false;
+        }
+        ++count;
+    };
+    if (params.devices.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * device = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                admit(device);
+            }
+        }
+    } else {
+        for (auto * device : params.devices) {
+            if (device) admit(device);
+        }
+    }
+    if (count == 0) {
+        exact = true;
+        return true;
+    }
+    if (exact) {
+        driver_version = devices[0].identity.driver_version;
+        runtime_version = devices[0].identity.runtime_version;
+        for (size_t i = 1; i < count; ++i) {
+            exact = exact &&
+                devices[i].identity.driver_version == driver_version &&
+                devices[i].identity.runtime_version == runtime_version;
+        }
+    }
+    std::sort(devices.begin(), devices.begin() + count,
+        [](const auto & a, const auto & b) {
+            const int uuid_order = std::memcmp(
+                a.identity.uuid, b.identity.uuid, sizeof(a.identity.uuid));
+            return uuid_order != 0
+                ? uuid_order < 0
+                : a.identity.pci_domain_bus_device_function <
+                      b.identity.pci_domain_bus_device_function;
+        });
+    for (size_t i = 1; i < count; ++i) {
+        if (std::memcmp(devices[i - 1].identity.uuid,
+                        devices[i].identity.uuid, 16) == 0) {
+            exact = false;
+        }
+    }
+    if (!exact) {
+        driver_version = 0;
+        runtime_version = 0;
+    }
+    return true;
+}
+
+bool has_active_tensor_buft_override(const common_params & params) noexcept {
+    for (const auto & row : params.tensor_buft_overrides) {
+        if (row.pattern != nullptr || row.buft != nullptr) return true;
+    }
+    return false;
+}
+
+bool canonical_main_device(
+        const std::array<canonical_device_identity, 128> & devices,
+        size_t count,
+        int32_t input_main,
+        uint32_t & canonical) noexcept {
+    if (input_main < 0) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (devices[i].input_ordinal == uint32_t(input_main)) {
+            canonical = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool decode_hex_digest(const char * value, size_t size,
                        std::array<uint8_t, 32> & out) noexcept {
     if (!value || size != 64) return false;
@@ -676,25 +846,29 @@ bool decode_hex_digest(const char * value, size_t size,
 
 bool fingerprint_config_root_from_params(
         const common_params & params,
+        const float * effective_tensor_split,
+        size_t effective_tensor_split_count,
         const common_cache_plan_vbr_regime & vbr,
         uint32_t effective_n_gpu_layers,
         uint16_t pipeline_mode,
         uint16_t allocator_vmm_regime,
         uint8_t * scratch, size_t scratch_size,
-        std::array<uint8_t, 32> & root, bool & exact) noexcept {
+        std::array<uint8_t, 32> & root, bool & exact,
+        uint32_t & inexact_fields) noexcept {
     try {
         bounded_bytes bytes { scratch, scratch_size, 0 };
         config_root_builder out;
         if (!out.u32(1, 2) || !out.u32(2, 2) || !out.u32(3, 2)) return false;
 
-        static constexpr char ABI_PREFIX[] = "zc-estimator-v2|";
         static constexpr char ABI_BACKEND[] = "|ggml-backend-abi=v2";
         const char * build = llama_build_info();
         const char * compiler = llama_compiler();
         const char * target = llama_build_target();
         const char separator[] = "|";
         const auto cost_abi = digest_parts({
-            { ABI_PREFIX, sizeof(ABI_PREFIX) - 1 }, { build, std::strlen(build) },
+            { SERVER_CACHE_CALIBRATION_ESTIMATOR_ABI_PREFIX,
+              sizeof(SERVER_CACHE_CALIBRATION_ESTIMATOR_ABI_PREFIX) - 1 },
+            { build, std::strlen(build) },
             { separator, 1 }, { compiler, std::strlen(compiler) },
             { separator, 1 }, { target, std::strlen(target) },
             { ABI_BACKEND, sizeof(ABI_BACKEND) - 1 },
@@ -711,66 +885,105 @@ bool fingerprint_config_root_from_params(
         if (!out.field(5, server_cache_fingerprint_field_type::utf8,
                        bytes.data, bytes.size)) return false;
 
-        auto device_at = [&](size_t wanted) -> ggml_backend_dev_t {
-            size_t seen = 0;
-            if (params.devices.empty()) {
-                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                    auto * device = ggml_backend_dev_get(i);
-                    if (ggml_backend_dev_type(device) !=
-                            GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-                    if (seen++ == wanted) return device;
-                }
-            } else {
-                for (auto * device : params.devices) {
-                    if (!device) continue;
-                    if (seen++ == wanted) return device;
-                }
-            }
-            return nullptr;
-        };
+        std::array<canonical_device_identity, 128> devices = {};
         size_t device_count = 0;
-        while (device_at(device_count)) ++device_count;
+        uint32_t driver_version = 0;
+        uint32_t runtime_version = 0;
+        bool hardware_exact = false;
+        if (!resolve_canonical_devices(
+                params, devices, device_count, driver_version,
+                runtime_version, hardware_exact)) return false;
+        // The CLI pads this vector with null rows for the auto-fit workspace.
+        // Capacity is not a user override and must not demote every ordinary
+        // server launch to a shadow-only hardware identity.
+        if (has_active_tensor_buft_override(params)) hardware_exact = false;
         if (device_count == 0) effective_n_gpu_layers = 0;
-        if (!out.u32(6, 0, device_count == 0) ||
-            !out.u32(7, 0, device_count == 0)) return false;
-        const char * system_info = llama_print_system_info();
+        if (!out.u32(6, driver_version, hardware_exact) ||
+            !out.u32(7, runtime_version, hardware_exact)) return false;
+
+        char cpu_identity[1024] = {};
+        size_t cpu_identity_size = 0;
+        const bool cpu_exact = cpu_backend_identity_v1(
+            cpu_identity, sizeof(cpu_identity), cpu_identity_size);
+        const char * cpu_value = cpu_exact
+            ? cpu_identity : llama_print_system_info();
+        const size_t cpu_value_size = cpu_exact
+            ? cpu_identity_size : std::strlen(cpu_value);
         if (!out.field(8, server_cache_fingerprint_field_type::utf8,
-                       system_info, std::strlen(system_info), false)) return false;
+                       cpu_value, cpu_value_size, cpu_exact)) return false;
 
         bytes.clear();
         if (device_count > UINT32_MAX || !bytes.u32(uint32_t(device_count))) return false;
         for (uint32_t i = 0; i < device_count; ++i) {
-            auto * device = device_at(i);
-            const char * name = ggml_backend_dev_name(device);
-            const char * description = ggml_backend_dev_description(device);
-            const char newline[] = "\n";
-            const auto pseudo_uuid = digest_parts({
-                { name, std::strlen(name) }, { newline, 1 },
-                { description, std::strlen(description) },
-            });
-            if (!bytes.u32(i) || !bytes.append(pseudo_uuid.data(), 16) ||
-                !bytes.u16(0) || !bytes.u16(0) || !bytes.u16(0)) return false;
+            const auto & identity = devices[i].identity;
+            if (!bytes.u32(i) || !bytes.append(identity.uuid, 16) ||
+                !bytes.u16(identity.backend_kind) ||
+                !bytes.u16(identity.arch_major) ||
+                !bytes.u16(identity.arch_minor)) return false;
         }
         if (!out.field(9, server_cache_fingerprint_field_type::bytes,
-                       bytes.data, bytes.size, device_count == 0)) return false;
-        bytes.clear();
-        if (!bytes.u32(0) ||
-            !out.field(10, server_cache_fingerprint_field_type::bytes,
-                       bytes.data, bytes.size, device_count == 0)) return false;
+                       bytes.data, bytes.size, hardware_exact)) return false;
 
         bytes.clear();
         if (device_count > UINT32_MAX ||
-            !bytes.u16(uint16_t(params.split_mode)) ||
-            !bytes.u32(uint32_t(std::max(0, params.main_gpu))) ||
+            (device_count != 0 && device_count > UINT32_MAX / device_count) ||
+            !bytes.u32(uint32_t(device_count * device_count))) return false;
+        for (uint32_t src = 0; src < device_count; ++src) {
+            for (uint32_t dst = 0; dst < device_count; ++dst) {
+                uint16_t link_class = 1;
+                uint8_t p2p = 1;
+                uint64_t bandwidth_class =
+                    devices[src].identity.pci_domain_bus_device_function;
+                if (src != dst) {
+                    ggml_backend_device_link_v1 link = {};
+                    link.struct_size = sizeof(link);
+                    auto * reg = ggml_backend_dev_backend_reg(devices[src].device);
+                    const auto query = reinterpret_cast<
+                        ggml_backend_device_link_v1_t>(
+                            ggml_backend_reg_get_proc_address(
+                                reg, GGML_BACKEND_DEVICE_LINK_V1_PROC));
+                    if (!query || !query(
+                            devices[src].device, devices[dst].device, &link) ||
+                        link.struct_size != sizeof(link) ||
+                        link.link_class == 0 || link.p2p > 1) {
+                        hardware_exact = false;
+                        link = {};
+                    }
+                    link_class = link.link_class;
+                    p2p = link.p2p;
+                    bandwidth_class = link.bandwidth_class;
+                }
+                if (!bytes.u32(src) || !bytes.u32(dst) ||
+                    !bytes.u16(link_class) || !bytes.u8(p2p) ||
+                    !bytes.u64(bandwidth_class)) return false;
+            }
+        }
+        if (!out.field(10, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size, hardware_exact)) return false;
+
+        bytes.clear();
+        uint32_t canonical_main = 0;
+        if (device_count != 0 && !canonical_main_device(
+                devices, device_count, params.main_gpu, canonical_main)) {
+            hardware_exact = false;
+        }
+        if (!bytes.u16(uint16_t(params.split_mode)) ||
+            !bytes.u32(canonical_main) ||
             !bytes.u32(effective_n_gpu_layers) ||
             !bytes.u32(uint32_t(device_count))) return false;
         for (size_t i = 0; i < device_count; ++i) {
-            if (!bytes.binary64(params.tensor_split[i])) return false;
+            if (!effective_tensor_split ||
+                devices[i].input_ordinal >= effective_tensor_split_count ||
+                !bytes.binary64(
+                    effective_tensor_split[devices[i].input_ordinal])) {
+                return false;
+            }
         }
         if (!bytes.u8(uint8_t(!params.no_kv_offload)) ||
             !bytes.u8(uint8_t(!params.no_op_offload)) ||
             !out.field(11, server_cache_fingerprint_field_type::bytes,
-                       bytes.data, bytes.size)) return false;
+                       bytes.data, bytes.size, hardware_exact)) return false;
+        out.exact = out.exact && hardware_exact;
         if (!out.u32(12, uint32_t(std::max(0, params.n_batch))) ||
             !out.u32(13, uint32_t(std::max(0, params.n_ubatch))) ||
             !out.u32(14, uint32_t(std::max(0, params.cpuparams.n_threads))) ||
@@ -902,10 +1115,12 @@ bool fingerprint_config_root_from_params(
             out.next_id != FIELD_TYPES.size() + 1) return false;
         root = out.hash.finish();
         exact = out.exact;
+        inexact_fields = out.inexact_fields;
         return true;
     } catch (...) {
         root = {};
         exact = false;
+        inexact_fields = 0;
         return false;
     }
 }
@@ -1183,7 +1398,8 @@ bool server_cache_fingerprint_fields_v1(
         out.push_back(server_cache_fingerprint_u32(2, 2));
         out.push_back(server_cache_fingerprint_u32(3, 2));
 
-        const std::string cost_abi = std::string("zc-estimator-v2|") +
+        const std::string cost_abi =
+            std::string(SERVER_CACHE_CALIBRATION_ESTIMATOR_ABI_PREFIX) +
             llama_build_info() + "|" + llama_compiler() + "|" +
             llama_build_target() + "|ggml-backend-abi=v2";
         out.push_back(server_cache_fingerprint_digest(
@@ -1195,73 +1411,101 @@ bool server_cache_fingerprint_fields_v1(
             backends += ggml_backend_reg_name(ggml_backend_reg_get(i));
         }
         if (!add_utf8(5, backends)) return false;
-        std::vector<ggml_backend_dev_t> effective_devices;
-        if (params.devices.empty()) {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                auto * device = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(device) ==
-                        GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    effective_devices.push_back(device);
-                }
-            }
-        } else {
-            for (auto * device : params.devices) {
-                if (device) {
-                    effective_devices.push_back(device);
-                }
-            }
-        }
-        if (effective_devices.empty()) {
-            effective_n_gpu_layers = 0;
-        }
+        std::array<canonical_device_identity, 128> effective_devices = {};
+        size_t device_count = 0;
+        uint32_t driver_version = 0;
+        uint32_t runtime_version = 0;
+        bool hardware_exact = false;
+        if (!resolve_canonical_devices(
+                params, effective_devices, device_count, driver_version,
+                runtime_version, hardware_exact)) return false;
+        if (has_active_tensor_buft_override(params)) hardware_exact = false;
+        if (device_count == 0) effective_n_gpu_layers = 0;
 
-        auto driver = server_cache_fingerprint_u32(6, 0);
-        auto runtime = server_cache_fingerprint_u32(7, 0);
-        // GGML has no cross-backend driver/runtime query. A zero is an honest
-        // stable shadow value, never exact on a device-backed profile.
-        driver.exact = effective_devices.empty();
-        runtime.exact = effective_devices.empty();
+        auto driver = server_cache_fingerprint_u32(6, driver_version);
+        auto runtime = server_cache_fingerprint_u32(7, runtime_version);
+        driver.exact = hardware_exact;
+        runtime.exact = hardware_exact;
         out.push_back(std::move(driver));
         out.push_back(std::move(runtime));
-        // Registry names alone do not distinguish runtime CPU ISA/model
-        // dispatch. Preserve the complete backend feature string as the
-        // compatibility seed, but keep it shadow-only until the backend
-        // exposes a versioned, collision-resistant hardware identity.
-        if (!add_utf8(8, llama_print_system_info(), false)) return false;
+
+        char cpu_identity[1024] = {};
+        size_t cpu_identity_size = 0;
+        const bool cpu_exact = cpu_backend_identity_v1(
+            cpu_identity, sizeof(cpu_identity), cpu_identity_size);
+        if (!add_utf8(8, cpu_exact
+                ? std::string(cpu_identity, cpu_identity_size)
+                : std::string(llama_print_system_info()), cpu_exact)) return false;
 
         std::vector<uint8_t> devices;
-        append_u32(devices, uint32_t(effective_devices.size()));
-        for (uint32_t i = 0; i < effective_devices.size(); ++i) {
-            const auto dev = effective_devices[i];
+        append_u32(devices, uint32_t(device_count));
+        for (uint32_t i = 0; i < device_count; ++i) {
+            const auto & identity = effective_devices[i].identity;
             append_u32(devices, i);
-            const auto pseudo_uuid = digest_text(
-                std::string(ggml_backend_dev_name(dev)) + "\n" +
-                ggml_backend_dev_description(dev));
-            devices.insert(devices.end(), pseudo_uuid.begin(),
-                           pseudo_uuid.begin() + 16);
-            append_u16(devices, 0); // backend enum unavailable
-            append_u16(devices, 0); // arch major unavailable
-            append_u16(devices, 0); // arch minor unavailable
+            devices.insert(devices.end(), identity.uuid, identity.uuid + 16);
+            append_u16(devices, identity.backend_kind);
+            append_u16(devices, identity.arch_major);
+            append_u16(devices, identity.arch_minor);
         }
-        add_bytes(9, devices, effective_devices.empty());
+        add_bytes(9, devices, hardware_exact);
 
         std::vector<uint8_t> topology;
-        append_u32(topology, 0); // no portable link/UUID API in GGML v1
-        add_bytes(10, topology, effective_devices.empty());
+        append_u32(topology, uint32_t(device_count * device_count));
+        for (uint32_t src = 0; src < device_count; ++src) {
+            for (uint32_t dst = 0; dst < device_count; ++dst) {
+                uint16_t link_class = 1;
+                uint8_t p2p = 1;
+                uint64_t bandwidth_class = effective_devices[src].identity.
+                    pci_domain_bus_device_function;
+                if (src != dst) {
+                    ggml_backend_device_link_v1 link = {};
+                    link.struct_size = sizeof(link);
+                    auto * reg = ggml_backend_dev_backend_reg(
+                        effective_devices[src].device);
+                    const auto query = reinterpret_cast<
+                        ggml_backend_device_link_v1_t>(
+                            ggml_backend_reg_get_proc_address(
+                                reg, GGML_BACKEND_DEVICE_LINK_V1_PROC));
+                    if (!query || !query(
+                            effective_devices[src].device,
+                            effective_devices[dst].device, &link) ||
+                        link.struct_size != sizeof(link) ||
+                        link.link_class == 0 || link.p2p > 1) {
+                        hardware_exact = false;
+                        link = {};
+                    }
+                    link_class = link.link_class;
+                    p2p = link.p2p;
+                    bandwidth_class = link.bandwidth_class;
+                }
+                append_u32(topology, src);
+                append_u32(topology, dst);
+                append_u16(topology, link_class);
+                topology.push_back(p2p);
+                append_u64(topology, bandwidth_class);
+            }
+        }
+        add_bytes(10, topology, hardware_exact);
 
         std::vector<uint8_t> placement;
         append_u16(placement, uint16_t(params.split_mode));
-        append_u32(placement, uint32_t(std::max(0, params.main_gpu)));
+        uint32_t canonical_main = 0;
+        if (device_count != 0 && !canonical_main_device(
+                effective_devices, device_count, params.main_gpu,
+                canonical_main)) hardware_exact = false;
+        append_u32(placement, canonical_main);
         append_u32(placement, effective_n_gpu_layers);
-        append_u32(placement, uint32_t(effective_devices.size()));
-        for (size_t i = 0; i < effective_devices.size(); ++i) {
-            if (!append_binary64(placement, params.tensor_split[i])) {
+        append_u32(placement, uint32_t(device_count));
+        for (size_t i = 0; i < device_count; ++i) {
+            if (!append_binary64(
+                    placement,
+                    params.tensor_split[effective_devices[i].input_ordinal])) {
                 return false;
             }
         }
         placement.push_back(uint8_t(!params.no_kv_offload));
         placement.push_back(uint8_t(!params.no_op_offload));
-        add_bytes(11, placement);
+        add_bytes(11, placement, hardware_exact);
 
         out.push_back(server_cache_fingerprint_u32(
             12, uint32_t(std::max(0, params.n_batch))));
@@ -1548,11 +1792,26 @@ bool server_cache_fingerprint_worker::configure(
         uint32_t effective_n_gpu_layers,
         uint16_t pipeline_mode,
         uint16_t allocator_vmm_regime) noexcept {
+    return configure(
+        params, params.tensor_split,
+        sizeof(params.tensor_split) / sizeof(params.tensor_split[0]),
+        vbr, effective_n_gpu_layers, pipeline_mode, allocator_vmm_regime);
+}
+
+bool server_cache_fingerprint_worker::configure(
+        const common_params & params,
+        const float * effective_tensor_split,
+        size_t effective_tensor_split_count,
+        const common_cache_plan_vbr_regime & vbr,
+        uint32_t effective_n_gpu_layers,
+        uint16_t pipeline_mode,
+        uint16_t allocator_vmm_regime) noexcept {
     if (started_ || thread_.joinable() || config_ready_) return false;
     if (!fingerprint_config_root_from_params(
-            params, vbr, effective_n_gpu_layers, pipeline_mode,
+            params, effective_tensor_split, effective_tensor_split_count,
+            vbr, effective_n_gpu_layers, pipeline_mode,
             allocator_vmm_regime, hash_buffer_.data(), hash_buffer_.size(),
-            config_root_, config_exact_)) return false;
+            config_root_, config_exact_, config_inexact_fields_)) return false;
     config_ready_ = true;
     return true;
 }

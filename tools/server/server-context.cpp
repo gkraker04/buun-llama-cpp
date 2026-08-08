@@ -2566,14 +2566,25 @@ private:
                 params_base.n_gpu_layers >= 0
                     ? uint32_t(params_base.n_gpu_layers)
                     : uint32_t(llama_model_n_layer(model_tgt) + 1);
+            size_t effective_split_count = 0;
+            const float * effective_split =
+                model_tgt->effective_tensor_split(effective_split_count);
+            if (!effective_split || effective_split_count >
+                    sizeof(params_base.tensor_split) /
+                        sizeof(params_base.tensor_split[0])) {
+                cache_fingerprint_worker.reset();
+                return;
+            }
             if (!cache_fingerprint_worker->configure(
-                    params_base, vbr, effective_n_gpu_layers,
+                    params_base, effective_split, effective_split_count,
+                    vbr, effective_n_gpu_layers,
                     uint16_t(llama_context_pipeline_parallel_active(ctx_tgt)),
                     uint16_t(llama_context_vbr_vmm_active(ctx_tgt)))) {
                 cache_fingerprint_worker.reset();
                 return;
             }
 
+            bool artifact_inputs_exact = true;
             auto append_model = [&](const llama_model * model,
                                     server_cache_fingerprint_artifact_role role) {
                 std::array<llama_model_artifact_descriptor,
@@ -2586,6 +2597,8 @@ private:
                 }
                 try {
                     for (uint32_t i = 0; i < source_count; ++i) {
+                        artifact_inputs_exact = artifact_inputs_exact &&
+                            source[i].integrity_exact;
                         const int descriptor = source[i].descriptor;
                         source[i].descriptor = -1;
                         if (!cache_fingerprint_worker->add_descriptor({
@@ -2610,6 +2623,12 @@ private:
                     server_cache_fingerprint_artifact_role::draft))) {
                 cache_fingerprint_worker.reset();
                 return;
+            }
+            if (params_base.cache_optimizer.cache_debug) {
+                SRV_INF("CACHE_FINGERPRINT_INPUT config_exact=%d artifacts_exact=%d inexact_fields=%08x\n",
+                    int(cache_fingerprint_worker->configured_exact()),
+                    int(artifact_inputs_exact),
+                    cache_fingerprint_worker->configured_inexact_fields());
             }
             for (uint32_t i = 0; i < params_base.lora_adapters.size(); ++i) {
                 std::array<uint8_t, 32> content = {};
@@ -2720,13 +2739,6 @@ private:
         return { value.serial, value.completed_us };
     }
 
-    static uint8_t cache_observation_start_bucket(llama_pos pos) noexcept {
-        if (pos < 4096) return 0;
-        if (pos < 32768) return 1;
-        if (pos < 131072) return 2;
-        return 3;
-    }
-
     void cache_observation_note_submission(
             const llama_batch & batch_view) noexcept {
         if (!cache_optimizer_observations || batch_view.n_tokens <= 0) {
@@ -2822,7 +2834,7 @@ private:
             attribution.speculative_participates = slot.can_speculate();
             attribution.warmup = llama_context_is_warmup(ctx_tgt);
             attribution.contention_bucket = active_slots == 1 ? 0 : 1;
-            attribution.start_bucket = cache_observation_start_bucket(
+            attribution.start_bucket = server_cache_observation_start_bucket(
                 first_pos == std::numeric_limits<llama_pos>::max()
                     ? 0 : first_pos);
             attribution.batch_bucket = server_cache_observation_batch_bucket(
@@ -2880,7 +2892,11 @@ private:
         }
     }
 
-    void cache_authority_config_failed(bool mirror_to_shadow) noexcept {
+    void cache_authority_config_failed(
+            bool mirror_to_shadow, const char * reason) noexcept {
+        if (cache_authority->configured) {
+            SRV_WRN("CACHE_AUTHORITY configuration disabled: %s\n", reason);
+        }
         cache_authority->configured = false;
         if (mirror_to_shadow && cache_plan_obs) {
             cache_plan_obs->shadow_unavailable++;
@@ -3063,6 +3079,11 @@ private:
                     ggml_backend_buffer_type_t buft = raw_buft;
                     if (ggml_backend_buft_is_meta(buft)) {
                         if (ggml_backend_meta_buft_n_bufts(buft) != 1) {
+                            SRV_WRN(
+                                "CACHE_AUTHORITY budget attribution refused: "
+                                "multi-device meta buffer compute=%zu children=%zu\n",
+                                row.compute,
+                                ggml_backend_meta_buft_n_bufts(buft));
                             complete = false;
                             continue;
                         }
@@ -3070,6 +3091,15 @@ private:
                     }
                     const ggml_backend_dev_t device =
                         ggml_backend_buft_get_device(buft);
+                    // CPU buffers consume the separately sampled host budget;
+                    // they are not missing accelerator-domain rows. Some CPU
+                    // buffer types do not advertise ggml's host-buffer cap,
+                    // so classify by the owning device before requiring a
+                    // topology-qualified compute reservation.
+                    if (!device || ggml_backend_dev_type(device) !=
+                            GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
                     auto it = std::find_if(
                         cache_authority->budget_devices.begin(),
                         cache_authority->budget_devices.end(),
@@ -3077,6 +3107,10 @@ private:
                             return input.backend_device == device;
                         });
                     if (it == cache_authority->budget_devices.end()) {
+                        SRV_WRN(
+                            "CACHE_AUTHORITY budget attribution refused: "
+                            "unmanifested GPU device=%s compute=%zu\n",
+                            ggml_backend_dev_name(device), row.compute);
                         complete = false;
                         continue;
                     }
@@ -3570,7 +3604,8 @@ private:
             server_cache_destruction_quote_options options,
             uint64_t * admission_sequence,
             common_cache_plan_destruction_counters & counters,
-            const cache_plan_host_source_registry * source_registry) noexcept {
+            const cache_plan_host_source_registry * source_registry,
+            server_cache_plan_local_inventory * local_evidence) noexcept {
         if (!cache_authority || !options.lifecycle_available) {
             rec.destruction.state = common_cache_plan_destruction_state::refused;
             rec.destruction.reason =
@@ -3684,6 +3719,18 @@ private:
                 return;
             }
 
+            if (local_evidence) {
+                for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+                    if (rec.inventory[i].viable() &&
+                        server_cache_destruction_effects_for(
+                            rec, int32_t(i), legacy_candidate,
+                            options.permitted_effects) != 0) {
+                        local_evidence->candidates[i].
+                            requires_d_consequences = true;
+                    }
+                }
+            }
+
             // D-A5 supplies B's previously unavailable eviction term before
             // the single planner optimum runs. The cost is the fitted cost of
             // restoring the displaced complete state, multiplied by the
@@ -3697,7 +3744,8 @@ private:
             // inside the normative 2 ms launch-path bound.
             const auto * calib = common_cache_plan_calib_find(
                 rec.calibration_profile);
-            if (params_base.cache_optimizer.cache_lifecycle && calib) {
+            if (params_base.cache_optimizer.cache_lifecycle &&
+                (calib || local_evidence)) {
                 std::unordered_map<int32_t, llama_cache_acct_value>
                     victim_state_sizes;
                 for (const auto & quote : rec.destruction_quotes) {
@@ -3736,8 +3784,22 @@ private:
                                   LLAMA_STATE_SEQ_FLAGS_NONE)
                             : 0;
                         if (target_bytes <= SIZE_MAX - draft_bytes) {
-                            size_it->second = llama_cache_acct_value::measured(
-                                target_bytes + draft_bytes);
+                            uint64_t total = uint64_t(target_bytes + draft_bytes);
+                            bool complete = true;
+                            for (const auto & checkpoint :
+                                    victim->prompt.checkpoints) {
+                                const uint64_t checkpoint_bytes = uint64_t(
+                                    checkpoint.size_without_shadow());
+                                if (checkpoint_bytes > UINT64_MAX - total) {
+                                    complete = false;
+                                    break;
+                                }
+                                total += checkpoint_bytes;
+                            }
+                            if (complete) {
+                                size_it->second =
+                                    llama_cache_acct_value::measured(total);
+                            }
                         }
                     }
                     if (size_it->second.state !=
@@ -3755,20 +3817,165 @@ private:
                             !victim->task || !victim->task->is_child());
                     uint32_t weight = 0;
                     uint64_t price_us = 0;
-                    if (!server_cache_host_retention_price_us(
-                            *calib, bytes,
-                            receipt.lease_verdict ==
-                                common_cache_plan_destruction_lease_verdict::
-                                    soft_leased,
-                            main_family, weight, price_us)) {
+                    const bool soft_leased = receipt.lease_verdict ==
+                        common_cache_plan_destruction_lease_verdict::soft_leased;
+                    if (!server_cache_retention_weight_milli(
+                            soft_leased, main_family,
+                            SERVER_CACHE_HOST_WEIGHT_SCALE, weight)) {
                         continue;
                     }
-                    auto & term = candidate.cost_terms[size_t(
-                        llama_cache_acct_cost_kind::eviction)];
-                    term.raw = llama_cache_acct_value::measured(bytes);
-                    term.estimated_us =
-                        llama_cache_acct_value::measured(price_us);
-                    term.estimator_version = calib->estimator_version;
+                    if (local_evidence && receipt.plan_candidate >= 0 &&
+                        uint32_t(receipt.plan_candidate) < rec.n_inventory) {
+                        auto & local = local_evidence->candidates[size_t(
+                            receipt.plan_candidate)];
+                        local.requires_d_consequences = true;
+                        std::array<uint8_t, 32> victim_adapter_digest = {};
+                        const bool victim_adapter_complete =
+                            server_cache_adapter_application_digest_v1(
+                                victim->lora, victim_adapter_digest);
+                        const uint8_t prepare_shape =
+                            candidate.target_slot_id == legacy_target_slot
+                                ? 2 : 3;
+                        const auto add = [&](
+                                server_cache_observation_operation operation,
+                                common_cache_plan_provider provider,
+                                uint8_t shape,
+                                llama_cache_acct_cost_kind cost_kind,
+                                uint32_t weight_milli,
+                                uint64_t operation_bytes,
+                                const std::array<uint8_t, 32> & adapter_digest,
+                                bool adapter_complete,
+                                llama_pos reference_frontier = -1,
+                                common_cache_plan_destruction_effect_set effects = 0) {
+                            if (local.consequence_count >=
+                                    local.consequences.size()) return false;
+                            auto & evidence = local.consequences[
+                                local.consequence_count];
+                            auto key = server_cache_observation_cpu_key(
+                                operation, provider, shape);
+                            key.adapter_application_digest = adapter_digest;
+                            key.adapter_application_complete = adapter_complete;
+                            if (operation ==
+                                    server_cache_observation_operation::
+                                        destruction_apply &&
+                                !server_cache_calibration_apply_shape_digest_v1(
+                                    effects,
+                                    server_cache_destruction_class::slot_drop,
+                                    server_cache_destruction_release_owner::
+                                        legacy_wrapper_or_capability,
+                                    key.effect_action_shape_digest)) {
+                                return false;
+                            }
+                            std::array<double, 4> feature = {};
+                            uint8_t family = 0;
+                            if (!server_cache_observation_byte_feature(
+                                    operation_bytes, family, feature)) return false;
+                            key.size_family = family;
+                            if (operation ==
+                                    server_cache_observation_operation::restore) {
+                                if (reference_frontier < 0) return false;
+                                if (!server_cache_observation_apply_restore_geometry(
+                                        key, reference_frontier,
+                                        uint32_t(std::max(1, params_base.n_batch)),
+                                        uint32_t(std::max(1, params_base.n_ubatch)))) {
+                                    return false;
+                                }
+                            }
+                            cache_optimizer_observations->
+                                apply_execution_fingerprint(key);
+                            if (!server_cache_observation_key_valid(key)) {
+                                return false;
+                            }
+                            evidence.key = key;
+                            evidence.feature = feature;
+                            evidence.cost_kind = cost_kind;
+                            evidence.weight_milli = weight_milli;
+                            evidence.measurable = true;
+                            ++local.consequence_count;
+                            return true;
+                        };
+                        const server_prompt_cache_state * recovery_source = nullptr;
+                        if (receipt.recovery_source_artifact_id.v != 0 &&
+                            prompt_cache) {
+                            const auto cited = std::find_if(
+                                artifacts.begin(), artifacts.end(),
+                                [&](const auto & artifact) {
+                                    return artifact.candidate.artifact_id ==
+                                               receipt.recovery_source_artifact_id &&
+                                           artifact.kind ==
+                                               common_retention_artifact_kind::host_entry &&
+                                           artifact.host_source_id >= 0;
+                                });
+                            if (cited != artifacts.end()) {
+                                const auto state = std::find_if(
+                                    prompt_cache->states.begin(),
+                                    prompt_cache->states.end(),
+                                    [&](const auto & item) {
+                                        return item.cache_plan_source_id ==
+                                            cited->host_source_id;
+                                    });
+                                if (state != prompt_cache->states.end()) {
+                                    recovery_source = &*state;
+                                }
+                            }
+                        }
+                        uint64_t recovery_bytes = 0;
+                        llama_pos recovery_frontier = -1;
+                        std::array<uint8_t, 32> recovery_adapter_digest = {};
+                        bool recovery_adapter_complete = false;
+                        if (recovery_source) {
+                            recovery_bytes = uint64_t(recovery_source->size());
+                            recovery_frontier = recovery_source->prompt.tokens.pos_next(
+                                recovery_source->prompt.tokens.size());
+                            recovery_adapter_digest =
+                                recovery_source->adapter_application_digest;
+                            recovery_adapter_complete =
+                                recovery_source->adapter_application_complete;
+                        } else if (receipt.recovery_citation ==
+                                common_cache_plan_recovery_citation::prospective) {
+                            recovery_bytes = bytes;
+                            recovery_frontier = victim->prompt.tokens.pos_next(
+                                victim->prompt.tokens.size());
+                            recovery_adapter_digest = victim_adapter_digest;
+                            recovery_adapter_complete = victim_adapter_complete;
+                        }
+                        const bool local_ready =
+                            prepare_shape != 3 &&
+                            victim_adapter_complete &&
+                            add(server_cache_observation_operation::
+                                    durability_prepare,
+                                common_cache_plan_provider::live_slot,
+                                prepare_shape,
+                                llama_cache_acct_cost_kind::transfer, 1000,
+                                bytes, victim_adapter_digest,
+                                victim_adapter_complete) &&
+                            add(server_cache_observation_operation::
+                                    destruction_apply,
+                                common_cache_plan_provider::live_slot, 0,
+                                llama_cache_acct_cost_kind::transfer, 1000,
+                                bytes, victim_adapter_digest,
+                                victim_adapter_complete, -1,
+                                receipt.effects) &&
+                            add(server_cache_observation_operation::restore,
+                                common_cache_plan_provider::host_cache_entry, 0,
+                                llama_cache_acct_cost_kind::eviction, weight,
+                                recovery_bytes, recovery_adapter_digest,
+                                recovery_adapter_complete,
+                                recovery_frontier);
+                        if (!local_ready) {
+                            local.consequence_count = 0;
+                        }
+                    }
+                    if (calib && server_cache_host_retention_price_us(
+                            *calib, bytes, soft_leased, main_family,
+                            weight, price_us)) {
+                        auto & term = candidate.cost_terms[size_t(
+                            llama_cache_acct_cost_kind::eviction)];
+                        term.raw = llama_cache_acct_value::measured(bytes);
+                        term.estimated_us =
+                            llama_cache_acct_value::measured(price_us);
+                        term.estimator_version = calib->estimator_version;
+                    }
                 }
             }
         } catch (...) {
@@ -4275,7 +4482,8 @@ private:
                 }
             }
             if (cache_plan_authority) {
-                cache_plan_authority->finalize_execution(rec);
+                cache_plan_authority->finalize_execution(
+                    rec, &slot.cache_plan_execution.local_authority);
             } else {
                 common_cache_plan_finalize_shadow_authority(rec);
             }
@@ -4289,8 +4497,11 @@ private:
             if (rec.authority.state ==
                     common_cache_plan_authority_state::authoritative) {
                 rec.optimizer.request_execution_policy =
-                    common_cache_optimizer_execution_policy::
-                        landed_checked_in_authority;
+                    rec.optimizer.local_authority.certified_once
+                        ? common_cache_optimizer_execution_policy::
+                              local_online_authority
+                        : common_cache_optimizer_execution_policy::
+                              landed_checked_in_authority;
             } else if (rec.retarget_committed) {
                 rec.optimizer.request_execution_policy =
                     common_cache_optimizer_execution_policy::
@@ -6316,12 +6527,22 @@ private:
         // B0 shadow observer [P2]: constructed only under the effective debug input — the observer
         // object and both surfaces exist iff the flag is set. Off = strictly zero observer work
         // (B-a). It records the shared authority substrate above (owned by server_context).
-        const auto plan_authority_level =
-            params_base.cache_optimizer.landed_authority_level;
+        const auto plan_authority_level = std::max(
+            params_base.cache_optimizer.landed_authority_level,
+            params_base.cache_optimizer.local_authority_ceiling);
         if (params_base.cache_optimizer.cache_debug ||
             plan_authority_level != common_cache_plan_authority_level::off) {
             cache_plan_authority =
-                std::make_unique<server_cache_plan_authority>(plan_authority_level);
+                std::make_unique<server_cache_plan_authority>(
+                    plan_authority_level, cache_optimizer_observations.get());
+            if (params_base.cache_optimizer.local_authority_ceiling !=
+                    common_cache_plan_authority_level::off) {
+                std::array<uint8_t, 32> profile_display_salt = {};
+                if (server_cache_calibration_secure_random(profile_display_salt)) {
+                    (void) cache_plan_authority->set_profile_display_salt(
+                        profile_display_salt);
+                }
+            }
         }
 
         if (params_base.cache_optimizer.cache_debug ||
@@ -6447,7 +6668,12 @@ private:
             ngl_eff = params_base.n_gpu_layers >= 0
                 ? params_base.n_gpu_layers
                 : llama_model_n_layer(model_tgt) + 1;
-            if (ngl_eff > 0 && !gpu_identities.empty()) {
+            // Context compute/KV workspace can still live on a CUDA device
+            // when zero model layers are offloaded (observed on the CPU gate).
+            // Manifest every resolved runtime device; measured-zero rows are
+            // harmless, while omitting an actually used device makes the
+            // complete budget fail closed and disables host-cache lifecycle.
+            if (!gpu_identities.empty()) {
                 llama_cache_acct_shard_topology topology;
                 if (llama_cache_acct_build_shard_topology(
                         gpu_identities,
@@ -6464,7 +6690,8 @@ private:
                                 topology,
                                 llama_cache_acct_device_ordinal{ uint16_t(i) },
                                 domain)) {
-                            cache_authority_config_failed(true);
+                            cache_authority_config_failed(
+                                true, "device-domain construction");
                             cache_authority->live_device_domains.clear();
                             break;
                         }
@@ -6473,7 +6700,8 @@ private:
                         });
                     }
                 } else {
-                    cache_authority_config_failed(true);
+                    cache_authority_config_failed(
+                        true, "topology construction");
                 }
             }
 
@@ -6580,7 +6808,8 @@ private:
             }
             if (!cache_authority->ledger.configure_required_producers(
                     required.data(), required.size())) {
-                cache_authority_config_failed(false);
+                cache_authority_config_failed(
+                    false, "completeness manifest");
             }
             if (capture_manifest_enabled) {
                 // Capture reservations span pageable metadata/companions and
@@ -6594,19 +6823,22 @@ private:
                 // so this co-init is load-bearing here yet behavior-neutral for F0b.
                 if (!server_vbr_artifact_store_observe_empty_accounting(
                         cache_authority->ledger, host_domain)) {
-                    cache_authority_config_failed(true);
+                    cache_authority_config_failed(
+                        true, "host artifact empty accounting");
                 }
                 for (const auto & binding :
                         cache_authority->live_device_domains) {
                     if (!server_vbr_artifact_store_observe_empty_accounting(
                             cache_authority->ledger,
                             binding.domain)) {
-                        cache_authority_config_failed(true);
+                        cache_authority_config_failed(
+                            true, "device artifact empty accounting");
                     }
                 }
                 if (!server_vbr_artifact_store_configure_pinned_accounting(
                         cache_authority->ledger, pinned_domain)) {
-                    cache_authority_config_failed(true);
+                    cache_authority_config_failed(
+                        true, "pinned accounting");
                 }
             }
             cache_authority->retention.configure(
@@ -6689,10 +6921,12 @@ private:
             // attribution leaves every affected domain unavailable; a measured zero is
             // valid (e.g. no recurrent layers on an attention-only target).
             if (!cache_plan_observe_live_memory(true)) {
-                cache_authority_config_failed(true);
+                cache_authority_config_failed(
+                    true, "live-memory attribution");
             }
             if (!cache_plan_configure_budget()) {
-                cache_authority_config_failed(true);
+                cache_authority_config_failed(
+                    true, "budget configuration");
             }
             if (capture_manifest_enabled) {
                 std::vector<llama_cache_acct_resource_domain>
@@ -6709,7 +6943,8 @@ private:
                 if (!server_vbr_artifact_store_verify_accounting(
                         cache_authority->ledger,
                         capture_accounting_domains)) {
-                    cache_authority_config_failed(true);
+                    cache_authority_config_failed(
+                        true, "artifact accounting verification");
                 }
             }
 
@@ -6720,7 +6955,8 @@ private:
                 !cache_authority->budget.reset(
                     cache_authority->ledger.snapshot(),
                     cache_authority->budget_config)) {
-                cache_authority_config_failed(false);
+                cache_authority_config_failed(
+                    false, "initial budget sample");
             }
 
             if (capture_manifest_enabled &&
@@ -7186,9 +7422,7 @@ private:
     }
 
     struct cache_plan_observation_inventory {
-        std::array<server_cache_observation_key,
-                   COMMON_CACHE_PLAN_MAX_CANDIDATES> keys = {};
-        std::array<bool, COMMON_CACHE_PLAN_MAX_CANDIDATES> measurable = {};
+        server_cache_plan_local_inventory local;
     };
 
     void cache_plan_observation_candidate(
@@ -7201,11 +7435,13 @@ private:
             bool isolated,
             cache_plan_observation_inventory * out) noexcept {
         if (!out || !cache_optimizer_observations || !row || !isolated ||
-            !row->viable() || lcp_tokens >= task.tokens.size()) {
+            !row->viable() || lcp_tokens > task.tokens.size()) {
             return;
         }
         const uint64_t replay_tokens = task.tokens.size() - lcp_tokens;
-        if (replay_tokens == 0 || replay_tokens > UINT32_MAX) {
+        if ((replay_tokens == 0 && key.operation !=
+                server_cache_observation_operation::restore) ||
+            replay_tokens > UINT32_MAX) {
             return;
         }
         const llama_pos start_position = task.tokens.pos_next(lcp_tokens);
@@ -7215,9 +7451,13 @@ private:
         std::array<double, 4> feature = {};
         uint8_t size_family = 0;
         uint8_t replay_batch_bucket = 0;
-        const uint32_t max_effective_batch = uint32_t(
-            std::min<uint64_t>(
-                replay_tokens, uint64_t(params_base.n_batch)));
+        // A fully covered host/checkpoint restore still performs the first
+        // post-install decode submission.  Its restore class is therefore
+        // measurable with batch geometry 1 even though its prompt replay tail
+        // is empty.  Replay-only candidates continue to require real tokens.
+        const uint32_t max_effective_batch = uint32_t(std::max<uint64_t>(
+            1, std::min<uint64_t>(
+                replay_tokens, uint64_t(params_base.n_batch))));
         const bool feature_ok = key.operation ==
                 server_cache_observation_operation::restore
             ? server_cache_observation_byte_feature(
@@ -7228,24 +7468,32 @@ private:
         if (!feature_ok) {
             return;
         }
-        key.contention_bucket = 0;
-        key.start_bucket = cache_observation_start_bucket(start_position);
-        key.batch_bucket = key.operation ==
-                server_cache_observation_operation::restore
-            ? server_cache_observation_batch_bucket(max_effective_batch)
-            : replay_batch_bucket;
-        key.ubatch_bucket = server_cache_observation_batch_bucket(
-            uint32_t(std::max(1, params_base.n_ubatch)));
+        if (key.operation == server_cache_observation_operation::restore) {
+            if (!server_cache_observation_apply_restore_geometry(
+                    key, start_position, max_effective_batch,
+                    uint32_t(std::max(1, params_base.n_ubatch)))) {
+                return;
+            }
+        } else {
+            key.contention_bucket = 0;
+            key.start_bucket = server_cache_observation_start_bucket(
+                start_position);
+            key.batch_bucket = replay_batch_bucket;
+            key.ubatch_bucket = server_cache_observation_batch_bucket(
+                uint32_t(std::max(1, params_base.n_ubatch)));
+        }
         key.size_family = size_family;
         if (!server_cache_observation_key_valid(key)) {
             return;
         }
         const auto index = size_t(row - rec.inventory.data());
-        if (index >= rec.n_inventory || index >= out->keys.size()) {
+        if (index >= rec.n_inventory ||
+            index >= out->local.candidates.size()) {
             return;
         }
-        out->keys[index] = key;
-        out->measurable[index] = true;
+        out->local.candidates[index].key = key;
+        out->local.candidates[index].feature = feature;
+        out->local.candidates[index].measurable = true;
     }
 
     bool cache_plan_inventory_live_rows(
@@ -7562,9 +7810,12 @@ private:
             bool adapter_matches,
             const std::string & incoming_adapter,
             const server_cache_plan_execution & execution,
+            const common_cache_plan_record * record,
             bool destruction_certified = false) {
         if (!execution.authoritative() || execution.target != target.id ||
-            target.is_processing()) {
+            target.is_processing() ||
+            (record && cache_plan_authority &&
+             !cache_plan_authority->local_currency_current(*record))) {
             return false;
         }
         if (execution.kind != server_cache_plan_execution_kind::cold_replay &&
@@ -7650,7 +7901,9 @@ private:
             return;
         }
         GGML_ASSERT(cache_plan_authority && slot.cache_plan);
-        cache_plan_authority->fallback_legacy(*slot.cache_plan, reason);
+        cache_plan_authority->fallback_legacy(
+            *slot.cache_plan, reason,
+            &slot.cache_plan_execution.local_authority);
         slot.cache_plan_execution.clear();
     }
 
@@ -7661,6 +7914,10 @@ private:
         const auto & execution = slot.cache_plan_execution;
         if (!execution.restores_checkpoint()) {
             return true;
+        }
+        if (slot.cache_plan && cache_plan_authority &&
+            !cache_plan_authority->local_currency_current(*slot.cache_plan)) {
+            return false;
         }
         int32_t ordinal = -1;
         if (!server_cache_plan_checkpoint_override_ordinal(
@@ -8122,6 +8379,7 @@ private:
         bool incoming_adapter_ready = false;
         bool incoming_adapter_matches = false;
         bool host_lookup_enabled = false;
+        std::optional<server_cache_plan_local_authority_latch> local_authority;
     };
 
     struct cache_plan_stage1_mode {
@@ -8162,26 +8420,32 @@ private:
         cache_plan_host_source_registry source_registry(
             !mode.preflight);
         cache_plan_derive_incoming_adapter(task, target, out);
-        if (!mode.preflight && cache_optimizer_observations) {
+        if (cache_optimizer_observations &&
+            (!mode.preflight ||
+             (params_base.cache_optimizer.mode ==
+                  common_cache_optimizer_mode::auto_mode &&
+              params_base.cache_optimizer.local_authority_ceiling !=
+                  common_cache_plan_authority_level::off))) {
             out.observations.emplace();
         }
         cache_plan_inventory_before_mutation(
             task, target, out.incoming_loras, out.incoming_adapter, rec,
             source_registry,
             out.observations ? &*out.observations : nullptr);
+        uint64_t inventory_ordinal = 0;
         if (!mode.preflight && cache_optimizer_observations &&
             !rec.inventory_saturated() &&
             !cache_calibration_inventory_currency_exhausted) {
             if (cache_calibration_inventory_ordinal == UINT64_MAX) {
                 cache_calibration_inventory_currency_exhausted = true;
             } else {
-                const uint64_t inventory_ordinal =
-                    ++cache_calibration_inventory_ordinal;
+                inventory_ordinal = ++cache_calibration_inventory_ordinal;
                 for (uint32_t i = 0; i < rec.n_inventory; ++i) {
-                    if (out.observations->measurable[i]) {
+                    if (out.observations->local.candidates[i].measurable) {
                         (void) cache_optimizer_observations->
                             note_safe_measurable_opportunity(
-                                out.observations->keys[i], inventory_ordinal);
+                                out.observations->local.candidates[i].key,
+                                inventory_ordinal);
                     }
                 }
             }
@@ -8224,7 +8488,8 @@ private:
             cache_plan_quote_destruction(
                 target.id, out.host_lookup_enabled, rec,
                 options, production_quote_sequence,
-                *destruction_counters, &source_registry);
+                *destruction_counters, &source_registry,
+                out.observations ? &out.observations->local : nullptr);
             const uint64_t destruction_quote_duration = uint64_t(
                 std::max<int64_t>(0,
                     ggml_time_us() - destruction_quote_started));
@@ -8239,8 +8504,52 @@ private:
                 destruction_counters->quote_duration_us_max,
                 destruction_quote_duration);
         }
-        mode.plan_authority->plan_before_mutation(
-            rec, capability_before, capability_after);
+        if (inventory_ordinal != 0 && out.observations) {
+            for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+                const auto & candidate =
+                    out.observations->local.candidates[i];
+                for (uint8_t d = 0;
+                     d < candidate.consequence_count; ++d) {
+                    if (candidate.consequences[d].measurable) {
+                        (void) cache_optimizer_observations->
+                            note_safe_measurable_opportunity(
+                                candidate.consequences[d].key,
+                                inventory_ordinal);
+                    }
+                }
+            }
+        }
+        const bool local_mode = params_base.cache_optimizer.mode ==
+                common_cache_optimizer_mode::auto_mode &&
+            params_base.cache_optimizer.local_authority_ceiling !=
+                common_cache_plan_authority_level::off &&
+            cache_optimizer_observations && out.observations;
+        if (local_mode) {
+            if (!mode.preflight) {
+                out.local_authority.emplace();
+            }
+            rec.optimizer.profile_resume_origin =
+                cache_calibration && cache_calibration->profile_persisted_origin()
+                    ? common_cache_optimizer_resume_origin::persisted
+                    : common_cache_optimizer_resume_origin::current_process;
+            const auto now_ms = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            const int32_t legacy_candidate =
+                server_cache_plan_legacy_candidate(
+                    rec, target.id, out.host_lookup_enabled);
+            mode.plan_authority->plan_local_before_mutation(
+                rec, out.observations->local,
+                *cache_optimizer_observations, legacy_candidate,
+                capability_before, capability_after,
+                now_ms < 0 ? 0 : uint64_t(now_ms),
+                server_cache_plan_nonconsuming_host_effects(
+                    params_base.cache_optimizer.cache_lifecycle),
+                out.local_authority ? &*out.local_authority : nullptr);
+        } else {
+            mode.plan_authority->plan_before_mutation(
+                rec, capability_before, capability_after);
+        }
         if (destruction_counters &&
             (mode.preflight || cache_plan_obs != nullptr)) {
             const int32_t legacy_candidate =
@@ -8301,6 +8610,7 @@ private:
                 // which always owns cache_plan_authority.
                 GGML_ASSERT(cache_plan_authority);
                 server_slot * const legacy_ret = ret;
+                server_cache_plan_execution execution;
                 try {
                     cache_plan_inventory_and_plan_before_mutation(
                         task, *legacy_ret, update_cache, *plan_rec,
@@ -8345,13 +8655,16 @@ private:
                         displacement = cache_plan_certify_live_displacement(
                             *planned_ret, *legacy_ret, *plan_rec);
                     }
-                    auto execution = cache_plan_authority->authorize(
+                    execution = cache_plan_authority->authorize(
                         *plan_rec, legacy_ret->id,
                         host_lookup_enabled,
                         planned_adapter_matches,
                         server_cache_plan_nonconsuming_host_effects(
                             params_base.cache_optimizer.cache_lifecycle) |
-                        (displacement.ready ? displacement.effects : 0));
+                        (displacement.ready ? displacement.effects : 0),
+                        stage1_inventory.local_authority
+                            ? std::move(*stage1_inventory.local_authority)
+                            : server_cache_plan_local_authority_latch{});
                     if (execution.authoritative() &&
                         server_cache_plan_retarget_currency_required(
                             selection_admits_retarget, planned_target,
@@ -8359,17 +8672,19 @@ private:
                         !planned_slot_current) {
                         cache_plan_authority->fallback_legacy(
                             *plan_rec,
-                            common_cache_plan_authority_fallback::stale_capability);
+                            common_cache_plan_authority_fallback::stale_capability,
+                            &execution.local_authority);
                         execution.clear();
                     }
                     if (execution.authoritative() &&
                         !cache_plan_execution_revalidate(
                             task, *planned_ret, planned_adapter_matches,
-                            incoming_adapter, execution,
+                            incoming_adapter, execution, plan_rec.get(),
                             displacement.ready)) {
                         cache_plan_authority->fallback_legacy(
                             *plan_rec,
-                            common_cache_plan_authority_fallback::stale_capability);
+                            common_cache_plan_authority_fallback::stale_capability,
+                            &execution.local_authority);
                         execution.clear();
                     }
                     if (execution.authoritative() &&
@@ -8398,7 +8713,8 @@ private:
                             cache_plan_authority->fallback_legacy(
                                 *plan_rec,
                                 common_cache_plan_authority_fallback::
-                                    destruction_authority_required);
+                                    destruction_authority_required,
+                                &execution.local_authority);
                             execution.clear();
                         }
                     }
@@ -8451,9 +8767,13 @@ private:
                                 plan_rec->selection),
                             legacy_ret->id);
                     }
-                    ret->cache_plan_execution = execution;
+                    ret->cache_plan_execution = std::move(execution);
                 } catch (...) {
-                    cache_plan_authority->fail_closed(*plan_rec);
+                    cache_plan_authority->fail_closed(
+                        *plan_rec,
+                        common_cache_plan_authority_fallback::internal_fault,
+                        &execution.local_authority);
+                    execution.clear();
                     ret->cache_plan_execution.clear();
                     if (cache_plan_obs) {
                         cache_plan_obs->shadow_unavailable++;
@@ -8517,6 +8837,18 @@ private:
                             std::hash<std::string>{}(incoming_adapter));
                 }
 
+                // Publication/eviction observations can advance the local
+                // coefficient currency. Every provider kind must revalidate
+                // after that work, not only host restores.
+                if (authority_exec && request_cache_plan &&
+                    !cache_plan_authority->local_currency_current(
+                        *request_cache_plan)) {
+                    cache_plan_fallback_legacy(
+                        *ret,
+                        common_cache_plan_authority_fallback::stale_capability);
+                    authority_exec = false;
+                }
+
                 // save/publish can deduplicate or evict host nodes. Revalidate
                 // the exact source after that mutation and before the required
                 // load. A soft miss is a typed legacy fallback, not a restore
@@ -8528,7 +8860,8 @@ private:
                          server_cache_plan_execution_kind::host_checkpoint_restore) &&
                     !cache_plan_execution_revalidate(
                         task, *ret, incoming_adapter_matches,
-                        incoming_adapter, ret->cache_plan_execution)) {
+                        incoming_adapter, ret->cache_plan_execution,
+                        request_cache_plan)) {
                     cache_plan_fallback_legacy(
                         *ret,
                         common_cache_plan_authority_fallback::stale_capability);

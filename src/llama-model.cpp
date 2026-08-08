@@ -1116,6 +1116,10 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    // Normalized cumulative split points actually used by tensor placement.
+    // Unlike params.tensor_split this also captures the auto free-VRAM split.
+    std::array<float, 128> effective_tensor_split = {};
+    size_t effective_tensor_split_count = 0;
 
     // Duplicated from llama_model_loader before it closes. These descriptors
     // identify the exact objects mapped/read by this model; ZC3a may duplicate
@@ -1399,6 +1403,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
+    }
+    GGML_ASSERT(splits.size() <= pimpl->effective_tensor_split.size());
+    pimpl->effective_tensor_split_count = splits.size();
+    float prior_split = 0.0f;
+    for (size_t i = 0; i < splits.size(); ++i) {
+        pimpl->effective_tensor_split[i] = splits[i] - prior_split;
+        prior_split = splits[i];
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
@@ -1798,6 +1809,11 @@ void llama_model::adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+const float * llama_model::effective_tensor_split(size_t & count) const noexcept {
+    count = pimpl->effective_tensor_split_count;
+    return pimpl->effective_tensor_split.data();
 }
 
 bool llama_model::capture_artifact_descriptors(

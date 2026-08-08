@@ -70,25 +70,12 @@ endif()
 # ZC1 consumes retention_policy at its host/checkpoint adapters, the one
 # save-time lineage resolver, record/preflight serialization, and
 # initialization wiring. ZC2/ZC3 consume observer_store_enabled exactly at
-# loader descriptor capture and observer construction. The authority ceiling
-# remains descriptive until its own ratchet.
-function(assert_no_future_policy_reads text label)
-    string(REGEX MATCHALL
-        "(\\.|->)local_authority_ceiling"
-        future_hits "${text}")
-    if (future_hits)
-        message(FATAL_ERROR
-            "${label}: ZC0b descriptive policy field acquired a production read: ${future_hits}")
-    endif()
-endfunction()
+# loader descriptor capture and observer construction. ZC5a consumes the
+# local authority ceiling at four scoped startup/planning doors in context.
 
 file(GLOB_RECURSE production_cpp
     "${root}/tools/server/*.cpp"
     "${root}/tools/server/*.h")
-foreach(path IN LISTS production_cpp)
-    file(READ "${path}" text)
-    assert_no_future_policy_reads("${text}" "${path}")
-endforeach()
 
 set(all_production "")
 foreach(path IN LISTS production_cpp)
@@ -108,15 +95,20 @@ if (NOT retention_policy_reads EQUAL 6)
     message(FATAL_ERROR
         "ZC1 retention-policy consumer census drifted: ${retention_policy_reads}")
 endif()
+count_literal("${context_cpp}" ".local_authority_ceiling"
+    local_authority_ceiling_reads)
+if (NOT local_authority_ceiling_reads EQUAL 4)
+    message(FATAL_ERROR
+        "ZC5a local-authority ceiling consumer census drifted: ${local_authority_ceiling_reads}")
+endif()
 
-# Negative controls: future member reads remain forbidden, and an extra
-# retention-policy consumer must fail the exact census.
-set(future_mutation "void probe(const auto & effective) { (void) effective.local_authority_ceiling; }")
-string(REGEX MATCHALL
-    "(\\.|->)local_authority_ceiling"
-    future_mutation_hits "${future_mutation}")
-if (NOT future_mutation_hits)
-    message(FATAL_ERROR "future-policy member-read negative control did not trip")
+# Negative controls: an extra authority or retention consumer must fail its
+# exact census.
+set(future_mutation "${context_cpp}\nvoid probe(const auto & effective) { (void) effective.local_authority_ceiling; }")
+count_literal("${future_mutation}" ".local_authority_ceiling"
+    future_mutation_hits)
+if (future_mutation_hits EQUAL 4)
+    message(FATAL_ERROR "authority-policy member-read negative control did not trip")
 endif()
 set(observer_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.observer_store_enabled; }")
 count_literal("${observer_mutation}" ".observer_store_enabled"

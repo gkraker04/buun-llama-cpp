@@ -19,6 +19,9 @@
 #include <utility>
 #include <vector>
 
+bool server_cache_calibration_secure_random(
+    std::array<uint8_t, 32> & out) noexcept;
+
 template <typename T, size_t Capacity, typename Size = uint16_t>
 struct server_cache_calibration_bounded_array {
     static_assert(Capacity <= size_t(std::numeric_limits<Size>::max()));
@@ -248,6 +251,7 @@ struct server_cache_calibration_profile_currency {
         resume_authority_validation_required = {};
     int64_t resume_started_us = 0;
     bool clock_authority_reset = false;
+    bool persisted_origin = false;
 };
 
 // Envelope helpers are public only to the model-free persistence tests. The
@@ -443,6 +447,7 @@ public:
                            [](bool value) { return value; });
     }
     int64_t resume_started_us() const noexcept { return resume_started_us_; }
+    bool profile_persisted_origin() const noexcept;
     void complete_resume_validation(
         uint32_t estimator_slot, bool succeeded) noexcept;
 

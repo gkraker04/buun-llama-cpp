@@ -57,6 +57,8 @@ add_library(${TARGET} STATIC
     server-schema.h
 )
 
+target_compile_definitions(${TARGET} PRIVATE SERVER_CACHE_LOCAL_AUTHORITY=1)
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()

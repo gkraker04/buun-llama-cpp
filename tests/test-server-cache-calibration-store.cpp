@@ -222,7 +222,7 @@ int main() {
     std::vector<uint8_t> encoded;
     CHECK(server_cache_calibration_encode_manifest(manifest, encoded));
     CHECK(sha256_is(encoded,
-        "0b2cdff19d7f99a6598fcea8a264e059ba58dfed63b534c939ed5f351dd8bb11"));
+        "8f0de079c9e01ed52231c6318daa150c8613185350fd9cae27ae08bc744f6378"));
     server_cache_calibration_manifest decoded;
     CHECK(server_cache_calibration_decode_manifest(
         encoded.data(), encoded.size(), decoded));
@@ -304,7 +304,7 @@ int main() {
     CHECK(server_cache_calibration_encode_profile(
         manifest.store_lineage_id, snapshot, encoded));
     CHECK(sha256_is(encoded,
-        "9b287c02d41ea87f9df78143b2fd25365f94b254668d0b747faf86b20d36e121"));
+        "1365bf47203e9872956387eace03f25834179f178fd76d0ba305782490220acb"));
     server_cache_calibration_profile_snapshot decoded_profile;
     CHECK(server_cache_calibration_decode_profile(
         encoded.data(), encoded.size(), manifest.store_lineage_id,
@@ -1243,6 +1243,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     CHECK(coordinator_loaded);
+    CHECK(!coordinator.profile_persisted_origin());
     auto one_row = accepted_record(coordinator_fingerprint);
     CHECK(coordinator_observer.observe(one_row));
     server_cache_execution_fingerprint second_fingerprint =
@@ -1298,6 +1299,7 @@ int main() {
     }
     CHECK(resumed_loaded);
     CHECK(resumed_coordinator.resume_pending());
+    CHECK(resumed_coordinator.profile_persisted_origin());
     CHECK(resumed_coordinator.resume_started_us() > 0);
     CHECK(std::any_of(resumed_observer.instances().begin(),
                       resumed_observer.instances().end(),
@@ -1318,6 +1320,7 @@ int main() {
                               resumed_observer.instances().begin()),
         true);
     CHECK(!resumed_coordinator.resume_pending());
+    CHECK(resumed_coordinator.profile_persisted_origin());
     resumed_coordinator.lifecycle(resumed_observer);
     CHECK(resumed_coordinator.health() ==
           server_cache_calibration_writer_health::healthy);

@@ -157,6 +157,14 @@ public:
         uint32_t effective_n_gpu_layers,
         uint16_t pipeline_mode,
         uint16_t allocator_vmm_regime) noexcept;
+    bool configure(
+        const common_params & params,
+        const float * effective_tensor_split,
+        size_t effective_tensor_split_count,
+        const common_cache_plan_vbr_regime & vbr,
+        uint32_t effective_n_gpu_layers,
+        uint16_t pipeline_mode,
+        uint16_t allocator_vmm_regime) noexcept;
     bool add_descriptor(server_cache_fingerprint_descriptor value) noexcept;
     bool add_fixed_artifact(server_cache_fingerprint_artifact value) noexcept;
     bool launch() noexcept;
@@ -165,6 +173,10 @@ public:
     }
     bool poll(server_cache_execution_fingerprint & out) noexcept;
     void stop() noexcept;
+    bool configured_exact() const noexcept { return config_exact_; }
+    uint32_t configured_inexact_fields() const noexcept {
+        return config_inexact_fields_;
+    }
 
 private:
     static constexpr size_t arena_region_bytes = 1024 * 1024;
@@ -193,5 +205,6 @@ private:
     std::array<uint8_t, 32> config_root_ = {};
     bool config_ready_ = false;
     bool config_exact_ = false;
+    uint32_t config_inexact_fields_ = 0;
     alignas(64) std::array<uint8_t, hash_buffer_bytes> hash_buffer_;
 };

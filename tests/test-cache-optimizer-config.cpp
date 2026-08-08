@@ -116,12 +116,15 @@ static void test_nonoff_modes() {
         out = common_cache_optimizer_resolve(raw);
         CHECK(out.error == common_cache_optimizer_config_error::none);
         CHECK(out.landed_authority_level == common_cache_plan_authority_level::off);
-        CHECK(out.local_authority_ceiling == raw.cache_plan_authority);
+        CHECK(out.local_authority_ceiling ==
+              (raw.cache_plan_authority == common_cache_plan_authority_level::off
+                  ? common_cache_plan_authority_level::off
+                  : common_cache_plan_authority_level::by_id));
     }
     raw.cache_plan_authority_explicit = false;
     raw.cache_plan_authority = common_cache_plan_authority_level::lru;
     out = common_cache_optimizer_resolve(raw);
-    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::off);
+    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::by_id);
 }
 
 static std::vector<char *> argv_for(std::vector<std::string> & args) {
@@ -158,7 +161,7 @@ static void test_parser_explicitness() {
     CHECK(params.cache_optimizer.landed_authority_level ==
           common_cache_plan_authority_level::off);
     CHECK(params.cache_optimizer.local_authority_ceiling ==
-          common_cache_plan_authority_level::similarity);
+          common_cache_plan_authority_level::by_id);
 
     std::vector<std::string> absent_args { "test-cache-optimizer-config" };
     auto absent_argv = argv_for(absent_args);

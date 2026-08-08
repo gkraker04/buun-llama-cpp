@@ -21,6 +21,29 @@ constexpr double DRIFT_FALSE_ALARM_SYSTEM = 1e-3;
 constexpr double VALIDATION_TAU = 1e-3;
 constexpr double LOG_WEALTH_LIMIT = 1e6;
 constexpr double CONDITION_LIMIT = 1e8;
+// ZC5's provisional authority is intentionally an operational envelope, not
+// a second claim that the worst-case self-normalized interval has converged.
+// The latter remains attached to every prediction as diagnostic currency.
+// Authority additionally requires the active-state floor of four held-out
+// validations, then covers
+// three times the largest absolute pre-update held-out residual among the
+// four to eight most recent validations, with a 1%/500-us noise floor. A spike
+// therefore tightens nothing; it immediately widens the next decisions, while
+// the existing tail latch, validation e-process, freshness and drift terminal
+// remain the fail-closed outer boundary.
+constexpr uint64_t PROVISIONAL_AUTHORITY_VALIDATION_FLOOR = 4;
+constexpr uint64_t PROVISIONAL_AUTHORITY_RESIDUAL_FLOOR = 4;
+constexpr double PROVISIONAL_AUTHORITY_ENVELOPE_MULTIPLIER = 3.0;
+constexpr double PROVISIONAL_AUTHORITY_RELATIVE_FLOOR = 0.01;
+constexpr double PROVISIONAL_AUTHORITY_ABSOLUTE_FLOOR_US = 500.0;
+// Opportunity aging complements, rather than replaces, the ten-minute wall
+// clock fence below.  The former 256-row window expired before a dormant
+// counterfactual could complete fingerprinting plus restart validation on a
+// high-throughput live server.  Keep the counter bounded, but large enough for
+// that background convergence path to finish.
+constexpr uint64_t PROVISIONAL_AUTHORITY_OPPORTUNITY_LIMIT = 4096;
+constexpr uint64_t PROVISIONAL_AUTHORITY_WALL_CLOCK_LIMIT_MS =
+    24ULL * 60 * 60 * 1000;
 constexpr std::array<double, 3> VALIDATION_LAMBDAS = {
     1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0,
 };
@@ -165,6 +188,37 @@ double dot(const std::array<double, 4> & lhs,
     double out = 0.0;
     for (uint8_t i = 0; i < dim; ++i) out += lhs[i] * rhs[i];
     return out;
+}
+
+bool provisional_authority_radius(
+        const server_cache_observation_instance & instance,
+        double predicted_magnitude,
+        double absolute_scalar,
+        double & out) noexcept {
+    out = 0.0;
+    if (!(predicted_magnitude >= 0.0) || !std::isfinite(predicted_magnitude) ||
+        !(absolute_scalar > 0.0) || !std::isfinite(absolute_scalar) ||
+        instance.n_validation < PROVISIONAL_AUTHORITY_VALIDATION_FLOOR ||
+        instance.reservoir_seen < PROVISIONAL_AUTHORITY_RESIDUAL_FLOOR) {
+        return false;
+    }
+    const uint64_t ymax = server_cache_observation_response_cap_us(
+        instance.key.operation, instance.key.size_family);
+    double maximum_residual = 0.0;
+    const size_t residual_count = size_t(std::min<uint64_t>(
+        instance.reservoir_seen, instance.residual_capacity));
+    for (size_t i = 0; i < residual_count; ++i) {
+        const uint64_t sample = instance.response_reservoir[i];
+        if (sample > ymax) return false;
+        maximum_residual = std::max(
+            maximum_residual, double(sample) * absolute_scalar);
+    }
+    const double floor = std::max(
+        PROVISIONAL_AUTHORITY_ABSOLUTE_FLOOR_US * absolute_scalar,
+        PROVISIONAL_AUTHORITY_RELATIVE_FLOOR * predicted_magnitude);
+    out = PROVISIONAL_AUTHORITY_ENVELOPE_MULTIPLIER *
+        std::max(maximum_residual, floor);
+    return std::isfinite(out);
 }
 
 double logsumexp6(const std::array<double, 6> & values) {
@@ -384,19 +438,17 @@ bool server_cache_calibration_apply_shape_digest_v1(
         actions.data(), count, out);
 }
 
-bool server_cache_calibration_predict(
+namespace {
+
+bool predict_point_solved(
         const server_cache_observation_instance & instance,
-        const server_cache_calibration_claim_identity & claim,
         const std::array<double, 4> & feature,
-        server_cache_calibration_prediction & out) noexcept {
+        server_cache_calibration_prediction & out,
+        factorization & solved) noexcept {
     out = {};
     const uint8_t dim = instance.key.feature_dim;
     const uint64_t floor = dim == 1 ? 4 : uint64_t(dim) + 1;
-    if (!instance.used || instance.authority_terminal !=
-            server_cache_calibration_authority_terminal::none ||
-        instance.estimator_slot == UINT32_MAX ||
-        claim.estimator_slot != instance.estimator_slot ||
-        claim.fit_generation != instance.fit_generation ||
+    if (!instance.used || instance.estimator_slot == UINT32_MAX ||
         instance.n_success < floor) {
         out.status = server_cache_calibration_prediction_status::learning;
         return false;
@@ -405,11 +457,67 @@ bool server_cache_calibration_predict(
         out.status = server_cache_calibration_prediction_status::out_of_coverage;
         return false;
     }
-    factorization solved;
     if (!factor(instance, solved)) {
         out.status = server_cache_calibration_prediction_status::numeric_fault;
         return false;
     }
+    const double ymax = double(server_cache_observation_response_cap_us(
+        instance.key.operation, instance.key.size_family));
+    const double point = dot(feature, solved.theta, dim);
+    if (!(ymax > 0.0) || !std::isfinite(point) || point < 0.0 ||
+        point > ymax) {
+        out.status = server_cache_calibration_prediction_status::numeric_fault;
+        return false;
+    }
+    out.status = server_cache_calibration_prediction_status::ok;
+    out.point_us = point;
+    out.lower_us = point;
+    out.upper_us = point;
+    out.condition_number = solved.condition;
+    out.log_determinant = solved.log_det;
+    return true;
+}
+
+} // namespace
+
+bool server_cache_calibration_predict_point(
+        const server_cache_observation_instance & instance,
+        const std::array<double, 4> & feature,
+        server_cache_calibration_prediction & out) noexcept {
+    factorization solved;
+    return predict_point_solved(instance, feature, out, solved);
+}
+
+bool server_cache_calibration_predict(
+        const server_cache_observation_instance & instance,
+        const server_cache_calibration_claim_identity & claim,
+        const std::array<double, 4> & feature,
+        server_cache_calibration_prediction & out) noexcept {
+    factorization solved;
+    if (!predict_point_solved(instance, feature, out, solved)) {
+        return false;
+    }
+    if (instance.authority_terminal !=
+            server_cache_calibration_authority_terminal::none ||
+        claim.estimator_slot != instance.estimator_slot ||
+        claim.fit_generation != instance.fit_generation) {
+        const double point = out.point_us;
+        out.status = instance.authority_terminal ==
+                server_cache_calibration_authority_terminal::tail_exceeded
+            ? server_cache_calibration_prediction_status::out_of_coverage
+            : instance.authority_terminal ==
+                    server_cache_calibration_authority_terminal::numeric_fault
+                ? server_cache_calibration_prediction_status::numeric_fault
+                : instance.authority_terminal ==
+                        server_cache_calibration_authority_terminal::confidence_budget_exhausted ||
+                      instance.authority_terminal ==
+                        server_cache_calibration_authority_terminal::ordinal_exhausted
+                    ? server_cache_calibration_prediction_status::confidence_budget_exhausted
+                    : server_cache_calibration_prediction_status::learning;
+        out.point_us = point;
+        return false;
+    }
+    const uint8_t dim = instance.key.feature_dim;
     double log_delta = 0.0;
     if (!log_budget(CONFIDENCE_ERROR_SYSTEM, claim, log_delta)) {
         out.status = server_cache_calibration_prediction_status::confidence_budget_exhausted;
@@ -424,13 +532,12 @@ bool server_cache_calibration_predict(
     const double leverage = dot(feature, inverse_feature, dim);
     const double ymax = double(server_cache_observation_response_cap_us(
         instance.key.operation, instance.key.size_family));
-    const double point = dot(feature, solved.theta, dim);
+    const double point = out.point_us;
     const double r = ymax / 2.0;
     const double s = ymax * std::sqrt(double(dim));
     const double beta_argument = solved.log_det - 2.0 * log_delta;
     if (!(leverage >= 0.0) || !std::isfinite(leverage) ||
-        !(ymax > 0.0) || !std::isfinite(point) || point < 0.0 ||
-        point > ymax || beta_argument < 0.0 || !std::isfinite(beta_argument)) {
+        beta_argument < 0.0 || !std::isfinite(beta_argument)) {
         out.status = server_cache_calibration_prediction_status::numeric_fault;
         return false;
     }
@@ -441,7 +548,6 @@ bool server_cache_calibration_predict(
         return false;
     }
     out.status = server_cache_calibration_prediction_status::ok;
-    out.point_us = point;
     out.radius_us = radius;
     out.lower_us = std::max(0.0, point - radius);
     out.upper_us = std::min(ymax, point + radius);
@@ -496,12 +602,14 @@ server_cache_calibration_instance_state server_cache_calibration_state(
     const double log_e = logsumexp6(instance.log_wealth) - std::log(6.0);
     const bool clock_fresh = instance.last_validation_unix_ms != 0 &&
         now_unix_ms >= instance.last_validation_unix_ms &&
-        now_unix_ms - instance.last_validation_unix_ms <= 10 * 60 * 1000;
+        now_unix_ms - instance.last_validation_unix_ms <=
+            PROVISIONAL_AUTHORITY_WALL_CLOCK_LIMIT_MS;
     const bool opportunity_fresh =
         instance.safe_measurable_opportunities >=
             instance.opportunity_at_last_validation &&
         instance.safe_measurable_opportunities -
-            instance.opportunity_at_last_validation < 256;
+            instance.opportunity_at_last_validation <
+                PROVISIONAL_AUTHORITY_OPPORTUNITY_LIMIT;
     const bool active = authority_admission_allowed &&
         instance.key.identity_exact &&
         instance.n_success >= fit_floor &&
@@ -527,6 +635,7 @@ bool server_cache_calibration_bound_direct_difference(
         const server_cache_observation_instance * instance = nullptr;
         server_cache_calibration_claim_identity claim;
         std::array<double, 4> delta = {};
+        double absolute_scalar = 0.0;
     };
     std::array<group, 32> groups = {};
     size_t group_count = 0;
@@ -540,18 +649,40 @@ bool server_cache_calibration_bound_direct_difference(
             return false;
         }
         if (term.claim.fit_generation != term.instance->fit_generation ||
-            term.claim.estimator_slot != term.instance->estimator_slot ||
+            term.claim.estimator_slot != term.instance->estimator_slot) {
+            out.status = server_cache_calibration_prediction_status::numeric_fault;
+            return false;
+        }
+        if (term.instance->authority_terminal !=
+                server_cache_calibration_authority_terminal::none) {
+            switch (term.instance->authority_terminal) {
+                case server_cache_calibration_authority_terminal::tail_exceeded:
+                    out.status = server_cache_calibration_prediction_status::out_of_coverage;
+                    break;
+                case server_cache_calibration_authority_terminal::confidence_budget_exhausted:
+                case server_cache_calibration_authority_terminal::ordinal_exhausted:
+                    out.status = server_cache_calibration_prediction_status::
+                        confidence_budget_exhausted;
+                    break;
+                case server_cache_calibration_authority_terminal::numeric_fault:
+                    out.status = server_cache_calibration_prediction_status::numeric_fault;
+                    break;
+                case server_cache_calibration_authority_terminal::drifted:
+                    out.status = server_cache_calibration_prediction_status::learning;
+                    break;
+                case server_cache_calibration_authority_terminal::none:
+                case server_cache_calibration_authority_terminal::_count:
+                    out.status = server_cache_calibration_prediction_status::numeric_fault;
+                    break;
+            }
+            return false;
+        }
+        if (
             server_cache_calibration_state(
                 *term.instance, term.claim, term.feature, term.now_unix_ms,
                 nullptr, term.authority_admission_allowed) !=
                     server_cache_calibration_instance_state::active) {
             out.status = server_cache_calibration_prediction_status::learning;
-            return false;
-        }
-        server_cache_calibration_prediction available;
-        if (!server_cache_calibration_predict(
-                *term.instance, term.claim, term.feature, available)) {
-            out.status = available.status;
             return false;
         }
         size_t group_index = group_count;
@@ -582,6 +713,12 @@ bool server_cache_calibration_bound_direct_difference(
                 server_cache_calibration_contribution_side::baseline
             ? 1.0 : -1.0;
         const double scalar = sign * double(term.weight_milli) / 1000.0;
+        groups[group_index].absolute_scalar += std::fabs(scalar);
+        if (!std::isfinite(groups[group_index].absolute_scalar)) {
+            out.status =
+                server_cache_calibration_prediction_status::numeric_fault;
+            return false;
+        }
         for (uint8_t d = 0; d < term.instance->key.feature_dim; ++d) {
             groups[group_index].delta[d] += scalar * term.feature[d];
             if (!std::isfinite(groups[group_index].delta[d])) {
@@ -598,41 +735,23 @@ bool server_cache_calibration_bound_direct_difference(
         const auto & item = groups[i];
         const uint8_t dim = item.instance->key.feature_dim;
         factorization solved;
-        double log_delta = 0.0;
         if (!factor(*item.instance, solved)) {
             out.status =
                 server_cache_calibration_prediction_status::numeric_fault;
             return false;
         }
-        if (!log_budget(CONFIDENCE_ERROR_SYSTEM, item.claim, log_delta)) {
-            out.status = server_cache_calibration_prediction_status::
-                confidence_budget_exhausted;
-            return false;
-        }
-        std::array<double, 4> inverse_delta = {};
-        for (uint8_t row = 0; row < dim; ++row) {
-            for (uint8_t column = 0; column < dim; ++column) {
-                inverse_delta[row] +=
-                    solved.inverse[row][column] * item.delta[column];
-            }
-        }
-        double leverage = dot(item.delta, inverse_delta, dim);
-        if (leverage < 0.0 && leverage > -1e-12) leverage = 0.0;
-        const double ymax = double(server_cache_observation_response_cap_us(
-            item.instance->key.operation, item.instance->key.size_family));
-        const double beta_argument = solved.log_det - 2.0 * log_delta;
-        if (beta_argument < 0.0 || !std::isfinite(beta_argument) ||
-            !(ymax > 0.0)) {
-            out.status =
-                server_cache_calibration_prediction_status::numeric_fault;
-            return false;
-        }
-        const double beta = ymax / 2.0 * std::sqrt(beta_argument) +
-                            ymax * std::sqrt(double(dim));
         const double item_benefit = dot(item.delta, solved.theta, dim);
-        const double item_radius = beta * std::sqrt(leverage);
-        if (!(leverage >= 0.0) ||
-            !std::isfinite(item_benefit) || !std::isfinite(item_radius) ||
+        const bool cancels = std::all_of(
+            item.delta.begin(), item.delta.begin() + dim,
+            [](double value) { return value == 0.0; });
+        double item_radius = 0.0;
+        if (!cancels && !provisional_authority_radius(
+                *item.instance, std::fabs(item_benefit),
+                item.absolute_scalar, item_radius)) {
+            out.status = server_cache_calibration_prediction_status::learning;
+            return false;
+        }
+        if (!std::isfinite(item_benefit) || !std::isfinite(item_radius) ||
             radius > std::numeric_limits<double>::max() - item_radius) {
             out.status =
                 server_cache_calibration_prediction_status::numeric_fault;
@@ -651,6 +770,116 @@ bool server_cache_calibration_bound_direct_difference(
     out.radius_us = radius;
     out.benefit_lower_us = benefit - radius;
     return std::isfinite(out.benefit_lower_us);
+}
+
+bool server_cache_calibration_capture_snapshot(
+        const server_cache_observation_store & store,
+        uint64_t now_unix_ms,
+        server_cache_calibration_authority_snapshot & out) noexcept {
+    out = {};
+    const auto & fingerprint = store.execution_fingerprint();
+    const uint64_t serial = store.authority_currency_serial();
+    if (!fingerprint.complete || !fingerprint.exact || serial == 0 ||
+        serial == UINT64_MAX) {
+        return false;
+    }
+    out.store = &store;
+    out.authority_currency_serial = serial;
+    out.now_unix_ms = now_unix_ms;
+    out.available = true;
+    return true;
+}
+
+bool server_cache_calibration_snapshot_current(
+        const server_cache_calibration_authority_snapshot & snapshot) noexcept {
+    return snapshot.available && snapshot.store &&
+        snapshot.authority_currency_serial != 0 &&
+        snapshot.authority_currency_serial != UINT64_MAX &&
+        snapshot.store->authority_currency_serial() ==
+            snapshot.authority_currency_serial &&
+        snapshot.store->execution_fingerprint().complete &&
+        snapshot.store->execution_fingerprint().exact;
+}
+
+bool server_cache_calibration_snapshot_lookup_exact(
+        const server_cache_calibration_authority_snapshot & snapshot,
+        const server_cache_observation_key & key,
+        const std::array<double, 4> & feature,
+        server_cache_calibration_snapshot_lookup & out) noexcept {
+    out = {};
+    if (!server_cache_calibration_snapshot_current(snapshot) ||
+        !key.identity_complete || !key.identity_exact) {
+        out.prediction.status =
+            server_cache_calibration_prediction_status::out_of_coverage;
+        return false;
+    }
+    const auto & instances = snapshot.store->instances();
+    for (uint32_t slot = 0; slot < instances.size(); ++slot) {
+        const auto & instance = instances[slot];
+        if (!instance.used || !(instance.key == key)) continue;
+        out.instance = &instance;
+        if (!snapshot.store->calibration_claim(slot, out.claim)) {
+            out.state = server_cache_calibration_instance_state::quarantined;
+            out.prediction.status =
+                server_cache_calibration_prediction_status::numeric_fault;
+            return false;
+        }
+        out.state = server_cache_calibration_state(
+            instance, out.claim, feature, snapshot.now_unix_ms,
+            &out.prediction,
+            snapshot.store->authority_admission_allowed(slot));
+        server_cache_calibration_prediction point;
+        out.point_available = out.prediction.status ==
+            server_cache_calibration_prediction_status::ok;
+        if (!out.point_available &&
+            instance.authority_terminal !=
+                server_cache_calibration_authority_terminal::numeric_fault &&
+            server_cache_calibration_predict_point(instance, feature, point)) {
+            const auto status = out.prediction.status;
+            out.prediction.point_us = point.point_us;
+            out.prediction.condition_number = point.condition_number;
+            out.prediction.log_determinant = point.log_determinant;
+            out.prediction.status = status;
+            out.point_available = true;
+        }
+        return true;
+    }
+    out.prediction.status =
+        server_cache_calibration_prediction_status::learning;
+    return false;
+}
+
+bool server_cache_calibration_instance_key_digest_v1(
+        const server_cache_observation_key & key,
+        std::array<uint8_t, 32> & out) noexcept {
+    out = {};
+    if (!server_cache_observation_key_valid(key)) return false;
+    static constexpr char domain[] = "buun-zc-instance-key-v1";
+    llama_sha256 hash;
+    hash.update(domain, sizeof(domain));
+    const uint8_t enums[] = {
+        uint8_t(key.operation), uint8_t(key.provider), key.restore_kind,
+        key.prepare_shape, key.contention_bucket, key.start_bucket,
+        key.batch_bucket, key.ubatch_bucket, key.size_family,
+        key.feature_dim, uint8_t(key.model_kind),
+        key.target_draft_spec_composition,
+        uint8_t(key.adapter_application_complete),
+        uint8_t(key.identity_complete), uint8_t(key.identity_exact),
+    };
+    hash.update(enums, sizeof(enums));
+    uint8_t extent[8];
+    llama_store_le_u64(extent, key.operation_extent_bytes);
+    hash.update(extent, sizeof(extent));
+    for (const auto * digest : {
+             &key.profile_execution_digest,
+             &key.participant_execution_digest,
+             &key.adapter_application_digest,
+             &key.representation_digest,
+             &key.effect_action_shape_digest }) {
+        hash.update(digest->data(), digest->size());
+    }
+    out = hash.finish();
+    return true;
 }
 
 bool server_cache_calibration_validation_assignment(
@@ -750,6 +979,15 @@ bool server_cache_calibration_complete(
                 server_cache_calibration_authority_terminal::numeric_fault;
             return false;
         }
+        const double absolute_residual = std::fabs(
+            double(record.capped_service_us) -
+            assignment.validation_prediction.point_us);
+        if (!std::isfinite(absolute_residual) || absolute_residual > ymax) {
+            instance.authority_terminal =
+                server_cache_calibration_authority_terminal::numeric_fault;
+            return false;
+        }
+        const uint64_t residual_us = uint64_t(std::ceil(absolute_residual));
         auto next_wealth = next.log_wealth;
         for (size_t lambda_i = 0; lambda_i < VALIDATION_LAMBDAS.size(); ++lambda_i) {
             for (size_t sign_i = 0; sign_i < 2; ++sign_i) {
@@ -774,6 +1012,9 @@ bool server_cache_calibration_complete(
         next.opportunity_at_last_validation =
             next.safe_measurable_opportunities;
         next.last_validation_unix_ms = context.unix_ms;
+        next.response_reservoir[
+            next.reservoir_seen % next.residual_capacity] = residual_us;
+        if (next.reservoir_seen != UINT64_MAX) ++next.reservoir_seen;
         out.validation_changed = true;
 
         double log_alpha = 0.0;
@@ -813,10 +1054,6 @@ bool server_cache_calibration_complete(
         out.moments_changed = true;
     }
 
-    next.response_reservoir[
-        next.reservoir_seen % next.residual_capacity] =
-        record.capped_service_us;
-    if (next.reservoir_seen != UINT64_MAX) ++next.reservoir_seen;
     if (record.tail_exceeded) {
         next.tail_exceeded = true;
         next.tail_actual_max_us = std::max(

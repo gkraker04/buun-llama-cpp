@@ -1,4 +1,5 @@
 #include "server-cache-calibration-store.h"
+#include "server-cache-calibration-model.h"
 
 #include "../../src/llama-sha256.h"
 #include "server-common.h"
@@ -215,7 +216,6 @@ private:
 };
 
 constexpr uint32_t STORE_SCHEMA = 1;
-constexpr uint32_t ESTIMATOR_VERSION = 2;
 constexpr size_t ROOT_PAYLOAD_LIMIT = 64 * 1024;
 constexpr size_t PROFILE_PAYLOAD_LIMIT = 1024 * 1024;
 constexpr size_t MAX_PROFILES = 16;
@@ -794,7 +794,8 @@ bool decode_envelope(const uint8_t * data, size_t size, size_t limit,
         return !refused && !stream_refused && object_keys.empty() && out.is_object() &&
             out.value("object", "") == expected_object &&
             out.value("schema_version", 0u) == STORE_SCHEMA &&
-            out.value("estimator_version", 0u) == ESTIMATOR_VERSION;
+            out.value("estimator_version", 0u) ==
+                SERVER_CACHE_CALIBRATION_ESTIMATOR_VERSION;
     } catch (...) {
         return false;
     }
@@ -814,7 +815,7 @@ codec_json manifest_json(const server_cache_calibration_manifest & value) {
     return {
         { "object", "cache_calibration_store" },
         { "schema_version", STORE_SCHEMA },
-        { "estimator_version", ESTIMATOR_VERSION },
+        { "estimator_version", SERVER_CACHE_CALIBRATION_ESTIMATOR_VERSION },
         { "store_lineage_id", hex_digest(value.store_lineage_id) },
         { "next_boot_claim_ordinal", value.next_boot_claim_ordinal },
         { "next_profile_generation_ordinal", value.next_profile_generation_ordinal },
@@ -849,7 +850,9 @@ bool encode_profile_streamed(
     out.insert(out.end(), MAGIC, MAGIC + 8);
     append_u32(out, STORE_SCHEMA);
     append_u32(out, 0);
-    append_text(out, "{\"object\":\"cache_calibration_profile\",\"schema_version\":1,\"estimator_version\":2,\"store_lineage_id\":\"");
+    append_text(out, "{\"object\":\"cache_calibration_profile\",\"schema_version\":1,\"estimator_version\":");
+    append_unsigned(out, SERVER_CACHE_CALIBRATION_ESTIMATOR_VERSION);
+    append_text(out, ",\"store_lineage_id\":\"");
     const codec_string lineage_hex = hex_digest(lineage);
     out.insert(out.end(), lineage_hex.begin(), lineage_hex.end());
     append_text(out, "\",\"profile_generation_ordinal\":");
@@ -1347,6 +1350,11 @@ bool profile_nonregressed(
 }
 
 } // namespace
+
+bool server_cache_calibration_secure_random(
+        std::array<uint8_t, 32> & out) noexcept {
+    return random_lineage(out);
+}
 
 bool server_cache_calibration_validate_profile(
         const server_cache_calibration_profile_snapshot & value,
@@ -2495,6 +2503,7 @@ bool server_cache_calibration_coordinator::cache_snapshot(
     replacement.profile_identity_digest = value.profile_identity_digest;
     replacement.profile_state_rank = profile_reuse_state_rank(value);
     replacement.clock_authority_reset = value.clock_authority_reset;
+    replacement.persisted_origin = value.persisted_seed;
     if (!profile_currencies_.push_back(replacement)) return false;
     cached_dirty_ = has_cached_dirty();
     return true;
@@ -2554,6 +2563,7 @@ bool server_cache_calibration_coordinator::resolve_load(
         }
         value.resume_started_us = ggml_time_us();
         value.clock_authority_reset = profile.clock_authority_reset;
+        value.persisted_origin = true;
         return profile_currencies_.push_back(value);
     };
     if (load_resolved_) {
@@ -2664,6 +2674,16 @@ void server_cache_calibration_coordinator::note_profile_use() noexcept {
         return;
     }
     currency->profile_last_use_epoch = ++profile_last_use_epoch_;
+}
+
+bool server_cache_calibration_coordinator::profile_persisted_origin() const noexcept {
+    const auto currency = std::find_if(
+        profile_currencies_.begin(), profile_currencies_.end(),
+        [&](const auto & value) {
+            return value.profile_identity_digest == profile_identity_digest_;
+        });
+    return currency != profile_currencies_.end() &&
+        currency->persisted_origin;
 }
 
 void server_cache_calibration_coordinator::apply_claim_identity(

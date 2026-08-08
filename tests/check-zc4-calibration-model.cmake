@@ -24,6 +24,9 @@ foreach(REQUIRED IN ITEMS
         "CONFIDENCE_ERROR_SYSTEM = 1e-3"
         "DRIFT_FALSE_ALARM_SYSTEM = 1e-3"
         "CONDITION_LIMIT = 1e8"
+        "PROVISIONAL_AUTHORITY_OPPORTUNITY_LIMIT = 4096"
+        "PROVISIONAL_AUTHORITY_WALL_CLOCK_LIMIT_MS ="
+        "24ULL * 60 * 60 * 1000"
         "server_cache_calibration_validation_assignment("
         "qualified_execution_ordinal % 8 == mixed % 8"
         "record.capped_service_us"
@@ -229,7 +232,7 @@ function(zc4_validate_opportunity_hook TEXT OUT)
         return()
     endif()
     foreach(REQUIRED IN ITEMS
-            "if (!mode.preflight && cache_optimizer_observations)"
+            "if (!mode.preflight && cache_optimizer_observations &&"
             "out.observations.emplace()"
             "out.observations ? &*out.observations : nullptr"
             "note_safe_measurable_opportunity("
@@ -242,7 +245,9 @@ function(zc4_validate_opportunity_hook TEXT OUT)
     endforeach()
     count_literal("${OPPORTUNITY_REGION}"
         "note_safe_measurable_opportunity(" OPPORTUNITY_USE_COUNT)
-    if (NOT OPPORTUNITY_USE_COUNT EQUAL 1)
+    # One pass ages provider operations; the post-quote pass ages D-owned
+    # preparation/apply/recovery terms discovered by the lifecycle quote.
+    if (NOT OPPORTUNITY_USE_COUNT EQUAL 2)
         set(${OUT} FALSE PARENT_SCOPE)
         return()
     endif()
@@ -259,6 +264,36 @@ foreach(REQUIRED IN ITEMS
     contract_require_token("${CONTEXT_CPP}" "${REQUIRED}"
         "ZC4 measurable multi-submission opportunity geometry")
 endforeach()
+
+function(zc4_validate_fully_covered_restore TEXT OUT)
+    contract_extract_region("${TEXT}"
+        "void cache_plan_observation_candidate("
+        "bool cache_plan_inventory_live_rows("
+        RESTORE_REGION RESTORE_REGION_FOUND)
+    if (NOT RESTORE_REGION_FOUND)
+        set(${OUT} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    foreach(REQUIRED IN ITEMS
+            "lcp_tokens > task.tokens.size()"
+            "replay_tokens == 0 && key.operation !="
+            "server_cache_observation_operation::restore"
+            "std::max<uint64_t>("
+            "1, std::min<uint64_t>(")
+        string(FIND "${RESTORE_REGION}" "${REQUIRED}" FOUND)
+        if (FOUND EQUAL -1)
+            set(${OUT} FALSE PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${OUT} TRUE PARENT_SCOPE)
+endfunction()
+zc4_validate_fully_covered_restore(
+    "${CONTEXT_CPP}" FULLY_COVERED_RESTORE_VALID)
+if (NOT FULLY_COVERED_RESTORE_VALID)
+    message(FATAL_ERROR
+        "ZC4 fully-covered restore observation geometry drifted")
+endif()
 
 function(zc4_validate_profile_use_hook CONTEXT STORE OUT)
     contract_extract_region("${CONTEXT}"
@@ -339,10 +374,17 @@ foreach(REQUIRED IN ITEMS
         "server_cache_calibration_abandon("
         "server_cache_calibration_state("
         "context.force_validation = resume_validation_pending_[instance_slot]"
+        "!resume_validation_pending_[instance_slot]"
         "principal_cell->fit_rows < 4")
     contract_require_token("${OBSERVER_CPP}" "${REQUIRED}"
         "ZC4 observer-to-estimator join")
 endforeach()
+contract_find_forbidden("${OBSERVER_CPP}" RESUME_GLOBAL_BLOCK
+    "any_resume_pending")
+if (RESUME_GLOBAL_BLOCK)
+    message(FATAL_ERROR
+        "ZC4 dormant restored classes must not globally block fit admission")
+endif()
 
 foreach(REQUIRED IN ITEMS
         "construct<server_cache_observation_store>"
@@ -400,7 +442,11 @@ file(GLOB SERVER_CPP "${SOURCE_ROOT}/tools/server/*.cpp")
 set(NON_SHADOW_MODEL_READERS "")
 foreach(PATH IN LISTS SERVER_CPP)
     if (PATH MATCHES "server-cache-calibration-model\\.cpp$" OR
-        PATH MATCHES "server-cache-observer\\.cpp$")
+        PATH MATCHES "server-cache-observer\\.cpp$" OR
+        # ZC5's single authority adapter is the only production consumer of
+        # the immutable ZC4 model view. The separate ZC5 contract scan pins
+        # its exact read/currency/certification doors.
+        PATH MATCHES "server-cache-plan-authority\\.cpp$")
         continue()
     endif()
     file(READ "${PATH}" TEXT)
@@ -548,7 +594,7 @@ if (MUTATED_OPPORTUNITY_VALID)
 endif()
 
 set(MUTATED_OBSERVATION_DOOR "${CONTEXT_CPP}")
-string(REPLACE "if (!mode.preflight && cache_optimizer_observations)"
+string(REPLACE "if (!mode.preflight && cache_optimizer_observations &&"
     "if (!mode.preflight)" MUTATED_OBSERVATION_DOOR
     "${MUTATED_OBSERVATION_DOOR}")
 zc4_validate_opportunity_hook("${MUTATED_OBSERVATION_DOOR}"
@@ -565,6 +611,18 @@ zc4_no_obsolete_opportunity_cutoff(
 if (MUTATED_NO_OLD_CUTOFF)
     message(FATAL_ERROR
         "ZC4 obsolete opportunity-cutoff negative control did not trip")
+endif()
+
+set(MUTATED_FULLY_COVERED_RESTORE "${CONTEXT_CPP}")
+string(REPLACE "lcp_tokens > task.tokens.size()"
+    "lcp_tokens >= task.tokens.size()" MUTATED_FULLY_COVERED_RESTORE
+    "${MUTATED_FULLY_COVERED_RESTORE}")
+zc4_validate_fully_covered_restore(
+    "${MUTATED_FULLY_COVERED_RESTORE}"
+    MUTATED_FULLY_COVERED_RESTORE_VALID)
+if (MUTATED_FULLY_COVERED_RESTORE_VALID)
+    message(FATAL_ERROR
+        "ZC4 fully-covered restore negative control did not trip")
 endif()
 
 set(MUTATED_PROFILE_USE "${CONTEXT_CPP}")

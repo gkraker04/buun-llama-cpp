@@ -14,13 +14,9 @@
 // persistence owners.  All inputs are fixed before the observed response is
 // inspected, and every routine is allocation-free and noexcept.
 
-struct server_cache_calibration_claim_identity {
-    bool available = false;
-    uint64_t boot_claim_ordinal = 0;
-    uint64_t profile_generation_ordinal = 0;
-    uint32_t estimator_slot = 0;
-    uint64_t fit_generation = 0;
-};
+inline constexpr uint32_t SERVER_CACHE_CALIBRATION_ESTIMATOR_VERSION = 3;
+inline constexpr char SERVER_CACHE_CALIBRATION_ESTIMATOR_ABI_PREFIX[] =
+    "zc-estimator-v3|";
 
 enum class server_cache_calibration_prediction_status : uint8_t {
     ok = 0,
@@ -55,6 +51,10 @@ const char * server_cache_calibration_instance_state_name(
 bool server_cache_calibration_predict(
     const server_cache_observation_instance & instance,
     const server_cache_calibration_claim_identity & claim,
+    const std::array<double, 4> & feature,
+    server_cache_calibration_prediction & out) noexcept;
+bool server_cache_calibration_predict_point(
+    const server_cache_observation_instance & instance,
     const std::array<double, 4> & feature,
     server_cache_calibration_prediction & out) noexcept;
 server_cache_calibration_instance_state server_cache_calibration_state(
@@ -93,6 +93,40 @@ bool server_cache_calibration_bound_direct_difference(
     const server_cache_calibration_contribution * contributions,
     size_t count,
     server_cache_calibration_direct_bound & out) noexcept;
+
+// Scheduler-owned immutable view of one exact local profile. The instance
+// table itself is stable storage; authority is valid only while the captured
+// serial still matches, so no request can mix coefficients from two updates.
+struct server_cache_calibration_authority_snapshot {
+    const server_cache_observation_store * store = nullptr;
+    uint64_t authority_currency_serial = 0;
+    uint64_t now_unix_ms = 0;
+    bool available = false;
+};
+
+struct server_cache_calibration_snapshot_lookup {
+    const server_cache_observation_instance * instance = nullptr;
+    server_cache_calibration_claim_identity claim;
+    server_cache_calibration_prediction prediction;
+    server_cache_calibration_instance_state state =
+        server_cache_calibration_instance_state::unseen;
+    bool point_available = false;
+};
+
+bool server_cache_calibration_capture_snapshot(
+    const server_cache_observation_store & store,
+    uint64_t now_unix_ms,
+    server_cache_calibration_authority_snapshot & out) noexcept;
+bool server_cache_calibration_snapshot_current(
+    const server_cache_calibration_authority_snapshot & snapshot) noexcept;
+bool server_cache_calibration_snapshot_lookup_exact(
+    const server_cache_calibration_authority_snapshot & snapshot,
+    const server_cache_observation_key & key,
+    const std::array<double, 4> & feature,
+    server_cache_calibration_snapshot_lookup & out) noexcept;
+bool server_cache_calibration_instance_key_digest_v1(
+    const server_cache_observation_key & key,
+    std::array<uint8_t, 32> & out) noexcept;
 
 bool server_cache_calibration_representation_digest_v1(
     const void * bytes,

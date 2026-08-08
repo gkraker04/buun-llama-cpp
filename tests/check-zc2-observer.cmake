@@ -103,7 +103,7 @@ endif()
 
 contract_extract_region("${CONTEXT_CPP}"
     "void cache_observation_finish(server_slot & slot)"
-    "void cache_authority_config_failed(bool mirror_to_shadow)"
+    "void cache_authority_config_failed("
     TERMINAL_REGION TERMINAL_FOUND)
 if (NOT TERMINAL_FOUND)
     message(FATAL_ERROR "ZC2 operation-terminal fence region is missing")

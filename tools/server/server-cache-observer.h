@@ -81,6 +81,7 @@ bool server_cache_observation_replay_feature(
     uint8_t & size_family,
     std::array<double, 4> & feature) noexcept;
 uint8_t server_cache_observation_batch_bucket(uint32_t batch) noexcept;
+uint8_t server_cache_observation_start_bucket(int64_t position) noexcept;
 bool server_cache_observation_replay_chain_geometry(
     uint64_t tokens,
     uint32_t max_effective_batch,
@@ -128,6 +129,11 @@ struct server_cache_observation_key {
 
 bool server_cache_observation_key_valid(
     const server_cache_observation_key & key) noexcept;
+bool server_cache_observation_apply_restore_geometry(
+    server_cache_observation_key & key,
+    int64_t reference_frontier,
+    uint32_t effective_batch,
+    uint32_t effective_ubatch) noexcept;
 
 // Admission time is captured at the first provider-owned operation seam,
 // before any response is available. Estimator admission must never resample
@@ -205,6 +211,10 @@ struct server_cache_observation_instance {
     server_cache_observation_key key;
     std::array<std::array<double, 4>, 4> v = {};
     std::array<double, 4> b = {};
+    // Estimator v3 stores absolute pre-update held-out residuals here.  The
+    // stable wire field name is retained so the estimator-version gate, rather
+    // than an ad-hoc schema fork, owns the semantic transition from v2's raw
+    // responses.
     std::array<uint64_t, residual_capacity> response_reservoir = {};
     uint64_t n_success = 0;
     uint64_t reservoir_seen = 0;
@@ -231,6 +241,14 @@ struct server_cache_observation_instance {
     uint64_t opportunity_at_last_validation = 0;
     uint64_t last_fit_unix_ms = 0;
     uint64_t last_validation_unix_ms = 0;
+};
+
+struct server_cache_calibration_claim_identity {
+    bool available = false;
+    uint64_t boot_claim_ordinal = 0;
+    uint64_t profile_generation_ordinal = 0;
+    uint32_t estimator_slot = 0;
+    uint64_t fit_generation = 0;
 };
 
 struct server_cache_observation_counters {
@@ -293,6 +311,13 @@ public:
     }
     uint64_t records_seen() const noexcept { return records_seen_; }
     uint64_t mutation_generation() const noexcept { return mutation_generation_; }
+    uint64_t authority_currency_serial() const noexcept {
+        return authority_currency_serial_;
+    }
+    bool calibration_claim(
+        uint32_t estimator_slot,
+        server_cache_calibration_claim_identity & out) const noexcept;
+    bool authority_admission_allowed(uint32_t estimator_slot) const noexcept;
     void set_execution_fingerprint(
         const server_cache_execution_fingerprint & value) noexcept;
     void apply_execution_fingerprint(
@@ -308,9 +333,7 @@ public:
         bool available,
         uint64_t boot_claim_ordinal,
         uint64_t profile_generation_ordinal) noexcept;
-    void set_committed_profile_mutation_generation(uint64_t value) noexcept {
-        committed_profile_mutation_generation_ = value;
-    }
+    void set_committed_profile_mutation_generation(uint64_t value) noexcept;
     void set_operation_identity(
         bool complete,
         const std::array<uint8_t, 32> & representation_digest,
@@ -365,6 +388,7 @@ private:
     server_cache_observation_counters counters_;
     uint64_t records_seen_ = 0;
     uint64_t mutation_generation_ = 0;
+    uint64_t authority_currency_serial_ = 1;
     server_cache_execution_fingerprint execution_fingerprint_;
     bool claim_identity_available_ = false;
     uint64_t boot_claim_ordinal_ = 0;
@@ -386,6 +410,8 @@ private:
     std::array<uint32_t, slot_scratch_capacity> slot_batch_tokens_ = {};
     std::array<int32_t, slot_scratch_capacity> slot_first_positions_ = {};
     size_t slot_scratch_count_ = 0;
+
+    void note_authority_mutation() noexcept;
 };
 
 server_cache_observation_key server_cache_observation_cpu_key(

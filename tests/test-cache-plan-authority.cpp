@@ -1,8 +1,11 @@
 #include "server-cache-plan-authority.h"
 #include "common-cache-plan-estimate.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #define CHECK(COND) do { if (!(COND)) { \
     std::fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #COND); \
@@ -1279,6 +1282,536 @@ static void test_eligible_and_executed_index_different_tiers() {
     CHECK(rec.authority.executed_plan_candidate == 1);
 }
 
+static server_cache_observation_key local_key(
+        common_cache_plan_provider provider,
+        server_cache_observation_operation operation,
+        const std::array<uint8_t, 32> & execution_root) {
+    auto out = server_cache_observation_cpu_key(operation, provider, 0);
+    if (operation == server_cache_observation_operation::replay) {
+        out.feature_dim = 4;
+    }
+    out.profile_execution_digest = execution_root;
+    out.adapter_application_digest[0] = uint8_t(provider) + 1;
+    out.adapter_application_complete = true;
+    out.representation_digest[0] = 0x44;
+    CHECK(server_cache_calibration_single_participant_digest_v1(
+        out.adapter_application_digest, out.representation_digest, 0,
+        out.participant_execution_digest));
+    CHECK(server_cache_calibration_effect_action_digest_v1(
+        nullptr, 0, out.effect_action_shape_digest));
+    out.identity_complete = true;
+    out.identity_exact = true;
+    return out;
+}
+
+static server_cache_observation_instance mature_local_instance(
+        uint32_t slot,
+        server_cache_observation_key key,
+        const std::array<double, 4> & feature,
+        double point_us,
+        uint64_t now_ms) {
+    server_cache_observation_instance out;
+    out.used = true;
+    out.estimator_slot = slot;
+    out.key = key;
+    out.n_success = 64;
+    out.n_validation = 8;
+    out.fit_region_count = key.operation ==
+            server_cache_observation_operation::replay ? 5 : 4;
+    out.validation_region_count = 3;
+    out.fit_region_minutes = { 1, 2, 3, 4 };
+    out.validation_region_minutes = { 1, 2, 3 };
+    out.last_validation_unix_ms = now_ms;
+    out.safe_measurable_opportunities = 8;
+    out.opportunity_at_last_validation = 8;
+    for (uint8_t i = 0; i < key.feature_dim; ++i) {
+        out.v[i][i] = 1.0e12;
+        out.b[i] = point_us * 1.0e12;
+        out.feature_min[i] = feature[i];
+        out.feature_max[i] = feature[i];
+    }
+    out.response_reservoir.fill(10);
+    out.reservoir_seen = out.response_reservoir.size();
+    return out;
+}
+
+static void test_local_by_id_certification_and_currency() {
+    constexpr uint64_t now_ms = 600000;
+    server_cache_execution_fingerprint fingerprint;
+    fingerprint.complete = true;
+    fingerprint.exact = true;
+    fingerprint.execution_root[0] = 0x71;
+
+    server_cache_observation_store observations;
+    observations.set_execution_fingerprint(fingerprint);
+    observations.set_calibration_claim_identity(true, 3, 5);
+
+    server_cache_plan_local_inventory evidence;
+    common_cache_plan_record rec;
+    rec.selection = common_cache_plan_selection::by_id;
+    rec.id_slot = 0;
+    rec.n_prompt_tokens = llama_cache_acct_value::measured(100);
+    auto * live = add_viable(
+        rec, common_cache_plan_provider::live_slot, 0, 0);
+    live->lcp_tokens = llama_cache_acct_value::measured(50);
+    auto * checkpoint = add_viable(
+        rec, common_cache_plan_provider::live_context_checkpoint, 0, 0);
+    checkpoint->lcp_tokens = llama_cache_acct_value::measured(90);
+    checkpoint->payload_bytes = llama_cache_acct_value::measured(1024);
+    auto * host = add_viable(
+        rec, common_cache_plan_provider::host_cache_entry, 0, 7);
+    host->lcp_tokens = llama_cache_acct_value::measured(80);
+    host->payload_bytes = llama_cache_acct_value::measured(2048);
+    const uint32_t live_id = uint32_t(live - rec.inventory.data());
+    const uint32_t checkpoint_id = uint32_t(checkpoint - rec.inventory.data());
+    const uint32_t host_id = uint32_t(host - rec.inventory.data());
+
+    uint8_t family = 0;
+    uint8_t batch_bucket = 0;
+    std::array<double, 4> live_feature = {};
+    CHECK(server_cache_observation_replay_chain_geometry(
+        50, 50, family, batch_bucket, live_feature));
+    auto live_key = local_key(
+        common_cache_plan_provider::live_slot,
+        server_cache_observation_operation::replay,
+        fingerprint.execution_root);
+    live_key.size_family = family;
+    live_key.batch_bucket = batch_bucket;
+    live_key.ubatch_bucket = 0;
+    live_key.start_bucket = 0;
+    std::array<double, 4> checkpoint_feature = {};
+    CHECK(server_cache_observation_byte_feature(
+        1024, family, checkpoint_feature));
+    auto checkpoint_key = local_key(
+        common_cache_plan_provider::live_context_checkpoint,
+        server_cache_observation_operation::restore,
+        fingerprint.execution_root);
+    checkpoint_key.size_family = family;
+    checkpoint_key.batch_bucket =
+        server_cache_observation_batch_bucket(10);
+    checkpoint_key.ubatch_bucket = 0;
+    checkpoint_key.start_bucket = 0;
+    std::array<double, 4> host_feature = {};
+    CHECK(server_cache_observation_byte_feature(
+        2048, family, host_feature));
+    auto host_key = local_key(
+        common_cache_plan_provider::host_cache_entry,
+        server_cache_observation_operation::restore,
+        fingerprint.execution_root);
+    host_key.size_family = family;
+    CHECK(server_cache_observation_apply_restore_geometry(
+        host_key, 80, 10, 1));
+    std::array<double, 4> prepare_feature = {};
+    CHECK(server_cache_observation_byte_feature(
+        1024, family, prepare_feature));
+    auto prepare_key = local_key(
+        common_cache_plan_provider::live_slot,
+        server_cache_observation_operation::durability_prepare,
+        fingerprint.execution_root);
+    prepare_key.prepare_shape = 2;
+    prepare_key.size_family = family;
+
+    std::array<server_cache_observation_instance,
+               server_cache_observation_store::instance_capacity> instances = {};
+    instances[0] = mature_local_instance(
+        0, live_key, live_feature, 1000, now_ms);
+    instances[1] = mature_local_instance(
+        1, checkpoint_key, checkpoint_feature, 100000, now_ms);
+    instances[2] = mature_local_instance(
+        2, prepare_key, prepare_feature, 100, now_ms);
+    instances[3] = mature_local_instance(
+        3, host_key, host_feature, 50000, now_ms);
+    // Point-complete but deliberately provisional. V1 requires confidence
+    // only for the selected baseline/challenger, not every third candidate.
+    instances[3].n_validation = 1;
+    instances[3].validation_region_count = 1;
+    CHECK(observations.restore_persisted_instances(instances, 1));
+    server_cache_resume_validation_flags resume_pending = {};
+    resume_pending[0] = true;
+    resume_pending[1] = true;
+    resume_pending[2] = true;
+    resume_pending[3] = true;
+    observations.set_resume_state(resume_pending, resume_pending, 0);
+    observations.set_calibration_claim_identity(true, 3, 5);
+    observations.set_committed_profile_mutation_generation(UINT64_MAX);
+
+    evidence.candidates[live_id] = { live_key, live_feature, true };
+    evidence.candidates[checkpoint_id] = {
+        checkpoint_key, checkpoint_feature, true };
+    evidence.candidates[host_id] = { host_key, host_feature, true };
+    const auto original_rec = rec;
+    server_cache_calibration_authority_snapshot snapshot;
+    CHECK(server_cache_calibration_capture_snapshot(
+        observations, now_ms, snapshot));
+    server_cache_calibration_snapshot_lookup live_lookup;
+    server_cache_calibration_snapshot_lookup checkpoint_lookup;
+    server_cache_calibration_snapshot_lookup prepare_lookup;
+    CHECK(server_cache_calibration_snapshot_lookup_exact(
+        snapshot, live_key, live_feature, live_lookup));
+    CHECK(server_cache_calibration_snapshot_lookup_exact(
+        snapshot, checkpoint_key, checkpoint_feature, checkpoint_lookup));
+    CHECK(server_cache_calibration_snapshot_lookup_exact(
+        snapshot, prepare_key, prepare_feature, prepare_lookup));
+    CHECK(live_lookup.state == server_cache_calibration_instance_state::active);
+    CHECK(checkpoint_lookup.state == server_cache_calibration_instance_state::active);
+    CHECK(prepare_lookup.state == server_cache_calibration_instance_state::active);
+    server_cache_calibration_contribution direct_terms[2];
+    direct_terms[0] = { checkpoint_lookup.instance, checkpoint_lookup.claim,
+        checkpoint_feature, 1000,
+        server_cache_calibration_contribution_side::baseline, now_ms, true };
+    direct_terms[1] = { live_lookup.instance, live_lookup.claim,
+        live_feature, 1000,
+        server_cache_calibration_contribution_side::challenger, now_ms, true };
+    server_cache_calibration_direct_bound direct;
+    CHECK(server_cache_calibration_bound_direct_difference(
+        direct_terms, 2, direct));
+    CHECK(direct.status == server_cache_calibration_prediction_status::ok);
+    CHECK(direct.benefit_lower_us > 0.0);
+    server_cache_plan_authority authority(
+        common_cache_plan_authority_level::by_id, &observations);
+    std::array<uint8_t, 32> display_salt = {};
+    display_salt[0] = 0xa5;
+    CHECK(authority.set_profile_display_salt(display_salt));
+    std::string display_a;
+    std::string display_a_repeat;
+    CHECK(authority.profile_display_label(
+        fingerprint.execution_root, display_a));
+    CHECK(authority.profile_display_label(
+        fingerprint.execution_root, display_a_repeat));
+    CHECK(display_a == display_a_repeat);
+    server_cache_plan_authority other_process(
+        common_cache_plan_authority_level::by_id, &observations);
+    display_salt[1] = 0x5a;
+    CHECK(other_process.set_profile_display_salt(display_salt));
+    std::string display_b;
+    CHECK(other_process.profile_display_label(
+        fingerprint.execution_root, display_b));
+    CHECK(display_a != display_b);
+    const uint64_t planning_serial = observations.authority_currency_serial();
+    server_cache_plan_local_authority_latch local_latch;
+    authority.plan_local_before_mutation(
+        rec, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &local_latch);
+    CHECK(observations.authority_currency_serial() == planning_serial);
+    CHECK(rec.planner_status == common_cache_plan_planner_status::ok);
+    CHECK(rec.shadow_choice == int32_t(live_id));
+    CHECK(rec.optimizer.economic_disposition ==
+          common_cache_optimizer_disposition::certified_improvement);
+    CHECK(rec.optimizer.local_authority.certified_once);
+    CHECK(rec.optimizer.benefit_lower_known &&
+          rec.optimizer.benefit_lower_us > 0.0);
+    CHECK(rec.optimizer.profile_identity.rfind("local-", 0) == 0);
+    CHECK(rec.optimizer.profile_identity.find("71") == std::string::npos);
+    auto receipt_only = rec;
+    auto execution = authority.authorize(rec, 0, true, true, 0,
+        std::move(local_latch));
+    CHECK(execution.kind == server_cache_plan_execution_kind::live_replay);
+    auto copied_execution = authority.authorize(
+        receipt_only, 0, true, true, 0, std::move(local_latch));
+    CHECK(!copied_execution.authoritative());
+    CHECK(receipt_only.authority.state ==
+          common_cache_plan_authority_state::fallback_legacy);
+    CHECK(receipt_only.authority.fallback_reason ==
+          common_cache_plan_authority_fallback::internal_fault);
+    rec.shipped_plan_candidate = rec.shadow_choice;
+    authority.finalize_execution(rec, &execution.local_authority);
+    CHECK(rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::executed);
+
+    // The strict zero policy margin never promotes equality. Identical
+    // baseline/challenger features cancel before the confidence radius.
+    server_cache_calibration_contribution equal_terms[2];
+    equal_terms[0] = { live_lookup.instance, live_lookup.claim, live_feature,
+        1000, server_cache_calibration_contribution_side::baseline,
+        now_ms, true };
+    equal_terms[1] = equal_terms[0];
+    equal_terms[1].side =
+        server_cache_calibration_contribution_side::challenger;
+    server_cache_calibration_direct_bound equal_bound;
+    CHECK(server_cache_calibration_bound_direct_difference(
+        equal_terms, 2, equal_bound));
+    CHECK(equal_bound.benefit_lower_us == 0.0);
+
+    auto immature = original_rec;
+    auto * cold = add_viable(
+        immature, common_cache_plan_provider::cold_replay, -1, 0);
+    CHECK(cold != nullptr);
+    authority.plan_local_before_mutation(
+        immature, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms);
+    CHECK(!immature.authority_prequalified);
+    CHECK(immature.optimizer.local_fallback_reason ==
+          common_cache_optimizer_fallback_reason::incomplete_evidence);
+
+    auto chain = original_rec;
+    auto * composed = chain.add_chain(
+        common_cache_plan_provider::host_cache_entry,
+        int32_t(live_id), int32_t(checkpoint_id));
+    CHECK(composed != nullptr);
+    composed->disposition =
+        common_cache_plan_disposition::valid_not_chosen_cost;
+    authority.plan_local_before_mutation(
+        chain, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms);
+    CHECK(chain.authority_prequalified);
+    CHECK(chain.planner_status == common_cache_plan_planner_status::ok);
+    CHECK(chain.shadow_choice == int32_t(live_id));
+    const int32_t chain_id = int32_t(composed - chain.inventory.data());
+    auto chain_baseline = chain;
+    authority.plan_local_before_mutation(
+        chain_baseline, evidence, observations, chain_id,
+        9, 9, now_ms);
+    CHECK(!chain_baseline.authority_prequalified);
+    CHECK(chain_baseline.optimizer.local_fallback_reason ==
+          common_cache_optimizer_fallback_reason::incomplete_evidence);
+
+    auto exception_rec = original_rec;
+    server_cache_plan_local_authority_latch exception_latch;
+    authority.plan_local_before_mutation(
+        exception_rec, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &exception_latch);
+    auto exception_execution = authority.authorize(
+        exception_rec, 0, true, true, 0, std::move(exception_latch));
+    CHECK(exception_execution.authoritative());
+    authority.fail_closed(
+        exception_rec,
+        common_cache_plan_authority_fallback::internal_fault,
+        &exception_execution.local_authority);
+    CHECK(exception_rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::fallback);
+    CHECK(exception_rec.optimizer.local_authority.certified_once);
+    CHECK(!exception_execution.local_authority.execute(
+        exception_rec.optimizer.local_authority));
+
+    auto mismatch_rec = original_rec;
+    server_cache_plan_local_authority_latch mismatch_latch;
+    authority.plan_local_before_mutation(
+        mismatch_rec, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &mismatch_latch);
+    auto mismatch_execution = authority.authorize(
+        mismatch_rec, 0, true, true, 0, std::move(mismatch_latch));
+    CHECK(mismatch_execution.authoritative());
+    mismatch_rec.shipped_plan_candidate = int32_t(checkpoint_id);
+    authority.finalize_execution(
+        mismatch_rec, &mismatch_execution.local_authority);
+    CHECK(mismatch_rec.authority.state ==
+          common_cache_plan_authority_state::fallback_legacy);
+    CHECK(mismatch_rec.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::fallback);
+
+    auto priced_d = original_rec;
+    auto priced_evidence = evidence;
+    auto & priced_live = priced_evidence.candidates[live_id];
+    priced_live.requires_d_consequences = true;
+    priced_live.consequence_count = 1;
+    priced_live.consequences[0] = {
+        prepare_key, prepare_feature,
+        llama_cache_acct_cost_kind::transfer, 1000, true };
+    server_cache_plan_local_authority_latch priced_latch;
+    authority.plan_local_before_mutation(
+        priced_d, priced_evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &priced_latch);
+    CHECK(priced_d.authority_prequalified);
+    CHECK(priced_d.inventory[live_id].predicted_total_us.value >
+          rec.inventory[live_id].predicted_total_us.value);
+    CHECK(priced_d.inventory[live_id]
+              .cost_terms[size_t(llama_cache_acct_cost_kind::transfer)]
+              .estimated_us.state == llama_cache_acct_known::known);
+
+    auto missing_d = original_rec;
+    auto missing_evidence = evidence;
+    missing_evidence.candidates[live_id].requires_d_consequences = true;
+    authority.plan_local_before_mutation(
+        missing_d, missing_evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms);
+    CHECK(!missing_d.authority_prequalified);
+    CHECK(missing_d.optimizer.local_fallback_reason ==
+          common_cache_optimizer_fallback_reason::incomplete_evidence);
+
+    auto higher_tier = original_rec;
+    higher_tier.selection = common_cache_plan_selection::similarity;
+    authority.plan_local_before_mutation(
+        higher_tier, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms);
+    CHECK(!higher_tier.authority_prequalified);
+    CHECK(higher_tier.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::not_attempted);
+
+    // A copyable receipt is diagnostic only. Without the move-only capability
+    // produced by this exact planning invocation it cannot authorize.
+    auto stale = receipt_only;
+    CHECK(observations.note_safe_measurable_opportunity(live_key, 7));
+    CHECK(!authority.authorize(stale, 0).authoritative());
+    CHECK(stale.optimizer.local_authority.state ==
+          common_cache_optimizer_authority_state::fallback);
+    CHECK(stale.optimizer.local_authority.reason ==
+          common_cache_optimizer_fallback_reason::internal_fault);
+
+    auto stale_currency = original_rec;
+    server_cache_plan_local_authority_latch stale_latch;
+    authority.plan_local_before_mutation(
+        stale_currency, evidence, observations, int32_t(checkpoint_id),
+        9, 9, now_ms, 0, &stale_latch);
+    CHECK(stale_currency.authority_prequalified);
+    CHECK(observations.note_safe_measurable_opportunity(live_key, 8));
+    CHECK(!authority.authorize(stale_currency, 0, true, true, 0,
+        std::move(stale_latch)).authoritative());
+    CHECK(stale_currency.optimizer.local_authority.reason ==
+          common_cache_optimizer_fallback_reason::currency_changed);
+
+    uint64_t terminal_mutation = 10;
+    const auto check_terminal = [&] (
+            server_cache_calibration_authority_terminal terminal,
+            common_cache_optimizer_fallback_reason reason,
+            common_cache_optimizer_profile_state state,
+            common_cache_optimizer_coverage_class coverage,
+            bool economic_candidate_available) {
+        auto terminal_instances = instances;
+        terminal_instances[live_id].authority_terminal = terminal;
+        CHECK(observations.restore_persisted_instances(
+            terminal_instances, terminal_mutation++));
+        observations.set_calibration_claim_identity(true, 3, 5);
+        observations.set_committed_profile_mutation_generation(UINT64_MAX);
+        auto terminal_rec = original_rec;
+        authority.plan_local_before_mutation(
+            terminal_rec, evidence, observations, int32_t(checkpoint_id),
+            9, 9, now_ms);
+        CHECK(!terminal_rec.authority_prequalified);
+        CHECK(terminal_rec.optimizer.local_fallback_reason == reason);
+        CHECK(terminal_rec.optimizer.profile_state == state);
+        CHECK(terminal_rec.optimizer.coverage_class == coverage);
+        CHECK((terminal_rec.optimizer.economic_plan_candidate >= 0) ==
+              economic_candidate_available);
+    };
+    check_terminal(
+        server_cache_calibration_authority_terminal::tail_exceeded,
+        common_cache_optimizer_fallback_reason::out_of_coverage,
+        common_cache_optimizer_profile_state::provisional,
+        common_cache_optimizer_coverage_class::out_of_coverage, true);
+    check_terminal(
+        server_cache_calibration_authority_terminal::confidence_budget_exhausted,
+        common_cache_optimizer_fallback_reason::insufficient_confidence,
+        common_cache_optimizer_profile_state::provisional,
+        common_cache_optimizer_coverage_class::confidence_inactive, true);
+    check_terminal(
+        server_cache_calibration_authority_terminal::drifted,
+        common_cache_optimizer_fallback_reason::drifted,
+        common_cache_optimizer_profile_state::drifted,
+        common_cache_optimizer_coverage_class::confidence_inactive, true);
+    check_terminal(
+        server_cache_calibration_authority_terminal::numeric_fault,
+        common_cache_optimizer_fallback_reason::internal_fault,
+        common_cache_optimizer_profile_state::quarantined,
+        common_cache_optimizer_coverage_class::unavailable, false);
+
+    // Confidence, coverage, and drift are contribution-local. The unselected
+    // host row keeps its point estimate and diagnostic state, but cannot veto
+    // the active checkpoint-vs-live comparison. The selected-row cases above
+    // prove that the same terminals still fail closed with their typed reason.
+    for (const auto terminal : {
+            server_cache_calibration_authority_terminal::tail_exceeded,
+            server_cache_calibration_authority_terminal::drifted,
+            server_cache_calibration_authority_terminal::confidence_budget_exhausted }) {
+        auto terminal_instances = instances;
+        terminal_instances[host_id].authority_terminal = terminal;
+        CHECK(observations.restore_persisted_instances(
+            terminal_instances, terminal_mutation++));
+        observations.set_calibration_claim_identity(true, 3, 5);
+        observations.set_committed_profile_mutation_generation(UINT64_MAX);
+        auto unselected_terminal = original_rec;
+        server_cache_plan_local_authority_latch unselected_latch;
+        authority.plan_local_before_mutation(
+            unselected_terminal, evidence, observations,
+            int32_t(checkpoint_id), 9, 9, now_ms, 0, &unselected_latch);
+        CHECK(unselected_terminal.authority_prequalified);
+        CHECK(unselected_terminal.optimizer.local_fallback_reason ==
+              common_cache_optimizer_fallback_reason::none);
+        CHECK(unselected_terminal.optimizer.coverage_class ==
+              common_cache_optimizer_coverage_class::complete);
+    }
+}
+
+static void test_local_by_id_max_cardinality_budget() {
+    constexpr uint64_t now_ms = 600000;
+    server_cache_execution_fingerprint fingerprint;
+    fingerprint.complete = true;
+    fingerprint.exact = true;
+    fingerprint.execution_root[0] = 0x72;
+
+    server_cache_observation_store observations;
+    observations.set_execution_fingerprint(fingerprint);
+    observations.set_calibration_claim_identity(true, 3, 5);
+
+    common_cache_plan_record base;
+    base.selection = common_cache_plan_selection::by_id;
+    base.id_slot = 0;
+    base.n_prompt_tokens = llama_cache_acct_value::measured(100);
+    server_cache_plan_local_inventory evidence;
+    std::array<server_cache_observation_instance,
+               server_cache_observation_store::instance_capacity> instances = {};
+    uint8_t family = 0;
+    uint8_t batch_bucket = 0;
+    std::array<double, 4> feature = {};
+    CHECK(server_cache_observation_replay_chain_geometry(
+        50, 50, family, batch_bucket, feature));
+    for (uint32_t i = 0; i < COMMON_CACHE_PLAN_MAX_CANDIDATES; ++i) {
+        auto * row = add_viable(
+            base, common_cache_plan_provider::live_slot, int32_t(i), 0);
+        row->lcp_tokens = llama_cache_acct_value::measured(50);
+        const uint32_t candidate = uint32_t(row - base.inventory.data());
+        auto key = local_key(
+            common_cache_plan_provider::live_slot,
+            server_cache_observation_operation::replay,
+            fingerprint.execution_root);
+        key.adapter_application_digest[0] = uint8_t(i + 1);
+        CHECK(server_cache_calibration_single_participant_digest_v1(
+            key.adapter_application_digest, key.representation_digest, 0,
+            key.participant_execution_digest));
+        key.size_family = family;
+        key.batch_bucket = batch_bucket;
+        key.ubatch_bucket = 0;
+        key.start_bucket = 0;
+        instances[i] = mature_local_instance(
+            i, key, feature, i == 0 ? 100.0 : 100000.0 + i, now_ms);
+        evidence.candidates[candidate] = { key, feature, true };
+    }
+    CHECK(observations.restore_persisted_instances(instances, 1));
+    observations.set_calibration_claim_identity(true, 3, 5);
+    observations.set_committed_profile_mutation_generation(UINT64_MAX);
+    server_cache_plan_authority authority(
+        common_cache_plan_authority_level::by_id, &observations);
+    std::array<uint8_t, 32> salt = {};
+    salt[0] = 0x5a;
+    CHECK(authority.set_profile_display_salt(salt));
+
+    std::array<uint64_t, 101> elapsed_us = {};
+    for (size_t sample = 0; sample < elapsed_us.size(); ++sample) {
+        auto rec = base;
+        server_cache_plan_local_authority_latch latch;
+        const auto begin = std::chrono::steady_clock::now();
+        authority.plan_local_before_mutation(
+            rec, evidence, observations,
+            int32_t(COMMON_CACHE_PLAN_MAX_CANDIDATES - 1),
+            9, 9, now_ms, 0, &latch);
+        const auto end = std::chrono::steady_clock::now();
+        elapsed_us[sample] = uint64_t(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                end - begin).count());
+        CHECK(rec.authority_prequalified);
+        CHECK(rec.shadow_choice == 0);
+    }
+    std::sort(elapsed_us.begin(), elapsed_us.end());
+    std::fprintf(stderr,
+        "ZC5_MAX_CARDINALITY candidates=96 instances=128 p50_us=%llu p95_us=%llu max_us=%llu\n",
+        (unsigned long long) elapsed_us[50],
+        (unsigned long long) elapsed_us[95],
+        (unsigned long long) elapsed_us.back());
+    // CI is not the hardware acceptance gate, but a gross algorithmic
+    // regression must still fail here. Dorei separately pins the 2 ms policy
+    // budget on the production CPU/compiler.
+    CHECK(elapsed_us[95] < 10000);
+}
+
 int main() {
     test_candidate_classifiers();
     test_checkpoint_orientation_and_host_identity();
@@ -1296,5 +1829,7 @@ int main() {
     test_typed_planner_fallbacks();
     test_off_stays_shadow_and_failed_delivery_not_counted();
     test_eligible_and_executed_index_different_tiers();
+    test_local_by_id_certification_and_currency();
+    test_local_by_id_max_cardinality_budget();
     return 0;
 }

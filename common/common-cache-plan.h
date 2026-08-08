@@ -202,7 +202,7 @@ struct common_cache_optimizer_authority_receipt {
     llama_cache_acct_value profile_generation;
     llama_cache_acct_value authority_currency_serial;
     std::string instance_generation_digest;
-    uint32_t procedure_version = 2;
+    uint32_t procedure_version = 3;
     common_cache_optimizer_fallback_reason reason =
         common_cache_optimizer_fallback_reason::none;
 };

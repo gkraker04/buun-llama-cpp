@@ -153,6 +153,31 @@ uint8_t server_cache_observation_batch_bucket(uint32_t batch) noexcept {
     return 3;
 }
 
+uint8_t server_cache_observation_start_bucket(int64_t position) noexcept {
+    if (position < 4096) return 0;
+    if (position < 32768) return 1;
+    if (position < 131072) return 2;
+    return 3;
+}
+
+bool server_cache_observation_apply_restore_geometry(
+        server_cache_observation_key & key,
+        int64_t reference_frontier,
+        uint32_t effective_batch,
+        uint32_t effective_ubatch) noexcept {
+    if (key.operation != server_cache_observation_operation::restore ||
+        reference_frontier < 0 || effective_batch == 0 ||
+        effective_ubatch == 0) {
+        return false;
+    }
+    key.contention_bucket = 0;
+    key.start_bucket = server_cache_observation_start_bucket(
+        reference_frontier);
+    key.batch_bucket = server_cache_observation_batch_bucket(effective_batch);
+    key.ubatch_bucket = server_cache_observation_batch_bucket(effective_ubatch);
+    return true;
+}
+
 bool server_cache_observation_byte_feature(
         uint64_t bytes,
         uint8_t & size_family,
@@ -302,10 +327,48 @@ server_cache_observation_capture_cpu_start(bool enabled) noexcept {
     return out;
 }
 
+void server_cache_observation_store::note_authority_mutation() noexcept {
+    increment_saturating(authority_currency_serial_);
+}
+
+bool server_cache_observation_store::calibration_claim(
+        uint32_t estimator_slot,
+        server_cache_calibration_claim_identity & out) const noexcept {
+    out = {};
+    if (estimator_slot >= instances_.size() ||
+        !instances_[estimator_slot].used) {
+        return false;
+    }
+    out.available = claim_identity_available_ &&
+        committed_profile_mutation_generation_ >=
+            generation_started_mutation_[estimator_slot];
+    out.boot_claim_ordinal = boot_claim_ordinal_;
+    out.profile_generation_ordinal = profile_generation_ordinal_;
+    out.estimator_slot = estimator_slot;
+    out.fit_generation = instances_[estimator_slot].fit_generation;
+    return out.available;
+}
+
+bool server_cache_observation_store::authority_admission_allowed(
+        uint32_t estimator_slot) const noexcept {
+    // A fresh boot claim ordinal makes the restored confidence stream a new
+    // statistical branch. Exact, active and still-fresh persisted instances
+    // may therefore resume authority immediately; otherwise persistence would
+    // deadlock every unchosen counterfactual behind a validation it cannot
+    // obtain without already being selected. The pending bits still force the
+    // first naturally executed row into held-out validation and still block
+    // new fit admission during the restart barrier.
+    return estimator_slot < instances_.size() &&
+        authority_currency_serial_ != UINT64_MAX;
+}
+
 void server_cache_observation_store::set_execution_fingerprint(
         const server_cache_execution_fingerprint & value) noexcept {
     const bool changed_root =
         execution_fingerprint_.execution_root != value.execution_root;
+    const bool changed_metadata =
+        execution_fingerprint_.complete != value.complete ||
+        execution_fingerprint_.exact != value.exact;
     if (changed_root) {
         // Model/profile transitions are atomic at the scheduler seam. Never
         // retain instances keyed to the previous execution root.
@@ -313,11 +376,13 @@ void server_cache_observation_store::set_execution_fingerprint(
         principal_cells_ = {};
         generation_started_mutation_ = {};
         mutation_generation_ = 0;
-    } else if (execution_fingerprint_.complete != value.complete ||
-        execution_fingerprint_.exact != value.exact) {
+    } else if (changed_metadata) {
         increment_saturating(mutation_generation_);
     }
     execution_fingerprint_ = value;
+    if (changed_root || changed_metadata) {
+        note_authority_mutation();
+    }
 }
 
 bool server_cache_observation_store::restore_persisted_instances(
@@ -342,6 +407,7 @@ bool server_cache_observation_store::restore_persisted_instances(
         if (instances_[slot].used) instances_[slot].estimator_slot = slot;
     }
     mutation_generation_ = mutation_generation;
+    note_authority_mutation();
     return true;
 }
 
@@ -349,21 +415,40 @@ void server_cache_observation_store::set_calibration_claim_identity(
         bool available,
         uint64_t boot_claim_ordinal,
         uint64_t profile_generation_ordinal) noexcept {
+    const bool changed = claim_identity_available_ != available ||
+        boot_claim_ordinal_ != (available ? boot_claim_ordinal : 0) ||
+        profile_generation_ordinal_ !=
+            (available ? profile_generation_ordinal : 0);
     claim_identity_available_ = available;
     boot_claim_ordinal_ = available ? boot_claim_ordinal : 0;
     profile_generation_ordinal_ = available ? profile_generation_ordinal : 0;
+    if (changed) note_authority_mutation();
+}
+
+void server_cache_observation_store::set_committed_profile_mutation_generation(
+        uint64_t value) noexcept {
+    if (committed_profile_mutation_generation_ == value) return;
+    committed_profile_mutation_generation_ = value;
+    note_authority_mutation();
 }
 
 void server_cache_observation_store::set_operation_identity(
         bool complete,
         const std::array<uint8_t, 32> & representation_digest,
         uint8_t target_draft_spec_composition) noexcept {
-    operation_identity_complete_ = complete &&
+    const bool next_complete = complete &&
         target_draft_spec_composition <= 3;
-    operation_representation_digest_ = operation_identity_complete_
+    const auto next_digest = next_complete
         ? representation_digest : std::array<uint8_t, 32>{};
-    target_draft_spec_composition_ = operation_identity_complete_
+    const uint8_t next_composition = next_complete
         ? target_draft_spec_composition : 0;
+    const bool changed = operation_identity_complete_ != next_complete ||
+        operation_representation_digest_ != next_digest ||
+        target_draft_spec_composition_ != next_composition;
+    operation_identity_complete_ = next_complete;
+    operation_representation_digest_ = next_digest;
+    target_draft_spec_composition_ = next_composition;
+    if (changed) note_authority_mutation();
 }
 
 void server_cache_observation_store::set_resume_state(
@@ -380,6 +465,7 @@ void server_cache_observation_store::set_resume_state(
     resume_validation_outcome_count_ = 0;
     resume_fit_barrier_started_us_ = std::max<int64_t>(
         0, fit_barrier_started_us);
+    note_authority_mutation();
 }
 
 size_t server_cache_observation_store::take_resume_validation_outcomes(
@@ -436,6 +522,7 @@ bool server_cache_observation_store::note_safe_measurable_opportunity(
         instance.last_opportunity_inventory_ordinal = inventory_ordinal;
         ++instance.safe_measurable_opportunities;
         ++mutation_generation_;
+        note_authority_mutation();
         return true;
     }
     return false;
@@ -515,6 +602,7 @@ bool server_cache_observation_store::observe(
             store_recent(recent_records_, records_seen_, record);
             increment_saturating(counters_.numeric_fault);
             increment_saturating(mutation_generation_);
+            note_authority_mutation();
             return false;
         }
         server_cache_observation_instance fresh;
@@ -584,10 +672,13 @@ bool server_cache_observation_store::observe(
     // as validation_unavailable exactly once.
     context.force_validation = resume_validation_pending_[instance_slot] &&
         !registered && !rotated_generation;
-    const bool any_resume_pending = std::any_of(
-        resume_validation_pending_.begin(), resume_validation_pending_.end(),
-        [](bool value) { return value; });
-    context.fit_admission_allowed = !any_resume_pending &&
+    // Restart validation is instance-owned. An unrelated dormant persisted
+    // class must not permanently suppress new/current-process fit evidence;
+    // only the exact restored instance remains validation-only until its own
+    // one-shot terminal is consumed. The process-wide 60-second barrier still
+    // prevents restart from reopening the anonymous-principal window early.
+    context.fit_admission_allowed =
+        !resume_validation_pending_[instance_slot] &&
         (resume_fit_barrier_started_us_ == 0 ||
          (record.admission_clock.steady_us >= resume_fit_barrier_started_us_ &&
           record.admission_clock.steady_us - resume_fit_barrier_started_us_ >=
@@ -668,6 +759,7 @@ bool server_cache_observation_store::observe(
             record.terminal = server_cache_observation_terminal::diagnostic;
             record.reason = server_cache_observation_reason::numeric_overflow;
             increment_saturating(mutation_generation_);
+            note_authority_mutation();
             store_recent(recent_records_, records_seen_, record);
             increment_saturating(counters_.numeric_fault);
             return false;
@@ -678,6 +770,7 @@ bool server_cache_observation_store::observe(
         record.terminal = server_cache_observation_terminal::diagnostic;
         record.reason = server_cache_observation_reason::numeric_overflow;
         increment_saturating(mutation_generation_);
+        note_authority_mutation();
         store_recent(recent_records_, records_seen_, record);
         increment_saturating(counters_.numeric_fault);
         return false;
@@ -739,7 +832,7 @@ bool server_cache_observation_store::observe(
     record.calibration_fit_generation = instance->fit_generation;
     const auto profile_state = server_cache_calibration_state(
         *instance, context.claim, record.feature, context.unix_ms,
-        nullptr, !resume_authority_validation_required_[instance_slot]);
+        nullptr, authority_admission_allowed(instance_slot));
     record.calibration_profile_state = uint8_t(profile_state) + 1;
     if (result.validation_prediction_available) {
         record.calibration_prediction_available = true;
@@ -747,6 +840,7 @@ bool server_cache_observation_store::observe(
         record.calibration_radius_us = result.validation_prediction.radius_us;
     }
     increment_saturating(mutation_generation_);
+    note_authority_mutation();
     store_recent(recent_records_, records_seen_, record);
     if (outcome_available) {
         increment_saturating(counters_.accepted);

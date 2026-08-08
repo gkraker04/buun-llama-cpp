@@ -129,7 +129,7 @@ void test_known_coefficients_and_assignment() {
         nullptr, false) == server_cache_calibration_instance_state::provisional);
     CHECK(server_cache_calibration_state(
         value, claim, {1, 0, 0, 0},
-        value.last_validation_unix_ms + 10 * 60 * 1000 + 1,
+        value.last_validation_unix_ms + 24ULL * 60 * 60 * 1000 + 1,
         nullptr) == server_cache_calibration_instance_state::provisional);
 }
 
@@ -486,6 +486,22 @@ void test_direct_difference_bound() {
         faster, 2, bound));
     CHECK(bound.benefit_us > 1700 && bound.benefit_us < 2200);
     CHECK(bound.radius_us > 0);
+    const double stable_radius = bound.radius_us;
+
+    // Provisional authority uses the persisted held-out-residual envelope, not
+    // the much wider worst-case diagnostic CS. A single recent spike can only
+    // widen/refuse the decision, and the active-state held-out-validation
+    // floor is required.
+    value.response_reservoir[0] = 10000;
+    CHECK(server_cache_calibration_bound_direct_difference(
+        faster, 2, bound));
+    CHECK(bound.radius_us > stable_radius);
+    value.response_reservoir[0] = 1000;
+    value.n_validation = 3;
+    CHECK(!server_cache_calibration_bound_direct_difference(
+        faster, 2, bound));
+    CHECK(bound.status == server_cache_calibration_prediction_status::learning);
+    value.n_validation = 4;
 
     // A policy retention weight scales the same-key challenger feature and
     // can reverse the point estimate; it does not create timing evidence.
@@ -497,7 +513,9 @@ void test_direct_difference_bound() {
     faster[0].claim.fit_generation = value.fit_generation + 1;
     CHECK(!server_cache_calibration_bound_direct_difference(
         faster, 2, bound));
-    CHECK(bound.status == server_cache_calibration_prediction_status::learning);
+    // A contribution whose captured claim names a different generation is an
+    // internally inconsistent snapshot, not merely an immature model.
+    CHECK(bound.status == server_cache_calibration_prediction_status::numeric_fault);
     faster[0].claim = claim;
 
     auto immature = instance();
@@ -556,11 +574,11 @@ void test_exactness_and_opportunity_boundary() {
         nullptr) == server_cache_calibration_instance_state::provisional);
     value.key.identity_exact = true;
     value.opportunity_at_last_validation = 0;
-    value.safe_measurable_opportunities = 255;
+    value.safe_measurable_opportunities = 4095;
     CHECK(server_cache_calibration_state(
         value, claim, {1, 0, 0, 0}, value.last_validation_unix_ms,
         nullptr) == server_cache_calibration_instance_state::active);
-    value.safe_measurable_opportunities = 256;
+    value.safe_measurable_opportunities = 4096;
     CHECK(server_cache_calibration_state(
         value, claim, {1, 0, 0, 0}, value.last_validation_unix_ms,
         nullptr) == server_cache_calibration_instance_state::provisional);

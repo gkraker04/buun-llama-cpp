@@ -122,9 +122,11 @@ foreach(REQUIRED IN ITEMS
 endforeach()
 foreach(REQUIRED IN ITEMS
         "integrity_exact = false;"
-        "driver.exact = effective_devices.empty();"
-        "runtime.exact = effective_devices.empty();"
-        "add_utf8(8, llama_print_system_info(), false)")
+        "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
+        "GGML_BACKEND_DEVICE_LINK_V1_PROC"
+        "cpu_backend_identity_v1("
+        "driver_version, hardware_exact"
+        "runtime_version, hardware_exact")
     contract_require_token("${LLAMA_MMAP_CPP}${FINGERPRINT_CPP}${CONTEXT_CPP}"
         "${REQUIRED}" "ZC3a resolved hardware/mmproj identity contract")
 endforeach()
@@ -247,16 +249,16 @@ endif()
 
 set(MUTATED_HARDWARE "${FINGERPRINT_CPP}")
 string(REPLACE
-    "driver.exact = effective_devices.empty();"
-    "driver.exact = params.devices.empty();"
+    "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
+    "ggml_backend_device_identity_unversioned"
     MUTATED_HARDWARE "${MUTATED_HARDWARE}")
 string(FIND "${MUTATED_HARDWARE}"
-    "driver.exact = params.devices.empty();" MUTATED_AUTO_EXACT)
+    "ggml_backend_device_identity_unversioned" MUTATED_AUTO_EXACT)
 if (MUTATED_AUTO_EXACT EQUAL -1)
     message(FATAL_ERROR "ZC3a auto-device exactness control did not mutate")
 endif()
 string(FIND "${MUTATED_HARDWARE}"
-    "driver.exact = effective_devices.empty();" MUTATED_RESOLVED_EXACT)
+    "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC" MUTATED_RESOLVED_EXACT)
 if (NOT MUTATED_RESOLVED_EXACT EQUAL -1)
     message(FATAL_ERROR "ZC3a auto-device negative control did not trip")
 endif()

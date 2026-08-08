@@ -270,9 +270,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-plan-estimate.cpp)
     target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-    llama_build_and_test(
-        test-cache-plan-authority.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    llama_build_and_test(test-cache-plan-authority.cpp)
+    target_link_libraries(test-cache-plan-authority PRIVATE server-context)
     target_include_directories(test-cache-plan-authority PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
@@ -281,6 +280,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-authority.cmake)
+    add_test(
+        NAME test-zc5-local-authority-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc5-local-authority.cmake)
 
     llama_build_and_test(
         test-cache-plan-preflight.cpp

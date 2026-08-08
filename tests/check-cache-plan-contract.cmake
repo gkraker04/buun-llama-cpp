@@ -54,7 +54,7 @@ count_literal(
     "${server_context_source}"
     "server_cache_plan_nonconsuming_host_effects("
     nonconsuming_effect_mask_sites)
-if (NOT nonconsuming_effect_mask_sites EQUAL 5)
+if (NOT nonconsuming_effect_mask_sites EQUAL 6)
     message(FATAL_ERROR
         "D-A5 non-consuming host semantics escaped the one effect-mask channel")
 endif()

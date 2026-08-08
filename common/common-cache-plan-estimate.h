@@ -201,6 +201,15 @@ constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
 common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib);
 
+// Shared final chooser for an alternate estimator that has already filled a
+// complete all-or-nothing candidate table. It owns the same participation,
+// tie floor, and stable key as the checked-in fitter; missing totals refuse.
+common_cache_plan_planner_status common_cache_plan_choose_preestimated(
+    common_cache_plan_record & rec) noexcept;
+common_cache_plan_planner_status common_cache_plan_compose_preestimated_chains(
+    common_cache_plan_record & rec,
+    uint32_t estimator_version) noexcept;
+
 // The single planner attempt boundary shared by pre-mutation B-A staging and
 // legacy finalize fallback. It owns profile lookup and exception isolation.
 common_cache_plan_planner_status common_cache_plan_run_planner(

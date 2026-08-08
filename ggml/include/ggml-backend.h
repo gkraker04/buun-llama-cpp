@@ -222,6 +222,43 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // Optional, versioned execution-identity queries. These are resolved through
+    // ggml_backend_reg_get_proc_address so backends that cannot prove the full
+    // identity simply omit them; callers must remain fail-closed.
+    #define GGML_BACKEND_DEVICE_IDENTITY_V1_PROC "ggml_backend_device_identity_v1"
+    #define GGML_BACKEND_DEVICE_LINK_V1_PROC     "ggml_backend_device_link_v1"
+
+    enum ggml_backend_identity_kind {
+        GGML_BACKEND_IDENTITY_KIND_UNKNOWN = 0,
+        GGML_BACKEND_IDENTITY_KIND_CUDA    = 1,
+    };
+
+    struct ggml_backend_device_identity_v1 {
+        size_t   struct_size;
+        uint32_t driver_version;
+        uint32_t runtime_version;
+        uint8_t  uuid[16];
+        uint32_t pci_domain_bus_device_function;
+        uint16_t backend_kind;
+        uint16_t arch_major;
+        uint16_t arch_minor;
+    };
+
+    struct ggml_backend_device_link_v1 {
+        size_t   struct_size;
+        uint16_t link_class;
+        uint8_t  p2p;
+        uint64_t bandwidth_class;
+    };
+
+    typedef bool (*ggml_backend_device_identity_v1_t)(
+        ggml_backend_dev_t device,
+        struct ggml_backend_device_identity_v1 * identity);
+    typedef bool (*ggml_backend_device_link_v1_t)(
+        ggml_backend_dev_t source,
+        ggml_backend_dev_t destination,
+        struct ggml_backend_device_link_v1 * link);
+
     //
     // Backend registry
     //

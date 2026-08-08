@@ -82,6 +82,22 @@ int main() {
     static_assert(sizeof(server_cache_observation_store) <= 256 * 1024,
                   "ZC2 process-local store exceeded its fixed host bound");
     {
+        auto restore = key(0);
+        restore.operation = server_cache_observation_operation::restore;
+        restore.provider = common_cache_plan_provider::host_cache_entry;
+        CHECK(server_cache_observation_apply_restore_geometry(
+            restore, 5000, 512, 128));
+        CHECK(restore.contention_bucket == 0);
+        CHECK(restore.start_bucket == 1);
+        CHECK(restore.batch_bucket == 2);
+        CHECK(restore.ubatch_bucket == 1);
+        auto replay = key(0);
+        CHECK(!server_cache_observation_apply_restore_geometry(
+            replay, 5000, 512, 128));
+        CHECK(!server_cache_observation_apply_restore_geometry(
+            restore, -1, 512, 128));
+    }
+    {
         server_cache_observation_store store;
         CHECK(store.prepare_slot_scratch(
             server_cache_observation_store::slot_scratch_capacity));
@@ -596,7 +612,7 @@ int main() {
         over_tail.tail_exceeded = true;
         CHECK(store.observe(over_tail));
         CHECK(store.instances()[0].b[3] == 2000000.0);
-        CHECK(store.instances()[0].response_reservoir[0] == 2000000);
+        CHECK(store.instances()[0].reservoir_seen == 0);
         CHECK(store.instances()[0].tail_exceeded);
 
         auto inconsistent = accepted(11);
@@ -745,6 +761,15 @@ int main() {
         pending[0] = true;
         pending[1] = true;
         store.set_resume_state(pending, pending, 0);
+        // A new exact class is not owned by either restored one-shot bit. Once
+        // the independent monotonic barrier is open, dormant restored classes
+        // cannot deadlock its fit stream.
+        auto fresh = accepted(42);
+        fresh.key.profile_execution_digest =
+            instances[0].key.profile_execution_digest;
+        CHECK(store.observe(fresh));
+        CHECK(fresh.calibration_assignment ==
+              uint8_t(server_cache_calibration_assignment::fit) + 1);
         auto first = accepted(40);
         auto second = accepted(41);
         second.key.profile_execution_digest = first.key.profile_execution_digest;

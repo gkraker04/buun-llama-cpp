@@ -2,6 +2,7 @@
 
 #include "common-cache-plan.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 const char * common_cache_optimizer_mode_name(common_cache_optimizer_mode mode) {
@@ -79,12 +80,13 @@ common_cache_optimizer_effective_config common_cache_optimizer_resolve(
         return out;
     }
 
-    // ZC0b has no independently landed local authority ratchet. An absent
-    // ceiling (or explicit off) therefore resolves to none; later ZC5 units
-    // raise the absent ceiling one independently-gated tier at a time.
+    // ZC5a lands only the by-id local ratchet. An explicit higher ceiling is
+    // a ceiling, not a request to enable unlanded tiers; explicit off remains
+    // a complete local-authority kill switch.
     out.local_authority_ceiling = raw.cache_plan_authority_explicit
-        ? raw.cache_plan_authority
-        : common_cache_plan_authority_level::off;
+        ? std::min(raw.cache_plan_authority,
+                   common_cache_plan_authority_level::by_id)
+        : common_cache_plan_authority_level::by_id;
     return out;
 }
 

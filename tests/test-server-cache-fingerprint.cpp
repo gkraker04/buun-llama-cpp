@@ -1,4 +1,5 @@
 #include "server-cache-fingerprint.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-sha256.h"
 #include "common.h"
@@ -184,6 +185,90 @@ static std::vector<server_cache_fingerprint_artifact> artifacts() {
     };
 }
 
+struct fake_gpu_identity {
+    const char * name;
+    const char * description;
+    ggml_backend_device_identity_v1 identity;
+};
+
+static const char * fake_gpu_name(ggml_backend_dev_t device) {
+    return static_cast<fake_gpu_identity *>(device->context)->name;
+}
+
+static const char * fake_gpu_description(ggml_backend_dev_t device) {
+    return static_cast<fake_gpu_identity *>(device->context)->description;
+}
+
+static enum ggml_backend_dev_type fake_gpu_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static bool fake_gpu_identity_query(
+        ggml_backend_dev_t device,
+        ggml_backend_device_identity_v1 * identity) {
+    if (!device || !identity || identity->struct_size != sizeof(*identity)) {
+        return false;
+    }
+    *identity = static_cast<fake_gpu_identity *>(device->context)->identity;
+    return true;
+}
+
+static bool fake_gpu_link_query(
+        ggml_backend_dev_t source,
+        ggml_backend_dev_t destination,
+        ggml_backend_device_link_v1 * link) {
+    if (!source || !destination || !link ||
+        link->struct_size != sizeof(*link) || source == destination) {
+        return false;
+    }
+    const auto * src = static_cast<fake_gpu_identity *>(source->context);
+    const auto * dst = static_cast<fake_gpu_identity *>(destination->context);
+    *link = {};
+    link->struct_size = sizeof(*link);
+    link->link_class = uint16_t(2 +
+        ((src->identity.pci_domain_bus_device_function ^
+          dst->identity.pci_domain_bus_device_function) & 3));
+    link->p2p = 1;
+    return true;
+}
+
+static void * fake_gpu_proc(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, GGML_BACKEND_DEVICE_IDENTITY_V1_PROC) == 0) {
+        return reinterpret_cast<void *>(fake_gpu_identity_query);
+    }
+    if (std::strcmp(name, GGML_BACKEND_DEVICE_LINK_V1_PROC) == 0) {
+        return reinterpret_cast<void *>(fake_gpu_link_query);
+    }
+    return nullptr;
+}
+
+static ggml_backend_device make_fake_gpu(
+        ggml_backend_reg_t reg, fake_gpu_identity * identity) {
+    ggml_backend_device out = {};
+    out.iface.get_name = fake_gpu_name;
+    out.iface.get_description = fake_gpu_description;
+    out.iface.get_type = fake_gpu_type;
+    out.reg = reg;
+    out.context = identity;
+    return out;
+}
+
+static fake_gpu_identity make_fake_gpu_identity(
+        const char * name, uint8_t uuid_byte, uint32_t pci_bdf) {
+    fake_gpu_identity out = {};
+    out.name = name;
+    out.description = "fake CUDA GPU";
+    out.identity.struct_size = sizeof(out.identity);
+    out.identity.driver_version = 13010;
+    out.identity.runtime_version = 13000;
+    std::fill(std::begin(out.identity.uuid), std::end(out.identity.uuid), uuid_byte);
+    out.identity.pci_domain_bus_device_function = pci_bdf;
+    out.identity.backend_kind = GGML_BACKEND_IDENTITY_KIND_CUDA;
+    out.identity.arch_major = 8;
+    out.identity.arch_minor = 6;
+    return out;
+}
+
 int main() {
     server_cache_execution_fingerprint first;
     CHECK(server_cache_execution_fingerprint_v1(
@@ -349,6 +434,155 @@ int main() {
     CHECK(read_u32(production_fields[10].payload, 6) == 0);
     const auto default_production_fields = production_fields;
 
+    // Argument parsing reserves the auto-fit override workspace with null
+    // entries on every normal CLI launch. Those rows are capacity, not an
+    // active placement override, and must preserve the exact same profile.
+    production_params.tensor_buft_overrides.resize(
+        llama_max_tensor_buft_overrides(), { nullptr, nullptr });
+    CHECK(server_cache_fingerprint_fields_v1(
+        production_params, production_vbr, 99, 0, 0, production_fields));
+    CHECK(production_fields.size() == default_production_fields.size());
+    for (size_t i = 0; i < production_fields.size(); ++i) {
+        CHECK(production_fields[i].id == default_production_fields[i].id);
+        CHECK(production_fields[i].type == default_production_fields[i].type);
+        CHECK(production_fields[i].payload == default_production_fields[i].payload);
+        CHECK(production_fields[i].exact == default_production_fields[i].exact);
+    }
+    production_params.tensor_buft_overrides[0] = { ".*", nullptr };
+    CHECK(server_cache_fingerprint_fields_v1(
+        production_params, production_vbr, 99, 0, 0, production_fields));
+    CHECK(!production_fields[5].exact);
+    CHECK(!production_fields[6].exact);
+    CHECK(!production_fields[8].exact);
+    CHECK(!production_fields[9].exact);
+    CHECK(!production_fields[10].exact);
+    production_params.tensor_buft_overrides[0] = { nullptr, nullptr };
+    production_params.tensor_buft_overrides.clear();
+
+    // A CUDA-enabled gate exercises the real optional backend query rather
+    // than counting only fake-interface tokens. CPU-only builds keep this
+    // branch inert and prove the zero-device profile separately above.
+    size_t real_gpu_count = 0;
+    bool real_gpu_queries_complete = true;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * device = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ++real_gpu_count;
+        auto * reg = ggml_backend_dev_backend_reg(device);
+        const auto query = reinterpret_cast<
+            ggml_backend_device_identity_v1_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_DEVICE_IDENTITY_V1_PROC));
+        if (!query) {
+            real_gpu_queries_complete = false;
+            continue;
+        }
+        ggml_backend_device_identity_v1 identity = {};
+        identity.struct_size = sizeof(identity);
+        if (!query(device, &identity) || identity.driver_version == 0 ||
+            identity.runtime_version == 0) {
+            real_gpu_queries_complete = false;
+        }
+    }
+    if (real_gpu_count != 0) {
+        common_params real_gpu_params;
+        real_gpu_params.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
+        CHECK(server_cache_fingerprint_fields_v1(
+            real_gpu_params, production_vbr, 99, 0, 0, production_fields));
+        CHECK(read_u32(production_fields[8].payload, 0) == real_gpu_count);
+        if (real_gpu_queries_complete) {
+            for (size_t i = 5; i <= 10; ++i) CHECK(production_fields[i].exact);
+        } else {
+            CHECK(!production_fields[5].exact || !production_fields[8].exact ||
+                  !production_fields[9].exact || !production_fields[10].exact);
+        }
+    }
+
+    // Physical CUDA identity and placement are canonicalized independently of
+    // loader enumeration. Reversing A/B while retaining the same main device
+    // and physical tensor split must reuse the exact same persisted profile.
+    ggml_backend_reg fake_reg = {};
+    fake_reg.api_version = GGML_BACKEND_API_VERSION;
+    fake_reg.iface.get_proc_address = fake_gpu_proc;
+    auto gpu_a_identity = make_fake_gpu_identity("CUDA-A", 0x11, 0x00000100);
+    auto gpu_b_identity = make_fake_gpu_identity("CUDA-B", 0x22, 0x00000200);
+    auto gpu_a = make_fake_gpu(&fake_reg, &gpu_a_identity);
+    auto gpu_b = make_fake_gpu(&fake_reg, &gpu_b_identity);
+
+    common_params placement_ab = production_params;
+    placement_ab.devices = { &gpu_a, &gpu_b, nullptr };
+    placement_ab.main_gpu = 1;
+    placement_ab.tensor_split[0] = 0.25f;
+    placement_ab.tensor_split[1] = 0.75f;
+    std::vector<server_cache_fingerprint_field> fields_ab;
+    CHECK(server_cache_fingerprint_fields_v1(
+        placement_ab, production_vbr, 99, 0, 0, fields_ab));
+    CHECK(fields_ab[5].exact && fields_ab[6].exact &&
+          fields_ab[8].exact && fields_ab[9].exact && fields_ab[10].exact);
+
+    common_params placement_ba = production_params;
+    placement_ba.devices = { &gpu_b, &gpu_a, nullptr };
+    placement_ba.main_gpu = 0;
+    placement_ba.tensor_split[0] = 0.75f;
+    placement_ba.tensor_split[1] = 0.25f;
+    std::vector<server_cache_fingerprint_field> fields_ba;
+    CHECK(server_cache_fingerprint_fields_v1(
+        placement_ba, production_vbr, 99, 0, 0, fields_ba));
+    for (size_t i = 5; i <= 10; ++i) {
+        CHECK(fields_ab[i].payload == fields_ba[i].payload);
+        CHECK(fields_ab[i].exact == fields_ba[i].exact);
+    }
+
+    auto changed_placement = placement_ab;
+    changed_placement.tensor_split[0] = 0.5f;
+    changed_placement.tensor_split[1] = 0.5f;
+    CHECK(server_cache_fingerprint_fields_v1(
+        changed_placement, production_vbr, 99, 0, 0, production_fields));
+    CHECK(production_fields[10].payload != fields_ab[10].payload);
+
+    auto single_gpu = placement_ab;
+    single_gpu.devices = { &gpu_a, nullptr };
+    single_gpu.main_gpu = 0;
+    single_gpu.tensor_split[0] = 1.0f;
+    CHECK(server_cache_fingerprint_fields_v1(
+        single_gpu, production_vbr, 99, 0, 0, production_fields));
+    CHECK(production_fields[8].payload != fields_ab[8].payload);
+    CHECK(production_fields[10].payload != fields_ab[10].payload);
+
+    auto changed_driver_identity = gpu_a_identity;
+    changed_driver_identity.identity.driver_version += 1;
+    auto gpu_a_new_driver = make_fake_gpu(&fake_reg, &changed_driver_identity);
+    auto changed_driver = single_gpu;
+    changed_driver.devices = { &gpu_a_new_driver, nullptr };
+    CHECK(server_cache_fingerprint_fields_v1(
+        changed_driver, production_vbr, 99, 0, 0, production_fields));
+    CHECK(production_fields[5].exact);
+    CHECK(production_fields[5].payload != fields_ab[5].payload);
+
+    auto missing_uuid_identity = gpu_a_identity;
+    std::fill(std::begin(missing_uuid_identity.identity.uuid),
+              std::end(missing_uuid_identity.identity.uuid), 0);
+    auto missing_uuid = make_fake_gpu(&fake_reg, &missing_uuid_identity);
+    auto missing_uuid_params = single_gpu;
+    missing_uuid_params.devices = { &missing_uuid, nullptr };
+    CHECK(server_cache_fingerprint_fields_v1(
+        missing_uuid_params, production_vbr, 99, 0, 0, production_fields));
+    CHECK(!production_fields[5].exact && !production_fields[8].exact &&
+          !production_fields[10].exact);
+
+    auto changed_runtime = gpu_b_identity;
+    changed_runtime.identity.runtime_version += 1;
+    auto gpu_b_new_runtime = make_fake_gpu(&fake_reg, &changed_runtime);
+    auto runtime_params = placement_ab;
+    runtime_params.devices = { &gpu_a, &gpu_b_new_runtime, nullptr };
+    CHECK(server_cache_fingerprint_fields_v1(
+        runtime_params, production_vbr, 99, 0, 0, production_fields));
+    CHECK(!production_fields[5].exact && !production_fields[6].exact &&
+          !production_fields[8].exact && !production_fields[9].exact &&
+          !production_fields[10].exact);
+
     auto active_spec = production_params;
     active_spec.speculative.set_type(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
     CHECK(server_cache_fingerprint_fields_v1(
@@ -420,6 +654,37 @@ int main() {
     CHECK(configured_delivered && configured_result.complete);
     CHECK(configured_result.config_root == config_root(default_production_fields));
     configured_worker->stop();
+
+#if defined(_WIN32)
+    const int configured_gpu_duplicate = _dup(_fileno(file));
+#else
+    const int configured_gpu_duplicate = dup(fileno(file));
+#endif
+    CHECK(configured_gpu_duplicate >= 0);
+    auto configured_gpu_worker =
+        std::make_unique<server_cache_fingerprint_worker>();
+    auto placement_without_effective_split = placement_ab;
+    std::fill(std::begin(placement_without_effective_split.tensor_split),
+              std::end(placement_without_effective_split.tensor_split), 0.0f);
+    const float effective_split[] = { 0.25f, 0.75f };
+    CHECK(configured_gpu_worker->configure(
+        placement_without_effective_split,
+        effective_split, std::size(effective_split),
+        production_vbr, 99, 0, 0));
+    CHECK(configured_gpu_worker->add_descriptor({
+        server_cache_fingerprint_artifact_role::target,
+        0, configured_gpu_duplicate, 3, false }));
+    CHECK(configured_gpu_worker->launch());
+    server_cache_execution_fingerprint configured_gpu_result;
+    bool configured_gpu_delivered = false;
+    for (int i = 0; i < 200 &&
+             !(configured_gpu_delivered = configured_gpu_worker->poll(
+                   configured_gpu_result)); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(configured_gpu_delivered && configured_gpu_result.complete);
+    CHECK(configured_gpu_result.config_root == config_root(fields_ab));
+    configured_gpu_worker->stop();
 
 #if !defined(_WIN32)
     // Bounded admission closes the rejected descriptor immediately, and the
