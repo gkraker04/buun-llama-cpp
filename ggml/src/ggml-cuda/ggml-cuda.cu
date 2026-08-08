@@ -572,6 +572,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
+#if defined(GGML_USE_HIP)
+        // RDNA4 kernels can issue a vector access immediately past the logical compute workspace.
+        // Unlike the legacy pool's 5% look-ahead allocation, the VMM pool otherwise maps exactly
+        // to the requested high-water. Keep one physical granule as part of each live allocation
+        // so the access cannot cross into an unmapped page or an adjacent workspace.
+        if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
+            GGML_ASSERT(size <= SIZE_MAX - granularity);
+            size += granularity;
+        }
+#endif
 
         size_t avail = pool_size - pool_used;
 
@@ -606,10 +616,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemRelease(handle));
 
             // set access
-            // ROCm workaround (buun-llama-cpp#69, gfx1100): hipMemSetAccess only succeeds on a
+            // ROCm workaround (buun-llama-cpp#69): hipMemSetAccess only succeeds on a
             // range starting at the pool base — per-offset grants on later mappings return
             // hipErrorInvalidValue. Granting the whole contiguous [base, base+size+new) range
-            // is a no-op re-grant on CUDA (this pool only ever grows; no unmapped holes).
+            // is safe because this pool only ever grows and has no unmapped holes. This behavior
+            // has been observed on both gfx1100 and gfx1201.
             // NOTE for VBR-on-ROCm: vbr-vmm.cu grants per-chunk AND unmaps (holes) — this
             // whole-range trick cannot transfer there; needs its own design.
             // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
