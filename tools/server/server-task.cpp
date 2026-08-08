@@ -1,6 +1,7 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-observer.h"
+#include "server-cache-calibration-model.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-retention-policy.h"
 
@@ -2284,11 +2285,16 @@ void observe_checkpoint_cpu_operation(
         server_cache_observation_operation operation,
         uint8_t prepare_shape,
         uint64_t extent_bytes,
-        int64_t start_us,
+        server_cache_observation_cpu_start start,
         bool success,
         int64_t owned_end_us = 0,
         std::array<uint8_t, 32> adapter_application_digest = {},
-        bool adapter_application_complete = false) noexcept {
+        bool adapter_application_complete = false,
+        common_cache_plan_destruction_effect_set effects = 0,
+        server_cache_destruction_class destruction_class =
+            server_cache_destruction_class::_count,
+        server_cache_destruction_release_owner release_owner =
+            server_cache_destruction_release_owner::none) noexcept {
     if (!context.observations) {
         return;
     }
@@ -2299,11 +2305,17 @@ void observe_checkpoint_cpu_operation(
         prepare_shape);
     key.adapter_application_digest = adapter_application_digest;
     key.adapter_application_complete = adapter_application_complete;
+    if (operation == server_cache_observation_operation::destruction_apply) {
+        (void) server_cache_calibration_apply_shape_digest_v1(
+            effects, destruction_class, release_owner,
+            key.effect_action_shape_digest);
+    }
     context.observations->apply_execution_fingerprint(key);
     server_cache_observation_record record;
     (void) server_cache_observe_cpu_operation(
         context.observations, key, context.slot_id, extent_bytes,
-        start_us, end_us, success, &record);
+        start, end_us, success,
+        context.observations->cpu_operation_isolated(), &record);
     server_cache_emit_observation_noexcept(
         record, context.debug_observability);
 }
@@ -2399,9 +2411,8 @@ bool checkpoint_drop_certified(
         return false;
     }
     const auto fresh = authority.ledger.snapshot();
-    const int64_t prepare_start_us = context.observations
-        ? ggml_time_us()
-        : 0;
+    const auto prepare_start = server_cache_observation_capture_cpu_start(
+        context.observations != nullptr);
     auto prepared = server_cache_prepare_release_set(
         quote, current, authority.ledger, fresh.serial,
         project, std::move(pin));
@@ -2413,7 +2424,7 @@ bool checkpoint_drop_certified(
             context,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, false, prepare_end_us,
+            prepare_start, false, prepare_end_us,
             victim_adapter_digest, victim_adapter_complete);
         refuse(&quote.receipt, prepared.reason);
         return false;
@@ -2447,7 +2458,7 @@ bool checkpoint_drop_certified(
         context,
         server_cache_observation_operation::durability_prepare,
         /*prepare_shape=*/1, /*extent_bytes=*/0,
-        prepare_start_us, true, prepare_end_us,
+        prepare_start, true, prepare_end_us,
         victim_adapter_digest, victim_adapter_complete);
     authority.observe_host_destruction(quote.receipt, true);
     emit_checkpoint_destruction(context,
@@ -2460,9 +2471,8 @@ bool checkpoint_drop_certified(
     const auto admission = server_cache_checkpoint_observe_drop(context,
         reason, current.front().candidate.artifact_id);
     const std::thread::id scheduler_owner = std::this_thread::get_id();
-    const int64_t apply_start_us = context.observations
-        ? ggml_time_us()
-        : 0;
+    const auto apply_start = server_cache_observation_capture_cpu_start(
+        context.observations != nullptr);
     GGML_ASSERT(context.raw_owner && context.raw_drop);
     next = context.raw_drop(
         context.raw_owner, victim, std::next(victim));
@@ -2480,8 +2490,12 @@ bool checkpoint_drop_certified(
         context,
         server_cache_observation_operation::destruction_apply,
         /*prepare_shape=*/0, apply_extent_bytes,
-        apply_start_us, true, 0,
-        victim_adapter_digest, victim_adapter_complete);
+        apply_start, true, 0,
+        victim_adapter_digest, victim_adapter_complete,
+        quote.receipt.effects,
+        server_cache_destruction_class::checkpoint_drop,
+        server_cache_destruction_release_owner::
+            legacy_wrapper_or_capability);
     quote.receipt.state =
         common_cache_plan_destruction_state::executed;
     quote.receipt.actual_accounting_serial =
@@ -2929,11 +2943,16 @@ void server_prompt_cache_observe_cpu_operation(
         server_cache_observation_operation operation,
         uint8_t prepare_shape,
         uint64_t extent_bytes,
-        int64_t start_us,
+        server_cache_observation_cpu_start start,
         bool success,
         int64_t owned_end_us = 0,
         std::array<uint8_t, 32> adapter_application_digest = {},
-        bool adapter_application_complete = false) noexcept {
+        bool adapter_application_complete = false,
+        common_cache_plan_destruction_effect_set effects = 0,
+        server_cache_destruction_class destruction_class =
+            server_cache_destruction_class::_count,
+        server_cache_destruction_release_owner release_owner =
+            server_cache_destruction_release_owner::none) noexcept {
     if (!cache.cache_observations) {
         return;
     }
@@ -2944,11 +2963,17 @@ void server_prompt_cache_observe_cpu_operation(
         prepare_shape);
     key.adapter_application_digest = adapter_application_digest;
     key.adapter_application_complete = adapter_application_complete;
+    if (operation == server_cache_observation_operation::destruction_apply) {
+        (void) server_cache_calibration_apply_shape_digest_v1(
+            effects, destruction_class, release_owner,
+            key.effect_action_shape_digest);
+    }
     cache.cache_observations->apply_execution_fingerprint(key);
     server_cache_observation_record record;
     (void) server_cache_observe_cpu_operation(
         cache.cache_observations, key, -1, extent_bytes,
-        start_us, end_us, success, &record);
+        start, end_us, success,
+        cache.cache_observations->cpu_operation_isolated(), &record);
     server_cache_emit_observation_noexcept(
         record, cache.debug_observability);
 }
@@ -3389,9 +3414,8 @@ host_destruction_certification certify_host_destruction(
             std::move(victim),
         };
         const auto fresh = cache.acct->snapshot();
-        const int64_t prepare_start_us = cache.cache_observations
-            ? ggml_time_us()
-            : 0;
+        const auto prepare_start = server_cache_observation_capture_cpu_start(
+            cache.cache_observations != nullptr);
         auto prepared = server_cache_prepare_release_set(
             out.quote,
             current,
@@ -3407,7 +3431,7 @@ host_destruction_certification certify_host_destruction(
                 cache,
                 server_cache_observation_operation::durability_prepare,
                 /*prepare_shape=*/1, /*extent_bytes=*/0,
-                prepare_start_us, false, prepare_end_us,
+                prepare_start, false, prepare_end_us,
                 victim_adapter_digest, victim_adapter_complete);
             refuse_certified(prepared.reason);
             return out;
@@ -3430,7 +3454,7 @@ host_destruction_certification certify_host_destruction(
             cache,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, true, prepare_end_us,
+            prepare_start, true, prepare_end_us,
             victim_adapter_digest, victim_adapter_complete);
         server_prompt_cache_observe_host_destruction(
             cache, out.quote.receipt, true, out.projected_bytes, ranking);
@@ -3878,9 +3902,8 @@ bool server_prompt_cache::destroy_priced_host_entry(
             " - removing priced host entry source_id=%d (size = %.3f MiB)\n",
             chosen->victim->cache_plan_source_id,
             chosen->victim->size() / (1024.0 * 1024.0));
-        const int64_t apply_start_us = cache_observations
-            ? ggml_time_us()
-            : 0;
+        const auto apply_start = server_cache_observation_capture_cpu_start(
+            cache_observations != nullptr);
         server_prompt_cache_destroy_entry_impl(*this, chosen->victim);
         // D-A3 uses the same no-interleaving terminal as D-A2. Pricing and all
         // fallible recovery work completed before the physical erase; the raw
@@ -3893,8 +3916,12 @@ bool server_prompt_cache::destroy_priced_host_entry(
         server_prompt_cache_observe_cpu_operation(
             *this, server_cache_observation_operation::destruction_apply,
             /*prepare_shape=*/0, apply_extent_bytes,
-            apply_start_us, true, apply_terminal_us,
-            victim_adapter_digest, victim_adapter_complete);
+            apply_start, true, apply_terminal_us,
+            victim_adapter_digest, victim_adapter_complete,
+            certified.quote.receipt.effects,
+            server_cache_destruction_class::host_artifact_drop,
+            server_cache_destruction_release_owner::
+                legacy_wrapper_or_capability);
         if (destruction_obs) {
             destruction_obs->note_host_trade_executed(
                 admission.sequence,
@@ -4274,16 +4301,15 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     }
 
     const uint64_t serial = acct->snapshot().serial;
-    const int64_t prepare_start_us = cache_observations
-        ? ggml_time_us()
-        : 0;
+    const auto prepare_start = server_cache_observation_capture_cpu_start(
+        cache_observations != nullptr);
     auto prepared = llama_cache_prepare_release_set(*acct, ops, serial);
     if (!prepared.ready()) {
         server_prompt_cache_observe_cpu_operation(
             *this,
             server_cache_observation_operation::durability_prepare,
             /*prepare_shape=*/1, /*extent_bytes=*/0,
-            prepare_start_us, false, 0,
+            prepare_start, false, 0,
             victim_adapter_digest, victim_adapter_complete);
         return false;
     }
@@ -4291,15 +4317,14 @@ bool server_prompt_cache::try_destroy_entry_prepared(
         *this,
         server_cache_observation_operation::durability_prepare,
         /*prepare_shape=*/1, /*extent_bytes=*/0,
-        prepare_start_us, true, 0,
+        prepare_start, true, 0,
         victim_adapter_digest, victim_adapter_complete);
 
     const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
     const std::thread::id scheduler_owner = std::this_thread::get_id();
     const uint64_t apply_extent_bytes = uint64_t(it->size());
-    const int64_t apply_start_us = cache_observations
-        ? ggml_time_us()
-        : 0;
+    const auto apply_start = server_cache_observation_capture_cpu_start(
+        cache_observations != nullptr);
     (void) server_prompt_cache_destroy_entry_impl(*this, it);
     // ZC's exact-release door is scheduler-owned. The observer above only
     // previews existing operations; the raw list erase has no callback or C
@@ -4311,8 +4336,14 @@ bool server_prompt_cache::try_destroy_entry_prepared(
     server_prompt_cache_retire_manifest(*this, retirement);
     server_prompt_cache_observe_cpu_operation(
         *this, server_cache_observation_operation::destruction_apply,
-        /*prepare_shape=*/0, apply_extent_bytes, apply_start_us, true, 0,
-        victim_adapter_digest, victim_adapter_complete);
+        /*prepare_shape=*/0, apply_extent_bytes, apply_start, true, 0,
+        victim_adapter_digest, victim_adapter_complete,
+        common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption),
+        server_cache_destruction_class::host_artifact_drop,
+        server_cache_destruction_release_owner::
+            legacy_wrapper_or_capability);
     if (destruction_obs) {
         destruction_obs->note_prepared_release(admission.sequence, true);
     }
@@ -4377,8 +4408,9 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     }
     const uint64_t redundant_apply_extent = redundant.ready
         ? uint64_t(it->size()) : 0;
-    const int64_t redundant_apply_start = redundant.ready && cache_observations
-        ? ggml_time_us() : 0;
+    const auto redundant_apply_start =
+        server_cache_observation_capture_cpu_start(
+            redundant.ready && cache_observations);
     auto next = server_prompt_cache_destroy_entry_impl(*this, it);
     if (redundant.ready) {
         // D-A2 certify→mutate→commit boundary. Like D-A1, publication and
@@ -4395,7 +4427,11 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
             *this, server_cache_observation_operation::destruction_apply,
             /*prepare_shape=*/0, redundant_apply_extent,
             redundant_apply_start, true, redundant_apply_end,
-            victim_adapter_digest, victim_adapter_complete);
+            victim_adapter_digest, victim_adapter_complete,
+            redundant.quote.receipt.effects,
+            server_cache_destruction_class::host_artifact_drop,
+            server_cache_destruction_release_owner::
+                legacy_wrapper_or_capability);
         if (destruction_obs) {
             destruction_obs->note_redundant_host_executed(
                 admission.sequence, redundant.projected_bytes);
@@ -4970,6 +5006,12 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     if constexpr (Measure) {
         observation->attempted = true;
+        observation->admission_clock =
+            server_cache_observation_capture_admission_clock();
+        observation->adapter_application_digest =
+            it_best->adapter_application_digest;
+        observation->adapter_application_complete =
+            it_best->adapter_application_complete;
     }
     uint64_t observed_owned_cpu_us = 0;
     auto observe_span = [&](int64_t start_us) noexcept {

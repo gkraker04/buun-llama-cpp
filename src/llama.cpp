@@ -474,6 +474,15 @@ bool llama_model_dup_artifact_descriptors(
     return model && model->duplicate_artifact_descriptors(out);
 }
 
+bool llama_model_dup_artifact_descriptors_bounded(
+        const llama_model * model,
+        llama_model_artifact_descriptor * out,
+        size_t capacity,
+        size_t * count) {
+    return model && model->duplicate_artifact_descriptors_bounded(
+        out, capacity, count);
+}
+
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
     llama_model_saver ms(model);
     ms.add_kv_from_model();

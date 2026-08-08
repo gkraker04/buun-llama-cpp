@@ -131,9 +131,14 @@ void server_cache_fingerprint_descriptors_close(
     std::vector<server_cache_fingerprint_descriptor> & descriptors) noexcept;
 
 // One cancelable, bounded worker. It never touches the scheduler or planner.
-// The scheduler may advertise demand; hashing then pauses between 1-MiB reads.
+// The scheduler may advertise demand; hashing then pauses between bounded
+// reads. The complete object, including its read buffer, fits the ZC4 1-MiB
+// fingerprint arena region.
 class server_cache_fingerprint_worker {
 public:
+    static constexpr size_t descriptor_capacity = 256;
+    static constexpr size_t fixed_artifact_capacity = 256;
+
     server_cache_fingerprint_worker() = default;
     ~server_cache_fingerprint_worker();
     server_cache_fingerprint_worker(const server_cache_fingerprint_worker &) = delete;
@@ -143,6 +148,18 @@ public:
         std::vector<server_cache_fingerprint_descriptor> descriptors,
         std::vector<server_cache_fingerprint_field> fields,
         std::vector<server_cache_fingerprint_artifact> fixed_artifacts = {}) noexcept;
+    // Production admission writes directly into the arena-owned worker. The
+    // configuration root is streamed through the frozen v1 codec, so neither
+    // input tables nor canonical byte vectors escape the 1-MiB region.
+    bool configure(
+        const common_params & params,
+        const common_cache_plan_vbr_regime & vbr,
+        uint32_t effective_n_gpu_layers,
+        uint16_t pipeline_mode,
+        uint16_t allocator_vmm_regime) noexcept;
+    bool add_descriptor(server_cache_fingerprint_descriptor value) noexcept;
+    bool add_fixed_artifact(server_cache_fingerprint_artifact value) noexcept;
+    bool launch() noexcept;
     void set_scheduler_demand(bool value) noexcept {
         scheduler_demand_.store(value, std::memory_order_relaxed);
     }
@@ -150,10 +167,12 @@ public:
     void stop() noexcept;
 
 private:
-    void run(
-        std::vector<server_cache_fingerprint_descriptor> descriptors,
-        std::vector<server_cache_fingerprint_field> fields,
-        std::vector<server_cache_fingerprint_artifact> fixed_artifacts) noexcept;
+    static constexpr size_t arena_region_bytes = 1024 * 1024;
+    static constexpr size_t arena_state_reserve_bytes = 64 * 1024;
+    static constexpr size_t hash_buffer_bytes =
+        arena_region_bytes - arena_state_reserve_bytes;
+
+    void run() noexcept;
 
     std::atomic<bool> cancel_{false};
     std::atomic<bool> scheduler_demand_{false};
@@ -163,4 +182,16 @@ private:
     bool ready_ = false;
     bool delivered_ = false;
     bool started_ = false;
+    std::array<server_cache_fingerprint_descriptor, descriptor_capacity>
+        descriptors_ = {};
+    std::array<std::array<uint8_t, 32>, descriptor_capacity>
+        descriptor_digests_ = {};
+    std::array<server_cache_fingerprint_artifact, fixed_artifact_capacity>
+        fixed_artifacts_ = {};
+    size_t descriptor_count_ = 0;
+    size_t fixed_artifact_count_ = 0;
+    std::array<uint8_t, 32> config_root_ = {};
+    bool config_ready_ = false;
+    bool config_exact_ = false;
+    alignas(64) std::array<uint8_t, hash_buffer_bytes> hash_buffer_;
 };

@@ -1856,11 +1856,45 @@ bool llama_model::duplicate_artifact_descriptors(
     }
 }
 
+bool llama_model::duplicate_artifact_descriptors_bounded(
+        llama_model_artifact_descriptor * out,
+        size_t capacity,
+        size_t * count) const noexcept {
+    if (!count) return false;
+    *count = 0;
+    const size_t required = pimpl->artifact_descriptors.size();
+    if (required == 0 || required > capacity || !out) return false;
+    for (size_t i = 0; i < required; ++i) {
+        const auto & source = pimpl->artifact_descriptors[i];
+        const int duplicate = model_artifact_descriptor_dup(source.descriptor);
+        if (duplicate < 0) {
+            for (size_t j = 0; j < i; ++j) {
+                model_artifact_descriptor_close(out[j].descriptor);
+                out[j].descriptor = -1;
+            }
+            return false;
+        }
+        out[i] = { duplicate, source.byte_length, source.integrity_exact };
+    }
+    *count = required;
+    return true;
+}
+
 void llama_model_artifact_descriptors_close(
         std::vector<llama_model_artifact_descriptor> & descriptors) {
     for (auto & row : descriptors) {
         model_artifact_descriptor_close(row.descriptor);
         row.descriptor = -1;
+    }
+}
+
+void llama_model_artifact_descriptors_close_bounded(
+        llama_model_artifact_descriptor * descriptors,
+        size_t count) {
+    if (!descriptors) return;
+    for (size_t i = 0; i < count; ++i) {
+        model_artifact_descriptor_close(descriptors[i].descriptor);
+        descriptors[i].descriptor = -1;
     }
 }
 

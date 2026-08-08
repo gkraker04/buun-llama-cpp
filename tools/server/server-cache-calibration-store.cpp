@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <charconv>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <set>
 #include <tuple>
 
@@ -34,10 +36,183 @@
 #  endif
 #endif
 
-using json = nlohmann::ordered_json;
 namespace fs = std::filesystem;
 
 namespace {
+
+struct codec_arena_state {
+    struct alignas(std::max_align_t) block {
+        size_t size = 0;
+        block * previous = nullptr;
+        block * next = nullptr;
+        bool free = true;
+    };
+
+    codec_arena_state(void * storage, size_t storage_size) noexcept
+        : data(static_cast<uint8_t *>(storage)), size(storage_size) {
+        if (!data || size <= sizeof(block) ||
+            reinterpret_cast<uintptr_t>(data) % alignof(block) != 0) return;
+        first = ::new (data) block;
+        first->size = size - sizeof(block);
+    }
+
+    void * allocate(size_t bytes, size_t alignment) {
+        if (!first || bytes == 0 || alignment == 0 ||
+            (alignment & (alignment - 1)) != 0) throw std::bad_alloc();
+        alignment = std::max(alignment, alignof(block *));
+        for (block * candidate = first; candidate; candidate = candidate->next) {
+            if (!candidate->free) continue;
+            auto * body = reinterpret_cast<uint8_t *>(candidate + 1);
+            const uintptr_t unaligned =
+                reinterpret_cast<uintptr_t>(body + sizeof(block *));
+            const uintptr_t aligned =
+                (unaligned + alignment - 1) & ~(uintptr_t(alignment) - 1);
+            const size_t consumed = size_t(aligned -
+                reinterpret_cast<uintptr_t>(body)) + bytes;
+            if (consumed > candidate->size) continue;
+            const size_t split_offset = (consumed + alignof(block) - 1) &
+                ~(alignof(block) - 1);
+            const size_t remainder = split_offset <= candidate->size
+                ? candidate->size - split_offset : 0;
+            if (remainder > sizeof(block) + alignof(std::max_align_t)) {
+                auto * split = ::new (body + split_offset) block;
+                split->size = remainder - sizeof(block);
+                split->previous = candidate;
+                split->next = candidate->next;
+                if (split->next) split->next->previous = split;
+                candidate->next = split;
+                candidate->size = split_offset;
+            }
+            candidate->free = false;
+            *reinterpret_cast<block **>(aligned - sizeof(block *)) = candidate;
+            live += sizeof(block) + candidate->size;
+            peak = std::max(peak, live);
+            return reinterpret_cast<void *>(aligned);
+        }
+        throw std::bad_alloc();
+    }
+
+    bool owns(const void * value) const noexcept {
+        const auto * byte = static_cast<const uint8_t *>(value);
+        return data && byte >= data && byte < data + size;
+    }
+
+    void release(void * value, size_t, size_t) noexcept {
+        if (!owns(value)) return;
+        block * released = *reinterpret_cast<block **>(
+            static_cast<uint8_t *>(value) - sizeof(block *));
+        if (!owns(released) || released->free) return;
+        live = sizeof(block) + released->size <= live
+            ? live - sizeof(block) - released->size : 0;
+        released->free = true;
+        if (released->next && released->next->free) {
+            block * next = released->next;
+            released->size += sizeof(block) + next->size;
+            released->next = next->next;
+            if (released->next) released->next->previous = released;
+        }
+        if (released->previous && released->previous->free) {
+            block * previous = released->previous;
+            previous->size += sizeof(block) + released->size;
+            previous->next = released->next;
+            if (previous->next) previous->next->previous = previous;
+        }
+    }
+
+    size_t high_water() const noexcept { return peak; }
+
+    uint8_t * data = nullptr;
+    size_t size = 0;
+    block * first = nullptr;
+    size_t live = 0;
+    size_t peak = 0;
+};
+
+thread_local codec_arena_state * active_codec_arena = nullptr;
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+void set_active_codec_arena(codec_arena_state * value) noexcept {
+    active_codec_arena = value;
+}
+
+template <typename T>
+class codec_arena_allocator {
+public:
+    using value_type = T;
+
+    codec_arena_allocator() noexcept = default;
+    template <typename U>
+    codec_arena_allocator(const codec_arena_allocator<U> &) noexcept {}
+
+    T * allocate(size_t count) {
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            throw std::bad_alloc();
+        }
+        if (active_codec_arena) {
+            return static_cast<T *>(active_codec_arena->allocate(
+                count * sizeof(T), alignof(T)));
+        }
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T * value, size_t count) noexcept {
+        if (!value) return;
+        if (active_codec_arena && active_codec_arena->owns(value)) {
+            active_codec_arena->release(
+                value, count * sizeof(T), alignof(T));
+            return;
+        }
+        std::allocator<T>{}.deallocate(value, count);
+    }
+
+    template <typename U>
+    bool operator==(const codec_arena_allocator<U> &) const noexcept {
+        return true;
+    }
+    template <typename U>
+    bool operator!=(const codec_arena_allocator<U> &) const noexcept {
+        return false;
+    }
+};
+
+using codec_string = std::basic_string<
+    char, std::char_traits<char>, codec_arena_allocator<char>>;
+using codec_bytes = std::vector<uint8_t, codec_arena_allocator<uint8_t>>;
+using codec_key_set = std::set<
+    codec_string, std::less<codec_string>, codec_arena_allocator<codec_string>>;
+using codec_key_stack = std::vector<
+    codec_key_set, codec_arena_allocator<codec_key_set>>;
+using codec_json = nlohmann::basic_json<
+    nlohmann::ordered_map, std::vector, codec_string, bool,
+    std::int64_t, std::uint64_t, double, codec_arena_allocator,
+    nlohmann::adl_serializer, codec_bytes>;
+
+class codec_arena_scope {
+public:
+    codec_arena_scope(void * data, size_t size, size_t & high_water) noexcept
+        : state_(active_codec_arena ? nullptr : data,
+                 active_codec_arena ? 0 : size), high_water_(high_water),
+          previous_(active_codec_arena) {
+        if (data && size != 0 && !previous_) {
+            set_active_codec_arena(&state_);
+            active_ = true;
+        }
+    }
+
+    ~codec_arena_scope() {
+        if (!active_) return;
+        high_water_ = std::max(high_water_, state_.high_water());
+        set_active_codec_arena(previous_);
+    }
+
+private:
+    codec_arena_state state_;
+    size_t & high_water_;
+    codec_arena_state * previous_ = nullptr;
+    bool active_ = false;
+};
 
 constexpr uint32_t STORE_SCHEMA = 1;
 constexpr uint32_t ESTIMATOR_VERSION = 2;
@@ -74,7 +249,8 @@ bool take_test_fault(server_cache_calibration_test_fault expected) {
     return true;
 }
 
-void append_u32(std::vector<uint8_t> & out, uint32_t value) {
+template <typename ByteVector>
+void append_u32(ByteVector & out, uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) out.push_back(uint8_t(value >> (8 * i)));
 }
 
@@ -84,9 +260,9 @@ uint32_t read_u32(const uint8_t * data) {
     return out;
 }
 
-std::string hex_digest(const std::array<uint8_t, 32> & value) {
+codec_string hex_digest(const std::array<uint8_t, 32> & value) {
     static constexpr char digits[] = "0123456789abcdef";
-    std::string out(64, '0');
+    codec_string out(64, '0');
     for (size_t i = 0; i < value.size(); ++i) {
         out[2 * i] = digits[value[i] >> 4];
         out[2 * i + 1] = digits[value[i] & 15];
@@ -94,9 +270,9 @@ std::string hex_digest(const std::array<uint8_t, 32> & value) {
     return out;
 }
 
-bool parse_digest(const json & value, std::array<uint8_t, 32> & out) {
+bool parse_digest(const codec_json & value, std::array<uint8_t, 32> & out) {
     if (!value.is_string()) return false;
-    const std::string text = value.get<std::string>();
+    const auto & text = value.get_ref<const codec_string &>();
     if (text.size() != 64) return false;
     auto nibble = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
@@ -112,12 +288,12 @@ bool parse_digest(const json & value, std::array<uint8_t, 32> & out) {
     return true;
 }
 
-std::string double_bits(double value) {
+codec_string double_bits(double value) {
     if (value == 0) value = 0;
     uint64_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     static constexpr char digits[] = "0123456789abcdef";
-    std::string out(16, '0');
+    codec_string out(16, '0');
     for (size_t i = 0; i < 16; ++i) {
         out[15 - i] = digits[bits & 15];
         bits >>= 4;
@@ -125,9 +301,9 @@ std::string double_bits(double value) {
     return out;
 }
 
-bool parse_double_bits(const json & value, double & out) {
+bool parse_double_bits(const codec_json & value, double & out) {
     if (!value.is_string()) return false;
-    const std::string text = value.get<std::string>();
+    const auto & text = value.get_ref<const codec_string &>();
     if (text.size() != 16) return false;
     uint64_t bits = 0;
     for (char c : text) {
@@ -142,14 +318,14 @@ bool parse_double_bits(const json & value, double & out) {
 }
 
 template <size_t N>
-json doubles_json(const std::array<double, N> & values) {
-    json out = json::array();
+codec_json doubles_json(const std::array<double, N> & values) {
+    codec_json out = codec_json::array();
     for (double value : values) out.push_back(double_bits(value));
     return out;
 }
 
 template <size_t N>
-bool parse_doubles(const json & value, std::array<double, N> & out) {
+bool parse_doubles(const codec_json & value, std::array<double, N> & out) {
     if (!value.is_array() || value.size() != N) return false;
     for (size_t i = 0; i < N; ++i) {
         if (!parse_double_bits(value[i], out[i])) return false;
@@ -158,15 +334,15 @@ bool parse_doubles(const json & value, std::array<double, N> & out) {
 }
 
 template <size_t Capacity, typename Size>
-json integers_json(const server_cache_calibration_bounded_array<
+codec_json integers_json(const server_cache_calibration_bounded_array<
                        uint64_t, Capacity, Size> & values) {
-    json out = json::array();
+    codec_json out = codec_json::array();
     for (uint64_t value : values) out.push_back(value);
     return out;
 }
 
 template <size_t Capacity, typename Size>
-bool parse_unsigned_array(const json & value,
+bool parse_unsigned_array(const codec_json & value,
                           server_cache_calibration_bounded_array<
                               uint64_t, Capacity, Size> & out) {
     out.clear();
@@ -180,14 +356,14 @@ bool parse_unsigned_array(const json & value,
     return true;
 }
 
-bool exact_keys(const json & value, std::initializer_list<const char *> keys) {
+bool exact_keys(const codec_json & value, std::initializer_list<const char *> keys) {
     if (!value.is_object() || value.size() != keys.size()) return false;
     for (const char * key : keys) if (!value.contains(key)) return false;
     return true;
 }
 
 template <typename T>
-bool exact_unsigned(const json & value, T & out) {
+bool exact_unsigned(const codec_json & value, T & out) {
     static_assert(std::is_unsigned_v<T>);
     if (!value.is_number_unsigned()) return false;
     const uint64_t raw = value.get<uint64_t>();
@@ -204,16 +380,17 @@ const char * authority_terminal_name(
         case server_cache_calibration_authority_terminal::confidence_budget_exhausted: return "confidence_budget_exhausted";
         case server_cache_calibration_authority_terminal::ordinal_exhausted: return "ordinal_exhausted";
         case server_cache_calibration_authority_terminal::numeric_fault: return "numeric_fault";
+        case server_cache_calibration_authority_terminal::drifted: return "drifted";
         case server_cache_calibration_authority_terminal::_count: break;
     }
     return "invalid";
 }
 
 bool parse_authority_terminal(
-        const json & value,
+        const codec_json & value,
         server_cache_calibration_authority_terminal & out) {
     if (!value.is_string()) return false;
-    const std::string text = value.get<std::string>();
+    const auto & text = value.get_ref<const codec_string &>();
     for (uint8_t i = 0;
          i < uint8_t(server_cache_calibration_authority_terminal::_count); ++i) {
         const auto candidate = server_cache_calibration_authority_terminal(i);
@@ -225,7 +402,7 @@ bool parse_authority_terminal(
     return false;
 }
 
-json key_json(const server_cache_observation_key & key) {
+codec_json key_json(const server_cache_observation_key & key) {
     return {
         { "operation", server_cache_observation_operation_name(key.operation) },
         { "provider", common_cache_plan_provider_name(key.provider) },
@@ -237,6 +414,9 @@ json key_json(const server_cache_observation_key & key) {
         { "ubatch_bucket", key.ubatch_bucket },
         { "size_family", key.size_family },
         { "feature_dim", key.feature_dim },
+        { "model_kind", uint8_t(key.model_kind) },
+        { "operation_extent_bytes", key.operation_extent_bytes },
+        { "target_draft_spec_composition", key.target_draft_spec_composition },
         { "profile_execution_digest", hex_digest(key.profile_execution_digest) },
         { "participant_execution_digest", hex_digest(key.participant_execution_digest) },
         { "adapter_application_digest", hex_digest(key.adapter_application_digest) },
@@ -248,11 +428,13 @@ json key_json(const server_cache_observation_key & key) {
     };
 }
 
-bool parse_key(const json & value, server_cache_observation_key & out) {
+bool parse_key(const codec_json & value, server_cache_observation_key & out) {
     if (!exact_keys(value, {
             "operation", "provider", "restore_kind", "prepare_shape",
             "contention_bucket", "start_bucket", "batch_bucket",
-            "ubatch_bucket", "size_family", "feature_dim",
+            "ubatch_bucket", "size_family", "feature_dim", "model_kind",
+            "operation_extent_bytes",
+            "target_draft_spec_composition",
             "profile_execution_digest", "participant_execution_digest",
             "adapter_application_digest", "representation_digest",
             "effect_action_shape_digest", "adapter_application_complete",
@@ -260,8 +442,8 @@ bool parse_key(const json & value, server_cache_observation_key & out) {
     try {
         if (!value.at("operation").is_string() ||
             !value.at("provider").is_string()) return false;
-        const std::string operation = value.at("operation").get<std::string>();
-        const std::string provider = value.at("provider").get<std::string>();
+        const auto & operation = value.at("operation").get_ref<const codec_string &>();
+        const auto & provider = value.at("provider").get_ref<const codec_string &>();
         bool operation_found = false;
         bool provider_found = false;
         for (uint8_t i = 0;
@@ -282,6 +464,7 @@ bool parse_key(const json & value, server_cache_observation_key & out) {
             }
         }
         if (!operation_found || !provider_found) return false;
+        uint8_t model_kind = 0;
         if (!exact_unsigned(value.at("restore_kind"), out.restore_kind) ||
             !exact_unsigned(value.at("prepare_shape"), out.prepare_shape) ||
             !exact_unsigned(value.at("contention_bucket"), out.contention_bucket) ||
@@ -289,7 +472,16 @@ bool parse_key(const json & value, server_cache_observation_key & out) {
             !exact_unsigned(value.at("batch_bucket"), out.batch_bucket) ||
             !exact_unsigned(value.at("ubatch_bucket"), out.ubatch_bucket) ||
             !exact_unsigned(value.at("size_family"), out.size_family) ||
-            !exact_unsigned(value.at("feature_dim"), out.feature_dim)) return false;
+            !exact_unsigned(value.at("feature_dim"), out.feature_dim) ||
+            !exact_unsigned(value.at("model_kind"), model_kind) ||
+            !exact_unsigned(value.at("operation_extent_bytes"),
+                            out.operation_extent_bytes) ||
+            !exact_unsigned(value.at("target_draft_spec_composition"),
+                            out.target_draft_spec_composition)) return false;
+        if (model_kind >= uint8_t(server_cache_calibration_model_kind::_count)) {
+            return false;
+        }
+        out.model_kind = server_cache_calibration_model_kind(model_kind);
         if (out.size_family >= 4 || out.feature_dim == 0 || out.feature_dim > 4 ||
             !parse_digest(value.at("profile_execution_digest"), out.profile_execution_digest) ||
             !parse_digest(value.at("participant_execution_digest"), out.participant_execution_digest) ||
@@ -305,8 +497,8 @@ bool parse_key(const json & value, server_cache_observation_key & out) {
     }
 }
 
-json instance_json(const server_cache_calibration_instance_snapshot & value) {
-    json v = json::array();
+codec_json instance_json(const server_cache_calibration_instance_snapshot & value) {
+    codec_json v = codec_json::array();
     for (const auto & row : value.v) v.push_back(doubles_json(row));
     return {
         { "slot", value.slot },
@@ -418,25 +610,30 @@ bool manifest_semantically_valid(
         const server_cache_calibration_manifest & value) {
     if (!nonzero_digest(value.store_lineage_id) ||
         value.profiles.size() > MAX_PROFILES) return false;
-    std::set<uint64_t> q_values;
-    std::set<uint64_t> file_values;
-    std::set<uint64_t> prune_values;
-    std::set<std::array<uint8_t, 32>> identities;
-    for (const auto & ref : value.profiles) {
+    for (size_t i = 0; i < value.profiles.size(); ++i) {
+        const auto & ref = value.profiles[i];
         if (!nonzero_digest(ref.profile_identity_digest) ||
             ref.profile_generation_ordinal >=
                 value.next_profile_generation_ordinal ||
             ref.profile_file_generation >= value.next_immutable_file_ordinal ||
-            ref.persisted_prune_recency >= value.next_persisted_prune_epoch ||
-            !q_values.insert(ref.profile_generation_ordinal).second ||
-            !file_values.insert(ref.profile_file_generation).second ||
-            !prune_values.insert(ref.persisted_prune_recency).second ||
-            !identities.insert(ref.profile_identity_digest).second) return false;
+            ref.persisted_prune_recency >= value.next_persisted_prune_epoch) {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            const auto & prior = value.profiles[j];
+            if (ref.profile_generation_ordinal ==
+                    prior.profile_generation_ordinal ||
+                ref.profile_file_generation == prior.profile_file_generation ||
+                ref.persisted_prune_recency == prior.persisted_prune_recency ||
+                ref.profile_identity_digest == prior.profile_identity_digest) {
+                return false;
+            }
+        }
     }
     return true;
 }
 
-bool parse_instance(const json & value,
+bool parse_instance(const codec_json & value,
                     server_cache_calibration_instance_snapshot & out) {
     if (!exact_keys(value, {
             "slot", "key", "fit_generation", "authority_terminal",
@@ -515,9 +712,10 @@ std::array<uint8_t, 32> envelope_digest(
     return hash.finish();
 }
 
-bool encode_envelope(const json & payload, size_t limit,
-                     std::vector<uint8_t> & out) {
-    const std::string text = payload.dump();
+template <typename ByteVector>
+bool encode_envelope(const codec_json & payload, size_t limit,
+                     ByteVector & out) {
+    const codec_string text = payload.dump();
     if (text.size() > limit || text.size() > UINT32_MAX) return false;
     out.clear();
     out.reserve(ENVELOPE_FIXED + text.size());
@@ -533,7 +731,11 @@ bool encode_envelope(const json & payload, size_t limit,
 }
 
 bool decode_envelope(const uint8_t * data, size_t size, size_t limit,
-                     const char * expected_object, json & out) {
+                     const char * expected_object, codec_json & out,
+                     server_cache_calibration_bounded_array<
+                         server_cache_calibration_instance_snapshot,
+                         server_cache_observation_store::instance_capacity> *
+                         streamed_instances = nullptr) {
     if (!data || size < ENVELOPE_FIXED ||
         std::memcmp(data, MAGIC, 8) != 0 || read_u32(data + 8) != STORE_SCHEMA) return false;
     const uint32_t length = read_u32(data + 12);
@@ -541,35 +743,46 @@ bool decode_envelope(const uint8_t * data, size_t size, size_t limit,
     const auto expected = envelope_digest(data + 8, data + 12, data + 16, length);
     if (!std::equal(expected.begin(), expected.end(), data + 16 + length)) return false;
     bool refused = false;
+    bool stream_refused = false;
     size_t events = 0;
-    std::vector<std::set<std::string>> object_keys;
-    auto callback = [&](int depth, json::parse_event_t event, json & parsed) {
+    codec_key_stack object_keys;
+    auto callback = [&](int depth, codec_json::parse_event_t event, codec_json & parsed) {
         if (++events > JSON_EVENT_LIMIT || depth < 0 ||
             depth > JSON_DEPTH_LIMIT) {
             refused = true;
             return false;
         }
-        if (event == json::parse_event_t::object_start) {
+        if (event == codec_json::parse_event_t::object_start) {
             object_keys.emplace_back();
-        } else if (event == json::parse_event_t::key) {
+        } else if (event == codec_json::parse_event_t::key) {
             if (object_keys.empty() || !parsed.is_string()) {
                 refused = true;
                 return false;
             }
-            const std::string key = parsed.get<std::string>();
+            const codec_string key = parsed.get<codec_string>();
             if (key.size() > JSON_KEY_LIMIT ||
                 !object_keys.back().insert(key).second) {
                 refused = true;
                 return false;
             }
-        } else if (event == json::parse_event_t::object_end) {
+        } else if (event == codec_json::parse_event_t::object_end) {
             if (object_keys.empty()) {
                 refused = true;
                 return false;
             }
             object_keys.pop_back();
-        } else if (event == json::parse_event_t::value && parsed.is_string() &&
-                   parsed.get_ref<const std::string &>().size() >
+            if (streamed_instances && depth == 2) {
+                server_cache_calibration_instance_snapshot instance;
+                if (!parse_instance(parsed, instance) ||
+                    !streamed_instances->push_back(std::move(instance))) {
+                    stream_refused = true;
+                }
+                // A completed profile instance is copied directly into the
+                // fixed snapshot and discarded from the JSON DOM.
+                return false;
+            }
+        } else if (event == codec_json::parse_event_t::value && parsed.is_string() &&
+                   parsed.get_ref<const codec_string &>().size() >
                        JSON_STRING_LIMIT) {
             refused = true;
             return false;
@@ -577,8 +790,8 @@ bool decode_envelope(const uint8_t * data, size_t size, size_t limit,
         return !refused;
     };
     try {
-        out = json::parse(data + 16, data + 16 + length, callback, true, false);
-        return !refused && object_keys.empty() && out.is_object() &&
+        out = codec_json::parse(data + 16, data + 16 + length, callback, true, false);
+        return !refused && !stream_refused && object_keys.empty() && out.is_object() &&
             out.value("object", "") == expected_object &&
             out.value("schema_version", 0u) == STORE_SCHEMA &&
             out.value("estimator_version", 0u) == ESTIMATOR_VERSION;
@@ -587,8 +800,8 @@ bool decode_envelope(const uint8_t * data, size_t size, size_t limit,
     }
 }
 
-json manifest_json(const server_cache_calibration_manifest & value) {
-    json profiles = json::array();
+codec_json manifest_json(const server_cache_calibration_manifest & value) {
+    codec_json profiles = codec_json::array();
     for (const auto & profile : value.profiles) {
         profiles.push_back({
             { "profile_generation_ordinal", profile.profile_generation_ordinal },
@@ -613,25 +826,65 @@ json manifest_json(const server_cache_calibration_manifest & value) {
     };
 }
 
-json profile_json(const std::array<uint8_t, 32> & lineage,
-                  const server_cache_calibration_profile_snapshot & value) {
-    json instances = json::array();
-    for (const auto & instance : value.instances) instances.push_back(instance_json(instance));
-    return {
-        { "object", "cache_calibration_profile" },
-        { "schema_version", STORE_SCHEMA },
-        { "estimator_version", ESTIMATOR_VERSION },
-        { "store_lineage_id", hex_digest(lineage) },
-        { "profile_generation_ordinal", value.profile_generation_ordinal },
-        { "profile_file_generation", value.profile_file_generation },
-        { "persisted_prune_recency", value.persisted_prune_recency },
-        { "mutation_generation", value.mutation_generation },
-        { "profile_identity_digest", hex_digest(value.profile_identity_digest) },
-        { "identity_exact", value.identity_exact },
-        { "instances", std::move(instances) },
-        { "bounded_diagnostic_residual_reservoir", json::object() },
-        { "profile_last_update_unix_ms", value.profile_last_update_unix_ms },
-    };
+template <typename ByteVector>
+void append_text(ByteVector & out, const char * text) {
+    out.insert(out.end(), text, text + std::strlen(text));
+}
+
+template <typename ByteVector>
+void append_unsigned(ByteVector & out, uint64_t value) {
+    char text[32];
+    const auto converted = std::to_chars(text, text + sizeof(text), value);
+    if (converted.ec != std::errc()) throw std::bad_alloc();
+    out.insert(out.end(), text, converted.ptr);
+}
+
+template <typename ByteVector>
+bool encode_profile_streamed(
+        const std::array<uint8_t, 32> & lineage,
+        const server_cache_calibration_profile_snapshot & value,
+        ByteVector & out) {
+    out.clear();
+    out.reserve(PROFILE_PAYLOAD_LIMIT + ENVELOPE_FIXED);
+    out.insert(out.end(), MAGIC, MAGIC + 8);
+    append_u32(out, STORE_SCHEMA);
+    append_u32(out, 0);
+    append_text(out, "{\"object\":\"cache_calibration_profile\",\"schema_version\":1,\"estimator_version\":2,\"store_lineage_id\":\"");
+    const codec_string lineage_hex = hex_digest(lineage);
+    out.insert(out.end(), lineage_hex.begin(), lineage_hex.end());
+    append_text(out, "\",\"profile_generation_ordinal\":");
+    append_unsigned(out, value.profile_generation_ordinal);
+    append_text(out, ",\"profile_file_generation\":");
+    append_unsigned(out, value.profile_file_generation);
+    append_text(out, ",\"persisted_prune_recency\":");
+    append_unsigned(out, value.persisted_prune_recency);
+    append_text(out, ",\"mutation_generation\":");
+    append_unsigned(out, value.mutation_generation);
+    append_text(out, ",\"profile_identity_digest\":\"");
+    const codec_string identity_hex = hex_digest(value.profile_identity_digest);
+    out.insert(out.end(), identity_hex.begin(), identity_hex.end());
+    append_text(out, value.identity_exact
+        ? "\",\"identity_exact\":true,\"instances\":["
+        : "\",\"identity_exact\":false,\"instances\":[");
+    bool first = true;
+    for (const auto & instance : value.instances) {
+        if (!first) out.push_back(',');
+        first = false;
+        const codec_string encoded = instance_json(instance).dump();
+        out.insert(out.end(), encoded.begin(), encoded.end());
+        if (out.size() - 16 > PROFILE_PAYLOAD_LIMIT) return false;
+    }
+    append_text(out, "],\"bounded_diagnostic_residual_reservoir\":{},\"profile_last_update_unix_ms\":");
+    append_unsigned(out, value.profile_last_update_unix_ms);
+    out.push_back('}');
+    const size_t payload_size = out.size() - 16;
+    if (payload_size > PROFILE_PAYLOAD_LIMIT || payload_size > UINT32_MAX) return false;
+    const uint32_t length = uint32_t(payload_size);
+    for (unsigned i = 0; i < 4; ++i) out[12 + i] = uint8_t(length >> (8 * i));
+    const auto digest = envelope_digest(
+        out.data() + 8, out.data() + 12, out.data() + 16, payload_size);
+    out.insert(out.end(), digest.begin(), digest.end());
+    return true;
 }
 
 #if !defined(_WIN32)
@@ -639,11 +892,89 @@ bool validated_regular_stat(const struct stat & status) {
     return S_ISREG(status.st_mode) && status.st_uid == geteuid() &&
         status.st_nlink == 1 && (status.st_mode & 0777) == 0600;
 }
+
+// Walk an absolute directory path without ever following a symlink. Existing
+// system ancestors may have their platform modes/owners; every component we
+// create is owner-only. The store leaf applies the stricter owner/mode check
+// below after this function returns its parent capability.
+int open_directory_chain(const fs::path & path,
+                         const fs::path & secure_root) noexcept {
+    try {
+        if (!path.is_absolute() ||
+            (!secure_root.empty() && !secure_root.is_absolute())) return -1;
+        std::vector<std::string> secure_parts;
+        if (!secure_root.empty()) {
+            for (const auto & raw_part : secure_root) {
+                const std::string part = raw_part.string();
+                if (part.empty() || part == "/") continue;
+                if (part == "." || part == "..") return -1;
+                secure_parts.push_back(part);
+            }
+            if (secure_parts.empty()) return -1;
+        }
+        int current = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (current < 0) return -1;
+        size_t component_index = 0;
+        for (const auto & raw_part : path) {
+            const std::string part = raw_part.string();
+            if (part.empty() || part == "/") continue;
+            if (part == "." || part == "..") {
+                ::close(current);
+                return -1;
+            }
+            bool created = false;
+            int next = openat(current, part.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (next < 0 && errno == ENOENT) {
+                if (mkdirat(current, part.c_str(), 0700) != 0) {
+                    ::close(current);
+                    return -1;
+                }
+                created = true;
+                next = openat(current, part.c_str(),
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            }
+            struct stat status = {};
+            const bool secure_component = !secure_parts.empty() &&
+                component_index + 1 >= secure_parts.size();
+            if (component_index < secure_parts.size() &&
+                part != secure_parts[component_index]) {
+                ::close(current);
+                if (next >= 0) ::close(next);
+                return -1;
+            }
+            const bool status_valid = next >= 0 && fstat(next, &status) == 0 &&
+                S_ISDIR(status.st_mode);
+            const bool secure_mode_valid = !secure_component || created ||
+                (status_valid && status.st_uid == geteuid() &&
+                 (status.st_mode & 0777) == 0700);
+            const bool created_valid = !created ||
+                (status_valid && status.st_uid == geteuid() &&
+                 fchmod(next, 0700) == 0 && fsync(current) == 0);
+            const bool valid = status_valid && secure_mode_valid && created_valid;
+            ::close(current);
+            if (!valid) {
+                if (next >= 0) ::close(next);
+                return -1;
+            }
+            current = next;
+            ++component_index;
+        }
+        if (!secure_parts.empty() && component_index < secure_parts.size()) {
+            ::close(current);
+            return -1;
+        }
+        return current;
+    } catch (...) {
+        return -1;
+    }
+}
 #endif
 
+template <typename ByteVector>
 bool read_file_bounded(int directory_descriptor, const std::string & directory,
                        const std::string & name, size_t limit,
-                       std::vector<uint8_t> & out) {
+                       ByteVector & out) {
 #if defined(_WIN32)
     const std::string path = (fs::path(directory) / name).string();
     std::error_code ec;
@@ -725,9 +1056,10 @@ bool write_all(int fd, const uint8_t * data, size_t size) {
     return true;
 }
 
+template <typename ByteVector>
 bool write_file_exclusive(int directory_descriptor, const std::string & directory,
                           const std::string & name,
-                          const std::vector<uint8_t> & bytes) {
+                          const ByteVector & bytes) {
 #if defined(_WIN32)
     const std::string path = (fs::path(directory) / name).string();
     const int fd = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
@@ -761,9 +1093,10 @@ bool write_file_exclusive(int directory_descriptor, const std::string & director
     return ok;
 }
 
+template <typename ByteVector>
 bool replace_file(int directory_descriptor, const std::string & directory,
                   const std::string & name,
-                  const std::vector<uint8_t> & bytes) {
+                  const ByteVector & bytes) {
 #if defined(_WIN32)
     const int pid = _getpid();
 #else
@@ -901,6 +1234,68 @@ uint64_t unix_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+constexpr uint64_t RESTORED_FRESHNESS_HORIZON_MS = 10 * 60 * 1000;
+
+bool profile_clock_anomalous(
+        const server_cache_calibration_profile_snapshot & value,
+        uint64_t now) {
+    return value.profile_last_update_unix_ms != 0 &&
+        (now < value.profile_last_update_unix_ms ||
+         now - value.profile_last_update_unix_ms >
+             RESTORED_FRESHNESS_HORIZON_MS);
+}
+
+uint8_t profile_reuse_state_rank(
+        const server_cache_calibration_profile_snapshot & value) {
+    uint8_t rank = 0;
+    for (const auto & instance : value.instances) {
+        if (instance.authority_terminal !=
+                server_cache_calibration_authority_terminal::none) {
+            continue;
+        }
+        uint8_t instance_rank = 1; // learning
+        if (instance.n_fit >= uint64_t(instance.key.feature_dim) + 1) {
+            instance_rank = 2; // fitted/provisional
+        }
+        if (value.identity_exact && instance.n_validation >= 4 &&
+            instance.validation_region_minutes.size() >= 3) {
+            instance_rank = 3; // strongest store-owned active evidence
+        }
+        rank = std::max(rank, instance_rank);
+    }
+    return rank;
+}
+
+void snapshot_fit_generations(
+        const server_cache_calibration_profile_snapshot & value,
+        std::array<uint64_t,
+                   server_cache_observation_store::instance_capacity> & generations,
+        std::array<bool,
+                   server_cache_observation_store::instance_capacity> & used) {
+    generations = {};
+    used = {};
+    for (const auto & instance : value.instances) {
+        if (instance.slot >= used.size()) continue;
+        used[instance.slot] = true;
+        generations[instance.slot] = instance.fit_generation;
+    }
+}
+
+bool observer_fit_generations_match(
+        const server_cache_observation_store & observer,
+        const server_cache_calibration_profile_currency & currency) {
+    const auto & instances = observer.instances();
+    for (size_t slot = 0; slot < instances.size(); ++slot) {
+        if (instances[slot].used !=
+                currency.committed_fit_generation_used[slot] ||
+            (instances[slot].used && instances[slot].fit_generation !=
+                currency.committed_fit_generations[slot])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool profile_nonregressed(
         const server_cache_calibration_profile_snapshot & older,
         const server_cache_calibration_profile_snapshot & newer) {
@@ -913,22 +1308,30 @@ bool profile_nonregressed(
         if (found == newer.instances.end() ||
             found->fit_generation < old_instance.fit_generation) return false;
         if (found->fit_generation > old_instance.fit_generation) {
-            // A checked new fit generation may reuse the bounded physical
-            // slot with a new key and reset moments. Sticky authority
-            // terminals remain lineage-wide until an explicit store reset.
-            if (old_instance.authority_terminal !=
-                    server_cache_calibration_authority_terminal::none &&
-                found->authority_terminal != old_instance.authority_terminal) {
-                return false;
-            }
+            // Only the observer's typed drift transition may consume g+1.
+            // The key is immutable in its physical estimator slot and the
+            // fresh generation must not inherit the drift terminal/tail.
+            if (old_instance.fit_generation == UINT64_MAX ||
+                found->fit_generation != old_instance.fit_generation + 1 ||
+                !(found->key == old_instance.key) ||
+                old_instance.authority_terminal !=
+                    server_cache_calibration_authority_terminal::drifted ||
+                found->authority_terminal !=
+                    server_cache_calibration_authority_terminal::none ||
+                found->tail_actual_max_us != 0) return false;
             continue;
         }
+        const bool clock_authority_reset = newer.clock_authority_reset &&
+            profile_clock_anomalous(older, unix_ms());
         if (!(found->key == old_instance.key) ||
             found->n_fit < old_instance.n_fit ||
             found->qualified_execution_ordinal < old_instance.qualified_execution_ordinal ||
-            found->n_validation < old_instance.n_validation ||
-            found->safe_measurable_opportunities < old_instance.safe_measurable_opportunities ||
-            found->opportunity_at_last_validation < old_instance.opportunity_at_last_validation ||
+            (!clock_authority_reset &&
+             (found->n_validation < old_instance.n_validation ||
+              found->safe_measurable_opportunities <
+                  old_instance.safe_measurable_opportunities ||
+              found->opportunity_at_last_validation <
+                  old_instance.opportunity_at_last_validation)) ||
             found->reservoir_seen < old_instance.reservoir_seen ||
             (old_instance.authority_terminal !=
                  server_cache_calibration_authority_terminal::none &&
@@ -965,6 +1368,24 @@ uint64_t server_cache_calibration_test_fault_hits() noexcept {
     return test_fault_hits.load(std::memory_order_acquire);
 }
 
+static bool encode_manifest_bounded(
+        const server_cache_calibration_manifest & value,
+        codec_bytes & out) {
+    out.clear();
+    if (!manifest_semantically_valid(value)) return false;
+    return encode_envelope(manifest_json(value), ROOT_PAYLOAD_LIMIT, out);
+}
+
+static bool encode_profile_bounded(
+        const std::array<uint8_t, 32> & store_lineage_id,
+        const server_cache_calibration_profile_snapshot & value,
+        codec_bytes & out) {
+    out.clear();
+    if (!nonzero_digest(store_lineage_id) ||
+        !server_cache_calibration_validate_profile(value)) return false;
+    return encode_profile_streamed(store_lineage_id, value, out);
+}
+
 bool server_cache_calibration_encode_manifest(
         const server_cache_calibration_manifest & value,
         std::vector<uint8_t> & out) noexcept {
@@ -983,7 +1404,7 @@ bool server_cache_calibration_decode_manifest(
         server_cache_calibration_manifest & out) noexcept {
     out = {};
     try {
-        json value;
+        codec_json value;
         if (!decode_envelope(data, size, ROOT_PAYLOAD_LIMIT,
                              "cache_calibration_store", value) ||
             !exact_keys(value, {
@@ -1030,16 +1451,18 @@ bool server_cache_calibration_decode_manifest(
         std::sort(out.profiles.begin(), out.profiles.end(), [](const auto & a, const auto & b) {
             return a.profile_generation_ordinal < b.profile_generation_ordinal;
         });
-        std::set<std::array<uint8_t, 32>> identities;
-        std::set<uint64_t> files;
-        std::set<uint64_t> prune_epochs;
         for (size_t i = 0; i < out.profiles.size(); ++i) {
-            if ((i != 0 && out.profiles[i - 1].profile_generation_ordinal ==
-                           out.profiles[i].profile_generation_ordinal) ||
-                !identities.insert(out.profiles[i].profile_identity_digest).second ||
-                !files.insert(out.profiles[i].profile_file_generation).second ||
-                !prune_epochs.insert(out.profiles[i].persisted_prune_recency).second) {
-                return false;
+            for (size_t j = 0; j < i; ++j) {
+                if (out.profiles[i].profile_generation_ordinal ==
+                        out.profiles[j].profile_generation_ordinal ||
+                    out.profiles[i].profile_identity_digest ==
+                        out.profiles[j].profile_identity_digest ||
+                    out.profiles[i].profile_file_generation ==
+                        out.profiles[j].profile_file_generation ||
+                    out.profiles[i].persisted_prune_recency ==
+                        out.profiles[j].persisted_prune_recency) {
+                    return false;
+                }
             }
         }
         return true;
@@ -1057,8 +1480,30 @@ bool server_cache_calibration_encode_profile(
         out.clear();
         if (!nonzero_digest(store_lineage_id) ||
             !server_cache_calibration_validate_profile(value)) return false;
-        return encode_envelope(profile_json(store_lineage_id, value),
-                               PROFILE_PAYLOAD_LIMIT, out);
+        return encode_profile_streamed(store_lineage_id, value, out);
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+bool server_cache_calibration_encode_profile_with_scratch_for_test(
+        const std::array<uint8_t, 32> & store_lineage_id,
+        const server_cache_calibration_profile_snapshot & value,
+        void * scratch, size_t scratch_size,
+        std::vector<uint8_t> & out, size_t & high_water) noexcept {
+    out.clear();
+    high_water = 0;
+    try {
+        {
+            codec_arena_scope codec(scratch, scratch_size, high_water);
+            codec_bytes bounded;
+            if (!encode_profile_bounded(store_lineage_id, value, bounded)) {
+                return false;
+            }
+            out.assign(bounded.begin(), bounded.end());
+        }
+        return true;
     } catch (...) {
         out.clear();
         return false;
@@ -1071,10 +1516,15 @@ bool server_cache_calibration_decode_profile(
         server_cache_calibration_profile_snapshot & out) noexcept {
     out = {};
     try {
-        json value;
+        codec_json value;
         std::array<uint8_t, 32> lineage = {};
+        server_cache_calibration_bounded_array<
+            server_cache_calibration_instance_snapshot,
+            server_cache_observation_store::instance_capacity>
+            streamed_instances;
         if (!decode_envelope(data, size, PROFILE_PAYLOAD_LIMIT,
-                             "cache_calibration_profile", value) ||
+                             "cache_calibration_profile", value,
+                             &streamed_instances) ||
             !exact_keys(value, {
                 "object", "schema_version", "estimator_version",
                 "store_lineage_id", "profile_generation_ordinal",
@@ -1099,18 +1549,33 @@ bool server_cache_calibration_decode_profile(
         if (!exact_unsigned(value.at("profile_last_update_unix_ms"),
                             out.profile_last_update_unix_ms)) return false;
         const auto & instances = value.at("instances");
-        if (!instances.is_array() ||
-            instances.size() > server_cache_observation_store::instance_capacity ||
+        if (!instances.is_array() || !instances.empty() ||
             !value.at("bounded_diagnostic_residual_reservoir").is_object() ||
             !value.at("bounded_diagnostic_residual_reservoir").empty()) return false;
         std::array<bool, server_cache_observation_store::instance_capacity> used = {};
-        for (const auto & row : instances) {
-            server_cache_calibration_instance_snapshot instance;
-            if (!parse_instance(row, instance) || used[instance.slot]) return false;
+        for (const auto & instance : streamed_instances) {
+            if (used[instance.slot]) return false;
             used[instance.slot] = true;
-            if (!out.instances.push_back(std::move(instance))) return false;
         }
+        out.instances = std::move(streamed_instances);
         return server_cache_calibration_validate_profile(out);
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+
+bool server_cache_calibration_decode_profile_with_scratch_for_test(
+        const uint8_t * data, size_t size,
+        const std::array<uint8_t, 32> & expected_lineage_id,
+        void * scratch, size_t scratch_size,
+        server_cache_calibration_profile_snapshot & out,
+        size_t & high_water) noexcept {
+    high_water = 0;
+    try {
+        codec_arena_scope codec(scratch, scratch_size, high_water);
+        return server_cache_calibration_decode_profile(
+            data, size, expected_lineage_id, out);
     } catch (...) {
         out = {};
         return false;
@@ -1182,6 +1647,8 @@ bool server_cache_calibration_restore_observer(
         value.instances.size() > server_cache_observation_store::instance_capacity) {
         return false;
     }
+    const bool clock_authority_reset = value.clock_authority_reset ||
+        profile_clock_anomalous(value, unix_ms());
     std::array<server_cache_observation_instance,
                server_cache_observation_store::instance_capacity> instances = {};
     for (const auto & source : value.instances) {
@@ -1192,7 +1659,6 @@ bool server_cache_calibration_restore_observer(
         auto & target = instances[source.slot];
         target.used = true;
         target.key = source.key;
-        target.key.identity_exact = store.execution_fingerprint().exact;
         target.fit_generation = source.fit_generation;
         target.authority_terminal = source.authority_terminal;
         target.v = source.v;
@@ -1202,23 +1668,25 @@ bool server_cache_calibration_restore_observer(
         target.feature_max = source.feature_max;
         target.qualified_execution_ordinal =
             source.qualified_execution_ordinal;
-        target.log_wealth = source.log_wealth;
-        target.n_validation = source.n_validation;
-        target.fit_region_count = uint8_t(source.fit_region_minutes.size());
-        std::copy(source.fit_region_minutes.begin(),
-                  source.fit_region_minutes.end(),
-                  target.fit_region_minutes.begin());
-        target.validation_region_count =
-            uint8_t(source.validation_region_minutes.size());
-        std::copy(source.validation_region_minutes.begin(),
-                  source.validation_region_minutes.end(),
-                  target.validation_region_minutes.begin());
-        target.safe_measurable_opportunities =
-            source.safe_measurable_opportunities;
-        target.opportunity_at_last_validation =
-            source.opportunity_at_last_validation;
-        target.last_fit_unix_ms = source.last_fit_unix_ms;
-        target.last_validation_unix_ms = source.last_validation_unix_ms;
+        if (!clock_authority_reset) {
+            target.log_wealth = source.log_wealth;
+            target.n_validation = source.n_validation;
+            target.fit_region_count = uint8_t(source.fit_region_minutes.size());
+            std::copy(source.fit_region_minutes.begin(),
+                      source.fit_region_minutes.end(),
+                      target.fit_region_minutes.begin());
+            target.validation_region_count =
+                uint8_t(source.validation_region_minutes.size());
+            std::copy(source.validation_region_minutes.begin(),
+                      source.validation_region_minutes.end(),
+                      target.validation_region_minutes.begin());
+            target.safe_measurable_opportunities =
+                source.safe_measurable_opportunities;
+            target.opportunity_at_last_validation =
+                source.opportunity_at_last_validation;
+            target.last_fit_unix_ms = source.last_fit_unix_ms;
+            target.last_validation_unix_ms = source.last_validation_unix_ms;
+        }
         target.response_reservoir = source.response_reservoir;
         target.reservoir_seen = source.reservoir_seen;
         target.tail_exceeded = source.authority_terminal ==
@@ -1248,8 +1716,9 @@ bool server_cache_calibration_store::commit_manifest() noexcept {
     auto next = manifest_;
     ++next.generation;
     next.last_update_unix_ms = unix_ms();
-    std::vector<uint8_t> bytes;
-    if (!server_cache_calibration_encode_manifest(next, bytes) ||
+    codec_arena_scope codec(codec_scratch_, codec_scratch_size_, codec_high_water_);
+    codec_bytes bytes;
+    if (!encode_manifest_bounded(next, bytes) ||
         take_test_fault(
             server_cache_calibration_test_fault::manifest_replace_once) ||
         !replace_file(directory_descriptor_, directory_, "manifest.bcal", bytes)) {
@@ -1263,11 +1732,14 @@ bool server_cache_calibration_store::commit_manifest() noexcept {
 bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
     if (failed_) return false;
     try {
-        std::set<std::string> live;
-        for (const auto & profile : manifest_.profiles) {
-            live.insert(profile_name(profile.profile_generation_ordinal,
-                                     profile.profile_file_generation));
-        }
+        const auto live = [&](uint64_t q, uint64_t f) {
+            return std::any_of(
+                manifest_.profiles.begin(), manifest_.profiles.end(),
+                [&](const auto & profile) {
+                    return profile.profile_generation_ordinal == q &&
+                        profile.profile_file_generation == f;
+                });
+        };
         size_t entries = 0;
         uint64_t bytes_seen = 0;
         bool removed = false;
@@ -1291,7 +1763,9 @@ bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
             uint64_t q = 0;
             uint64_t f = 0;
             if (!profile_filename(name, &q, &f) || name != profile_name(q, f)) return false;
-            std::vector<uint8_t> data;
+            codec_arena_scope codec(
+                codec_scratch_, codec_scratch_size_, codec_high_water_);
+            codec_bytes data;
             server_cache_calibration_profile_snapshot profile;
             if (!read_file_bounded(directory_descriptor_, directory_, name,
                                    PROFILE_PAYLOAD_LIMIT + ENVELOPE_FIXED, data) ||
@@ -1300,7 +1774,7 @@ bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
                                                           profile) ||
                 profile.profile_generation_ordinal != q ||
                 profile.profile_file_generation != f) return false;
-            if (live.find(name) == live.end()) {
+            if (!live(q, f)) {
                 if (!fs::remove(entry.path(), ec) || ec) return false;
                 removed = true;
             }
@@ -1343,7 +1817,9 @@ bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
                 valid = false;
                 break;
             }
-            std::vector<uint8_t> data;
+            codec_arena_scope codec(
+                codec_scratch_, codec_scratch_size_, codec_high_water_);
+            codec_bytes data;
             server_cache_calibration_profile_snapshot profile;
             if (!read_file_bounded(directory_descriptor_, directory_, name,
                                    PROFILE_PAYLOAD_LIMIT + ENVELOPE_FIXED, data) ||
@@ -1355,7 +1831,7 @@ bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
                 valid = false;
                 break;
             }
-            if (live.find(name) == live.end()) {
+            if (!live(q, f)) {
                 if (unlinkat(directory_descriptor_, name.c_str(), 0) != 0) {
                     valid = false;
                     break;
@@ -1372,7 +1848,8 @@ bool server_cache_calibration_store::garbage_collect_profiles() noexcept {
 }
 
 server_cache_calibration_load_status server_cache_calibration_store::open(
-        const std::string & directory) noexcept {
+        const std::string & directory,
+        const std::string & secure_state_root) noexcept {
     close();
 #if defined(_WIN32)
     // v1's owner/mode/link and descriptor-relative contract has no reviewed
@@ -1383,7 +1860,6 @@ server_cache_calibration_load_status server_cache_calibration_store::open(
 #else
     try {
         if (directory.empty()) return server_cache_calibration_load_status::io_fault;
-        std::error_code ec;
         directory_ = directory;
         failed_ = false;
         const fs::path store_path(directory);
@@ -1393,13 +1869,8 @@ server_cache_calibration_load_status server_cache_calibration_store::open(
             close();
             return server_cache_calibration_load_status::io_fault;
         }
-        fs::create_directories(parent_path, ec);
-        if (ec) {
-            close();
-            return server_cache_calibration_load_status::io_fault;
-        }
-        const int parent_descriptor = ::open(parent_path.c_str(),
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const int parent_descriptor = open_directory_chain(
+            parent_path, fs::path(secure_state_root));
         if (parent_descriptor < 0) {
             close();
             return server_cache_calibration_load_status::io_fault;
@@ -1503,7 +1974,9 @@ server_cache_calibration_load_status server_cache_calibration_store::open(
                 return server_cache_calibration_load_status::io_fault;
             }
         } else {
-            std::vector<uint8_t> bytes;
+            codec_arena_scope codec(
+                codec_scratch_, codec_scratch_size_, codec_high_water_);
+            codec_bytes bytes;
             if (!read_file_bounded(directory_descriptor_, directory_, "manifest.bcal",
                                    ROOT_PAYLOAD_LIMIT + ENVELOPE_FIXED, bytes) ||
                 !server_cache_calibration_decode_manifest(
@@ -1576,7 +2049,9 @@ bool server_cache_calibration_store::load_referenced_profile(
         server_cache_calibration_profile_snapshot & out) noexcept {
     out = {};
     try {
-        std::vector<uint8_t> bytes;
+        codec_arena_scope codec(
+            codec_scratch_, codec_scratch_size_, codec_high_water_);
+        codec_bytes bytes;
         if (!read_file_bounded(directory_descriptor_, directory_,
                 profile_name(ref.profile_generation_ordinal,
                              ref.profile_file_generation),
@@ -1650,8 +2125,10 @@ server_cache_calibration_load_status server_cache_calibration_store::commit_prof
         if (!commit_manifest()) {
             return server_cache_calibration_load_status::io_fault;
         }
-        std::vector<uint8_t> bytes;
-        if (!server_cache_calibration_encode_profile(
+        codec_arena_scope codec(
+            codec_scratch_, codec_scratch_size_, codec_high_water_);
+        codec_bytes bytes;
+        if (!encode_profile_bounded(
                 manifest_.store_lineage_id, value, bytes) ||
             take_test_fault(
                 server_cache_calibration_test_fault::profile_write_once) ||
@@ -1707,9 +2184,36 @@ server_cache_calibration_writer::~server_cache_calibration_writer() {
     stop();
 }
 
-bool server_cache_calibration_writer::start(std::string directory) noexcept {
+server_cache_calibration_profile_snapshot &
+server_cache_calibration_writer::pending_profile() noexcept {
+    return snapshots_->pending();
+}
+
+server_cache_calibration_profile_snapshot &
+server_cache_calibration_writer::inflight_profile() noexcept {
+    return snapshots_->inflight();
+}
+
+bool server_cache_calibration_writer::start(
+        std::string directory,
+        std::string secure_state_root) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (ever_started_ || started_ || directory.empty()) return false;
+    try {
+        if (!snapshots_) {
+            owned_snapshots_ =
+                std::make_unique<server_cache_calibration_snapshot_workspace>();
+            snapshots_ = owned_snapshots_.get();
+        }
+        if (!codec_scratch_) {
+            owned_codec_scratch_ =
+                std::make_unique<std::byte[]>(2 * 1024 * 1024);
+            codec_scratch_ = owned_codec_scratch_.get();
+            codec_scratch_size_ = 2 * 1024 * 1024;
+        }
+    } catch (...) {
+        return false;
+    }
     ever_started_ = true;
     started_ = true;
     stop_ = false;
@@ -1717,8 +2221,9 @@ bool server_cache_calibration_writer::start(std::string directory) noexcept {
                   std::memory_order_release);
     try {
         thread_ = std::thread(
-            [this, directory = std::move(directory)]() mutable {
-                run(std::move(directory));
+            [this, directory = std::move(directory),
+             secure_state_root = std::move(secure_state_root)]() mutable {
+                run(std::move(directory), std::move(secure_state_root));
             });
         return true;
     } catch (...) {
@@ -1756,17 +2261,17 @@ bool server_cache_calibration_writer::enqueue(
             return false;
         }
         if (pending_ &&
-            pending_profile_.profile_identity_digest ==
+            pending_profile().profile_identity_digest ==
                 value.profile_identity_digest &&
-            value.mutation_generation <= pending_profile_.mutation_generation) {
+            value.mutation_generation <= pending_profile().mutation_generation) {
             return false;
         }
-        if (pending_ && pending_profile_.profile_identity_digest !=
+        if (pending_ && pending_profile().profile_identity_digest !=
                             value.profile_identity_digest) return false;
-        pending_profile_ = value;
-        last_enqueued_identity_ = pending_profile_.profile_identity_digest;
+        pending_profile() = value;
+        last_enqueued_identity_ = pending_profile().profile_identity_digest;
         last_enqueued_mutation_generation_ =
-            pending_profile_.mutation_generation;
+            pending_profile().mutation_generation;
         pending_ = true;
         condition_.notify_one();
         return true;
@@ -1781,9 +2286,8 @@ bool server_cache_calibration_writer::poll_loaded(
     std::lock_guard<std::mutex> lock(mutex_);
     if (!load_ready_ || load_delivered_) return false;
     try {
-        profiles.clear();
-        if (loaded_profiles_) profiles = std::move(*loaded_profiles_);
-        loaded_profiles_.reset();
+        profiles = std::move(loaded_profiles_);
+        loaded_profiles_.clear();
         status = load_status_;
         load_delivered_ = true;
         return true;
@@ -1806,31 +2310,25 @@ bool server_cache_calibration_writer::poll_committed(
     return true;
 }
 
-void server_cache_calibration_writer::run(std::string directory) noexcept {
-    server_cache_calibration_store store;
-    const auto open_status = store.open(directory);
-    std::unique_ptr<server_cache_calibration_profile_set> loaded;
-    try {
-        loaded = std::make_unique<server_cache_calibration_profile_set>();
-    } catch (...) {
-        health_.store(server_cache_calibration_writer_health::quarantined,
-                      std::memory_order_release);
-        std::lock_guard<std::mutex> lock(mutex_);
-        load_status_ = server_cache_calibration_load_status::capacity;
-        load_ready_ = true;
-        return;
-    }
+void server_cache_calibration_writer::run(
+        std::string directory,
+        std::string secure_state_root) noexcept {
+    server_cache_calibration_store store(codec_scratch_, codec_scratch_size_);
+    const auto open_status = store.open(directory, secure_state_root);
+    loaded_profiles_.clear();
     const auto load_status = open_status == server_cache_calibration_load_status::ok
-        ? store.load_profiles(*loaded) : open_status;
+        ? store.load_profiles(loaded_profiles_) : open_status;
     if (open_status == server_cache_calibration_load_status::ok &&
         load_status == server_cache_calibration_load_status::ok) {
+        boot_claim_ordinal_.store(store.boot_claim_ordinal(),
+                                  std::memory_order_release);
+        boot_claim_ready_.store(true, std::memory_order_release);
         health_.store(server_cache_calibration_writer_health::healthy,
                       std::memory_order_release);
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         load_status_ = load_status;
-        loaded_profiles_ = std::move(loaded);
         load_ready_ = true;
     }
     if (open_status != server_cache_calibration_load_status::ok ||
@@ -1840,23 +2338,22 @@ void server_cache_calibration_writer::run(std::string directory) noexcept {
         return;
     }
     for (;;) {
-        server_cache_calibration_profile_snapshot value;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             condition_.wait(lock, [&] { return stop_ || pending_; });
             if (stop_ && !pending_) break;
-            value = std::move(pending_profile_);
+            inflight_profile() = std::move(pending_profile());
             pending_ = false;
         }
         unsigned retry = 0;
         for (;;) {
-            const auto status = store.commit_profile(value);
+            const auto status = store.commit_profile(inflight_profile());
             if (status == server_cache_calibration_load_status::ok) {
                 const auto found = std::find_if(
                     store.manifest().profiles.begin(),
                     store.manifest().profiles.end(), [&](const auto & ref) {
                         return ref.profile_identity_digest ==
-                            value.profile_identity_digest;
+                            inflight_profile().profile_identity_digest;
                     });
                 if (found == store.manifest().profiles.end()) {
                     health_.store(server_cache_calibration_writer_health::quarantined,
@@ -1867,9 +2364,12 @@ void server_cache_calibration_writer::run(std::string directory) noexcept {
                 ack.profile_identity_digest = found->profile_identity_digest;
                 ack.profile_generation_ordinal =
                     found->profile_generation_ordinal;
-                ack.mutation_generation = value.mutation_generation;
+                ack.mutation_generation = inflight_profile().mutation_generation;
                 ack.profile_file_generation = found->profile_file_generation;
                 ack.root_generation = store.manifest().generation;
+                snapshot_fit_generations(
+                    inflight_profile(), ack.fit_generations,
+                    ack.fit_generation_used);
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!committed_acks_.push_back(ack)) {
                     health_.store(
@@ -1893,10 +2393,11 @@ void server_cache_calibration_writer::run(std::string directory) noexcept {
             condition_.wait_for(lock, delay, [&] { return stop_ || pending_; });
             if (stop_) return;
             if (pending_ &&
-                pending_profile_.profile_identity_digest ==
-                    value.profile_identity_digest &&
-                pending_profile_.mutation_generation > value.mutation_generation) {
-                value = std::move(pending_profile_);
+                pending_profile().profile_identity_digest ==
+                    inflight_profile().profile_identity_digest &&
+                pending_profile().mutation_generation >
+                    inflight_profile().mutation_generation) {
+                inflight_profile() = std::move(pending_profile());
                 pending_ = false;
             }
         }
@@ -1904,8 +2405,10 @@ void server_cache_calibration_writer::run(std::string directory) noexcept {
 }
 
 bool server_cache_calibration_coordinator::start(
-        std::string directory) noexcept {
-    return writer_.start(std::move(directory));
+        std::string directory,
+        std::string secure_state_root) noexcept {
+    return writer_.start(
+        std::move(directory), std::move(secure_state_root));
 }
 
 bool server_cache_calibration_coordinator::cache_snapshot(
@@ -1918,8 +2421,33 @@ bool server_cache_calibration_coordinator::cache_snapshot(
         });
     if (cached != loaded_profiles_.end()) {
         const bool persisted_seed = cached->persisted_seed;
+        const bool clock_authority_reset = cached->clock_authority_reset ||
+            value.clock_authority_reset;
+        const uint64_t profile_generation_ordinal =
+            cached->profile_generation_ordinal;
+        const uint64_t profile_file_generation =
+            cached->profile_file_generation;
+        const uint64_t persisted_prune_recency =
+            cached->persisted_prune_recency;
+        const uint64_t profile_last_update_unix_ms =
+            cached->profile_last_update_unix_ms;
         *cached = value;
         cached->persisted_seed = persisted_seed;
+        cached->clock_authority_reset = clock_authority_reset;
+        cached->profile_generation_ordinal = profile_generation_ordinal;
+        cached->profile_file_generation = profile_file_generation;
+        cached->persisted_prune_recency = persisted_prune_recency;
+        cached->profile_last_update_unix_ms = profile_last_update_unix_ms;
+        const auto currency = std::find_if(
+            profile_currencies_.begin(), profile_currencies_.end(),
+            [&](const auto & candidate) {
+                return candidate.profile_identity_digest ==
+                    cached->profile_identity_digest;
+            });
+        if (currency != profile_currencies_.end()) {
+            currency->profile_state_rank = profile_reuse_state_rank(*cached);
+            currency->clock_authority_reset = clock_authority_reset;
+        }
         cached_dirty_ = has_cached_dirty();
         return true;
     }
@@ -1932,7 +2460,9 @@ bool server_cache_calibration_coordinator::cache_snapshot(
     // hope. last_enqueued is advanced only after writer_.enqueue() takes
     // ownership, so an in-flight accepted image is reusable without evidence
     // loss while a rejected dirty image is not.
+    if (profile_reuse_disabled_) return false;
     auto victim = loaded_profiles_.end();
+    auto victim_currency = profile_currencies_.end();
     for (auto it = loaded_profiles_.begin(); it != loaded_profiles_.end(); ++it) {
         const auto currency = std::find_if(
             profile_currencies_.begin(), profile_currencies_.end(),
@@ -1944,24 +2474,28 @@ bool server_cache_calibration_coordinator::cache_snapshot(
             it->mutation_generation >
                 currency->last_enqueued_mutation_generation) continue;
         if (victim == loaded_profiles_.end() ||
-            std::tie(it->persisted_prune_recency,
-                     it->profile_identity_digest) <
-                std::tie(victim->persisted_prune_recency,
-                         victim->profile_identity_digest)) {
+            std::tie(currency->profile_state_rank,
+                     currency->profile_last_use_epoch,
+                     it->profile_identity_digest,
+                     it->profile_generation_ordinal) <
+                std::tie(victim_currency->profile_state_rank,
+                         victim_currency->profile_last_use_epoch,
+                         victim->profile_identity_digest,
+                         victim->profile_generation_ordinal)) {
             victim = it;
+            victim_currency = currency;
         }
     }
     if (victim == loaded_profiles_.end()) return false;
-    const auto victim_identity = victim->profile_identity_digest;
     *victim = value;
-    const auto victim_currency = std::find_if(
-        profile_currencies_.begin(), profile_currencies_.end(),
-        [&](const auto & candidate) {
-            return candidate.profile_identity_digest == victim_identity;
-        });
     if (victim_currency != profile_currencies_.end()) {
         profile_currencies_.erase(victim_currency);
     }
+    server_cache_calibration_profile_currency replacement;
+    replacement.profile_identity_digest = value.profile_identity_digest;
+    replacement.profile_state_rank = profile_reuse_state_rank(value);
+    replacement.clock_authority_reset = value.clock_authority_reset;
+    if (!profile_currencies_.push_back(replacement)) return false;
     cached_dirty_ = has_cached_dirty();
     return true;
 }
@@ -1976,9 +2510,15 @@ bool server_cache_calibration_coordinator::resolve_load(
                 return value.profile_identity_digest ==
                     profile_identity_digest_;
             });
-        resume_pending_ = currency != profile_currencies_.end() &&
-            currency->resume_validation_pending;
-        resume_started_us_ = resume_pending_ ? currency->resume_started_us : 0;
+        resume_pending_ = currency != profile_currencies_.end()
+            ? currency->resume_validation_pending
+            : server_cache_resume_validation_flags{};
+        resume_authority_validation_required_ =
+            currency != profile_currencies_.end()
+                ? currency->resume_authority_validation_required
+                : server_cache_resume_validation_flags{};
+        resume_started_us_ = currency != profile_currencies_.end()
+            ? currency->resume_started_us : 0;
     };
     const auto seed_persisted_currency = [&](const auto & profile) {
         auto currency = std::find_if(
@@ -1987,7 +2527,11 @@ bool server_cache_calibration_coordinator::resolve_load(
                 return value.profile_identity_digest ==
                     profile.profile_identity_digest;
             });
-        if (currency != profile_currencies_.end()) return true;
+        if (currency != profile_currencies_.end()) {
+            currency->profile_state_rank = profile_reuse_state_rank(profile);
+            currency->clock_authority_reset = profile.clock_authority_reset;
+            return true;
+        }
         server_cache_calibration_profile_currency value;
         value.profile_identity_digest = profile.profile_identity_digest;
         value.last_enqueued_mutation_generation = profile.mutation_generation;
@@ -1996,9 +2540,20 @@ bool server_cache_calibration_coordinator::resolve_load(
             profile.profile_generation_ordinal;
         value.committed_profile_file_generation =
             profile.profile_file_generation;
+        snapshot_fit_generations(
+            profile, value.committed_fit_generations,
+            value.committed_fit_generation_used);
+        value.profile_state_rank = profile_reuse_state_rank(profile);
         value.committed_ack_seen = true;
-        value.resume_validation_pending = true;
+        for (const auto & instance : profile.instances) {
+            if (instance.slot >= value.resume_validation_pending.size()) {
+                return false;
+            }
+            value.resume_validation_pending[instance.slot] = true;
+            value.resume_authority_validation_required[instance.slot] = true;
+        }
         value.resume_started_us = ggml_time_us();
+        value.clock_authority_reset = profile.clock_authority_reset;
         return profile_currencies_.push_back(value);
     };
     if (load_resolved_) {
@@ -2009,6 +2564,10 @@ bool server_cache_calibration_coordinator::resolve_load(
                 effective_fingerprint.complete = false;
             }
             observer.set_execution_fingerprint(effective_fingerprint);
+            observer.set_resume_state(
+                resume_pending_, resume_authority_validation_required_,
+                resume_started_us_);
+            apply_claim_identity(observer);
             return true;
         }
 
@@ -2047,12 +2606,19 @@ bool server_cache_calibration_coordinator::resolve_load(
             if (found->persisted_seed) (void) seed_persisted_currency(*found);
         }
         select_resume_state();
+        observer.set_resume_state(
+            resume_pending_, resume_authority_validation_required_,
+            resume_started_us_);
+        apply_claim_identity(observer);
         return true;
     }
     server_cache_calibration_load_status status;
     if (!writer_.poll_loaded(status, loaded_profiles_)) return false;
+    const uint64_t load_unix_ms = unix_ms();
     for (auto & profile : loaded_profiles_) {
         profile.persisted_seed = true;
+        profile.clock_authority_reset =
+            profile_clock_anomalous(profile, load_unix_ms);
         if (!seed_persisted_currency(profile)) return false;
     }
 
@@ -2078,21 +2644,66 @@ bool server_cache_calibration_coordinator::resolve_load(
         }
     }
     load_resolved_ = true;
+    observer.set_resume_state(
+        resume_pending_, resume_authority_validation_required_,
+        resume_started_us_);
+    apply_claim_identity(observer);
     return true;
 }
 
-void server_cache_calibration_coordinator::complete_resume_validation() noexcept {
+void server_cache_calibration_coordinator::note_profile_use() noexcept {
+    if (!load_resolved_ || profile_reuse_disabled_) return;
+    const auto currency = std::find_if(
+        profile_currencies_.begin(), profile_currencies_.end(),
+        [&](const auto & value) {
+            return value.profile_identity_digest == profile_identity_digest_;
+        });
+    if (currency == profile_currencies_.end()) return;
+    if (profile_last_use_epoch_ == UINT64_MAX) {
+        profile_reuse_disabled_ = true;
+        return;
+    }
+    currency->profile_last_use_epoch = ++profile_last_use_epoch_;
+}
+
+void server_cache_calibration_coordinator::apply_claim_identity(
+        server_cache_observation_store & observer) noexcept {
+    const auto currency = std::find_if(
+        profile_currencies_.begin(), profile_currencies_.end(),
+        [&](const auto & value) {
+            return value.profile_identity_digest == profile_identity_digest_;
+        });
+    const bool available = writer_.boot_claim_ready() &&
+        currency != profile_currencies_.end() &&
+        currency->committed_ack_seen &&
+        observer_fit_generations_match(observer, *currency);
+    observer.set_calibration_claim_identity(
+        available,
+        available ? writer_.boot_claim_ordinal() : 0,
+        available ? currency->committed_profile_generation_ordinal : 0);
+    observer.set_committed_profile_mutation_generation(
+        currency != profile_currencies_.end()
+            ? currency->committed_mutation_generation : 0);
+}
+
+void server_cache_calibration_coordinator::complete_resume_validation(
+        uint32_t estimator_slot, bool succeeded) noexcept {
+    if (estimator_slot >= resume_pending_.size()) return;
     const auto currency = std::find_if(
         profile_currencies_.begin(), profile_currencies_.end(),
         [&](const auto & value) {
             return value.profile_identity_digest == profile_identity_digest_;
         });
     if (currency != profile_currencies_.end()) {
-        currency->resume_validation_pending = false;
-        currency->resume_started_us = 0;
+        currency->resume_validation_pending[estimator_slot] = false;
+        if (succeeded) {
+            currency->resume_authority_validation_required[estimator_slot] = false;
+        }
     }
-    resume_pending_ = false;
-    resume_started_us_ = 0;
+    resume_pending_[estimator_slot] = false;
+    if (succeeded) {
+        resume_authority_validation_required_[estimator_slot] = false;
+    }
 }
 
 bool server_cache_calibration_coordinator::consume_acks() noexcept {
@@ -2126,7 +2737,19 @@ bool server_cache_calibration_coordinator::consume_acks() noexcept {
         currency->committed_profile_file_generation =
             ack.profile_file_generation;
         currency->committed_root_generation = ack.root_generation;
+        currency->committed_fit_generations = ack.fit_generations;
+        currency->committed_fit_generation_used = ack.fit_generation_used;
         currency->committed_ack_seen = true;
+        currency->clock_authority_reset = false;
+        const auto cached = std::find_if(
+            loaded_profiles_.begin(), loaded_profiles_.end(),
+            [&](const auto & profile) {
+                return profile.profile_identity_digest ==
+                    ack.profile_identity_digest;
+            });
+        if (cached != loaded_profiles_.end()) {
+            cached->clock_authority_reset = false;
+        }
     }
     return progressed;
 }
@@ -2163,6 +2786,10 @@ bool server_cache_calibration_coordinator::enqueue_one_cached_dirty() noexcept {
             server_cache_calibration_profile_currency value;
             value.profile_identity_digest =
                 overflow_snapshot_.profile_identity_digest;
+            value.profile_state_rank =
+                profile_reuse_state_rank(overflow_snapshot_);
+            value.clock_authority_reset =
+                overflow_snapshot_.clock_authority_reset;
             if (!profile_currencies_.push_back(value)) return false;
             currency = profile_currencies_.end() - 1;
         }
@@ -2195,6 +2822,8 @@ bool server_cache_calibration_coordinator::enqueue_one_cached_dirty() noexcept {
             value.profile_identity_digest = profile.profile_identity_digest;
             value.last_enqueued_mutation_generation =
                 profile.mutation_generation;
+            value.profile_state_rank = profile_reuse_state_rank(profile);
+            value.clock_authority_reset = profile.clock_authority_reset;
             if (!profile_currencies_.push_back(value)) return false;
         } else {
             currency->last_enqueued_mutation_generation =
@@ -2230,8 +2859,14 @@ bool server_cache_calibration_coordinator::enqueue_latest(
         writer_.health() != server_cache_calibration_writer_health::healthy) {
         return false;
     }
-    if (!server_cache_calibration_snapshot_observer(observer, snapshot_buffer_) ||
-        !writer_.enqueue(snapshot_buffer_)) return false;
+    if (!server_cache_calibration_snapshot_observer(observer, snapshot_buffer_)) {
+        return false;
+    }
+    snapshot_buffer_.clock_authority_reset =
+        currency->clock_authority_reset;
+    currency->profile_state_rank =
+        profile_reuse_state_rank(snapshot_buffer_);
+    if (!writer_.enqueue(snapshot_buffer_)) return false;
     profile_identity_digest_ = observer.execution_fingerprint().execution_root;
     currency->last_enqueued_mutation_generation = mutation;
     last_enqueue_us_ = now_us;
@@ -2243,6 +2878,17 @@ void server_cache_calibration_coordinator::lifecycle(
     if (!load_resolved_ || writer_.health() !=
             server_cache_calibration_writer_health::healthy) return;
     const bool worker_progress = consume_acks();
+    apply_claim_identity(observer);
+    std::array<server_cache_resume_validation_outcome,
+               server_cache_observation_store::instance_capacity> resume_outcomes;
+    const size_t resume_outcome_count = observer.take_resume_validation_outcomes(
+        resume_outcomes.data(), resume_outcomes.size());
+    for (size_t i = 0; i < resume_outcome_count; ++i) {
+        complete_resume_validation(
+            resume_outcomes[i].estimator_slot,
+            resume_outcomes[i].kind ==
+                server_cache_resume_validation_outcome_kind::succeeded);
+    }
     const auto current = std::find_if(
         profile_currencies_.begin(), profile_currencies_.end(),
         [&](const auto & value) {

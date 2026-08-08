@@ -7,6 +7,7 @@
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-plan-preflight-internal.h"
+#include "server-cache-calibration-model.h"
 #include "server-cache-calibration-store.h"
 #include "server-cache-observer.h"
 #include "server-cache-yield.h"
@@ -710,23 +711,26 @@ struct server_slot {
                 common_cache_plan_provider::host_cache_entry, 0);
             if (!cache_observations->execution_fingerprint().complete) {
                 key.identity_complete = false;
-            } else if (!server_cache_adapter_application_digest_v1(
-                    lora, key.adapter_application_digest)) {
+            } else if (!load_observation.adapter_application_complete) {
                 key.identity_complete = false;
                 key.identity_exact = false;
             } else {
+                key.adapter_application_digest =
+                    load_observation.adapter_application_digest;
                 key.adapter_application_complete = true;
                 cache_observations->apply_execution_fingerprint(key);
             }
             if (load_observation.restored) {
                 cache_observation_epoch.arm(
-                    id, key, load_observation.owned_cpu_us);
+                    id, key, load_observation.owned_cpu_us,
+                    load_observation.admission_clock);
                 cache_observation_epoch.bind_provider(
                     key, load_observation.payload_bytes,
                     load_observation.owned_cpu_us);
             } else if (load_observation.attempted) {
                 cache_observation_epoch.arm(
-                    id, key, load_observation.owned_cpu_us);
+                    id, key, load_observation.owned_cpu_us,
+                    load_observation.admission_clock);
                 server_cache_observation_record record;
                 (void) cache_observation_epoch.abandon(
                     server_cache_observation_reason::operation_failed,
@@ -800,8 +804,13 @@ struct server_slot {
             server_cache_observation_operation operation,
             uint8_t prepare_shape,
             uint64_t extent_bytes,
-            int64_t start_us,
-            bool success) noexcept {
+            server_cache_observation_cpu_start start,
+            bool success,
+            common_cache_plan_destruction_effect_set effects = 0,
+            server_cache_destruction_class destruction_class =
+                server_cache_destruction_class::_count,
+            server_cache_destruction_release_owner release_owner =
+                server_cache_destruction_release_owner::none) noexcept {
         if (!cache_observations) {
             return;
         }
@@ -809,6 +818,11 @@ struct server_slot {
         const auto key = server_cache_observation_cpu_key(
             operation, common_cache_plan_provider::live_slot, prepare_shape);
         auto observed_key = key;
+        if (operation == server_cache_observation_operation::destruction_apply) {
+            (void) server_cache_calibration_apply_shape_digest_v1(
+                effects, destruction_class, release_owner,
+                observed_key.effect_action_shape_digest);
+        }
         if (!cache_observations->execution_fingerprint().complete) {
             observed_key.identity_complete = false;
         } else if (!server_cache_adapter_application_digest_v1(
@@ -822,7 +836,8 @@ struct server_slot {
         server_cache_observation_record record;
         (void) server_cache_observe_cpu_operation(
             cache_observations, observed_key, id, extent_bytes,
-            start_us, end_us, success, &record);
+            start, end_us, success,
+            cache_observations->cpu_operation_isolated(), &record);
         server_cache_emit_observation_noexcept(
             record, cache_debug_observability);
     }
@@ -898,9 +913,8 @@ struct server_slot {
                 ? target_extent + draft_extent
                 : 0;
         }
-        const int64_t apply_start_us = cache_observations
-            ? ggml_time_us()
-            : 0;
+        const auto apply_start = server_cache_observation_capture_cpu_start(
+            cache_observations != nullptr);
         server_cache_slot_drop_impl(false);
         GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
         const auto released = capability.commit(
@@ -915,7 +929,10 @@ struct server_slot {
             observe_cache_cpu_operation(
                 server_cache_observation_operation::destruction_apply,
                 /*prepare_shape=*/0, apply_extent_bytes,
-                apply_start_us, true);
+                apply_start, true, quote.receipt.effects,
+                server_cache_destruction_class::slot_drop,
+                server_cache_destruction_release_owner::
+                    legacy_wrapper_or_capability);
         }
 
         quote.receipt.state =
@@ -2435,18 +2452,35 @@ private:
     // Fixed-size, process-local ZC2 sufficient state. ZC3 replaces the
     // provisional identity with the stable multi-artifact profile; until then
     // production rows remain diagnostic and no planner can read this object.
-    std::unique_ptr<server_cache_observation_store> cache_optimizer_observations;
-    std::unique_ptr<server_cache_fingerprint_worker> cache_fingerprint_worker;
-    std::unique_ptr<server_cache_calibration_coordinator> cache_calibration;
+    // ZC4's one arena precedes every placement-owned object so reverse member
+    // destruction runs each destructor before releasing the backing storage.
+    static_assert(sizeof(server_cache_observation_store) <=
+                  server_cache_calibration_arena_layout::global_tables_size);
+    static_assert(sizeof(server_cache_fingerprint_worker) <=
+                  server_cache_calibration_arena_layout::fingerprint_size);
+    static_assert(sizeof(server_cache_calibration_coordinator) <=
+                  server_cache_calibration_arena_layout::profile_slots_size);
+    static_assert(sizeof(server_cache_calibration_snapshot_workspace) ==
+                  server_cache_calibration_arena_layout::snapshots_size);
+    std::unique_ptr<server_cache_calibration_arena> cache_calibration_arena;
+    server_cache_calibration_arena_ptr<server_cache_observation_store>
+        cache_optimizer_observations;
+    server_cache_calibration_arena_ptr<server_cache_fingerprint_worker>
+        cache_fingerprint_worker;
+    server_cache_calibration_arena_ptr<
+        server_cache_calibration_snapshot_workspace>
+        cache_calibration_snapshots;
+    server_cache_calibration_arena_ptr<server_cache_calibration_coordinator>
+        cache_calibration;
     std::optional<server_cache_execution_fingerprint> cache_fingerprint_pending;
     bool cache_fingerprint_ready_logged = false;
     bool cache_fingerprint_scheduler_busy = false;
-    std::vector<uint32_t> cache_observation_batch_tokens;
-    std::vector<llama_pos> cache_observation_first_pos;
+    uint64_t cache_calibration_inventory_ordinal = 0;
+    bool cache_calibration_inventory_currency_exhausted = false;
+    int cache_calibration_last_profile_use_task = -1;
 
-    server_cache_observation_key cache_observation_provider_key(
-            common_cache_plan_provider provider,
-            const std::vector<common_adapter_lora_info> & adapters) noexcept {
+    static server_cache_observation_key cache_observation_provider_base_key(
+            common_cache_plan_provider provider) noexcept {
         server_cache_observation_key key;
         key.provider = provider;
         key.operation = provider ==
@@ -2455,12 +2489,35 @@ private:
             : provider == common_cache_plan_provider::host_cache_entry
                 ? server_cache_observation_operation::restore
                 : server_cache_observation_operation::replay;
+        if (key.operation == server_cache_observation_operation::restore) {
+            key.restore_kind = provider ==
+                    common_cache_plan_provider::host_cache_entry
+                ? 1 : 3;
+        }
         key.feature_dim = key.operation == server_cache_observation_operation::restore
             ? 2 : 4;
+        key.model_kind = key.operation == server_cache_observation_operation::restore
+            ? server_cache_calibration_model_kind::restore_scaled
+            : server_cache_calibration_model_kind::replay_scaled;
+        static const std::array<uint8_t, 32> neutral_effect = [] {
+            std::array<uint8_t, 32> digest = {};
+            (void) server_cache_calibration_effect_action_digest_v1(
+                nullptr, 0, digest);
+            return digest;
+        }();
+        key.effect_action_shape_digest = neutral_effect;
         // ZC3a fills stable execution/representation digests. Until then the
         // real row is bounded diagnostic evidence and can never become fit.
         key.identity_complete = false;
-        if (!cache_optimizer_observations->execution_fingerprint().complete) {
+        return key;
+    }
+
+    server_cache_observation_key cache_observation_provider_key(
+            common_cache_plan_provider provider,
+            const std::vector<common_adapter_lora_info> & adapters) noexcept {
+        auto key = cache_observation_provider_base_key(provider);
+        if (!cache_optimizer_observations ||
+            !cache_optimizer_observations->execution_fingerprint().complete) {
             key.identity_complete = false;
         } else if (!server_cache_adapter_application_digest_v1(
                 adapters, key.adapter_application_digest)) {
@@ -2468,6 +2525,20 @@ private:
             key.identity_exact = false;
         } else {
             key.adapter_application_complete = true;
+            cache_optimizer_observations->apply_execution_fingerprint(key);
+        }
+        return key;
+    }
+
+    server_cache_observation_key cache_observation_provider_key(
+            common_cache_plan_provider provider,
+            const std::array<uint8_t, 32> & adapter_digest,
+            bool adapter_complete) noexcept {
+        auto key = cache_observation_provider_base_key(provider);
+        key.adapter_application_digest = adapter_digest;
+        key.adapter_application_complete = adapter_complete;
+        if (adapter_complete && cache_optimizer_observations &&
+            cache_optimizer_observations->execution_fingerprint().complete) {
             cache_optimizer_observations->apply_execution_fingerprint(key);
         }
         return key;
@@ -2481,10 +2552,13 @@ private:
             !params_base.mmproj.path.empty()) {
             return;
         }
-        std::vector<server_cache_fingerprint_field> fields;
-        std::vector<server_cache_fingerprint_descriptor> descriptors;
-        std::vector<server_cache_fingerprint_artifact> fixed_artifacts;
         try {
+            if (!cache_calibration_arena) return;
+            cache_fingerprint_worker.reset(
+                cache_calibration_arena->construct<server_cache_fingerprint_worker>(
+                    server_cache_calibration_arena_layout::fingerprint_begin,
+                    server_cache_calibration_arena_layout::fingerprint_size));
+            if (!cache_fingerprint_worker) return;
             const auto vbr = common_cache_plan_vbr_regime_from_params(
                 params_base,
                 [](const char * name) { return std::getenv(name); });
@@ -2492,29 +2566,40 @@ private:
                 params_base.n_gpu_layers >= 0
                     ? uint32_t(params_base.n_gpu_layers)
                     : uint32_t(llama_model_n_layer(model_tgt) + 1);
-            if (!server_cache_fingerprint_fields_v1(
+            if (!cache_fingerprint_worker->configure(
                     params_base, vbr, effective_n_gpu_layers,
                     uint16_t(llama_context_pipeline_parallel_active(ctx_tgt)),
-                    uint16_t(llama_context_vbr_vmm_active(ctx_tgt)), fields)) {
+                    uint16_t(llama_context_vbr_vmm_active(ctx_tgt)))) {
+                cache_fingerprint_worker.reset();
                 return;
             }
 
             auto append_model = [&](const llama_model * model,
                                     server_cache_fingerprint_artifact_role role) {
-                std::vector<llama_model_artifact_descriptor> source;
-                if (!llama_model_dup_artifact_descriptors(model, source)) {
+                std::array<llama_model_artifact_descriptor,
+                           server_cache_fingerprint_worker::descriptor_capacity>
+                    source = {};
+                size_t source_count = 0;
+                if (!llama_model_dup_artifact_descriptors_bounded(
+                        model, source.data(), source.size(), &source_count)) {
                     return false;
                 }
                 try {
-                    for (uint32_t i = 0; i < source.size(); ++i) {
-                        descriptors.push_back({
-                            role, i, source[i].descriptor,
-                            source[i].byte_length, source[i].integrity_exact });
+                    for (uint32_t i = 0; i < source_count; ++i) {
+                        const int descriptor = source[i].descriptor;
                         source[i].descriptor = -1;
+                        if (!cache_fingerprint_worker->add_descriptor({
+                                role, i, descriptor, source[i].byte_length,
+                                source[i].integrity_exact })) {
+                            llama_model_artifact_descriptors_close_bounded(
+                                source.data(), source_count);
+                            return false;
+                        }
                     }
                     return true;
                 } catch (...) {
-                    llama_model_artifact_descriptors_close(source);
+                    llama_model_artifact_descriptors_close_bounded(
+                        source.data(), source_count);
                     return false;
                 }
             };
@@ -2523,40 +2608,37 @@ private:
                 (model_dft && !append_model(
                     model_dft.get(),
                     server_cache_fingerprint_artifact_role::draft))) {
-                server_cache_fingerprint_descriptors_close(descriptors);
+                cache_fingerprint_worker.reset();
                 return;
             }
-            fixed_artifacts.reserve(params_base.lora_adapters.size());
             for (uint32_t i = 0; i < params_base.lora_adapters.size(); ++i) {
                 std::array<uint8_t, 32> content = {};
                 if (!params_base.lora_adapters[i].ptr) {
-                    server_cache_fingerprint_descriptors_close(descriptors);
+                    cache_fingerprint_worker.reset();
                     return;
                 }
                 llama_adapter_meta_digest(
                     params_base.lora_adapters[i].ptr, content.data());
-                fixed_artifacts.push_back({
+                if (!cache_fingerprint_worker->add_fixed_artifact({
                     server_cache_fingerprint_artifact_role::adapter,
                     i, 0, content,
                     // The loaded content is immutable, but the current adapter
                     // API does not expose its exact serialized byte extent.
-                    false });
+                    false })) {
+                    cache_fingerprint_worker.reset();
+                    return;
+                }
             }
-            cache_fingerprint_worker =
-                std::make_unique<server_cache_fingerprint_worker>();
             cache_fingerprint_worker->set_scheduler_demand(
                 cache_fingerprint_scheduler_busy ||
                 std::any_of(slots.begin(), slots.end(),
                     [](const server_slot & slot) {
                         return slot.is_processing();
                     }));
-            if (!cache_fingerprint_worker->start(
-                    std::move(descriptors), std::move(fields),
-                    std::move(fixed_artifacts))) {
+            if (!cache_fingerprint_worker->launch()) {
                 cache_fingerprint_worker.reset();
             }
         } catch (...) {
-            server_cache_fingerprint_descriptors_close(descriptors);
             cache_fingerprint_worker.reset();
         }
     }
@@ -2603,12 +2685,18 @@ private:
                 ? common_cache_plan_provider::live_slot
                 : common_cache_plan_provider::cold_replay;
             slot.cache_observation_epoch.arm(
-                slot.id, cache_observation_provider_key(provider, slot.lora));
+                slot.id, cache_observation_provider_key(provider, slot.lora), 0,
+                server_cache_observation_capture_admission_clock());
         }
         if (slot.task && (slot.task->is_parent() || slot.task->is_child())) {
             slot.cache_observation_epoch.mark_mixed(
                 server_cache_observation_reason::mixed_slots);
         }
+        // A required sync may have completed the preceding async submission
+        // after its outer close hook. Consume its passive timestamp before
+        // deciding whether this CPU segment overlaps unresolved backend work.
+        (void) slot.cache_observation_epoch.latch_fence(
+            cache_observation_fence(ctx_tgt));
         slot.cache_observation_epoch.begin_owned_cpu(ggml_time_us());
     }
 
@@ -2639,13 +2727,6 @@ private:
         return 3;
     }
 
-    static uint8_t cache_observation_batch_bucket(uint32_t n) noexcept {
-        if (n <= 32) return 0;
-        if (n <= 128) return 1;
-        if (n <= 512) return 2;
-        return 3;
-    }
-
     void cache_observation_note_submission(
             const llama_batch & batch_view) noexcept {
         if (!cache_optimizer_observations || batch_view.n_tokens <= 0) {
@@ -2664,29 +2745,26 @@ private:
         for (const auto & slot : slots) {
             active_slots += slot.is_processing() ? 1u : 0u;
         }
-        GGML_ASSERT(cache_observation_batch_tokens.size() == slots.size());
-        GGML_ASSERT(cache_observation_first_pos.size() == slots.size());
-        std::fill(cache_observation_batch_tokens.begin(),
-                  cache_observation_batch_tokens.end(), 0);
-        std::fill(cache_observation_first_pos.begin(),
-                  cache_observation_first_pos.end(),
-                  std::numeric_limits<llama_pos>::max());
+        GGML_ASSERT(cache_optimizer_observations->slot_scratch_count() ==
+                    slots.size());
+        cache_optimizer_observations->reset_slot_scratch();
         for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
             for (int32_t j = 0; j < batch_view.n_seq_id[i]; ++j) {
                 const llama_seq_id id = batch_view.seq_id[i][j];
                 if (id < 0 || size_t(id) >= slots.size()) {
                     continue;
                 }
-                ++cache_observation_batch_tokens[size_t(id)];
-                cache_observation_first_pos[size_t(id)] = std::min(
-                    cache_observation_first_pos[size_t(id)],
-                    batch_view.pos[i]);
+                if (!cache_optimizer_observations->note_slot_submission(
+                        id, 1, batch_view.pos[i])) {
+                    return;
+                }
             }
         }
         uint32_t prompt_slots = 0;
         for (const auto & slot : slots) {
             if (slot.id < 0 || size_t(slot.id) >= slots.size() ||
-                cache_observation_batch_tokens[size_t(slot.id)] == 0) {
+                cache_optimizer_observations->slot_batch_tokens(
+                    size_t(slot.id)) == 0) {
                 continue;
             }
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT ||
@@ -2700,9 +2778,11 @@ private:
                 continue;
             }
             const uint32_t owned_tokens =
-                cache_observation_batch_tokens[size_t(slot.id)];
+                cache_optimizer_observations->slot_batch_tokens(
+                    size_t(slot.id));
             const llama_pos first_pos =
-                cache_observation_first_pos[size_t(slot.id)];
+                cache_optimizer_observations->slot_first_position(
+                    size_t(slot.id));
             if (owned_tokens == 0) {
                 continue;
             }
@@ -2745,9 +2825,9 @@ private:
             attribution.start_bucket = cache_observation_start_bucket(
                 first_pos == std::numeric_limits<llama_pos>::max()
                     ? 0 : first_pos);
-            attribution.batch_bucket = cache_observation_batch_bucket(
+            attribution.batch_bucket = server_cache_observation_batch_bucket(
                 uint32_t(batch_view.n_tokens));
-            attribution.ubatch_bucket = cache_observation_batch_bucket(
+            attribution.ubatch_bucket = server_cache_observation_batch_bucket(
                 uint32_t(std::max(1, params_base.n_ubatch)));
             attribution.size_family = size_family;
             attribution.feature = feature;
@@ -2784,6 +2864,13 @@ private:
         if (!cache_optimizer_observations) {
             return;
         }
+        // A one-token completion can release its slot from inside post_decode,
+        // before the loop's outer close-fence hook runs. The sampler has
+        // already performed the required synchronize at this terminal, so
+        // consume that passive timestamp here as well. This adds no fence and
+        // leaves genuinely unfenced operations unavailable.
+        (void) slot.cache_observation_epoch.latch_fence(
+            cache_observation_fence(ctx_tgt));
         slot.cache_observation_epoch.mark_operation_terminal();
         server_cache_observation_record record;
         if (slot.cache_observation_epoch.finish(
@@ -3751,7 +3838,7 @@ private:
         }
         out.quote = *quote_it;
         bool prepare_observation_active = false;
-        int64_t prepare_start_us = 0;
+        server_cache_observation_cpu_start prepare_start;
         uint64_t prepare_extent_bytes = 0;
         const uint8_t prepare_shape = &legacy_target == &victim ? 2 : 3;
         const auto emit_refusal = [&](bool observe_transition) {
@@ -3776,7 +3863,7 @@ private:
                 victim.observe_cache_cpu_operation(
                     server_cache_observation_operation::durability_prepare,
                     prepare_shape, prepare_extent_bytes,
-                    prepare_start_us, false);
+                    prepare_start, false);
                 prepare_observation_active = false;
             }
             out.quote.receipt.state =
@@ -3795,9 +3882,8 @@ private:
         // legacy-prefix publication can then neither dedup the victim nor
         // leave the shorter legacy frontier without an exact durable copy.
         server_prompt_cache::iterator saved_victim;
-        prepare_start_us = victim.cache_observations
-            ? ggml_time_us()
-            : 0;
+        prepare_start = server_cache_observation_capture_cpu_start(
+            victim.cache_observations != nullptr);
         prepare_observation_active = true;
         const auto saved = victim.prompt_save(
             *prompt_cache, true, &saved_victim);
@@ -3865,7 +3951,7 @@ private:
         victim.observe_cache_cpu_operation(
             server_cache_observation_operation::durability_prepare,
             prepare_shape, prepare_extent_bytes,
-            prepare_start_us, true);
+            prepare_start, true);
         prepare_observation_active = false;
 
         server_cache_destruction_certify_receipt(
@@ -6121,26 +6207,100 @@ private:
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
         }
         if (params_base.cache_optimizer.observer_store_enabled) {
-            if (!cache_optimizer_observations) {
-                cache_optimizer_observations =
-                    std::make_unique<server_cache_observation_store>();
+            try {
+                if (!cache_calibration_arena) {
+                    cache_calibration_arena =
+                        std::make_unique<server_cache_calibration_arena>();
+                }
+                if (!cache_calibration_arena->allocate()) {
+                    cache_calibration_arena.reset();
+                    params_base.cache_optimizer.mode =
+                        common_cache_optimizer_mode::baseline;
+                    params_base.cache_optimizer.observer_store_enabled = false;
+                    SRV_WRN("%s\n", "cache optimizer calibration arena unavailable; continuing in baseline mode");
+                }
+            } catch (...) {
+                cache_calibration_arena.reset();
+                params_base.cache_optimizer.mode =
+                    common_cache_optimizer_mode::baseline;
+                params_base.cache_optimizer.observer_store_enabled = false;
+                SRV_WRN("%s\n", "cache optimizer calibration arena allocation failed; continuing in baseline mode");
             }
+        }
+        if (params_base.cache_optimizer.observer_store_enabled) {
+            if (!cache_optimizer_observations) {
+                cache_optimizer_observations.reset(
+                    cache_calibration_arena->construct<server_cache_observation_store>(
+                        server_cache_calibration_arena_layout::global_tables_begin,
+                        server_cache_calibration_arena_layout::global_tables_size));
+                if (!cache_optimizer_observations) {
+                    params_base.cache_optimizer.mode =
+                        common_cache_optimizer_mode::baseline;
+                    params_base.cache_optimizer.observer_store_enabled = false;
+                    SRV_WRN("%s\n", "cache optimizer observation store does not fit its fixed arena region; continuing in baseline mode");
+                }
+            }
+            if (cache_optimizer_observations &&
+                !cache_optimizer_observations->prepare_slot_scratch(slots.size())) {
+                cache_optimizer_observations.reset();
+                cache_calibration_arena.reset();
+                params_base.cache_optimizer.mode =
+                    common_cache_optimizer_mode::baseline;
+                params_base.cache_optimizer.observer_store_enabled = false;
+                SRV_WRN("cache optimizer slot scratch capacity exceeded (%zu > %zu); continuing in baseline mode\n",
+                        slots.size(),
+                        server_cache_observation_store::slot_scratch_capacity);
+            }
+        }
+        if (params_base.cache_optimizer.observer_store_enabled) {
             cache_fingerprint_ready_logged = false;
             cache_fingerprint_pending.reset();
-            cache_observation_batch_tokens.assign(slots.size(), 0);
-            cache_observation_first_pos.assign(
-                slots.size(), std::numeric_limits<llama_pos>::max());
             llama_set_sync_fence_observer(ctx_tgt, true);
             try {
+                const auto vbr = common_cache_plan_vbr_regime_from_params(
+                    params_base,
+                    [](const char * name) { return std::getenv(name); });
+                std::string representation = common_cache_plan_calib_kv(
+                    vbr, ggml_type_name(params_base.cache_type_k),
+                    ggml_type_name(params_base.cache_type_v));
+                const bool non_speculative =
+                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_NONE;
+                std::array<uint8_t, 32> representation_digest = {};
+                const bool representation_complete =
+                    non_speculative && !representation.empty() &&
+                    server_cache_calibration_representation_digest_v1(
+                        representation.data(), representation.size(),
+                        representation_digest);
+                cache_optimizer_observations->set_operation_identity(
+                    representation_complete, representation_digest,
+                    0 /* target_only */);
+                const std::string state_root = fs_get_state_directory();
                 const std::string calibration_dir =
-                    fs_get_cache_directory() + "cache-calibration-v1";
-                if (!cache_calibration) {
-                    cache_calibration =
-                        std::make_unique<server_cache_calibration_coordinator>();
+                    state_root + "calibration" +
+                    DIRECTORY_SEPARATOR + "v1";
+                if (!cache_calibration_snapshots) {
+                    cache_calibration_snapshots.reset(
+                        cache_calibration_arena->construct<
+                            server_cache_calibration_snapshot_workspace>(
+                                server_cache_calibration_arena_layout::snapshots_begin,
+                                server_cache_calibration_arena_layout::snapshots_size));
                 }
-                if (cache_calibration->health() ==
+                if (!cache_calibration && cache_calibration_snapshots) {
+                    cache_calibration.reset(
+                        cache_calibration_arena->construct<server_cache_calibration_coordinator>(
+                            server_cache_calibration_arena_layout::profile_slots_begin,
+                            server_cache_calibration_arena_layout::profile_slots_size,
+                            cache_calibration_snapshots.get(),
+                            cache_calibration_arena->region(
+                                server_cache_calibration_arena_layout::codec_scratch_begin,
+                                server_cache_calibration_arena_layout::codec_scratch_size,
+                                64),
+                            server_cache_calibration_arena_layout::codec_scratch_size));
+                }
+                if (cache_calibration_snapshots && cache_calibration &&
+                    cache_calibration->health() ==
                         server_cache_calibration_writer_health::idle &&
-                    !cache_calibration->start(calibration_dir)) {
+                    !cache_calibration->start(calibration_dir, state_root)) {
                     cache_calibration.reset();
                 }
             } catch (...) {
@@ -7025,10 +7185,76 @@ private:
                cache_plan_retarget_target_current(rec, *planned);
     }
 
+    struct cache_plan_observation_inventory {
+        std::array<server_cache_observation_key,
+                   COMMON_CACHE_PLAN_MAX_CANDIDATES> keys = {};
+        std::array<bool, COMMON_CACHE_PLAN_MAX_CANDIDATES> measurable = {};
+    };
+
+    void cache_plan_observation_candidate(
+            const server_task & task,
+            const common_cache_plan_record & rec,
+            const common_cache_plan_candidate * row,
+            server_cache_observation_key key,
+            uint64_t lcp_tokens,
+            uint64_t payload_bytes,
+            bool isolated,
+            cache_plan_observation_inventory * out) noexcept {
+        if (!out || !cache_optimizer_observations || !row || !isolated ||
+            !row->viable() || lcp_tokens >= task.tokens.size()) {
+            return;
+        }
+        const uint64_t replay_tokens = task.tokens.size() - lcp_tokens;
+        if (replay_tokens == 0 || replay_tokens > UINT32_MAX) {
+            return;
+        }
+        const llama_pos start_position = task.tokens.pos_next(lcp_tokens);
+        if (start_position < 0) {
+            return;
+        }
+        std::array<double, 4> feature = {};
+        uint8_t size_family = 0;
+        uint8_t replay_batch_bucket = 0;
+        const uint32_t max_effective_batch = uint32_t(
+            std::min<uint64_t>(
+                replay_tokens, uint64_t(params_base.n_batch)));
+        const bool feature_ok = key.operation ==
+                server_cache_observation_operation::restore
+            ? server_cache_observation_byte_feature(
+                  payload_bytes, size_family, feature)
+            : server_cache_observation_replay_chain_geometry(
+                  replay_tokens, max_effective_batch,
+                  size_family, replay_batch_bucket, feature);
+        if (!feature_ok) {
+            return;
+        }
+        key.contention_bucket = 0;
+        key.start_bucket = cache_observation_start_bucket(start_position);
+        key.batch_bucket = key.operation ==
+                server_cache_observation_operation::restore
+            ? server_cache_observation_batch_bucket(max_effective_batch)
+            : replay_batch_bucket;
+        key.ubatch_bucket = server_cache_observation_batch_bucket(
+            uint32_t(std::max(1, params_base.n_ubatch)));
+        key.size_family = size_family;
+        if (!server_cache_observation_key_valid(key)) {
+            return;
+        }
+        const auto index = size_t(row - rec.inventory.data());
+        if (index >= rec.n_inventory || index >= out->keys.size()) {
+            return;
+        }
+        out->keys[index] = key;
+        out->measurable[index] = true;
+    }
+
     bool cache_plan_inventory_live_rows(
             const server_task & task,
             const std::vector<uint64_t> & slot_lcps,
-            common_cache_plan_record & rec) {
+            const std::vector<common_adapter_lora_info> & incoming_loras,
+            bool isolated,
+            common_cache_plan_record & rec,
+            cache_plan_observation_inventory * observations) {
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto & slot = slots[i];
             if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -7051,6 +7277,14 @@ private:
                 uint64_t(std::max<int64_t>(slot.t_last_used, 0)));
             row->spec_capable = slot.can_speculate();
             row->spec_capable_known = true;
+            if (observations && cache_optimizer_observations &&
+                are_lora_equal(incoming_loras, slot.lora)) {
+                cache_plan_observation_candidate(
+                    task, rec, row,
+                    cache_observation_provider_key(
+                        common_cache_plan_provider::live_slot, slot.lora),
+                    slot_lcps[i], 0, isolated, observations);
+            }
         }
         rec.note_inventory_complete(common_cache_plan_provider::live_slot);
         return true;
@@ -7061,8 +7295,10 @@ private:
             const std::vector<uint64_t> & slot_lcps,
             const std::string & incoming_adapter,
             bool recurrent,
+            bool isolated,
             common_cache_plan_record & rec,
-            cache_plan_host_source_registry & source_registry) {
+            cache_plan_host_source_registry & source_registry,
+            cache_plan_observation_inventory * observations) {
         if (!prompt_cache) {
             rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
             return true;
@@ -7104,8 +7340,19 @@ private:
                     return false;
                 }
                 server_cache_plan_apply_host(host, host_eval);
+                if (observations && cache_optimizer_observations) {
+                    cache_plan_observation_candidate(
+                        task, rec, host,
+                        cache_observation_provider_key(
+                            common_cache_plan_provider::host_cache_entry,
+                            state.adapter_application_digest,
+                            state.adapter_application_complete),
+                        host_eval.lcp_tokens, host_eval.payload_bytes,
+                        isolated, observations);
+                }
 
                 int32_t checkpoint_ordinal = 0;
+                auto checkpoint_state = state.prompt.checkpoints.begin();
                 for (const auto & eval : checkpoint_evals) {
                     const int32_t checkpoint_source =
                         server_cache_plan_host_checkpoint_source_id(
@@ -7125,6 +7372,17 @@ private:
                         return false;
                     }
                     server_cache_plan_apply_checkpoint(checkpoint, eval);
+                    if (observations && cache_optimizer_observations) {
+                        cache_plan_observation_candidate(
+                            task, rec, checkpoint,
+                            cache_observation_provider_key(
+                                common_cache_plan_provider::live_context_checkpoint,
+                                checkpoint_state->adapter_application_digest,
+                                checkpoint_state->adapter_application_complete),
+                            eval.lcp_tokens, eval.payload_bytes,
+                            isolated, observations);
+                    }
+                    ++checkpoint_state;
                     if (server_cache_plan_viable(host_eval.reason) &&
                         server_cache_plan_viable(eval.reason)) {
                         checkpoint->component_only = true;
@@ -7149,8 +7407,11 @@ private:
     bool cache_plan_inventory_checkpoint_rows(
             const server_task & task,
             const std::vector<uint64_t> & slot_lcps,
+            const std::vector<common_adapter_lora_info> & incoming_loras,
             bool recurrent,
-            common_cache_plan_record & rec) {
+            bool isolated,
+            common_cache_plan_record & rec,
+            cache_plan_observation_inventory * observations) {
         // Complete planner scan. The shipped restore keeps its reverse find_if
         // and its shipped-visited transport below.
         for (size_t i = 0; i < slots.size(); ++i) {
@@ -7196,6 +7457,17 @@ private:
                         representation_matches, checkpoint.pos_min,
                         checkpoint.pos_max, pos_next, pos_min_threshold,
                         checkpoint.size_without_shadow()));
+                if (observations && cache_optimizer_observations &&
+                    are_lora_equal(incoming_loras, candidate_target.lora)) {
+                    cache_plan_observation_candidate(
+                        task, rec, row,
+                        cache_observation_provider_key(
+                            common_cache_plan_provider::live_context_checkpoint,
+                            checkpoint.adapter_application_digest,
+                            checkpoint.adapter_application_complete),
+                        row->lcp_tokens.value, row->payload_bytes.value,
+                        isolated, observations);
+                }
             }
         }
         rec.note_inventory_complete(
@@ -7207,7 +7479,10 @@ private:
     bool cache_plan_inventory_cold_rows(
             const server_task & task,
             const std::vector<uint64_t> & slot_lcps,
-            common_cache_plan_record & rec) {
+            const std::vector<common_adapter_lora_info> & incoming_loras,
+            bool isolated,
+            common_cache_plan_record & rec,
+            cache_plan_observation_inventory * observations) {
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto & candidate_target = slots[i];
             if (!cache_plan_target_in_domain(task, candidate_target)) {
@@ -7221,6 +7496,13 @@ private:
                 return false;
             }
             cold->accept();
+            if (observations && cache_optimizer_observations) {
+                cache_plan_observation_candidate(
+                    task, rec, cold,
+                    cache_observation_provider_key(
+                        common_cache_plan_provider::cold_replay, incoming_loras),
+                    0, 0, isolated, observations);
+            }
         }
         rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
         return true;
@@ -7229,9 +7511,11 @@ private:
     void cache_plan_inventory_before_mutation(
             const server_task & task,
             server_slot & target,
+            const std::vector<common_adapter_lora_info> & incoming_loras,
             const std::string & incoming_adapter,
             common_cache_plan_record & rec,
-            cache_plan_host_source_registry & source_registry) {
+            cache_plan_host_source_registry & source_registry,
+            cache_plan_observation_inventory * observations) {
         rec.id_slot = target.id;
         rec.n_prompt_tokens = llama_cache_acct_value::measured(task.tokens.size());
         rec.identity.adapter_config_digest = llama_cache_acct_value::measured(
@@ -7246,17 +7530,27 @@ private:
         }
         const bool recurrent = llama_model_is_recurrent(model_tgt) ||
                                llama_model_is_hybrid(model_tgt);
+        const bool isolated = observations &&
+            std::none_of(
+                slots.begin(), slots.end(),
+                [](const server_slot & slot) {
+                    return slot.is_processing();
+                }) &&
+            !task.is_parent() && !task.is_child();
 
         // A fixed record is an honest bounded surface, not a promise that a
         // cross-product always fits. Any failed append latches provider
         // overflow (or derived_plans_incomplete); stop paying work immediately.
-        if (!cache_plan_inventory_live_rows(task, slot_lcps, rec) ||
+        if (!cache_plan_inventory_live_rows(
+                task, slot_lcps, incoming_loras, isolated, rec, observations) ||
             !cache_plan_inventory_host_rows(
-                task, slot_lcps, incoming_adapter, recurrent, rec,
-                source_registry) ||
+                task, slot_lcps, incoming_adapter, recurrent, isolated, rec,
+                source_registry, observations) ||
             !cache_plan_inventory_checkpoint_rows(
-                task, slot_lcps, recurrent, rec) ||
-            !cache_plan_inventory_cold_rows(task, slot_lcps, rec)) {
+                task, slot_lcps, incoming_loras, recurrent, isolated, rec,
+                observations) ||
+            !cache_plan_inventory_cold_rows(
+                task, slot_lcps, incoming_loras, isolated, rec, observations)) {
             GGML_ASSERT(rec.inventory_saturated());
             return;
         }
@@ -7824,6 +8118,7 @@ private:
     struct cache_plan_stage1_inventory {
         std::vector<common_adapter_lora_info> incoming_loras;
         std::string incoming_adapter;
+        std::optional<cache_plan_observation_inventory> observations;
         bool incoming_adapter_ready = false;
         bool incoming_adapter_matches = false;
         bool host_lookup_enabled = false;
@@ -7867,8 +8162,30 @@ private:
         cache_plan_host_source_registry source_registry(
             !mode.preflight);
         cache_plan_derive_incoming_adapter(task, target, out);
+        if (!mode.preflight && cache_optimizer_observations) {
+            out.observations.emplace();
+        }
         cache_plan_inventory_before_mutation(
-            task, target, out.incoming_adapter, rec, source_registry);
+            task, target, out.incoming_loras, out.incoming_adapter, rec,
+            source_registry,
+            out.observations ? &*out.observations : nullptr);
+        if (!mode.preflight && cache_optimizer_observations &&
+            !rec.inventory_saturated() &&
+            !cache_calibration_inventory_currency_exhausted) {
+            if (cache_calibration_inventory_ordinal == UINT64_MAX) {
+                cache_calibration_inventory_currency_exhausted = true;
+            } else {
+                const uint64_t inventory_ordinal =
+                    ++cache_calibration_inventory_ordinal;
+                for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+                    if (out.observations->measurable[i]) {
+                        (void) cache_optimizer_observations->
+                            note_safe_measurable_opportunity(
+                                out.observations->keys[i], inventory_ordinal);
+                    }
+                }
+            }
+        }
         const uint64_t capability_after =
             cache_plan_capability_snapshot(task);
         const auto semantics = server_cache_plan_stage1_semantics_for(
@@ -7940,6 +8257,11 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+        if (cache_calibration && task.type == SERVER_TASK_TYPE_COMPLETION &&
+            task.id != cache_calibration_last_profile_use_task) {
+            cache_calibration->note_profile_use();
+            cache_calibration_last_profile_use_task = task.id;
+        }
         if (prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
             prompt_cache->retention_summary = nullptr;
             if (prompt_cache->retention_policy !=
@@ -10618,6 +10940,14 @@ private:
 #endif
 
     void update_slots() {
+        if (cache_optimizer_observations) {
+            cache_optimizer_observations->set_scheduler_active_slots(
+                uint32_t(std::count_if(
+                    slots.begin(), slots.end(),
+                    [](const server_slot & slot) {
+                        return slot.is_processing();
+                    })));
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -10754,6 +11084,23 @@ private:
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
                 } else {
+                    // The attempted batch was not queued successfully. The
+                    // same token range will be retried with another geometry,
+                    // so its observation cannot be retracted or combined with
+                    // the later success as one execution sample.
+                    if (cache_optimizer_observations) {
+                        for (auto & slot : slots) {
+                            if (slot.id >= 0 &&
+                                size_t(slot.id) <
+                                    cache_optimizer_observations->slot_scratch_count() &&
+                                cache_optimizer_observations->slot_batch_tokens(
+                                    size_t(slot.id)) > 0) {
+                                cache_observation_abandon(
+                                    slot,
+                                    server_cache_observation_reason::operation_failed);
+                            }
+                        }
+                    }
                     // try again with the updated n_batch
                     continue;
                 }
@@ -11122,6 +11469,11 @@ private:
                     bool checkpoint_observation_attempted = false;
                     uint64_t checkpoint_observation_payload_bytes = 0;
                     uint64_t checkpoint_observation_owned_cpu_us = 0;
+                    server_cache_observation_admission_clock
+                        checkpoint_observation_admission_clock;
+                    std::array<uint8_t, 32>
+                        checkpoint_observation_adapter_digest = {};
+                    bool checkpoint_observation_adapter_complete = false;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -12204,6 +12556,21 @@ private:
                                     }
 
                                     if (!do_reset) {
+                                        // Capture the checkpoint provider's admission currency before
+                                        // fallible VBR preflight, freeze acquisition, discard, or
+                                        // payload installation. Every later terminal consumes this
+                                        // one pre-outcome assignment; off/baseline perform none of it.
+                                        if (cache_optimizer_observations) {
+                                            checkpoint_observation_admission_clock =
+                                                server_cache_observation_capture_admission_clock();
+                                            checkpoint_observation_attempted = true;
+                                            checkpoint_observation_payload_bytes =
+                                                uint64_t(it->size_without_shadow());
+                                            checkpoint_observation_adapter_digest =
+                                                it->adapter_application_digest;
+                                            checkpoint_observation_adapter_complete =
+                                                it->adapter_application_complete;
+                                        }
                                         // [WS-6] A live_rebased PARTIAL_ONLY restore keeps the
                                         // current attention representation. Prove the current-tier
                                         // footprint fits before either the restore or its later
@@ -12281,9 +12648,6 @@ private:
                                         }
                                         slot.dflash_window_identity.clear();
                                         const size_t checkpoint_size = it->data_tgt.size();
-                                        checkpoint_observation_attempted = true;
-                                        checkpoint_observation_payload_bytes =
-                                            uint64_t(it->size_without_shadow());
                                         uint64_t checkpoint_target_us = 0;
                                         const size_t n = do_reset ? 0 :
                                             llama_state_seq_set_data_observed_ext(
@@ -12417,10 +12781,17 @@ private:
                                                     }
                                                     auto key = cache_observation_provider_key(
                                                         common_cache_plan_provider::live_context_checkpoint,
-                                                        slot.lora);
+                                                        {});
+                                                    key.adapter_application_digest =
+                                                        checkpoint_observation_adapter_digest;
+                                                    key.adapter_application_complete =
+                                                        checkpoint_observation_adapter_complete;
+                                                    cache_optimizer_observations->
+                                                        apply_execution_fingerprint(key);
                                                     slot.cache_observation_epoch.arm(
                                                         slot.id, key,
-                                                        checkpoint_observation_owned_cpu_us);
+                                                        checkpoint_observation_owned_cpu_us,
+                                                        checkpoint_observation_admission_clock);
                                                     slot.cache_observation_epoch.bind_provider(
                                                         key, uint64_t(it->size_without_shadow()),
                                                         checkpoint_observation_owned_cpu_us);
@@ -12464,10 +12835,17 @@ private:
                                             !slot.cache_observation_epoch.active()) {
                                             auto key = cache_observation_provider_key(
                                                 common_cache_plan_provider::live_context_checkpoint,
-                                                slot.lora);
+                                                {});
+                                            key.adapter_application_digest =
+                                                checkpoint_observation_adapter_digest;
+                                            key.adapter_application_complete =
+                                                checkpoint_observation_adapter_complete;
+                                            cache_optimizer_observations->
+                                                apply_execution_fingerprint(key);
                                             slot.cache_observation_epoch.arm(
                                                 slot.id, key,
-                                                checkpoint_observation_owned_cpu_us);
+                                                checkpoint_observation_owned_cpu_us,
+                                                checkpoint_observation_admission_clock);
                                             slot.cache_observation_epoch.bind_provider(
                                                 key,
                                                 checkpoint_observation_payload_bytes,

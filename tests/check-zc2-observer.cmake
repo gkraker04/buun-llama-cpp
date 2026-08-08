@@ -35,6 +35,7 @@ function(server_observer_wiring_complete CONTEXT LLAMA OUT)
             "llama_set_sync_fence_observer(ctx_tgt, true)"
             "cache_observation_note_submission(batch_view)"
             "cache_observation_close_fence()"
+            "slot.cache_observation_epoch.latch_fence("
             "llama_arm_sync_fence_observer(ctx_tgt)"
             "llama_get_sync_fence_info(ctx)")
         string(FIND "${CONTEXT}" "${REQUIRED}" POS)
@@ -57,14 +58,87 @@ function(server_observer_wiring_complete CONTEXT LLAMA OUT)
     set(${OUT} ${COMPLETE} PARENT_SCOPE)
 endfunction()
 
+function(observer_multi_submission_complete HEADER IMPL OUT)
+    set(COMPLETE TRUE)
+    foreach(REQUIRED IN ITEMS
+            "uint64_t backend_service_us_ = 0"
+            "uint32_t fenced_submissions_ = 0"
+            "bool submission_pending_ = false")
+        string(FIND "${HEADER}" "${REQUIRED}" POS)
+        if (POS EQUAL -1)
+            set(COMPLETE FALSE)
+        endif()
+    endforeach()
+    foreach(REQUIRED IN ITEMS
+            "tokens_ += value.tokens"
+            "server_cache_observation_replay_chain_geometry("
+            "server_cache_observation_same_chain_geometry(first, value)"
+            "backend_service_us_ += uint64_t("
+            "!terminal_ready_"
+            "fenced_submissions_ != submissions_")
+        string(FIND "${IMPL}" "${REQUIRED}" POS)
+        if (POS EQUAL -1)
+            set(COMPLETE FALSE)
+        endif()
+    endforeach()
+    set(${OUT} ${COMPLETE} PARENT_SCOPE)
+endfunction()
+
 observer_pure("${OBSERVER_H}${OBSERVER_CPP}" PURE)
 if (NOT PURE)
     message(FATAL_ERROR "ZC2 observer acquired authority, persistence, fitting, or synchronization")
 endif()
 
+observer_multi_submission_complete(
+    "${OBSERVER_H}" "${OBSERVER_CPP}" MULTI_COMPLETE)
+if (NOT MULTI_COMPLETE)
+    message(FATAL_ERROR
+        "ZC2 multi-submission attribution lost per-fence aggregation")
+endif()
+
 server_observer_wiring_complete("${CONTEXT_CPP}" "${LLAMA_CONTEXT_CPP}" COMPLETE)
 if (NOT COMPLETE)
     message(FATAL_ERROR "ZC2 passive submission/fence wiring is incomplete")
+endif()
+
+contract_extract_region("${CONTEXT_CPP}"
+    "void cache_observation_finish(server_slot & slot)"
+    "void cache_authority_config_failed(bool mirror_to_shadow)"
+    TERMINAL_REGION TERMINAL_FOUND)
+if (NOT TERMINAL_FOUND)
+    message(FATAL_ERROR "ZC2 operation-terminal fence region is missing")
+endif()
+foreach(REQUIRED IN ITEMS
+        "slot.cache_observation_epoch.latch_fence("
+        "cache_observation_fence(ctx_tgt)"
+        "slot.cache_observation_epoch.mark_operation_terminal()")
+    string(FIND "${TERMINAL_REGION}" "${REQUIRED}" POS)
+    if (POS EQUAL -1)
+        message(FATAL_ERROR
+            "ZC2 release-before-outer-close protection is incomplete: ${REQUIRED}")
+    endif()
+endforeach()
+
+contract_extract_region("${CONTEXT_CPP}"
+    "if (ok) {"
+    "// try again with the updated n_batch"
+    DECODE_RETRY_OBSERVER_REGION DECODE_RETRY_OBSERVER_FOUND)
+if (NOT DECODE_RETRY_OBSERVER_FOUND)
+    message(FATAL_ERROR "ZC2 decode-retry observer terminal is missing")
+endif()
+foreach(REQUIRED IN ITEMS
+        "cache_observation_abandon("
+        "cache_optimizer_observations->slot_batch_tokens("
+        "server_cache_observation_reason::operation_failed")
+    string(FIND "${DECODE_RETRY_OBSERVER_REGION}" "${REQUIRED}" POS)
+    if (POS EQUAL -1)
+        message(FATAL_ERROR
+            "ZC2 failed decode retry can contaminate a success sample: ${REQUIRED}")
+    endif()
+endforeach()
+string(FIND "${TERMINAL_REGION}" "llama_synchronize(" TERMINAL_SYNC)
+if (NOT TERMINAL_SYNC EQUAL -1)
+    message(FATAL_ERROR "ZC2 operation terminal added a synchronization call")
 endif()
 
 foreach(INTERNAL_NAME IN ITEMS
@@ -148,8 +222,8 @@ endif()
 foreach(REQUIRED IN ITEMS
         "server_cache_observation_operation::durability_prepare"
         "server_cache_observation_operation::destruction_apply"
-        "prepare_start_us"
-        "apply_start_us")
+        "server_cache_observation_cpu_start"
+        "server_cache_observation_capture_cpu_start(")
     string(FIND "${TASK_CPP}${CONTEXT_CPP}" "${REQUIRED}" POS)
     if (POS EQUAL -1)
         message(FATAL_ERROR "ZC2 CPU-only seam missing: ${REQUIRED}")
@@ -201,6 +275,70 @@ string(REPLACE
 server_observer_wiring_complete("${CONTEXT_CPP}" "${MUTATED_LLAMA}" MUTATED_COMPLETE)
 if (MUTATED_COMPLETE)
     message(FATAL_ERROR "ZC2 fence-update negative control did not trip")
+endif()
+
+set(MUTATED_OBSERVER "${OBSERVER_CPP}")
+string(REPLACE
+    "backend_service_us_ += uint64_t("
+    "/* deleted separately-fenced backend accumulation */ uint64_t("
+    MUTATED_OBSERVER "${MUTATED_OBSERVER}")
+observer_multi_submission_complete(
+    "${OBSERVER_H}" "${MUTATED_OBSERVER}" MUTATED_MULTI_COMPLETE)
+if (MUTATED_MULTI_COMPLETE)
+    message(FATAL_ERROR
+        "ZC2 multi-submission aggregation negative control did not trip")
+endif()
+
+set(MUTATED_CHAIN_GEOMETRY "${OBSERVER_CPP}")
+string(REPLACE
+    "server_cache_observation_same_chain_geometry(first, value)"
+    "true /* deleted frozen chain geometry */"
+    MUTATED_CHAIN_GEOMETRY "${MUTATED_CHAIN_GEOMETRY}")
+observer_multi_submission_complete(
+    "${OBSERVER_H}" "${MUTATED_CHAIN_GEOMETRY}"
+    MUTATED_CHAIN_GEOMETRY_COMPLETE)
+if (MUTATED_CHAIN_GEOMETRY_COMPLETE)
+    message(FATAL_ERROR
+        "ZC2 chain-geometry negative control did not trip")
+endif()
+
+set(MUTATED_TERMINAL_OWNER "${OBSERVER_CPP}")
+string(REPLACE "!active_ || !terminal_ready_ || submissions_ == 0"
+    "!active_ || submissions_ == 0"
+    MUTATED_TERMINAL_OWNER "${MUTATED_TERMINAL_OWNER}")
+observer_multi_submission_complete(
+    "${OBSERVER_H}" "${MUTATED_TERMINAL_OWNER}"
+    MUTATED_TERMINAL_OWNER_COMPLETE)
+if (MUTATED_TERMINAL_OWNER_COMPLETE)
+    message(FATAL_ERROR
+        "ZC2 epoch-owner terminal negative control did not trip")
+endif()
+
+set(MUTATED_DECODE_RETRY "${DECODE_RETRY_OBSERVER_REGION}")
+string(REPLACE "server_cache_observation_reason::operation_failed"
+    "server_cache_observation_reason::none"
+    MUTATED_DECODE_RETRY "${MUTATED_DECODE_RETRY}")
+string(FIND "${MUTATED_DECODE_RETRY}"
+    "server_cache_observation_reason::operation_failed"
+    MUTATED_DECODE_RETRY_TERMINAL)
+if (NOT MUTATED_DECODE_RETRY_TERMINAL EQUAL -1)
+    message(FATAL_ERROR
+        "ZC2 decode-retry terminal negative control did not trip")
+endif()
+
+set(MUTATED_CONTEXT "${CONTEXT_CPP}")
+string(REPLACE
+    "slot.cache_observation_epoch.latch_fence("
+    "slot.cache_observation_epoch.deleted_terminal_latch("
+    MUTATED_CONTEXT "${MUTATED_CONTEXT}")
+contract_extract_region("${MUTATED_CONTEXT}"
+    "void cache_observation_finish(server_slot & slot)"
+    "void cache_authority_config_failed(bool mirror_to_shadow)"
+    MUTATED_TERMINAL_REGION MUTATED_TERMINAL_FOUND)
+string(FIND "${MUTATED_TERMINAL_REGION}"
+    "slot.cache_observation_epoch.latch_fence(" MUTATED_TERMINAL_LATCH)
+if (NOT MUTATED_TERMINAL_LATCH EQUAL -1)
+    message(FATAL_ERROR "ZC2 terminal-latch deletion negative control did not trip")
 endif()
 
 set(MUTATED_TASK "${TASK_CPP}")

@@ -1085,6 +1085,87 @@ std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
+std::string fs_get_state_directory() {
+    const auto nonempty_env = [](const char * name) -> const char * {
+        const char * value = std::getenv(name);
+        return value && value[0] != '\0' ? value : nullptr;
+    };
+    const auto ensure_trailing_slash = [](std::string path) {
+        if (path.empty()) {
+            throw std::runtime_error("empty llama.cpp state directory");
+        }
+        if (path.back() != DIRECTORY_SEPARATOR) {
+            path += DIRECTORY_SEPARATOR;
+        }
+        return path;
+    };
+    const auto require_absolute = [](const char * name,
+                                     const char * value) -> std::string {
+        const std::filesystem::path path(value);
+        if (!path.is_absolute()) {
+            throw std::runtime_error(std::string(name) +
+                                     " must name an absolute directory");
+        }
+        return path.string();
+    };
+
+    if (const char * override_dir = nonempty_env("LLAMA_STATE_HOME")) {
+        return ensure_trailing_slash(
+            require_absolute("LLAMA_STATE_HOME", override_dir));
+    }
+
+    std::string state_directory;
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
+    if (const char * xdg_state = nonempty_env("XDG_STATE_HOME")) {
+        const std::filesystem::path xdg_path(xdg_state);
+        if (xdg_path.is_absolute()) {
+            state_directory = xdg_path.string();
+        }
+    }
+    if (state_directory.empty()) {
+        const char * home = nonempty_env("HOME");
+#if defined(__linux__)
+        if (!home) {
+            const struct passwd * pw = getpwuid(getuid());
+            home = pw && pw->pw_dir ? pw->pw_dir : nullptr;
+        }
+#endif
+        if (!home) {
+            throw std::runtime_error("failed to find home directory for llama.cpp state");
+        }
+        state_directory =
+            (std::filesystem::path(
+                require_absolute("HOME", home)) / ".local" / "state").string();
+    }
+    state_directory =
+        (std::filesystem::path(state_directory) / "llama.cpp").string();
+#elif defined(__APPLE__)
+    const char * home = nonempty_env("HOME");
+    if (!home) {
+        throw std::runtime_error("failed to find home directory for llama.cpp state");
+    }
+    state_directory = (std::filesystem::path(
+                           require_absolute("HOME", home)) / "Library" /
+                       "Application Support" / "llama.cpp").string();
+#elif defined(_WIN32)
+    const char * local_app_data = nonempty_env("LOCALAPPDATA");
+    if (!local_app_data) {
+        throw std::runtime_error("LOCALAPPDATA is unavailable for llama.cpp state");
+    }
+    state_directory =
+        (std::filesystem::path(
+            require_absolute("LOCALAPPDATA", local_app_data)) /
+         "llama.cpp").string();
+#elif defined(__EMSCRIPTEN__)
+    throw std::runtime_error(
+        "persistent state is not implemented on this platform");
+#else
+#  error Unknown architecture
+#endif
+    return ensure_trailing_slash(state_directory);
+}
+
 std::string fs_get_cache_file(const std::string & filename) {
     GGML_ASSERT(filename.find(DIRECTORY_SEPARATOR) == std::string::npos);
     std::string cache_directory = fs_get_cache_directory();

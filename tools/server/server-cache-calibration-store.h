@@ -6,10 +6,12 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -101,6 +103,10 @@ struct server_cache_calibration_profile_snapshot {
     // Process-local transport provenance; deliberately absent from the wire.
     // The coordinator sets it only on images loaded by the current boot.
     bool persisted_seed = false;
+    // A restored wall-clock anomaly clears validation/age authority without
+    // discarding fit moments. This marker is process-local and is never
+    // serialized; it only authenticates that exceptional same-writer reset.
+    bool clock_authority_reset = false;
 };
 
 // Estimator sufficient-state validation has one owner shared by decode,
@@ -136,6 +142,42 @@ using server_cache_calibration_profile_set =
 
 static_assert(std::is_standard_layout_v<server_cache_calibration_profile_snapshot>);
 static_assert(sizeof(server_cache_calibration_profile_snapshot) <= 1024 * 1024);
+
+// The arena reserves exactly two immutable single-profile handoff slots: one
+// coalesced pending image and one worker-owned in-flight image.
+class alignas(64) server_cache_calibration_snapshot_workspace {
+public:
+    static constexpr size_t slot_size = 1024 * 1024;
+
+    server_cache_calibration_snapshot_workspace() noexcept {
+        ::new (pending_storage_) server_cache_calibration_profile_snapshot;
+        ::new (inflight_storage_) server_cache_calibration_profile_snapshot;
+    }
+    ~server_cache_calibration_snapshot_workspace() {
+        pending().~server_cache_calibration_profile_snapshot();
+        inflight().~server_cache_calibration_profile_snapshot();
+    }
+    server_cache_calibration_snapshot_workspace(
+        const server_cache_calibration_snapshot_workspace &) = delete;
+    server_cache_calibration_snapshot_workspace & operator=(
+        const server_cache_calibration_snapshot_workspace &) = delete;
+
+    server_cache_calibration_profile_snapshot & pending() noexcept {
+        return *reinterpret_cast<server_cache_calibration_profile_snapshot *>(
+            pending_storage_);
+    }
+    server_cache_calibration_profile_snapshot & inflight() noexcept {
+        return *reinterpret_cast<server_cache_calibration_profile_snapshot *>(
+            inflight_storage_);
+    }
+
+private:
+    alignas(64) std::byte pending_storage_[slot_size];
+    alignas(64) std::byte inflight_storage_[slot_size];
+};
+
+static_assert(sizeof(server_cache_calibration_snapshot_workspace) ==
+              2 * 1024 * 1024);
 
 enum class server_cache_calibration_load_status : uint8_t {
     ok = 0,
@@ -175,6 +217,12 @@ struct server_cache_calibration_commit_ack {
     uint64_t mutation_generation = 0;
     uint64_t profile_file_generation = 0;
     uint64_t root_generation = 0;
+    std::array<uint64_t,
+               server_cache_observation_store::instance_capacity>
+        fit_generations = {};
+    std::array<bool,
+               server_cache_observation_store::instance_capacity>
+        fit_generation_used = {};
 };
 
 struct server_cache_calibration_profile_currency {
@@ -184,11 +232,22 @@ struct server_cache_calibration_profile_currency {
     uint64_t committed_profile_generation_ordinal = 0;
     uint64_t committed_profile_file_generation = 0;
     uint64_t committed_root_generation = 0;
+    std::array<uint64_t,
+               server_cache_observation_store::instance_capacity>
+        committed_fit_generations = {};
+    std::array<bool,
+               server_cache_observation_store::instance_capacity>
+        committed_fit_generation_used = {};
+    uint64_t profile_last_use_epoch = 0;
+    uint8_t profile_state_rank = 0;
     bool committed_ack_seen = false;
     // A persisted seed remains validation-pending across process-local
     // profile switches. Only the future validation owner may clear it.
-    bool resume_validation_pending = false;
+    server_cache_resume_validation_flags resume_validation_pending = {};
+    server_cache_resume_validation_flags
+        resume_authority_validation_required = {};
     int64_t resume_started_us = 0;
+    bool clock_authority_reset = false;
 };
 
 // Envelope helpers are public only to the model-free persistence tests. The
@@ -209,6 +268,21 @@ bool server_cache_calibration_decode_profile(
     size_t size,
     const std::array<uint8_t, 32> & expected_lineage_id,
     server_cache_calibration_profile_snapshot & out) noexcept;
+bool server_cache_calibration_encode_profile_with_scratch_for_test(
+    const std::array<uint8_t, 32> & store_lineage_id,
+    const server_cache_calibration_profile_snapshot & value,
+    void * scratch,
+    size_t scratch_size,
+    std::vector<uint8_t> & out,
+    size_t & high_water) noexcept;
+bool server_cache_calibration_decode_profile_with_scratch_for_test(
+    const uint8_t * data,
+    size_t size,
+    const std::array<uint8_t, 32> & expected_lineage_id,
+    void * scratch,
+    size_t scratch_size,
+    server_cache_calibration_profile_snapshot & out,
+    size_t & high_water) noexcept;
 
 bool server_cache_calibration_snapshot_observer(
     const server_cache_observation_store & store,
@@ -222,12 +296,17 @@ bool server_cache_calibration_restore_observer(
 class server_cache_calibration_store {
 public:
     server_cache_calibration_store() = default;
+    server_cache_calibration_store(void * codec_scratch,
+                                   size_t codec_scratch_size) noexcept
+        : codec_scratch_(codec_scratch),
+          codec_scratch_size_(codec_scratch_size) {}
     ~server_cache_calibration_store();
     server_cache_calibration_store(const server_cache_calibration_store &) = delete;
     server_cache_calibration_store & operator=(const server_cache_calibration_store &) = delete;
 
     server_cache_calibration_load_status open(
-        const std::string & directory) noexcept;
+        const std::string & directory,
+        const std::string & secure_state_root = {}) noexcept;
     void close() noexcept;
     bool is_open() const noexcept {
         return directory_descriptor_ >= 0 && lock_descriptor_ >= 0 && !failed_;
@@ -237,6 +316,7 @@ public:
         return manifest_;
     }
     uint64_t boot_claim_ordinal() const noexcept { return boot_claim_ordinal_; }
+    size_t codec_high_water() const noexcept { return codec_high_water_; }
 
     server_cache_calibration_load_status load_profiles(
         server_cache_calibration_profile_set & out) noexcept;
@@ -257,6 +337,9 @@ private:
     bool failed_ = false;
     uint64_t boot_claim_ordinal_ = 0;
     server_cache_calibration_manifest manifest_;
+    void * codec_scratch_ = nullptr;
+    size_t codec_scratch_size_ = 0;
+    size_t codec_high_water_ = 0;
 };
 
 // Scheduler-facing persistence door. start/poll/enqueue never perform file
@@ -265,11 +348,20 @@ private:
 class server_cache_calibration_writer {
 public:
     server_cache_calibration_writer() = default;
+    server_cache_calibration_writer(
+        server_cache_calibration_snapshot_workspace * snapshots,
+        void * codec_scratch,
+        size_t codec_scratch_size) noexcept
+        : snapshots_(snapshots), codec_scratch_(codec_scratch),
+          codec_scratch_size_(codec_scratch_size) {}
     ~server_cache_calibration_writer();
     server_cache_calibration_writer(const server_cache_calibration_writer &) = delete;
     server_cache_calibration_writer & operator=(const server_cache_calibration_writer &) = delete;
 
-    bool start(std::string directory) noexcept;
+    // Production must pass its exact state root. Model-free tests that own an
+    // already-isolated temporary leaf pass an explicit empty root.
+    bool start(std::string directory,
+               std::string secure_state_root) noexcept;
     void stop() noexcept;
     bool enqueue(const server_cache_calibration_profile_snapshot & value) noexcept;
     bool poll_loaded(
@@ -279,9 +371,17 @@ public:
     server_cache_calibration_writer_health health() const noexcept {
         return health_.load(std::memory_order_acquire);
     }
+    bool boot_claim_ready() const noexcept {
+        return boot_claim_ready_.load(std::memory_order_acquire);
+    }
+    uint64_t boot_claim_ordinal() const noexcept {
+        return boot_claim_ordinal_.load(std::memory_order_acquire);
+    }
 
 private:
-    void run(std::string directory) noexcept;
+    void run(std::string directory, std::string secure_state_root) noexcept;
+    server_cache_calibration_profile_snapshot & pending_profile() noexcept;
+    server_cache_calibration_profile_snapshot & inflight_profile() noexcept;
 
     mutable std::mutex mutex_;
     std::condition_variable condition_;
@@ -293,9 +393,16 @@ private:
     bool load_delivered_ = false;
     server_cache_calibration_load_status load_status_ =
         server_cache_calibration_load_status::missing;
-    std::unique_ptr<server_cache_calibration_profile_set> loaded_profiles_;
+    // The load handoff stays in the coordinator's profile region; pending and
+    // commit-inflight images live in the two exact snapshot-region slots. The
+    // worker never allocates another production full-profile handoff.
+    server_cache_calibration_profile_set loaded_profiles_;
     bool pending_ = false;
-    server_cache_calibration_profile_snapshot pending_profile_;
+    server_cache_calibration_snapshot_workspace * snapshots_ = nullptr;
+    std::unique_ptr<server_cache_calibration_snapshot_workspace> owned_snapshots_;
+    void * codec_scratch_ = nullptr;
+    size_t codec_scratch_size_ = 0;
+    std::unique_ptr<std::byte[]> owned_codec_scratch_;
     server_cache_calibration_bounded_array<
         server_cache_calibration_commit_ack, 16, uint8_t> committed_acks_;
     std::array<uint8_t, 32> last_enqueued_identity_ = {};
@@ -303,6 +410,8 @@ private:
     std::atomic<server_cache_calibration_writer_health> health_ =
         server_cache_calibration_writer_health::idle;
     std::atomic<uint8_t> committed_ack_count_ = 0;
+    std::atomic<bool> boot_claim_ready_ = false;
+    std::atomic<uint64_t> boot_claim_ordinal_ = 0;
 };
 
 // Scheduler-owned coordinator. It atomically joins the asynchronously loaded
@@ -310,10 +419,18 @@ private:
 // and exposes one model-sleep flush door without doing file I/O.
 class server_cache_calibration_coordinator {
 public:
-    bool start(std::string directory) noexcept;
+    server_cache_calibration_coordinator() = default;
+    server_cache_calibration_coordinator(
+        server_cache_calibration_snapshot_workspace * snapshots,
+        void * codec_scratch,
+        size_t codec_scratch_size) noexcept
+        : writer_(snapshots, codec_scratch, codec_scratch_size) {}
+    bool start(std::string directory,
+               std::string secure_state_root) noexcept;
     bool resolve_load(const server_cache_execution_fingerprint & fingerprint,
                       server_cache_observation_store & observer) noexcept;
     void lifecycle(server_cache_observation_store & observer) noexcept;
+    void note_profile_use() noexcept;
     void flush_latest(server_cache_observation_store & observer) noexcept;
     void drain_latest_for_shutdown(
         server_cache_observation_store & observer) noexcept;
@@ -321,9 +438,13 @@ public:
     server_cache_calibration_writer_health health() const noexcept {
         return writer_.health();
     }
-    bool resume_pending() const noexcept { return resume_pending_; }
+    bool resume_pending() const noexcept {
+        return std::any_of(resume_pending_.begin(), resume_pending_.end(),
+                           [](bool value) { return value; });
+    }
     int64_t resume_started_us() const noexcept { return resume_started_us_; }
-    void complete_resume_validation() noexcept;
+    void complete_resume_validation(
+        uint32_t estimator_slot, bool succeeded) noexcept;
 
 private:
     bool enqueue_latest(server_cache_observation_store & observer,
@@ -331,6 +452,7 @@ private:
     bool enqueue_one_cached_dirty() noexcept;
     bool has_cached_dirty() const noexcept;
     bool consume_acks() noexcept;
+    void apply_claim_identity(server_cache_observation_store & observer) noexcept;
     bool cache_snapshot(
         const server_cache_calibration_profile_snapshot & value) noexcept;
 
@@ -340,8 +462,12 @@ private:
     std::array<uint8_t, 32> profile_identity_digest_ = {};
     server_cache_calibration_bounded_array<
         server_cache_calibration_profile_currency, 16, uint8_t> profile_currencies_;
+    uint64_t profile_last_use_epoch_ = 0;
+    bool profile_reuse_disabled_ = false;
     int64_t last_enqueue_us_ = 0;
-    bool resume_pending_ = false;
+    server_cache_resume_validation_flags resume_pending_ = {};
+    server_cache_resume_validation_flags
+        resume_authority_validation_required_ = {};
     int64_t resume_started_us_ = 0;
     bool cached_dirty_ = false;
     int64_t cached_retry_us_ = 0;

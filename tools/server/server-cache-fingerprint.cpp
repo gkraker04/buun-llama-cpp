@@ -10,9 +10,9 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
-#include <memory>
 #include <tuple>
 
 #if defined(_WIN32)
@@ -28,8 +28,13 @@
 namespace {
 
 constexpr size_t MAX_CODEC_BYTES = 1024 * 1024;
+// Frozen total fingerprint-worker region budget. The in-object read buffer
+// reserves a small suffix for the worker's thread/state members.
 constexpr size_t HASH_CHUNK_BYTES = 1024 * 1024;
 constexpr uint64_t HASH_RATE_BYTES_PER_SECOND = 32ULL * 1024 * 1024;
+constexpr char ARTIFACT_DOMAIN[] = "buun-zc-artifacts-v1";
+constexpr char CONFIG_DOMAIN[] = "buun-zc-config-v1";
+constexpr char EXEC_DOMAIN[] = "buun-zc-exec-v1";
 constexpr char ADAPTER_APPLICATION_DOMAIN[] =
     "buun-zc-adapter-application-v1";
 
@@ -403,6 +408,61 @@ std::array<uint8_t, 32> digest(const std::vector<uint8_t> & bytes) {
     return hash.finish();
 }
 
+void hash_u16(llama_sha256 & hash, uint16_t value) {
+    const uint8_t bytes[2] = { uint8_t(value), uint8_t(value >> 8) };
+    hash.update(bytes, sizeof(bytes));
+}
+
+void hash_u32(llama_sha256 & hash, uint32_t value) {
+    uint8_t bytes[4];
+    llama_store_le_u32(bytes, value);
+    hash.update(bytes, sizeof(bytes));
+}
+
+void hash_u64(llama_sha256 & hash, uint64_t value) {
+    uint8_t bytes[8];
+    llama_store_le_u64(bytes, value);
+    hash.update(bytes, sizeof(bytes));
+}
+
+bool fingerprint_config_root_from_fields(
+        const std::vector<server_cache_fingerprint_field> & fields,
+        std::array<uint8_t, 32> & root, bool & exact) noexcept {
+    try {
+        if (fields.size() != FIELD_TYPES.size()) return false;
+        llama_sha256 hash;
+        hash.update(CONFIG_DOMAIN, sizeof(CONFIG_DOMAIN));
+        hash_u32(hash, uint32_t(fields.size()));
+        exact = true;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            const auto & field = fields[i];
+            if (field.id != i + 1 || !valid_field(field) ||
+                field.payload.size() > UINT32_MAX) return false;
+            hash_u16(hash, field.id);
+            const uint8_t type = uint8_t(field.type);
+            hash.update(&type, sizeof(type));
+            hash_u32(hash, uint32_t(field.payload.size()));
+            hash.update(field.payload.data(), field.payload.size());
+            exact = exact && field.exact;
+        }
+        root = hash.finish();
+        return true;
+    } catch (...) {
+        root = {};
+        exact = false;
+        return false;
+    }
+}
+
+void fingerprint_artifact_hash_update(
+        llama_sha256 & hash,
+        const server_cache_fingerprint_artifact & artifact) {
+    hash_u16(hash, uint16_t(artifact.role));
+    hash_u32(hash, artifact.ordinal);
+    hash_u64(hash, artifact.byte_length);
+    hash.update(artifact.content_sha256.data(), artifact.content_sha256.size());
+}
+
 std::array<uint8_t, 32> digest_text(const std::string & value) {
     llama_sha256 hash;
     hash.update(value.data(), value.size());
@@ -501,6 +561,355 @@ bool vbr_override_census_payload(
     return true;
 }
 
+struct bounded_bytes {
+    uint8_t * data = nullptr;
+    size_t capacity = 0;
+    size_t size = 0;
+
+    void clear() noexcept { size = 0; }
+    bool append(const void * source, size_t count) noexcept {
+        if (count > capacity - size || (count != 0 && !source)) return false;
+        if (count != 0) std::memcpy(data + size, source, count);
+        size += count;
+        return true;
+    }
+    bool u8(uint8_t value) noexcept { return append(&value, 1); }
+    bool u16(uint16_t value) noexcept {
+        const uint8_t bytes[2] = { uint8_t(value), uint8_t(value >> 8) };
+        return append(bytes, sizeof(bytes));
+    }
+    bool u32(uint32_t value) noexcept {
+        uint8_t bytes[4];
+        llama_store_le_u32(bytes, value);
+        return append(bytes, sizeof(bytes));
+    }
+    bool u64(uint64_t value) noexcept {
+        uint8_t bytes[8];
+        llama_store_le_u64(bytes, value);
+        return append(bytes, sizeof(bytes));
+    }
+    bool binary64(double value) noexcept {
+        if (!std::isfinite(value)) return false;
+        if (value == 0.0) value = 0.0;
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return u64(bits);
+    }
+    bool binary32(float value) noexcept {
+        if (!std::isfinite(value)) return false;
+        if (value == 0.0f) value = 0.0f;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return u32(bits);
+    }
+    bool text32(const std::string & value) noexcept {
+        return value.size() <= UINT32_MAX && u32(uint32_t(value.size())) &&
+               append(value.data(), value.size());
+    }
+};
+
+struct config_root_builder {
+    llama_sha256 hash;
+    uint16_t next_id = 1;
+    bool exact = true;
+
+    config_root_builder() {
+        hash.update(CONFIG_DOMAIN, sizeof(CONFIG_DOMAIN));
+        hash_u32(hash, uint32_t(FIELD_TYPES.size()));
+    }
+
+    bool field(uint16_t id, server_cache_fingerprint_field_type type,
+               const void * data, size_t size, bool field_exact = true) noexcept {
+        if (id != next_id || id > FIELD_TYPES.size() ||
+            type != FIELD_TYPES[id - 1] || size > UINT32_MAX ||
+            (size != 0 && !data)) return false;
+        hash_u16(hash, id);
+        const uint8_t type_byte = uint8_t(type);
+        hash.update(&type_byte, 1);
+        hash_u32(hash, uint32_t(size));
+        hash.update(data, size);
+        exact = exact && field_exact;
+        ++next_id;
+        return true;
+    }
+    bool u32(uint16_t id, uint32_t value, bool field_exact = true) noexcept {
+        uint8_t bytes[4];
+        llama_store_le_u32(bytes, value);
+        return field(id, server_cache_fingerprint_field_type::u32,
+                     bytes, sizeof(bytes), field_exact);
+    }
+    bool enumeration(uint16_t id, uint16_t value) noexcept {
+        const uint8_t bytes[2] = { uint8_t(value), uint8_t(value >> 8) };
+        return field(id, server_cache_fingerprint_field_type::enum_u16,
+                     bytes, sizeof(bytes));
+    }
+    bool boolean(uint16_t id, bool value) noexcept {
+        const uint8_t byte = uint8_t(value);
+        return field(id, server_cache_fingerprint_field_type::bool_u8,
+                     &byte, sizeof(byte));
+    }
+};
+
+std::array<uint8_t, 32> digest_parts(
+        std::initializer_list<std::pair<const char *, size_t>> parts) {
+    llama_sha256 hash;
+    for (const auto & part : parts) hash.update(part.first, part.second);
+    return hash.finish();
+}
+
+bool decode_hex_digest(const char * value, size_t size,
+                       std::array<uint8_t, 32> & out) noexcept {
+    if (!value || size != 64) return false;
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < out.size(); ++i) {
+        const int high = nibble(value[2 * i]);
+        const int low = nibble(value[2 * i + 1]);
+        if (high < 0 || low < 0) return false;
+        out[i] = uint8_t((high << 4) | low);
+    }
+    return true;
+}
+
+bool fingerprint_config_root_from_params(
+        const common_params & params,
+        const common_cache_plan_vbr_regime & vbr,
+        uint32_t effective_n_gpu_layers,
+        uint16_t pipeline_mode,
+        uint16_t allocator_vmm_regime,
+        uint8_t * scratch, size_t scratch_size,
+        std::array<uint8_t, 32> & root, bool & exact) noexcept {
+    try {
+        bounded_bytes bytes { scratch, scratch_size, 0 };
+        config_root_builder out;
+        if (!out.u32(1, 2) || !out.u32(2, 2) || !out.u32(3, 2)) return false;
+
+        static constexpr char ABI_PREFIX[] = "zc-estimator-v2|";
+        static constexpr char ABI_BACKEND[] = "|ggml-backend-abi=v2";
+        const char * build = llama_build_info();
+        const char * compiler = llama_compiler();
+        const char * target = llama_build_target();
+        const char separator[] = "|";
+        const auto cost_abi = digest_parts({
+            { ABI_PREFIX, sizeof(ABI_PREFIX) - 1 }, { build, std::strlen(build) },
+            { separator, 1 }, { compiler, std::strlen(compiler) },
+            { separator, 1 }, { target, std::strlen(target) },
+            { ABI_BACKEND, sizeof(ABI_BACKEND) - 1 },
+        });
+        if (!out.field(4, server_cache_fingerprint_field_type::digest32,
+                       cost_abi.data(), cost_abi.size())) return false;
+
+        bytes.clear();
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
+            if ((i != 0 && !bytes.u8('|')) ||
+                !bytes.append(name, std::strlen(name))) return false;
+        }
+        if (!out.field(5, server_cache_fingerprint_field_type::utf8,
+                       bytes.data, bytes.size)) return false;
+
+        auto device_at = [&](size_t wanted) -> ggml_backend_dev_t {
+            size_t seen = 0;
+            if (params.devices.empty()) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    auto * device = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(device) !=
+                            GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+                    if (seen++ == wanted) return device;
+                }
+            } else {
+                for (auto * device : params.devices) {
+                    if (!device) continue;
+                    if (seen++ == wanted) return device;
+                }
+            }
+            return nullptr;
+        };
+        size_t device_count = 0;
+        while (device_at(device_count)) ++device_count;
+        if (device_count == 0) effective_n_gpu_layers = 0;
+        if (!out.u32(6, 0, device_count == 0) ||
+            !out.u32(7, 0, device_count == 0)) return false;
+        const char * system_info = llama_print_system_info();
+        if (!out.field(8, server_cache_fingerprint_field_type::utf8,
+                       system_info, std::strlen(system_info), false)) return false;
+
+        bytes.clear();
+        if (device_count > UINT32_MAX || !bytes.u32(uint32_t(device_count))) return false;
+        for (uint32_t i = 0; i < device_count; ++i) {
+            auto * device = device_at(i);
+            const char * name = ggml_backend_dev_name(device);
+            const char * description = ggml_backend_dev_description(device);
+            const char newline[] = "\n";
+            const auto pseudo_uuid = digest_parts({
+                { name, std::strlen(name) }, { newline, 1 },
+                { description, std::strlen(description) },
+            });
+            if (!bytes.u32(i) || !bytes.append(pseudo_uuid.data(), 16) ||
+                !bytes.u16(0) || !bytes.u16(0) || !bytes.u16(0)) return false;
+        }
+        if (!out.field(9, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size, device_count == 0)) return false;
+        bytes.clear();
+        if (!bytes.u32(0) ||
+            !out.field(10, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size, device_count == 0)) return false;
+
+        bytes.clear();
+        if (device_count > UINT32_MAX ||
+            !bytes.u16(uint16_t(params.split_mode)) ||
+            !bytes.u32(uint32_t(std::max(0, params.main_gpu))) ||
+            !bytes.u32(effective_n_gpu_layers) ||
+            !bytes.u32(uint32_t(device_count))) return false;
+        for (size_t i = 0; i < device_count; ++i) {
+            if (!bytes.binary64(params.tensor_split[i])) return false;
+        }
+        if (!bytes.u8(uint8_t(!params.no_kv_offload)) ||
+            !bytes.u8(uint8_t(!params.no_op_offload)) ||
+            !out.field(11, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size)) return false;
+        if (!out.u32(12, uint32_t(std::max(0, params.n_batch))) ||
+            !out.u32(13, uint32_t(std::max(0, params.n_ubatch))) ||
+            !out.u32(14, uint32_t(std::max(0, params.cpuparams.n_threads))) ||
+            !out.u32(15, uint32_t(std::max(0, params.cpuparams_batch.n_threads)))) return false;
+        auto emit_cpu_mask = [&](uint16_t id, const common_cpu_params & cpu) {
+            bytes.clear();
+            uint32_t count = 0;
+            if (cpu.mask_valid) {
+                for (bool selected : cpu.cpumask) count += selected ? 1u : 0u;
+            }
+            if (!bytes.u32(count)) return false;
+            if (cpu.mask_valid) {
+                for (uint32_t i = 0; i < GGML_MAX_N_THREADS; ++i) {
+                    if (cpu.cpumask[i] && !bytes.u32(i)) return false;
+                }
+            }
+            return out.field(id, server_cache_fingerprint_field_type::bytes,
+                             bytes.data, bytes.size);
+        };
+        if (!emit_cpu_mask(16, params.cpuparams) ||
+            !emit_cpu_mask(17, params.cpuparams_batch) ||
+            !out.enumeration(18, uint16_t(params.numa)) ||
+            !out.boolean(19, params.flash_attn_type !=
+                              LLAMA_FLASH_ATTN_TYPE_DISABLED) ||
+            pipeline_mode > 1 || allocator_vmm_regime > 1 ||
+            !out.enumeration(20, pipeline_mode)) return false;
+        const bool has_draft = params.speculative.has_dft();
+        const bool has_model_free = params.speculative.has_model_free_type();
+        if (!out.enumeration(21, uint16_t(has_draft) |
+                                 (uint16_t(has_model_free) << 1))) return false;
+
+        bytes.clear();
+        char policy[128];
+        const int policy_size = std::snprintf(
+            policy, sizeof(policy), "%d|%d|%f",
+            params.speculative.tree_budget,
+            params.speculative.draft_topk,
+            double(params.speculative.sample_temp));
+        if (policy_size < 0 || size_t(policy_size) >= sizeof(policy)) return false;
+        const auto dflash_policy = digest_parts({ { policy, size_t(policy_size) } });
+        if (!bytes.u16(uint16_t(params.speculative.type())) ||
+            !bytes.u32(uint32_t(std::max(0, params.speculative.n_max))) ||
+            !bytes.u32(uint32_t(std::max(0, params.speculative.n_min))) ||
+            !bytes.u32(uint32_t(std::max(0, params.speculative.draft.n_max))) ||
+            !bytes.binary64(params.speculative.p_min) ||
+            !bytes.binary64(params.speculative.p_split) ||
+            !bytes.u8(uint8_t(has_model_free)) ||
+            !bytes.u8(uint8_t(params.speculative.type() ==
+                               COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) ||
+            !bytes.append(dflash_policy.data(), dflash_policy.size())) return false;
+        const bool speculative_exact = params.speculative.types.empty() ||
+            (params.speculative.types.size() == 1 &&
+             params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE);
+        if (!out.field(22, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size, speculative_exact) ||
+            !out.enumeration(23, uint16_t(params.cache_type_k)) ||
+            !out.enumeration(24, uint16_t(params.cache_type_v)) ||
+            !out.boolean(25, params.kv_unified) ||
+            !out.u32(26, uint32_t(std::max(0, params.n_ctx))) ||
+            !out.u32(27, uint32_t(std::max(0, params.n_parallel)))) return false;
+
+        std::array<uint8_t, 32> schedule_digest = digest_parts({ { "", 0 } });
+        bytes.clear();
+        if (vbr.override_rows.size() > UINT32_MAX ||
+            !bytes.u32(uint32_t(vbr.override_rows.size()))) return false;
+        uint16_t previous_id = 0;
+        for (const auto & row : vbr.override_rows) {
+            if (row.census_id == 0 || row.census_id <= previous_id ||
+                row.value.empty() || row.value.size() > UINT32_MAX ||
+                row.grammar > common_cache_plan_vbr_value_grammar::inline_or_path ||
+                !bytes.u16(row.census_id) || !bytes.u8(uint8_t(row.grammar)) ||
+                !bytes.u32(uint32_t(row.value.size())) ||
+                !bytes.append(row.value.data(), row.value.size())) return false;
+            previous_id = row.census_id;
+            if (row.grammar == common_cache_plan_vbr_value_grammar::inline_or_path) {
+                static constexpr char SHA_PREFIX[] = "sha256-";
+                if (row.value.size() != sizeof(SHA_PREFIX) - 1 + 64 ||
+                    row.value.compare(0, sizeof(SHA_PREFIX) - 1, SHA_PREFIX) != 0 ||
+                    !decode_hex_digest(row.value.data() + sizeof(SHA_PREFIX) - 1,
+                                       64, schedule_digest)) return false;
+            }
+        }
+        llama_sha256 override_hash;
+        override_hash.update(bytes.data, bytes.size);
+        const auto override_digest = override_hash.finish();
+
+        bytes.clear();
+        if (!bytes.u8(uint8_t(vbr.armed)) || !bytes.u8(uint8_t(vbr.side_k)) ||
+            !bytes.u8(uint8_t(vbr.side_v)) || !bytes.text32(vbr.budget_mode) ||
+            !bytes.text32(vbr.family) || !bytes.text32(vbr.policy) ||
+            !bytes.append(schedule_digest.data(), schedule_digest.size()) ||
+            !bytes.binary64(vbr.capacity_bits) ||
+            !bytes.binary64(vbr.selected_bpv) ||
+            !bytes.u64(vbr.vram_budget_bytes) ||
+            !bytes.binary32(vbr.reclaim_floor_bpv) ||
+            !bytes.binary32(vbr.reset_keep_frac) ||
+            !bytes.u8(uint8_t(vbr.unrepresented_override)) ||
+            !out.field(28, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size, !vbr.unrepresented_override) ||
+            !out.field(29, server_cache_fingerprint_field_type::digest32,
+                       override_digest.data(), override_digest.size())) return false;
+
+        uint32_t providers = 0;
+        providers |= 1u << uint16_t(common_cache_plan_provider::live_slot);
+        providers |= 1u << uint16_t(common_cache_plan_provider::cold_replay);
+        if (params.cache_ram_mib != 0) providers |=
+            1u << uint16_t(common_cache_plan_provider::host_cache_entry);
+        if (params.n_ctx_checkpoints > 0) providers |=
+            1u << uint16_t(common_cache_plan_provider::live_context_checkpoint);
+        if (!out.u32(30, providers)) return false;
+
+        bytes.clear();
+        if (!bytes.u32(2)) return false;
+        for (const auto provider : {
+                 common_cache_plan_provider::host_cache_entry,
+                 common_cache_plan_provider::live_context_checkpoint }) {
+            const char * name = common_cache_plan_provider_name(provider);
+            static constexpr char RECIPE_PREFIX[] = "restore-representation-v1|";
+            const auto recipe = digest_parts({
+                { RECIPE_PREFIX, sizeof(RECIPE_PREFIX) - 1 },
+                { name, std::strlen(name) },
+            });
+            if (!bytes.u16(uint16_t(provider)) || !bytes.u16(0) ||
+                !bytes.append(recipe.data(), recipe.size())) return false;
+        }
+        if (!out.field(31, server_cache_fingerprint_field_type::bytes,
+                       bytes.data, bytes.size) ||
+            !out.enumeration(32, allocator_vmm_regime) ||
+            out.next_id != FIELD_TYPES.size() + 1) return false;
+        root = out.hash.finish();
+        exact = out.exact;
+        return true;
+    } catch (...) {
+        root = {};
+        exact = false;
+        return false;
+    }
+}
+
 void close_descriptor(int fd) noexcept {
     if (fd < 0) {
         return;
@@ -523,19 +932,10 @@ int64_t read_at(int fd, void * data, size_t size, uint64_t offset) noexcept {
 #endif
 }
 
-struct worker_input {
-    std::vector<server_cache_fingerprint_descriptor> descriptors;
-    std::vector<server_cache_fingerprint_field> fields;
-    std::vector<server_cache_fingerprint_artifact> fixed_artifacts;
-
-    ~worker_input() {
-        for (auto & row : descriptors) {
-            close_descriptor(row.descriptor);
-        }
-    }
-};
-
 } // namespace
+
+static_assert(sizeof(server_cache_fingerprint_worker) <= HASH_CHUNK_BYTES,
+              "fingerprint worker must fit its fixed 1-MiB arena region");
 
 server_cache_fingerprint_field server_cache_fingerprint_bool(
         uint16_t id, bool value) {
@@ -656,7 +1056,6 @@ bool server_cache_execution_fingerprint_v1(
         }
 
         std::vector<uint8_t> artifact_bytes;
-        static constexpr char ARTIFACT_DOMAIN[] = "buun-zc-artifacts-v1";
         if (!append_bounded(artifact_bytes, ARTIFACT_DOMAIN,
                             sizeof(ARTIFACT_DOMAIN)) ||
             artifact_bytes.size() > MAX_CODEC_BYTES - 4) {
@@ -677,7 +1076,6 @@ bool server_cache_execution_fingerprint_v1(
         }
 
         std::vector<uint8_t> config_bytes;
-        static constexpr char CONFIG_DOMAIN[] = "buun-zc-config-v1";
         if (!append_bounded(config_bytes, CONFIG_DOMAIN,
                             sizeof(CONFIG_DOMAIN)) ||
             config_bytes.size() > MAX_CODEC_BYTES - 4) {
@@ -703,7 +1101,6 @@ bool server_cache_execution_fingerprint_v1(
         out.artifact_root = digest(artifact_bytes);
         out.config_root = digest(config_bytes);
         std::vector<uint8_t> execution_bytes;
-        static constexpr char EXEC_DOMAIN[] = "buun-zc-exec-v1";
         if (!append_bounded(execution_bytes, EXEC_DOMAIN,
                             sizeof(EXEC_DOMAIN)) ||
             !append_bounded(execution_bytes, out.artifact_root.data(), 32) ||
@@ -1111,33 +1508,90 @@ bool server_cache_fingerprint_worker::start(
         std::vector<server_cache_fingerprint_descriptor> descriptors,
         std::vector<server_cache_fingerprint_field> fields,
         std::vector<server_cache_fingerprint_artifact> fixed_artifacts) noexcept {
-    if (started_ || thread_.joinable() ||
-        (descriptors.empty() && fixed_artifacts.empty())) {
-        for (auto & row : descriptors) {
-            close_descriptor(row.descriptor);
-            row.descriptor = -1;
-        }
+    if (started_ || thread_.joinable() || config_ready_ ||
+        !fingerprint_config_root_from_fields(
+            fields, config_root_, config_exact_)) {
+        server_cache_fingerprint_descriptors_close(descriptors);
         return false;
     }
+    config_ready_ = true;
+    auto close_admitted = [&]() {
+        for (size_t i = 0; i < descriptor_count_; ++i) {
+            close_descriptor(descriptors_[i].descriptor);
+            descriptors_[i].descriptor = -1;
+        }
+        descriptor_count_ = 0;
+    };
+    for (auto & row : descriptors) {
+        const int descriptor = row.descriptor;
+        row.descriptor = -1;
+        if (!add_descriptor({ row.role, row.ordinal, descriptor,
+                              row.byte_length, row.integrity_exact })) {
+            server_cache_fingerprint_descriptors_close(descriptors);
+            close_admitted();
+            return false;
+        }
+    }
+    for (const auto & row : fixed_artifacts) {
+        if (!add_fixed_artifact(row)) {
+            server_cache_fingerprint_descriptors_close(descriptors);
+            close_admitted();
+            return false;
+        }
+    }
+    return launch();
+}
+
+bool server_cache_fingerprint_worker::configure(
+        const common_params & params,
+        const common_cache_plan_vbr_regime & vbr,
+        uint32_t effective_n_gpu_layers,
+        uint16_t pipeline_mode,
+        uint16_t allocator_vmm_regime) noexcept {
+    if (started_ || thread_.joinable() || config_ready_) return false;
+    if (!fingerprint_config_root_from_params(
+            params, vbr, effective_n_gpu_layers, pipeline_mode,
+            allocator_vmm_regime, hash_buffer_.data(), hash_buffer_.size(),
+            config_root_, config_exact_)) return false;
+    config_ready_ = true;
+    return true;
+}
+
+bool server_cache_fingerprint_worker::add_descriptor(
+        server_cache_fingerprint_descriptor value) noexcept {
+    if (started_ || thread_.joinable() || value.descriptor < 0 ||
+        !valid_artifact_role(value.role) ||
+        descriptor_count_ == descriptors_.size()) {
+        close_descriptor(value.descriptor);
+        return false;
+    }
+    descriptors_[descriptor_count_++] = value;
+    return true;
+}
+
+bool server_cache_fingerprint_worker::add_fixed_artifact(
+        server_cache_fingerprint_artifact value) noexcept {
+    if (started_ || thread_.joinable() || !valid_artifact_role(value.role) ||
+        fixed_artifact_count_ == fixed_artifacts_.size()) return false;
+    fixed_artifacts_[fixed_artifact_count_++] = value;
+    return true;
+}
+
+bool server_cache_fingerprint_worker::launch() noexcept {
+    if (started_ || thread_.joinable() || !config_ready_ ||
+        (descriptor_count_ == 0 && fixed_artifact_count_ == 0)) return false;
     cancel_.store(false, std::memory_order_relaxed);
     started_ = true;
     try {
-        auto input = std::make_unique<worker_input>();
-        input->descriptors.swap(descriptors);
-        input->fields.swap(fields);
-        input->fixed_artifacts.swap(fixed_artifacts);
-        thread_ = std::thread(
-            [this, input = std::move(input)]() mutable {
-                run(std::move(input->descriptors),
-                    std::move(input->fields),
-                    std::move(input->fixed_artifacts));
-            });
+        thread_ = std::thread([this] { run(); });
         return true;
     } catch (...) {
         started_ = false;
-        for (auto & row : descriptors) {
-            close_descriptor(row.descriptor);
+        for (size_t i = 0; i < descriptor_count_; ++i) {
+            close_descriptor(descriptors_[i].descriptor);
+            descriptors_[i].descriptor = -1;
         }
+        descriptor_count_ = 0;
         return false;
     }
 }
@@ -1158,14 +1612,13 @@ void server_cache_fingerprint_worker::stop() noexcept {
     if (thread_.joinable()) {
         thread_.join();
     }
+    for (size_t i = 0; i < descriptor_count_; ++i) {
+        close_descriptor(descriptors_[i].descriptor);
+        descriptors_[i].descriptor = -1;
+    }
 }
 
-void server_cache_fingerprint_worker::run(
-        std::vector<server_cache_fingerprint_descriptor> descriptors,
-        std::vector<server_cache_fingerprint_field> fields,
-        std::vector<server_cache_fingerprint_artifact> fixed_artifacts) noexcept {
-    std::vector<server_cache_fingerprint_artifact> artifacts =
-        std::move(fixed_artifacts);
+void server_cache_fingerprint_worker::run() noexcept {
     try {
 #if defined(__linux__)
         // Best-effort background I/O class. Failure is safe: the explicit
@@ -1173,12 +1626,23 @@ void server_cache_fingerprint_worker::run(
         (void) syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
                        IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
 #endif
-        artifacts.reserve(artifacts.size() + descriptors.size());
-        std::vector<uint8_t> buffer(HASH_CHUNK_BYTES);
         auto rate_window_started = std::chrono::steady_clock::now();
         uint64_t rate_window_read = 0;
         bool failed = false;
-        for (auto & source : descriptors) {
+        bool exact = config_exact_;
+        std::sort(descriptors_.begin(), descriptors_.begin() + descriptor_count_,
+            [](const auto & a, const auto & b) {
+                return std::tie(a.role, a.ordinal) <
+                       std::tie(b.role, b.ordinal);
+            });
+        std::sort(fixed_artifacts_.begin(),
+                  fixed_artifacts_.begin() + fixed_artifact_count_,
+            [](const auto & a, const auto & b) {
+                return std::tie(a.role, a.ordinal) <
+                       std::tie(b.role, b.ordinal);
+            });
+        for (size_t source_index = 0; source_index < descriptor_count_; ++source_index) {
+            auto & source = descriptors_[source_index];
             llama_sha256 hash;
             uint64_t offset = 0;
             while (offset < source.byte_length) {
@@ -1197,14 +1661,14 @@ void server_cache_fingerprint_worker::run(
                     break;
                 }
                 const size_t want = size_t(std::min<uint64_t>(
-                    buffer.size(), source.byte_length - offset));
+                    hash_buffer_.size(), source.byte_length - offset));
                 const int64_t got = read_at(
-                    source.descriptor, buffer.data(), want, offset);
+                    source.descriptor, hash_buffer_.data(), want, offset);
                 if (got <= 0 || size_t(got) != want) {
                     failed = true;
                     break;
                 }
-                hash.update(buffer.data(), size_t(got));
+                hash.update(hash_buffer_.data(), size_t(got));
                 offset += uint64_t(got);
                 rate_window_read += uint64_t(got);
                 const uint64_t whole_seconds =
@@ -1227,37 +1691,86 @@ void server_cache_fingerprint_worker::run(
                             std::chrono::milliseconds(2))));
                 }
             }
-            if (!failed) {
-                artifacts.push_back({ source.role, source.ordinal,
-                    source.byte_length, hash.finish(),
-                    source.integrity_exact });
-            }
+            if (!failed) descriptor_digests_[source_index] = hash.finish();
             close_descriptor(source.descriptor);
             source.descriptor = -1;
             if (failed) {
                 break;
             }
         }
-        for (auto & source : descriptors) {
-            close_descriptor(source.descriptor);
-            source.descriptor = -1;
+        for (size_t i = 0; i < descriptor_count_; ++i) {
+            close_descriptor(descriptors_[i].descriptor);
+            descriptors_[i].descriptor = -1;
         }
         server_cache_execution_fingerprint result;
         if (!failed && !cancel_.load(std::memory_order_relaxed)) {
-            std::sort(artifacts.begin(), artifacts.end(),
-                [](const auto & a, const auto & b) {
-                    return std::tie(a.role, a.ordinal) <
-                           std::tie(b.role, b.ordinal);
-                });
-            (void) server_cache_execution_fingerprint_v1(
-                std::move(artifacts), std::move(fields), result);
+            llama_sha256 artifact_hash;
+            artifact_hash.update(ARTIFACT_DOMAIN, sizeof(ARTIFACT_DOMAIN));
+            hash_u32(artifact_hash,
+                     uint32_t(descriptor_count_ + fixed_artifact_count_));
+            server_cache_fingerprint_artifact previous;
+            bool has_previous = false;
+            size_t descriptor_index = 0;
+            size_t fixed_index = 0;
+            while (descriptor_index < descriptor_count_ ||
+                   fixed_index < fixed_artifact_count_) {
+                server_cache_fingerprint_artifact artifact;
+                const bool take_descriptor =
+                    fixed_index == fixed_artifact_count_ ||
+                    (descriptor_index < descriptor_count_ &&
+                     std::tie(descriptors_[descriptor_index].role,
+                              descriptors_[descriptor_index].ordinal) <
+                         std::tie(fixed_artifacts_[fixed_index].role,
+                                  fixed_artifacts_[fixed_index].ordinal));
+                if (take_descriptor) {
+                    const auto & source = descriptors_[descriptor_index];
+                    artifact = { source.role, source.ordinal, source.byte_length,
+                        descriptor_digests_[descriptor_index],
+                        source.integrity_exact };
+                    ++descriptor_index;
+                } else {
+                    artifact = fixed_artifacts_[fixed_index++];
+                }
+                if (!valid_artifact_role(artifact.role) ||
+                    (!has_previous && (artifact.role !=
+                         server_cache_fingerprint_artifact_role::target ||
+                         artifact.ordinal != 0)) ||
+                    (has_previous &&
+                     std::tie(artifact.role, artifact.ordinal) <=
+                         std::tie(previous.role, previous.ordinal)) ||
+                    (has_previous && artifact.role == previous.role &&
+                     artifact.ordinal != previous.ordinal + 1) ||
+                    (has_previous && artifact.role != previous.role &&
+                     artifact.ordinal != 0)) {
+                    failed = true;
+                    break;
+                }
+                fingerprint_artifact_hash_update(artifact_hash, artifact);
+                exact = exact && artifact.exact;
+                previous = artifact;
+                has_previous = true;
+            }
+            if (!failed) result.artifact_root = artifact_hash.finish();
+        }
+        if (!failed && !cancel_.load(std::memory_order_relaxed)) {
+            result.config_root = config_root_;
+            llama_sha256 execution_hash;
+            execution_hash.update(EXEC_DOMAIN, sizeof(EXEC_DOMAIN));
+            execution_hash.update(result.artifact_root.data(),
+                                  result.artifact_root.size());
+            execution_hash.update(result.config_root.data(),
+                                  result.config_root.size());
+            result.execution_root = execution_hash.finish();
+            result.complete = true;
+            result.exact = exact;
         }
         std::lock_guard<std::mutex> lock(mutex_);
         result_ = result;
         ready_ = true;
     } catch (...) {
-        for (auto & source : descriptors) {
-            close_descriptor(source.descriptor);
+        for (size_t i = 0; i < descriptor_count_; ++i) {
+            close_descriptor(descriptors_[i].descriptor);
+            descriptors_[i].descriptor = -1;
         }
         std::lock_guard<std::mutex> lock(mutex_);
         result_ = {};

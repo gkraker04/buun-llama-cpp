@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-cache-plan-preflight-internal.h
     server-cache-observer.cpp
     server-cache-observer.h
+    server-cache-calibration-model.cpp
+    server-cache-calibration-model.h
     server-cache-calibration-store.cpp
     server-cache-calibration-store.h
     server-cache-fingerprint.cpp
@@ -139,6 +141,16 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-cache-observer PRIVATE cxx_std_17)
     add_test(NAME test-server-cache-observer COMMAND test-server-cache-observer)
     set_property(TEST test-server-cache-observer PROPERTY LABELS main)
+
+    add_executable(test-server-cache-calibration-model
+        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-calibration-model.cpp)
+    target_link_libraries(test-server-cache-calibration-model PRIVATE server-context)
+    target_include_directories(test-server-cache-calibration-model PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(test-server-cache-calibration-model PRIVATE cxx_std_17)
+    add_test(NAME test-server-cache-calibration-model
+        COMMAND test-server-cache-calibration-model)
+    set_property(TEST test-server-cache-calibration-model PROPERTY LABELS main)
 
     add_executable(test-server-cache-fingerprint
         ${CMAKE_SOURCE_DIR}/tests/test-server-cache-fingerprint.cpp)

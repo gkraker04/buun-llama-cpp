@@ -96,9 +96,10 @@ foreach(path IN LISTS production_cpp)
     string(APPEND all_production "${text}")
 endforeach()
 
+set(expected_observer_store_enabled_reads 8)
 count_literal("${all_production}" ".observer_store_enabled"
     observer_store_enabled_reads)
-if (NOT observer_store_enabled_reads EQUAL 2)
+if (NOT observer_store_enabled_reads EQUAL expected_observer_store_enabled_reads)
     message(FATAL_ERROR
         "ZC2 observer-store consumer census drifted: ${observer_store_enabled_reads}")
 endif()
@@ -120,7 +121,9 @@ endif()
 set(observer_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.observer_store_enabled; }")
 count_literal("${observer_mutation}" ".observer_store_enabled"
     observer_mutation_reads)
-if (observer_mutation_reads EQUAL 2)
+math(EXPR expected_observer_mutation_reads
+    "${expected_observer_store_enabled_reads} + 1")
+if (NOT observer_mutation_reads EQUAL expected_observer_mutation_reads)
     message(FATAL_ERROR "observer-store consumer negative control did not trip")
 endif()
 set(retention_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.retention_policy; }")

@@ -22,8 +22,11 @@ if (NOT implemented_ceiling)
 endif()
 
 function(cache_plan_authority_order_valid source output)
+    # Pin the completed inventory call without coupling this contract to the
+    # evolving observer arguments that follow the authoritative source
+    # registry. The close parenthesis is deliberately not part of the token.
     string(FIND "${source}"
-        "task, target, out.incoming_adapter, rec, source_registry);"
+        "task, target, out.incoming_loras, out.incoming_adapter, rec,\n            source_registry"
         inventory_pos)
     string(FIND "${source}" "mode.plan_authority->plan_before_mutation(" planner_pos)
     string(FIND "${source}" "cache_plan_authority->authorize(" authority_pos)

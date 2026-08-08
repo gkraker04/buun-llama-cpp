@@ -70,13 +70,32 @@ foreach(REQUIRED IN ITEMS
     contract_require_token("${CONTEXT_CPP}${SERVER_TASK_CPP}" "${REQUIRED}"
         "ZC3a immutable host/checkpoint adapter carrier")
 endforeach()
-count_literal("${COMMON_H}${SERVER_TASK_H}"
-    "std::array<uint8_t, 32> adapter_application_digest = {};"
-    ADAPTER_CARRIER_COUNT)
-if (NOT ADAPTER_CARRIER_COUNT EQUAL 2)
-    message(FATAL_ERROR
-        "ZC3a adapter identity needs exactly host + checkpoint carriers; got ${ADAPTER_CARRIER_COUNT}")
+set(COMMON_H_WITH_SENTINEL "${COMMON_H}\n// ZC3A_COMMON_HEADER_EOF")
+contract_extract_region("${COMMON_H_WITH_SENTINEL}"
+    "struct common_prompt_checkpoint {"
+    "// ZC3A_COMMON_HEADER_EOF"
+    CHECKPOINT_CARRIER CHECKPOINT_CARRIER_FOUND)
+contract_extract_region("${SERVER_TASK_H}"
+    "struct server_prompt_cache_state {"
+    "struct server_prompt_cache_load_observation {"
+    HOST_CARRIER HOST_CARRIER_FOUND)
+contract_extract_region("${SERVER_TASK_H}"
+    "struct server_prompt_cache_load_observation {"
+    "inline void server_prompt_cache_apply_retention_lineage("
+    LOAD_OBSERVATION_CARRIER LOAD_OBSERVATION_CARRIER_FOUND)
+if (NOT CHECKPOINT_CARRIER_FOUND OR NOT HOST_CARRIER_FOUND OR
+    NOT LOAD_OBSERVATION_CARRIER_FOUND)
+    message(FATAL_ERROR "ZC3a adapter carrier regions are incomplete")
 endif()
+foreach(CARRIER IN ITEMS CHECKPOINT_CARRIER HOST_CARRIER LOAD_OBSERVATION_CARRIER)
+    count_literal("${${CARRIER}}"
+        "std::array<uint8_t, 32> adapter_application_digest = {};"
+        ADAPTER_CARRIER_COUNT)
+    if (NOT ADAPTER_CARRIER_COUNT EQUAL 1)
+        message(FATAL_ERROR
+            "ZC3a ${CARRIER} needs exactly one adapter identity carrier; got ${ADAPTER_CARRIER_COUNT}")
+    endif()
+endforeach()
 set(MUTATED_CHECKPOINT "${CHECKPOINT_CPP}")
 string(REPLACE
     "adapter_application_complete(other.adapter_application_complete),"
@@ -131,8 +150,11 @@ endif()
 
 foreach(REQUIRED IN ITEMS
         "if (llama_model_artifact_capture_enabled())"
-        "model->capture_artifact_descriptors(ml)")
-    contract_require_token("${LLAMA_CPP}" "${REQUIRED}"
+        "model->capture_artifact_descriptors(ml)"
+        "llama_model_dup_artifact_descriptors_bounded("
+        "duplicate_artifact_descriptors_bounded("
+        "llama_model_artifact_descriptors_close_bounded(")
+    contract_require_token("${LLAMA_CPP}${LLAMA_MODEL_CPP}${LLAMA_EXT_H}" "${REQUIRED}"
         "ZC3a loader-owned descriptor capture")
 endforeach()
 foreach(REQUIRED IN ITEMS
@@ -142,11 +164,47 @@ foreach(REQUIRED IN ITEMS
         "cache_calibration->resolve_load("
         "cache_optimizer_observations->set_execution_fingerprint("
         "cache_fingerprint_worker->set_scheduler_demand(true)"
+        "cache_fingerprint_worker->configure("
+        "cache_fingerprint_worker->add_descriptor("
+        "cache_fingerprint_worker->add_fixed_artifact("
+        "cache_fingerprint_worker->launch()"
         "cache_fingerprint_scheduler_busy = true"
         "cache_fingerprint_worker.reset();")
     contract_require_token("${CONTEXT_CPP}" "${REQUIRED}"
         "ZC3a observer-only production wiring")
 endforeach()
+
+contract_extract_region("${FINGERPRINT_CPP}"
+    "bool fingerprint_config_root_from_params("
+    "void close_descriptor("
+    BOUNDED_CONFIG_REGION BOUNDED_CONFIG_REGION_FOUND)
+set(FINGERPRINT_CPP_WITH_SENTINEL
+    "${FINGERPRINT_CPP}\n// ZC3A_FINGERPRINT_CPP_EOF")
+contract_extract_region("${FINGERPRINT_CPP_WITH_SENTINEL}"
+    "void server_cache_fingerprint_worker::run() noexcept"
+    "// ZC3A_FINGERPRINT_CPP_EOF"
+    WORKER_RUN_REGION WORKER_RUN_REGION_FOUND)
+contract_extract_region("${CONTEXT_CPP}"
+    "void cache_fingerprint_start() noexcept"
+    "void cache_fingerprint_lifecycle_point() noexcept"
+    PRODUCTION_START_REGION PRODUCTION_START_REGION_FOUND)
+if (NOT BOUNDED_CONFIG_REGION_FOUND OR NOT WORKER_RUN_REGION_FOUND OR
+    NOT PRODUCTION_START_REGION_FOUND)
+    message(FATAL_ERROR "ZC3a bounded fingerprint regions are incomplete")
+endif()
+contract_find_forbidden(
+    "${BOUNDED_CONFIG_REGION}${WORKER_RUN_REGION}${PRODUCTION_START_REGION}"
+    FINGERPRINT_HEAP_ESCAPE
+    "std::vector<server_cache_fingerprint_field>"
+    "std::vector<server_cache_fingerprint_descriptor>"
+    "std::vector<server_cache_fingerprint_artifact>"
+    "std::vector<llama_model_artifact_descriptor>"
+    "server_cache_execution_fingerprint_v1("
+    "server_cache_fingerprint_fields_v1(")
+if (FINGERPRINT_HEAP_ESCAPE)
+    message(FATAL_ERROR
+        "ZC3a production fingerprint escaped bounded arena ownership: ${FINGERPRINT_HEAP_ESCAPE}")
+endif()
 
 foreach(REQUIRED IN ITEMS
         "key.profile_execution_digest = execution_fingerprint_.execution_root;"
@@ -216,6 +274,15 @@ set(MUTATED_FINGERPRINT "${FINGERPRINT_CPP}\nstatic constexpr char EXTRA[] = \"b
 count_literal("${MUTATED_FINGERPRINT}" "buun-zc-exec-v1" MUTATED_DOMAIN_COUNT)
 if (MUTATED_DOMAIN_COUNT EQUAL 1)
     message(FATAL_ERROR "ZC3a domain-owner negative control did not trip")
+endif()
+
+set(MUTATED_BOUNDED_CONFIG
+    "${BOUNDED_CONFIG_REGION}\nstd::vector<server_cache_fingerprint_field> escaped;")
+contract_find_forbidden("${MUTATED_BOUNDED_CONFIG}"
+    MUTATED_HEAP_ESCAPE "std::vector<server_cache_fingerprint_field>")
+if (NOT MUTATED_HEAP_ESCAPE)
+    message(FATAL_ERROR
+        "ZC3a bounded-fingerprint heap-escape negative control did not trip")
 endif()
 
 message(STATUS "ZC3a fingerprint contract checks passed")

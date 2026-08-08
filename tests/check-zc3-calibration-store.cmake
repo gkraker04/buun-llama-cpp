@@ -8,6 +8,8 @@ file(READ "${SOURCE_ROOT}/tools/server/server-cache-calibration-store.cpp" STORE
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-calibration-store.h" STORE_H)
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" CONTEXT_CPP)
 file(READ "${SOURCE_ROOT}/tools/server/server-cache-observer.cpp" OBSERVER_CPP)
+file(READ "${SOURCE_ROOT}/common/common.cpp" COMMON_CPP)
+file(READ "${SOURCE_ROOT}/common/common.h" COMMON_H)
 
 foreach(REQUIRED IN ITEMS
         "ROOT_PAYLOAD_LIMIT = 64 * 1024"
@@ -36,8 +38,8 @@ foreach(REQUIRED IN ITEMS
         "ack.profile_generation_ordinal !="
         "ack.profile_file_generation <="
         "server_cache_calibration_validate_profile("
-        "resume_validation_pending = true"
-        "complete_resume_validation()"
+        "resume_validation_pending[instance.slot] = true"
+        "complete_resume_validation("
         "enqueue_one_cached_dirty()"
         "Slot reuse requires immutable-snapshot acceptance"
         "committed_ack_count_.load(std::memory_order_acquire)"
@@ -50,13 +52,51 @@ foreach(REQUIRED IN ITEMS
 endforeach()
 
 foreach(REQUIRED IN ITEMS
-        "cache_calibration->start(calibration_dir)"
+        "cache_calibration->start(calibration_dir, state_root)"
+        "const std::string state_root = fs_get_state_directory()"
+        "state_root + \"calibration\""
         "cache_calibration->resolve_load("
         "cache_calibration->lifecycle(*cache_optimizer_observations)"
         "cache_calibration->flush_latest(*cache_optimizer_observations)")
     contract_require_token("${CONTEXT_CPP}" "${REQUIRED}"
         "ZC3b coordinator integration contract")
 endforeach()
+
+foreach(REQUIRED IN ITEMS
+        "std::string fs_get_state_directory()"
+        "LLAMA_STATE_HOME"
+        "XDG_STATE_HOME"
+        ".local"
+        "Application Support"
+        "LOCALAPPDATA")
+    contract_require_token("${COMMON_CPP}${COMMON_H}" "${REQUIRED}"
+        "ZC3b durable platform-state resolver")
+endforeach()
+
+foreach(REQUIRED IN ITEMS
+        "int open_directory_chain(const fs::path & path,"
+        "openat(current, part.c_str(),"
+        "O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW"
+        "const bool secure_component = !secure_parts.empty()"
+        "status.st_uid == geteuid()"
+        "(status.st_mode & 0777) == 0700"
+        "const int parent_descriptor = open_directory_chain(")
+    contract_require_token("${STORE_CPP}" "${REQUIRED}"
+        "ZC3b descriptor-relative state-root ancestry")
+endforeach()
+
+contract_forbid_token("${COMMON_CPP}" "GGML_ABORT(\"persistent state"
+    "ZC3b unsupported state storage must fall back to memory")
+contract_require_token("${COMMON_CPP}"
+    "throw std::runtime_error(\n        \"persistent state is not implemented"
+    "ZC3b unsupported state storage fallback")
+
+contract_find_forbidden("${CONTEXT_CPP}" CALIBRATION_CACHE_PATH
+    "fs_get_cache_directory() + \"cache-calibration-v1\"")
+if (CALIBRATION_CACHE_PATH)
+    message(FATAL_ERROR
+        "ZC3b calibration persistence regressed into disposable cache storage")
+endif()
 
 contract_find_forbidden("${STORE_CPP}${STORE_H}" FORBIDDEN
     "cache_plan_authority"
@@ -79,10 +119,41 @@ if (CONTEXT_IO)
     message(FATAL_ERROR "ZC3b scheduler context acquired file I/O: ${CONTEXT_IO}")
 endif()
 
-count_literal("${CONTEXT_CPP}" "cache_calibration->start(calibration_dir)"
+count_literal("${CONTEXT_CPP}" "cache_calibration->start(calibration_dir, state_root)"
     COORDINATOR_START_COUNT)
 if (NOT COORDINATOR_START_COUNT EQUAL 1)
     message(FATAL_ERROR "ZC3b coordinator must have one production start; got ${COORDINATOR_START_COUNT}")
+endif()
+
+function(zc3b_validate_secure_root_handoff HEADER IMPL OUT)
+    count_literal("${HEADER}" "bool start(std::string directory,"
+        SECURE_START_DECLS)
+    count_literal("${HEADER}" "std::string secure_state_root) noexcept;"
+        SECURE_ROOT_DECLS)
+    if (NOT SECURE_START_DECLS EQUAL 2 OR NOT SECURE_ROOT_DECLS EQUAL 3)
+        set(${OUT} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    foreach(REQUIRED IN ITEMS
+            "secure_state_root = std::move(secure_state_root)"
+            "run(std::move(directory), std::move(secure_state_root))"
+            "store.open(directory, secure_state_root)"
+            "writer_.start("
+            "std::move(directory), std::move(secure_state_root))")
+        string(FIND "${IMPL}" "${REQUIRED}" FOUND)
+        if (FOUND EQUAL -1)
+            set(${OUT} FALSE PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${OUT} TRUE PARENT_SCOPE)
+endfunction()
+
+zc3b_validate_secure_root_handoff(
+    "${STORE_H}" "${STORE_CPP}" SECURE_ROOT_HANDOFF_VALID)
+if (NOT SECURE_ROOT_HANDOFF_VALID)
+    message(FATAL_ERROR
+        "ZC3b secure state-root carrier is incomplete")
 endif()
 
 function(zc3b_validate_observer_gate TEXT OUT)
@@ -95,14 +166,14 @@ function(zc3b_validate_observer_gate TEXT OUT)
         return()
     endif()
     count_literal("${OBSERVER_REGION}"
-        "cache_calibration->start(calibration_dir)" REGION_START_COUNT)
+        "cache_calibration->start(calibration_dir, state_root)" REGION_START_COUNT)
     if (NOT REGION_START_COUNT EQUAL 1)
         set(${OUT} FALSE PARENT_SCOPE)
         return()
     endif()
     string(REPLACE "${OBSERVER_REGION}" "" OUTSIDE_REGION "${TEXT}")
     string(FIND "${OUTSIDE_REGION}"
-        "cache_calibration->start(calibration_dir)" OUTSIDE_START)
+        "cache_calibration->start(calibration_dir, state_root)" OUTSIDE_START)
     if (NOT OUTSIDE_START EQUAL -1)
         set(${OUT} FALSE PARENT_SCOPE)
         return()
@@ -115,10 +186,18 @@ if (NOT OBSERVER_GATE_VALID)
     message(FATAL_ERROR "ZC3b coordinator escaped the observer-only construction gate")
 endif()
 
-count_literal("${OBSERVER_CPP}" "increment_saturating(mutation_generation_);"
-    MUTATION_COUNT)
-if (NOT MUTATION_COUNT EQUAL 2)
-    message(FATAL_ERROR "ZC3b authority-currency generation census drifted: ${MUTATION_COUNT}")
+function(zc3b_validate_mutation_census TEXT OUT)
+    count_literal("${TEXT}" "increment_saturating(mutation_generation_);"
+        MUTATION_COUNT)
+    if (MUTATION_COUNT EQUAL 5)
+        set(${OUT} TRUE PARENT_SCOPE)
+    else()
+        set(${OUT} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+zc3b_validate_mutation_census("${OBSERVER_CPP}" MUTATION_CENSUS_VALID)
+if (NOT MUTATION_CENSUS_VALID)
+    message(FATAL_ERROR "ZC3b authority-currency generation census drifted")
 endif()
 
 file(GLOB SERVER_PRODUCTION "${SOURCE_ROOT}/tools/server/*.cpp")
@@ -135,11 +214,33 @@ if (NOT FAULT_CALL EQUAL -1)
 endif()
 
 # Mutation controls exercise the same scoped validators/censuses.
-set(MUTATED_CONTEXT "${CONTEXT_CPP}\ncache_calibration->start(calibration_dir);")
-count_literal("${MUTATED_CONTEXT}" "cache_calibration->start(calibration_dir)"
+set(MUTATED_CONTEXT "${CONTEXT_CPP}\ncache_calibration->start(calibration_dir, state_root);")
+count_literal("${MUTATED_CONTEXT}" "cache_calibration->start(calibration_dir, state_root)"
     MUTATED_START_COUNT)
 if (MUTATED_START_COUNT EQUAL 1)
     message(FATAL_ERROR "ZC3b coordinator-start negative control did not trip")
+endif()
+
+set(MUTATED_SECURE_ROOT_HANDOFF "${STORE_CPP}")
+string(REPLACE "store.open(directory, secure_state_root)"
+    "store.open(directory)"
+    MUTATED_SECURE_ROOT_HANDOFF "${MUTATED_SECURE_ROOT_HANDOFF}")
+zc3b_validate_secure_root_handoff(
+    "${STORE_H}" "${MUTATED_SECURE_ROOT_HANDOFF}"
+    MUTATED_SECURE_ROOT_HANDOFF_VALID)
+if (MUTATED_SECURE_ROOT_HANDOFF_VALID)
+    message(FATAL_ERROR
+        "ZC3b secure-root handoff negative control did not trip")
+endif()
+
+set(MUTATED_STATE_CONTEXT "${CONTEXT_CPP}")
+string(REPLACE "const std::string state_root = fs_get_state_directory()"
+    "const std::string state_root = fs_get_cache_directory()"
+    MUTATED_STATE_CONTEXT "${MUTATED_STATE_CONTEXT}")
+string(FIND "${MUTATED_STATE_CONTEXT}"
+    "const std::string state_root = fs_get_state_directory()" MUTATED_STATE_OWNER)
+if (NOT MUTATED_STATE_OWNER EQUAL -1)
+    message(FATAL_ERROR "ZC3b durable-state-owner negative control did not trip")
 endif()
 
 set(MUTATED_GATE "${CONTEXT_CPP}")
@@ -155,9 +256,9 @@ endif()
 set(MUTATED_OBSERVER "${OBSERVER_CPP}")
 string(REPLACE "increment_saturating(mutation_generation_);" ""
     MUTATED_OBSERVER "${MUTATED_OBSERVER}")
-count_literal("${MUTATED_OBSERVER}" "increment_saturating(mutation_generation_);"
-    MUTATED_MUTATION_COUNT)
-if (MUTATED_MUTATION_COUNT EQUAL 2)
+zc3b_validate_mutation_census("${MUTATED_OBSERVER}"
+    MUTATED_MUTATION_CENSUS_VALID)
+if (MUTATED_MUTATION_CENSUS_VALID)
     message(FATAL_ERROR "ZC3b currency-mutation negative control did not trip")
 endif()
 
@@ -167,6 +268,19 @@ count_literal("${STORE_CPP}" "O_NOFOLLOW" ORIGINAL_NOFOLLOW_COUNT)
 count_literal("${MUTATED_STORE}" "O_NOFOLLOW" MUTATED_NOFOLLOW_COUNT)
 if (NOT MUTATED_NOFOLLOW_COUNT LESS ORIGINAL_NOFOLLOW_COUNT)
     message(FATAL_ERROR "ZC3b no-follow negative control did not trip")
+endif()
+
+set(MUTATED_ANCESTOR "${STORE_CPP}")
+string(REPLACE
+    "O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW"
+    "O_RDONLY | O_DIRECTORY | O_CLOEXEC"
+    MUTATED_ANCESTOR "${MUTATED_ANCESTOR}")
+string(FIND "${MUTATED_ANCESTOR}"
+    "O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW"
+    MUTATED_ANCESTOR_NOFOLLOW)
+if (NOT MUTATED_ANCESTOR_NOFOLLOW EQUAL -1)
+    message(FATAL_ERROR
+        "ZC3b state-ancestor no-follow negative control did not trip")
 endif()
 
 set(MUTATED_STORE_MODE "${STORE_CPP}")

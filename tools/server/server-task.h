@@ -6,6 +6,7 @@
 #include "llama.h"
 #include "server-cache-lifecycle.h"
 #include "server-cache-lease.h"
+#include "server-cache-observer.h"
 #include "server-cache-plan-preflight.h"
 #include "server-cache-control.h"
 #include "server-retention-sidecar.h"
@@ -838,6 +839,11 @@ struct server_prompt_cache_load_observation {
     bool restored = false;
     uint64_t payload_bytes = 0;
     uint64_t owned_cpu_us = 0;
+    server_cache_observation_admission_clock admission_clock;
+    // Identity belongs to the retained source that was actually selected,
+    // never to the incoming request that happened to trigger the restore.
+    std::array<uint8_t, 32> adapter_application_digest = {};
+    bool adapter_application_complete = false;
 };
 
 inline void server_prompt_cache_apply_retention_lineage(

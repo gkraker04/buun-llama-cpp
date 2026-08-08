@@ -513,7 +513,18 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc3-calibration-store.cmake
 )
 
+add_test(
+    NAME test-zc4-calibration-model-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc4-calibration-model.cmake
+)
 find_program(CAPSTONE_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
+add_test(
+    NAME test-zc4-shadow-report
+    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-zc4-shadow-report.py
+)
 add_test(
     NAME test-capstone-truth
     COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
@@ -621,11 +632,17 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+# This CPU/backend-neutral fragmentation fixture predates the fork-wide VBR
+# default. Keep its state-layout contract on the static KV implementation;
+# VBR generation accounting has its own dedicated restore tests.
+llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -ctk f16 -ctv f16)
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+# State serialization is backend-neutral and this fixture runs on CPU-only
+# builders. Pin the static KV mode explicitly: the fork-wide default is VBR,
+# whose device cache correctly refuses a CPU-only context.
+llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -ctk f16 -ctv f16)
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (NOT GGML_BACKEND_DL)

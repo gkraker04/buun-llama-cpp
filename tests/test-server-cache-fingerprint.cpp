@@ -1,9 +1,11 @@
 #include "server-cache-fingerprint.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-sha256.h"
 #include "common.h"
 #include "common-cache-plan-estimate.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -11,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +27,30 @@
 #  include <unistd.h>
 #endif
 
+static std::atomic<bool> reject_allocations { false };
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+void * operator new(std::size_t size) {
+    if (reject_allocations.load(std::memory_order_relaxed)) throw std::bad_alloc();
+    if (void * value = std::malloc(size)) return value;
+    throw std::bad_alloc();
+}
+
+void * operator new[](std::size_t size) {
+    return ::operator new(size);
+}
+
+void operator delete(void * value) noexcept { std::free(value); }
+void operator delete[](void * value) noexcept { std::free(value); }
+void operator delete(void * value, std::size_t) noexcept { std::free(value); }
+void operator delete[](void * value, std::size_t) noexcept { std::free(value); }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 #define CHECK(x) do { \
     if (!(x)) { \
         std::fprintf(stderr, "CHECK failed at %s:%d: %s\n", \
@@ -30,6 +58,9 @@
         std::abort(); \
     } \
 } while (0)
+
+static_assert(sizeof(server_cache_fingerprint_worker) <= 1024 * 1024,
+              "fingerprint worker and its buffer must fit the ZC4 arena");
 
 static std::string hex(const std::array<uint8_t, 32> & value) {
     static const char digits[] = "0123456789abcdef";
@@ -47,6 +78,26 @@ static uint32_t read_u32(const std::vector<uint8_t> & value, size_t offset) {
         (uint32_t(value[offset + 1]) << 8) |
         (uint32_t(value[offset + 2]) << 16) |
         (uint32_t(value[offset + 3]) << 24);
+}
+
+static std::array<uint8_t, 32> config_root(
+        const std::vector<server_cache_fingerprint_field> & fields) {
+    static constexpr char domain[] = "buun-zc-config-v1";
+    llama_sha256 hash;
+    hash.update(domain, sizeof(domain));
+    uint8_t count[4];
+    llama_store_le_u32(count, uint32_t(fields.size()));
+    hash.update(count, sizeof(count));
+    for (const auto & field : fields) {
+        const uint8_t header[3] = {
+            uint8_t(field.id), uint8_t(field.id >> 8), uint8_t(field.type) };
+        hash.update(header, sizeof(header));
+        uint8_t size[4];
+        llama_store_le_u32(size, uint32_t(field.payload.size()));
+        hash.update(size, sizeof(size));
+        hash.update(field.payload.data(), field.payload.size());
+    }
+    return hash.finish();
 }
 
 static server_cache_fingerprint_field utf8(uint16_t id, const char * value) {
@@ -288,6 +339,7 @@ int main() {
     // selection cannot retain the loader's negative/all-layers GPU sentinel.
     common_params production_params;
     production_params.devices = { nullptr };
+    production_params.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
     common_cache_plan_vbr_regime production_vbr;
     std::vector<server_cache_fingerprint_field> production_fields;
     CHECK(server_cache_fingerprint_fields_v1(
@@ -295,6 +347,7 @@ int main() {
     CHECK(production_fields.size() == 32);
     CHECK(production_fields[10].id == 11);
     CHECK(read_u32(production_fields[10].payload, 6) == 0);
+    const auto default_production_fields = production_fields;
 
     auto active_spec = production_params;
     active_spec.speculative.set_type(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -339,6 +392,78 @@ int main() {
         0, 3, abc_sha, false } }, fields(), expected_worker));
     CHECK(worker_result.execution_root == expected_worker.execution_root);
     worker.stop();
+
+    // The production-only config path streams the identical frozen bytes into
+    // the arena-owned worker without constructing the public vector codec.
+#if defined(_WIN32)
+    const int configured_duplicate = _dup(_fileno(file));
+#else
+    const int configured_duplicate = dup(fileno(file));
+#endif
+    CHECK(configured_duplicate >= 0);
+    auto configured_worker = std::make_unique<server_cache_fingerprint_worker>();
+    reject_allocations.store(true, std::memory_order_relaxed);
+    const bool configured_without_allocation = configured_worker->configure(
+        production_params, production_vbr, 99, 0, 0);
+    reject_allocations.store(false, std::memory_order_relaxed);
+    CHECK(configured_without_allocation);
+    CHECK(configured_worker->add_descriptor({
+        server_cache_fingerprint_artifact_role::target,
+        0, configured_duplicate, 3, false }));
+    CHECK(configured_worker->launch());
+    server_cache_execution_fingerprint configured_result;
+    bool configured_delivered = false;
+    for (int i = 0; i < 200 &&
+             !(configured_delivered = configured_worker->poll(configured_result)); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(configured_delivered && configured_result.complete);
+    CHECK(configured_result.config_root == config_root(default_production_fields));
+    configured_worker->stop();
+
+#if !defined(_WIN32)
+    // Bounded admission closes the rejected descriptor immediately, and the
+    // unlaunched worker destructor closes every descriptor it already owns.
+    int first_bounded_descriptor = -1;
+    {
+        auto bounded_worker = std::make_unique<server_cache_fingerprint_worker>();
+        CHECK(bounded_worker->configure(
+            production_params, production_vbr, 99, 0, 0));
+        for (size_t i = 0;
+             i < server_cache_fingerprint_worker::descriptor_capacity; ++i) {
+            const int descriptor = dup(fileno(file));
+            CHECK(descriptor >= 0);
+            if (i == 0) first_bounded_descriptor = descriptor;
+            CHECK(bounded_worker->add_descriptor({
+                server_cache_fingerprint_artifact_role::target,
+                uint32_t(i), descriptor, 3, false }));
+        }
+        const int overflow_descriptor = dup(fileno(file));
+        CHECK(overflow_descriptor >= 0);
+        CHECK(!bounded_worker->add_descriptor({
+            server_cache_fingerprint_artifact_role::target,
+            uint32_t(server_cache_fingerprint_worker::descriptor_capacity),
+            overflow_descriptor, 3, false }));
+        CHECK(fcntl(overflow_descriptor, F_GETFD) == -1 && errno == EBADF);
+    }
+    CHECK(first_bounded_descriptor >= 0);
+    CHECK(fcntl(first_bounded_descriptor, F_GETFD) == -1 && errno == EBADF);
+#endif
+    {
+        auto bounded_artifacts = std::make_unique<server_cache_fingerprint_worker>();
+        CHECK(bounded_artifacts->configure(
+            production_params, production_vbr, 99, 0, 0));
+        for (size_t i = 0;
+             i < server_cache_fingerprint_worker::fixed_artifact_capacity; ++i) {
+            CHECK(bounded_artifacts->add_fixed_artifact({
+                server_cache_fingerprint_artifact_role::target,
+                uint32_t(i), 0, {}, false }));
+        }
+        CHECK(!bounded_artifacts->add_fixed_artifact({
+            server_cache_fingerprint_artifact_role::target,
+            uint32_t(server_cache_fingerprint_worker::fixed_artifact_capacity),
+            0, {}, false }));
+    }
 
     // The worker is all-or-nothing: a short descriptor never publishes a
     // partial root, and artifact ordering is the canonical role/ordinal order.
@@ -442,6 +567,51 @@ int main() {
         0, rejected_duplicate, 3, false } }, fields()));
     CHECK(fcntl(rejected_duplicate, F_GETFD) == -1 && errno == EBADF);
 #endif
+
+    // The arena-owned buffer is slightly smaller than its 1-MiB region so the
+    // worker state fits beside it. A full-MiB descriptor therefore proves the
+    // same fixed buffer is reused across reads without changing the digest.
+    {
+        FILE * chunked_file = std::tmpfile();
+        CHECK(chunked_file != nullptr);
+        std::array<uint8_t, 64 * 1024> block = {};
+        for (size_t i = 0; i < block.size(); ++i) {
+            block[i] = uint8_t(i * 17 + 3);
+        }
+        llama_sha256 chunked_hash;
+        for (size_t written = 0; written < 1024 * 1024;
+             written += block.size()) {
+            CHECK(std::fwrite(block.data(), 1, block.size(), chunked_file) ==
+                  block.size());
+            chunked_hash.update(block.data(), block.size());
+        }
+        CHECK(std::fflush(chunked_file) == 0);
+#if defined(_WIN32)
+        const int chunked_duplicate = _dup(_fileno(chunked_file));
+#else
+        const int chunked_duplicate = dup(fileno(chunked_file));
+#endif
+        CHECK(chunked_duplicate >= 0);
+        server_cache_fingerprint_worker chunked_worker;
+        CHECK(chunked_worker.start({ {
+            server_cache_fingerprint_artifact_role::target,
+            0, chunked_duplicate, 1024 * 1024, false } }, fields()));
+        server_cache_execution_fingerprint chunked_result;
+        bool chunked_delivered = false;
+        for (int i = 0; i < 500 &&
+                 !(chunked_delivered = chunked_worker.poll(chunked_result)); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(chunked_delivered && chunked_result.complete);
+        server_cache_execution_fingerprint expected_chunked;
+        CHECK(server_cache_execution_fingerprint_v1({ {
+            server_cache_fingerprint_artifact_role::target,
+            0, 1024 * 1024, chunked_hash.finish(), false } },
+            fields(), expected_chunked));
+        CHECK(chunked_result.execution_root == expected_chunked.execution_root);
+        chunked_worker.stop();
+        std::fclose(chunked_file);
+    }
     std::fclose(file);
 
     CHECK(!llama_model_artifact_capture_enabled());

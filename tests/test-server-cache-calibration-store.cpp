@@ -1,4 +1,6 @@
 #include "server-cache-calibration-store.h"
+#include "server-cache-calibration-model.h"
+#include "common.h"
 #include "../src/llama-sha256.h"
 
 #include <algorithm>
@@ -28,6 +30,69 @@
 } while (0)
 
 namespace fs = std::filesystem;
+
+#if !defined(_WIN32)
+class scoped_environment {
+public:
+    explicit scoped_environment(const char * name) : name_(name) {
+        if (const char * value = std::getenv(name)) {
+            had_value_ = true;
+            value_ = value;
+        }
+    }
+
+    ~scoped_environment() {
+        if (had_value_) {
+            setenv(name_, value_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+private:
+    const char * name_;
+    bool had_value_ = false;
+    std::string value_;
+};
+
+static void test_state_directory_resolution() {
+    scoped_environment restore_override("LLAMA_STATE_HOME");
+    scoped_environment restore_xdg("XDG_STATE_HOME");
+    scoped_environment restore_home("HOME");
+
+    CHECK(setenv("LLAMA_STATE_HOME", "/tmp/llama-explicit-state", 1) == 0);
+    CHECK(fs_get_state_directory() == "/tmp/llama-explicit-state/");
+
+    CHECK(unsetenv("LLAMA_STATE_HOME") == 0);
+    CHECK(setenv("XDG_STATE_HOME", "/tmp/llama-xdg-state", 1) == 0);
+    CHECK(fs_get_state_directory() == "/tmp/llama-xdg-state/llama.cpp/");
+
+    CHECK(setenv("XDG_STATE_HOME", "relative-state-is-invalid", 1) == 0);
+    CHECK(setenv("HOME", "/tmp/llama-home", 1) == 0);
+    CHECK(fs_get_state_directory() ==
+          "/tmp/llama-home/.local/state/llama.cpp/");
+
+    CHECK(setenv("LLAMA_STATE_HOME", "relative-override-is-invalid", 1) == 0);
+    bool rejected = false;
+    try {
+        (void) fs_get_state_directory();
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+
+    CHECK(unsetenv("LLAMA_STATE_HOME") == 0);
+    CHECK(unsetenv("XDG_STATE_HOME") == 0);
+    CHECK(setenv("HOME", "relative-home-is-invalid", 1) == 0);
+    rejected = false;
+    try {
+        (void) fs_get_state_directory();
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+#endif
 
 static void append_u32(std::vector<uint8_t> & out, uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) out.push_back(uint8_t(value >> (8 * i)));
@@ -61,7 +126,12 @@ static bool sha256_is(const std::vector<uint8_t> & bytes,
         actual.push_back(digits[byte >> 4]);
         actual.push_back(digits[byte & 15]);
     }
-    return actual == expected;
+    if (actual != expected) {
+        std::fprintf(stderr, "sha256 mismatch: expected %s, actual %s\n",
+                     expected, actual.c_str());
+        return false;
+    }
+    return true;
 }
 
 static server_cache_calibration_profile_snapshot profile(uint8_t identity) {
@@ -79,6 +149,8 @@ static server_cache_calibration_profile_snapshot profile(uint8_t identity) {
     instance.key.participant_execution_digest[0] = 1;
     instance.key.adapter_application_digest[0] = 2;
     instance.key.representation_digest[0] = 3;
+    CHECK(server_cache_calibration_effect_action_digest_v1(
+        nullptr, 0, instance.key.effect_action_shape_digest));
     instance.key.adapter_application_complete = true;
     instance.key.identity_complete = true;
     instance.v[0][0] = 2.0;
@@ -115,6 +187,7 @@ static void write_bytes(const fs::path & path,
 static server_cache_observation_record accepted_record(
         const server_cache_execution_fingerprint & fingerprint) {
     server_cache_observation_record out;
+    out.admission_clock = { true, 1000000, 60000 };
     out.key.operation = server_cache_observation_operation::replay;
     out.key.provider = common_cache_plan_provider::live_slot;
     out.key.feature_dim = 4;
@@ -124,6 +197,8 @@ static server_cache_observation_record accepted_record(
     out.key.participant_execution_digest[0] = 0x31;
     out.key.adapter_application_digest[0] = 0x32;
     out.key.representation_digest[0] = 0x33;
+    CHECK(server_cache_calibration_effect_action_digest_v1(
+        nullptr, 0, out.key.effect_action_shape_digest));
     out.feature = { 0.0, 0.0, 0.0, 1.0 };
     out.owned_cpu_us = 10;
     out.backend_service_us = 90;
@@ -134,6 +209,10 @@ static server_cache_observation_record accepted_record(
 }
 
 int main() {
+#if !defined(_WIN32)
+    test_state_directory_resolution();
+#endif
+
     server_cache_calibration_manifest manifest;
     manifest.store_lineage_id[0] = 0xab;
     manifest.next_boot_claim_ordinal = 0;
@@ -225,7 +304,7 @@ int main() {
     CHECK(server_cache_calibration_encode_profile(
         manifest.store_lineage_id, snapshot, encoded));
     CHECK(sha256_is(encoded,
-        "a92f11418d31cb60c14353d65fdec12c9872fabba01f3944a997fd42f013dd83"));
+        "9b287c02d41ea87f9df78143b2fd25365f94b254668d0b747faf86b20d36e121"));
     server_cache_calibration_profile_snapshot decoded_profile;
     CHECK(server_cache_calibration_decode_profile(
         encoded.data(), encoded.size(), manifest.store_lineage_id,
@@ -244,7 +323,8 @@ int main() {
              server_cache_calibration_authority_terminal::tail_exceeded,
              server_cache_calibration_authority_terminal::confidence_budget_exhausted,
              server_cache_calibration_authority_terminal::ordinal_exhausted,
-             server_cache_calibration_authority_terminal::numeric_fault }) {
+             server_cache_calibration_authority_terminal::numeric_fault,
+             server_cache_calibration_authority_terminal::drifted }) {
         auto terminal_profile = profile(0x43);
         auto & instance = terminal_profile.instances.front();
         instance.fit_generation = 9;
@@ -278,6 +358,7 @@ int main() {
         const auto & roundtrip = terminal_roundtrip.instances.front();
         CHECK(roundtrip.fit_generation == 9);
         CHECK(roundtrip.authority_terminal == terminal);
+        CHECK(!roundtrip.key.identity_exact);
         CHECK(roundtrip.log_wealth[2] == -0.25);
         CHECK(roundtrip.n_validation == 3);
         CHECK(roundtrip.validation_region_minutes.size() == 1);
@@ -285,6 +366,45 @@ int main() {
         CHECK(roundtrip.opportunity_at_last_validation == 6);
         CHECK(roundtrip.last_fit_unix_ms == 100);
         CHECK(roundtrip.last_validation_unix_ms == 101);
+    }
+
+    // A restored wall-clock anomaly keeps the fitted moments/coverage but
+    // starts validation, age, and diversity authority from ordinary learning.
+    for (uint64_t anomalous_update : { uint64_t(1), UINT64_MAX }) {
+        auto clock_profile = profile(0x45);
+        clock_profile.profile_last_update_unix_ms = anomalous_update;
+        auto & source = clock_profile.instances.front();
+        source.log_wealth[1] = 0.5;
+        source.n_validation = 4;
+        CHECK(source.validation_region_minutes.push_back(12));
+        CHECK(source.validation_region_minutes.push_back(13));
+        source.safe_measurable_opportunities = 9;
+        source.opportunity_at_last_validation = 8;
+        source.last_fit_unix_ms = anomalous_update;
+        source.last_validation_unix_ms = anomalous_update;
+        server_cache_observation_store restored;
+        server_cache_execution_fingerprint fingerprint;
+        fingerprint.complete = true;
+        fingerprint.exact = true;
+        fingerprint.execution_root = clock_profile.profile_identity_digest;
+        restored.set_execution_fingerprint(fingerprint);
+        CHECK(server_cache_calibration_restore_observer(clock_profile, restored));
+        const auto & result = restored.instances()[source.slot];
+        CHECK(result.used);
+        CHECK(result.v == source.v);
+        CHECK(result.b == source.b);
+        CHECK(result.n_success == source.n_fit);
+        CHECK(result.feature_min == source.feature_min);
+        CHECK(result.feature_max == source.feature_max);
+        CHECK(result.n_validation == 0);
+        CHECK(result.log_wealth == (std::array<double, 6>{}));
+        CHECK(result.fit_region_count == 0);
+        CHECK(result.validation_region_count == 0);
+        CHECK(result.safe_measurable_opportunities == 0);
+        CHECK(result.opportunity_at_last_validation == 0);
+        CHECK(result.last_fit_unix_ms == 0);
+        CHECK(result.last_validation_unix_ms == 0);
+        CHECK(!result.key.identity_exact);
     }
 
     // Closed key semantics are shared by live admission and persistence.
@@ -347,6 +467,54 @@ int main() {
     CHECK(server_cache_calibration_encode_profile(
         manifest.store_lineage_id, maximal, encoded));
     CHECK(encoded.size() <= 1024 * 1024 + 48);
+    std::vector<uint8_t> codec_scratch(2 * 1024 * 1024);
+    std::vector<uint8_t> bounded_encoded;
+    size_t codec_high_water = 0;
+    CHECK(server_cache_calibration_encode_profile_with_scratch_for_test(
+        manifest.store_lineage_id, maximal,
+        codec_scratch.data(), codec_scratch.size(), bounded_encoded,
+        codec_high_water));
+    CHECK(bounded_encoded == encoded);
+    CHECK(codec_high_water > 0 && codec_high_water <= codec_scratch.size());
+    std::fprintf(stderr, "ZC4 codec maximal high-water: %zu / %zu bytes\n",
+                 codec_high_water, codec_scratch.size());
+    size_t lower = 1;
+    size_t upper = codec_scratch.size();
+    while (lower < upper) {
+        const size_t middle = lower + (upper - lower) / 2;
+        std::vector<uint8_t> probe_scratch(middle);
+        size_t probe_high_water = 0;
+        if (server_cache_calibration_encode_profile_with_scratch_for_test(
+                manifest.store_lineage_id, maximal,
+                probe_scratch.data(), probe_scratch.size(), bounded_encoded,
+                probe_high_water)) {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    CHECK(lower <= codec_scratch.size());
+    std::vector<uint8_t> exhausted_scratch(lower - 1);
+    size_t exhausted_high_water = 0;
+    CHECK(!server_cache_calibration_encode_profile_with_scratch_for_test(
+        manifest.store_lineage_id, maximal,
+        exhausted_scratch.data(), exhausted_scratch.size(), bounded_encoded,
+        exhausted_high_water));
+    std::fprintf(stderr, "ZC4 codec one-byte exhaustion boundary: %zu bytes\n",
+                 lower);
+    server_cache_calibration_profile_snapshot bounded_decoded;
+    size_t decode_high_water = 0;
+    CHECK(server_cache_calibration_decode_profile_with_scratch_for_test(
+        encoded.data(), encoded.size(), manifest.store_lineage_id,
+        codec_scratch.data(), codec_scratch.size(), bounded_decoded,
+        decode_high_water));
+    CHECK(bounded_decoded.profile_identity_digest ==
+          maximal.profile_identity_digest);
+    CHECK(bounded_decoded.instances.size() == maximal.instances.size());
+    CHECK(server_cache_calibration_validate_profile(bounded_decoded));
+    CHECK(decode_high_water > 0 && decode_high_water <= codec_scratch.size());
+    std::fprintf(stderr, "ZC4 codec maximal decode high-water: %zu / %zu bytes\n",
+                 decode_high_water, codec_scratch.size());
 
     auto negative_zero = encoded;
     const std::string needle = "0000000000000000";
@@ -373,6 +541,22 @@ int main() {
     auto saturated_mutation = snapshot;
     saturated_mutation.mutation_generation = UINT64_MAX;
     CHECK(!server_cache_calibration_validate_profile(saturated_mutation));
+
+    auto clock_prior = profile(0x46);
+    clock_prior.profile_last_update_unix_ms = UINT64_MAX;
+    clock_prior.instances.front().n_validation = 4;
+    clock_prior.instances.front().safe_measurable_opportunities = 9;
+    clock_prior.instances.front().opportunity_at_last_validation = 8;
+    auto clock_reset = clock_prior;
+    ++clock_reset.mutation_generation;
+    clock_reset.instances.front().n_validation = 0;
+    clock_reset.instances.front().safe_measurable_opportunities = 0;
+    clock_reset.instances.front().opportunity_at_last_validation = 0;
+    CHECK(!server_cache_calibration_validate_profile(
+        clock_reset, &clock_prior));
+    clock_reset.clock_authority_reset = true;
+    CHECK(server_cache_calibration_validate_profile(
+        clock_reset, &clock_prior));
 
 #if defined(_WIN32)
     const int pid = _getpid();
@@ -487,10 +671,28 @@ int main() {
     CHECK(regression_store.load_profiles(loaded) ==
           server_cache_calibration_load_status::ok);
     CHECK(loaded.front().instances.front().n_fit == 1);
+    auto changed_key = loaded.front();
+    ++changed_key.mutation_generation;
+    ++changed_key.instances.front().fit_generation;
+    changed_key.instances.front().key.participant_execution_digest[0] ^= 0x7f;
+    CHECK(regression_store.commit_profile(changed_key) ==
+          server_cache_calibration_load_status::corrupt);
+
+    auto drifted_generation = loaded.front();
+    ++drifted_generation.mutation_generation;
+    drifted_generation.instances.front().authority_terminal =
+        server_cache_calibration_authority_terminal::drifted;
+    CHECK(regression_store.commit_profile(drifted_generation) ==
+          server_cache_calibration_load_status::ok);
+    CHECK(regression_store.load_profiles(loaded) ==
+          server_cache_calibration_load_status::ok);
+
     auto next_generation = loaded.front();
     ++next_generation.mutation_generation;
     ++next_generation.instances.front().fit_generation;
-    next_generation.instances.front().key.participant_execution_digest[0] ^= 0x7f;
+    next_generation.instances.front().authority_terminal =
+        server_cache_calibration_authority_terminal::none;
+    next_generation.instances.front().tail_actual_max_us = 0;
     next_generation.instances.front().n_fit = 0;
     next_generation.instances.front().qualified_execution_ordinal = 0;
     next_generation.instances.front().v = {};
@@ -501,7 +703,14 @@ int main() {
     next_generation.instances.front().b = {};
     next_generation.instances.front().feature_min = {};
     next_generation.instances.front().feature_max = {};
+    next_generation.instances.front().log_wealth = {};
+    next_generation.instances.front().n_validation = 0;
     next_generation.instances.front().fit_region_minutes.clear();
+    next_generation.instances.front().validation_region_minutes.clear();
+    next_generation.instances.front().safe_measurable_opportunities = 0;
+    next_generation.instances.front().opportunity_at_last_validation = 0;
+    next_generation.instances.front().last_fit_unix_ms = 0;
+    next_generation.instances.front().last_validation_unix_ms = 0;
     next_generation.instances.front().response_reservoir = {};
     next_generation.instances.front().reservoir_seen = 0;
     CHECK(regression_store.commit_profile(next_generation) ==
@@ -511,6 +720,15 @@ int main() {
     --reused_generation.instances.front().fit_generation;
     CHECK(regression_store.commit_profile(reused_generation) ==
           server_cache_calibration_load_status::corrupt);
+    regression_store.close();
+    CHECK(regression_store.open(regression_directory.string()) ==
+          server_cache_calibration_load_status::ok);
+    CHECK(regression_store.load_profiles(loaded) ==
+          server_cache_calibration_load_status::ok);
+    CHECK(loaded.front().instances.front().fit_generation ==
+          next_generation.instances.front().fit_generation);
+    CHECK(loaded.front().instances.front().key ==
+          next_generation.instances.front().key);
     regression_store.close();
 
     // The bounded disk set deterministically prunes the oldest persisted use.
@@ -756,6 +974,51 @@ int main() {
     CHECK(symlink_store.open(symlink_directory.string()) ==
           server_cache_calibration_load_status::io_fault);
 
+    const fs::path ancestor_target = fs::temp_directory_path() /
+        ("buun-zc3b-ancestor-target-" + std::to_string(pid));
+    const fs::path ancestor_alias = fs::temp_directory_path() /
+        ("buun-zc3b-ancestor-alias-" + std::to_string(pid));
+    fs::remove_all(ancestor_target, ec);
+    fs::remove(ancestor_alias, ec);
+    fs::create_directory(ancestor_target);
+    fs::create_directory_symlink(ancestor_target, ancestor_alias, ec);
+    CHECK(!ec);
+    server_cache_calibration_store ancestor_symlink_store;
+    CHECK(ancestor_symlink_store.open(
+              (ancestor_alias / "calibration" / "v1").string(),
+              ancestor_alias.string()) ==
+          server_cache_calibration_load_status::io_fault);
+
+    const fs::path safe_state_root = fs::temp_directory_path() /
+        ("buun-zc3b-safe-state-root-" + std::to_string(pid));
+    fs::remove_all(safe_state_root, ec);
+    server_cache_calibration_store safe_state_store;
+    CHECK(safe_state_store.open(
+              (safe_state_root / "calibration" / "v1").string(),
+              safe_state_root.string()) ==
+          server_cache_calibration_load_status::ok);
+    safe_state_store.close();
+    for (const auto & path : { safe_state_root,
+                              safe_state_root / "calibration",
+                              safe_state_root / "calibration" / "v1" }) {
+        struct stat status = {};
+        CHECK(stat(path.c_str(), &status) == 0);
+        CHECK((status.st_mode & 0777) == 0700);
+        CHECK(status.st_uid == geteuid());
+    }
+
+    const fs::path unsafe_state_root = fs::temp_directory_path() /
+        ("buun-zc3b-unsafe-state-root-" + std::to_string(pid));
+    fs::remove_all(unsafe_state_root, ec);
+    fs::create_directory(unsafe_state_root);
+    fs::permissions(unsafe_state_root, fs::perms::all,
+                    fs::perm_options::replace);
+    server_cache_calibration_store unsafe_state_store;
+    CHECK(unsafe_state_store.open(
+              (unsafe_state_root / "calibration" / "v1").string(),
+              unsafe_state_root.string()) ==
+          server_cache_calibration_load_status::io_fault);
+
     const fs::path open_mode_directory = fs::temp_directory_path() /
         ("buun-zc3b-open-mode-" + std::to_string(pid));
     fs::remove_all(open_mode_directory, ec);
@@ -815,7 +1078,7 @@ int main() {
     fs::remove_all(async_directory, ec);
     auto writer_owner = std::make_unique<server_cache_calibration_writer>();
     auto & writer = *writer_owner;
-    CHECK(writer.start(async_directory.string()));
+    CHECK(writer.start(async_directory.string(), {}));
     server_cache_calibration_load_status writer_status;
     auto writer_loaded_owner = std::make_unique<server_cache_calibration_bounded_array<
         server_cache_calibration_profile_snapshot, 16, uint8_t>>();
@@ -899,7 +1162,7 @@ int main() {
     auto retry_writer_owner =
         std::make_unique<server_cache_calibration_writer>();
     auto & retry_writer = *retry_writer_owner;
-    CHECK(retry_writer.start(async_directory.string()));
+    CHECK(retry_writer.start(async_directory.string(), {}));
     bool retry_loaded = false;
     for (int i = 0; i < 500 &&
              !(retry_loaded = retry_writer.poll_loaded(
@@ -945,7 +1208,7 @@ int main() {
     auto corrupt_writer_owner =
         std::make_unique<server_cache_calibration_writer>();
     auto & corrupt_writer = *corrupt_writer_owner;
-    CHECK(corrupt_writer.start(corrupt_writer_directory.string()));
+    CHECK(corrupt_writer.start(corrupt_writer_directory.string(), {}));
     bool corrupt_loaded = false;
     for (int i = 0; i < 500 &&
              !(corrupt_loaded = corrupt_writer.poll_loaded(
@@ -968,7 +1231,7 @@ int main() {
     auto coordinator_owner =
         std::make_unique<server_cache_calibration_coordinator>();
     auto & coordinator = *coordinator_owner;
-    CHECK(coordinator.start(coordinator_directory.string()));
+    CHECK(coordinator.start(coordinator_directory.string(), {}));
     server_cache_execution_fingerprint coordinator_fingerprint;
     coordinator_fingerprint.complete = true;
     coordinator_fingerprint.execution_root[0] = 0x91;
@@ -1025,7 +1288,7 @@ int main() {
     auto resumed_coordinator_owner =
         std::make_unique<server_cache_calibration_coordinator>();
     auto & resumed_coordinator = *resumed_coordinator_owner;
-    CHECK(resumed_coordinator.start(coordinator_directory.string()));
+    CHECK(resumed_coordinator.start(coordinator_directory.string(), {}));
     server_cache_observation_store resumed_observer;
     bool resumed_loaded = false;
     for (int i = 0; i < 500 &&
@@ -1045,7 +1308,15 @@ int main() {
     CHECK(resumed_coordinator.resolve_load(coordinator_fingerprint,
                                             resumed_observer));
     CHECK(resumed_coordinator.resume_pending());
-    resumed_coordinator.complete_resume_validation();
+    const auto resumed_instance = std::find_if(
+        resumed_observer.instances().begin(),
+        resumed_observer.instances().end(),
+        [](const auto & value) { return value.used; });
+    CHECK(resumed_instance != resumed_observer.instances().end());
+    resumed_coordinator.complete_resume_validation(
+        static_cast<uint32_t>(resumed_instance -
+                              resumed_observer.instances().begin()),
+        true);
     CHECK(!resumed_coordinator.resume_pending());
     resumed_coordinator.lifecycle(resumed_observer);
     CHECK(resumed_coordinator.health() ==
@@ -1059,7 +1330,7 @@ int main() {
     auto capacity_coordinator_owner =
         std::make_unique<server_cache_calibration_coordinator>();
     auto & capacity_coordinator = *capacity_coordinator_owner;
-    CHECK(capacity_coordinator.start(prune_directory.string()));
+    CHECK(capacity_coordinator.start(prune_directory.string(), {}));
     server_cache_observation_store capacity_observer;
     server_cache_execution_fingerprint capacity_fingerprint;
     capacity_fingerprint.complete = true;
@@ -1084,6 +1355,172 @@ int main() {
     CHECK(capacity_coordinator.health() ==
           server_cache_calibration_writer_health::healthy);
     capacity_coordinator.stop();
+
+    // The full process-local table reuses a clean immature profile before a
+    // mature profile that was selected in this process. This is independent
+    // of disk prune recency and preserves A->B->A convergence.
+    const fs::path reuse_directory = fs::temp_directory_path() /
+        ("buun-zc4-profile-reuse-" + std::to_string(pid));
+    fs::remove_all(reuse_directory, ec);
+    server_cache_calibration_store reuse_store;
+    CHECK(reuse_store.open(reuse_directory.string()) ==
+          server_cache_calibration_load_status::ok);
+    for (uint8_t identity = 0x80; identity < 0x90; ++identity) {
+        auto value = profile(identity);
+        if (identity != 0x80) {
+            value.identity_exact = true;
+            auto & instance = value.instances.front();
+            instance.key.identity_exact = true;
+            instance.n_fit = 5;
+            instance.n_validation = 4;
+            CHECK(instance.validation_region_minutes.push_back(12));
+            CHECK(instance.validation_region_minutes.push_back(13));
+            CHECK(instance.validation_region_minutes.push_back(14));
+            instance.safe_measurable_opportunities = 4;
+            instance.opportunity_at_last_validation = 4;
+        }
+        CHECK(reuse_store.commit_profile(value) ==
+              server_cache_calibration_load_status::ok);
+    }
+    reuse_store.close();
+    auto reuse_coordinator_owner =
+        std::make_unique<server_cache_calibration_coordinator>();
+    auto & reuse_coordinator = *reuse_coordinator_owner;
+    CHECK(reuse_coordinator.start(reuse_directory.string(), {}));
+    server_cache_execution_fingerprint active_fingerprint;
+    active_fingerprint.complete = true;
+    active_fingerprint.exact = true;
+    active_fingerprint.execution_root[0] = 0x81;
+    server_cache_observation_store reuse_observer;
+    bool reuse_loaded = false;
+    for (int i = 0; i < 500 &&
+             !(reuse_loaded = reuse_coordinator.resolve_load(
+                 active_fingerprint, reuse_observer)); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(reuse_loaded);
+    CHECK(reuse_observer.instances()[3].used);
+    server_cache_execution_fingerprint novel_fingerprint = active_fingerprint;
+    novel_fingerprint.execution_root[0] = 0xb0;
+    CHECK(reuse_coordinator.resolve_load(novel_fingerprint, reuse_observer));
+    auto novel_row = accepted_record(novel_fingerprint);
+    CHECK(reuse_observer.observe(novel_row));
+    server_cache_execution_fingerprint another_fingerprint = active_fingerprint;
+    another_fingerprint.execution_root[0] = 0x82;
+    CHECK(reuse_coordinator.resolve_load(another_fingerprint, reuse_observer));
+    CHECK(reuse_observer.instances()[3].used);
+    server_cache_execution_fingerprint immature_fingerprint = active_fingerprint;
+    immature_fingerprint.execution_root[0] = 0x80;
+    CHECK(reuse_coordinator.resolve_load(immature_fingerprint, reuse_observer));
+    CHECK(std::none_of(reuse_observer.instances().begin(),
+                       reuse_observer.instances().end(),
+                       [](const auto & value) { return value.used; }));
+    CHECK(reuse_coordinator.resolve_load(active_fingerprint, reuse_observer));
+    CHECK(reuse_observer.instances()[3].used);
+    reuse_coordinator.stop();
+
+    // With state rank held equal, request-local use recency is the next reuse
+    // key. A completion touch protects A while the colder lexicographic peer
+    // is replaced by a seventeenth profile.
+    const fs::path recency_directory = fs::temp_directory_path() /
+        ("buun-zc4-profile-recency-" + std::to_string(pid));
+    fs::remove_all(recency_directory, ec);
+    server_cache_calibration_store recency_store;
+    CHECK(recency_store.open(recency_directory.string()) ==
+          server_cache_calibration_load_status::ok);
+    for (uint8_t identity = 0xa0; identity < 0xb0; ++identity) {
+        CHECK(recency_store.commit_profile(profile(identity)) ==
+              server_cache_calibration_load_status::ok);
+    }
+    recency_store.close();
+    auto recency_coordinator_owner =
+        std::make_unique<server_cache_calibration_coordinator>();
+    auto & recency_coordinator = *recency_coordinator_owner;
+    CHECK(recency_coordinator.start(recency_directory.string(), {}));
+    server_cache_execution_fingerprint recency_a;
+    recency_a.complete = true;
+    recency_a.execution_root[0] = 0xa0;
+    server_cache_observation_store recency_observer;
+    bool recency_loaded = false;
+    for (int i = 0; i < 500 &&
+             !(recency_loaded = recency_coordinator.resolve_load(
+                 recency_a, recency_observer)); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(recency_loaded);
+    CHECK(recency_observer.instances()[3].used);
+    recency_coordinator.note_profile_use();
+    server_cache_execution_fingerprint recency_novel = recency_a;
+    recency_novel.execution_root[0] = 0xb0;
+    CHECK(recency_coordinator.resolve_load(recency_novel,
+                                           recency_observer));
+    auto recency_novel_row = accepted_record(recency_novel);
+    CHECK(recency_observer.observe(recency_novel_row));
+    server_cache_execution_fingerprint recency_existing = recency_a;
+    recency_existing.execution_root[0] = 0xaf;
+    CHECK(recency_coordinator.resolve_load(recency_existing,
+                                            recency_observer));
+    server_cache_execution_fingerprint recency_cold = recency_a;
+    recency_cold.execution_root[0] = 0xa1;
+    CHECK(recency_coordinator.resolve_load(recency_cold,
+                                            recency_observer));
+    CHECK(std::none_of(recency_observer.instances().begin(),
+                       recency_observer.instances().end(),
+                       [](const auto & value) { return value.used; }));
+    CHECK(recency_coordinator.resolve_load(recency_a, recency_observer));
+    CHECK(recency_observer.instances()[3].used);
+    recency_coordinator.stop();
+
+    // A typed drift transition may learn immediately, but h/q authority stays
+    // unavailable until the immutable image acknowledging the current g has
+    // returned to the scheduler thread.
+    const fs::path generation_ack_directory = fs::temp_directory_path() /
+        ("buun-zc4-generation-ack-" + std::to_string(pid));
+    fs::remove_all(generation_ack_directory, ec);
+    auto generation_coordinator_owner =
+        std::make_unique<server_cache_calibration_coordinator>();
+    auto & generation_coordinator = *generation_coordinator_owner;
+    CHECK(generation_coordinator.start(generation_ack_directory.string(), {}));
+    server_cache_execution_fingerprint generation_fingerprint;
+    generation_fingerprint.complete = true;
+    generation_fingerprint.exact = true;
+    generation_fingerprint.execution_root[0] = 0xc1;
+    server_cache_observation_store generation_observer;
+    bool generation_loaded = false;
+    for (int i = 0; i < 500 &&
+             !(generation_loaded = generation_coordinator.resolve_load(
+                 generation_fingerprint, generation_observer)); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(generation_loaded);
+    auto generation_seed = profile(0xc1);
+    generation_seed.instances.front().authority_terminal =
+        server_cache_calibration_authority_terminal::drifted;
+    CHECK(server_cache_calibration_restore_observer(
+        generation_seed, generation_observer));
+    auto generation_row = accepted_record(generation_fingerprint);
+    generation_row.key = generation_seed.instances.front().key;
+    CHECK(generation_observer.observe(generation_row));
+    CHECK(generation_observer.instances()[3].fit_generation == 1);
+    CHECK(!generation_row.calibration_claim_available);
+    generation_coordinator.flush_latest(generation_observer);
+    auto before_ack = accepted_record(generation_fingerprint);
+    before_ack.key = generation_seed.instances.front().key;
+    CHECK(generation_observer.observe(before_ack));
+    CHECK(!before_ack.calibration_claim_available);
+    bool current_generation_acked = false;
+    for (int i = 0; i < 500 && !current_generation_acked; ++i) {
+        generation_coordinator.lifecycle(generation_observer);
+        auto probe = accepted_record(generation_fingerprint);
+        probe.key = generation_seed.instances.front().key;
+        CHECK(generation_observer.observe(probe));
+        current_generation_acked = probe.calibration_claim_available;
+        if (!current_generation_acked) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    CHECK(current_generation_acked);
+    generation_coordinator.stop();
     fs::remove_all(directory, ec);
     fs::remove_all(async_directory, ec);
     fs::remove_all(regression_directory, ec);
@@ -1095,11 +1532,19 @@ int main() {
     fs::remove_all(root_exhausted_directory, ec);
     fs::remove_all(root_budget_directory, ec);
     fs::remove_all(coordinator_directory, ec);
+    fs::remove_all(reuse_directory, ec);
+    fs::remove_all(generation_ack_directory, ec);
 #if !defined(_WIN32)
     fs::remove_all(missing_root, ec);
     fs::remove_all(linked_directory, ec);
     fs::remove(symlink_directory, ec);
     fs::remove_all(symlink_target, ec);
+    fs::remove(ancestor_alias, ec);
+    fs::remove_all(ancestor_target, ec);
+    fs::remove_all(safe_state_root, ec);
+    fs::permissions(unsafe_state_root, fs::perms::owner_all,
+                    fs::perm_options::replace);
+    fs::remove_all(unsafe_state_root, ec);
     fs::permissions(open_mode_directory, fs::perms::owner_all,
                     fs::perm_options::replace, ec);
     fs::remove_all(open_mode_directory, ec);

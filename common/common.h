@@ -1147,6 +1147,11 @@ bool fs_is_directory(const std::string & path);
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
 
+// Durable, machine-local application state. Unlike fs_get_cache_directory(),
+// callers may rely on this tree surviving ordinary cache cleanup. The
+// LLAMA_STATE_HOME override names the llama.cpp state root itself.
+std::string fs_get_state_directory();
+
 struct common_file_info {
     std::string path;
     std::string name;

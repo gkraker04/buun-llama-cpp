@@ -42,8 +42,16 @@ struct llama_model_artifact_descriptor {
 LLAMA_API bool llama_model_dup_artifact_descriptors(
         const llama_model * model,
         std::vector<llama_model_artifact_descriptor> & out);
+LLAMA_API bool llama_model_dup_artifact_descriptors_bounded(
+        const llama_model * model,
+        llama_model_artifact_descriptor * out,
+        size_t capacity,
+        size_t * count);
 LLAMA_API void llama_model_artifact_descriptors_close(
         std::vector<llama_model_artifact_descriptor> & descriptors);
+LLAMA_API void llama_model_artifact_descriptors_close_bounded(
+        llama_model_artifact_descriptor * descriptors,
+        size_t count);
 
 // Internal load-scope switch. The server enables descriptor retention only
 // while loading a model for an active optimizer observation store. Returning

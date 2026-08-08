@@ -655,6 +655,10 @@ struct llama_model {
     bool capture_artifact_descriptors(llama_model_loader & ml) noexcept;
     bool duplicate_artifact_descriptors(
         std::vector<llama_model_artifact_descriptor> & out) const noexcept;
+    bool duplicate_artifact_descriptors_bounded(
+        llama_model_artifact_descriptor * out,
+        size_t capacity,
+        size_t * count) const noexcept;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
