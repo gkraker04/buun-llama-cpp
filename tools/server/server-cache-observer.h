@@ -41,6 +41,18 @@ enum class server_cache_observation_reason : uint8_t {
     _count,
 };
 
+// Persisted authority-relevant estimator state is carried by the live
+// instance even before ZC4 consumes it. This prevents the persistence seam
+// from silently dropping future non-tail terminals on restart.
+enum class server_cache_calibration_authority_terminal : uint8_t {
+    none = 0,
+    tail_exceeded,
+    confidence_budget_exhausted,
+    ordinal_exhausted,
+    numeric_fault,
+    _count,
+};
+
 const char * server_cache_observation_operation_name(
     server_cache_observation_operation value) noexcept;
 const char * server_cache_observation_terminal_name(
@@ -87,6 +99,9 @@ struct server_cache_observation_key {
     bool operator==(const server_cache_observation_key & other) const noexcept;
 };
 
+bool server_cache_observation_key_valid(
+    const server_cache_observation_key & key) noexcept;
+
 struct server_cache_observation_record {
     server_cache_observation_key key;
     std::array<double, 4> feature = {};
@@ -127,6 +142,23 @@ struct server_cache_observation_instance {
     uint64_t n_success = 0;
     uint64_t reservoir_seen = 0;
     bool tail_exceeded = false;
+    uint64_t tail_actual_max_us = 0;
+    uint64_t fit_generation = 0;
+    server_cache_calibration_authority_terminal authority_terminal =
+        server_cache_calibration_authority_terminal::none;
+    std::array<double, 4> feature_min = {};
+    std::array<double, 4> feature_max = {};
+    uint64_t qualified_execution_ordinal = 0;
+    std::array<double, 6> log_wealth = {};
+    uint64_t n_validation = 0;
+    std::array<uint64_t, 8> fit_region_minutes = {};
+    uint8_t fit_region_count = 0;
+    std::array<uint64_t, 8> validation_region_minutes = {};
+    uint8_t validation_region_count = 0;
+    uint64_t safe_measurable_opportunities = 0;
+    uint64_t opportunity_at_last_validation = 0;
+    uint64_t last_fit_unix_ms = 0;
+    uint64_t last_validation_unix_ms = 0;
 };
 
 struct server_cache_observation_counters {
@@ -158,6 +190,7 @@ public:
         return recent_records_;
     }
     uint64_t records_seen() const noexcept { return records_seen_; }
+    uint64_t mutation_generation() const noexcept { return mutation_generation_; }
     void set_execution_fingerprint(
         const server_cache_execution_fingerprint & value) noexcept;
     void apply_execution_fingerprint(
@@ -165,12 +198,17 @@ public:
     const server_cache_execution_fingerprint & execution_fingerprint() const noexcept {
         return execution_fingerprint_;
     }
+    bool restore_persisted_instances(
+        const std::array<server_cache_observation_instance,
+                         instance_capacity> & instances,
+        uint64_t mutation_generation) noexcept;
 
 private:
     std::array<server_cache_observation_instance, instance_capacity> instances_ = {};
     std::array<server_cache_observation_record, diagnostic_capacity> recent_records_ = {};
     server_cache_observation_counters counters_;
     uint64_t records_seen_ = 0;
+    uint64_t mutation_generation_ = 0;
     server_cache_execution_fingerprint execution_fingerprint_;
 };
 

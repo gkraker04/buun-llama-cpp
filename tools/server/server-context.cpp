@@ -7,6 +7,7 @@
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-plan-preflight-internal.h"
+#include "server-cache-calibration-store.h"
 #include "server-cache-observer.h"
 #include "server-cache-yield.h"
 #include "server-vbr-artifact-store.h"
@@ -2333,7 +2334,10 @@ public:
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
-            destroy();
+            destroy(true);
+        } else if (cache_calibration && cache_optimizer_observations) {
+            cache_calibration->drain_latest_for_shutdown(
+                *cache_optimizer_observations);
         }
     }
 
@@ -2433,6 +2437,8 @@ private:
     // production rows remain diagnostic and no planner can read this object.
     std::unique_ptr<server_cache_observation_store> cache_optimizer_observations;
     std::unique_ptr<server_cache_fingerprint_worker> cache_fingerprint_worker;
+    std::unique_ptr<server_cache_calibration_coordinator> cache_calibration;
+    std::optional<server_cache_execution_fingerprint> cache_fingerprint_pending;
     bool cache_fingerprint_ready_logged = false;
     bool cache_fingerprint_scheduler_busy = false;
     std::vector<uint32_t> cache_observation_batch_tokens;
@@ -2556,19 +2562,35 @@ private:
     }
 
     void cache_fingerprint_lifecycle_point() noexcept {
-        if (!cache_fingerprint_worker || !cache_optimizer_observations) {
+        if (!cache_optimizer_observations) {
             return;
         }
-        server_cache_execution_fingerprint result;
-        if (cache_fingerprint_worker->poll(result)) {
-            cache_optimizer_observations->set_execution_fingerprint(result);
-            if (result.complete && !cache_fingerprint_ready_logged) {
+        if (cache_fingerprint_worker) {
+            server_cache_execution_fingerprint result;
+            if (cache_fingerprint_worker->poll(result)) {
+                cache_fingerprint_pending = result;
+                cache_fingerprint_worker->stop();
+                cache_fingerprint_worker.reset();
+            }
+        }
+        if (cache_fingerprint_pending) {
+            const bool ready = cache_calibration
+                ? cache_calibration->resolve_load(
+                    *cache_fingerprint_pending, *cache_optimizer_observations)
+                : (cache_optimizer_observations->set_execution_fingerprint(
+                       *cache_fingerprint_pending), true);
+            if (!ready) return;
+            if (cache_fingerprint_pending->complete &&
+                !cache_fingerprint_ready_logged) {
                 cache_fingerprint_ready_logged = true;
                 SRV_INF("cache optimizer: stable execution fingerprint ready (%s)\n",
-                        result.exact ? "exact" : "shadow-only");
+                        cache_fingerprint_pending->exact ? "exact" : "shadow-only");
             }
-            cache_fingerprint_worker->stop();
-            cache_fingerprint_worker.reset();
+            cache_fingerprint_pending.reset();
+        }
+        if (cache_calibration &&
+            cache_optimizer_observations->execution_fingerprint().complete) {
+            cache_calibration->lifecycle(*cache_optimizer_observations);
         }
     }
 
@@ -4585,12 +4607,20 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
-    void destroy() {
+    void destroy(bool final_shutdown = false) {
         // ZC3a hashes loader-owned descriptor duplicates only. Join before
         // model/context teardown; cancellation never publishes a partial root.
         if (cache_fingerprint_worker) {
             cache_fingerprint_worker->stop();
             cache_fingerprint_worker.reset();
+        }
+        if (cache_calibration && cache_optimizer_observations) {
+            if (final_shutdown) {
+                cache_calibration->drain_latest_for_shutdown(
+                    *cache_optimizer_observations);
+            } else {
+                cache_calibration->flush_latest(*cache_optimizer_observations);
+            }
         }
         if (ctx_tgt) {
             llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
@@ -6091,12 +6121,31 @@ private:
             cache_plan_obs = std::make_unique<server_cache_plan_observer>();
         }
         if (params_base.cache_optimizer.observer_store_enabled) {
-            cache_optimizer_observations =
-                std::make_unique<server_cache_observation_store>();
+            if (!cache_optimizer_observations) {
+                cache_optimizer_observations =
+                    std::make_unique<server_cache_observation_store>();
+            }
+            cache_fingerprint_ready_logged = false;
+            cache_fingerprint_pending.reset();
             cache_observation_batch_tokens.assign(slots.size(), 0);
             cache_observation_first_pos.assign(
                 slots.size(), std::numeric_limits<llama_pos>::max());
             llama_set_sync_fence_observer(ctx_tgt, true);
+            try {
+                const std::string calibration_dir =
+                    fs_get_cache_directory() + "cache-calibration-v1";
+                if (!cache_calibration) {
+                    cache_calibration =
+                        std::make_unique<server_cache_calibration_coordinator>();
+                }
+                if (cache_calibration->health() ==
+                        server_cache_calibration_writer_health::idle &&
+                    !cache_calibration->start(calibration_dir)) {
+                    cache_calibration.reset();
+                }
+            } catch (...) {
+                cache_calibration.reset();
+            }
             cache_fingerprint_start();
         }
         if (params_base.cache_optimizer.cache_debug ||

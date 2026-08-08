@@ -138,7 +138,9 @@ endforeach()
 foreach(REQUIRED IN ITEMS
         "params_base.cache_optimizer.observer_store_enabled"
         "llama_model_artifact_capture_set("
-        "cache_optimizer_observations->set_execution_fingerprint(result)"
+        "cache_fingerprint_pending = result"
+        "cache_calibration->resolve_load("
+        "cache_optimizer_observations->set_execution_fingerprint("
         "cache_fingerprint_worker->set_scheduler_demand(true)"
         "cache_fingerprint_scheduler_busy = true"
         "cache_fingerprint_worker.reset();")

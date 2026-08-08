@@ -506,6 +506,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc3-fingerprint.cmake
 )
 
+add_test(
+    NAME test-zc3-calibration-store-source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc3-calibration-store.cmake
+)
+
 find_program(CAPSTONE_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
 add_test(
     NAME test-capstone-truth

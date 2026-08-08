@@ -19,7 +19,11 @@ static server_cache_observation_key key(uint8_t identity) {
     out.feature_dim = 4;
     out.adapter_application_complete = true;
     out.identity_complete = true;
-    out.participant_execution_digest[0] = identity;
+    const uint8_t nonzero_identity = uint8_t(identity + 1);
+    out.profile_execution_digest[0] = nonzero_identity;
+    out.participant_execution_digest[0] = nonzero_identity;
+    out.adapter_application_digest[0] = nonzero_identity;
+    out.representation_digest[0] = nonzero_identity;
     return out;
 }
 
@@ -83,8 +87,8 @@ int main() {
         operation_key.identity_complete = true;
         store.apply_execution_fingerprint(operation_key);
         CHECK(operation_key.profile_execution_digest[0] == 0xe3);
-        CHECK(operation_key.participant_execution_digest[0] == 8);
-        CHECK(operation_key.representation_digest[0] == 0);
+        CHECK(operation_key.participant_execution_digest[0] == 9);
+        CHECK(operation_key.representation_digest[0] == 9);
         CHECK(!operation_key.identity_complete);
         CHECK(operation_key.identity_exact);
     }

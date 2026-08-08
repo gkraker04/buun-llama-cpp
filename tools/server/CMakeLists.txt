@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-cache-plan-preflight-internal.h
     server-cache-observer.cpp
     server-cache-observer.h
+    server-cache-calibration-store.cpp
+    server-cache-calibration-store.h
     server-cache-fingerprint.cpp
     server-cache-fingerprint.h
     server-cache-lease.cpp
@@ -60,6 +62,9 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+if (WIN32)
+    target_link_libraries(${TARGET} PRIVATE bcrypt)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 
@@ -143,6 +148,16 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-cache-fingerprint PRIVATE cxx_std_17)
     add_test(NAME test-server-cache-fingerprint COMMAND test-server-cache-fingerprint)
     set_property(TEST test-server-cache-fingerprint PROPERTY LABELS main)
+
+    add_executable(test-server-cache-calibration-store
+        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-calibration-store.cpp)
+    target_link_libraries(test-server-cache-calibration-store PRIVATE server-context)
+    target_include_directories(test-server-cache-calibration-store PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(test-server-cache-calibration-store PRIVATE cxx_std_17)
+    add_test(NAME test-server-cache-calibration-store
+        COMMAND test-server-cache-calibration-store)
+    set_property(TEST test-server-cache-calibration-store PROPERTY LABELS main)
 
     add_executable(zc1-retention-grid bench/zc1-retention-grid.cpp)
     target_link_libraries(zc1-retention-grid PRIVATE server-context)

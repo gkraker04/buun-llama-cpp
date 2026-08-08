@@ -31,8 +31,7 @@ bool finite_feature(const server_cache_observation_record & record) noexcept {
 
 bool valid_enum_and_terminal(
         const server_cache_observation_record & record) noexcept {
-    if (record.key.operation >= server_cache_observation_operation::_count ||
-        record.key.provider >= common_cache_plan_provider::_count ||
+    if (!server_cache_observation_key_valid(record.key) ||
         record.terminal >= server_cache_observation_terminal::_count ||
         record.reason >= server_cache_observation_reason::_count) {
         return false;
@@ -189,9 +188,65 @@ bool server_cache_observation_key::operator==(
         effect_action_shape_digest == other.effect_action_shape_digest;
 }
 
+bool server_cache_observation_key_valid(
+        const server_cache_observation_key & key) noexcept {
+    const auto nonzero = [](const std::array<uint8_t, 32> & digest) {
+        return std::any_of(digest.begin(), digest.end(),
+                           [](uint8_t byte) { return byte != 0; });
+    };
+    if (key.operation >= server_cache_observation_operation::_count ||
+        key.provider >= common_cache_plan_provider::_count ||
+        key.restore_kind > 4 || key.prepare_shape > 4 ||
+        key.contention_bucket > 1 || key.start_bucket > 3 ||
+        key.batch_bucket > 3 || key.ubatch_bucket > 3 ||
+        key.size_family > 3 || key.feature_dim == 0 ||
+        key.feature_dim > 4) return false;
+    if (!key.identity_complete) return true;
+    if (!key.adapter_application_complete ||
+        !nonzero(key.profile_execution_digest) ||
+        !nonzero(key.participant_execution_digest) ||
+        !nonzero(key.adapter_application_digest) ||
+        !nonzero(key.representation_digest)) return false;
+    if (key.operation == server_cache_observation_operation::destruction_apply &&
+        !nonzero(key.effect_action_shape_digest)) return false;
+    return true;
+}
+
 void server_cache_observation_store::set_execution_fingerprint(
         const server_cache_execution_fingerprint & value) noexcept {
+    const bool changed_root =
+        execution_fingerprint_.execution_root != value.execution_root;
+    if (changed_root) {
+        // Model/profile transitions are atomic at the scheduler seam. Never
+        // retain instances keyed to the previous execution root.
+        instances_ = {};
+        mutation_generation_ = 0;
+    } else if (execution_fingerprint_.complete != value.complete ||
+        execution_fingerprint_.exact != value.exact) {
+        increment_saturating(mutation_generation_);
+    }
     execution_fingerprint_ = value;
+}
+
+bool server_cache_observation_store::restore_persisted_instances(
+        const std::array<server_cache_observation_instance,
+                         instance_capacity> & instances,
+        uint64_t mutation_generation) noexcept {
+    if (!execution_fingerprint_.complete || mutation_generation == 0) {
+        return false;
+    }
+    for (const auto & instance : instances) {
+        if (!instance.used) continue;
+        if (!instance.key.identity_complete ||
+            instance.key.profile_execution_digest !=
+                execution_fingerprint_.execution_root ||
+            instance.key.feature_dim == 0 || instance.key.feature_dim > 4) {
+            return false;
+        }
+    }
+    instances_ = instances;
+    mutation_generation_ = mutation_generation;
+    return true;
 }
 
 void server_cache_observation_store::apply_execution_fingerprint(
@@ -283,6 +338,15 @@ bool server_cache_observation_store::observe(
             return false;
         }
     }
+    if (mutation_generation_ == std::numeric_limits<uint64_t>::max() ||
+        (instance && instance->n_success ==
+             std::numeric_limits<uint64_t>::max())) {
+        record.terminal = server_cache_observation_terminal::diagnostic;
+        record.reason = server_cache_observation_reason::numeric_overflow;
+        store_recent(recent_records_, records_seen_, record);
+        increment_saturating(counters_.numeric_fault);
+        return false;
+    }
 
     // Compute the update before reserving a new instance. A numeric fault
     // cannot consume a capacity slot with a half-initialized key.
@@ -341,6 +405,25 @@ bool server_cache_observation_store::observe(
     increment_saturating(instance->reservoir_seen);
     increment_saturating(instance->n_success);
     instance->tail_exceeded = instance->tail_exceeded || record.tail_exceeded;
+    if (record.tail_exceeded) {
+        instance->authority_terminal =
+            server_cache_calibration_authority_terminal::tail_exceeded;
+        instance->tail_actual_max_us = std::max(
+            instance->tail_actual_max_us, record.owned_service_us);
+    }
+    if (instance->n_success == 1) {
+        instance->feature_min = record.feature;
+        instance->feature_max = record.feature;
+    } else {
+        for (uint8_t i = 0; i < record.key.feature_dim; ++i) {
+            instance->feature_min[i] =
+                std::min(instance->feature_min[i], record.feature[i]);
+            instance->feature_max[i] =
+                std::max(instance->feature_max[i], record.feature[i]);
+        }
+    }
+    increment_saturating(instance->qualified_execution_ordinal);
+    increment_saturating(mutation_generation_);
     store_recent(recent_records_, records_seen_, record);
     increment_saturating(counters_.accepted);
     return true;
