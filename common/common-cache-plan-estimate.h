@@ -71,13 +71,6 @@ enum class common_cache_plan_vbr_value_grammar : uint8_t {
     inline_or_path,
 };
 
-struct common_cache_plan_vbr_override_row {
-    uint16_t census_id = 0;
-    common_cache_plan_vbr_value_grammar grammar =
-        common_cache_plan_vbr_value_grammar::scalar;
-    std::string value;
-};
-
 // CLOSED CENSUS of every quoted VBR_* name in src/common/tools/ggml (D-pins r6).
 // The CI scan is reader-agnostic: wrapper reads, direct reads, programmatic producers,
 // diagnostics, and scripts all have to be classified here. `affects_cost` controls
@@ -137,7 +130,6 @@ struct common_cache_plan_vbr_regime {
     float       reclaim_floor_bpv = 0.0f;
     float       reset_keep_frac   = 0.0f;
     std::string overrides;           // canonical env-override tokens, empty when none
-    std::vector<common_cache_plan_vbr_override_row> override_rows;
     bool        unrepresented_override = false;
 };
 
@@ -200,15 +192,6 @@ constexpr double COMMON_CACHE_PLAN_TIE_ABS_FLOOR_US = 100.0;
 // eviction; the same total/optimum consumes those optional terms.
 common_cache_plan_planner_status common_cache_plan_estimate_and_choose(
         common_cache_plan_record & rec, const common_cache_plan_calib & calib);
-
-// Shared final chooser for an alternate estimator that has already filled a
-// complete all-or-nothing candidate table. It owns the same participation,
-// tie floor, and stable key as the checked-in fitter; missing totals refuse.
-common_cache_plan_planner_status common_cache_plan_choose_preestimated(
-    common_cache_plan_record & rec) noexcept;
-common_cache_plan_planner_status common_cache_plan_compose_preestimated_chains(
-    common_cache_plan_record & rec,
-    uint32_t estimator_version) noexcept;
 
 // The single planner attempt boundary shared by pre-mutation B-A staging and
 // legacy finalize fallback. It owns profile lookup and exception isolation.

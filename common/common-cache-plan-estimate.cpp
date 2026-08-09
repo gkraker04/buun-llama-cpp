@@ -173,9 +173,7 @@ common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
         return vbr;
     }
 
-    uint16_t census_id = 0;
 #define COMMON_CACHE_PLAN_VBR_ENV_FOLD(NAME, AFFECTS, GRAMMAR)                         \
-    ++census_id;                                                                        \
     if (AFFECTS) {                                                                     \
         if (const char * val = getenv_fn(NAME)) {                                      \
             std::string token;                                                         \
@@ -184,10 +182,6 @@ common_cache_plan_vbr_regime common_cache_plan_vbr_regime_from_params(
                 vbr.unrepresented_override = true;                                     \
             } else {                                                                   \
                 vbr.overrides += (vbr.overrides.empty() ? "" : " ") + token;          \
-                const size_t separator = token.find('=');                              \
-                vbr.override_rows.push_back({ census_id,                               \
-                    common_cache_plan_vbr_value_grammar::GRAMMAR,                      \
-                    token.substr(separator + 1) });                                    \
             }                                                                          \
         }                                                                              \
     }
@@ -341,8 +335,8 @@ static bool cache_plan_row_participates(
 
 // the ONE place B terms are written and versions stamped. Optional D-owned
 // transfer/eviction terms are included in the same predicted total.
-static bool cache_plan_fill_terms_version(common_cache_plan_candidate & c,
-                                  uint32_t estimator_version,
+static bool cache_plan_fill_terms(common_cache_plan_candidate & c,
+                                  const common_cache_plan_calib & calib,
                                   uint64_t restore_bytes, double restore_us,
                                   uint64_t replay_tokens, double replay_us,
                                   double workspace_us) {
@@ -350,7 +344,7 @@ static bool cache_plan_fill_terms_version(common_cache_plan_candidate & c,
         auto & term = c.cost_terms[size_t(kind)];
         term.raw               = llama_cache_acct_value::measured(raw);
         term.estimated_us      = llama_cache_acct_value::measured((uint64_t) std::llround(us));
-        term.estimator_version = estimator_version;
+        term.estimator_version = calib.estimator_version;
     };
     set_term(llama_cache_acct_cost_kind::restore,   restore_bytes, restore_us);
     set_term(llama_cache_acct_cost_kind::replay,    replay_tokens, replay_us);
@@ -365,7 +359,7 @@ static bool cache_plan_fill_terms_version(common_cache_plan_candidate & c,
         const auto & term = c.cost_terms[size_t(kind)];
         if (term.estimated_us.state == llama_cache_acct_known::known) {
             if (term.raw.state != llama_cache_acct_known::known ||
-                term.estimator_version != estimator_version) {
+                term.estimator_version != calib.estimator_version) {
                 c.predicted_total_us = {};
                 return false;
             }
@@ -380,16 +374,6 @@ static bool cache_plan_fill_terms_version(common_cache_plan_candidate & c,
     c.predicted_total_us = llama_cache_acct_value::measured(
         (uint64_t) std::llround(total));
     return true;
-}
-
-static bool cache_plan_fill_terms(common_cache_plan_candidate & c,
-                                  const common_cache_plan_calib & calib,
-                                  uint64_t restore_bytes, double restore_us,
-                                  uint64_t replay_tokens, double replay_us,
-                                  double workspace_us) {
-    return cache_plan_fill_terms_version(
-        c, calib.estimator_version, restore_bytes, restore_us,
-        replay_tokens, replay_us, workspace_us);
 }
 
 // estimate one non-chain row; false = a needed scalar is missing (typed-unknown lcp/bytes)
@@ -466,6 +450,11 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
     if (rec.n_prompt_tokens.state != llama_cache_acct_known::known) {
         return common_cache_plan_planner_status::incomplete_evidence;
     }
+    if (!cache_plan_lru_stratum_complete(rec)) {
+        return common_cache_plan_planner_status::incomplete_evidence;
+    }
+    const auto * lru_legacy = rec.selection == common_cache_plan_selection::lru
+        ? cache_plan_target_live_row(rec, rec.id_slot) : nullptr;
     const uint64_t n_prompt = rec.n_prompt_tokens.value;
 
     // pass 0 (verify-r1 finding 2): a visited candidate whose shipped phase established
@@ -492,24 +481,13 @@ static common_cache_plan_planner_status cache_plan_estimate_impl(
         }
     }
 
-    const auto composed = common_cache_plan_compose_preestimated_chains(
-        rec, calib.estimator_version);
-    return composed == common_cache_plan_planner_status::ok
-        ? common_cache_plan_choose_preestimated(rec) : composed;
-}
-
-common_cache_plan_planner_status common_cache_plan_compose_preestimated_chains(
-        common_cache_plan_record & rec,
-        uint32_t estimator_version) noexcept {
-    if (estimator_version == 0) {
-        return common_cache_plan_planner_status::invalid_calibration;
-    }
-    // A chain installs every restore component, while its replay tail is only
-    // the deepest component's. D-owned terms remain candidate-local and are
-    // added once by the same versioned totalizer.
-    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
+    // pass 2: chain rows compose from their components — restore/workspace add, replay is
+    // the DEEPEST component's (the chain replays only past its furthest frontier)
+    for (uint32_t i = 0; i < rec.n_inventory; i++) {
         auto & c = rec.inventory[i];
-        if (!c.is_chain() || !c.viable()) continue;
+        if (!c.is_chain() || !c.viable()) {
+            continue;
+        }
         uint64_t restore_bytes = 0, replay_tokens = UINT64_MAX;
         double   restore_us = 0.0, workspace_us = 0.0, replay_us = 0.0;
         bool     ok = false;
@@ -537,36 +515,14 @@ common_cache_plan_planner_status common_cache_plan_compose_preestimated_chains(
         if (!ok) {
             return common_cache_plan_planner_status::incomplete_evidence;
         }
-        if (!cache_plan_fill_terms_version(
-                c, estimator_version, restore_bytes, restore_us,
+        if (!cache_plan_fill_terms(
+                c, calib, restore_bytes, restore_us,
                 replay_tokens, replay_us, workspace_us)) {
             return common_cache_plan_planner_status::incomplete_evidence;
         }
     }
-    return common_cache_plan_planner_status::ok;
-}
 
-common_cache_plan_planner_status common_cache_plan_choose_preestimated(
-        common_cache_plan_record & rec) noexcept {
-    // Final shared chooser: callers must have populated every viable row, not
-    // merely the rows they expect to win. This keeps missing local evidence
-    // fail-closed and preserves the existing all-candidate contract.
-    // The LRU speculation stratum is part of that same complete domain, not
-    // an estimator-specific precondition: both checked-in and local fits must
-    // refuse before filtering when any participating target lacks its live
-    // speculation carrier.
-    if (!cache_plan_lru_stratum_complete(rec)) {
-        return common_cache_plan_planner_status::incomplete_evidence;
-    }
-    for (uint32_t i = 0; i < rec.n_inventory; ++i) {
-        const auto & candidate = rec.inventory[i];
-        if (candidate.viable() &&
-            candidate.predicted_total_us.state != llama_cache_acct_known::known) {
-            return common_cache_plan_planner_status::incomplete_evidence;
-        }
-    }
-    const auto * lru_legacy = rec.selection == common_cache_plan_selection::lru
-        ? cache_plan_target_live_row(rec, rec.id_slot) : nullptr;
+    // pass 3: minimum + tie set + planner-owned stable choice
     uint64_t min_total  = UINT64_MAX;
     bool     any        = false;
     for (uint32_t i = 0; i < rec.n_inventory; i++) {

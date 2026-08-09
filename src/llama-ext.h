@@ -9,49 +9,6 @@
 #include <cstdint>
 #include <map>
 
-// Internal, passive completion metadata for an explicitly armed server
-// observation.  Arming never synchronizes; the first already-required
-// synchronize after an owned submission latches the completion and disarms
-// the capture.  Later sampler/getter synchronizations cannot move it.
-struct llama_sync_fence_info {
-    uint64_t serial;
-    int64_t  completed_us;
-};
-
-LLAMA_API llama_sync_fence_info llama_get_sync_fence_info(
-        const llama_context * ctx);
-LLAMA_API void llama_set_sync_fence_observer(
-        llama_context * ctx, bool enabled);
-LLAMA_API void llama_arm_sync_fence_observer(llama_context * ctx);
-LLAMA_API bool llama_context_is_warmup(const llama_context * ctx);
-LLAMA_API bool llama_context_pipeline_parallel_active(
-        const llama_context * ctx);
-LLAMA_API bool llama_context_vbr_vmm_active(const llama_context * ctx);
-
-// Returns the loader-verified execution-cost structure of a model. The
-// digest covers architecture/hyperparameters and canonical tensor
-// descriptors, but intentionally excludes tensor payload bytes.
-LLAMA_API bool llama_model_cost_structure_digest(
-        const llama_model * model, uint8_t * out, uint64_t * tensor_bytes);
-
-// Internal load-scope switch. The server enables execution-cost structure
-// capture only while loading a model for an active optimizer observation
-// store. Returning the prior value makes nested common fit/probe loads restore
-// the exact state.
-LLAMA_API bool llama_model_cost_structure_capture_set(bool enabled);
-LLAMA_API bool llama_model_cost_structure_capture_enabled(void);
-
-// Like llama_state_seq_set_data_ext(), but reports only the causally-owned
-// state install after that API's pre-existing synchronize. No new fence is
-// introduced and a null duration preserves the public API's exact path.
-LLAMA_API size_t llama_state_seq_set_data_observed_ext(
-        llama_context * ctx,
-        const uint8_t * src,
-        size_t size,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags,
-        uint64_t * owned_cpu_us);
-
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

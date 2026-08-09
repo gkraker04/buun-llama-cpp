@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A/ZC decision record, schema version 7.
+// common-cache-plan.h — P2 B0/B/D-S/B-A/D-A decision record, schema version 6.
 //
 // §7.7 decision records + §7.5 shadow-planner inventory: the ONE closed plan-reason enum
 // shared by server and tests, the orthogonal candidate disposition, the closed provider
@@ -35,17 +35,15 @@
 // not_observed actual-yield slot reserved for later D-A authority. v5 adds the
 // B-A authority receipt and target-qualified candidate identity without changing
 // the established meaning of `shadow_choice` (the planner counterfactual). v6 adds
-// D-A's shadow destruction quote/receipt; accounting remains schema 2. v7
-// adds the zero-config optimizer decision/retention object without changing
-// any v1..v6 field meaning.
+// D-A's shadow destruction quote/receipt; accounting remains schema 2.
 
-constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 7;
+constexpr uint32_t COMMON_CACHE_PLAN_SCHEMA_VERSION = 6;
 
 // Explicit record→embedded-accounting compatibility table. A C schema bump cannot compile
 // under the current record version until this table and the record version move together.
 constexpr uint32_t common_cache_plan_accounting_schema(uint32_t record_schema) {
     return (record_schema == 3 || record_schema == 4 || record_schema == 5 ||
-            record_schema == 6 || record_schema == 7) ? 2 :
+            record_schema == 6) ? 2 :
            (record_schema == 1 || record_schema == 2 ? 1 : 0);
 }
 static_assert(common_cache_plan_accounting_schema(COMMON_CACHE_PLAN_SCHEMA_VERSION) ==
@@ -66,178 +64,6 @@ constexpr size_t COMMON_CACHE_PLAN_MAX_COMPONENTS = 2;
 // a CHAIN row is the derived composed plan over selected component rows.
 constexpr int32_t COMMON_CACHE_PLAN_SOURCE_AGGREGATE = -1;
 constexpr int32_t COMMON_CACHE_PLAN_SOURCE_CHAIN     = -2;
-
-#define COMMON_CACHE_OPTIMIZER_MODE_LIST(X) \
-    X(off, "off") X(baseline, "baseline") X(learn, "learn") X(auto_mode, "auto")
-#define COMMON_CACHE_OPTIMIZER_RETENTION_LIST(X) \
-    X(historical, "historical") X(zc_v1, "zc_v1")
-#define COMMON_CACHE_OPTIMIZER_INVENTORY_LIST(X) \
-    X(complete, "complete") X(capacity, "capacity") X(unavailable, "unavailable")
-#define COMMON_CACHE_OPTIMIZER_EXECUTION_LIST(X) \
-    X(historical_legacy, "historical_legacy") \
-    X(landed_fallback_path, "landed_fallback_path") \
-    X(landed_checked_in_authority, "landed_checked_in_authority") \
-    X(local_online_authority, "local_online_authority")
-#define COMMON_CACHE_OPTIMIZER_DISPOSITION_LIST(X) \
-    X(not_attempted, "not_attempted") X(learning, "learning") \
-    X(refused, "refused") X(certified_improvement, "certified_improvement")
-#define COMMON_CACHE_OPTIMIZER_FALLBACK_LIST(X) \
-    X(none, "none") X(profile_unfitted, "profile_unfitted") \
-    X(incomplete_evidence, "incomplete_evidence") X(out_of_coverage, "out_of_coverage") \
-    X(insufficient_confidence, "insufficient_confidence") X(drifted, "drifted") \
-    X(currency_changed, "currency_changed") X(safety_refusal, "safety_refusal") \
-    X(internal_fault, "internal_fault")
-#define COMMON_CACHE_OPTIMIZER_PROFILE_SOURCE_LIST(X) \
-    X(none, "none") X(checked_in, "checked_in") X(local_fit, "local_fit")
-#define COMMON_CACHE_OPTIMIZER_RESUME_LIST(X) \
-    X(none, "none") X(current_process, "current_process") X(persisted, "persisted")
-#define COMMON_CACHE_OPTIMIZER_PROFILE_STATE_LIST(X) \
-    X(unavailable, "unavailable") X(unseen, "unseen") X(seeded, "seeded") \
-    X(learning, "learning") X(provisional, "provisional") X(active, "active") \
-    X(drifted, "drifted") X(quarantined, "quarantined")
-#define COMMON_CACHE_OPTIMIZER_COVERAGE_LIST(X) \
-    X(unavailable, "unavailable") X(complete, "complete") \
-    X(point_estimate_incomplete, "point_estimate_incomplete") \
-    X(confidence_inactive, "confidence_inactive") X(out_of_coverage, "out_of_coverage")
-#define COMMON_CACHE_OPTIMIZER_AUTHORITY_STATE_LIST(X) \
-    X(not_attempted, "not_attempted") X(prequalified, "prequalified") \
-    X(certified, "certified") X(fallback, "fallback") X(executed, "executed")
-#define COMMON_CACHE_RETENTION_COUNTED_OUTCOME_LIST(X) \
-    X(executed, "executed") X(deferred, "deferred") \
-    X(publication_skipped, "publication_skipped") X(blocked, "blocked")
-#define COMMON_CACHE_RETENTION_OUTCOME_LIST(X) \
-    X(not_attempted, "not_attempted") \
-    COMMON_CACHE_RETENTION_COUNTED_OUTCOME_LIST(X) \
-    X(mixed, "mixed")
-#define COMMON_CACHE_RETENTION_REASON_LIST(X) \
-    X(publication_skipped_protected, "publication_skipped_protected") \
-    X(publication_skipped_oversized, "publication_skipped_oversized") \
-    X(bound_blocked_protected, "bound_blocked_protected") X(zero_release, "zero_release") \
-    X(retention_id_exhausted, "retention_id_exhausted") \
-    X(retention_epoch_exhausted, "retention_epoch_exhausted") \
-    X(checkpoint_id_exhausted, "checkpoint_id_exhausted") \
-    X(checkpoint_staging_unavailable, "checkpoint_staging_unavailable") \
-    X(protected_over_capacity, "protected_over_capacity") \
-    X(publication_skipped_shrink_pending, "publication_skipped_shrink_pending") \
-    X(stale_retirement_pending, "stale_retirement_pending") \
-    X(stale_retirement_refused, "stale_retirement_refused") \
-    X(publication_skipped_recovery_unavailable, "publication_skipped_recovery_unavailable") \
-    X(shrink_blocked_protected, "shrink_blocked_protected") \
-    X(shrink_blocked_recovery_unavailable, "shrink_blocked_recovery_unavailable") \
-    X(publication_skipped_policy, "publication_skipped_policy") \
-    X(accounting_unavailable, "accounting_unavailable") \
-    X(durability_save_failed, "durability_save_failed") \
-    X(alternate_route, "alternate_route") X(internal_fault, "internal_fault")
-
-#define COMMON_CACHE_CLOSED_ENUM(name, list) \
-    enum class name : uint8_t { \
-        list(COMMON_CACHE_CLOSED_ENUM_MEMBER) \
-        _count, \
-    };
-#define COMMON_CACHE_CLOSED_ENUM_MEMBER(sym, wire) sym,
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_mode_wire, COMMON_CACHE_OPTIMIZER_MODE_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_retention_wire, COMMON_CACHE_OPTIMIZER_RETENTION_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_inventory_status, COMMON_CACHE_OPTIMIZER_INVENTORY_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_execution_policy, COMMON_CACHE_OPTIMIZER_EXECUTION_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_disposition, COMMON_CACHE_OPTIMIZER_DISPOSITION_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_fallback_reason, COMMON_CACHE_OPTIMIZER_FALLBACK_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_profile_source, COMMON_CACHE_OPTIMIZER_PROFILE_SOURCE_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_resume_origin, COMMON_CACHE_OPTIMIZER_RESUME_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_profile_state, COMMON_CACHE_OPTIMIZER_PROFILE_STATE_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_coverage_class, COMMON_CACHE_OPTIMIZER_COVERAGE_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_optimizer_authority_state, COMMON_CACHE_OPTIMIZER_AUTHORITY_STATE_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_retention_outcome, COMMON_CACHE_RETENTION_OUTCOME_LIST)
-COMMON_CACHE_CLOSED_ENUM(common_cache_retention_reason, COMMON_CACHE_RETENTION_REASON_LIST)
-#undef COMMON_CACHE_CLOSED_ENUM_MEMBER
-#undef COMMON_CACHE_CLOSED_ENUM
-
-const char * common_cache_optimizer_mode_wire_name(common_cache_optimizer_mode_wire value);
-const char * common_cache_optimizer_retention_wire_name(common_cache_optimizer_retention_wire value);
-const char * common_cache_optimizer_inventory_status_name(common_cache_optimizer_inventory_status value);
-const char * common_cache_optimizer_execution_policy_name(common_cache_optimizer_execution_policy value);
-const char * common_cache_optimizer_disposition_name(common_cache_optimizer_disposition value);
-const char * common_cache_optimizer_fallback_reason_name(common_cache_optimizer_fallback_reason value);
-const char * common_cache_optimizer_profile_source_name(common_cache_optimizer_profile_source value);
-const char * common_cache_optimizer_resume_origin_name(common_cache_optimizer_resume_origin value);
-const char * common_cache_optimizer_profile_state_name(common_cache_optimizer_profile_state value);
-const char * common_cache_optimizer_coverage_class_name(common_cache_optimizer_coverage_class value);
-const char * common_cache_optimizer_authority_state_name(common_cache_optimizer_authority_state value);
-const char * common_cache_retention_outcome_name(common_cache_retention_outcome value);
-const char * common_cache_retention_reason_name(common_cache_retention_reason value);
-
-constexpr common_cache_retention_outcome common_cache_retention_counted_outcomes[] = {
-#define COMMON_CACHE_RETENTION_COUNTED_MEMBER(sym, wire) common_cache_retention_outcome::sym,
-    COMMON_CACHE_RETENTION_COUNTED_OUTCOME_LIST(COMMON_CACHE_RETENTION_COUNTED_MEMBER)
-#undef COMMON_CACHE_RETENTION_COUNTED_MEMBER
-};
-
-constexpr size_t COMMON_CACHE_RETENTION_COUNTED_OUTCOME_COUNT =
-    sizeof(common_cache_retention_counted_outcomes) /
-    sizeof(common_cache_retention_counted_outcomes[0]);
-
-struct common_cache_retention_summary {
-    std::array<uint64_t, COMMON_CACHE_RETENTION_COUNTED_OUTCOME_COUNT> outcome_counts = {};
-    std::array<uint64_t, size_t(common_cache_retention_reason::_count)> reason_counts = {};
-    uint64_t evictions = 0;
-    uint64_t released_bytes = 0;
-    uint64_t released_tokens = 0;
-
-    void note(
-        common_cache_retention_outcome outcome,
-        common_cache_retention_reason reason = common_cache_retention_reason::_count,
-        uint64_t bytes = 0,
-        uint64_t tokens = 0) noexcept;
-    uint64_t count(common_cache_retention_outcome outcome) const noexcept;
-    common_cache_retention_outcome state() const noexcept;
-};
-
-struct common_cache_optimizer_authority_receipt {
-    common_cache_optimizer_authority_state state =
-        common_cache_optimizer_authority_state::not_attempted;
-    bool certified_once = false;
-    common_cache_optimizer_profile_source coefficient_source =
-        common_cache_optimizer_profile_source::none;
-    int32_t candidate = -1;
-    llama_cache_acct_value boot_claim_ordinal;
-    llama_cache_acct_value profile_generation;
-    llama_cache_acct_value authority_currency_serial;
-    std::string instance_generation_digest;
-    uint32_t procedure_version = 3;
-    common_cache_optimizer_fallback_reason reason =
-        common_cache_optimizer_fallback_reason::none;
-};
-
-struct common_cache_optimizer_record {
-    uint32_t policy_version = 1;
-    common_cache_optimizer_mode_wire mode = common_cache_optimizer_mode_wire::off;
-    common_cache_optimizer_retention_wire retention_policy =
-        common_cache_optimizer_retention_wire::historical;
-    common_cache_optimizer_inventory_status inventory_status =
-        common_cache_optimizer_inventory_status::unavailable;
-    int32_t baseline_plan_candidate = -1;
-    int32_t economic_plan_candidate = -1;
-    common_cache_optimizer_execution_policy request_execution_policy =
-        common_cache_optimizer_execution_policy::historical_legacy;
-    common_cache_optimizer_disposition economic_disposition =
-        common_cache_optimizer_disposition::not_attempted;
-    common_cache_optimizer_fallback_reason local_fallback_reason =
-        common_cache_optimizer_fallback_reason::none;
-    common_cache_optimizer_profile_source profile_source =
-        common_cache_optimizer_profile_source::none;
-    common_cache_optimizer_resume_origin profile_resume_origin =
-        common_cache_optimizer_resume_origin::none;
-    common_cache_optimizer_profile_state profile_state =
-        common_cache_optimizer_profile_state::unseen;
-    std::string profile_identity;
-    common_cache_optimizer_coverage_class coverage_class =
-        common_cache_optimizer_coverage_class::unavailable;
-    double benefit_estimate_us = 0;
-    bool benefit_estimate_known = false;
-    double benefit_lower_us = 0;
-    bool benefit_lower_known = false;
-    common_cache_optimizer_authority_receipt local_authority;
-    common_cache_retention_summary retention_summary;
-};
 
 // Fixed §7.7 precedence encoded in the VALUES: validity before economics, band order
 // identity(100) → structural(200) → generation/lineage(300) → domain/tier(400) → budget(500)
@@ -1067,18 +893,12 @@ struct common_cache_plan_record {
     // non-destructive selected row from a missing destructive quote.
     int32_t destruction_legacy_plan_candidate = -1;
 
-    // Schema-v7 zero-config request/evidence surface. The retention summary
-    // is task-local; landed D-A maintenance remains in `destruction` and is
-    // never double-counted here.
-    common_cache_optimizer_record optimizer;
-
     // Process-local B-A staging state; deliberately not serialized. A
     // precomputed planner result survives legacy mutation/finalization, while
     // the receipt remains the schema-v5 wire surface.
     bool planner_precomputed = false;
     bool authority_prequalified = false;
     bool authority_inventory_complete = false;
-    bool retarget_committed = false;
 
     // measured actuals (never estimates)
     llama_cache_acct_value n_prompt_tokens;

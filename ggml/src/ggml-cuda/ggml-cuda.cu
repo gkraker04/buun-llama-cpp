@@ -4788,106 +4788,6 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     };
 }
 
-static bool ggml_backend_cuda_device_identity_v1(
-        ggml_backend_dev_t dev,
-        ggml_backend_device_identity_v1 * identity) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED(dev);
-    GGML_UNUSED(identity);
-    return false;
-#else
-    if (!dev || !identity ||
-        identity->struct_size != sizeof(ggml_backend_device_identity_v1)) {
-        return false;
-    }
-    auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
-    const int physical = ggml_cuda_get_physical_device(ctx->device);
-    cudaDeviceProp props = {};
-    int driver = 0;
-    int runtime = 0;
-    if (cudaDriverGetVersion(&driver) != cudaSuccess ||
-        cudaRuntimeGetVersion(&runtime) != cudaSuccess ||
-        cudaGetDeviceProperties(&props, physical) != cudaSuccess ||
-        driver <= 0 || runtime <= 0 || props.major <= 0 || props.minor < 0 ||
-        props.major > UINT16_MAX || props.minor > UINT16_MAX) {
-        (void) cudaGetLastError();
-        return false;
-    }
-    unsigned domain = 0;
-    unsigned bus = 0;
-    unsigned device = 0;
-    unsigned function = 0;
-    char trailing = 0;
-    if (ctx->pci_bus_id.find("-v") != std::string::npos ||
-        std::sscanf(ctx->pci_bus_id.c_str(), "%x:%x:%x.%x%c",
-                    &domain, &bus, &device, &function, &trailing) != 4 ||
-        domain > 0xffffu || bus > 0xffu || device > 0x1fu ||
-        function > 0x7u) {
-        return false;
-    }
-    ggml_backend_device_identity_v1 out = {};
-    out.struct_size = sizeof(out);
-    out.driver_version = uint32_t(driver);
-    out.runtime_version = uint32_t(runtime);
-    memcpy(out.uuid, props.uuid.bytes, sizeof(out.uuid));
-    out.pci_domain_bus_device_function =
-        uint32_t((domain << 16) | (bus << 8) | (device << 3) | function);
-    out.backend_kind = GGML_BACKEND_IDENTITY_KIND_CUDA;
-    out.arch_major = uint16_t(props.major);
-    out.arch_minor = uint16_t(props.minor);
-    bool nonzero_uuid = false;
-    for (const uint8_t byte : out.uuid) nonzero_uuid |= byte != 0;
-    if (!nonzero_uuid) return false;
-    *identity = out;
-    return true;
-#endif
-}
-
-static bool ggml_backend_cuda_device_link_v1(
-        ggml_backend_dev_t source,
-        ggml_backend_dev_t destination,
-        ggml_backend_device_link_v1 * link) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED(source);
-    GGML_UNUSED(destination);
-    GGML_UNUSED(link);
-    return false;
-#else
-    if (!source || !destination || !link || source == destination ||
-        link->struct_size != sizeof(ggml_backend_device_link_v1) ||
-        source->reg != destination->reg) {
-        return false;
-    }
-    auto * src = static_cast<ggml_backend_cuda_device_context *>(source->context);
-    auto * dst = static_cast<ggml_backend_cuda_device_context *>(destination->context);
-    const int src_physical = ggml_cuda_get_physical_device(src->device);
-    const int dst_physical = ggml_cuda_get_physical_device(dst->device);
-    if (src_physical == dst_physical) return false;
-    int access = 0;
-    int rank = 0;
-    if (cudaDeviceCanAccessPeer(&access, src_physical, dst_physical) != cudaSuccess ||
-        cudaDeviceGetP2PAttribute(&rank, cudaDevP2PAttrPerformanceRank,
-                                  src_physical, dst_physical) != cudaSuccess ||
-        rank < 0 || rank > int(UINT16_MAX) - 2) {
-        (void) cudaGetLastError();
-        return false;
-    }
-    ggml_backend_device_link_v1 out = {};
-    out.struct_size = sizeof(out);
-    // 0 is unavailable and 1 is the canonical self attachment. Peer paths
-    // begin at 2; CUDA's performance rank then preserves its ordering without
-    // colliding with either sentinel.
-    out.link_class = uint16_t(rank + 2);
-    out.p2p = uint8_t(access != 0);
-    // CUDA exposes a stable peer performance class but no portable negotiated
-    // link-bandwidth value. Keep the reserved field zero rather than inventing
-    // a byte/s estimate; link_class remains the exact topology discriminator.
-    out.bandwidth_class = 0;
-    *link = out;
-    return true;
-#endif
-}
-
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -5589,12 +5489,6 @@ static int dflash_cuda_profiler_stop(void) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    if (strcmp(name, GGML_BACKEND_DEVICE_IDENTITY_V1_PROC) == 0) {
-        return (void *) ggml_backend_cuda_device_identity_v1;
-    }
-    if (strcmp(name, GGML_BACKEND_DEVICE_LINK_V1_PROC) == 0) {
-        return (void *) ggml_backend_cuda_device_link_v1;
-    }
     if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
         return (void *)ggml_backend_cuda_vbr_iface;
     }

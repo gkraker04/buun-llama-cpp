@@ -192,8 +192,8 @@ static void test_revoke_and_planner_clear() {
 // kinds with canonical raw units — a default array would collapse to five "restore" slots
 static void test_record_defaults() {
     common_cache_plan_record rec;
-    CHECK(rec.schema_version == 7);
-    CHECK(common_cache_plan_accounting_schema(7) == 2);
+    CHECK(rec.schema_version == 6);
+    CHECK(common_cache_plan_accounting_schema(6) == 2);
     CHECK(rec.outcome == common_cache_plan_outcome::unknown);
     CHECK(rec.n_reused_tokens.state == llama_cache_acct_known::unknown);
     CHECK(rec.ttft_us.state == llama_cache_acct_known::unknown);
@@ -443,16 +443,11 @@ static void test_json_serialization() {
 
     const auto j = common_cache_plan_record_json(rec);
     // Golden regeneration door: this deliberately exercises the production
-    // serializer instead of maintaining a hand-authored schema-7 facsimile.
-    if (std::getenv("CACHE_PLAN_PRINT_SCHEMA7_GOLDEN")) {
+    // serializer instead of maintaining a hand-authored schema-6 facsimile.
+    if (std::getenv("CACHE_PLAN_PRINT_SCHEMA6_GOLDEN")) {
         std::puts(j.dump().c_str());
     }
-    CHECK(j["schema_version"] == 7);
-    CHECK(j["optimizer"]["policy_version"] == 1);
-    CHECK(j["optimizer"]["mode"] == "off");
-    CHECK(j["optimizer"]["retention_policy"] == "historical");
-    CHECK(j["optimizer"]["retention_summary"]["state"] ==
-          "not_attempted");
+    CHECK(j["schema_version"] == 6);
     CHECK(j["candidates"].size() == 3);
     CHECK(j["candidates"][0]["id"] == 0);
     CHECK(j["candidates"][0]["provider"] == "host_cache_entry");
@@ -597,46 +592,6 @@ static void test_authority_receipt_and_counters() {
     CHECK(counters.fallback_legacy[tier] == 1);
     CHECK(counters.fallback_reason[size_t(
               common_cache_plan_authority_fallback::destruction_authority_required)] == 1);
-}
-
-static void test_optimizer_retention_summary_mixed_wire() {
-    common_cache_plan_record rec;
-    rec.optimizer.mode = common_cache_optimizer_mode_wire::baseline;
-    rec.optimizer.retention_policy =
-        common_cache_optimizer_retention_wire::zc_v1;
-    auto & summary = rec.optimizer.retention_summary;
-    summary.note(
-        common_cache_retention_outcome::executed,
-        common_cache_retention_reason::_count, 4096, 128);
-    summary.note(
-        common_cache_retention_outcome::blocked,
-        common_cache_retention_reason::shrink_blocked_protected);
-    summary.note(
-        common_cache_retention_outcome::publication_skipped,
-        common_cache_retention_reason::publication_skipped_shrink_pending);
-
-    const auto j = common_cache_plan_record_json(rec);
-    const auto & wire = j["optimizer"]["retention_summary"];
-    CHECK(wire["state"] == "mixed");
-    CHECK(wire["outcome_counts"]["executed"] == 1);
-    CHECK(wire["outcome_counts"]["blocked"] == 1);
-    CHECK(wire["outcome_counts"]["publication_skipped"] == 1);
-    CHECK(wire["reason_counts"]["shrink_blocked_protected"] == 1);
-    CHECK(wire["reason_counts"]["publication_skipped_shrink_pending"] == 1);
-    CHECK(wire["evictions"] == 1);
-    CHECK(wire["released_bytes"] == 4096);
-    CHECK(wire["released_tokens"] == 128);
-    CHECK(summary.count(common_cache_retention_outcome::executed) == 1);
-    CHECK(summary.count(common_cache_retention_outcome::deferred) == 0);
-    CHECK(summary.count(common_cache_retention_outcome::blocked) == 1);
-    CHECK(summary.count(common_cache_retention_outcome::mixed) == 0);
-
-    // Invalid closed-enum inputs are ignored rather than indexing the bounded
-    // arrays. Production never constructs them; this pins fail-soft evidence.
-    const auto before = summary.reason_counts;
-    summary.note(common_cache_retention_outcome::blocked,
-                 common_cache_retention_reason(uint8_t(255)));
-    CHECK(summary.reason_counts == before);
 }
 
 static void test_yield_not_required_serialization() {
@@ -849,7 +804,6 @@ int main() {
     test_record_defaults();
     test_name_tables();
     test_authority_receipt_and_counters();
-    test_optimizer_retention_summary_mixed_wire();
     test_json_serialization();
     test_yield_not_required_serialization();
     test_actual_yield_uses_post_commit_observation();

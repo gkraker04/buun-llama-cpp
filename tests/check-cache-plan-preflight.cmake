@@ -233,7 +233,7 @@ if (NOT route_found)
 endif()
 foreach(required
         "res->headers[\"Cache-Control\"] = \"no-store\";"
-        "if (!params.cache_optimizer.cache_plan_preflight)"
+        "if (!params.cache_plan_preflight)"
         "server_cache_plan_preflight_exposure_allowed("
         "SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT"
         "res->rd.post_task(std::move(task));"
@@ -268,7 +268,7 @@ foreach(forbidden
     endif()
 endforeach()
 string(FIND "${route_body}" "res->headers[\"Cache-Control\"]" no_store_pos)
-string(FIND "${route_body}" "if (!params.cache_optimizer.cache_plan_preflight)" gate_pos)
+string(FIND "${route_body}" "if (!params.cache_plan_preflight)" gate_pos)
 string(FIND "${route_body}" "json::parse(req.body)" parse_pos)
 string(FIND "${route_body}" "res->rd.post_task(std::move(task));" queue_pos)
 if (no_store_pos EQUAL -1 OR gate_pos LESS no_store_pos OR
@@ -426,7 +426,7 @@ endif()
 
 function(route_no_store_valid source output)
     foreach(required
-            "if (params.cache_receipt || params.cache_optimizer.cache_plan_preflight ||"
+            "if (params.cache_receipt || params.cache_plan_preflight ||"
             "const bool cache_oracle_route ="
             "(cache_plan_preflight || cache_control_api) &&"
             "server_http_redacts_request_bodies(req.path)"
@@ -482,7 +482,7 @@ if (gcp_exclusion_negative_ok)
 endif()
 
 string(FIND "${context_source}"
-    "cache_plan_obs || cache_plan_authority || cache_authority ||\n            params_base.cache_optimizer.cache_plan_preflight"
+    "cache_plan_obs || cache_plan_authority || cache_authority ||\n            params_base.cache_plan_preflight"
     profile_gate)
 string(FIND "${context_source}"
     "cache_plan_calibration_profile = common_cache_plan_calib_profile("

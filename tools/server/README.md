@@ -222,7 +222,6 @@ is forced when `-np > 1`.
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
-| `--cache-optimizer MODE` | cache optimizer mode: `off`, `baseline`, `learn`, or `auto` (default: `off`; use `auto` to enable learned cache authority)<br/>(env: LLAMA_ARG_CACHE_OPTIMIZER) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
@@ -917,37 +916,6 @@ Same as the `/v1/embeddings` endpoint.
 ]
 ```
 
-### Cache optimizer modes and persisted calibration
-
-The cache optimizer defaults to `off`, preserving the historical policy with
-no calibration or local-planner overhead. Use `--cache-optimizer auto` to opt
-into learned cache authority. It observes cache replay and restore
-costs, saves bounded calibration profiles under the platform state
-directory (`$XDG_STATE_HOME/llama.cpp` or `~/.local/state/llama.cpp` on Linux,
-and `~/Library/Application Support/llama.cpp` on macOS;
-`LLAMA_STATE_HOME` overrides the root). Windows currently learns in memory and
-fails the persistent-store door safely until its secure directory-handle
-implementation lands. The optimizer uses a saved profile only when the model,
-adapters, hardware, runtime, effective placement, and operating bucket match.
-A new or mismatched setup starts in the intentional baseline and learns without
-delaying inference; confidence-gated authority becomes available only for
-mature exact operation classes.
-
-Model matching uses the loader-verified execution-cost structure (architecture,
-graph-affecting parameters, tensor types/shapes/layout, and backend placement),
-not a background hash of the GGUF weight payload. Models with different learned
-weight values may therefore share calibration when their execution structure is
-identical; no model-file scan competes with inference.
-
-Use `--cache-optimizer learn` for persistent observation without economic
-authority, `baseline` for the structural baseline without calibration, or
-`off` for the historical selector and no ZC profile loading or writing.
-With `auto` mode, an explicit `--cache-plan-authority` is the
-ceiling for confidence-gated local authority.
-`fallback_legacy` in debug receipts means the request safely used that
-historical selector because local evidence was unavailable, immature, stale,
-or no longer current; it is a compatibility fallback, not an inference error.
-
 ### POST `/cache/plan`: Preview cache reuse and displacement
 
 This opt-in endpoint is enabled with `--cache-plan-preflight`. It is available
@@ -968,13 +936,6 @@ reuse and destruction classes but no slot/source/artifact identifiers, digests,
 accounting domains, serials, or lease identities. Every response carries
 `Cache-Control: no-store`, and request/response bodies are excluded from server
 request logs and `--log-prompts-dir` output.
-
-Likewise, the legacy `ttft_us` field in a `CACHE_PLAN` debug record is the
-provider prompt-processing span. It does not include cache lookup or a host
-restore/install completed before slot launch, so it must not be used as an
-end-to-end product-latency oracle. Performance gates use client-observed time to
-first streamed output (or an explicitly named whole-request cycle measurement)
-and retain the provider span only as diagnostic attribution.
 
 ```bash
 curl --request POST http://127.0.0.1:8080/cache/plan \

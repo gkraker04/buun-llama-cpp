@@ -44,7 +44,7 @@ function(enforcement_contract kv server output)
     string(FIND "${server}" "SRV_INF(\"CACHE_VBR_HARD_SEAL %s\\n\"" seal_evidence)
     string(FIND "${server}" "ERROR_TYPE_HARD_LEASE_BLOCKED" typed_http)
     string(FIND "${server}" "vbr_hard_seal_evidence_take(hard_seal_evidence);" evidence_take)
-    string(FIND "${server}" "if (params_base.cache_optimizer.cache_debug) {\n            for (const auto & step : hard_seal_evidence)" debug_gate)
+    string(FIND "${server}" "if (params_base.cache_debug) {\n            for (const auto & step : hard_seal_evidence)" debug_gate)
     if (degrade_guard EQUAL -1 OR degrade_status EQUAL -1 OR
         tree_guard EQUAL -1 OR clear_guard EQUAL -1 OR
         reset_guard EQUAL -1 OR purge_guard EQUAL -1 OR
@@ -198,7 +198,7 @@ if (evidence_negative_ok)
 endif()
 
 string(REPLACE
-    "if (params_base.cache_optimizer.cache_debug) {\n            for (const auto & step : hard_seal_evidence)"
+    "if (params_base.cache_debug) {\n            for (const auto & step : hard_seal_evidence)"
     "if (true) {\n            for (const auto & step : hard_seal_evidence)"
     debug_gate_negative "${server_source}")
 enforcement_contract("${kv_source}" "${debug_gate_negative}" debug_gate_negative_ok)

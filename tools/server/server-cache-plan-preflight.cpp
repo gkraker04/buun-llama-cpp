@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
@@ -233,14 +232,6 @@ bool server_cache_plan_preflight_build_view(
         out.status = server_cache_plan_preflight_status::ok;
         out.planner_status = rec.planner_status;
         out.configured_level = rec.authority.configured_level;
-        out.optimizer = rec.optimizer;
-        out.optimizer.inventory_status = rec.inventory_saturated()
-            ? common_cache_optimizer_inventory_status::capacity
-            : common_cache_optimizer_inventory_status::complete;
-        out.optimizer.baseline_plan_candidate =
-            out.optimizer.inventory_status ==
-                    common_cache_optimizer_inventory_status::complete
-                ? rec.authority.legacy_plan_candidate : -1;
         out.selection_tier = rec.selection;
         out.fallback_reason = rec.authority.fallback_reason;
         if (rec.planner_status == common_cache_plan_planner_status::ok &&
@@ -282,9 +273,6 @@ bool server_cache_plan_preflight_build_view(
             return true;
         }
         const auto & selected = rec.inventory[size_t(rec.shadow_choice)];
-        if (out.optimizer.mode == common_cache_optimizer_mode_wire::off) {
-            out.optimizer.economic_plan_candidate = rec.shadow_choice;
-        }
         out.provider = selected.provider;
         out.provider_available = true;
         out.target_relation = rec.selection == common_cache_plan_selection::by_id
@@ -401,7 +389,7 @@ json server_cache_plan_preflight_json(
           public_value(view.predicted_replay_tokens) },
         { "predicted_restore_bytes",
           public_value(view.predicted_restore_bytes) },
-        { "predicted_owned_service_us", public_value(view.predicted_ttft_us) },
+        { "predicted_ttft_us", public_value(view.predicted_ttft_us) },
         { "estimate_scope", "cache_path_only" },
         { "estimator_version", view.estimator_version == 0
               ? json(nullptr) : json(view.estimator_version) },
@@ -437,66 +425,9 @@ json server_cache_plan_preflight_json(
           public_value(destruction.estimated_destruction_us) },
     };
 
-    const auto & optimizer = view.optimizer;
-    const bool local_mode =
-        optimizer.mode == common_cache_optimizer_mode_wire::learn ||
-        optimizer.mode == common_cache_optimizer_mode_wire::auto_mode;
-    const bool landed_candidate =
-        !local_mode && optimizer.economic_plan_candidate >= 0;
-    const char * economic_source = local_mode &&
-            optimizer.economic_plan_candidate >= 0
-        ? "local_fit"
-        : landed_candidate ? "landed_checked_in" : "none";
-    const char * assessment = "not_attempted";
-    if (local_mode && optimizer.economic_disposition ==
-            common_cache_optimizer_disposition::learning) {
-        assessment = "learning";
-    } else if (optimizer.economic_disposition ==
-                   common_cache_optimizer_disposition::refused) {
-        assessment = "refused";
-    } else if (optimizer.economic_plan_candidate >= 0) {
-        assessment = "candidate_if_still_current";
-    }
-    const auto unavailable_ordinal = [](int32_t ordinal) {
-        return ordinal >= 0 ? json(ordinal) : json("unavailable");
-    };
-    const auto unavailable_number = [](bool known, double value) {
-        return known && std::isfinite(value)
-            ? json(value) : json("unavailable");
-    };
-    json optimizer_preview = {
-        { "mode", common_cache_optimizer_mode_wire_name(optimizer.mode) },
-        { "retention_policy", common_cache_optimizer_retention_wire_name(
-              optimizer.retention_policy) },
-        { "baseline_plan_candidate", unavailable_ordinal(
-              optimizer.baseline_plan_candidate) },
-        { "economic_plan_candidate", unavailable_ordinal(
-              optimizer.economic_plan_candidate) },
-        { "predicted_economic_source", economic_source },
-        { "economic_assessment", assessment },
-        { "fallback_reason", common_cache_optimizer_fallback_reason_name(
-              optimizer.local_fallback_reason) },
-        { "profile_source", common_cache_optimizer_profile_source_name(
-              optimizer.profile_source) },
-        { "profile_resume_origin", common_cache_optimizer_resume_origin_name(
-              optimizer.profile_resume_origin) },
-        { "profile_state", common_cache_optimizer_profile_state_name(
-              optimizer.profile_state) },
-        { "short_identity", optimizer.profile_identity.empty()
-              ? json("unavailable") : json(optimizer.profile_identity) },
-        { "coverage_class", common_cache_optimizer_coverage_class_name(
-              optimizer.coverage_class) },
-        { "benefit_estimate_us", unavailable_number(
-              optimizer.benefit_estimate_known,
-              optimizer.benefit_estimate_us) },
-        { "benefit_lower_us", unavailable_number(
-              optimizer.benefit_lower_known,
-              optimizer.benefit_lower_us) },
-    };
-
     return json {
         { "object", "cache_plan_preflight" },
-        { "schema_version", 2 },
+        { "schema_version", 1 },
         { "cache_plan_schema_version", COMMON_CACHE_PLAN_SCHEMA_VERSION },
         { "authoritative", false },
         { "reservation", "none" },
@@ -504,7 +435,6 @@ json server_cache_plan_preflight_json(
         { "status", preflight_status_name(view.status) },
         { "planner", std::move(planner) },
         { "destruction", std::move(destruction_json) },
-        { "optimizer_preview", std::move(optimizer_preview) },
         { "miss_reasons", std::move(miss_reasons) },
         { "limitations", json::array({
             "point_in_time",

@@ -8,7 +8,6 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
-#include "llama-sha256.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -38,18 +37,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-thread_local bool model_cost_structure_capture_enabled = false;
-
-bool llama_model_cost_structure_capture_enabled() {
-    return model_cost_structure_capture_enabled;
-}
-
-bool llama_model_cost_structure_capture_set(bool enabled) {
-    const bool previous = model_cost_structure_capture_enabled;
-    model_cost_structure_capture_enabled = enabled;
-    return previous;
-}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1048,6 +1035,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
+    impl() = default;
+    ~impl() = default;
 
     uint64_t n_elements = 0;
 
@@ -1082,16 +1071,6 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
-    // Normalized cumulative split points actually used by tensor placement.
-    // Unlike params.tensor_split this also captures the auto free-VRAM split.
-    std::array<float, 128> effective_tensor_split = {};
-    size_t effective_tensor_split_count = 0;
-
-    // Canonical execution-cost structure captured from loader-verified model
-    // metadata. It intentionally excludes tensor payload bytes: dense weight
-    // values do not select kernels or alter cache-operation cost.
-    std::array<uint8_t, 32> cost_structure_digest = {};
-    bool cost_structure_digest_ready = false;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1369,13 +1348,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
-    }
-    GGML_ASSERT(splits.size() <= pimpl->effective_tensor_split.size());
-    pimpl->effective_tensor_split_count = splits.size();
-    float prior_split = 0.0f;
-    for (size_t i = 0; i < splits.size(); ++i) {
-        pimpl->effective_tensor_split[i] = splits[i] - prior_split;
-        prior_split = splits[i];
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
@@ -1775,82 +1747,6 @@ void llama_model::adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
-}
-
-const float * llama_model::effective_tensor_split(size_t & count) const noexcept {
-    count = pimpl->effective_tensor_split_count;
-    return pimpl->effective_tensor_split.data();
-}
-
-bool llama_model::capture_cost_structure_digest() noexcept {
-    try {
-        llama_sha256_writer writer;
-        static constexpr char domain[] =
-            "llama.cpp model execution-cost structure";
-        writer.string(domain, sizeof(domain) - 1);
-        writer.u32(1); // serialization version
-        writer.u32(uint32_t(arch));
-        writer.u32(uint32_t(type));
-        writer.u32(uint32_t(pimpl->ftype));
-
-        // llama_hparams is zero-initialized, trivially copyable, and bound to
-        // the server cost-ABI/build identity in the outer fingerprint. This
-        // captures graph-affecting scalar and per-layer arrays without
-        // serializing descriptive/tokenizer GGUF metadata.
-        static_assert(std::is_trivially_copyable<llama_hparams>::value,
-                      "llama_hparams must remain trivially copyable");
-        writer.string(&hparams, sizeof(hparams));
-
-        std::vector<const std::pair<std::string, ggml_tensor *> *> tensors;
-        tensors.reserve(tensors_by_name.size());
-        for (const auto & row : tensors_by_name) {
-            tensors.push_back(&row);
-        }
-        std::sort(tensors.begin(), tensors.end(), [](const auto * lhs, const auto * rhs) {
-            return lhs->first < rhs->first;
-        });
-        writer.u64(tensors.size());
-        for (const auto * row : tensors) {
-            const ggml_tensor * tensor = row->second;
-            if (!tensor) return false;
-            writer.string(row->first.data(), row->first.size());
-            writer.u32(uint32_t(tensor->type));
-            writer.u32(uint32_t(ggml_n_dims(tensor)));
-            for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
-                writer.u64(uint64_t(tensor->ne[i]));
-                writer.u64(uint64_t(tensor->nb[i]));
-            }
-            writer.u64(uint64_t(ggml_nbytes(tensor)));
-            writer.u32(uint32_t(tensor->flags));
-            const char * buft_name = "unallocated";
-            if (tensor->buffer) {
-                const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
-                if (buft && ggml_backend_buft_name(buft)) {
-                    buft_name = ggml_backend_buft_name(buft);
-                }
-            }
-            writer.string(buft_name, std::strlen(buft_name));
-        }
-        pimpl->cost_structure_digest = writer.finish();
-        pimpl->cost_structure_digest_ready = true;
-        return true;
-    } catch (...) {
-        pimpl->cost_structure_digest = {};
-        pimpl->cost_structure_digest_ready = false;
-        return false;
-    }
-}
-
-bool llama_model::cost_structure_digest(
-        std::array<uint8_t, 32> & out, uint64_t & tensor_bytes) const noexcept {
-    if (!pimpl->cost_structure_digest_ready) {
-        out = {};
-        tensor_bytes = 0;
-        return false;
-    }
-    out = pimpl->cost_structure_digest;
-    tensor_bytes = uint64_t(pimpl->n_bytes);
-    return true;
 }
 
 uint32_t llama_model::n_gpu_layers() const {

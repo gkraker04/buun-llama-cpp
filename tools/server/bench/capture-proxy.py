@@ -25,12 +25,6 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from trace_common import (
-	SSEPayloadAccumulator,
-	extract_server_metrics,
-	merge_server_metrics,
-)
-
 
 HOP_BY_HOP = {
 	"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -99,10 +93,44 @@ def request_fingerprint(body):
 	return out
 
 
+def extract_server_metrics(payload):
+	"""Pull whatever the server volunteered about reuse. Shape varies by
+	endpoint and build; record what exists, decide at scoring time."""
+	found = {}
+	if not isinstance(payload, dict):
+		return found
+	timings = payload.get("timings")
+	if isinstance(timings, dict):
+		found["timings"] = timings
+	usage = payload.get("usage")
+	if isinstance(usage, dict):
+		found["usage"] = usage
+	for key in ("tokens_evaluated", "tokens_cached", "tokens_predicted",
+			"id_slot", "truncated", "stop_type"):
+		if key in payload:
+			found[key] = payload[key]
+	return found
+
+
+def sse_payloads(buffer):
+	"""Yield parsed JSON objects from accumulated SSE text."""
+	for line in buffer.splitlines():
+		line = line.strip()
+		if not line.startswith("data:"):
+			continue
+		data = line[5:].strip()
+		if not data or data == "[DONE]":
+			continue
+		try:
+			yield json.loads(data)
+		except ValueError:
+			continue
+
+
 def sse_has_content(payload):
 	if not isinstance(payload, dict):
 		return False
-	if payload.get("content") or payload.get("reasoning_content"):
+	if payload.get("content"):
 		return True
 	choices = payload.get("choices")
 	if isinstance(choices, list):
@@ -110,8 +138,7 @@ def sse_has_content(payload):
 			if not isinstance(choice, dict):
 				continue
 			delta = choice.get("delta")
-			if isinstance(delta, dict) and (
-					delta.get("content") or delta.get("reasoning_content")):
+			if isinstance(delta, dict) and delta.get("content"):
 				return True
 			if choice.get("text"):
 				return True
@@ -242,8 +269,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 		t_first_token = None
 		received = 0
 		text_buffer = ""
-		server_metrics = {}
-		sse_reader = SSEPayloadAccumulator() if streaming else None
+		final_payload = None
 
 		try:
 			while True:
@@ -260,10 +286,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 					self.wfile.flush()
 					if len(text_buffer) < TEXT_CAP:
 						text_buffer += chunk.decode("utf-8", "replace")
-					for payload in sse_reader.feed(chunk):
-						merge_server_metrics(server_metrics, payload)
-						if t_first_token is None and sse_has_content(payload):
-							t_first_token = now_ms()
+					if t_first_token is None:
+						for payload in sse_payloads(text_buffer):
+							if sse_has_content(payload):
+								t_first_token = now_ms()
+								break
 				else:
 					self.wfile.write(chunk)
 					# Non-streaming bodies carry timings/usage in the single
@@ -277,9 +304,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 			record["stream_error"] = str(error)
 		finally:
 			conn.close()
-		if streaming:
-			for payload in sse_reader.feed(b"", final=True):
-				merge_server_metrics(server_metrics, payload)
 
 		t_end = now_ms()
 		record["response_bytes"] = received
@@ -289,14 +313,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
 			if t_first_token else record["ttfb_ms"])
 		record["total_ms"] = round(t_end - t_arrival, 3)
 
-		if not streaming:
+		if streaming:
+			for payload in sse_payloads(text_buffer):
+				metrics = extract_server_metrics(payload)
+				if metrics:
+					final_payload = metrics
+		else:
 			try:
-				server_metrics = extract_server_metrics(
+				final_payload = extract_server_metrics(
 					json.loads(text_buffer or "{}"))
 			except ValueError:
-				server_metrics = {}
-		if server_metrics:
-			record["server"] = server_metrics
+				final_payload = None
+		if final_payload:
+			record["server"] = final_payload
 
 		# The harness echoes each answer back inside the NEXT request, so inputs
 		# alone almost reconstruct the session — but the final turn, anything the

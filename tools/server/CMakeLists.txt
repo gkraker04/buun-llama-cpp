@@ -21,20 +21,10 @@ add_library(${TARGET} STATIC
     server-cache-plan-preflight.cpp
     server-cache-plan-preflight.h
     server-cache-plan-preflight-internal.h
-    server-cache-observer.cpp
-    server-cache-observer.h
-    server-cache-calibration-model.cpp
-    server-cache-calibration-model.h
-    server-cache-calibration-store.cpp
-    server-cache-calibration-store.h
-    server-cache-fingerprint.cpp
-    server-cache-fingerprint.h
     server-cache-lease.cpp
     server-cache-lease.h
     server-cache-retention-proof.cpp
     server-cache-retention-proof.h
-    server-cache-retention-policy.cpp
-    server-cache-retention-policy.h
     server-cache-vbr-proof.cpp
     server-cache-vbr-proof.h
     server-cache-yield.cpp
@@ -57,8 +47,6 @@ add_library(${TARGET} STATIC
     server-schema.h
 )
 
-target_compile_definitions(${TARGET} PRIVATE SERVER_CACHE_LOCAL_AUTHORITY=1)
-
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -66,9 +54,6 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
-if (WIN32)
-    target_link_libraries(${TARGET} PRIVATE bcrypt)
-endif()
 
 # llama-server-impl: server logic, reusable by app
 
@@ -125,63 +110,4 @@ if (LLAMA_BUILD_TESTS)
     set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
         LABELS main
         ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
-
-    add_executable(test-server-retention-policy
-        ${CMAKE_SOURCE_DIR}/tests/test-server-retention-policy.cpp)
-    target_link_libraries(test-server-retention-policy PRIVATE server-context)
-    target_include_directories(test-server-retention-policy PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(test-server-retention-policy PRIVATE cxx_std_17)
-    add_test(NAME test-server-retention-policy COMMAND test-server-retention-policy)
-    set_property(TEST test-server-retention-policy PROPERTY LABELS main)
-
-    add_executable(test-server-cache-observer
-        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-observer.cpp)
-    target_link_libraries(test-server-cache-observer PRIVATE server-context)
-    target_include_directories(test-server-cache-observer PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(test-server-cache-observer PRIVATE cxx_std_17)
-    add_test(NAME test-server-cache-observer COMMAND test-server-cache-observer)
-    set_property(TEST test-server-cache-observer PROPERTY LABELS main)
-
-    add_executable(test-server-cache-calibration-model
-        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-calibration-model.cpp)
-    target_link_libraries(test-server-cache-calibration-model PRIVATE server-context)
-    target_include_directories(test-server-cache-calibration-model PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(test-server-cache-calibration-model PRIVATE cxx_std_17)
-    add_test(NAME test-server-cache-calibration-model
-        COMMAND test-server-cache-calibration-model)
-    set_property(TEST test-server-cache-calibration-model PROPERTY LABELS main)
-
-    add_executable(test-server-cache-fingerprint
-        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-fingerprint.cpp)
-    target_link_libraries(test-server-cache-fingerprint PRIVATE server-context)
-    target_include_directories(test-server-cache-fingerprint PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(test-server-cache-fingerprint PRIVATE cxx_std_17)
-    add_test(NAME test-server-cache-fingerprint COMMAND test-server-cache-fingerprint)
-    set_property(TEST test-server-cache-fingerprint PROPERTY LABELS main)
-
-    add_executable(test-server-cache-calibration-store
-        ${CMAKE_SOURCE_DIR}/tests/test-server-cache-calibration-store.cpp)
-    target_link_libraries(test-server-cache-calibration-store PRIVATE server-context)
-    target_include_directories(test-server-cache-calibration-store PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(test-server-cache-calibration-store PRIVATE cxx_std_17)
-    add_test(NAME test-server-cache-calibration-store
-        COMMAND test-server-cache-calibration-store)
-    set_property(TEST test-server-cache-calibration-store PROPERTY LABELS main)
-
-    add_executable(zc1-retention-grid bench/zc1-retention-grid.cpp)
-    target_link_libraries(zc1-retention-grid PRIVATE server-context)
-    target_include_directories(zc1-retention-grid PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(zc1-retention-grid PRIVATE cxx_std_17)
-    find_program(ZC1_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
-    add_test(NAME test-zc1-retention-tools
-        COMMAND ${ZC1_PYTHON_EXECUTABLE}
-            ${CMAKE_SOURCE_DIR}/tests/test-zc1-retention-tools.py
-            --grid $<TARGET_FILE:zc1-retention-grid>)
-    set_property(TEST test-zc1-retention-tools PROPERTY LABELS main)
 endif()

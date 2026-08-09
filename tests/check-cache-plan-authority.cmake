@@ -22,11 +22,8 @@ if (NOT implemented_ceiling)
 endif()
 
 function(cache_plan_authority_order_valid source output)
-    # Pin the completed inventory call without coupling this contract to the
-    # evolving observer arguments that follow the authoritative source
-    # registry. The close parenthesis is deliberately not part of the token.
     string(FIND "${source}"
-        "task, target, out.incoming_loras, out.incoming_adapter, rec,\n            source_registry"
+        "task, target, out.incoming_adapter, rec, source_registry);"
         inventory_pos)
     string(FIND "${source}" "mode.plan_authority->plan_before_mutation(" planner_pos)
     string(FIND "${source}" "cache_plan_authority->authorize(" authority_pos)
@@ -227,7 +224,7 @@ foreach(pin
         "common_cache_plan_destruction_counters & counters"
         "GGML_ASSERT(rec != nullptr || required_source_id < 0);"
         "int32_t cache_plan_source_id = -1;"
-        "COMMON_CACHE_PLAN_SCHEMA_VERSION = 7")
+        "COMMON_CACHE_PLAN_SCHEMA_VERSION = 6")
     string(FIND "${common_header}${plan_header}${server_source}${task_source}${task_header}${authority_header}" "${pin}" pin_pos)
     if (pin_pos EQUAL -1)
         message(FATAL_ERROR "B-A authority contract pin missing: ${pin}")

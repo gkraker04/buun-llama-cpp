@@ -127,13 +127,6 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
-// Loader-derived execution-cost structure. This hashes canonical GGUF metadata,
-// tensor descriptors, modality, and effective backend placement, never tensor
-// payload bytes or the source path. Returns false when the loaded projector
-// cannot supply a complete structural identity.
-MTMD_API bool mtmd_cost_structure_digest(
-    const mtmd_context * ctx, uint8_t digest[32], uint64_t * tensor_bytes);
-
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk
 MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);

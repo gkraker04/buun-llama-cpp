@@ -6,7 +6,6 @@
 #include "llama.h"
 #include "server-cache-lifecycle.h"
 #include "server-cache-lease.h"
-#include "server-cache-observer.h"
 #include "server-cache-plan-preflight.h"
 #include "server-cache-control.h"
 #include "server-retention-sidecar.h"
@@ -804,15 +803,7 @@ struct server_prompt_cache_state {
     // receives the provisional D-A3 retention weight; child-task saves do not.
     // E1 declared identity replaces this heuristic rather than stacking with it.
     bool main_family = false;
-    common_cache_retention_lineage retention_lineage;
-    std::array<uint8_t, 32> adapter_application_digest = {};
-    bool adapter_application_complete = false;
-
-    // ZC1 process-local retention identity. A list splice preserves both;
-    // independently materialized nodes receive a fresh generation at publish.
-    // Neither value is an artifact/wire identity or restart-persistent.
-    uint64_t retention_generation_id = 0;
-    uint64_t retention_last_use_epoch = 0;
+    common_cache_family_binding cache_family;
 
     std::array<llama_cache_acct_op_id, 3> release_ops() const noexcept {
         return { acct_op_snapshot, acct_op_ckpt, acct_op_accel };
@@ -834,31 +825,17 @@ struct server_prompt_cache_state {
     }
 };
 
-struct server_prompt_cache_load_observation {
-    bool attempted = false;
-    bool restored = false;
-    uint64_t payload_bytes = 0;
-    uint64_t owned_cpu_us = 0;
-    server_cache_observation_admission_clock admission_clock;
-    // Identity belongs to the retained source that was actually selected,
-    // never to the incoming request that happened to trigger the restore.
-    std::array<uint8_t, 32> adapter_application_digest = {};
-    bool adapter_application_complete = false;
-};
-
-inline void server_prompt_cache_apply_retention_lineage(
+inline void server_prompt_cache_apply_family(
         server_prompt_cache_state & state,
-        common_cache_retention_lineage lineage,
-        bool intentional_retention,
-        bool historical_automatic_main) noexcept {
-    state.retention_lineage = lineage;
-    state.main_family = common_cache_retention_main_family(
-        lineage, intentional_retention, historical_automatic_main);
+        common_cache_family_binding binding,
+        bool automatic_main_family) noexcept {
+    state.cache_family = binding;
+    state.main_family = common_cache_family_main_family(
+        binding, automatic_main_family);
 }
 
 struct server_cache_authority;
 class server_cache_recovery_pin;
-class server_cache_observation_store;
 
 struct server_prompt_cache_payload_leaf {
     llama_cache_acct_category category =
@@ -875,7 +852,7 @@ struct server_prompt_cache_payload_leaf {
 // that intent explicitly if server_tokens ever becomes copyable.
 struct server_prompt_cache_restore_delivery {
     server_prompt prompt;
-    common_cache_retention_lineage retention_lineage;
+    common_cache_family_binding cache_family;
     bool retains_source = false;
 };
 
@@ -934,13 +911,7 @@ struct server_prompt_cache {
     // published entry, never an eviction that bought nothing. Under lifecycle hard-lease pressure,
     // publish() may also return false after removing only its just-spliced incoming node; every
     // previously retained hard-leased/recovery-pinned entry remains untouched.
-    std::list<server_prompt_cache_state> stage(
-        const server_prompt & prompt,
-        size_t state_size_main,
-        size_t state_size_drft,
-        std::string adapter_config_key,
-        std::array<uint8_t, 32> adapter_application_digest = {},
-        bool adapter_application_complete = false);
+    std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
     bool publish(
             std::list<server_prompt_cache_state> entry,
             const server_prompt * source_prompt = nullptr,
@@ -951,10 +922,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_retention_lineage * restored_lineage = nullptr, server_prompt_cache_load_observation * observation = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
 
-    template <bool Observed, bool Measure>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_retention_lineage * restored_lineage, server_prompt_cache_load_observation * observation);
+    template <bool Observed>
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
 
     // D-A1's two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.
@@ -971,10 +942,6 @@ struct server_prompt_cache {
             int32_t debug_source_id = -1);
 
     void update();
-
-    // Called once at the real request scheduling boundary. Debug/preflight
-    // never call it, so observation cannot make a retained entry look newer.
-    void retention_event_begin() noexcept;
 
     iterator destroy_entry(
             iterator it,
@@ -1001,26 +968,12 @@ struct server_prompt_cache {
     // Explicit emission gate. An observed load also exists under B authority,
     // so rec != nullptr is not evidence that --cache-debug was enabled.
     bool debug_observability = false;
-    server_cache_observation_store * cache_observations = nullptr;
     uint64_t debug_lifecycle_emissions = 0;
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;
     uint64_t debug_host_pressure_floor_outcomes = 0;
     llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
     bool host_trade_substrate_warned = false;
-    common_cache_retention_summary * retention_summary = nullptr;
-
-    common_cache_optimizer_retention_policy retention_policy =
-        common_cache_optimizer_retention_policy::historical_legacy;
-    bool retention_identity_available = true;
-    // Closed terminal for the process-local ZC identity allocator. `_count`
-    // means no failure; generation and event-epoch exhaustion stay distinct
-    // in schema-7 evidence instead of collapsing into one diagnosis.
-    common_cache_retention_reason retention_identity_failure =
-        common_cache_retention_reason::_count;
-    uint64_t retention_next_generation_id = 1;
-    uint64_t retention_next_use_epoch = 1;
-    uint64_t retention_current_use_epoch = 0;
 
     ~server_prompt_cache() {
         clear_accounting();
@@ -1054,15 +1007,7 @@ private:
             bool & recovery_pin_excluded);
     bool evict_front_under_pressure(
             server_cache_destruction_reason reason,
-            iterator incoming,
-            uint64_t need);
-    bool evict_zc_soft_floor(
-            server_cache_destruction_reason reason,
-            iterator incoming,
-            uint64_t need);
-    bool try_destroy_entry_prepared(
-            iterator it,
-            server_cache_destruction_reason reason);
+            iterator incoming);
     bool update_impl(iterator incoming);
     iterator destroy_entry_impl(
             iterator it,

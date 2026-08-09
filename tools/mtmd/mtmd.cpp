@@ -6,7 +6,6 @@
 #include "debug/mtmd-debug.h"
 
 #include "llama.h"
-#include "src/llama-sha256.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -805,40 +804,6 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
-}
-
-bool mtmd_cost_structure_digest(
-        const mtmd_context * ctx, uint8_t digest[32], uint64_t * tensor_bytes) {
-    if (!ctx || !digest || !tensor_bytes) return false;
-    llama_sha256_writer writer;
-    static constexpr char domain[] = "mtmd context execution-cost structure";
-    writer.string(domain, sizeof(domain) - 1);
-    writer.u32(1);
-    writer.u32(uint32_t(ctx->n_threads));
-    writer.u32(uint32_t(ctx->batch_max_tokens));
-    uint64_t total = 0;
-    uint32_t count = 0;
-    for (const clip_ctx * clip : {ctx->ctx_v, ctx->ctx_a}) {
-        if (!clip) continue;
-        std::array<uint8_t, 32> part = {};
-        uint64_t bytes = 0;
-        if (!clip_cost_structure_digest(clip, part.data(), &bytes)) {
-            return false;
-        }
-        writer.u32(count++);
-        writer.bytes(part.data(), part.size());
-        writer.u64(bytes);
-        // Vision and audio contexts can be two views of the same mmproj GGUF.
-        // Its artifact extent is therefore the largest loaded view, not the
-        // sum of duplicate views of the same backing file.
-        total = std::max(total, bytes);
-    }
-    if (count == 0) return false;
-    writer.u32(count);
-    const auto result = writer.finish();
-    std::memcpy(digest, result.data(), result.size());
-    *tensor_bytes = total;
-    return true;
 }
 
 struct mtmd_tokenizer {

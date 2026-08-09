@@ -60,8 +60,8 @@ endif()
 # D-A0b wiring: policy objects and lease inspection are live under debug OR
 # lifecycle, while the cache-plan serialization observer remains debug-only.
 function(da0b_lifecycle_wiring_valid source output)
-    string(FIND "${source}" "if (params_base.cache_optimizer.cache_debug) {\n            cache_plan_obs =" debug_emit_gate)
-    string(FIND "${source}" "if (params_base.cache_optimizer.cache_debug ||\n            params_base.cache_optimizer.cache_lifecycle) {" lifecycle_gate)
+    string(FIND "${source}" "if (params_base.cache_debug) {\n            cache_plan_obs =" debug_emit_gate)
+    string(FIND "${source}" "if (params_base.cache_debug || params_base.cache_lifecycle) {" lifecycle_gate)
     string(FIND "${source}" "cache_authority->destruction.lease_evaluator =" lease_wiring)
     if (debug_emit_gate EQUAL -1 OR lifecycle_gate EQUAL -1 OR
         lease_wiring LESS_EQUAL lifecycle_gate)
@@ -107,8 +107,8 @@ if (idle_reason EQUAL -1 OR tagged_idle EQUAL -1 OR
     message(FATAL_ERROR "D-A0b destruction-reason attribution drifted")
 endif()
 string(REPLACE
-    "if (params_base.cache_optimizer.cache_debug ||\n            params_base.cache_optimizer.cache_lifecycle) {"
-    "if (params_base.cache_optimizer.cache_debug) {"
+    "if (params_base.cache_debug || params_base.cache_lifecycle) {"
+    "if (params_base.cache_debug) {"
     lifecycle_negative "${server_context}")
 da0b_lifecycle_wiring_valid("${lifecycle_negative}" lifecycle_negative_valid)
 if (lifecycle_negative_valid)
@@ -289,55 +289,9 @@ if (raw_call_pos EQUAL -1 OR legacy_release_pos LESS_EQUAL raw_call_pos)
 endif()
 count_literal(
     "${server_task}" "server_prompt_cache_destroy_entry_impl(" raw_impl_sites)
-if (NOT raw_impl_sites EQUAL 4)
+if (NOT raw_impl_sites EQUAL 3)
     message(FATAL_ERROR
-        "D-A/ZC raw host primitive must have one definition and three censused capability/wrapper calls; found ${raw_impl_sites}")
-endif()
-
-# ZC's narrow prepared-release adapter owns a third censused mutation edge.
-# Its immutable-inventory caller may advance after a refusal, but once this
-# edge erases a node the exact accounting commit must be adjacent and fatal on
-# drift, matching the already-landed capability terminals.
-function(zc_host_commit_gap_valid source output)
-    contract_extract_region(
-        "${source}"
-        "(void) server_prompt_cache_destroy_entry_impl(*this, it);"
-        "const auto commit_status = prepared.commit();"
-        body found)
-    if (NOT found)
-        set(${output} FALSE PARENT_SCOPE)
-        return()
-    endif()
-    contract_find_forbidden(
-        "${body}" forbidden
-        "gauge_set("
-        "reserve("
-        "stage("
-        "preview_release_set("
-        "->release("
-        "clone("
-        "retire("
-        "server_cache_retention_admit("
-        "server_fault("
-        "std::function")
-    if (forbidden)
-        set(${output} FALSE PARENT_SCOPE)
-    else()
-        set(${output} TRUE PARENT_SCOPE)
-    endif()
-endfunction()
-
-zc_host_commit_gap_valid("${server_task}" zc_host_commit_gap_ok)
-if (NOT zc_host_commit_gap_ok)
-    message(FATAL_ERROR "ZC host prepared-release commit gap drifted")
-endif()
-string(REPLACE
-    "(void) server_prompt_cache_destroy_entry_impl(*this, it);"
-    "(void) server_prompt_cache_destroy_entry_impl(*this, it); acct->release({});"
-    zc_gap_negative "${server_task}")
-zc_host_commit_gap_valid("${zc_gap_negative}" zc_gap_negative_ok)
-if (zc_gap_negative_ok)
-    message(FATAL_ERROR "ZC host prepared-release negative control did not trip")
+        "D-A3 raw host primitive must have one definition and two censused capability/wrapper calls; found ${raw_impl_sites}")
 endif()
 
 # Negative control C: injecting an internal release into the raw primitive must
@@ -518,7 +472,7 @@ endif()
 contract_extract_region(
     "${server_task}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner, nullptr,"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
     da2_commit_gap da2_commit_gap_found)
 contract_find_forbidden(
     "${da2_commit_gap}" da2_gap_forbidden
@@ -550,7 +504,7 @@ string(REPLACE
 contract_extract_region(
     "${da2_gap_negative}"
     "auto next = server_prompt_cache_destroy_entry_impl(*this, it);"
-    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner, nullptr,"
+    "commit_certified_host_destruction(\n            *this, redundant, scheduler_owner);"
     da2_negative_gap da2_negative_found)
 contract_find_forbidden(
     "${da2_negative_gap}" da2_negative_forbidden "release(")
@@ -561,7 +515,7 @@ endif()
 # CACHE_HOST_LIFECYCLE is debug evidence, not an Observed-template signal:
 # B authority also supplies a record when --cache-debug is absent.
 string(FIND "${server_context}"
-    "prompt_cache->debug_observability = params_base.cache_optimizer.cache_debug;"
+    "prompt_cache->debug_observability = params_base.cache_debug;"
     da1_debug_wiring)
 contract_extract_region(
     "${server_task}"
@@ -666,7 +620,7 @@ function(da3_hard_floor_valid source output)
     foreach(needle
             "candidate.lease_known && !candidate.hard_leased"
             "candidate.victim->recovery_pins == 0"
-            "if (!zc_pressure_checked && !update_impl(self)) {"
+            "if (!update_impl(self)) {"
             "note_host_trade_publication_skip()")
         string(FIND "${source}" "${needle}" needle_pos)
         if (needle_pos EQUAL -1)
@@ -685,7 +639,7 @@ contract_extract_region(
 contract_extract_region(
     "${da3_trade_body}"
     "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
-    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking,"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
     da3_commit_gap da3_commit_gap_found)
 contract_find_forbidden(
     "${da3_commit_gap}" da3_gap_forbidden
@@ -759,7 +713,7 @@ string(REPLACE
 contract_extract_region(
     "${da3_gap_negative}"
     "server_prompt_cache_destroy_entry_impl(*this, chosen->victim);"
-    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking,"
+    "commit_certified_host_destruction(\n            *this, certified, scheduler_owner, &chosen->ranking);"
     da3_negative_gap da3_negative_found)
 contract_find_forbidden(
     "${da3_negative_gap}" da3_negative_forbidden "release(")
@@ -913,7 +867,7 @@ if (NOT da4_raw_checkpoint_found OR da4_raw_checkpoint_forbidden OR
         "D-A4 live-checkpoint ownership/commit-gap/host-clone contract drifted")
 endif()
 string(FIND "${server_context}"
-    "bool optional_thinning_attempt = !zc_retention &&\n                            slot.lifecycle_authority &&\n                            slot.checkpoint_thinning_attempt_begin(false);"
+    "const bool optional_thinning_attempt =\n                            slot.lifecycle_authority &&\n                            slot.checkpoint_thinning_attempt_begin(false);"
     da4_attempt_lifecycle_gate)
 string(FIND "${server_task}"
     "if (!attempt_claimed &&\n        !server_cache_checkpoint_thinning_attempt_begin(context, capacity_mode)) {\n        return false;\n    }\n    context.thinning_refusal"
@@ -964,10 +918,10 @@ count_literal(
     "${authority_source}${server_context}${server_task}"
     "admit_live_checkpoints("
     da4_admit_live_checkpoints_count)
-if (NOT da4_admit_live_checkpoint_count EQUAL 3 OR
+if (NOT da4_admit_live_checkpoint_count EQUAL 2 OR
     NOT da4_admit_live_checkpoints_count EQUAL 3)
     message(FATAL_ERROR
-        "D-A4/ZC1 live-checkpoint ownership admission census drifted: expected single definition + detached ZC adapter + historical creation adapter and batch definition + single adapter + restore, found single=${da4_admit_live_checkpoint_count} batch=${da4_admit_live_checkpoints_count}")
+        "D-A4 live-checkpoint ownership admission census drifted: expected single definition + creation adapter and batch definition + single adapter + restore, found single=${da4_admit_live_checkpoint_count} batch=${da4_admit_live_checkpoints_count}")
 endif()
 string(REPLACE
     "next = context.raw_drop("

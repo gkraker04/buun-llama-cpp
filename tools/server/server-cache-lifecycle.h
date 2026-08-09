@@ -27,37 +27,6 @@ enum class server_cache_destruction_class : uint8_t {
     _count,
 };
 
-enum class server_cache_destruction_release_owner : uint8_t {
-    none = 0,
-    legacy_wrapper_or_capability = 1,
-};
-
-struct server_cache_destruction_census_row {
-    server_cache_destruction_class destruction_class;
-    server_cache_destruction_release_owner release_owner;
-};
-
-constexpr std::array<server_cache_destruction_census_row,
-                     size_t(server_cache_destruction_class::_count)>
-server_cache_destruction_census = {{
-#define SERVER_CACHE_DESTRUCTION_CENSUS_ROW(name, symbol, admission, release_owner) \
-    { server_cache_destruction_class::name, \
-      server_cache_destruction_release_owner::release_owner },
-    SERVER_CACHE_DESTRUCTION_INVENTORY(SERVER_CACHE_DESTRUCTION_CENSUS_ROW)
-#undef SERVER_CACHE_DESTRUCTION_CENSUS_ROW
-}};
-
-constexpr bool server_cache_destruction_census_valid() noexcept {
-    for (size_t i = 0; i < server_cache_destruction_census.size(); ++i) {
-        if (size_t(server_cache_destruction_census[i].destruction_class) != i) {
-            return false;
-        }
-    }
-    return true;
-}
-static_assert(server_cache_destruction_census_valid(),
-              "destruction census enum/table order diverged");
-
 enum class server_cache_destruction_reason : uint8_t {
     slot_rebind = 0,
     child_release,

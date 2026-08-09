@@ -190,15 +190,12 @@ common_prompt_checkpoint::~common_prompt_checkpoint() = default;
 common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other) :
     n_tokens(other.n_tokens),
     id_task(other.id_task),
-    id_task_referenced(other.id_task_referenced),
     pos_min(other.pos_min),
     pos_max(other.pos_max),
     representation_epoch(other.representation_epoch),
     representation_epoch_swa(other.representation_epoch_swa),
     computation_frontier(other.computation_frontier),
-    retention_lineage(other.retention_lineage),
-    adapter_application_digest(other.adapter_application_digest),
-    adapter_application_complete(other.adapter_application_complete),
+    cache_family(other.cache_family),
     data_tgt(other.data_tgt),
     data_dft(other.data_dft),
     accel(other.accel),
@@ -229,7 +226,6 @@ size_t common_prompt_checkpoint::size() const {
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
     id_task  = -1; // was omitted [R6]
-    id_task_referenced = -1;
 
     pos_min = 0;
     pos_max = 0;
@@ -238,9 +234,7 @@ void common_prompt_checkpoint::clear() {
     representation_epoch_swa = 0;
 
     computation_frontier.clear();
-    retention_lineage = {};
-    adapter_application_digest = {};
-    adapter_application_complete = false;
+    cache_family = {};
 
     data_tgt.clear();
     data_dft.clear();

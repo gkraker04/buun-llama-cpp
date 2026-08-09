@@ -22,8 +22,6 @@ import time
 import urllib.error
 import urllib.request
 
-from trace_common import merge_server_metrics, sse_payloads
-
 
 BLOCK = 4096
 
@@ -244,15 +242,32 @@ def response_content(text, streaming):
 
 def server_metrics(text, streaming):
 	found = {}
+	blobs = []
 	if streaming:
-		for payload in sse_payloads(text):
-			merge_server_metrics(found, payload)
+		for line in text.splitlines():
+			line = line.strip()
+			if line.startswith("data:"):
+				data = line[5:].strip()
+				if data and data != "[DONE]":
+					blobs.append(data)
 	else:
+		blobs.append(text)
+	for blob in blobs:
 		try:
-			payload = json.loads(text)
+			payload = json.loads(blob)
 		except ValueError:
-			payload = None
-		merge_server_metrics(found, payload)
+			continue
+		if not isinstance(payload, dict):
+			continue
+		timings = payload.get("timings")
+		if isinstance(timings, dict):
+			found["timings"] = timings
+		usage = payload.get("usage")
+		if isinstance(usage, dict):
+			found["usage"] = usage
+		for key in ("tokens_evaluated", "tokens_cached", "id_slot"):
+			if key in payload:
+				found[key] = payload[key]
 	return found
 
 
@@ -310,50 +325,6 @@ def recorded_generation(row):
 	return None
 
 
-def capture_pin_issues(records, warmup=0):
-	"""Successful captured requests must carry the count that pinning promises."""
-	return [row.get("seq") for row in records
-		if (row.get("seq") or 0) >= warmup
-		and 200 <= int(row.get("status") or 0) < 300
-		and recorded_generation(row) is None]
-
-
-def apply_calibration_replay_preset(args):
-	"""Select the shortest honest training timeline.
-
-	Calibration replay is deliberately not a performance experiment. It keeps
-	the captured dependency/overlap topology and authentic generation lengths,
-	but drops recorded human, tool, and harness pauses. Estimator admission still
-	uses the server's real pre-outcome clocks; this helper never virtualizes time.
-	"""
-	if not args.calibration_replay:
-		return
-	if args.mode != "chained":
-		raise SystemExit("--calibration-replay requires --mode chained")
-	if args.claim_grade:
-		raise SystemExit("--calibration-replay is training-only, not claim-grade")
-	if not args.pin_generation:
-		raise SystemExit("--calibration-replay requires --pin-generation to preserve cache pressure")
-	if args.think_speed != 1.0 or args.max_think_ms != 0.0:
-		raise SystemExit("--calibration-replay owns gap pacing; do not combine it "
-			"with --think-speed or --max-think-ms")
-	args.no_think_time = True
-
-
-def observe_server_parallel(args):
-	request = urllib.request.Request(f"http://{args.target}/slots", method="GET")
-	if args.api_key:
-		request.add_header("Authorization", f"Bearer {args.api_key}")
-	try:
-		with urllib.request.urlopen(request, timeout=args.timeout) as response:
-			payload = json.loads(response.read().decode("utf-8", "replace"))
-	except Exception as error:
-		raise SystemExit(f"claim-grade replay could not inspect /slots: {error}")
-	if not isinstance(payload, list) or not payload:
-		raise SystemExit("claim-grade replay: /slots did not report a non-empty slot list")
-	return len(payload)
-
-
 def prepare_body(row, args):
 	"""Apply comparability overrides. Prompts are never touched — only how the
 	arm is asked to sample and how much it is asked to generate."""
@@ -362,10 +333,13 @@ def prepare_body(row, args):
 
 	if args.greedy:
 		# Removes sampling variance so a re-replay differs only by what changed.
-		# It does not freeze concurrent batch composition: even a static-KV null
-		# replay can flip a near-tie at -np > 1. Byte identity is therefore a
-		# serialized-null oracle only. VBR has the additional pressure-driven tier
-		# source of divergence. --pin-generation equalizes decode work regardless.
+		# With a STATIC KV type on both arms this should also make the two arms
+		# emit identical text: static quantization is deterministic and
+		# speculative decoding is lossless (verify accepts only the target's own
+		# tokens). VBR is the exception — tier assignment follows VRAM pressure,
+		# and the branches spend VRAM differently, so its schedule and therefore
+		# its logits are branch-dependent. --pin-generation equalizes decode work
+		# regardless.
 		body["temperature"] = 0.0
 		body["top_k"] = 1
 		body["top_p"] = 1.0
@@ -440,11 +414,7 @@ def fire(row, args, results, lock):
 		"prompt_tokens": prompt_tokens_total(metrics),
 		"generated_tokens": generated_tokens(metrics),
 		"generated_recorded": recorded_generation(row),
-		# Missing is unknown, never false. Context truncation is a capability
-		# observation and must survive intact into cross-arm comparison.
-		"truncated": (metrics.get("truncated")
-			if isinstance(metrics.get("truncated"), bool) else None),
-		"stop_type": metrics.get("stop_type"),
+		"truncated": bool(metrics.get("truncated")),
 		"output_sha": hashlib.sha256(
 			response_content(text, streaming).encode("utf-8", "replace")
 		).hexdigest()[:16],
@@ -483,9 +453,7 @@ def summarize(results, args, wall_ms, timeline):
 		}
 
 	truncated_rows = [row for row in ok if row.get("truncated")]
-	truncated_known = [row for row in ok if row.get("truncated") is not None]
 	generated_known = [row for row in ok if row.get("generated_tokens") is not None]
-	recorded_known = [row for row in ok if row.get("generated_recorded") is not None]
 	generated_total = sum(row["generated_tokens"] for row in generated_known)
 	pin_matched = sum(
 		1 for row in generated_known
@@ -504,21 +472,6 @@ def summarize(results, args, wall_ms, timeline):
 
 	server_ms = max(0.0, wall_ms - timeline["think_ms_slept"])
 	recorded_total = timeline["think_ms_recorded"]
-	claim_reasons = []
-	if not args.greedy:
-		claim_reasons.append("sampling_not_greedy")
-	if not args.pin_generation:
-		claim_reasons.append("generation_pin_not_requested")
-	if len(ok) != len(scored):
-		claim_reasons.append("replay_request_failed")
-	if len(recorded_known) != len(ok):
-		claim_reasons.append("capture_generation_missing")
-	if len(generated_known) != len(ok):
-		claim_reasons.append("replay_generation_missing")
-	if pin_matched != len(ok):
-		claim_reasons.append("generation_pin_mismatch")
-	if len(truncated_known) != len(ok):
-		claim_reasons.append("context_truncation_unreported")
 	return {
 		"label": args.label,
 		"target": args.target,
@@ -537,18 +490,8 @@ def summarize(results, args, wall_ms, timeline):
 			"gaps_capped": timeline["gaps_capped"],
 			"think_ms_dropped_by_cap": round(timeline["think_ms_dropped_by_cap"], 3),
 			"think_speed": args.think_speed,
-			"faithful": (args.mode == "chained" and not args.no_think_time
-				and args.think_speed == 1.0
+			"faithful": (not args.no_think_time and args.think_speed == 1.0
 				and timeline["gaps_capped"] == 0),
-		},
-		"calibration_replay": {
-			"enabled": bool(args.calibration_replay),
-			"training_only": bool(args.calibration_replay),
-			"optimization_claim": False,
-			"real_server_admission_clocks": True,
-			"recorded_inter_group_gaps_dropped": bool(args.calibration_replay),
-			"captured_overlap_topology_preserved": (
-				bool(args.calibration_replay) and not args.serialize_overlap),
 		},
 		"requests_total": len(results),
 		"requests_scored": len(scored),
@@ -562,28 +505,13 @@ def summarize(results, args, wall_ms, timeline):
 		"ttft_weighted_p95_ms": percentile(weighted_ttft, 0.95),
 		"latency_ms_total": round(sum(row["total_ms"] for row in ok), 3),
 		"truncated_requests": len(truncated_rows),
-		"truncated_reported_for": len(truncated_known),
 		"generated_tokens_total": generated_total,
 		"generated_reported_for": len(generated_known),
 		"generated_matched_capture": pin_matched,
-		"claim_validation": {
-			"requested": bool(args.claim_grade),
-			"valid": not claim_reasons,
-			"reasons": claim_reasons,
-		},
-		"execution": {
-			"serialize_overlap": bool(args.serialize_overlap),
-			"server_parallel_observed": args.server_parallel_observed,
-		},
 		"sampling": {
 			"greedy": bool(args.greedy),
 			"seed": args.seed if args.greedy else None,
-			"pin_generation_requested": bool(args.pin_generation),
-			"pin_generation_complete": (
-				bool(args.pin_generation) and pin_matched == len(ok)),
-			# Compatibility alias: now means the promise was actually fulfilled.
-			"pinned_generation": (
-				bool(args.pin_generation) and pin_matched == len(ok)),
+			"pinned_generation": bool(args.pin_generation),
 		},
 		"fresh_prefill_tokens": total_fresh,
 		"fresh_prefill_reported_for": len(fresh_known),
@@ -608,17 +536,10 @@ def main():
 			"offsets (concurrency-faithful; wall clock is NOT a speedup claim)")
 	parser.add_argument("--speed", type=float, default=1.0,
 		help="paced mode only: arrival-pacing multiplier")
-	parser.add_argument("--serialize-overlap", action="store_true",
-		help="serialized-null oracle only: execute captured overlap groups in "
-			"stable sequence order; claim mode also requires the server /slots count to be 1")
 	parser.add_argument("--think-speed", type=float, default=1.0,
 		help="chained mode: divide recorded harness think time by this")
 	parser.add_argument("--no-think-time", action="store_true",
 		help="chained mode: drop harness/tool time, measure server time only")
-	parser.add_argument("--calibration-replay", action="store_true",
-		help="training-only chained preset: preserve captured overlap and pinned "
-			"generation, but drop recorded human/tool/harness gaps; uses real server "
-			"admission clocks and is never claim-grade")
 	parser.add_argument("--max-think-ms", type=float, default=0.0,
 		help="chained mode: cap any single gap (0 = faithful). Capping is "
 			"disclosed in the scorecard; it suppresses idle-driven cache work "
@@ -628,17 +549,15 @@ def main():
 	parser.add_argument("--timeout", type=float, default=900.0)
 	parser.add_argument("--api-key", default=None)
 	parser.add_argument("--greedy", action="store_true",
-		help="force temperature 0 / top_k 1 / fixed seed; output identity is a "
-			"determinism oracle only in a separate serialized (-np 1) null cell")
+		help="force temperature 0 / top_k 1 / fixed seed: removes sampling "
+			"variance, and with a static KV type on both arms should yield "
+			"identical text (a mismatch is then a real determinism finding)")
 	parser.add_argument("--seed", type=int, default=7)
 	parser.add_argument("--pin-generation", action="store_true",
 		help="generate exactly as many tokens as the capture did (ignore_eos). "
 			"Decode work becomes identical across arms by construction — "
 			"required when an arm runs VBR, whose pressure-driven tier schedule "
 			"is branch-dependent; belt-and-braces on static-KV cells")
-	parser.add_argument("--claim-grade", action="store_true",
-		help="fail closed unless greedy generation pinning and context-truncation "
-			"evidence are complete for every successful scored response")
 	parser.add_argument("--tooled-system-chars", type=int, default=1500)
 	parser.add_argument("--tooled-tools", type=int, default=3)
 	parser.add_argument("--background-predict", type=int, default=256)
@@ -646,26 +565,12 @@ def main():
 	parser.add_argument("--background-weight", type=float, default=0.1)
 	parser.add_argument("--limit", type=int, default=0)
 	args = parser.parse_args()
-	apply_calibration_replay_preset(args)
 
 	header, records = load_trace(args.trace)
 	if args.limit:
 		records = records[:args.limit]
 	if not records:
 		raise SystemExit("trace contained no replayable requests")
-	if args.serialize_overlap and args.mode != "chained":
-		raise SystemExit("--serialize-overlap requires --mode chained")
-	args.server_parallel_observed = None
-	if args.claim_grade:
-		if not args.greedy or not args.pin_generation:
-			raise SystemExit("claim-grade replay requires --greedy --pin-generation")
-		missing = capture_pin_issues(records, args.warmup)
-		if missing:
-			raise SystemExit("claim-grade replay: successful capture rows lack "
-				f"generation counts: {missing}")
-		args.server_parallel_observed = observe_server_parallel(args)
-		if args.serialize_overlap and args.server_parallel_observed != 1:
-			raise SystemExit("serialized claim replay requires exactly one server slot")
 
 	dominant = dominant_system_prefix(records)
 	for row in records:
@@ -710,22 +615,18 @@ def main():
 				slept = capped / args.think_speed
 				time.sleep(slept / 1000.0)
 			timeline["think_ms_slept"] += slept
-			if args.serialize_overlap:
-				for row in group["rows"]:
-					fire(row, args, results, lock)
-			else:
-				group_start = now_ms()
-				threads = []
-				for row, spread in zip(group["rows"], group["spread_ms"]):
-					delay = (group_start + spread) - now_ms()
-					if delay > 0:
-						time.sleep(delay / 1000.0)
-					thread = threading.Thread(
-						target=fire, args=(row, args, results, lock), daemon=True)
-					thread.start()
-					threads.append(thread)
-				for thread in threads:
-					thread.join()
+			group_start = now_ms()
+			threads = []
+			for row, spread in zip(group["rows"], group["spread_ms"]):
+				delay = (group_start + spread) - now_ms()
+				if delay > 0:
+					time.sleep(delay / 1000.0)
+				thread = threading.Thread(
+					target=fire, args=(row, args, results, lock), daemon=True)
+				thread.start()
+				threads.append(thread)
+			for thread in threads:
+				thread.join()
 	else:
 		threads = []
 		first_offset = records[0].get("t_arrival_ms") or 0.0
@@ -775,9 +676,6 @@ def main():
 	if scorecard["status_other"]:
 		print(f"TRACE_REPLAY {args.label} NON-200 statuses:"
 			f" {scorecard['status_other']}")
-	if args.claim_grade and not scorecard["claim_validation"]["valid"]:
-		raise SystemExit("claim-grade replay invalid: " + ", ".join(
-			scorecard["claim_validation"]["reasons"]))
 
 
 if __name__ == "__main__":

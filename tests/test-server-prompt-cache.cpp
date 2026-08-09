@@ -66,58 +66,6 @@ void configure_host_accounting(
     }
 }
 
-void publish_owned_test_checkpoint(
-        server_cache_authority & authority,
-        std::list<common_prompt_checkpoint> & ring,
-        int32_t slot_id,
-        int64_t n_tokens,
-        uint8_t fill) {
-    ring.emplace_back();
-    auto & checkpoint = ring.back();
-    checkpoint.n_tokens = n_tokens;
-    checkpoint.pos_max = llama_pos(n_tokens - 1);
-    checkpoint.data_tgt.assign(64, fill);
-    checkpoint.computation_frontier.version =
-        common_computation_frontier::VERSION;
-    checkpoint.computation_frontier.sequence_epoch = 1;
-    checkpoint.computation_frontier.token_count = n_tokens;
-    checkpoint.computation_frontier.next_position = llama_pos(n_tokens);
-    checkpoint.computation_frontier.execution_identity =
-        "zc1-checkpoint-execution";
-    checkpoint.computation_frontier.adapter_config_identity =
-        "zc1-checkpoint-adapter";
-    checkpoint.computation_frontier.media_content_identity =
-        "zc1-checkpoint-media";
-    server_cache_lease_identity identity {
-        checkpoint.computation_frontier.execution_identity,
-        checkpoint.computation_frontier.adapter_config_identity,
-        checkpoint.computation_frontier.media_content_identity,
-    };
-    common_chat_msg_spans spans;
-    spans.add(COMMON_CHAT_ROLE_USER, 0, 10);
-    spans.add(COMMON_CHAT_ROLE_USER, 50, 10);
-    spans.add(COMMON_CHAT_ROLE_USER, 120, 10);
-    spans.add(COMMON_CHAT_ROLE_USER, 180, 10);
-    const auto key = server_retention_instance_key::for_checkpoint(
-        slot_id, &checkpoint);
-    CHECK(authority.retention.publish(
-        key, common_retention_pool::attention, spans, true,
-        200, uint64_t(n_tokens), true, &identity));
-    std::vector<llama_cache_acct_op_id> ops;
-    CHECK(authority.admit_live_checkpoint(
-        authority.retention.artifact_id(key), checkpoint.size(), 0, ops));
-    CHECK(authority.retention.attach_release_ops(key, std::move(ops)));
-}
-
-server_cache_checkpoint_authority_context::checkpoint_iterator
-erase_test_checkpoints(
-        void * owner,
-        server_cache_checkpoint_authority_context::checkpoint_iterator first,
-        server_cache_checkpoint_authority_context::checkpoint_iterator last) {
-    auto * ring = static_cast<std::list<common_prompt_checkpoint> *>(owner);
-    return ring->erase(first, last);
-}
-
 std::list<server_prompt_cache_state> make_entry(
         const char * identity,
         size_t bytes) {
@@ -388,99 +336,51 @@ void test_declared_family_round_trip_and_price() {
     checkpoint.n_tokens = 2;
     checkpoint.pos_min = 0;
     checkpoint.pos_max = 1;
-    checkpoint.id_task_referenced = 17;
-    checkpoint.adapter_application_digest[0] = 0xa5;
-    checkpoint.adapter_application_complete = true;
-    checkpoint.retention_lineage.declaration = declared_main;
+    checkpoint.cache_family = declared_main;
     checkpoint.data_tgt.assign(4, 7);
 
     common_prompt_checkpoint copied = checkpoint;
-    CHECK(copied.retention_lineage.declaration == declared_main);
-    CHECK(copied.id_task_referenced == 17);
+    CHECK(copied.cache_family == declared_main);
     common_prompt_checkpoint assigned;
     assigned = checkpoint;
-    CHECK(assigned.retention_lineage.declaration == declared_main);
-    CHECK(assigned.id_task_referenced == 17);
-    CHECK(assigned.adapter_application_complete);
-    CHECK(assigned.adapter_application_digest[0] == 0xa5);
+    CHECK(assigned.cache_family == declared_main);
     copied.clear();
-    CHECK(!copied.retention_lineage.declaration.declared());
-    CHECK(copied.id_task_referenced == -1);
-    CHECK(!copied.adapter_application_complete);
-
-    common_prompt_checkpoint automatic_checkpoint;
-    automatic_checkpoint.retention_lineage.automatic_provenance =
-        common_cache_retention_provenance::proven_server_parent;
-    common_prompt_checkpoint automatic_copy = automatic_checkpoint;
-    CHECK(automatic_copy.retention_lineage.automatic_provenance ==
-          common_cache_retention_provenance::proven_server_parent);
-    automatic_copy.clear();
-    CHECK(automatic_copy.retention_lineage.automatic_provenance ==
-          common_cache_retention_provenance::neutral);
+    CHECK(!copied.cache_family.declared());
 
     server_prompt source;
     source.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
     source.checkpoints.push_back(checkpoint);
     source.sequence_epoch = 9;
     const auto cloned = source.clone();
-    CHECK(cloned.checkpoints.front().retention_lineage.declaration == declared_main);
+    CHECK(cloned.checkpoints.front().cache_family == declared_main);
 
     server_prompt_cache cache(0, 0);
-    std::array<uint8_t, 32> host_adapter_digest = {};
-    host_adapter_digest[0] = 0x5a;
-    auto staged = cache.stage(
-        source, 8, 0, "family-adapter", host_adapter_digest, true);
+    auto staged = cache.stage(source, 8, 0, "family-adapter");
     CHECK(staged.size() == 1);
-    CHECK(staged.front().prompt.checkpoints.front().retention_lineage.declaration ==
+    CHECK(staged.front().prompt.checkpoints.front().cache_family ==
           declared_main);
-    CHECK(staged.front().adapter_application_complete);
-    CHECK(staged.front().adapter_application_digest[0] == 0x5a);
-    CHECK(staged.front().prompt.checkpoints.front().adapter_application_complete);
-    CHECK(staged.front().prompt.checkpoints.front().adapter_application_digest[0] ==
-          0xa5);
-    server_prompt_cache_apply_retention_lineage(
-        staged.front(), { declared_main, {} }, true, false);
-    CHECK(staged.front().retention_lineage.declaration == declared_main);
+    server_prompt_cache_apply_family(
+        staged.front(), declared_main, false);
+    CHECK(staged.front().cache_family == declared_main);
     CHECK(staged.front().main_family);
     CHECK(cache.publish(std::move(staged)));
 
     server_prompt_cache_restore_delivery delivery;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), delivery));
-    CHECK(delivery.retention_lineage.declaration == declared_main);
-    const auto delivered_lineage = delivery.retention_lineage;
+    CHECK(delivery.cache_family == declared_main);
+    const auto delivered_family = delivery.cache_family;
     server_prompt restored_prompt;
     cache.commit_restore_delivery(
         cache.states.begin(), std::move(delivery), restored_prompt, 3);
     CHECK(cache.states.empty());
-    CHECK(delivered_lineage.declaration == declared_main);
-    CHECK(restored_prompt.checkpoints.front().retention_lineage.declaration ==
-          declared_main);
+    CHECK(delivered_family == declared_main);
+    CHECK(restored_prompt.checkpoints.front().cache_family == declared_main);
 
     const common_cache_family_binding undeclared;
     server_prompt_cache_state automatic;
-    server_prompt_cache_apply_retention_lineage(
-        automatic, { undeclared, {} }, false, true);
+    server_prompt_cache_apply_family(automatic, undeclared, true);
     CHECK(automatic.main_family);
-    CHECK(!automatic.retention_lineage.declaration.declared());
-
-    server_prompt_cache_state neutral;
-    server_prompt_cache_apply_retention_lineage(
-        neutral, { undeclared, common_cache_retention_provenance::neutral },
-        true, true);
-    CHECK(!neutral.main_family);
-    server_prompt_cache_state proven_parent;
-    server_prompt_cache_apply_retention_lineage(
-        proven_parent,
-        { undeclared,
-          common_cache_retention_provenance::proven_server_parent },
-        true, false);
-    CHECK(proven_parent.main_family);
-    CHECK(std::string(common_cache_retention_lineage_name(
-              neutral.retention_lineage)) == "neutral");
-    CHECK(std::string(common_cache_retention_lineage_name(
-              proven_parent.retention_lineage)) == "proven_server_parent");
-    CHECK(std::string(common_cache_retention_lineage_name(
-              { declared_main, {} })) == "declared_main");
+    CHECK(!automatic.cache_family.declared());
 
     const common_cache_plan_calib calib {
         "e1-family-test", 1, 0.0, 1.0, 10.0,
@@ -510,21 +410,16 @@ void test_declared_family_round_trip_and_price() {
     // One lineage rule covers slot reuse, undeclared append, and an explicit
     // declaration branching from retained content. A tokenizer-global BOS or
     // shared system prefix is not by itself conversation continuity.
-    const common_cache_retention_lineage main_lineage { declared_main, {} };
-    const common_cache_retention_lineage neutral_lineage { undeclared, {} };
-    const common_cache_retention_lineage branch_lineage {
-        declared_branch, {},
-    };
-    CHECK(common_cache_retention_follow_lineage(
-              main_lineage, neutral_lineage, 0, 3) == neutral_lineage);
-    CHECK(common_cache_retention_follow_lineage(
-              main_lineage, branch_lineage, 0, 3) == branch_lineage);
-    CHECK(common_cache_retention_follow_lineage(
-              main_lineage, neutral_lineage, 3, 3) == main_lineage);
-    CHECK(common_cache_retention_follow_lineage(
-              main_lineage, branch_lineage, 3, 3) == main_lineage);
-    CHECK(common_cache_retention_follow_lineage(
-              main_lineage, branch_lineage, 1, 3) == branch_lineage);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, undeclared, 0, 3) == undeclared);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 0, 3) == declared_branch);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, undeclared, 3, 3) == declared_main);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 3, 3) == declared_main);
+    CHECK(common_cache_family_follow_lineage(
+              declared_main, declared_branch, 1, 3) == declared_branch);
 
     server_task parent(SERVER_TASK_TYPE_COMPLETION);
     parent.cache_family_binding_token = { 17, 29 };
@@ -637,8 +532,8 @@ void test_lifecycle_restore_retains_immutable_source() {
     const common_cache_family_binding declared_branch {
         { 0xe11b51de }, common_cache_family_role::branch,
     };
-    server_prompt_cache_apply_retention_lineage(
-        entry.front(), { declared_branch, {} }, false, true);
+    server_prompt_cache_apply_family(
+        entry.front(), declared_branch, true);
     entry.front().prompt.sequence_epoch = 17;
     entry.front().data.main.assign(32, 7);
     entry.front().prompt.checkpoints.emplace_back();
@@ -692,7 +587,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     server_prompt_cache_restore_delivery first;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), first));
     CHECK(first.retains_source);
-    CHECK(first.retention_lineage.declaration == declared_branch);
+    CHECK(first.cache_family == declared_branch);
     CHECK(cache.states.size() == 1);
     CHECK(cache.states.front().size() == host_size_before);
 
@@ -705,7 +600,7 @@ void test_lifecycle_restore_retains_immutable_source() {
     CHECK(live_first.checkpoints.size() == 2);
     CHECK(&live_first.checkpoints.front() != source_checkpoint);
     CHECK(live_first.checkpoints.front().n_tokens == 2);
-    CHECK(cache.states.front().retention_lineage.declaration == declared_branch);
+    CHECK(cache.states.front().cache_family == declared_branch);
     const auto live_ops_after_first = authority.ledger.snapshot().live_ops;
     CHECK(live_ops_after_first > live_ops_before);
     server_retention_candidate restored;
@@ -844,7 +739,7 @@ void test_lifecycle_restore_retains_immutable_source() {
 
     server_prompt_cache_restore_delivery second;
     CHECK(cache.prepare_restore_delivery(cache.states.begin(), second));
-    CHECK(second.retention_lineage.declaration == declared_branch);
+    CHECK(second.cache_family == declared_branch);
     server_prompt live_second;
     cache.commit_restore_delivery(
         cache.states.begin(), std::move(second), live_second, 5);
@@ -1824,10 +1719,10 @@ void test_host_trade_main_family_weight_flips_victim() {
     const common_cache_family_binding declared_branch {
         declared_main.family, common_cache_family_role::branch,
     };
-    main->retention_lineage.declaration = declared_main;
-    main_r->retention_lineage.declaration = declared_main;
-    child->retention_lineage.declaration = declared_branch;
-    child_r->retention_lineage.declaration = declared_branch;
+    main->cache_family = declared_main;
+    main_r->cache_family = declared_main;
+    child->cache_family = declared_branch;
+    child_r->cache_family = declared_branch;
     size_t callback_calls = 0;
     authority.host_retention_weight_context = &callback_calls;
     authority.host_retention_weight = [](
@@ -2064,201 +1959,6 @@ void test_host_trade_floor_skips_recovery_pin() {
         server_cache_control_operation::lease_release,
         release).status == server_cache_control_status::ok);
     CHECK(pinned->recovery_pins == 0);
-}
-
-void test_zc_soft_floor_exact_release_and_protection() {
-    server_cache_authority authority;
-    available_host_fallback fallback;
-    server_cache_lease_table hard_leases(nullptr, &fallback);
-    const std::string execution = "zc-soft-floor";
-    server_prompt_cache cache(0, 0);
-    configure_host_trade(authority, cache, execution, &hard_leases);
-    cache.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-
-    cache.retention_event_begin();
-    auto oldest = install_host_trade_entry(
-        cache, authority, "zc-oldest", 64);
-    cache.retention_event_begin();
-    auto hard = install_host_trade_entry(
-        cache, authority, "zc-hard", 64);
-    CHECK(oldest->retention_generation_id != 0);
-    CHECK(hard->retention_generation_id != 0);
-    CHECK(oldest->retention_generation_id !=
-          hard->retention_generation_id);
-    CHECK(oldest->retention_last_use_epoch <
-          hard->retention_last_use_epoch);
-    CHECK(grant_host_lease(
-        cache, hard_leases, hard, server_cache_lease_class::hard));
-
-    const auto commits_before =
-        authority.destruction.prepared_release_commits;
-    cache.limit_tokens = 3;
-    cache.update();
-    CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "zc-hard");
-    CHECK(authority.destruction.prepared_release_commits ==
-          commits_before + 1);
-
-    // One pressure call owns one immutable inventory and drains the complete
-    // deficit. Equal-cost rows retain the stable last-use ordering while each
-    // physical erase still commits one exact prepared release.
-    server_cache_authority wave_authority;
-    server_prompt_cache wave(0, 0);
-    common_cache_retention_summary wave_summary;
-    configure_host_trade(wave_authority, wave, execution);
-    wave.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-    wave.retention_summary = &wave_summary;
-    wave.retention_event_begin();
-    auto wave_oldest = install_host_trade_entry(
-        wave, wave_authority, "zc-wave-oldest", 64);
-    const uint64_t wave_oldest_id = wave_oldest->retention_generation_id;
-    wave.retention_event_begin();
-    auto wave_middle = install_host_trade_entry(
-        wave, wave_authority, "zc-wave-middle", 64);
-    const uint64_t wave_middle_id = wave_middle->retention_generation_id;
-    wave.retention_event_begin();
-    auto wave_newest = install_host_trade_entry(
-        wave, wave_authority, "zc-wave-newest", 64);
-    const uint64_t wave_newest_id = wave_newest->retention_generation_id;
-    const auto wave_commits_before =
-        wave_authority.destruction.prepared_release_commits;
-    wave.limit_tokens = 3;
-    wave.update();
-    CHECK(wave.states.size() == 1);
-    CHECK(wave.states.front().retention_generation_id == wave_newest_id);
-    CHECK(wave.states.front().retention_generation_id != wave_oldest_id);
-    CHECK(wave.states.front().retention_generation_id != wave_middle_id);
-    CHECK(wave_authority.destruction.prepared_release_commits ==
-          wave_commits_before + 2);
-    CHECK(wave_summary.evictions == 2);
-    CHECK(wave_summary.released_tokens == 6);
-
-    // With every incumbent protected, the incoming node is the refused
-    // publication. The existing hard entry and its accounting ops survive.
-    const auto live_ops_before = authority.ledger.snapshot().live_ops;
-    cache.limit_tokens = cache.n_tokens();
-    cache.retention_event_begin();
-    CHECK(!cache.publish(make_prompt_entry(
-        "zc-incoming", { 901, 902, 903 })));
-    CHECK(cache.states.size() == 1);
-    CHECK(cache.states.front().adapter_config_key == "zc-hard");
-    CHECK(authority.ledger.snapshot().live_ops == live_ops_before);
-
-    // A grown publication that cannot fit must not first dedup its prefix and
-    // then discover that the remaining hard state makes the publication
-    // impossible. The pre-pressure feasibility pass preserves both
-    // incumbents and discards only the staged incoming node.
-    server_cache_authority second_authority;
-    available_host_fallback second_fallback;
-    server_cache_lease_table second_leases(nullptr, &second_fallback);
-    server_prompt_cache second(0, 0);
-    configure_host_trade(
-        second_authority, second, execution, &second_leases);
-    second.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-    second.retention_event_begin();
-    auto prefix = install_host_trade_entry(
-        second, second_authority, "shared", 64);
-    prefix->prompt.tokens = server_tokens(
-        llama_tokens({ 1, 2, 3 }), false);
-    second.retention_event_begin();
-    auto protected_entry = install_host_trade_entry(
-        second, second_authority, "protected", 64);
-    CHECK(grant_host_lease(
-        second, second_leases, protected_entry,
-        server_cache_lease_class::hard));
-    second.limit_tokens = second.n_tokens();
-    const auto prefix_id = prefix->retention_generation_id;
-    const auto protected_id = protected_entry->retention_generation_id;
-    second.retention_event_begin();
-    CHECK(!second.publish(make_prompt_entry(
-        "shared", { 1, 2, 3, 4 })));
-    CHECK(second.states.size() == 2);
-    CHECK(std::any_of(second.states.begin(), second.states.end(),
-        [&](const auto & state) {
-            return state.retention_generation_id == prefix_id;
-        }));
-    CHECK(std::any_of(second.states.begin(), second.states.end(),
-        [&](const auto & state) {
-            return state.retention_generation_id == protected_id;
-        }));
-
-    // Maintenance has no staged publication to discard. Exhausting an all-
-    // protected inventory is therefore a blocked bound, not a publication
-    // refusal, and must leave the protected entry intact.
-    server_cache_authority maintenance_authority;
-    available_host_fallback maintenance_fallback;
-    server_cache_lease_table maintenance_leases(
-        nullptr, &maintenance_fallback);
-    server_prompt_cache maintenance(0, 0);
-    common_cache_retention_summary maintenance_summary;
-    configure_host_trade(
-        maintenance_authority, maintenance, execution, &maintenance_leases);
-    maintenance.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-    maintenance.retention_summary = &maintenance_summary;
-    maintenance.retention_event_begin();
-    auto maintenance_hard = install_host_trade_entry(
-        maintenance, maintenance_authority, "zc-maintenance-hard", 64);
-    CHECK(grant_host_lease(
-        maintenance, maintenance_leases, maintenance_hard,
-        server_cache_lease_class::hard));
-    const uint64_t maintenance_id =
-        maintenance_hard->retention_generation_id;
-    maintenance.limit_tokens = 2;
-    maintenance.update();
-    CHECK(maintenance.states.size() == 1);
-    CHECK(maintenance.states.front().retention_generation_id ==
-          maintenance_id);
-    CHECK(maintenance_summary.count(
-              common_cache_retention_outcome::blocked) == 1);
-    CHECK(maintenance_summary.reason_counts[size_t(
-              common_cache_retention_reason::bound_blocked_protected)] == 1);
-    CHECK(maintenance_summary.count(
-              common_cache_retention_outcome::publication_skipped) == 0);
-}
-
-void test_zc_retention_identity_failure_typing() {
-    server_prompt_cache epoch_cache(0, 0);
-    epoch_cache.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-    epoch_cache.retention_next_use_epoch = UINT64_MAX;
-    epoch_cache.retention_event_begin();
-    CHECK(!epoch_cache.retention_identity_available);
-    CHECK(epoch_cache.retention_identity_failure ==
-          common_cache_retention_reason::retention_epoch_exhausted);
-
-    server_prompt_cache generation_cache(0, 0);
-    generation_cache.retention_policy =
-        common_cache_optimizer_retention_policy::intentional_baseline;
-    generation_cache.retention_current_use_epoch = 1;
-    generation_cache.retention_next_generation_id = UINT64_MAX;
-    CHECK(generation_cache.publish(make_prompt_entry(
-        "zc-generation-exhaustion", { 1, 2, 3 })));
-    CHECK(!generation_cache.retention_identity_available);
-    CHECK(generation_cache.retention_identity_failure ==
-          common_cache_retention_reason::retention_id_exhausted);
-}
-
-void test_checkpoint_task_protection_policies() {
-    common_prompt_checkpoint checkpoint;
-    checkpoint.id_task = 11;
-    checkpoint.id_task_referenced = 22;
-
-    CHECK(server_cache_checkpoint_task_protected(
-        checkpoint, 11,
-        server_cache_checkpoint_task_policy::historical_affinity));
-    CHECK(!server_cache_checkpoint_task_protected(
-        checkpoint, 22,
-        server_cache_checkpoint_task_policy::historical_affinity));
-    CHECK(!server_cache_checkpoint_task_protected(
-        checkpoint, 11,
-        server_cache_checkpoint_task_policy::current_reference));
-    CHECK(server_cache_checkpoint_task_protected(
-        checkpoint, 22,
-        server_cache_checkpoint_task_policy::current_reference));
 }
 
 void test_cache_control_shutdown_drains_host_pin() {
@@ -2530,8 +2230,6 @@ void test_checkpoint_thin_lane_skips_pinned_member() {
         floor_reason,
         false,
         {},
-        {},
-        nullptr,
         false,
         nullptr,
         [](void *,
@@ -2550,63 +2248,6 @@ void test_checkpoint_thin_lane_skips_pinned_member() {
         ring.size(), authority.retention.recovery_pinned(pinned_key) ? 1 : 0);
     pin = {};
     authority.retention.retire_slot(17);
-}
-
-void test_zc1_checkpoint_certified_and_stale_release() {
-    server_cache_authority authority;
-    configure_host_accounting(authority, true);
-    std::list<common_prompt_checkpoint> ring;
-    publish_owned_test_checkpoint(authority, ring, 19, 100, 1);
-    publish_owned_test_checkpoint(authority, ring, 19, 150, 2);
-    const uint64_t live_before = authority.ledger.snapshot().live_ops;
-    CHECK(live_before > 0);
-
-    server_cache_checkpoint_attempt_latch attempts;
-    const common_prompt_checkpoint * seam = nullptr;
-    common_cache_plan_destruction_reason thin_reason =
-        common_cache_plan_destruction_reason::none;
-    common_cache_plan_destruction_reason floor_reason =
-        common_cache_plan_destruction_reason::none;
-    server_cache_checkpoint_authority_context context {
-        19,
-        ring,
-        &authority,
-        &authority.retention,
-        &authority.destruction,
-        &authority.leases,
-        attempts,
-        seam,
-        thin_reason,
-        floor_reason,
-        false,
-        {},
-        {},
-        nullptr,
-        false,
-        &ring,
-        erase_test_checkpoints,
-    };
-
-    auto recovery = ring.begin();
-    auto victim = std::next(recovery);
-    CHECK(server_cache_checkpoint_drop_with_recovery(
-        context, victim, recovery, 100,
-        server_cache_destruction_reason::checkpoint_capacity));
-    CHECK(ring.size() == 1);
-    CHECK(ring.front().n_tokens == 100);
-    CHECK(authority.ledger.snapshot().live_ops > 0);
-    CHECK(authority.ledger.snapshot().live_ops < live_before);
-    CHECK(authority.destruction.checkpoint_thin_executed == 1);
-
-    // A conclusively stale member has no recovery citation because it cannot
-    // restore the current lineage, but its exact accounting release remains
-    // mandatory and goes through the same raw-mutation/commit boundary.
-    CHECK(server_cache_checkpoint_drop_stale(
-        context, ring.begin(),
-        server_cache_destruction_reason::checkpoint_thin));
-    CHECK(ring.empty());
-    CHECK(authority.ledger.snapshot().live_ops == 0);
-    CHECK(authority.destruction.checkpoint_thin_executed == 2);
 }
 
 void test_checkpoint_capacity_floor() {
@@ -2867,14 +2508,10 @@ int main(int argc, char ** argv) {
     test_host_trade_hard_lease_veto();
     test_host_trade_all_hard_skips_publication();
     test_host_trade_floor_skips_recovery_pin();
-    test_zc_soft_floor_exact_release_and_protection();
-    test_zc_retention_identity_failure_typing();
-    test_checkpoint_task_protection_policies();
     test_cache_control_shutdown_drains_host_pin();
     test_host_trade_partial_substrate_is_typed();
     test_checkpoint_thinning_policy();
     test_checkpoint_thin_lane_skips_pinned_member();
-    test_zc1_checkpoint_certified_and_stale_release();
     test_checkpoint_capacity_floor();
     test_checkpoint_attempt_latch_rearms_on_ring_change();
     test_checkpoint_effect_matrix_consistency();

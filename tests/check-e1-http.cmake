@@ -84,8 +84,8 @@ endif()
 
 require_token("${common_header}" "bool cache_control_api = false;" "default-off flag")
 require_token("${arg_source}" "{\"--cache-control-api\"}" "flag parser")
-require_token("${server_source}" "if (cache_optimizer.cache_control_api)" "registration gate")
-require_token("${server_source}" "!cache_optimizer.cache_lifecycle" "lifecycle startup gate")
+require_token("${server_source}" "if (params.cache_control_api)" "registration gate")
+require_token("${server_source}" "!params.cache_lifecycle" "lifecycle startup gate")
 require_token("${http_source}" "server_http_is_cache_control_route(req.path)"
     "disabled typed-refusal classifier")
 require_token("${http_source}" "\"not_supported_error\"" "disabled typed refusal")

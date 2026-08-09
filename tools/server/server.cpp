@@ -8,7 +8,6 @@
 
 #include "arg.h"
 #include "build-info.h"
-#include "common-cache-plan.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -128,44 +127,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
-    // Presets may have changed raw cache controls after CLI parsing. Resolve
-    // once more before any runtime consumer; below this point only the
-    // effective object is authoritative.
-    std::string cache_optimizer_error;
-    if (!common_cache_optimizer_resolve_params(params, &cache_optimizer_error)) {
-        SRV_ERR("invalid cache optimizer configuration: %s\n",
-                cache_optimizer_error.c_str());
-        return 1;
-    }
-    const auto & cache_optimizer = params.cache_optimizer;
-
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
 
-    if (!is_router_server) {
-        SRV_INF("cache optimizer: mode=%s (%s), retention=%s, calibration=%s, landed authority=%s, local ceiling=%s\n",
-                common_cache_optimizer_mode_name(cache_optimizer.mode),
-                params.cache_optimizer_mode_explicit ? "explicit" : "default",
-                cache_optimizer.retention_policy ==
-                        common_cache_optimizer_retention_policy::intentional_baseline
-                    ? "intentional" : "historical",
-                cache_optimizer.observer_store_enabled ? "enabled" : "disabled",
-                common_cache_plan_authority_level_name(
-                    cache_optimizer.landed_authority_level),
-                common_cache_plan_authority_level_name(
-                    cache_optimizer.local_authority_ceiling));
-    }
-
-    if (cache_optimizer.cache_plan_preflight &&
+    if (params.cache_plan_preflight &&
         (is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
              params.hostname, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
         return 1;
     }
-    if (cache_optimizer.cache_control_api &&
-        (!cache_optimizer.cache_lifecycle || is_router_server ||
+    if (params.cache_control_api &&
+        (!params.cache_lifecycle || is_router_server ||
          !server_cache_plan_preflight_exposure_allowed(
              params.hostname, params.api_keys.size()))) {
         SRV_ERR("%s", "--cache-control-api requires --cache-lifecycle and a single-model, trusted-local, single-principal server\n");
@@ -306,7 +280,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     ctx_http.post("/cache/plan",                ex_wrapper(routes.post_cache_plan));
-    if (cache_optimizer.cache_control_api) {
+    if (params.cache_control_api) {
         for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
             ctx_http.post(std::string(route.path),
                           ex_wrapper(routes.post_cache_control));
@@ -550,7 +524,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         auto * ll_ctx = ctx_server.get_llama_context();
         if (ll_ctx != nullptr) {
-            common_memory_breakdown_print(ll_ctx, true);
+            common_memory_breakdown_print(ll_ctx);
         }
     }
 

@@ -916,15 +916,6 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
-    if (sync_fence_observer_enabled_ && sync_fence_observer_armed_ &&
-        n_queued_tokens > 0) {
-        sync_fence_info_.completed_us = ggml_time_us();
-        if (sync_fence_info_.serial != std::numeric_limits<uint64_t>::max()) {
-            ++sync_fence_info_.serial;
-        }
-        sync_fence_observer_armed_ = false;
-    }
-
     // A2 (Rev 5.1): the scheduler fence above is the per-family success boundary for the
     // deferred append/reuse extents — promote submitted -> committed here. No new fences.
     if (memory) {
@@ -956,22 +947,6 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
-}
-
-llama_sync_fence_info llama_context::sync_fence_info() const noexcept {
-    return sync_fence_info_;
-}
-
-void llama_context::set_sync_fence_observer(bool enabled) noexcept {
-    sync_fence_observer_enabled_ = enabled;
-    sync_fence_observer_armed_ = false;
-    if (!enabled) {
-        sync_fence_info_ = {};
-    }
-}
-
-void llama_context::arm_sync_fence_observer() noexcept {
-    sync_fence_observer_armed_ = sync_fence_observer_enabled_;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -9072,34 +9047,6 @@ void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
 
-llama_sync_fence_info llama_get_sync_fence_info(const llama_context * ctx) {
-    return ctx ? ctx->sync_fence_info() : llama_sync_fence_info {};
-}
-
-void llama_set_sync_fence_observer(llama_context * ctx, bool enabled) {
-    if (ctx) {
-        ctx->set_sync_fence_observer(enabled);
-    }
-}
-
-void llama_arm_sync_fence_observer(llama_context * ctx) {
-    if (ctx) {
-        ctx->arm_sync_fence_observer();
-    }
-}
-
-bool llama_context_is_warmup(const llama_context * ctx) {
-    return ctx && ctx->is_warmup();
-}
-
-bool llama_context_pipeline_parallel_active(const llama_context * ctx) {
-    return ctx && ctx->pipeline_parallel_active();
-}
-
-bool llama_context_vbr_vmm_active(const llama_context * ctx) {
-    return ctx && ctx->vbr_vmm_active();
-}
-
 float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 
@@ -9993,20 +9940,10 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
-size_t llama_state_seq_set_data_observed_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, uint64_t * owned_cpu_us) {
-    ctx->synchronize();
-    const int64_t start_us = owned_cpu_us ? ggml_time_us() : 0;
-    const size_t result = ctx->state_seq_set_data(seq_id, src, size, flags);
-    if (owned_cpu_us) {
-        const int64_t end_us = ggml_time_us();
-        *owned_cpu_us = end_us >= start_us ? uint64_t(end_us - start_us) : 0;
-    }
-    return result;
-}
-
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    return llama_state_seq_set_data_observed_ext(
-        ctx, src, size, seq_id, flags, nullptr);
+    ctx->synchronize();
+
+    return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

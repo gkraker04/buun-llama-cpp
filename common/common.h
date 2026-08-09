@@ -8,7 +8,6 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 
-#include <array>
 #include <set>
 #include <sstream>
 #include <string>
@@ -51,74 +50,6 @@ struct common_time_meas {
 // to carry the closed value without introducing the common.h <-> checkpoint-
 // shadow include cycle.
 enum class common_cache_plan_authority_level : uint8_t;
-
-// Zero-config cache optimizer control plane. ZC0b freezes the raw/effective
-// split before any optimizer behavior lands: parser callbacks own the raw
-// values and explicitness bits, while runtime consumers use only the resolved
-// effective configuration below.
-enum class common_cache_optimizer_mode : uint8_t {
-    off = 0,
-    baseline,
-    learn,
-    auto_mode,
-    _count,
-};
-
-enum class common_cache_optimizer_retention_policy : uint8_t {
-    historical_legacy = 0,
-    intentional_baseline,
-    _count,
-};
-
-enum class common_cache_optimizer_config_error : uint8_t {
-    none = 0,
-    landed_authority_conflict,
-    _count,
-};
-
-struct common_cache_optimizer_raw_config {
-    common_cache_optimizer_mode mode = common_cache_optimizer_mode::off;
-    bool mode_explicit = false;
-
-    bool cache_lifecycle = false;
-    bool cache_lifecycle_explicit = false;
-    common_cache_plan_authority_level cache_plan_authority{};
-    bool cache_plan_authority_explicit = false;
-    bool cache_debug = false;
-    bool cache_debug_explicit = false;
-    bool cache_plan_preflight = false;
-    bool cache_plan_preflight_explicit = false;
-    bool cache_control_api = false;
-    bool cache_control_api_explicit = false;
-};
-
-struct common_cache_optimizer_effective_config {
-    common_cache_optimizer_mode mode = common_cache_optimizer_mode::off;
-
-    // Existing landed runtime inputs. These reproduce the raw expert vector
-    // exactly in off mode and are the only ZC0b fields runtime code consumes.
-    bool cache_lifecycle = false;
-    common_cache_plan_authority_level landed_authority_level{};
-    bool cache_debug = false;
-    bool cache_plan_preflight = false;
-    bool cache_control_api = false;
-
-    // Frozen future-ZC intent. ZC0b computes these but deliberately gives them
-    // no behavior consumer yet.
-    common_cache_optimizer_retention_policy retention_policy =
-        common_cache_optimizer_retention_policy::historical_legacy;
-    bool observer_store_enabled = false;
-    common_cache_plan_authority_level local_authority_ceiling{};
-
-    common_cache_optimizer_config_error error =
-        common_cache_optimizer_config_error::none;
-};
-
-const char * common_cache_optimizer_mode_name(common_cache_optimizer_mode mode);
-common_cache_optimizer_mode common_cache_optimizer_mode_parse(const std::string & value);
-const char * common_cache_optimizer_config_error_name(common_cache_optimizer_config_error error);
-common_cache_optimizer_effective_config common_cache_optimizer_resolve(
-    const common_cache_optimizer_raw_config & raw) noexcept;
 
 struct common_adapter_lora_info {
     std::string path;
@@ -874,37 +805,26 @@ struct common_params {
 
     // B0 shadow cache-plan observer: strictly zero observer work when disabled
     bool cache_debug = false;
-    bool cache_debug_explicit = false;
 
     // Trusted-local, single-principal E0 cache-plan preview surface. This flag
     // only exposes the route; ordinary requests allocate no observer/planner
     // state merely because it is enabled.
     bool cache_plan_preflight = false;
-    bool cache_plan_preflight_explicit = false;
 
     // Trusted-local, single-principal E1 cache-control HTTP surface. The
     // scheduler authority remains unavailable unless cache lifecycle is also
     // enabled; this flag only registers the reviewed routes.
     bool cache_control_api = false;
-    bool cache_control_api_explicit = false;
 
     // B-A graduated authority request. B-A0b dual-runs every non-off level but
     // still executes legacy unconditionally; later ratchets consume the same
     // closed spelling without another flag migration.
     common_cache_plan_authority_level cache_plan_authority{}; // zero = off
-    bool cache_plan_authority_explicit = false;
 
     // P2 F: cache-lifecycle authority substrate (accounting-gated admission). Constructs the
     // authority (ledger/coordinator/leases/retention) independent of --cache-debug; enforcement
     // is default-off and wired into no mutation path until F0b.
     bool cache_lifecycle = false;
-    bool cache_lifecycle_explicit = false;
-
-    // ZC0b raw mode and the one post-parse effective configuration. Runtime
-    // code must not reinterpret the raw cache flags above.
-    common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::off;
-    bool cache_optimizer_mode_explicit = false;
-    common_cache_optimizer_effective_config cache_optimizer;
 
     // enable built-in tools
     std::vector<std::string> server_tools;
@@ -986,13 +906,6 @@ struct common_params {
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
 };
-
-// The only adapter allowed to read the raw cache-control fields on
-// common_params. It refreshes `params.cache_optimizer` after parsing or preset
-// application and returns false with a stable typed reason on conflict.
-bool common_cache_optimizer_resolve_params(
-    common_params & params,
-    std::string * error = nullptr) noexcept;
 
 enum class common_vbr_cpu_fallback_result {
     not_needed,
@@ -1146,11 +1059,6 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
-
-// Durable, machine-local application state. Unlike fs_get_cache_directory(),
-// callers may rely on this tree surviving ordinary cache cleanup. The
-// LLAMA_STATE_HOME override names the llama.cpp state root itself.
-std::string fs_get_state_directory();
 
 struct common_file_info {
     std::string path;
@@ -1435,15 +1343,8 @@ struct common_checkpoint_shadow;
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
-    // Legacy created-or-adopted task affinity. The historical thinning and
-    // capacity paths intentionally preserve this landed meaning: restore may
-    // rebind it to the consuming task. ZC uses id_task_referenced instead.
+    // (optional) id of the task that created the checkpoint
     int id_task = -1;
-
-    // Task that actually restored from this member. Creation ownership is
-    // not a current-execution dependency: conflating the two protects every
-    // checkpoint produced by a long prefill and can freeze a finite ring.
-    int id_task_referenced = -1;
 
     llama_pos pos_min;
     llama_pos pos_max;
@@ -1460,15 +1361,9 @@ struct common_prompt_checkpoint {
     // during the Phase-1 migration. Legacy checkpoints have version == 0.
     common_computation_frontier computation_frontier;
 
-    // E1 declaration plus ZC proven-parent provenance. This policy metadata
-    // follows checkpoint copies/restores but never enters payload bytes.
-    common_cache_retention_lineage retention_lineage;
-
-    // Request-effective adapter identity for cost observations. This follows
-    // the immutable checkpoint payload across host clones; absence keeps the
-    // corresponding estimator row diagnostic rather than borrowing base cost.
-    std::array<uint8_t, 32> adapter_application_digest = {};
-    bool adapter_application_complete = false;
+    // E1 declared-family provenance. This is policy metadata only: it follows
+    // checkpoint copies/restores but never enters checkpoint payload bytes.
+    common_cache_family_binding cache_family;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;

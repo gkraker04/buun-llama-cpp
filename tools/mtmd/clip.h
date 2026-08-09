@@ -102,6 +102,3 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
-
-bool clip_cost_structure_digest(
-    const struct clip_ctx * ctx, uint8_t digest[32], uint64_t * tensor_bytes);

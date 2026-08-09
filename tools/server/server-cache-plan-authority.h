@@ -1,13 +1,11 @@
 #pragma once
 
 #include "common-cache-plan.h"
-#include "server-cache-calibration-model.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <type_traits>
 
 enum class server_cache_plan_execution_kind : uint8_t {
     legacy = 0,
@@ -19,52 +17,6 @@ enum class server_cache_plan_execution_kind : uint8_t {
     _count,
 };
 
-class server_cache_plan_local_authority_latch {
-public:
-    server_cache_plan_local_authority_latch() = default;
-    server_cache_plan_local_authority_latch(
-        const server_cache_plan_local_authority_latch &) = delete;
-    server_cache_plan_local_authority_latch & operator=(
-        const server_cache_plan_local_authority_latch &) = delete;
-    server_cache_plan_local_authority_latch(
-        server_cache_plan_local_authority_latch && other) noexcept;
-    server_cache_plan_local_authority_latch & operator=(
-        server_cache_plan_local_authority_latch && other) noexcept;
-
-    bool prequalify(
-        const common_cache_optimizer_authority_receipt & receipt) noexcept;
-    bool certify(
-        const common_cache_optimizer_authority_receipt & receipt) noexcept;
-    bool fallback(
-        common_cache_optimizer_authority_receipt & receipt,
-        common_cache_optimizer_fallback_reason reason) noexcept;
-    bool execute(common_cache_optimizer_authority_receipt & receipt) noexcept;
-    bool certified_for(
-        const common_cache_optimizer_authority_receipt & receipt) const noexcept;
-    void clear() noexcept;
-
-private:
-    void reset() noexcept;
-    void move_from(server_cache_plan_local_authority_latch & other) noexcept;
-
-    common_cache_optimizer_authority_state state_ =
-        common_cache_optimizer_authority_state::not_attempted;
-    bool certified_once_ = false;
-    common_cache_optimizer_profile_source coefficient_source_ =
-        common_cache_optimizer_profile_source::none;
-    int32_t candidate_ = -1;
-    uint64_t boot_claim_ordinal_ = 0;
-    uint64_t profile_generation_ = 0;
-    uint64_t authority_currency_serial_ = 0;
-    std::array<uint8_t, 32> instance_generation_digest_ = {};
-    uint32_t procedure_version_ = 0;
-};
-
-static_assert(!std::is_copy_constructible_v<
-    server_cache_plan_local_authority_latch>);
-static_assert(!std::is_copy_assignable_v<
-    server_cache_plan_local_authority_latch>);
-
 // Process-local execution capability. It contains only request-local inventory
 // ordinals/source ids, never a pointer into a cache container. The server
 // revalidates those ids immediately before the first mutation.
@@ -74,15 +26,6 @@ struct server_cache_plan_execution {
     int32_t target = -1;
     int32_t host_source_id = -1;
     int32_t checkpoint_source_id = -1;
-    server_cache_plan_local_authority_latch local_authority;
-
-    server_cache_plan_execution() = default;
-    server_cache_plan_execution(const server_cache_plan_execution &) = delete;
-    server_cache_plan_execution & operator=(
-        const server_cache_plan_execution &) = delete;
-    server_cache_plan_execution(server_cache_plan_execution &&) noexcept = default;
-    server_cache_plan_execution & operator=(
-        server_cache_plan_execution &&) noexcept = default;
 
     constexpr bool authoritative() const noexcept {
         return kind != server_cache_plan_execution_kind::legacy;
@@ -94,28 +37,6 @@ struct server_cache_plan_execution {
     }
 
     void clear() noexcept { *this = {}; }
-};
-
-struct server_cache_plan_local_candidate_evidence {
-    server_cache_observation_key key;
-    std::array<double, 4> feature = {};
-    bool measurable = false;
-    struct consequence {
-        server_cache_observation_key key;
-        std::array<double, 4> feature = {};
-        llama_cache_acct_cost_kind cost_kind =
-            llama_cache_acct_cost_kind::eviction;
-        uint32_t weight_milli = 1000;
-        bool measurable = false;
-    };
-    std::array<consequence, 3> consequences = {};
-    uint8_t consequence_count = 0;
-    bool requires_d_consequences = false;
-};
-
-struct server_cache_plan_local_inventory {
-    std::array<server_cache_plan_local_candidate_evidence,
-               COMMON_CACHE_PLAN_MAX_CANDIDATES> candidates = {};
 };
 
 static_assert(uint8_t(common_cache_plan_selection::none) ==
@@ -251,18 +172,9 @@ struct server_cache_plan_authority {
         common_cache_plan_authority_level::off;
     common_cache_plan_authority_counters counters;
     std::string calibration_profile;
-    const server_cache_observation_store * local_observations = nullptr;
-
-    bool set_profile_display_salt(
-        const std::array<uint8_t, 32> & salt) noexcept;
-    bool profile_display_label(
-        const std::array<uint8_t, 32> & execution_root,
-        std::string & out) noexcept;
 
     explicit server_cache_plan_authority(
-        common_cache_plan_authority_level level,
-        const server_cache_observation_store * observations = nullptr) noexcept
-        : configured_level(level), local_observations(observations) {}
+        common_cache_plan_authority_level level) noexcept : configured_level(level) {}
 
     // Runs the existing cost planner against the complete, target-qualified
     // pre-mutation inventory. Capability is sampled on both sides of the call;
@@ -272,25 +184,10 @@ struct server_cache_plan_authority {
         uint64_t capability_before,
         uint64_t capability_after) noexcept;
 
-    // ZC5 local path. Point estimates and the confidence certificate consume
-    // one serial-pinned profile snapshot; checked-in and local coefficients
-    // never mix in a request.
-    void plan_local_before_mutation(
-        common_cache_plan_record & rec,
-        const server_cache_plan_local_inventory & evidence,
-        const server_cache_observation_store & observations,
-        int32_t legacy_plan_candidate,
-        uint64_t capability_before,
-        uint64_t capability_after,
-        uint64_t now_unix_ms,
-        common_cache_plan_destruction_effect_set permitted_effects = 0,
-        server_cache_plan_local_authority_latch * latch = nullptr) noexcept;
-
     void fail_closed(
         common_cache_plan_record & rec,
         common_cache_plan_authority_fallback reason =
-            common_cache_plan_authority_fallback::internal_fault,
-        server_cache_plan_local_authority_latch * latch = nullptr) noexcept;
+            common_cache_plan_authority_fallback::internal_fault) noexcept;
 
     // Authorize one complete plan at the record's selected tier. The argument
     // names the legacy-selected target: by_id remains bound to it, while later
@@ -302,36 +199,18 @@ struct server_cache_plan_authority {
         int32_t legacy_target_slot_id,
         bool host_lookup_enabled = true,
         bool target_identity_matches = true,
-        common_cache_plan_destruction_effect_set permitted_effects = 0,
-        server_cache_plan_local_authority_latch latch = {}) noexcept;
+        common_cache_plan_destruction_effect_set permitted_effects = 0) noexcept;
 
     // Capability drift discovered after planning but before mutation. Preserve
     // the planner verdict for agreement telemetry while reverting execution to
     // the untouched legacy path.
     void fallback_legacy(
         common_cache_plan_record & rec,
-        common_cache_plan_authority_fallback reason,
-        server_cache_plan_local_authority_latch * latch = nullptr) noexcept;
-
-    bool local_currency_current(
-        const common_cache_plan_record & rec) const noexcept;
+        common_cache_plan_authority_fallback reason) noexcept;
 
     // Execution has completed. The schema-v5 receipt keeps the counterfactual
     // legacy plan under authority and always records the plan that really ran.
-    void finalize_execution(
-        common_cache_plan_record & rec,
-        server_cache_plan_local_authority_latch * latch = nullptr) noexcept;
-
-private:
-    struct profile_display_entry {
-        std::array<uint8_t, 32> execution_root = {};
-        std::array<uint8_t, 16> digest = {};
-        bool used = false;
-        bool collision = false;
-    };
-    std::array<uint8_t, 32> profile_display_salt_ = {};
-    std::array<profile_display_entry, 16> profile_display_entries_ = {};
-    bool profile_display_salt_ready_ = false;
+    void finalize_execution(common_cache_plan_record & rec) noexcept;
 };
 
 // Counterfactual forced-slot legacy provider sequence over the complete

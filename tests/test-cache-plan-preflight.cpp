@@ -360,24 +360,19 @@ static void test_wire_serializer_and_golden() {
     CHECK(server_cache_plan_preflight_build_view(rec, 7, true, view));
     const auto wire = server_cache_plan_preflight_json(view);
     CHECK(wire["object"] == "cache_plan_preflight");
-    CHECK(wire["schema_version"] == 2);
-    CHECK(wire["cache_plan_schema_version"] == 7);
+    CHECK(wire["schema_version"] == 1);
+    CHECK(wire["cache_plan_schema_version"] == 6);
     CHECK(wire["authoritative"] == false);
     CHECK(wire["reservation"] == "none");
     CHECK(wire["valid_until"].is_null());
     CHECK(wire["planner"]["expected_path"] ==
           "conditional_on_destruction_certification");
     CHECK(wire["planner"]["estimate_scope"] == "cache_path_only");
-    CHECK(wire["planner"].contains("predicted_owned_service_us"));
-    CHECK(!wire["planner"].contains("predicted_ttft_us"));
     CHECK(wire["planner"]["estimator_version"] == 7);
     CHECK(wire["planner"]["cost_terms"]["workspace"]["operations"] == 2);
     CHECK(!wire["planner"]["cost_terms"]["workspace"].contains("bytes"));
     CHECK(wire["destruction"]["effects"].size() == 2);
     CHECK(wire["limitations"].size() == 4);
-    CHECK(wire["optimizer_preview"]["mode"] == "off");
-    CHECK(wire["optimizer_preview"]["retention_policy"] ==
-          "historical");
     assert_redacted_keys(wire);
     const std::string encoded = wire.dump(2) + "\n";
     CHECK(encoded.find("987654321") == std::string::npos);

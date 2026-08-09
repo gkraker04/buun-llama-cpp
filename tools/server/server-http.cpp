@@ -166,7 +166,7 @@ bool server_http_context::init(const common_params & params) {
     });
 
     srv->set_error_handler([
-            cache_control_api = params.cache_optimizer.cache_control_api](
+            cache_control_api = params.cache_control_api](
             const httplib::Request & req, httplib::Response & res) {
         if (res.status == 404) {
             if (!cache_control_api &&
@@ -319,12 +319,12 @@ bool server_http_context::init(const common_params & params) {
     // narrower but must also cover middleware-generated 401/503 responses,
     // which never reach its handler. Install this hook only when one feature
     // needs it so both features remain zero-work while disabled.
-    if (params.cache_receipt || params.cache_optimizer.cache_plan_preflight ||
-        params.cache_optimizer.cache_control_api) {
+    if (params.cache_receipt || params.cache_plan_preflight ||
+        params.cache_control_api) {
         srv->set_post_routing_handler([
                 cache_receipt = params.cache_receipt,
-                cache_plan_preflight = params.cache_optimizer.cache_plan_preflight,
-                cache_control_api = params.cache_optimizer.cache_control_api](
+                cache_plan_preflight = params.cache_plan_preflight,
+                cache_control_api = params.cache_control_api](
                 const httplib::Request & req, httplib::Response & res) {
             const bool cache_oracle_route =
                 (cache_plan_preflight || cache_control_api) &&

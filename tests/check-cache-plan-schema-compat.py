@@ -15,14 +15,12 @@ from cache_plan_common import (  # noqa: E402
 
 
 fixture = root / "tools" / "server" / "bench" / "fixtures" / "cache-plan-golden.jsonl"
-fixture_v7 = root / "tools" / "server" / "bench" / "fixtures" / "cache-plan-v7-golden.jsonl"
 
-records = list(iter_cache_plan_records([fixture, fixture_v7]))
+records = list(iter_cache_plan_records([fixture]))
 schema4 = [rec for rec in records if rec["schema_version"] == 4]
 schema5 = [rec for rec in records if rec["schema_version"] == 5]
 schema6 = [rec for rec in records if rec["schema_version"] == 6]
-schema7 = [rec for rec in records if rec["schema_version"] == 7]
-assert SUPPORTED_SCHEMAS == (1, 2, 3, 4, 5, 6, 7)
+assert SUPPORTED_SCHEMAS == (1, 2, 3, 4, 5, 6)
 assert len(schema4) == 2
 assert {rec["yield"]["plan_state"] for rec in schema4} == {
     "not_required",
@@ -79,24 +77,11 @@ assert schema6[0]["seq_cp_capability"] is True
 assert schema6[0]["yield"]["actual_state"] == "not_observed"
 assert schema6[0]["accounting"]["schema_version"] == 2
 
-assert len(schema7) == 1
-assert schema7[0]["accounting"]["schema_version"] == 2
-assert schema7[0]["optimizer"]["policy_version"] == 1
-assert schema7[0]["optimizer"]["mode"] == "off"
-assert schema7[0]["optimizer"]["retention_policy"] == "historical"
-assert schema7[0]["optimizer"]["retention_summary"]["state"] == "not_attempted"
-assert schema7[0]["optimizer"]["retention_summary"]["outcome_counts"] == {
-    "executed": 0,
-    "deferred": 0,
-    "publication_skipped": 0,
-    "blocked": 0,
-}
-
 try:
-    list(iter_cache_plan_records([fixture_v7], supported_schemas=(1, 2, 3, 4, 5, 6)))
+    list(iter_cache_plan_records([fixture], supported_schemas=(1, 2, 3, 4, 5)))
 except UnsupportedSchemaError:
     pass
 else:
-    raise AssertionError("frozen schema-6 reader accepted a schema-7 record")
+    raise AssertionError("frozen schema-5 reader accepted a schema-6 record")
 
 print("cache-plan schema compatibility checks passed")

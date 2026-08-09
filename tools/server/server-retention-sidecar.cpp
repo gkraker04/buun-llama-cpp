@@ -228,49 +228,9 @@ bool server_retention_sidecar_store::publish(
         bool coverage_valid,
         const server_cache_lease_identity * checkpoint_identity,
         const server_cache_lease_frontier * replacement_frontier) noexcept {
-    common_retention_stamp reserved;
-    if (!reserve_stamp(pool, reserved)) {
-        retire(key);
-        return false;
-    }
-    return publish_reserved(
-        key, reserved, spans, source_known, turn_token_count,
-        coverage_tokens, coverage_valid, checkpoint_identity,
-        replacement_frontier);
-}
-
-bool server_retention_sidecar_store::reserve_stamp(
-        common_retention_pool pool,
-        common_retention_stamp & stamp) noexcept {
-    stamp = {};
-    if (!allocator.issue(pool, stamp)) {
-        mark_unavailable();
-        return false;
-    }
-    return stamp.stable_id != 0;
-}
-
-bool server_retention_sidecar_store::publish_reserved(
-        const server_retention_instance_key & key,
-        const common_retention_stamp & reserved,
-        const common_chat_msg_spans & spans,
-        bool source_known,
-        uint64_t turn_token_count,
-        uint64_t coverage_tokens,
-        bool coverage_valid,
-        const server_cache_lease_identity * checkpoint_identity,
-        const server_cache_lease_frontier * replacement_frontier,
-        server_retention_anchor_policy anchor_policy) noexcept {
     common_retention_artifact_record record;
     record.kind = key.kind;
-    record.stamp = reserved;
-    if (record.stamp.stable_id == 0 ||
-        record.stamp.recency_ordinal == 0 ||
-        record.stamp.pool >= common_retention_pool::_count ||
-        anchor_policy >= server_retention_anchor_policy::_count ||
-        (anchor_policy ==
-             server_retention_anchor_policy::checkpoint_desired_set &&
-         key.kind != common_retention_artifact_kind::checkpoint)) {
+    if (!allocator.issue(pool, record.stamp)) {
         retire(key);
         mark_unavailable();
         return false;
@@ -286,17 +246,6 @@ bool server_retention_sidecar_store::publish_reserved(
         record.stamp.mandatory_anchor = false;
         record.stamp.mapped_turn_ordinal = 0;
         record.stamp.anchor_rank = 0;
-    }
-    // `mandatory_anchor`'s newest-turn result is relative to the immutable
-    // turn table captured with an artifact. Every past checkpoint therefore
-    // remains "newest" in its own record and treating that bit as a permanent
-    // veto freezes a finite ring. ZC's desired-set lanes own checkpoint
-    // semantic anchoring instead. Hard leases, recovery pins, and the exact
-    // member restored by the current task remain independent protections.
-    // Other artifact kinds and the landed non-ZC checkpoint path are exact.
-    if (anchor_policy ==
-            server_retention_anchor_policy::checkpoint_desired_set) {
-        record.stamp.mandatory_anchor = false;
     }
     if (!install(
             key, std::move(record), checkpoint_identity,

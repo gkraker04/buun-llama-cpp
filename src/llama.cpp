@@ -332,12 +332,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
-        // Capture cost identity from metadata already verified by the loader.
-        // This is O(tensor-count) and never rereads model payload bytes.
-        if (llama_model_cost_structure_capture_enabled()) {
-            (void) model->capture_cost_structure_digest();
-        }
-
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
@@ -465,17 +459,6 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     std::string path_model;
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
-}
-
-bool llama_model_cost_structure_digest(
-        const llama_model * model, uint8_t * out, uint64_t * tensor_bytes) {
-    if (!model || !out || !tensor_bytes) return false;
-    std::array<uint8_t, 32> digest = {};
-    uint64_t bytes = 0;
-    if (!model->cost_structure_digest(digest, bytes)) return false;
-    std::memcpy(out, digest.data(), digest.size());
-    *tensor_bytes = bytes;
-    return true;
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

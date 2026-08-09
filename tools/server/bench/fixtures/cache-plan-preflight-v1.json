@@ -1,7 +1,7 @@
 {
   "object": "cache_plan_preflight",
-  "schema_version": 2,
-  "cache_plan_schema_version": 7,
+  "schema_version": 1,
+  "cache_plan_schema_version": 6,
   "authoritative": false,
   "reservation": "none",
   "valid_until": null,
@@ -19,7 +19,7 @@
     "predicted_reuse_tokens": 96,
     "predicted_replay_tokens": 4,
     "predicted_restore_bytes": 16,
-    "predicted_owned_service_us": 52,
+    "predicted_ttft_us": 52,
     "estimate_scope": "cache_path_only",
     "estimator_version": 7,
     "cost_terms": {
@@ -66,22 +66,6 @@
     "recovery": "prospective",
     "projected_release_bytes": 64,
     "estimated_destruction_us": 9
-  },
-  "optimizer_preview": {
-    "mode": "off",
-    "retention_policy": "historical",
-    "baseline_plan_candidate": "unavailable",
-    "economic_plan_candidate": 0,
-    "predicted_economic_source": "landed_checked_in",
-    "economic_assessment": "candidate_if_still_current",
-    "fallback_reason": "none",
-    "profile_source": "none",
-    "profile_resume_origin": "none",
-    "profile_state": "unseen",
-    "short_identity": "unavailable",
-    "coverage_class": "unavailable",
-    "benefit_estimate_us": "unavailable",
-    "benefit_lower_us": "unavailable"
   },
   "miss_reasons": [
     {

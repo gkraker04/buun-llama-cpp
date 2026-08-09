@@ -270,8 +270,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-cache-plan-estimate.cpp)
     target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-    llama_build_and_test(test-cache-plan-authority.cpp)
-    target_link_libraries(test-cache-plan-authority PRIVATE server-context)
+    llama_build_and_test(
+        test-cache-plan-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
     target_include_directories(test-cache-plan-authority PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
@@ -280,11 +281,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-authority.cmake)
-    add_test(
-        NAME test-zc5-local-authority-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc5-local-authority.cmake)
 
     llama_build_and_test(
         test-cache-plan-preflight.cpp
@@ -294,7 +290,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_definitions(test-cache-plan-preflight PRIVATE
-        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-plan-preflight-v2.json")
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-plan-preflight-v1.json")
     add_test(
         NAME test-cache-plan-preflight-contract
         COMMAND ${CMAKE_COMMAND}
@@ -484,76 +480,6 @@ add_test(
 )
 
 add_test(
-    NAME test-cache-optimizer-config-contract
-    COMMAND ${CMAKE_COMMAND}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-optimizer-config.cmake
-)
-
-add_test(
-    NAME test-zc1-retention-policy-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc1-retention-policy.cmake
-)
-
-add_test(
-    NAME test-zc2-observer-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc2-observer.cmake
-)
-
-add_test(
-    NAME test-zc3-fingerprint-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc3-fingerprint.cmake
-)
-
-add_test(
-    NAME test-zc3-calibration-store-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc3-calibration-store.cmake
-)
-
-add_test(
-    NAME test-zc4-calibration-model-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-zc4-calibration-model.cmake
-)
-find_program(CAPSTONE_PYTHON_EXECUTABLE NAMES python3 REQUIRED)
-add_test(
-    NAME test-zc4-shadow-report
-    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/test-zc4-shadow-report.py
-)
-add_test(
-    NAME test-zc6-capstone-report
-    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
-        ${PROJECT_SOURCE_DIR}/tools/server/bench/zc6-capstone-report.py
-        --self-test
-)
-add_test(
-    NAME test-zc6-capstone-runner-cleanup
-    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
-        ${PROJECT_SOURCE_DIR}/tools/server/bench/zc0-light-gate.py
-        --self-test-cleanup
-)
-add_test(
-    NAME test-capstone-truth
-    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/test-capstone-truth.py
-)
-add_test(
-    NAME test-capstone-truth-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-capstone-truth.cmake
-)
-
-add_test(
     NAME test-cache-plan-fixtures-source
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
@@ -613,7 +539,6 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
-llama_build_and_test(test-cache-optimizer-config.cpp)
 llama_build_and_test(test-vbr-policy.cpp)
 llama_build_and_test(test-vbr-downward.cpp)
 llama_build_and_test(test-vbr-physical.cpp)
@@ -648,17 +573,11 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
-# This CPU/backend-neutral fragmentation fixture predates the fork-wide VBR
-# default. Keep its state-layout contract on the static KV implementation;
-# VBR generation accounting has its own dedicated restore tests.
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -ctk f16 -ctv f16)
+llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
-# State serialization is backend-neutral and this fixture runs on CPU-only
-# builders. Pin the static KV mode explicitly: the fork-wide default is VBR,
-# whose device cache correctly refuses a CPU-only context.
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}" -ctk f16 -ctv f16)
+llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (NOT GGML_BACKEND_DL)

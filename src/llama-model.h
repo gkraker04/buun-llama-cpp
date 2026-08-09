@@ -1,7 +1,6 @@
 #pragma once
 
 #include "llama.h"
-#include "llama-ext.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -652,10 +651,6 @@ struct llama_model {
     // (used for the drafter's gathered tok_embd/output copies under a tensor-sharded target)
     void adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf);
     const float * tensor_split() const;
-    const float * effective_tensor_split(size_t & count) const noexcept;
-    bool capture_cost_structure_digest() noexcept;
-    bool cost_structure_digest(
-        std::array<uint8_t, 32> & out, uint64_t & tensor_bytes) const noexcept;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;

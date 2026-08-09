@@ -40,16 +40,15 @@ endfunction()
 
 function(checkpoint_carrier_valid header source output)
     string(FIND "${header}"
-        "common_cache_retention_lineage retention_lineage;" field)
+        "common_cache_family_binding cache_family;" field)
     extract_region("${source}"
         "common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other)"
         "common_prompt_checkpoint & common_prompt_checkpoint::operator=" copy_ctor)
     extract_region("${source}"
         "void common_prompt_checkpoint::clear()"
         "common_checkpoint_shadow_reason common_checkpoint_shadow_capture_scoped" clear_body)
-    string(FIND "${copy_ctor}"
-        "retention_lineage(other.retention_lineage)" copied)
-    string(FIND "${clear_body}" "retention_lineage = {};" cleared)
+    string(FIND "${copy_ctor}" "cache_family(other.cache_family)" copied)
+    string(FIND "${clear_body}" "cache_family = {};" cleared)
     if(field EQUAL -1 OR copied EQUAL -1 OR cleared EQUAL -1)
         set(${output} FALSE PARENT_SCOPE)
     else()
@@ -64,14 +63,14 @@ function(propagation_valid task control context output)
             "server_cache_control_operation::family_bind"
             "resolve_family_binding("
             "server_cache_family_resolve_for_launch("
-            "server_prompt_cache_apply_retention_lineage("
+            "server_prompt_cache_apply_family("
             "copy.cache_family_binding_token = cache_family_binding_token;"
-            "common_cache_retention_follow_lineage("
-            "other.retention_lineage = retention_lineage;"
-            "next.retention_lineage = slot.retention_lineage;"
-            "common_cache_retention_lineage restored_lineage = retention_lineage;"
-            "*restored_lineage = delivery.retention_lineage;"
-            "state->slot->retention_lineage = {};"
+            "common_cache_family_follow_lineage("
+            "other.cache_family = cache_family;"
+            "next.cache_family = slot.cache_family;"
+            "common_cache_family_binding restored_family = cache_family;"
+            "*restored_family = delivery.cache_family;"
+            "state->slot->cache_family = {};"
             "if (prompt.tokens.empty())")
         set(joined "${task}\n${control}\n${context}")
         string(FIND "${joined}" "${token}" found)
@@ -88,24 +87,12 @@ function(single_carrier_valid task context output)
         "common_cache_family_allows_additional_weight("
         callback_guard)
     string(FIND "${context}"
-        "server_prompt_cache_apply_retention_lineage("
+        "server_prompt_cache_apply_family("
         save_write)
     if(callback_guard EQUAL -1 OR save_write EQUAL -1)
         set(${output} FALSE PARENT_SCOPE)
     else()
         set(${output} TRUE PARENT_SCOPE)
-    endif()
-endfunction()
-
-function(retention_resolver_valid context output)
-    string(REGEX MATCHALL
-        "common_cache_retention_main_family\\("
-        resolver_calls "${context}")
-    list(LENGTH resolver_calls resolver_count)
-    if(resolver_count EQUAL 2)
-        set(${output} TRUE PARENT_SCOPE)
-    else()
-        set(${output} FALSE PARENT_SCOPE)
     endif()
 endfunction()
 
@@ -122,9 +109,7 @@ endfunction()
 function(task_strong_binding_absent task output)
     string(FIND "${task}"
         "common_cache_family_binding cache_family;" found)
-    string(FIND "${task}"
-        "common_cache_retention_lineage" lineage_found)
-    if(found EQUAL -1 AND lineage_found EQUAL -1)
+    if(found EQUAL -1)
         set(${output} TRUE PARENT_SCOPE)
     else()
         set(${output} FALSE PARENT_SCOPE)
@@ -145,28 +130,6 @@ checkpoint_carrier_valid(
     "${common_header}" "${checkpoint_source}" carrier_ok)
 if(NOT carrier_ok)
     message(FATAL_ERROR "E1.1b checkpoint copy/clear carrier contract failed")
-endif()
-
-foreach(token IN ITEMS
-        "common_cache_retention_provenance::proven_server_parent"
-        "slot.intentional_retention && !incoming_family.declared() &&"
-        "task.is_parent()"
-        "common_cache_retention_main_family(")
-    require_token("${context_source}" "${token}"
-        "intentional-retention provenance")
-endforeach()
-retention_resolver_valid("${context_source}" retention_resolver_ok)
-if(NOT retention_resolver_ok)
-    message(FATAL_ERROR
-        "E1/ZC context retention-main-family resolver census changed")
-endif()
-
-string(REGEX MATCHALL "state[.]main_family =" main_family_writes
-    "${task_header}\n${task_source}\n${context_source}")
-list(LENGTH main_family_writes main_family_write_count)
-if(NOT main_family_write_count EQUAL 1)
-    message(FATAL_ERROR
-        "E1/ZC main_family must have one state writer: ${main_family_write_count}")
 endif()
 
 propagation_valid(
@@ -194,7 +157,7 @@ task_strong_binding_absent("${task_struct}" task_strong_absent)
 if(NOT task_strong_absent)
     message(FATAL_ERROR "E1.1b task carries injectable strong binding")
 endif()
-    string(REGEX MATCHALL "retention_lineage = [{][}]" family_clears
+string(REGEX MATCHALL "cache_family = [{][}]" family_clears
     "${context_source}")
 list(LENGTH family_clears family_clear_count)
 if(NOT family_clear_count EQUAL 4)
@@ -223,21 +186,21 @@ if(NOT test_door_absent)
 endif()
 
 # House-standard negative controls rerun the actual predicates.
-string(REPLACE "retention_lineage(other.retention_lineage)"
-    "retention_lineage()" bad_copy "${checkpoint_source}")
+string(REPLACE "cache_family(other.cache_family)"
+    "cache_family()" bad_copy "${checkpoint_source}")
 checkpoint_carrier_valid("${common_header}" "${bad_copy}" bad_copy_ok)
 if(bad_copy_ok)
     message(FATAL_ERROR "checkpoint-copy negative control did not trip")
 endif()
 
-string(REPLACE "retention_lineage = {};"
+string(REPLACE "cache_family = {};"
     "/* family clear removed */" bad_clear "${checkpoint_source}")
 checkpoint_carrier_valid("${common_header}" "${bad_clear}" bad_clear_ok)
 if(bad_clear_ok)
     message(FATAL_ERROR "checkpoint-clear negative control did not trip")
 endif()
 
-string(REPLACE "next.retention_lineage = slot.retention_lineage;"
+string(REPLACE "next.cache_family = slot.cache_family;"
     "/* checkpoint propagation removed */" bad_context "${context_source}")
 propagation_valid(
     "${task_header}\n${task_source}" "${control_header}\n${control_source}"
@@ -256,7 +219,7 @@ if(bad_child_ok)
     message(FATAL_ERROR "child-token negative control did not trip")
 endif()
 
-string(REPLACE "other.retention_lineage = retention_lineage;"
+string(REPLACE "other.cache_family = cache_family;"
     "/* child slot provenance removed */" bad_child_context "${context_source}")
 propagation_valid(
     "${task_header}\n${task_source}"
@@ -266,7 +229,7 @@ if(bad_child_slot_ok)
     message(FATAL_ERROR "child-slot negative control did not trip")
 endif()
 
-string(REPLACE "state->slot->retention_lineage = {};"
+string(REPLACE "state->slot->cache_family = {};"
     "/* import provenance reset removed */" bad_import "${context_source}")
 propagation_valid(
     "${task_header}\n${task_source}"
@@ -286,7 +249,7 @@ if(bad_empty_ok)
     message(FATAL_ERROR "empty-terminal negative control did not trip")
 endif()
 
-string(REPLACE "*restored_lineage = delivery.retention_lineage;"
+string(REPLACE "*restored_family = delivery.cache_family;"
     "/* restored family provenance removed */" bad_restore "${task_source}")
 propagation_valid(
     "${task_header}\n${bad_restore}" "${control_header}\n${control_source}"
@@ -303,28 +266,11 @@ if(bad_price_ok)
     message(FATAL_ERROR "single-carrier negative control did not trip")
 endif()
 
-string(REPLACE "common_cache_retention_main_family("
-    "common_cache_retention_main_family_removed("
-    bad_retention_resolver "${context_source}")
-retention_resolver_valid(
-    "${bad_retention_resolver}" bad_retention_resolver_ok)
-if(bad_retention_resolver_ok)
-    message(FATAL_ERROR
-        "retention-main-family resolver negative control did not trip")
-endif()
-
 set(bad_task_struct
     "${task_struct}\ncommon_cache_family_binding cache_family;")
 task_strong_binding_absent("${bad_task_struct}" bad_task_absent)
 if(bad_task_absent)
     message(FATAL_ERROR "task-strong-binding negative control did not trip")
-endif()
-
-set(bad_lineage_task_struct
-    "${task_struct}\ncommon_cache_retention_lineage retention_lineage;")
-task_strong_binding_absent("${bad_lineage_task_struct}" bad_lineage_task_absent)
-if(bad_lineage_task_absent)
-    message(FATAL_ERROR "task-lineage negative control did not trip")
 endif()
 
 string(REPLACE "retained_prefix == current_tokens"

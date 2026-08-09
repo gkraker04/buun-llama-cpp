@@ -65,7 +65,6 @@ add_library(${TARGET}
     chat-peg-parser.h
     chat.cpp
     chat.h
-    common-cache-optimizer.cpp
     common-cache-plan.cpp
     common-cache-plan.h
     common-cache-plan-estimate.cpp
