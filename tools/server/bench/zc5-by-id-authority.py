@@ -1125,7 +1125,7 @@ def main():
     parser.add_argument("--extra-server-arg", action="append", default=[])
     parser.add_argument("--sealed-model", action="store_true")
     parser.add_argument("--default-auto", action="store_true",
-                        help="omit --cache-optimizer for the authority arm")
+                        help="deprecated: omitted mode now means off")
     parser.add_argument("--paired-counterfactual", action="store_true",
                         help="compare copied persisted auto/learn/baseline arms")
     parser.add_argument("--paired-executions", type=int, default=8)
@@ -1137,6 +1137,10 @@ def main():
     if args.self_test:
         self_test()
         return
+    if args.default_auto:
+        parser.error(
+            "--default-auto is retired because omitted mode now means off; "
+            "the authority arm always uses explicit auto")
     for required in (args.server_bin, args.model, args.state_home, args.workdir):
         if not required:
             parser.error("live mode requires server/model/state-home/workdir")
@@ -1190,11 +1194,11 @@ def main():
     auto_log = os.path.join(args.workdir, "auto.log")
     if args.paired_counterfactual:
         outputs, auto_requests, authority_cycles, _ = run_until_execution(
-            args, "auto", None if args.default_auto else "auto",
+            args, "auto", "auto",
             args.decision_tier, args.port + 1, auto_log,
             state_homes["auto"], args.authority_seconds)
     else:
-        auto = Arm(args, None if args.default_auto else "auto",
+        auto = Arm(args, "auto",
                    args.decision_tier, args.port + 1, auto_log)
         outputs = []
         auto_requests = 0
@@ -1234,7 +1238,7 @@ def main():
                 mature_state, trial_root / "baseline-state")
             order = PAIRED_ARM_ORDERS[trial % len(PAIRED_ARM_ORDERS)]
             arm_specs = {
-                "auto": (None if args.default_auto else "auto",
+                "auto": ("auto",
                          args.decision_tier, args.port + 1, auto_state),
                 "learn": ("learn", "off", args.port + 2, learn_state),
                 "baseline": ("baseline", "off", args.port + 3,
@@ -1340,7 +1344,7 @@ def main():
     result = {
         "schema": "zc5-local-authority/v3",
         "decision_tier": args.decision_tier,
-        "default_auto": args.default_auto,
+        "default_auto": False,
         "learn_requests": learn_requests,
         "auto_requests": auto_requests,
         "auto_records": len(outputs),

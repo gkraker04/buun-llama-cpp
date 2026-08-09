@@ -60,17 +60,17 @@ static void test_explicit_off_is_total_identity() {
     }
 }
 
-static void test_absent_defaults_auto_after_zc6_qualifies() {
+static void test_absent_defaults_off() {
     auto raw = raw_off(false, common_cache_plan_authority_level::off,
                        false, false, false, false);
     const auto out = common_cache_optimizer_resolve(raw);
-    CHECK(out.mode == common_cache_optimizer_mode::auto_mode);
-    CHECK(out.cache_lifecycle);
+    CHECK(out.mode == common_cache_optimizer_mode::off);
+    CHECK(!out.cache_lifecycle);
     CHECK(out.retention_policy ==
-          common_cache_optimizer_retention_policy::intentional_baseline);
-    CHECK(out.observer_store_enabled);
+          common_cache_optimizer_retention_policy::historical_legacy);
+    CHECK(!out.observer_store_enabled);
     CHECK(out.landed_authority_level == common_cache_plan_authority_level::off);
-    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::lru);
+    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::off);
     CHECK(out.error == common_cache_optimizer_config_error::none);
 }
 
@@ -169,10 +169,10 @@ static void test_parser_explicitness() {
     CHECK(common_params_parse(int(absent_argv.size()), absent_argv.data(),
                               absent, LLAMA_EXAMPLE_SERVER));
     CHECK(!absent.cache_optimizer_mode_explicit);
-    CHECK(absent.cache_optimizer.mode == common_cache_optimizer_mode::auto_mode);
-    CHECK(absent.cache_optimizer.observer_store_enabled);
+    CHECK(absent.cache_optimizer.mode == common_cache_optimizer_mode::off);
+    CHECK(!absent.cache_optimizer.observer_store_enabled);
     CHECK(absent.cache_optimizer.local_authority_ceiling ==
-          common_cache_plan_authority_level::lru);
+          common_cache_plan_authority_level::off);
 
     std::vector<std::string> absent_ceiling_args {
         "test-cache-optimizer-config",
@@ -186,13 +186,13 @@ static void test_parser_explicitness() {
                               LLAMA_EXAMPLE_SERVER));
     CHECK(!absent_ceiling.cache_optimizer_mode_explicit);
     CHECK(absent_ceiling.cache_optimizer.mode ==
-          common_cache_optimizer_mode::auto_mode);
-    CHECK(absent_ceiling.cache_optimizer.cache_lifecycle);
-    CHECK(absent_ceiling.cache_optimizer.observer_store_enabled);
+          common_cache_optimizer_mode::off);
+    CHECK(!absent_ceiling.cache_optimizer.cache_lifecycle);
+    CHECK(!absent_ceiling.cache_optimizer.observer_store_enabled);
     CHECK(absent_ceiling.cache_optimizer.landed_authority_level ==
-          common_cache_plan_authority_level::off);
-    CHECK(absent_ceiling.cache_optimizer.local_authority_ceiling ==
           common_cache_plan_authority_level::similarity);
+    CHECK(absent_ceiling.cache_optimizer.local_authority_ceiling ==
+          common_cache_plan_authority_level::off);
 
     std::vector<std::string> explicit_args {
         "test-cache-optimizer-config", "--cache-optimizer", "off",
@@ -236,7 +236,7 @@ int main() {
     CHECK(rejected);
 
     test_explicit_off_is_total_identity();
-    test_absent_defaults_auto_after_zc6_qualifies();
+    test_absent_defaults_off();
     test_nonoff_modes();
     test_parser_explicitness();
     std::puts("test-cache-optimizer-config: PASS");

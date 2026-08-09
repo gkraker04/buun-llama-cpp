@@ -58,27 +58,26 @@ foreach(pin IN ITEMS
     contract_require_token("${server_cpp}" "${pin}" "ZC6 startup summary")
 endforeach()
 
-# ZC6 qualifies automatic rollout. The raw CLI carrier remains historical-off
-# for compatibility, while the resolver maps omission to auto and preserves
-# every explicit mode exactly.
+# Learned authority remains opt-in. The raw CLI carrier and effective resolver
+# both map omission to the historical off path and preserve explicit modes.
 contract_require_token("${optimizer_cpp}"
     "const auto mode = raw.mode_explicit"
-    "qualified ZC6 absent optimizer default owner")
+    "absent optimizer default owner")
 contract_require_token("${optimizer_cpp}"
-    ": common_cache_optimizer_mode::auto_mode;"
-    "qualified ZC6 rollout default")
+    ": common_cache_optimizer_mode::off;"
+    "opt-in optimizer default")
 contract_require_token("${common_h}"
     "common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::off;"
     "raw absent-mode default")
 contract_require_token("${arg_cpp}"
-    "default: auto; use off for the historical policy"
-    "qualified ZC6 CLI default guidance")
+    "default: off; use auto to enable learned cache authority"
+    "opt-in CLI default guidance")
 contract_require_token("${server_readme}"
-    "The cache optimizer defaults to `auto`; use `--cache-optimizer off`"
-    "qualified ZC6 public default guidance")
+    "The cache optimizer defaults to `off`, preserving the historical policy"
+    "opt-in public default guidance")
 contract_forbid_token("${server_readme}"
-    "automatic default remains rollout-gated"
-    "retired ZC6 rollout-gated guidance")
+    "The cache optimizer defaults to `auto`"
+    "stale automatic-default guidance")
 set(default_mutation "${optimizer_cpp}")
 string(REPLACE
     "const auto mode = raw.mode_explicit"
@@ -88,7 +87,7 @@ string(FIND "${default_mutation}"
     "const auto mode = raw.mode_explicit"
     old_default)
 if (NOT old_default EQUAL -1)
-    message(FATAL_ERROR "qualified ZC6 absent-default negative control did not trip")
+    message(FATAL_ERROR "absent-default negative control did not trip")
 endif()
 
 # ZC1 consumes retention_policy at its host/checkpoint adapters, the one

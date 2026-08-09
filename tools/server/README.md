@@ -222,7 +222,7 @@ is forced when `-np > 1`.
 | `--threads-http N` | number of threads used to process HTTP requests (default: -1)<br/>(env: LLAMA_ARG_THREADS_HTTP) |
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
-| `--cache-optimizer MODE` | cache optimizer mode: `off`, `baseline`, `learn`, or `auto` (default: `auto`; use explicit `off` for the historical policy)<br/>(env: LLAMA_ARG_CACHE_OPTIMIZER) |
+| `--cache-optimizer MODE` | cache optimizer mode: `off`, `baseline`, `learn`, or `auto` (default: `off`; use `auto` to enable learned cache authority)<br/>(env: LLAMA_ARG_CACHE_OPTIMIZER) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
@@ -919,8 +919,9 @@ Same as the `/v1/embeddings` endpoint.
 
 ### Cache optimizer modes and persisted calibration
 
-The cache optimizer defaults to `auto`; use `--cache-optimizer off` as the
-explicit historical-policy escape hatch. It observes cache replay and restore
+The cache optimizer defaults to `off`, preserving the historical policy with
+no calibration or local-planner overhead. Use `--cache-optimizer auto` to opt
+into learned cache authority. It observes cache replay and restore
 costs, saves bounded calibration profiles under the platform state
 directory (`$XDG_STATE_HOME/llama.cpp` or `~/.local/state/llama.cpp` on Linux,
 and `~/Library/Application Support/llama.cpp` on macOS;
@@ -942,8 +943,7 @@ Use `--cache-optimizer learn` for persistent observation without economic
 authority, `baseline` for the structural baseline without calibration, or
 `off` for the historical selector and no ZC profile loading or writing.
 With `auto` mode, an explicit `--cache-plan-authority` is the
-ceiling for confidence-gated local authority; use `--cache-optimizer off` to
-request the historical checked-in authority behavior.
+ceiling for confidence-gated local authority.
 `fallback_legacy` in debug receipts means the request safely used that
 historical selector because local evidence was unavailable, immature, stale,
 or no longer current; it is a compatibility fallback, not an inference error.

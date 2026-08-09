@@ -48,11 +48,11 @@ const char * common_cache_optimizer_config_error_name(
 common_cache_optimizer_effective_config common_cache_optimizer_resolve(
         const common_cache_optimizer_raw_config & raw) noexcept {
     common_cache_optimizer_effective_config out;
-    // ZC6 qualifies automatic rollout. Every explicit mode remains exact;
-    // omission selects auto without changing the raw CLI compatibility default.
+    // Learned authority remains opt-in. Every explicit mode remains exact;
+    // omission preserves the historical policy and its zero-overhead path.
     const auto mode = raw.mode_explicit
         ? raw.mode
-        : common_cache_optimizer_mode::auto_mode;
+        : common_cache_optimizer_mode::off;
     out.mode = mode;
     out.cache_debug = raw.cache_debug;
     out.cache_plan_preflight = raw.cache_plan_preflight;

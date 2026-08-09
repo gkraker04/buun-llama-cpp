@@ -430,8 +430,7 @@ def run_capstone_session(args):
 			(False, "concurrent", 2), (True, "serialized", 1)):
 		for mode in orders:
 			extra = list(common)
-			# Exercise the candidate auto implementation explicitly until ZC6's
-			# resource endpoint qualifies the separate absent-mode rollout.
+			# Auto is opt-in; capstone comparisons always name every mode.
 			extra.extend(("--cache-optimizer", mode))
 			name = f"capstone-{shape}-{mode}"
 			results[(shape, mode)], _ = run_arm(
