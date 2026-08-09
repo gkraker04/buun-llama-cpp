@@ -318,6 +318,28 @@ def capture_pin_issues(records, warmup=0):
 		and recorded_generation(row) is None]
 
 
+def apply_calibration_replay_preset(args):
+	"""Select the shortest honest training timeline.
+
+	Calibration replay is deliberately not a performance experiment. It keeps
+	the captured dependency/overlap topology and authentic generation lengths,
+	but drops recorded human, tool, and harness pauses. Estimator admission still
+	uses the server's real pre-outcome clocks; this helper never virtualizes time.
+	"""
+	if not args.calibration_replay:
+		return
+	if args.mode != "chained":
+		raise SystemExit("--calibration-replay requires --mode chained")
+	if args.claim_grade:
+		raise SystemExit("--calibration-replay is training-only, not claim-grade")
+	if not args.pin_generation:
+		raise SystemExit("--calibration-replay requires --pin-generation to preserve cache pressure")
+	if args.think_speed != 1.0 or args.max_think_ms != 0.0:
+		raise SystemExit("--calibration-replay owns gap pacing; do not combine it "
+			"with --think-speed or --max-think-ms")
+	args.no_think_time = True
+
+
 def observe_server_parallel(args):
 	request = urllib.request.Request(f"http://{args.target}/slots", method="GET")
 	if args.api_key:
@@ -519,6 +541,15 @@ def summarize(results, args, wall_ms, timeline):
 				and args.think_speed == 1.0
 				and timeline["gaps_capped"] == 0),
 		},
+		"calibration_replay": {
+			"enabled": bool(args.calibration_replay),
+			"training_only": bool(args.calibration_replay),
+			"optimization_claim": False,
+			"real_server_admission_clocks": True,
+			"recorded_inter_group_gaps_dropped": bool(args.calibration_replay),
+			"captured_overlap_topology_preserved": (
+				bool(args.calibration_replay) and not args.serialize_overlap),
+		},
 		"requests_total": len(results),
 		"requests_scored": len(scored),
 		"requests_ok": len(ok),
@@ -584,6 +615,10 @@ def main():
 		help="chained mode: divide recorded harness think time by this")
 	parser.add_argument("--no-think-time", action="store_true",
 		help="chained mode: drop harness/tool time, measure server time only")
+	parser.add_argument("--calibration-replay", action="store_true",
+		help="training-only chained preset: preserve captured overlap and pinned "
+			"generation, but drop recorded human/tool/harness gaps; uses real server "
+			"admission clocks and is never claim-grade")
 	parser.add_argument("--max-think-ms", type=float, default=0.0,
 		help="chained mode: cap any single gap (0 = faithful). Capping is "
 			"disclosed in the scorecard; it suppresses idle-driven cache work "
@@ -611,6 +646,7 @@ def main():
 	parser.add_argument("--background-weight", type=float, default=0.1)
 	parser.add_argument("--limit", type=int, default=0)
 	args = parser.parse_args()
+	apply_calibration_replay_preset(args)
 
 	header, records = load_trace(args.trace)
 	if args.limit:

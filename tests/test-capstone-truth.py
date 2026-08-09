@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 
+from types import SimpleNamespace
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BENCH = ROOT / "tools" / "server" / "bench"
@@ -50,6 +52,27 @@ def scorecard(rows=None, *, serialized=False):
 
 
 class CapstoneTruthTest(unittest.TestCase):
+	def test_calibration_replay_preset_is_training_only_and_owns_pacing(self):
+		args = SimpleNamespace(
+			calibration_replay=True, mode="chained", claim_grade=False,
+			pin_generation=True, think_speed=1.0, max_think_ms=0.0,
+			no_think_time=False)
+		trace_replay.apply_calibration_replay_preset(args)
+		self.assertTrue(args.no_think_time)
+
+		for change, message in (
+			({"mode": "paced"}, "requires --mode chained"),
+			({"claim_grade": True}, "training-only"),
+			({"pin_generation": False}, "requires --pin-generation"),
+			({"think_speed": 2.0}, "owns gap pacing"),
+		):
+			invalid = SimpleNamespace(**vars(args))
+			invalid.no_think_time = False
+			for key, value in change.items():
+				setattr(invalid, key, value)
+			with self.assertRaisesRegex(SystemExit, message):
+				trace_replay.apply_calibration_replay_preset(invalid)
+
 	def test_incremental_sse_metrics_outlive_body_retention(self):
 		reader = trace_common.SSEPayloadAccumulator()
 		metrics = {}

@@ -9,6 +9,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "src/llama-sha256.h"
 
 #include <algorithm>
 #include <cassert>
@@ -172,6 +173,10 @@ struct clip_ctx {
     std::map<ggml_backend_dev_t, size_t> mem_compute;
 
     bool support_batch = false;
+
+    std::array<uint8_t, 32> cost_structure_digest = {};
+    uint64_t cost_structure_tensor_bytes = 0;
+    bool cost_structure_digest_ready = false;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
@@ -1044,6 +1049,9 @@ struct clip_model_loader {
 
     size_t model_size = 0; // in bytes
 
+    std::array<uint8_t, 32> cost_structure_digest = {};
+    bool cost_structure_digest_ready = false;
+
     bool has_vision = false;
     bool has_audio  = false;
 
@@ -1073,6 +1081,8 @@ struct clip_model_loader {
         ctx_meta.reset(meta);
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+
+        capture_cost_structure();
 
         // print gguf info
         {
@@ -1116,6 +1126,167 @@ struct clip_model_loader {
             }
         }
     }
+
+    static void write_numeric_value(
+            llama_sha256_writer & writer, enum gguf_type type,
+            const void * data) {
+        switch (type) {
+            case GGUF_TYPE_UINT8: {
+                uint8_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(value); return;
+            }
+            case GGUF_TYPE_INT8: {
+                int8_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(uint64_t(int64_t(value))); return;
+            }
+            case GGUF_TYPE_UINT16: {
+                uint16_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(value); return;
+            }
+            case GGUF_TYPE_INT16: {
+                int16_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(uint64_t(int64_t(value))); return;
+            }
+            case GGUF_TYPE_UINT32: {
+                uint32_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(value); return;
+            }
+            case GGUF_TYPE_INT32: {
+                int32_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(uint64_t(int64_t(value))); return;
+            }
+            case GGUF_TYPE_FLOAT32: {
+                uint32_t bits; std::memcpy(&bits, data, sizeof(bits));
+                writer.u32(bits); return;
+            }
+            case GGUF_TYPE_BOOL: {
+                bool value; std::memcpy(&value, data, sizeof(value));
+                writer.u32(value ? 1 : 0); return;
+            }
+            case GGUF_TYPE_UINT64: {
+                uint64_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(value); return;
+            }
+            case GGUF_TYPE_INT64: {
+                int64_t value; std::memcpy(&value, data, sizeof(value));
+                writer.u64(uint64_t(value)); return;
+            }
+            case GGUF_TYPE_FLOAT64: {
+                uint64_t bits; std::memcpy(&bits, data, sizeof(bits));
+                writer.u64(bits); return;
+            }
+            case GGUF_TYPE_STRING:
+            case GGUF_TYPE_ARRAY:
+            case GGUF_TYPE_COUNT:
+                break;
+        }
+        throw std::runtime_error("unsupported GGUF cost-structure value");
+    }
+
+    static size_t numeric_value_size(enum gguf_type type) {
+        switch (type) {
+            case GGUF_TYPE_UINT8:
+            case GGUF_TYPE_INT8:
+            case GGUF_TYPE_BOOL: return 1;
+            case GGUF_TYPE_UINT16:
+            case GGUF_TYPE_INT16: return 2;
+            case GGUF_TYPE_UINT32:
+            case GGUF_TYPE_INT32:
+            case GGUF_TYPE_FLOAT32: return 4;
+            case GGUF_TYPE_UINT64:
+            case GGUF_TYPE_INT64:
+            case GGUF_TYPE_FLOAT64: return 8;
+            case GGUF_TYPE_STRING:
+            case GGUF_TYPE_ARRAY:
+            case GGUF_TYPE_COUNT: return 0;
+        }
+        return 0;
+    }
+
+    void capture_cost_structure() {
+        llama_sha256_writer writer;
+        static constexpr char domain[] = "mtmd GGUF execution-cost structure";
+        writer.string(domain, sizeof(domain) - 1);
+        writer.u32(1);
+
+        std::vector<int64_t> keys;
+        keys.reserve(size_t(gguf_get_n_kv(ctx_gguf.get())));
+        for (int64_t i = 0; i < gguf_get_n_kv(ctx_gguf.get()); ++i) {
+            const char * key = gguf_get_key(ctx_gguf.get(), i);
+            // clip.* is the loader's cost-relevant metadata namespace.
+            // Deliberately exclude descriptive/source metadata such as
+            // general.name, basename, quantized_by and repo_url. Tensor
+            // type/shape/extent below carries the physical representation.
+            if (!key || std::strncmp(key, "clip.", 5) != 0) {
+                continue;
+            }
+            keys.push_back(i);
+        }
+        std::sort(keys.begin(), keys.end(), [&](int64_t lhs, int64_t rhs) {
+            return std::strcmp(gguf_get_key(ctx_gguf.get(), lhs),
+                               gguf_get_key(ctx_gguf.get(), rhs)) < 0;
+        });
+        writer.u64(keys.size());
+        for (int64_t id : keys) {
+            const char * key = gguf_get_key(ctx_gguf.get(), id);
+            writer.string(key, std::strlen(key));
+            const auto type = gguf_get_kv_type(ctx_gguf.get(), id);
+            writer.u32(uint32_t(type));
+            if (type == GGUF_TYPE_STRING) {
+                const char * value = gguf_get_val_str(ctx_gguf.get(), id);
+                writer.string(value, std::strlen(value));
+            } else if (type == GGUF_TYPE_ARRAY) {
+                const auto element_type = gguf_get_arr_type(ctx_gguf.get(), id);
+                const size_t count = gguf_get_arr_n(ctx_gguf.get(), id);
+                writer.u32(uint32_t(element_type));
+                writer.u64(count);
+                if (element_type == GGUF_TYPE_STRING) {
+                    for (size_t i = 0; i < count; ++i) {
+                        const char * value = gguf_get_arr_str(ctx_gguf.get(), id, i);
+                        writer.string(value, std::strlen(value));
+                    }
+                } else {
+                    const auto * data = static_cast<const uint8_t *>(
+                        gguf_get_arr_data(ctx_gguf.get(), id));
+                    const size_t stride = numeric_value_size(element_type);
+                    if ((!data && count != 0) || stride == 0) {
+                        throw std::runtime_error("invalid GGUF cost-structure array");
+                    }
+                    for (size_t i = 0; i < count; ++i) {
+                        write_numeric_value(writer, element_type, data + i * stride);
+                    }
+                }
+            } else {
+                write_numeric_value(
+                    writer, type, gguf_get_val_data(ctx_gguf.get(), id));
+            }
+        }
+
+        std::vector<int64_t> tensors;
+        tensors.reserve(size_t(gguf_get_n_tensors(ctx_gguf.get())));
+        for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+            tensors.push_back(i);
+        }
+        std::sort(tensors.begin(), tensors.end(), [&](int64_t lhs, int64_t rhs) {
+            return std::strcmp(gguf_get_tensor_name(ctx_gguf.get(), lhs),
+                               gguf_get_tensor_name(ctx_gguf.get(), rhs)) < 0;
+        });
+        writer.u64(tensors.size());
+        for (int64_t id : tensors) {
+            const char * name = gguf_get_tensor_name(ctx_gguf.get(), id);
+            const int64_t * ne = gguf_get_tensor_ne(ctx_gguf.get(), id);
+            writer.string(name, std::strlen(name));
+            writer.u32(uint32_t(gguf_get_tensor_type(ctx_gguf.get(), id)));
+            for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
+                writer.u64(uint64_t(ne[d]));
+            }
+            writer.u64(uint64_t(gguf_get_tensor_size(ctx_gguf.get(), id)));
+        }
+        cost_structure_digest = writer.finish();
+        cost_structure_digest_ready = true;
+    }
+
+    bool assign_cost_structure(clip_ctx & ctx_clip) const;
 
     void load_hparams(clip_model & model, clip_modality modality) {
         auto & hparams = model.hparams;
@@ -3179,6 +3350,31 @@ struct clip_model_loader {
     }
 };
 
+bool clip_model_loader::assign_cost_structure(clip_ctx & ctx_clip) const {
+    if (!cost_structure_digest_ready) return false;
+    llama_sha256_writer writer;
+    static constexpr char domain[] = "mtmd loaded execution-cost structure";
+    writer.string(domain, sizeof(domain) - 1);
+    writer.u32(1);
+    writer.bytes(cost_structure_digest.data(), cost_structure_digest.size());
+    writer.u32(uint32_t(ctx_clip.model.modality));
+    writer.u32(uint32_t(ctx_clip.model.proj_type));
+    writer.u32(uint32_t(ctx_clip.flash_attn_type));
+    writer.u32(uint32_t(ctx_clip.model.hparams.custom_image_min_tokens));
+    writer.u32(uint32_t(ctx_clip.model.hparams.custom_image_max_tokens));
+    const char * backend = ggml_backend_name(ctx_clip.backend);
+    writer.string(backend, backend ? std::strlen(backend) : 0);
+    writer.u64(ctx_clip.backend_buft.size());
+    for (const auto buft : ctx_clip.backend_buft) {
+        const char * name = buft ? ggml_backend_buft_name(buft) : nullptr;
+        writer.string(name, name ? std::strlen(name) : 0);
+    }
+    ctx_clip.cost_structure_digest = writer.finish();
+    ctx_clip.cost_structure_tensor_bytes = uint64_t(model_size);
+    ctx_clip.cost_structure_digest_ready = true;
+    return true;
+}
+
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params) {
     clip_ctx * ctx_vision = nullptr;
     clip_ctx * ctx_audio = nullptr;
@@ -3195,6 +3391,9 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
+            if (!loader.assign_cost_structure(*ctx_vision)) {
+                throw std::runtime_error("failed to capture vision cost structure");
+            }
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_vision);
             }
@@ -3209,6 +3408,9 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
+            if (!loader.assign_cost_structure(*ctx_audio)) {
+                throw std::runtime_error("failed to capture audio cost structure");
+            }
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_audio);
             }
@@ -3224,6 +3426,17 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
     }
 
     return {ctx_vision, ctx_audio};
+}
+
+bool clip_cost_structure_digest(
+        const clip_ctx * ctx, uint8_t digest[32], uint64_t * tensor_bytes) {
+    if (!ctx || !digest || !tensor_bytes || !ctx->cost_structure_digest_ready) {
+        return false;
+    }
+    std::memcpy(digest, ctx->cost_structure_digest.data(),
+                ctx->cost_structure_digest.size());
+    *tensor_bytes = ctx->cost_structure_tensor_bytes;
+    return true;
 }
 
 struct clip_cap clip_get_cap(const char * fname) {

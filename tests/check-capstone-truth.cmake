@@ -27,9 +27,13 @@ function(capstone_truth_contract common capture replay compare output)
             set(ok FALSE)
         endif()
     endforeach()
-    foreach(token IN ITEMS
-            "--claim-grade"
-            "capture_pin_issues(records"
+	foreach(token IN ITEMS
+			"--claim-grade"
+			"--calibration-replay"
+			"apply_calibration_replay_preset(args)"
+			"real_server_admission_clocks"
+			"recorded_inter_group_gaps_dropped"
+			"capture_pin_issues(records"
             "context_truncation_unreported"
             "observe_server_parallel(args)"
             "--serialize-overlap"

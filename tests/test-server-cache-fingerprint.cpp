@@ -332,11 +332,11 @@ int main() {
     mmproj[0] = 0x33;
     with_mmproj.push_back({
         server_cache_fingerprint_artifact_role::mmproj,
-        0, 789, mmproj, false });
+        0, 789, mmproj, true });
     CHECK(server_cache_execution_fingerprint_v1(
         with_mmproj, fields(), different));
     CHECK(different.execution_root != first.execution_root);
-    CHECK(!different.exact);
+    CHECK(different.exact);
 
     auto duplicate_artifact = artifacts();
     duplicate_artifact.push_back(duplicate_artifact.front());

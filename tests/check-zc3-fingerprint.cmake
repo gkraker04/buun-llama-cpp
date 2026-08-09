@@ -17,6 +17,8 @@ file(READ "${SOURCE_ROOT}/src/llama-mmap.cpp" LLAMA_MMAP_CPP)
 file(READ "${SOURCE_ROOT}/src/llama-model.cpp" LLAMA_MODEL_CPP)
 file(READ "${SOURCE_ROOT}/src/llama-ext.h" LLAMA_EXT_H)
 file(READ "${SOURCE_ROOT}/include/llama.h" PUBLIC_LLAMA_H)
+file(READ "${SOURCE_ROOT}/tools/mtmd/clip.cpp" MTMD_CLIP_CPP)
+file(READ "${SOURCE_ROOT}/tools/mtmd/mtmd.cpp" MTMD_CPP)
 file(READ "${SOURCE_ROOT}/tests/test-server-cache-fingerprint.cpp" TEST_CPP)
 
 foreach(NAME IN ITEMS
@@ -114,11 +116,48 @@ foreach(REQUIRED IN ITEMS
         "ZC6 loader-verified cost-structure identity")
 endforeach()
 foreach(REQUIRED IN ITEMS
-        "!params_base.mmproj.path.empty()"
-        "a multimodal execution fingerprint is honestly unavailable")
+        "mtmd_cost_structure_digest("
+        "server_cache_fingerprint_artifact_role::mmproj"
+        "0, tensor_bytes, structure, true"
+        "params_base.mmproj_gpu_swap")
     contract_require_token("${CONTEXT_CPP}" "${REQUIRED}"
-        "ZC3a actual-mmproj-loader fail-closed contract")
+        "ZC3a actual-mmproj-loader structural identity contract")
 endforeach()
+function(zc3_validate_mmproj_structure TEXT OUT)
+    set(VALID TRUE)
+    foreach(REQUIRED IN ITEMS
+            "mtmd GGUF execution-cost structure"
+            "std::strncmp(key, \"clip.\", 5) != 0"
+            "gguf_get_tensor_type("
+            "gguf_get_tensor_ne("
+            "gguf_get_tensor_size("
+            "mtmd loaded execution-cost structure"
+            "mtmd context execution-cost structure"
+            "total = std::max(total, bytes);")
+        string(FIND "${TEXT}" "${REQUIRED}" FOUND)
+        if (FOUND EQUAL -1)
+            set(VALID FALSE)
+        endif()
+    endforeach()
+    set(${OUT} ${VALID} PARENT_SCOPE)
+endfunction()
+set(MMPROJ_STRUCTURE "${MTMD_CLIP_CPP}${MTMD_CPP}")
+zc3_validate_mmproj_structure("${MMPROJ_STRUCTURE}" MMPROJ_STRUCTURE_VALID)
+if (NOT MMPROJ_STRUCTURE_VALID)
+    message(FATAL_ERROR
+        "ZC3a mmproj identity is not canonical, path-free structural identity")
+endif()
+set(MUTATED_MMPROJ_STRUCTURE "${MMPROJ_STRUCTURE}")
+string(REPLACE
+    "std::strncmp(key, \"clip.\", 5) != 0"
+    "false"
+    MUTATED_MMPROJ_STRUCTURE "${MUTATED_MMPROJ_STRUCTURE}")
+zc3_validate_mmproj_structure(
+    "${MUTATED_MMPROJ_STRUCTURE}" MUTATED_MMPROJ_STRUCTURE_VALID)
+if (MUTATED_MMPROJ_STRUCTURE_VALID)
+    message(FATAL_ERROR
+        "ZC3a mmproj metadata-scope negative control did not trip")
+endif()
 foreach(REQUIRED IN ITEMS
         "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
         "GGML_BACKEND_DEVICE_LINK_V1_PROC"

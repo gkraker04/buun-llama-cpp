@@ -2545,9 +2545,9 @@ private:
 
     void cache_fingerprint_start() noexcept {
         if (!cache_optimizer_observations || !model_tgt ||
-            // mtmd does not yet expose the loaded projector's canonical
-            // execution-cost structure; a multimodal execution fingerprint is honestly unavailable.
-            !params_base.mmproj.path.empty()) {
+            // GPU-swap changes the projector's effective backend after startup;
+            // one static execution root cannot represent both placements.
+            params_base.mmproj_gpu_swap) {
             return;
         }
         try {
@@ -2601,6 +2601,18 @@ private:
                     server_cache_fingerprint_artifact_role::draft))) {
                 cache_fingerprint_worker.reset();
                 return;
+            }
+            if (mctx) {
+                std::array<uint8_t, 32> structure = {};
+                uint64_t tensor_bytes = 0;
+                if (!mtmd_cost_structure_digest(
+                        mctx, structure.data(), &tensor_bytes) ||
+                    !cache_fingerprint_worker->add_fixed_artifact({
+                        server_cache_fingerprint_artifact_role::mmproj,
+                        0, tensor_bytes, structure, true })) {
+                    cache_fingerprint_worker.reset();
+                    return;
+                }
             }
             if (params_base.cache_optimizer.cache_debug) {
                 SRV_INF("CACHE_FINGERPRINT_INPUT config_exact=%d artifacts_exact=%d inexact_fields=%08x\n",
