@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <map>
-#include <vector>
 
 // Internal, passive completion metadata for an explicitly armed server
 // observation.  Arming never synchronizes; the first already-required
@@ -29,35 +28,18 @@ LLAMA_API bool llama_context_pipeline_parallel_active(
         const llama_context * ctx);
 LLAMA_API bool llama_context_vbr_vmm_active(const llama_context * ctx);
 
-// Duplicates of the exact descriptors opened by the model loader. The caller
-// owns descriptor and must close it. integrity_exact means the backing object
-// was immutable before loading (sealed object or fs-verity); hashing a normal
-// mutable file remains a shadow-only compatibility seed.
-struct llama_model_artifact_descriptor {
-    int descriptor;
-    uint64_t byte_length;
-    bool integrity_exact;
-};
+// Returns the loader-verified execution-cost structure of a model. The
+// digest covers architecture/hyperparameters and canonical tensor
+// descriptors, but intentionally excludes tensor payload bytes.
+LLAMA_API bool llama_model_cost_structure_digest(
+        const llama_model * model, uint8_t * out, uint64_t * tensor_bytes);
 
-LLAMA_API bool llama_model_dup_artifact_descriptors(
-        const llama_model * model,
-        std::vector<llama_model_artifact_descriptor> & out);
-LLAMA_API bool llama_model_dup_artifact_descriptors_bounded(
-        const llama_model * model,
-        llama_model_artifact_descriptor * out,
-        size_t capacity,
-        size_t * count);
-LLAMA_API void llama_model_artifact_descriptors_close(
-        std::vector<llama_model_artifact_descriptor> & descriptors);
-LLAMA_API void llama_model_artifact_descriptors_close_bounded(
-        llama_model_artifact_descriptor * descriptors,
-        size_t count);
-
-// Internal load-scope switch. The server enables descriptor retention only
-// while loading a model for an active optimizer observation store. Returning
-// the prior value makes nested common fit/probe loads restore the exact state.
-LLAMA_API bool llama_model_artifact_capture_set(bool enabled);
-LLAMA_API bool llama_model_artifact_capture_enabled(void);
+// Internal load-scope switch. The server enables execution-cost structure
+// capture only while loading a model for an active optimizer observation
+// store. Returning the prior value makes nested common fit/probe loads restore
+// the exact state.
+LLAMA_API bool llama_model_cost_structure_capture_set(bool enabled);
+LLAMA_API bool llama_model_cost_structure_capture_enabled(void);
 
 // Like llama_state_seq_set_data_ext(), but reports only the causally-owned
 // state install after that API's pre-existing synchronize. No new fence is

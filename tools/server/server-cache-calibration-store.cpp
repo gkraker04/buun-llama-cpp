@@ -2587,7 +2587,7 @@ bool server_cache_calibration_coordinator::resolve_load(
         if (observer.mutation_generation() != 0 &&
             server_cache_calibration_snapshot_observer(observer,
                                                         snapshot_buffer_)) {
-            const bool enqueued = enqueue_latest(observer, ggml_time_us());
+            const bool enqueued = enqueue_latest(observer);
             if (!cache_snapshot(snapshot_buffer_) && !enqueued) {
                 // One overflow image preserves the final dirty profile. The
                 // next root runs identity-unavailable shadow mode until the
@@ -2817,6 +2817,7 @@ bool server_cache_calibration_coordinator::enqueue_one_cached_dirty() noexcept {
             if (!writer_.enqueue(overflow_snapshot_)) return false;
             currency->last_enqueued_mutation_generation =
                 overflow_snapshot_.mutation_generation;
+            currency->dirty_since_us = 0;
             overflow_dirty_ = false;
             overflow_snapshot_ = {};
             cached_dirty_ = has_cached_dirty();
@@ -2842,12 +2843,14 @@ bool server_cache_calibration_coordinator::enqueue_one_cached_dirty() noexcept {
             value.profile_identity_digest = profile.profile_identity_digest;
             value.last_enqueued_mutation_generation =
                 profile.mutation_generation;
+            value.dirty_since_us = 0;
             value.profile_state_rank = profile_reuse_state_rank(profile);
             value.clock_authority_reset = profile.clock_authority_reset;
             if (!profile_currencies_.push_back(value)) return false;
         } else {
             currency->last_enqueued_mutation_generation =
                 profile.mutation_generation;
+            currency->dirty_since_us = 0;
         }
         if (overflow_dirty_) {
             (void) cache_snapshot(overflow_snapshot_);
@@ -2860,8 +2863,7 @@ bool server_cache_calibration_coordinator::enqueue_one_cached_dirty() noexcept {
 }
 
 bool server_cache_calibration_coordinator::enqueue_latest(
-        server_cache_observation_store & observer,
-        int64_t now_us) noexcept {
+        server_cache_observation_store & observer) noexcept {
     const uint64_t mutation = observer.mutation_generation();
     auto currency = std::find_if(
         profile_currencies_.begin(), profile_currencies_.end(),
@@ -2889,8 +2891,21 @@ bool server_cache_calibration_coordinator::enqueue_latest(
     if (!writer_.enqueue(snapshot_buffer_)) return false;
     profile_identity_digest_ = observer.execution_fingerprint().execution_root;
     currency->last_enqueued_mutation_generation = mutation;
-    last_enqueue_us_ = now_us;
+    currency->dirty_since_us = 0;
     return true;
+}
+
+bool server_cache_calibration_profile_persistence_due(
+        server_cache_calibration_profile_currency & currency,
+        uint64_t mutation_generation,
+        int64_t now_us) noexcept {
+    if (mutation_generation <= currency.last_enqueued_mutation_generation) {
+        currency.dirty_since_us = 0;
+        return false;
+    }
+    if (currency.dirty_since_us == 0) currency.dirty_since_us = now_us;
+    return mutation_generation - currency.last_enqueued_mutation_generation >= 64 ||
+        now_us - currency.dirty_since_us >= 30000000;
 }
 
 void server_cache_calibration_coordinator::lifecycle(
@@ -2909,15 +2924,26 @@ void server_cache_calibration_coordinator::lifecycle(
             resume_outcomes[i].kind ==
                 server_cache_resume_validation_outcome_kind::succeeded);
     }
-    const auto current = std::find_if(
+    auto current = std::find_if(
         profile_currencies_.begin(), profile_currencies_.end(),
         [&](const auto & value) {
             return value.profile_identity_digest == profile_identity_digest_;
         });
     const uint64_t mutation = observer.mutation_generation();
+    if (current == profile_currencies_.end() && mutation != 0 &&
+        profile_currencies_.size() < profile_currencies_.capacity()) {
+        server_cache_calibration_profile_currency value;
+        value.profile_identity_digest = profile_identity_digest_;
+        if (profile_currencies_.push_back(value)) {
+            current = profile_currencies_.end() - 1;
+        }
+    }
     const uint64_t last_enqueued = current == profile_currencies_.end()
         ? 0 : current->last_enqueued_mutation_generation;
     const bool current_dirty = mutation > last_enqueued;
+    if (!current_dirty && current != profile_currencies_.end()) {
+        current->dirty_since_us = 0;
+    }
     if (!cached_dirty_ && !overflow_dirty_ && !current_dirty) return;
     const int64_t now_us = ggml_time_us();
     if ((cached_dirty_ || overflow_dirty_) &&
@@ -2932,12 +2958,12 @@ void server_cache_calibration_coordinator::lifecycle(
         deferred_fingerprint_.reset();
     }
     if (!current_dirty) return;
-    const bool sample_due = mutation >= last_enqueued &&
-        mutation - last_enqueued >= 64;
-    const bool time_due = last_enqueue_us_ == 0 ||
-        now_us - last_enqueue_us_ >= 30000000;
-    if (sample_due || time_due) {
-        enqueue_latest(observer, now_us);
+    const bool persistence_due = current != profile_currencies_.end()
+        ? server_cache_calibration_profile_persistence_due(
+              *current, mutation, now_us)
+        : mutation >= 64;
+    if (persistence_due) {
+        enqueue_latest(observer);
     }
 }
 
@@ -2945,7 +2971,7 @@ void server_cache_calibration_coordinator::flush_latest(
         server_cache_observation_store & observer) noexcept {
     if (observer.mutation_generation() != 0 &&
         server_cache_calibration_snapshot_observer(observer, snapshot_buffer_)) {
-        const bool enqueued = enqueue_latest(observer, ggml_time_us());
+        const bool enqueued = enqueue_latest(observer);
         if (!cache_snapshot(snapshot_buffer_) && !enqueued) {
             overflow_snapshot_ = snapshot_buffer_;
             overflow_dirty_ = true;

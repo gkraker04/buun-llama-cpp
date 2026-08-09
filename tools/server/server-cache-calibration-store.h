@@ -242,6 +242,9 @@ struct server_cache_calibration_profile_currency {
                server_cache_observation_store::instance_capacity>
         committed_fit_generation_used = {};
     uint64_t profile_last_use_epoch = 0;
+    // The persistence cadence belongs to this exact profile.  A model/profile
+    // switch must not lend elapsed dirty time to a different currency.
+    int64_t dirty_since_us = 0;
     uint8_t profile_state_rank = 0;
     bool committed_ack_seen = false;
     // A persisted seed remains validation-pending across process-local
@@ -253,6 +256,11 @@ struct server_cache_calibration_profile_currency {
     bool clock_authority_reset = false;
     bool persisted_origin = false;
 };
+
+bool server_cache_calibration_profile_persistence_due(
+    server_cache_calibration_profile_currency & currency,
+    uint64_t mutation_generation,
+    int64_t now_us) noexcept;
 
 // Envelope helpers are public only to the model-free persistence tests. The
 // payload parser is bounded before JSON allocation and rejects duplicate keys.
@@ -452,8 +460,7 @@ public:
         uint32_t estimator_slot, bool succeeded) noexcept;
 
 private:
-    bool enqueue_latest(server_cache_observation_store & observer,
-                        int64_t now_us) noexcept;
+    bool enqueue_latest(server_cache_observation_store & observer) noexcept;
     bool enqueue_one_cached_dirty() noexcept;
     bool has_cached_dirty() const noexcept;
     bool consume_acks() noexcept;
@@ -469,7 +476,6 @@ private:
         server_cache_calibration_profile_currency, 16, uint8_t> profile_currencies_;
     uint64_t profile_last_use_epoch_ = 0;
     bool profile_reuse_disabled_ = false;
-    int64_t last_enqueue_us_ = 0;
     server_cache_resume_validation_flags resume_pending_ = {};
     server_cache_resume_validation_flags
         resume_authority_validation_required_ = {};

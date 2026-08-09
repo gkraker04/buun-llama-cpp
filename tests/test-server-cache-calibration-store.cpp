@@ -1222,6 +1222,61 @@ int main() {
     CHECK(!corrupt_writer.enqueue(retry_profile));
     corrupt_writer.stop();
 
+    // The first dirty row starts the 30-second cadence; it must not publish a
+    // profile immediately.  Stopping the worker drains only work that was
+    // actually enqueued, making this a deterministic assertion rather than a
+    // timing race against the background writer.
+    const fs::path cadence_directory = fs::temp_directory_path() /
+        ("buun-zc3b-cadence-" + std::to_string(pid));
+    fs::remove_all(cadence_directory, ec);
+    {
+        auto cadence_coordinator_owner =
+            std::make_unique<server_cache_calibration_coordinator>();
+        auto & cadence_coordinator = *cadence_coordinator_owner;
+        CHECK(cadence_coordinator.start(cadence_directory.string(), {}));
+        server_cache_execution_fingerprint cadence_fingerprint;
+        cadence_fingerprint.complete = true;
+        cadence_fingerprint.execution_root[0] = 0x90;
+        server_cache_observation_store cadence_observer;
+        bool cadence_loaded = false;
+        for (int i = 0; i < 500 &&
+                 !(cadence_loaded = cadence_coordinator.resolve_load(
+                     cadence_fingerprint, cadence_observer)); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(cadence_loaded);
+        auto cadence_row = accepted_record(cadence_fingerprint);
+        CHECK(cadence_observer.observe(cadence_row));
+        cadence_coordinator.lifecycle(cadence_observer);
+        cadence_coordinator.stop();
+    }
+    {
+        server_cache_calibration_store cadence_store;
+        server_cache_calibration_profile_set cadence_profiles;
+        CHECK(cadence_store.open(cadence_directory.string()) ==
+              server_cache_calibration_load_status::ok);
+        CHECK(cadence_store.load_profiles(cadence_profiles) ==
+              server_cache_calibration_load_status::ok);
+        CHECK(cadence_profiles.empty());
+        cadence_store.close();
+    }
+
+    // Dirty cadence is profile currency, not coordinator wall time.  A's
+    // elapsed age can make A due without making newly-dirty B due.
+    server_cache_calibration_profile_currency cadence_a;
+    server_cache_calibration_profile_currency cadence_b;
+    CHECK(!server_cache_calibration_profile_persistence_due(
+        cadence_a, 1, 100));
+    CHECK(cadence_a.dirty_since_us == 100);
+    CHECK(server_cache_calibration_profile_persistence_due(
+        cadence_a, 1, 30000100));
+    CHECK(!server_cache_calibration_profile_persistence_due(
+        cadence_b, 1, 30000100));
+    CHECK(cadence_b.dirty_since_us == 30000100);
+    CHECK(!server_cache_calibration_profile_persistence_due(
+        cadence_a, 0, 30000101));
+    CHECK(cadence_a.dirty_since_us == 0);
+
     // One sub-cadence row is flushed explicitly at the model-sleep/final
     // lifecycle door and reconstructs on the next process.
     const fs::path coordinator_directory = fs::temp_directory_path() /
@@ -1528,6 +1583,7 @@ int main() {
     fs::remove_all(async_directory, ec);
     fs::remove_all(regression_directory, ec);
     fs::remove_all(prune_directory, ec);
+    fs::remove_all(cadence_directory, ec);
     fs::remove_all(manifest_fault_directory, ec);
     fs::remove_all(reference_fault_directory, ec);
     fs::remove_all(swapped_directory, ec);

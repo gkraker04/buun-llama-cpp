@@ -2474,7 +2474,6 @@ private:
         cache_calibration;
     std::optional<server_cache_execution_fingerprint> cache_fingerprint_pending;
     bool cache_fingerprint_ready_logged = false;
-    bool cache_fingerprint_scheduler_busy = false;
     uint64_t cache_calibration_inventory_ordinal = 0;
     bool cache_calibration_inventory_currency_exhausted = false;
     int cache_calibration_last_profile_use_task = -1;
@@ -2546,9 +2545,8 @@ private:
 
     void cache_fingerprint_start() noexcept {
         if (!cache_optimizer_observations || !model_tgt ||
-            // mtmd currently exposes only a path-reopening loader. Until it
-            // can duplicate the descriptor actually consumed by inference,
-            // a multimodal execution fingerprint is honestly unavailable.
+            // mtmd does not yet expose the loaded projector's canonical
+            // execution-cost structure; a multimodal execution fingerprint is honestly unavailable.
             !params_base.mmproj.path.empty()) {
             return;
         }
@@ -2587,34 +2585,14 @@ private:
             bool artifact_inputs_exact = true;
             auto append_model = [&](const llama_model * model,
                                     server_cache_fingerprint_artifact_role role) {
-                std::array<llama_model_artifact_descriptor,
-                           server_cache_fingerprint_worker::descriptor_capacity>
-                    source = {};
-                size_t source_count = 0;
-                if (!llama_model_dup_artifact_descriptors_bounded(
-                        model, source.data(), source.size(), &source_count)) {
+                std::array<uint8_t, 32> structure = {};
+                uint64_t tensor_bytes = 0;
+                if (!llama_model_cost_structure_digest(
+                        model, structure.data(), &tensor_bytes)) {
                     return false;
                 }
-                try {
-                    for (uint32_t i = 0; i < source_count; ++i) {
-                        artifact_inputs_exact = artifact_inputs_exact &&
-                            source[i].integrity_exact;
-                        const int descriptor = source[i].descriptor;
-                        source[i].descriptor = -1;
-                        if (!cache_fingerprint_worker->add_descriptor({
-                                role, i, descriptor, source[i].byte_length,
-                                source[i].integrity_exact })) {
-                            llama_model_artifact_descriptors_close_bounded(
-                                source.data(), source_count);
-                            return false;
-                        }
-                    }
-                    return true;
-                } catch (...) {
-                    llama_model_artifact_descriptors_close_bounded(
-                        source.data(), source_count);
-                    return false;
-                }
+                return cache_fingerprint_worker->add_fixed_artifact({
+                    role, 0, tensor_bytes, structure, true });
             };
             if (!append_model(model_tgt,
                               server_cache_fingerprint_artifact_role::target) ||
@@ -2640,20 +2618,11 @@ private:
                     params_base.lora_adapters[i].ptr, content.data());
                 if (!cache_fingerprint_worker->add_fixed_artifact({
                     server_cache_fingerprint_artifact_role::adapter,
-                    i, 0, content,
-                    // The loaded content is immutable, but the current adapter
-                    // API does not expose its exact serialized byte extent.
-                    false })) {
+                    i, 0, content, true })) {
                     cache_fingerprint_worker.reset();
                     return;
                 }
             }
-            cache_fingerprint_worker->set_scheduler_demand(
-                cache_fingerprint_scheduler_busy ||
-                std::any_of(slots.begin(), slots.end(),
-                    [](const server_slot & slot) {
-                        return slot.is_processing();
-                    }));
             if (!cache_fingerprint_worker->launch()) {
                 cache_fingerprint_worker.reset();
             }
@@ -2670,7 +2639,6 @@ private:
             server_cache_execution_fingerprint result;
             if (cache_fingerprint_worker->poll(result)) {
                 cache_fingerprint_pending = result;
-                cache_fingerprint_worker->stop();
                 cache_fingerprint_worker.reset();
             }
         }
@@ -4905,10 +4873,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy(bool final_shutdown = false) {
-        // ZC3a hashes loader-owned descriptor duplicates only. Join before
-        // model/context teardown; cancellation never publishes a partial root.
+        // The synchronous combiner lives in the optimizer arena. Retire its
+        // result owner before model/context and arena teardown.
         if (cache_fingerprint_worker) {
-            cache_fingerprint_worker->stop();
             cache_fingerprint_worker.reset();
         }
         if (cache_calibration && cache_optimizer_observations) {
@@ -5285,14 +5252,15 @@ private:
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
-        const bool prior_artifact_capture = llama_model_artifact_capture_set(
+        const bool prior_structure_capture =
+            llama_model_cost_structure_capture_set(
             params_base.cache_optimizer.observer_store_enabled);
-        struct artifact_capture_scope {
+        struct cost_structure_capture_scope {
             bool prior;
-            ~artifact_capture_scope() {
-                (void) llama_model_artifact_capture_set(prior);
+            ~cost_structure_capture_scope() {
+                (void) llama_model_cost_structure_capture_set(prior);
             }
-        } artifact_capture_guard { prior_artifact_capture };
+        } cost_structure_capture_guard { prior_structure_capture };
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -6508,14 +6476,23 @@ private:
                                 64),
                             server_cache_calibration_arena_layout::codec_scratch_size));
                 }
+                bool persistence_started = false;
                 if (cache_calibration_snapshots && cache_calibration &&
                     cache_calibration->health() ==
                         server_cache_calibration_writer_health::idle &&
-                    !cache_calibration->start(calibration_dir, state_root)) {
+                    cache_calibration->start(calibration_dir, state_root)) {
+                    persistence_started = true;
+                    SRV_INF("cache optimizer calibration profile root: %s\n",
+                            calibration_dir.c_str());
+                } else {
                     cache_calibration.reset();
+                }
+                if (!persistence_started) {
+                    SRV_WRN("%s", "cache optimizer calibration persistence unavailable; continuing in memory\n");
                 }
             } catch (...) {
                 cache_calibration.reset();
+                SRV_WRN("%s", "cache optimizer calibration persistence unavailable; continuing in memory\n");
             }
             cache_fingerprint_start();
         }
@@ -7152,12 +7129,6 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task) {
-            // New-task dispatch performs scheduler-owned selection and restore
-            // before update_slots(). Pause the background verifier first.
-            cache_fingerprint_scheduler_busy = true;
-            if (cache_fingerprint_worker) {
-                cache_fingerprint_worker->set_scheduler_demand(true);
-            }
             process_single_task(std::move(task));
         });
         queue_tasks.on_update_slots([this]() {
@@ -8420,12 +8391,17 @@ private:
         cache_plan_host_source_registry source_registry(
             !mode.preflight);
         cache_plan_derive_incoming_adapter(task, target, out);
+        const bool local_identity_ready =
+            cache_optimizer_observations &&
+            cache_optimizer_observations->execution_fingerprint().complete &&
+            cache_optimizer_observations->execution_fingerprint().exact;
         if (cache_optimizer_observations &&
             (!mode.preflight ||
              (params_base.cache_optimizer.mode ==
                   common_cache_optimizer_mode::auto_mode &&
               params_base.cache_optimizer.local_authority_ceiling !=
-                  common_cache_plan_authority_level::off))) {
+                  common_cache_plan_authority_level::off)) &&
+            (mode.preflight || local_identity_ready)) {
             out.observations.emplace();
         }
         cache_plan_inventory_before_mutation(
@@ -8433,7 +8409,7 @@ private:
             source_registry,
             out.observations ? &*out.observations : nullptr);
         uint64_t inventory_ordinal = 0;
-        if (!mode.preflight && cache_optimizer_observations &&
+        if (!mode.preflight && cache_optimizer_observations && out.observations &&
             !rec.inventory_saturated() &&
             !cache_calibration_inventory_currency_exhausted) {
             if (cache_calibration_inventory_ordinal == UINT64_MAX) {
@@ -8523,8 +8499,9 @@ private:
                 common_cache_optimizer_mode::auto_mode &&
             params_base.cache_optimizer.local_authority_ceiling !=
                 common_cache_plan_authority_level::off &&
-            cache_optimizer_observations && out.observations;
+            cache_optimizer_observations;
         if (local_mode) {
+            static const server_cache_plan_local_inventory unavailable_evidence;
             if (!mode.preflight) {
                 out.local_authority.emplace();
             }
@@ -8539,7 +8516,9 @@ private:
                 server_cache_plan_legacy_candidate(
                     rec, target.id, out.host_lookup_enabled);
             mode.plan_authority->plan_local_before_mutation(
-                rec, out.observations->local,
+                rec, out.observations
+                    ? out.observations->local
+                    : unavailable_evidence,
                 *cache_optimizer_observations, legacy_candidate,
                 capability_before, capability_after,
                 now_ms < 0 ? 0 : uint64_t(now_ms),
@@ -11294,26 +11273,6 @@ private:
         }
 #endif
 
-        struct fingerprint_scheduler_scope {
-            server_context_impl & context;
-            explicit fingerprint_scheduler_scope(server_context_impl & value)
-                : context(value) {
-                context.cache_fingerprint_scheduler_busy = true;
-                if (context.cache_fingerprint_worker) {
-                    context.cache_fingerprint_worker->set_scheduler_demand(true);
-                }
-            }
-            ~fingerprint_scheduler_scope() {
-                context.cache_fingerprint_scheduler_busy = false;
-                if (!context.cache_fingerprint_worker) {
-                    return;
-                }
-                const bool demand = std::any_of(
-                    context.slots.begin(), context.slots.end(),
-                    [](const server_slot & slot) { return slot.is_processing(); });
-                context.cache_fingerprint_worker->set_scheduler_demand(demand);
-            }
-        } fingerprint_demand_guard(*this);
         cache_fingerprint_lifecycle_point();
 
         // E1 holder/lease expiry is scheduler-owned even when no further E1

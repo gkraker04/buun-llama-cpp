@@ -332,11 +332,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
-        // Preserve duplicates of the exact loader-owned descriptors only for
-        // an explicitly armed internal load scope. Failure only makes ZC3
-        // identity unavailable; model loading and inference remain unchanged.
-        if (llama_model_artifact_capture_enabled()) {
-            (void) model->capture_artifact_descriptors(ml);
+        // Capture cost identity from metadata already verified by the loader.
+        // This is O(tensor-count) and never rereads model payload bytes.
+        if (llama_model_cost_structure_capture_enabled()) {
+            (void) model->capture_cost_structure_digest();
         }
 
         return {0, model_ptr.release()};
@@ -468,19 +467,15 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
 }
 
-bool llama_model_dup_artifact_descriptors(
-        const llama_model * model,
-        std::vector<llama_model_artifact_descriptor> & out) {
-    return model && model->duplicate_artifact_descriptors(out);
-}
-
-bool llama_model_dup_artifact_descriptors_bounded(
-        const llama_model * model,
-        llama_model_artifact_descriptor * out,
-        size_t capacity,
-        size_t * count) {
-    return model && model->duplicate_artifact_descriptors_bounded(
-        out, capacity, count);
+bool llama_model_cost_structure_digest(
+        const llama_model * model, uint8_t * out, uint64_t * tensor_bytes) {
+    if (!model || !out || !tensor_bytes) return false;
+    std::array<uint8_t, 32> digest = {};
+    uint64_t bytes = 0;
+    if (!model->cost_structure_digest(digest, bytes)) return false;
+    std::memcpy(out, digest.data(), digest.size());
+    *tensor_bytes = bytes;
+    return true;
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

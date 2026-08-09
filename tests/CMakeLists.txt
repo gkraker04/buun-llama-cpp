@@ -530,6 +530,18 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-zc4-shadow-report.py
 )
 add_test(
+    NAME test-zc6-capstone-report
+    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tools/server/bench/zc6-capstone-report.py
+        --self-test
+)
+add_test(
+    NAME test-zc6-capstone-runner-cleanup
+    COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tools/server/bench/zc0-light-gate.py
+        --self-test-cleanup
+)
+add_test(
     NAME test-capstone-truth
     COMMAND ${CAPSTONE_PYTHON_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test-capstone-truth.py

@@ -653,13 +653,9 @@ struct llama_model {
     void adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf);
     const float * tensor_split() const;
     const float * effective_tensor_split(size_t & count) const noexcept;
-    bool capture_artifact_descriptors(llama_model_loader & ml) noexcept;
-    bool duplicate_artifact_descriptors(
-        std::vector<llama_model_artifact_descriptor> & out) const noexcept;
-    bool duplicate_artifact_descriptors_bounded(
-        llama_model_artifact_descriptor * out,
-        size_t capacity,
-        size_t * count) const noexcept;
+    bool capture_cost_structure_digest() noexcept;
+    bool cost_structure_digest(
+        std::array<uint8_t, 32> & out, uint64_t & tensor_bytes) const noexcept;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;

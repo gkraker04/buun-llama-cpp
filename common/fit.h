@@ -32,7 +32,9 @@ void common_fit_print(
                  llama_model_params * mparams,
                llama_context_params * cparams);
 
-void common_memory_breakdown_print(const llama_context * ctx);
+void common_memory_breakdown_print(
+    const llama_context * ctx,
+    bool final_device_witness = false);
 
 struct common_device_memory_data {
     int64_t total;

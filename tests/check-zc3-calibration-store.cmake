@@ -41,6 +41,10 @@ foreach(REQUIRED IN ITEMS
         "resume_validation_pending[instance.slot] = true"
         "complete_resume_validation("
         "enqueue_one_cached_dirty()"
+        "int64_t dirty_since_us = 0"
+        "server_cache_calibration_profile_persistence_due("
+        "currency.dirty_since_us = now_us"
+        "now_us - currency.dirty_since_us >= 30000000"
         "Slot reuse requires immutable-snapshot acceptance"
         "committed_ack_count_.load(std::memory_order_acquire)"
         "drain_latest_for_shutdown("
@@ -50,6 +54,14 @@ foreach(REQUIRED IN ITEMS
     contract_require_token("${STORE_CPP}${STORE_H}" "${REQUIRED}"
         "ZC3b bounded/capability/dirty-currency contract")
 endforeach()
+
+contract_forbid_token("${STORE_CPP}"
+    "last_enqueue_us_ == 0 ||"
+    "ZC3b first dirty row must not bypass the 64-mutation/30-second cadence")
+contract_forbid_token("${STORE_H}" "dirty_since_us_"
+    "ZC3b dirty cadence must be owned by exact profile currency")
+contract_forbid_token("${STORE_H}" "last_enqueue_us_"
+    "ZC3b dirty cadence must not retain a coordinator-global clock")
 
 foreach(REQUIRED IN ITEMS
         "cache_calibration->start(calibration_dir, state_root)"
@@ -303,6 +315,17 @@ count_literal("${MUTATED_PROFILE_SWITCH}"
     MUTATED_PROFILE_SWITCH_COUNT)
 if (NOT MUTATED_PROFILE_SWITCH_COUNT LESS PROFILE_SWITCH_COUNT)
     message(FATAL_ERROR "ZC3b profile-transition negative control did not trip")
+endif()
+
+set(MUTATED_DIRTY_CURRENCY "${STORE_CPP}")
+string(REPLACE "currency.dirty_since_us = now_us"
+    "/* removed per-profile dirty clock */"
+    MUTATED_DIRTY_CURRENCY "${MUTATED_DIRTY_CURRENCY}")
+string(FIND "${MUTATED_DIRTY_CURRENCY}"
+    "currency.dirty_since_us = now_us" MUTATED_DIRTY_CURRENCY_FOUND)
+if (NOT MUTATED_DIRTY_CURRENCY_FOUND EQUAL -1)
+    message(FATAL_ERROR
+        "ZC3b per-profile dirty-cadence negative control did not trip")
 endif()
 
 message(STATUS "ZC3b calibration-store contract checks passed")

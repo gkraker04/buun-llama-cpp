@@ -22,7 +22,6 @@ struct llama_file {
     size_t size() const;
 
     int file_id() const; // fileno overload
-    bool integrity_exact_at_open() const;
 
     void seek(size_t offset, int whence) const;
 

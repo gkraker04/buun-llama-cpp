@@ -8,6 +8,7 @@
 
 #include "arg.h"
 #include "build-info.h"
+#include "common-cache-plan.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -141,6 +142,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
                                && params.model.hf_repo.empty();
+
+    if (!is_router_server) {
+        SRV_INF("cache optimizer: mode=%s (%s), retention=%s, calibration=%s, landed authority=%s, local ceiling=%s\n",
+                common_cache_optimizer_mode_name(cache_optimizer.mode),
+                params.cache_optimizer_mode_explicit ? "explicit" : "default",
+                cache_optimizer.retention_policy ==
+                        common_cache_optimizer_retention_policy::intentional_baseline
+                    ? "intentional" : "historical",
+                cache_optimizer.observer_store_enabled ? "enabled" : "disabled",
+                common_cache_plan_authority_level_name(
+                    cache_optimizer.landed_authority_level),
+                common_cache_plan_authority_level_name(
+                    cache_optimizer.local_authority_ceiling));
+    }
 
     if (cache_optimizer.cache_plan_preflight &&
         (is_router_server ||
@@ -535,7 +550,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         auto * ll_ctx = ctx_server.get_llama_context();
         if (ll_ctx != nullptr) {
-            common_memory_breakdown_print(ll_ctx);
+            common_memory_breakdown_print(ll_ctx, true);
         }
     }
 

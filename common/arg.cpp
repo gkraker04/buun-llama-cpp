@@ -4271,7 +4271,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
         {"--cache-optimizer"}, "MODE",
-        "zero-config cache optimizer mode: off, baseline, learn, or auto (default: off)",
+        "zero-config cache optimizer mode: off, baseline, learn, or auto (default: auto; use off for the historical policy)",
         [](common_params & params, const std::string & value) {
             params.cache_optimizer_mode = common_cache_optimizer_mode_parse(value);
             params.cache_optimizer_mode_explicit = true;

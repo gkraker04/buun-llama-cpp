@@ -1320,7 +1320,9 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
-void common_memory_breakdown_print(const struct llama_context * ctx) {
+void common_memory_breakdown_print(
+        const struct llama_context * ctx,
+        bool final_device_witness) {
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);
 
@@ -1459,6 +1461,22 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         LOG_TRC(td[0].c_str(),
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
+    }
+
+    // Claim-grade resource gates need allocator-owner bytes, not only a
+    // process-wide driver high-water that can move by one CUDA graph-pool
+    // quantum when legal concurrent batching changes.  This opt-in witness is
+    // emitted after the workload, from llama's actual model/context/compute
+    // buffers, and does not run on ordinary invocations.
+    if (final_device_witness &&
+        std::getenv("LLAMA_DEVICE_MEMORY_WITNESS") != nullptr) {
+        LOG_INF("LLAMA_DEVICE_MEMORY_BEGIN count=%zu\n", mb_dev.size());
+        for (size_t i = 0; i < mb_dev.size(); ++i) {
+            const auto & mb = mb_dev[i];
+            LOG_INF("LLAMA_DEVICE_MEMORY device=%zu model=%zu context=%zu compute=%zu total=%zu\n",
+                i, mb.model, mb.context, mb.compute, mb.total());
+        }
+        LOG_INF("LLAMA_DEVICE_MEMORY_END count=%zu\n", mb_dev.size());
     }
 }
 

@@ -8,8 +8,6 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <chrono>
-#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -21,26 +19,15 @@
 #  include <cpuid.h>
 #endif
 
-#if defined(_WIN32)
-#  include <io.h>
-#else
-#  if defined(__linux__)
-#    include <linux/ioprio.h>
-#    include <sys/syscall.h>
-#  endif
-#  include <unistd.h>
-#endif
-
 namespace {
 
 constexpr size_t MAX_CODEC_BYTES = 1024 * 1024;
-// Frozen total fingerprint-worker region budget. The in-object read buffer
-// reserves a small suffix for the worker's thread/state members.
-constexpr size_t HASH_CHUNK_BYTES = 1024 * 1024;
-constexpr uint64_t HASH_RATE_BYTES_PER_SECOND = 32ULL * 1024 * 1024;
-constexpr char ARTIFACT_DOMAIN[] = "buun-zc-artifacts-v1";
+// Frozen total fingerprint-worker region budget. The in-object codec buffer
+// reserves a small suffix for the combiner state.
+constexpr size_t FINGERPRINT_ARENA_BYTES = 1024 * 1024;
+constexpr char ARTIFACT_DOMAIN[] = "buun-zc-cost-structures-v1";
 constexpr char CONFIG_DOMAIN[] = "buun-zc-config-v1";
-constexpr char EXEC_DOMAIN[] = "buun-zc-exec-v1";
+constexpr char EXEC_DOMAIN[] = "buun-zc-exec-v2";
 constexpr char ADAPTER_APPLICATION_DOMAIN[] =
     "buun-zc-adapter-application-v1";
 
@@ -466,7 +453,7 @@ void fingerprint_artifact_hash_update(
     hash_u16(hash, uint16_t(artifact.role));
     hash_u32(hash, artifact.ordinal);
     hash_u64(hash, artifact.byte_length);
-    hash.update(artifact.content_sha256.data(), artifact.content_sha256.size());
+    hash.update(artifact.structure_sha256.data(), artifact.structure_sha256.size());
 }
 
 std::array<uint8_t, 32> digest_text(const std::string & value) {
@@ -1125,31 +1112,9 @@ bool fingerprint_config_root_from_params(
     }
 }
 
-void close_descriptor(int fd) noexcept {
-    if (fd < 0) {
-        return;
-    }
-#if defined(_WIN32)
-    _close(fd);
-#else
-    close(fd);
-#endif
-}
-
-int64_t read_at(int fd, void * data, size_t size, uint64_t offset) noexcept {
-#if defined(_WIN32)
-    if (_lseeki64(fd, offset, SEEK_SET) < 0) {
-        return -1;
-    }
-    return _read(fd, data, unsigned(std::min<size_t>(size, INT_MAX)));
-#else
-    return pread(fd, data, size, off_t(offset));
-#endif
-}
-
 } // namespace
 
-static_assert(sizeof(server_cache_fingerprint_worker) <= HASH_CHUNK_BYTES,
+static_assert(sizeof(server_cache_fingerprint_worker) <= FINGERPRINT_ARENA_BYTES,
               "fingerprint worker must fit its fixed 1-MiB arena region");
 
 server_cache_fingerprint_field server_cache_fingerprint_bool(
@@ -1285,7 +1250,7 @@ bool server_cache_execution_fingerprint_v1(
             append_u32(artifact_bytes, artifact.ordinal);
             append_u64(artifact_bytes, artifact.byte_length);
             if (!append_bounded(artifact_bytes,
-                                artifact.content_sha256.data(), 32)) {
+                                artifact.structure_sha256.data(), 32)) {
                 return false;
             }
         }
@@ -1736,56 +1701,6 @@ bool server_cache_adapter_application_entries_digest_v1(
     }
 }
 
-server_cache_fingerprint_worker::~server_cache_fingerprint_worker() {
-    stop();
-}
-
-void server_cache_fingerprint_descriptors_close(
-        std::vector<server_cache_fingerprint_descriptor> & descriptors) noexcept {
-    for (auto & row : descriptors) {
-        close_descriptor(row.descriptor);
-        row.descriptor = -1;
-    }
-}
-
-bool server_cache_fingerprint_worker::start(
-        std::vector<server_cache_fingerprint_descriptor> descriptors,
-        std::vector<server_cache_fingerprint_field> fields,
-        std::vector<server_cache_fingerprint_artifact> fixed_artifacts) noexcept {
-    if (started_ || thread_.joinable() || config_ready_ ||
-        !fingerprint_config_root_from_fields(
-            fields, config_root_, config_exact_)) {
-        server_cache_fingerprint_descriptors_close(descriptors);
-        return false;
-    }
-    config_ready_ = true;
-    auto close_admitted = [&]() {
-        for (size_t i = 0; i < descriptor_count_; ++i) {
-            close_descriptor(descriptors_[i].descriptor);
-            descriptors_[i].descriptor = -1;
-        }
-        descriptor_count_ = 0;
-    };
-    for (auto & row : descriptors) {
-        const int descriptor = row.descriptor;
-        row.descriptor = -1;
-        if (!add_descriptor({ row.role, row.ordinal, descriptor,
-                              row.byte_length, row.integrity_exact })) {
-            server_cache_fingerprint_descriptors_close(descriptors);
-            close_admitted();
-            return false;
-        }
-    }
-    for (const auto & row : fixed_artifacts) {
-        if (!add_fixed_artifact(row)) {
-            server_cache_fingerprint_descriptors_close(descriptors);
-            close_admitted();
-            return false;
-        }
-    }
-    return launch();
-}
-
 bool server_cache_fingerprint_worker::configure(
         const common_params & params,
         const common_cache_plan_vbr_regime & vbr,
@@ -1806,7 +1721,7 @@ bool server_cache_fingerprint_worker::configure(
         uint32_t effective_n_gpu_layers,
         uint16_t pipeline_mode,
         uint16_t allocator_vmm_regime) noexcept {
-    if (started_ || thread_.joinable() || config_ready_) return false;
+    if (started_ || config_ready_) return false;
     if (!fingerprint_config_root_from_params(
             params, effective_tensor_split, effective_tensor_split_count,
             vbr, effective_n_gpu_layers, pipeline_mode,
@@ -1816,48 +1731,23 @@ bool server_cache_fingerprint_worker::configure(
     return true;
 }
 
-bool server_cache_fingerprint_worker::add_descriptor(
-        server_cache_fingerprint_descriptor value) noexcept {
-    if (started_ || thread_.joinable() || value.descriptor < 0 ||
-        !valid_artifact_role(value.role) ||
-        descriptor_count_ == descriptors_.size()) {
-        close_descriptor(value.descriptor);
-        return false;
-    }
-    descriptors_[descriptor_count_++] = value;
-    return true;
-}
-
 bool server_cache_fingerprint_worker::add_fixed_artifact(
         server_cache_fingerprint_artifact value) noexcept {
-    if (started_ || thread_.joinable() || !valid_artifact_role(value.role) ||
+    if (started_ || !valid_artifact_role(value.role) ||
         fixed_artifact_count_ == fixed_artifacts_.size()) return false;
     fixed_artifacts_[fixed_artifact_count_++] = value;
     return true;
 }
 
 bool server_cache_fingerprint_worker::launch() noexcept {
-    if (started_ || thread_.joinable() || !config_ready_ ||
-        (descriptor_count_ == 0 && fixed_artifact_count_ == 0)) return false;
-    cancel_.store(false, std::memory_order_relaxed);
+    if (started_ || !config_ready_ || fixed_artifact_count_ == 0) return false;
     started_ = true;
-    try {
-        thread_ = std::thread([this] { run(); });
-        return true;
-    } catch (...) {
-        started_ = false;
-        for (size_t i = 0; i < descriptor_count_; ++i) {
-            close_descriptor(descriptors_[i].descriptor);
-            descriptors_[i].descriptor = -1;
-        }
-        descriptor_count_ = 0;
-        return false;
-    }
+    combine();
+    return true;
 }
 
 bool server_cache_fingerprint_worker::poll(
         server_cache_execution_fingerprint & out) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!ready_ || delivered_) {
         return false;
     }
@@ -1866,130 +1756,26 @@ bool server_cache_fingerprint_worker::poll(
     return true;
 }
 
-void server_cache_fingerprint_worker::stop() noexcept {
-    cancel_.store(true, std::memory_order_relaxed);
-    if (thread_.joinable()) {
-        thread_.join();
-    }
-    for (size_t i = 0; i < descriptor_count_; ++i) {
-        close_descriptor(descriptors_[i].descriptor);
-        descriptors_[i].descriptor = -1;
-    }
-}
-
-void server_cache_fingerprint_worker::run() noexcept {
+void server_cache_fingerprint_worker::combine() noexcept {
     try {
-#if defined(__linux__)
-        // Best-effort background I/O class. Failure is safe: the explicit
-        // scheduler pause and bounded rate limiter remain authoritative.
-        (void) syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
-                       IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
-#endif
-        auto rate_window_started = std::chrono::steady_clock::now();
-        uint64_t rate_window_read = 0;
         bool failed = false;
         bool exact = config_exact_;
-        std::sort(descriptors_.begin(), descriptors_.begin() + descriptor_count_,
-            [](const auto & a, const auto & b) {
-                return std::tie(a.role, a.ordinal) <
-                       std::tie(b.role, b.ordinal);
-            });
         std::sort(fixed_artifacts_.begin(),
                   fixed_artifacts_.begin() + fixed_artifact_count_,
             [](const auto & a, const auto & b) {
                 return std::tie(a.role, a.ordinal) <
                        std::tie(b.role, b.ordinal);
             });
-        for (size_t source_index = 0; source_index < descriptor_count_; ++source_index) {
-            auto & source = descriptors_[source_index];
-            llama_sha256 hash;
-            uint64_t offset = 0;
-            while (offset < source.byte_length) {
-                if (cancel_.load(std::memory_order_relaxed)) {
-                    failed = true;
-                    break;
-                }
-                while (scheduler_demand_.load(std::memory_order_relaxed) &&
-                       !cancel_.load(std::memory_order_relaxed)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    rate_window_started = std::chrono::steady_clock::now();
-                    rate_window_read = 0;
-                }
-                if (cancel_.load(std::memory_order_relaxed)) {
-                    failed = true;
-                    break;
-                }
-                const size_t want = size_t(std::min<uint64_t>(
-                    hash_buffer_.size(), source.byte_length - offset));
-                const int64_t got = read_at(
-                    source.descriptor, hash_buffer_.data(), want, offset);
-                if (got <= 0 || size_t(got) != want) {
-                    failed = true;
-                    break;
-                }
-                hash.update(hash_buffer_.data(), size_t(got));
-                offset += uint64_t(got);
-                rate_window_read += uint64_t(got);
-                const uint64_t whole_seconds =
-                    rate_window_read / HASH_RATE_BYTES_PER_SECOND;
-                const uint64_t remainder =
-                    rate_window_read % HASH_RATE_BYTES_PER_SECOND;
-                const uint64_t target_us = whole_seconds * 1000000ULL +
-                    remainder * 1000000ULL /
-                        HASH_RATE_BYTES_PER_SECOND;
-                const auto target = rate_window_started +
-                    std::chrono::microseconds(target_us);
-                while (target > std::chrono::steady_clock::now() &&
-                       !cancel_.load(std::memory_order_relaxed)) {
-                    const auto remaining = target -
-                        std::chrono::steady_clock::now();
-                    std::this_thread::sleep_for(std::min(
-                        remaining,
-                        std::chrono::duration_cast<
-                            std::chrono::steady_clock::duration>(
-                            std::chrono::milliseconds(2))));
-                }
-            }
-            if (!failed) descriptor_digests_[source_index] = hash.finish();
-            close_descriptor(source.descriptor);
-            source.descriptor = -1;
-            if (failed) {
-                break;
-            }
-        }
-        for (size_t i = 0; i < descriptor_count_; ++i) {
-            close_descriptor(descriptors_[i].descriptor);
-            descriptors_[i].descriptor = -1;
-        }
         server_cache_execution_fingerprint result;
-        if (!failed && !cancel_.load(std::memory_order_relaxed)) {
+        if (!failed) {
             llama_sha256 artifact_hash;
             artifact_hash.update(ARTIFACT_DOMAIN, sizeof(ARTIFACT_DOMAIN));
-            hash_u32(artifact_hash,
-                     uint32_t(descriptor_count_ + fixed_artifact_count_));
+            hash_u32(artifact_hash, uint32_t(fixed_artifact_count_));
             server_cache_fingerprint_artifact previous;
             bool has_previous = false;
-            size_t descriptor_index = 0;
-            size_t fixed_index = 0;
-            while (descriptor_index < descriptor_count_ ||
-                   fixed_index < fixed_artifact_count_) {
-                server_cache_fingerprint_artifact artifact;
-                const bool take_descriptor =
-                    fixed_index == fixed_artifact_count_ ||
-                    (descriptor_index < descriptor_count_ &&
-                     std::tie(descriptors_[descriptor_index].role,
-                              descriptors_[descriptor_index].ordinal) <
-                         std::tie(fixed_artifacts_[fixed_index].role,
-                                  fixed_artifacts_[fixed_index].ordinal));
-                if (take_descriptor) {
-                    const auto & source = descriptors_[descriptor_index];
-                    artifact = { source.role, source.ordinal, source.byte_length,
-                        descriptor_digests_[descriptor_index],
-                        source.integrity_exact };
-                    ++descriptor_index;
-                } else {
-                    artifact = fixed_artifacts_[fixed_index++];
-                }
+            for (size_t fixed_index = 0;
+                 fixed_index < fixed_artifact_count_; ++fixed_index) {
+                const auto & artifact = fixed_artifacts_[fixed_index];
                 if (!valid_artifact_role(artifact.role) ||
                     (!has_previous && (artifact.role !=
                          server_cache_fingerprint_artifact_role::target ||
@@ -2011,7 +1797,7 @@ void server_cache_fingerprint_worker::run() noexcept {
             }
             if (!failed) result.artifact_root = artifact_hash.finish();
         }
-        if (!failed && !cancel_.load(std::memory_order_relaxed)) {
+        if (!failed) {
             result.config_root = config_root_;
             llama_sha256 execution_hash;
             execution_hash.update(EXEC_DOMAIN, sizeof(EXEC_DOMAIN));
@@ -2023,15 +1809,9 @@ void server_cache_fingerprint_worker::run() noexcept {
             result.complete = true;
             result.exact = exact;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
         result_ = result;
         ready_ = true;
     } catch (...) {
-        for (size_t i = 0; i < descriptor_count_; ++i) {
-            close_descriptor(descriptors_[i].descriptor);
-            descriptors_[i].descriptor = -1;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
         result_ = {};
         ready_ = true;
     }

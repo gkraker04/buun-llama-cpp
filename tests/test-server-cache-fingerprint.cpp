@@ -1,14 +1,13 @@
 #include "server-cache-fingerprint.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-sha256.h"
 #include "common.h"
 #include "common-cache-plan-estimate.h"
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,16 +16,7 @@
 #include <memory>
 #include <new>
 #include <string>
-#include <thread>
 #include <vector>
-
-#if defined(_WIN32)
-#  include <fcntl.h>
-#  include <io.h>
-#else
-#  include <fcntl.h>
-#  include <unistd.h>
-#endif
 
 static std::atomic<bool> reject_allocations { false };
 
@@ -270,6 +260,43 @@ static fake_gpu_identity make_fake_gpu_identity(
 }
 
 int main() {
+    // Cost identity is structural, not a weight-content checksum. Mutating
+    // tensor payload under an identical loader structure must rejoin, while a
+    // cost-relevant tensor descriptor mutation must not.
+    llama_quant_model_desc model_desc = {
+        "llama", 16, 32, 1, 2, 2, 0, 8, 8 };
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+        llama_quant_model_from_metadata(&model_desc), llama_model_free);
+    CHECK(model != nullptr);
+    std::array<uint8_t, 1024> tensor_arena = {};
+    ggml_init_params tensor_params = {
+        tensor_arena.size(), tensor_arena.data(), false };
+    ggml_context_ptr tensor_context(ggml_init(tensor_params));
+    CHECK(tensor_context != nullptr);
+    ggml_tensor * structural_tensor = ggml_new_tensor_2d(
+        tensor_context.get(), GGML_TYPE_F32, 4, 4);
+    CHECK(structural_tensor != nullptr && structural_tensor->data != nullptr);
+    ggml_set_name(structural_tensor, "blk.0.attn_q.weight");
+    model->tensors_by_name.emplace_back(
+        structural_tensor->name, structural_tensor);
+    CHECK(model->capture_cost_structure_digest());
+    std::array<uint8_t, 32> structure_before = {};
+    uint64_t structure_bytes = 0;
+    CHECK(llama_model_cost_structure_digest(
+        model.get(), structure_before.data(), &structure_bytes));
+    std::memset(structural_tensor->data, 0xa5, ggml_nbytes(structural_tensor));
+    CHECK(model->capture_cost_structure_digest());
+    std::array<uint8_t, 32> content_changed = {};
+    CHECK(llama_model_cost_structure_digest(
+        model.get(), content_changed.data(), &structure_bytes));
+    CHECK(content_changed == structure_before);
+    structural_tensor->flags = GGML_TENSOR_FLAG_INPUT;
+    CHECK(model->capture_cost_structure_digest());
+    std::array<uint8_t, 32> descriptor_changed = {};
+    CHECK(llama_model_cost_structure_digest(
+        model.get(), descriptor_changed.data(), &structure_bytes));
+    CHECK(descriptor_changed != structure_before);
+
     server_cache_execution_fingerprint first;
     CHECK(server_cache_execution_fingerprint_v1(
         artifacts(), fields(), first));
@@ -288,14 +315,14 @@ int main() {
     // Production-codec golden. Names and paths are intentionally absent: a
     // rename of the same loader object cannot alter any of these bytes.
     CHECK(hex(first.artifact_root) ==
-          "3c6440ad78d136e44565da591e0171606d66fe1d561be4663c65dc605bed5ab6");
+          "24edd1bcdebef3935c728040619352fc62926b5faa31103c9afcb9ceb0ee6a88");
     CHECK(hex(first.config_root) ==
           "6ca7e20b5bedd77c62565a8853b959e6d85d709dd25655293fa203fad7e12aff");
     CHECK(hex(first.execution_root) ==
-          "bad581506275f13c4118cf01d56ba31bb1f0141dd4371250daf8adc4f4b15084");
+          "62d54604460a097936629ffbe1d6cc224e85c0b9866b895351b10362a833859b");
 
     auto changed = artifacts();
-    changed[0].content_sha256[3] = 7;
+    changed[0].structure_sha256[3] = 7;
     server_cache_execution_fingerprint different;
     CHECK(server_cache_execution_fingerprint_v1(changed, fields(), different));
     CHECK(different.execution_root != first.execution_root);
@@ -589,78 +616,28 @@ int main() {
         active_spec, production_vbr, 0, 0, 0, production_fields));
     CHECK(!production_fields[21].exact);
 
-    // Descriptor hashing consumes the exact loader object, not a reopened
-    // path, and publishes only a complete root. The synthetic file remains
-    // mutable, so the resulting compatibility seed must stay shadow-only.
-    FILE * file = std::tmpfile();
-    CHECK(file != nullptr);
-    CHECK(std::fwrite("abc", 1, 3, file) == 3);
-    CHECK(std::fflush(file) == 0);
-#if defined(_WIN32)
-    const int duplicate = _dup(_fileno(file));
-#else
-    const int duplicate = dup(fileno(file));
-#endif
-    CHECK(duplicate >= 0);
-    server_cache_fingerprint_worker worker;
-    CHECK(worker.start({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, duplicate, 3, false } }, fields()));
-    server_cache_execution_fingerprint worker_result;
-    bool worker_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(worker_delivered = worker.poll(worker_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(worker_delivered);
-    CHECK(worker_result.complete && !worker_result.exact);
-    const std::array<uint8_t, 32> abc_sha = {
-        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
-    };
-    server_cache_execution_fingerprint expected_worker;
-    CHECK(server_cache_execution_fingerprint_v1({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, 3, abc_sha, false } }, fields(), expected_worker));
-    CHECK(worker_result.execution_root == expected_worker.execution_root);
-    worker.stop();
-
-    // The production-only config path streams the identical frozen bytes into
-    // the arena-owned worker without constructing the public vector codec.
-#if defined(_WIN32)
-    const int configured_duplicate = _dup(_fileno(file));
-#else
-    const int configured_duplicate = dup(fileno(file));
-#endif
-    CHECK(configured_duplicate >= 0);
+    // The production-only config path streams the frozen config bytes into the
+    // arena-owned combiner, then synchronously combines resident structural
+    // digests without descriptor or payload I/O.
     auto configured_worker = std::make_unique<server_cache_fingerprint_worker>();
     reject_allocations.store(true, std::memory_order_relaxed);
     const bool configured_without_allocation = configured_worker->configure(
         production_params, production_vbr, 99, 0, 0);
     reject_allocations.store(false, std::memory_order_relaxed);
     CHECK(configured_without_allocation);
-    CHECK(configured_worker->add_descriptor({
-        server_cache_fingerprint_artifact_role::target,
-        0, configured_duplicate, 3, false }));
+    CHECK(configured_worker->add_fixed_artifact(artifacts().front()));
     CHECK(configured_worker->launch());
     server_cache_execution_fingerprint configured_result;
-    bool configured_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(configured_delivered = configured_worker->poll(configured_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(configured_delivered && configured_result.complete);
+    CHECK(configured_worker->poll(configured_result));
+    CHECK(configured_result.complete);
     CHECK(configured_result.config_root == config_root(default_production_fields));
-    configured_worker->stop();
+    server_cache_execution_fingerprint configured_expected;
+    const std::vector<server_cache_fingerprint_artifact> configured_artifacts = {
+        artifacts().front() };
+    CHECK(server_cache_execution_fingerprint_v1(
+        configured_artifacts, fields(), configured_expected));
+    CHECK(configured_result.artifact_root == configured_expected.artifact_root);
 
-#if defined(_WIN32)
-    const int configured_gpu_duplicate = _dup(_fileno(file));
-#else
-    const int configured_gpu_duplicate = dup(fileno(file));
-#endif
-    CHECK(configured_gpu_duplicate >= 0);
     auto configured_gpu_worker =
         std::make_unique<server_cache_fingerprint_worker>();
     auto placement_without_effective_split = placement_ab;
@@ -671,49 +648,12 @@ int main() {
         placement_without_effective_split,
         effective_split, std::size(effective_split),
         production_vbr, 99, 0, 0));
-    CHECK(configured_gpu_worker->add_descriptor({
-        server_cache_fingerprint_artifact_role::target,
-        0, configured_gpu_duplicate, 3, false }));
+    CHECK(configured_gpu_worker->add_fixed_artifact(artifacts().front()));
     CHECK(configured_gpu_worker->launch());
     server_cache_execution_fingerprint configured_gpu_result;
-    bool configured_gpu_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(configured_gpu_delivered = configured_gpu_worker->poll(
-                   configured_gpu_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(configured_gpu_delivered && configured_gpu_result.complete);
+    CHECK(configured_gpu_worker->poll(configured_gpu_result));
+    CHECK(configured_gpu_result.complete);
     CHECK(configured_gpu_result.config_root == config_root(fields_ab));
-    configured_gpu_worker->stop();
-
-#if !defined(_WIN32)
-    // Bounded admission closes the rejected descriptor immediately, and the
-    // unlaunched worker destructor closes every descriptor it already owns.
-    int first_bounded_descriptor = -1;
-    {
-        auto bounded_worker = std::make_unique<server_cache_fingerprint_worker>();
-        CHECK(bounded_worker->configure(
-            production_params, production_vbr, 99, 0, 0));
-        for (size_t i = 0;
-             i < server_cache_fingerprint_worker::descriptor_capacity; ++i) {
-            const int descriptor = dup(fileno(file));
-            CHECK(descriptor >= 0);
-            if (i == 0) first_bounded_descriptor = descriptor;
-            CHECK(bounded_worker->add_descriptor({
-                server_cache_fingerprint_artifact_role::target,
-                uint32_t(i), descriptor, 3, false }));
-        }
-        const int overflow_descriptor = dup(fileno(file));
-        CHECK(overflow_descriptor >= 0);
-        CHECK(!bounded_worker->add_descriptor({
-            server_cache_fingerprint_artifact_role::target,
-            uint32_t(server_cache_fingerprint_worker::descriptor_capacity),
-            overflow_descriptor, 3, false }));
-        CHECK(fcntl(overflow_descriptor, F_GETFD) == -1 && errno == EBADF);
-    }
-    CHECK(first_bounded_descriptor >= 0);
-    CHECK(fcntl(first_bounded_descriptor, F_GETFD) == -1 && errno == EBADF);
-#endif
     {
         auto bounded_artifacts = std::make_unique<server_cache_fingerprint_worker>();
         CHECK(bounded_artifacts->configure(
@@ -729,161 +669,25 @@ int main() {
             uint32_t(server_cache_fingerprint_worker::fixed_artifact_capacity),
             0, {}, false }));
     }
-
-    // The worker is all-or-nothing: a short descriptor never publishes a
-    // partial root, and artifact ordering is the canonical role/ordinal order.
-#if defined(_WIN32)
-    const int short_duplicate = _dup(_fileno(file));
-#else
-    const int short_duplicate = dup(fileno(file));
-#endif
-    CHECK(short_duplicate >= 0);
-    server_cache_fingerprint_worker short_worker;
-    CHECK(short_worker.start({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, short_duplicate, 4, false } }, fields()));
-    server_cache_execution_fingerprint short_result;
-    bool short_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(short_delivered = short_worker.poll(short_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(short_delivered);
-    CHECK(!short_result.complete);
-    short_worker.stop();
-
-#if defined(_WIN32)
-    const int target_duplicate = _dup(_fileno(file));
-    const int draft_duplicate = _dup(_fileno(file));
-#else
-    const int target_duplicate = dup(fileno(file));
-    const int draft_duplicate = dup(fileno(file));
-#endif
-    CHECK(target_duplicate >= 0 && draft_duplicate >= 0);
-    server_cache_fingerprint_worker ordered_worker;
-    CHECK(ordered_worker.start({
-        { server_cache_fingerprint_artifact_role::target,
-          0, target_duplicate, 3, false },
-        { server_cache_fingerprint_artifact_role::draft,
-          0, draft_duplicate, 3, false },
-    }, fields()));
-    server_cache_execution_fingerprint ordered_result;
-    bool ordered_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(ordered_delivered = ordered_worker.poll(ordered_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(ordered_delivered);
-    CHECK(ordered_result.complete);
-    server_cache_execution_fingerprint expected_ordered;
-    CHECK(server_cache_execution_fingerprint_v1({
-        { server_cache_fingerprint_artifact_role::target,
-          0, 3, abc_sha, false },
-        { server_cache_fingerprint_artifact_role::draft,
-          0, 3, abc_sha, false },
-    }, fields(), expected_ordered));
-    CHECK(ordered_result.execution_root == expected_ordered.execution_root);
-    ordered_worker.stop();
-
-#if defined(_WIN32)
-    const int paused_duplicate = _dup(_fileno(file));
-#else
-    const int paused_duplicate = dup(fileno(file));
-#endif
-    CHECK(paused_duplicate >= 0);
-    server_cache_fingerprint_worker paused_worker;
-    paused_worker.set_scheduler_demand(true);
-    CHECK(paused_worker.start({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, paused_duplicate, 3, false } }, fields()));
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    server_cache_execution_fingerprint paused_result;
-    CHECK(!paused_worker.poll(paused_result));
-    paused_worker.set_scheduler_demand(false);
-    bool paused_delivered = false;
-    for (int i = 0; i < 200 &&
-             !(paused_delivered = paused_worker.poll(paused_result)); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    CHECK(paused_delivered);
-    CHECK(paused_result.complete);
-    paused_worker.stop();
-
-#if defined(_WIN32)
-    const int cancelled_duplicate = _dup(_fileno(file));
-#else
-    const int cancelled_duplicate = dup(fileno(file));
-#endif
-    CHECK(cancelled_duplicate >= 0);
-    server_cache_fingerprint_worker cancelled_worker;
-    cancelled_worker.set_scheduler_demand(true);
-    CHECK(cancelled_worker.start({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, cancelled_duplicate, 3, false } }, fields()));
-    cancelled_worker.stop();
-    server_cache_execution_fingerprint cancelled_result;
-    CHECK(cancelled_worker.poll(cancelled_result));
-    CHECK(!cancelled_result.complete);
-#if !defined(_WIN32)
-    const int rejected_duplicate = dup(fileno(file));
-    CHECK(rejected_duplicate >= 0);
-    CHECK(!worker.start({ {
-        server_cache_fingerprint_artifact_role::target,
-        0, rejected_duplicate, 3, false } }, fields()));
-    CHECK(fcntl(rejected_duplicate, F_GETFD) == -1 && errno == EBADF);
-#endif
-
-    // The arena-owned buffer is slightly smaller than its 1-MiB region so the
-    // worker state fits beside it. A full-MiB descriptor therefore proves the
-    // same fixed buffer is reused across reads without changing the digest.
     {
-        FILE * chunked_file = std::tmpfile();
-        CHECK(chunked_file != nullptr);
-        std::array<uint8_t, 64 * 1024> block = {};
-        for (size_t i = 0; i < block.size(); ++i) {
-            block[i] = uint8_t(i * 17 + 3);
-        }
-        llama_sha256 chunked_hash;
-        for (size_t written = 0; written < 1024 * 1024;
-             written += block.size()) {
-            CHECK(std::fwrite(block.data(), 1, block.size(), chunked_file) ==
-                  block.size());
-            chunked_hash.update(block.data(), block.size());
-        }
-        CHECK(std::fflush(chunked_file) == 0);
-#if defined(_WIN32)
-        const int chunked_duplicate = _dup(_fileno(chunked_file));
-#else
-        const int chunked_duplicate = dup(fileno(chunked_file));
-#endif
-        CHECK(chunked_duplicate >= 0);
-        server_cache_fingerprint_worker chunked_worker;
-        CHECK(chunked_worker.start({ {
+        auto gapped_artifacts =
+            std::make_unique<server_cache_fingerprint_worker>();
+        CHECK(gapped_artifacts->configure(
+            production_params, production_vbr, 99, 0, 0));
+        CHECK(gapped_artifacts->add_fixed_artifact({
             server_cache_fingerprint_artifact_role::target,
-            0, chunked_duplicate, 1024 * 1024, false } }, fields()));
-        server_cache_execution_fingerprint chunked_result;
-        bool chunked_delivered = false;
-        for (int i = 0; i < 500 &&
-                 !(chunked_delivered = chunked_worker.poll(chunked_result)); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        CHECK(chunked_delivered && chunked_result.complete);
-        server_cache_execution_fingerprint expected_chunked;
-        CHECK(server_cache_execution_fingerprint_v1({ {
-            server_cache_fingerprint_artifact_role::target,
-            0, 1024 * 1024, chunked_hash.finish(), false } },
-            fields(), expected_chunked));
-        CHECK(chunked_result.execution_root == expected_chunked.execution_root);
-        chunked_worker.stop();
-        std::fclose(chunked_file);
+            1, 0, {}, true }));
+        CHECK(gapped_artifacts->launch());
+        server_cache_execution_fingerprint invalid_result;
+        CHECK(gapped_artifacts->poll(invalid_result));
+        CHECK(!invalid_result.complete);
     }
-    std::fclose(file);
 
-    CHECK(!llama_model_artifact_capture_enabled());
-    CHECK(!llama_model_artifact_capture_set(true));
-    CHECK(llama_model_artifact_capture_enabled());
-    CHECK(llama_model_artifact_capture_set(false));
-    CHECK(!llama_model_artifact_capture_enabled());
+    CHECK(!llama_model_cost_structure_capture_enabled());
+    CHECK(!llama_model_cost_structure_capture_set(true));
+    CHECK(llama_model_cost_structure_capture_enabled());
+    CHECK(llama_model_cost_structure_capture_set(false));
+    CHECK(!llama_model_cost_structure_capture_enabled());
 
     std::puts("PASS");
     return 0;

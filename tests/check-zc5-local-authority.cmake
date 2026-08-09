@@ -16,6 +16,28 @@ file(READ "${SOURCE_ROOT}/tools/server/server-cache-plan-authority.h" AUTHORITY_
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" CONTEXT_CPP)
 file(READ "${SOURCE_ROOT}/src/llama-model.cpp" MODEL_LOADER_CPP)
 file(READ "${SOURCE_ROOT}/common/common-cache-plan-estimate.cpp" ESTIMATE_CPP)
+file(READ "${SOURCE_ROOT}/tools/server/bench/zc5-by-id-authority.py" LIVE_DRIVER)
+
+function(zc5_validate_identity_fast_refusal TEXT OUT)
+    set(VALID TRUE)
+    foreach(REQUIRED IN ITEMS
+            "const bool local_identity_ready ="
+            "execution_fingerprint().complete"
+            "execution_fingerprint().exact"
+            "(mode.preflight || local_identity_ready)"
+            "static const server_cache_plan_local_inventory unavailable_evidence;"
+            ": unavailable_evidence")
+        string(FIND "${TEXT}" "${REQUIRED}" FOUND)
+        if (FOUND EQUAL -1)
+            set(VALID FALSE)
+        endif()
+    endforeach()
+    set(${OUT} ${VALID} PARENT_SCOPE)
+endfunction()
+zc5_validate_identity_fast_refusal("${CONTEXT_CPP}" IDENTITY_FAST_REFUSAL_VALID)
+if (NOT IDENTITY_FAST_REFUSAL_VALID)
+    message(FATAL_ERROR "ZC6 incomplete-identity local authority fast refusal is incomplete")
+endif()
 
 foreach(REQUIRED IN ITEMS
         "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
@@ -198,6 +220,51 @@ if (FLEET_WIDE_CONFIDENCE)
     message(FATAL_ERROR
         "ZC5a reintroduced confidence maturity for unselected candidates")
 endif()
+
+foreach(REQUIRED IN ITEMS
+        "--paired-counterfactual"
+        "--fresh-overhead-report"
+        "--fresh-overhead-adjudication"
+        "--fresh-overhead-cell"
+        "shutil.copytree(source, destination)"
+        "paired_authority_benefits("
+        "validate_fresh_overhead_report(value, required_cell, adjudication=None,"
+        "ZC6_ADJUDICATED_FAILURES = frozenset({"
+        "validate_fresh_report_reductions(value)"
+        "adjudication.get(\"report_sha256\") != report_sha256"
+        "report_failures != ZC6_ADJUDICATED_FAILURES"
+        "adjudication.get(\"required_efficacy_cell\") != required_cell"
+        "adjudicated efficacy cell tax evidence is not green"
+        "set(labels) != ZC6_CAPSTONE_LABELS"
+        "set(overhead_by_cell) != ZC6_CAPSTONE_LABELS"
+        "\"learning_tax_passed\""
+        "\"planner_tax_passed\""
+        "\"total_tax_passed\""
+        "\"schedule_passed\""
+        "\"resource_passed\""
+        "fresh_overhead_upper_us = load_fresh_overhead_report("
+        "args.fresh_overhead_report, args.fresh_overhead_cell,"
+        "args.fresh_overhead_adjudication)"
+        "request_currency(counterfactual) != expected_request"
+        "prior_trajectory_currency("
+        "shipped, inventory_currency(row)"
+        "projected_inventory_currency("
+        "postdecision_publication_extras("
+        "recency_order(row, candidate_ids=None)"
+        "candidate_currency(counterfactual_row) != expected_candidate"
+        "counterfactual.get(\"shipped_plan_candidate\") != baseline_candidate"
+        "PAIRED_ARM_ORDERS[trial % len(PAIRED_ARM_ORDERS)]"
+        "for arm_name in order:"
+        "matched[0][\"arm_order\"] = list(order)"
+        "time.perf_counter_ns()"
+        "\"auto_provider_ttft_us\": ttft[0]"
+        "\"gross_benefit_us\": latency[1] - latency[0]"
+        "\"net_benefit_us\": latency[2] - latency[0]"
+        "gross_lower_us <= headroom_required_us"
+        "net_lower_us <= 0")
+    contract_require_token("${LIVE_DRIVER}" "${REQUIRED}"
+        "ZC6 separated authority efficacy")
+endforeach()
 contract_extract_region("${AUTHORITY_CPP}"
     "struct local_profile_reduction {"
     "void server_cache_plan_authority::plan_local_before_mutation("
@@ -294,6 +361,17 @@ if (NOT MUTATED_CPU_CLASSIFIER EQUAL -1)
     message(FATAL_ERROR
         "ZC5a CPU budget-classifier negative control did not trip")
 endif()
+set(MUTATED_IDENTITY_FAST_REFUSAL "${CONTEXT_CPP}")
+string(REPLACE
+    "cache_optimizer_observations->execution_fingerprint().exact"
+    "true"
+    MUTATED_IDENTITY_FAST_REFUSAL "${MUTATED_IDENTITY_FAST_REFUSAL}")
+zc5_validate_identity_fast_refusal(
+    "${MUTATED_IDENTITY_FAST_REFUSAL}" MUTATED_IDENTITY_FAST_REFUSAL_VALID)
+if (MUTATED_IDENTITY_FAST_REFUSAL_VALID)
+    message(FATAL_ERROR
+        "ZC6 incomplete-identity fast-refusal negative control did not trip")
+endif()
 set(MUTATED_LATCH "${AUTHORITY_CPP}")
 string(REPLACE "other.reset();" "" MUTATED_LATCH "${MUTATED_LATCH}")
 string(FIND "${MUTATED_LATCH}" "other.reset();" MOVED_FROM_RESET)
@@ -333,6 +411,102 @@ contract_find_forbidden("${MUTATED_REDUCTION}" MUTATED_FLEET_TERMINAL
 if (NOT MUTATED_FLEET_TERMINAL)
     message(FATAL_ERROR
         "ZC5a unselected-terminal negative control did not trip")
+endif()
+set(MUTATED_EFFICACY "${LIVE_DRIVER}")
+string(REPLACE
+    "gross_lower_us <= headroom_required_us"
+    "false"
+    MUTATED_EFFICACY "${MUTATED_EFFICACY}")
+string(FIND "${MUTATED_EFFICACY}"
+    "gross_lower_us <= headroom_required_us" MUTATED_EFFICACY_GATE)
+if (NOT MUTATED_EFFICACY_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 authority-efficacy headroom negative control did not trip")
+endif()
+set(MUTATED_CANDIDATE_CURRENCY "${LIVE_DRIVER}")
+string(REPLACE
+    "candidate_currency(counterfactual_row) != expected_candidate"
+    "false"
+    MUTATED_CANDIDATE_CURRENCY "${MUTATED_CANDIDATE_CURRENCY}")
+string(FIND "${MUTATED_CANDIDATE_CURRENCY}"
+    "candidate_currency(counterfactual_row) != expected_candidate"
+    MUTATED_CANDIDATE_CURRENCY_GATE)
+if (NOT MUTATED_CANDIDATE_CURRENCY_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 candidate-currency negative control did not trip")
+endif()
+set(MUTATED_REPORT_CENSUS "${LIVE_DRIVER}")
+string(REPLACE
+    "set(labels) != ZC6_CAPSTONE_LABELS"
+    "false"
+    MUTATED_REPORT_CENSUS "${MUTATED_REPORT_CENSUS}")
+string(FIND "${MUTATED_REPORT_CENSUS}"
+    "set(labels) != ZC6_CAPSTONE_LABELS" MUTATED_REPORT_CENSUS_GATE)
+if (NOT MUTATED_REPORT_CENSUS_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 fresh-overhead census negative control did not trip")
+endif()
+set(MUTATED_REPORT_TAX "${LIVE_DRIVER}")
+string(REPLACE
+    "\"planner_tax_passed\""
+    "\"passed\""
+    MUTATED_REPORT_TAX "${MUTATED_REPORT_TAX}")
+string(FIND "${MUTATED_REPORT_TAX}"
+    "\"planner_tax_passed\"" MUTATED_REPORT_TAX_GATE)
+if (NOT MUTATED_REPORT_TAX_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 planner-tax negative control did not trip")
+endif()
+set(MUTATED_REPORT_SHAPE "${LIVE_DRIVER}")
+string(REPLACE
+    "if not isinstance(taxes, dict) or set(taxes) != set(family_passes):"
+    "if false:"
+    MUTATED_REPORT_SHAPE "${MUTATED_REPORT_SHAPE}")
+string(FIND "${MUTATED_REPORT_SHAPE}"
+    "set(taxes) != set(family_passes)" MUTATED_REPORT_SHAPE_GATE)
+if (NOT MUTATED_REPORT_SHAPE_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 report-shape negative control did not trip")
+endif()
+set(MUTATED_PRIOR_INVENTORY "${LIVE_DRIVER}")
+string(REPLACE
+    "shipped, inventory_currency(row)"
+    "shipped, candidate_currency(shipped_row)"
+    MUTATED_PRIOR_INVENTORY "${MUTATED_PRIOR_INVENTORY}")
+string(FIND "${MUTATED_PRIOR_INVENTORY}"
+    "shipped, inventory_currency(row)" MUTATED_PRIOR_INVENTORY_GATE)
+if (NOT MUTATED_PRIOR_INVENTORY_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 pre-final inventory negative control did not trip")
+endif()
+set(MUTATED_REPORT_CELL "${LIVE_DRIVER}")
+string(REPLACE
+    "set(overhead_by_cell) != ZC6_CAPSTONE_LABELS"
+    "false"
+    MUTATED_REPORT_CELL "${MUTATED_REPORT_CELL}")
+string(FIND "${MUTATED_REPORT_CELL}"
+    "set(overhead_by_cell) != ZC6_CAPSTONE_LABELS" MUTATED_REPORT_CELL_GATE)
+if (NOT MUTATED_REPORT_CELL_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 cell-matched overhead negative control did not trip")
+endif()
+set(MUTATED_ARM_ORDER "${LIVE_DRIVER}")
+string(REPLACE
+    "PAIRED_ARM_ORDERS[trial % len(PAIRED_ARM_ORDERS)]"
+    "PAIRED_ARM_ORDERS[0]"
+    MUTATED_ARM_ORDER "${MUTATED_ARM_ORDER}")
+string(FIND "${MUTATED_ARM_ORDER}"
+    "PAIRED_ARM_ORDERS[trial % len(PAIRED_ARM_ORDERS)]"
+    MUTATED_ARM_ORDER_GATE)
+if (NOT MUTATED_ARM_ORDER_GATE EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 frozen arm-order negative control did not trip")
+endif()
+string(FIND "${LIVE_DRIVER}" "--fresh-overhead-upper-us"
+    FREE_FRESH_OVERHEAD_AUTHORITY)
+if (NOT FREE_FRESH_OVERHEAD_AUTHORITY EQUAL -1)
+    message(FATAL_ERROR
+        "ZC6 paired authority retained a free fresh-overhead bound")
 endif()
 
 message(STATUS "ZC5a-d local-authority contract checks passed")

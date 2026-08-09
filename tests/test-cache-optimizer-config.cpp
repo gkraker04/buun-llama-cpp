@@ -12,21 +12,6 @@
     std::abort(); \
 } } while (0)
 
-static void check_same_effective(
-        const common_cache_optimizer_effective_config & a,
-        const common_cache_optimizer_effective_config & b) {
-    CHECK(a.mode == b.mode);
-    CHECK(a.cache_lifecycle == b.cache_lifecycle);
-    CHECK(a.landed_authority_level == b.landed_authority_level);
-    CHECK(a.cache_debug == b.cache_debug);
-    CHECK(a.cache_plan_preflight == b.cache_plan_preflight);
-    CHECK(a.cache_control_api == b.cache_control_api);
-    CHECK(a.retention_policy == b.retention_policy);
-    CHECK(a.observer_store_enabled == b.observer_store_enabled);
-    CHECK(a.local_authority_ceiling == b.local_authority_ceiling);
-    CHECK(a.error == b.error);
-}
-
 static common_cache_optimizer_raw_config raw_off(
         bool lifecycle,
         common_cache_plan_authority_level authority,
@@ -51,31 +36,42 @@ static common_cache_optimizer_raw_config raw_off(
     return raw;
 }
 
-static void test_off_is_total_identity() {
+static void test_explicit_off_is_total_identity() {
     for (uint8_t level = uint8_t(common_cache_plan_authority_level::off);
          level < uint8_t(common_cache_plan_authority_level::_count); ++level) {
         for (uint8_t bits = 0; bits < 16; ++bits) {
             const auto authority =
                 static_cast<common_cache_plan_authority_level>(level);
-            const auto absent = common_cache_optimizer_resolve(raw_off(
-                bits & 1, authority, bits & 2, bits & 4, bits & 8, false));
             const auto explicit_off = common_cache_optimizer_resolve(raw_off(
                 bits & 1, authority, bits & 2, bits & 4, bits & 8, true));
-            check_same_effective(absent, explicit_off);
-            CHECK(absent.mode == common_cache_optimizer_mode::off);
-            CHECK(absent.cache_lifecycle == bool(bits & 1));
-            CHECK(absent.landed_authority_level == authority);
-            CHECK(absent.cache_debug == bool(bits & 2));
-            CHECK(absent.cache_plan_preflight == bool(bits & 4));
-            CHECK(absent.cache_control_api == bool(bits & 8));
-            CHECK(absent.retention_policy ==
+            CHECK(explicit_off.mode == common_cache_optimizer_mode::off);
+            CHECK(explicit_off.cache_lifecycle == bool(bits & 1));
+            CHECK(explicit_off.landed_authority_level == authority);
+            CHECK(explicit_off.cache_debug == bool(bits & 2));
+            CHECK(explicit_off.cache_plan_preflight == bool(bits & 4));
+            CHECK(explicit_off.cache_control_api == bool(bits & 8));
+            CHECK(explicit_off.retention_policy ==
                   common_cache_optimizer_retention_policy::historical_legacy);
-            CHECK(!absent.observer_store_enabled);
-            CHECK(absent.local_authority_ceiling ==
+            CHECK(!explicit_off.observer_store_enabled);
+            CHECK(explicit_off.local_authority_ceiling ==
                   common_cache_plan_authority_level::off);
-            CHECK(absent.error == common_cache_optimizer_config_error::none);
+            CHECK(explicit_off.error == common_cache_optimizer_config_error::none);
         }
     }
+}
+
+static void test_absent_defaults_auto_after_zc6_qualifies() {
+    auto raw = raw_off(false, common_cache_plan_authority_level::off,
+                       false, false, false, false);
+    const auto out = common_cache_optimizer_resolve(raw);
+    CHECK(out.mode == common_cache_optimizer_mode::auto_mode);
+    CHECK(out.cache_lifecycle);
+    CHECK(out.retention_policy ==
+          common_cache_optimizer_retention_policy::intentional_baseline);
+    CHECK(out.observer_store_enabled);
+    CHECK(out.landed_authority_level == common_cache_plan_authority_level::off);
+    CHECK(out.local_authority_ceiling == common_cache_plan_authority_level::lru);
+    CHECK(out.error == common_cache_optimizer_config_error::none);
 }
 
 static void test_nonoff_modes() {
@@ -83,6 +79,7 @@ static void test_nonoff_modes() {
     raw.cache_debug = true;
     raw.cache_plan_preflight = true;
     raw.cache_control_api = true;
+    raw.mode_explicit = true;
 
     raw.mode = common_cache_optimizer_mode::baseline;
     auto out = common_cache_optimizer_resolve(raw);
@@ -172,17 +169,47 @@ static void test_parser_explicitness() {
     CHECK(common_params_parse(int(absent_argv.size()), absent_argv.data(),
                               absent, LLAMA_EXAMPLE_SERVER));
     CHECK(!absent.cache_optimizer_mode_explicit);
-    CHECK(absent.cache_optimizer.mode == common_cache_optimizer_mode::off);
+    CHECK(absent.cache_optimizer.mode == common_cache_optimizer_mode::auto_mode);
+    CHECK(absent.cache_optimizer.observer_store_enabled);
+    CHECK(absent.cache_optimizer.local_authority_ceiling ==
+          common_cache_plan_authority_level::lru);
+
+    std::vector<std::string> absent_ceiling_args {
+        "test-cache-optimizer-config",
+        "--cache-plan-authority", "similarity",
+        "--cache-debug",
+    };
+    auto absent_ceiling_argv = argv_for(absent_ceiling_args);
+    common_params absent_ceiling;
+    CHECK(common_params_parse(int(absent_ceiling_argv.size()),
+                              absent_ceiling_argv.data(), absent_ceiling,
+                              LLAMA_EXAMPLE_SERVER));
+    CHECK(!absent_ceiling.cache_optimizer_mode_explicit);
+    CHECK(absent_ceiling.cache_optimizer.mode ==
+          common_cache_optimizer_mode::auto_mode);
+    CHECK(absent_ceiling.cache_optimizer.cache_lifecycle);
+    CHECK(absent_ceiling.cache_optimizer.observer_store_enabled);
+    CHECK(absent_ceiling.cache_optimizer.landed_authority_level ==
+          common_cache_plan_authority_level::off);
+    CHECK(absent_ceiling.cache_optimizer.local_authority_ceiling ==
+          common_cache_plan_authority_level::similarity);
 
     std::vector<std::string> explicit_args {
-        "test-cache-optimizer-config", "--cache-optimizer", "off"
+        "test-cache-optimizer-config", "--cache-optimizer", "off",
+        "--cache-plan-authority", "lru",
     };
     auto explicit_argv = argv_for(explicit_args);
     common_params explicit_off;
     CHECK(common_params_parse(int(explicit_argv.size()), explicit_argv.data(),
                               explicit_off, LLAMA_EXAMPLE_SERVER));
     CHECK(explicit_off.cache_optimizer_mode_explicit);
-    check_same_effective(absent.cache_optimizer, explicit_off.cache_optimizer);
+    CHECK(explicit_off.cache_optimizer.mode == common_cache_optimizer_mode::off);
+    CHECK(!explicit_off.cache_optimizer.cache_lifecycle);
+    CHECK(!explicit_off.cache_optimizer.observer_store_enabled);
+    CHECK(explicit_off.cache_optimizer.landed_authority_level ==
+          common_cache_plan_authority_level::lru);
+    CHECK(explicit_off.cache_optimizer.local_authority_ceiling ==
+          common_cache_plan_authority_level::off);
 
     std::vector<std::string> conflict_args {
         "test-cache-optimizer-config", "--cache-optimizer", "learn",
@@ -208,7 +235,8 @@ int main() {
     }
     CHECK(rejected);
 
-    test_off_is_total_identity();
+    test_explicit_off_is_total_identity();
+    test_absent_defaults_auto_after_zc6_qualifies();
     test_nonoff_modes();
     test_parser_explicitness();
     std::puts("test-cache-optimizer-config: PASS");

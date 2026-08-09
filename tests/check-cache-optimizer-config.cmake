@@ -9,6 +9,7 @@ file(READ "${root}/common/common-cache-optimizer.cpp" optimizer_cpp)
 file(READ "${root}/tools/server/server.cpp" server_cpp)
 file(READ "${root}/tools/server/server-http.cpp" http_cpp)
 file(READ "${root}/tools/server/server-context.cpp" context_cpp)
+file(READ "${root}/tools/server/README.md" server_readme)
 
 function(assert_no_runtime_raw_reads text label)
     string(REGEX MATCHALL
@@ -48,23 +49,46 @@ contract_require_token("${arg_cpp}"
 contract_require_token("${server_cpp}"
     "common_cache_optimizer_resolve_params(params, &cache_optimizer_error)"
     "post-preset resolver")
+foreach(pin IN ITEMS
+        "cache optimizer: mode=%s (%s), retention=%s, calibration=%s"
+        "params.cache_optimizer_mode_explicit ? \"explicit\" : \"default\""
+        "common_cache_optimizer_mode_name(cache_optimizer.mode)"
+        "cache_optimizer.observer_store_enabled ? \"enabled\" : \"disabled\""
+        "cache_optimizer.local_authority_ceiling")
+    contract_require_token("${server_cpp}" "${pin}" "ZC6 startup summary")
+endforeach()
 
-# Until ZC6 the absent default is deliberately off. This exact declaration is
-# a mutation-sensitive pin: changing it to auto before the default ratchet must
-# fail the foundation gate.
+# ZC6 qualifies automatic rollout. The raw CLI carrier remains historical-off
+# for compatibility, while the resolver maps omission to auto and preserves
+# every explicit mode exactly.
+contract_require_token("${optimizer_cpp}"
+    "const auto mode = raw.mode_explicit"
+    "qualified ZC6 absent optimizer default owner")
+contract_require_token("${optimizer_cpp}"
+    ": common_cache_optimizer_mode::auto_mode;"
+    "qualified ZC6 rollout default")
 contract_require_token("${common_h}"
     "common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::off;"
-    "absent optimizer default")
-set(default_mutation "${common_h}")
+    "raw absent-mode default")
+contract_require_token("${arg_cpp}"
+    "default: auto; use off for the historical policy"
+    "qualified ZC6 CLI default guidance")
+contract_require_token("${server_readme}"
+    "The cache optimizer defaults to `auto`; use `--cache-optimizer off`"
+    "qualified ZC6 public default guidance")
+contract_forbid_token("${server_readme}"
+    "automatic default remains rollout-gated"
+    "retired ZC6 rollout-gated guidance")
+set(default_mutation "${optimizer_cpp}")
 string(REPLACE
-    "common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::off;"
-    "common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::auto_mode;"
+    "const auto mode = raw.mode_explicit"
+    "const auto mode = true"
     default_mutation "${default_mutation}")
 string(FIND "${default_mutation}"
-    "common_cache_optimizer_mode cache_optimizer_mode = common_cache_optimizer_mode::off;"
+    "const auto mode = raw.mode_explicit"
     old_default)
 if (NOT old_default EQUAL -1)
-    message(FATAL_ERROR "absent-default negative control did not trip")
+    message(FATAL_ERROR "qualified ZC6 absent-default negative control did not trip")
 endif()
 
 # ZC1 consumes retention_policy at its host/checkpoint adapters, the one
@@ -83,7 +107,7 @@ foreach(path IN LISTS production_cpp)
     string(APPEND all_production "${text}")
 endforeach()
 
-set(expected_observer_store_enabled_reads 8)
+set(expected_observer_store_enabled_reads 9)
 count_literal("${all_production}" ".observer_store_enabled"
     observer_store_enabled_reads)
 if (NOT observer_store_enabled_reads EQUAL expected_observer_store_enabled_reads)
@@ -91,7 +115,7 @@ if (NOT observer_store_enabled_reads EQUAL expected_observer_store_enabled_reads
         "ZC2 observer-store consumer census drifted: ${observer_store_enabled_reads}")
 endif()
 count_literal("${all_production}" ".retention_policy" retention_policy_reads)
-if (NOT retention_policy_reads EQUAL 6)
+if (NOT retention_policy_reads EQUAL 7)
     message(FATAL_ERROR
         "ZC1 retention-policy consumer census drifted: ${retention_policy_reads}")
 endif()
@@ -120,7 +144,7 @@ if (NOT observer_mutation_reads EQUAL expected_observer_mutation_reads)
 endif()
 set(retention_mutation "${all_production}\nvoid probe(const auto & effective) { (void) effective.retention_policy; }")
 count_literal("${retention_mutation}" ".retention_policy" retention_mutation_reads)
-if (retention_mutation_reads EQUAL 6)
+if (retention_mutation_reads EQUAL 7)
     message(FATAL_ERROR "retention-policy consumer negative control did not trip")
 endif()
 

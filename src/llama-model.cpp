@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-sha256.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -38,44 +39,15 @@
 #include <string>
 #include <vector>
 
-#if defined(_WIN32)
-#  include <io.h>
-#else
-#  include <unistd.h>
-#endif
+thread_local bool model_cost_structure_capture_enabled = false;
 
-thread_local bool model_artifact_capture_enabled = false;
-
-namespace {
-
-void model_artifact_descriptor_close(int fd) noexcept {
-    if (fd < 0) {
-        return;
-    }
-#if defined(_WIN32)
-    _close(fd);
-#else
-    close(fd);
-#endif
+bool llama_model_cost_structure_capture_enabled() {
+    return model_cost_structure_capture_enabled;
 }
 
-int model_artifact_descriptor_dup(int fd) noexcept {
-#if defined(_WIN32)
-    return _dup(fd);
-#else
-    return dup(fd);
-#endif
-}
-
-} // namespace
-
-bool llama_model_artifact_capture_enabled() {
-    return model_artifact_capture_enabled;
-}
-
-bool llama_model_artifact_capture_set(bool enabled) {
-    const bool previous = model_artifact_capture_enabled;
-    model_artifact_capture_enabled = enabled;
+bool llama_model_cost_structure_capture_set(bool enabled) {
+    const bool previous = model_cost_structure_capture_enabled;
+    model_cost_structure_capture_enabled = enabled;
     return previous;
 }
 
@@ -1076,12 +1048,6 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
-    impl() = default;
-    ~impl() {
-        for (auto & row : artifact_descriptors) {
-            model_artifact_descriptor_close(row.descriptor);
-        }
-    }
 
     uint64_t n_elements = 0;
 
@@ -1121,11 +1087,11 @@ struct llama_model::impl {
     std::array<float, 128> effective_tensor_split = {};
     size_t effective_tensor_split_count = 0;
 
-    // Duplicated from llama_model_loader before it closes. These descriptors
-    // identify the exact objects mapped/read by this model; ZC3a may duplicate
-    // them again for its cancelable background verifier without reopening a
-    // path.
-    std::vector<llama_model_artifact_descriptor> artifact_descriptors;
+    // Canonical execution-cost structure captured from loader-verified model
+    // metadata. It intentionally excludes tensor payload bytes: dense weight
+    // values do not select kernels or alter cache-operation cost.
+    std::array<uint8_t, 32> cost_structure_digest = {};
+    bool cost_structure_digest_ready = false;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1816,102 +1782,75 @@ const float * llama_model::effective_tensor_split(size_t & count) const noexcept
     return pimpl->effective_tensor_split.data();
 }
 
-bool llama_model::capture_artifact_descriptors(
-        llama_model_loader & ml) noexcept {
-    std::vector<llama_model_artifact_descriptor> captured;
+bool llama_model::capture_cost_structure_digest() noexcept {
     try {
-        captured.reserve(ml.files.size());
-        for (const auto & file : ml.files) {
-            if (!file) {
-                throw std::runtime_error("invalid model artifact descriptor");
-            }
-            const int duplicate = model_artifact_descriptor_dup(file->file_id());
-            if (duplicate < 0) {
-                throw std::runtime_error("failed to duplicate model artifact descriptor");
-            }
-            captured.push_back({ duplicate, uint64_t(file->size()),
-                                 file->integrity_exact_at_open() });
+        llama_sha256_writer writer;
+        static constexpr char domain[] =
+            "llama.cpp model execution-cost structure";
+        writer.string(domain, sizeof(domain) - 1);
+        writer.u32(1); // serialization version
+        writer.u32(uint32_t(arch));
+        writer.u32(uint32_t(type));
+        writer.u32(uint32_t(pimpl->ftype));
+
+        // llama_hparams is zero-initialized, trivially copyable, and bound to
+        // the server cost-ABI/build identity in the outer fingerprint. This
+        // captures graph-affecting scalar and per-layer arrays without
+        // serializing descriptive/tokenizer GGUF metadata.
+        static_assert(std::is_trivially_copyable<llama_hparams>::value,
+                      "llama_hparams must remain trivially copyable");
+        writer.string(&hparams, sizeof(hparams));
+
+        std::vector<const std::pair<std::string, ggml_tensor *> *> tensors;
+        tensors.reserve(tensors_by_name.size());
+        for (const auto & row : tensors_by_name) {
+            tensors.push_back(&row);
         }
-        for (auto & row : pimpl->artifact_descriptors) {
-            model_artifact_descriptor_close(row.descriptor);
+        std::sort(tensors.begin(), tensors.end(), [](const auto * lhs, const auto * rhs) {
+            return lhs->first < rhs->first;
+        });
+        writer.u64(tensors.size());
+        for (const auto * row : tensors) {
+            const ggml_tensor * tensor = row->second;
+            if (!tensor) return false;
+            writer.string(row->first.data(), row->first.size());
+            writer.u32(uint32_t(tensor->type));
+            writer.u32(uint32_t(ggml_n_dims(tensor)));
+            for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+                writer.u64(uint64_t(tensor->ne[i]));
+                writer.u64(uint64_t(tensor->nb[i]));
+            }
+            writer.u64(uint64_t(ggml_nbytes(tensor)));
+            writer.u32(uint32_t(tensor->flags));
+            const char * buft_name = "unallocated";
+            if (tensor->buffer) {
+                const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+                if (buft && ggml_backend_buft_name(buft)) {
+                    buft_name = ggml_backend_buft_name(buft);
+                }
+            }
+            writer.string(buft_name, std::strlen(buft_name));
         }
-        pimpl->artifact_descriptors = std::move(captured);
-        return !pimpl->artifact_descriptors.empty();
+        pimpl->cost_structure_digest = writer.finish();
+        pimpl->cost_structure_digest_ready = true;
+        return true;
     } catch (...) {
-        for (auto & row : captured) {
-            model_artifact_descriptor_close(row.descriptor);
-        }
+        pimpl->cost_structure_digest = {};
+        pimpl->cost_structure_digest_ready = false;
         return false;
     }
 }
 
-bool llama_model::duplicate_artifact_descriptors(
-        std::vector<llama_model_artifact_descriptor> & out) const noexcept {
-    std::vector<llama_model_artifact_descriptor> duplicates;
-    try {
-        duplicates.reserve(pimpl->artifact_descriptors.size());
-        for (const auto & source : pimpl->artifact_descriptors) {
-            const int duplicate = model_artifact_descriptor_dup(source.descriptor);
-            if (duplicate < 0) {
-                throw std::runtime_error("failed to duplicate model artifact descriptor");
-            }
-            duplicates.push_back({ duplicate, source.byte_length,
-                                   source.integrity_exact });
-        }
-        for (auto & row : out) {
-            model_artifact_descriptor_close(row.descriptor);
-            row.descriptor = -1;
-        }
-        out = std::move(duplicates);
-        return !out.empty();
-    } catch (...) {
-        for (auto & row : duplicates) {
-            model_artifact_descriptor_close(row.descriptor);
-        }
+bool llama_model::cost_structure_digest(
+        std::array<uint8_t, 32> & out, uint64_t & tensor_bytes) const noexcept {
+    if (!pimpl->cost_structure_digest_ready) {
+        out = {};
+        tensor_bytes = 0;
         return false;
     }
-}
-
-bool llama_model::duplicate_artifact_descriptors_bounded(
-        llama_model_artifact_descriptor * out,
-        size_t capacity,
-        size_t * count) const noexcept {
-    if (!count) return false;
-    *count = 0;
-    const size_t required = pimpl->artifact_descriptors.size();
-    if (required == 0 || required > capacity || !out) return false;
-    for (size_t i = 0; i < required; ++i) {
-        const auto & source = pimpl->artifact_descriptors[i];
-        const int duplicate = model_artifact_descriptor_dup(source.descriptor);
-        if (duplicate < 0) {
-            for (size_t j = 0; j < i; ++j) {
-                model_artifact_descriptor_close(out[j].descriptor);
-                out[j].descriptor = -1;
-            }
-            return false;
-        }
-        out[i] = { duplicate, source.byte_length, source.integrity_exact };
-    }
-    *count = required;
+    out = pimpl->cost_structure_digest;
+    tensor_bytes = uint64_t(pimpl->n_bytes);
     return true;
-}
-
-void llama_model_artifact_descriptors_close(
-        std::vector<llama_model_artifact_descriptor> & descriptors) {
-    for (auto & row : descriptors) {
-        model_artifact_descriptor_close(row.descriptor);
-        row.descriptor = -1;
-    }
-}
-
-void llama_model_artifact_descriptors_close_bounded(
-        llama_model_artifact_descriptor * descriptors,
-        size_t count) {
-    if (!descriptors) return;
-    for (size_t i = 0; i < count; ++i) {
-        model_artifact_descriptor_close(descriptors[i].descriptor);
-        descriptors[i].descriptor = -1;
-    }
 }
 
 uint32_t llama_model::n_gpu_layers() const {

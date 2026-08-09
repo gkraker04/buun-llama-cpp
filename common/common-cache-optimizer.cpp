@@ -48,14 +48,18 @@ const char * common_cache_optimizer_config_error_name(
 common_cache_optimizer_effective_config common_cache_optimizer_resolve(
         const common_cache_optimizer_raw_config & raw) noexcept {
     common_cache_optimizer_effective_config out;
-    out.mode = raw.mode;
+    // ZC6 qualifies automatic rollout. Every explicit mode remains exact;
+    // omission selects auto without changing the raw CLI compatibility default.
+    const auto mode = raw.mode_explicit
+        ? raw.mode
+        : common_cache_optimizer_mode::auto_mode;
+    out.mode = mode;
     out.cache_debug = raw.cache_debug;
     out.cache_plan_preflight = raw.cache_plan_preflight;
     out.cache_control_api = raw.cache_control_api;
 
-    if (raw.mode == common_cache_optimizer_mode::off) {
-        // The absent-mode default remains off through ZC5. Explicit off and
-        // absent mode therefore preserve every landed expert flag exactly.
+    if (mode == common_cache_optimizer_mode::off) {
+        // Explicit off preserves every landed expert flag exactly.
         out.cache_lifecycle = raw.cache_lifecycle;
         out.landed_authority_level = raw.cache_plan_authority;
         out.local_authority_ceiling = common_cache_plan_authority_level::off;
@@ -68,11 +72,11 @@ common_cache_optimizer_effective_config common_cache_optimizer_resolve(
     out.cache_lifecycle = true;
     out.landed_authority_level = common_cache_plan_authority_level::off;
     out.retention_policy = common_cache_optimizer_retention_policy::intentional_baseline;
-    out.observer_store_enabled = raw.mode == common_cache_optimizer_mode::learn ||
-                                 raw.mode == common_cache_optimizer_mode::auto_mode;
+    out.observer_store_enabled = mode == common_cache_optimizer_mode::learn ||
+                                 mode == common_cache_optimizer_mode::auto_mode;
 
-    if (raw.mode == common_cache_optimizer_mode::baseline ||
-        raw.mode == common_cache_optimizer_mode::learn) {
+    if (mode == common_cache_optimizer_mode::baseline ||
+        mode == common_cache_optimizer_mode::learn) {
         if (raw.cache_plan_authority_explicit &&
             raw.cache_plan_authority != common_cache_plan_authority_level::off) {
             out.error = common_cache_optimizer_config_error::landed_authority_conflict;

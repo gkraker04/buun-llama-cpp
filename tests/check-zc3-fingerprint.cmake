@@ -21,16 +21,15 @@ file(READ "${SOURCE_ROOT}/tests/test-server-cache-fingerprint.cpp" TEST_CPP)
 
 foreach(NAME IN ITEMS
         "server_cache_execution_fingerprint"
-        "server_cache_fingerprint_worker"
-        "llama_model_artifact_descriptor")
+        "server_cache_fingerprint_worker")
     contract_forbid_token("${PUBLIC_LLAMA_H}" "${NAME}"
         "ZC3a internal fingerprint leaked into installed llama.h")
 endforeach()
 
 foreach(DOMAIN IN ITEMS
-        "buun-zc-artifacts-v1"
+        "buun-zc-cost-structures-v1"
         "buun-zc-config-v1"
-        "buun-zc-exec-v1"
+        "buun-zc-exec-v2"
         "buun-zc-adapter-application-v1")
     count_literal("${FINGERPRINT_CPP}" "${DOMAIN}" DOMAIN_COUNT)
     if (NOT DOMAIN_COUNT EQUAL 1)
@@ -44,11 +43,7 @@ foreach(REQUIRED IN ITEMS
         "sizeof(ARTIFACT_DOMAIN)"
         "sizeof(CONFIG_DOMAIN)"
         "sizeof(EXEC_DOMAIN)"
-        "HASH_CHUNK_BYTES = 1024 * 1024"
-        "HASH_RATE_BYTES_PER_SECOND = 32ULL * 1024 * 1024"
-        "scheduler_demand_.load"
-        "IOPRIO_CLASS_IDLE"
-        "pread(fd, data, size, off_t(offset))")
+        "FINGERPRINT_ARENA_BYTES = 1024 * 1024")
     contract_require_token("${FINGERPRINT_CPP}" "${REQUIRED}"
         "ZC3a canonical/worker contract")
 endforeach()
@@ -108,11 +103,15 @@ if (NOT MUTATED_CHECKPOINT_COPY EQUAL -1)
     message(FATAL_ERROR "ZC3a checkpoint-copy negative control did not trip")
 endif()
 foreach(REQUIRED IN ITEMS
-        "llama_model_artifact_capture_enabled() &&"
-        "llama_file_integrity_exact(file_id())"
-        "file->integrity_exact_at_open()")
-    contract_require_token("${LLAMA_MMAP_CPP}${LLAMA_MODEL_CPP}" "${REQUIRED}"
-        "ZC3a immutability-before-consumption contract")
+        "llama.cpp model execution-cost structure"
+        "writer.string(&hparams, sizeof(hparams))"
+        "writer.u32(uint32_t(tensor->type))"
+        "writer.u64(uint64_t(tensor->ne[i]))"
+        "writer.u64(uint64_t(tensor->nb[i]))"
+        "ggml_backend_buft_name(buft)"
+        "intentionally excludes tensor payload bytes")
+    contract_require_token("${LLAMA_MODEL_CPP}${LLAMA_EXT_H}" "${REQUIRED}"
+        "ZC6 loader-verified cost-structure identity")
 endforeach()
 foreach(REQUIRED IN ITEMS
         "!params_base.mmproj.path.empty()"
@@ -121,13 +120,12 @@ foreach(REQUIRED IN ITEMS
         "ZC3a actual-mmproj-loader fail-closed contract")
 endforeach()
 foreach(REQUIRED IN ITEMS
-        "integrity_exact = false;"
         "GGML_BACKEND_DEVICE_IDENTITY_V1_PROC"
         "GGML_BACKEND_DEVICE_LINK_V1_PROC"
         "cpu_backend_identity_v1("
         "driver_version, hardware_exact"
         "runtime_version, hardware_exact")
-    contract_require_token("${LLAMA_MMAP_CPP}${FINGERPRINT_CPP}${CONTEXT_CPP}"
+    contract_require_token("${FINGERPRINT_CPP}${CONTEXT_CPP}"
         "${REQUIRED}" "ZC3a resolved hardware/mmproj identity contract")
 endforeach()
 contract_require_token("${FINGERPRINT_H}" "mmproj  = 3"
@@ -151,26 +149,23 @@ if (FORBIDDEN)
 endif()
 
 foreach(REQUIRED IN ITEMS
-        "if (llama_model_artifact_capture_enabled())"
-        "model->capture_artifact_descriptors(ml)"
-        "llama_model_dup_artifact_descriptors_bounded("
-        "duplicate_artifact_descriptors_bounded("
-        "llama_model_artifact_descriptors_close_bounded(")
+        "if (llama_model_cost_structure_capture_enabled())"
+        "model->capture_cost_structure_digest()"
+        "llama_model_cost_structure_digest("
+        "model->cost_structure_digest(digest, bytes)")
     contract_require_token("${LLAMA_CPP}${LLAMA_MODEL_CPP}${LLAMA_EXT_H}" "${REQUIRED}"
-        "ZC3a loader-owned descriptor capture")
+        "ZC6 loader-owned cost-structure capture")
 endforeach()
 foreach(REQUIRED IN ITEMS
         "params_base.cache_optimizer.observer_store_enabled"
-        "llama_model_artifact_capture_set("
+        "llama_model_cost_structure_capture_set("
         "cache_fingerprint_pending = result"
         "cache_calibration->resolve_load("
         "cache_optimizer_observations->set_execution_fingerprint("
-        "cache_fingerprint_worker->set_scheduler_demand(true)"
         "cache_fingerprint_worker->configure("
-        "cache_fingerprint_worker->add_descriptor("
+        "llama_model_cost_structure_digest("
         "cache_fingerprint_worker->add_fixed_artifact("
         "cache_fingerprint_worker->launch()"
-        "cache_fingerprint_scheduler_busy = true"
         "cache_fingerprint_worker.reset();")
     contract_require_token("${CONTEXT_CPP}" "${REQUIRED}"
         "ZC3a observer-only production wiring")
@@ -178,29 +173,86 @@ endforeach()
 
 contract_extract_region("${FINGERPRINT_CPP}"
     "bool fingerprint_config_root_from_params("
-    "void close_descriptor("
+    "} // namespace"
     BOUNDED_CONFIG_REGION BOUNDED_CONFIG_REGION_FOUND)
 set(FINGERPRINT_CPP_WITH_SENTINEL
     "${FINGERPRINT_CPP}\n// ZC3A_FINGERPRINT_CPP_EOF")
 contract_extract_region("${FINGERPRINT_CPP_WITH_SENTINEL}"
-    "void server_cache_fingerprint_worker::run() noexcept"
+    "bool server_cache_fingerprint_worker::launch() noexcept"
+    "bool server_cache_fingerprint_worker::poll("
+    WORKER_LAUNCH_REGION WORKER_LAUNCH_REGION_FOUND)
+contract_extract_region("${FINGERPRINT_CPP_WITH_SENTINEL}"
+    "void server_cache_fingerprint_worker::combine() noexcept"
     "// ZC3A_FINGERPRINT_CPP_EOF"
-    WORKER_RUN_REGION WORKER_RUN_REGION_FOUND)
+    WORKER_COMBINE_REGION WORKER_COMBINE_REGION_FOUND)
 contract_extract_region("${CONTEXT_CPP}"
     "void cache_fingerprint_start() noexcept"
     "void cache_fingerprint_lifecycle_point() noexcept"
     PRODUCTION_START_REGION PRODUCTION_START_REGION_FOUND)
-if (NOT BOUNDED_CONFIG_REGION_FOUND OR NOT WORKER_RUN_REGION_FOUND OR
+if (NOT BOUNDED_CONFIG_REGION_FOUND OR NOT WORKER_LAUNCH_REGION_FOUND OR
+    NOT WORKER_COMBINE_REGION_FOUND OR
     NOT PRODUCTION_START_REGION_FOUND)
     message(FATAL_ERROR "ZC3a bounded fingerprint regions are incomplete")
 endif()
+function(zc3_validate_synchronous_structure TEXT OUT)
+    set(VALID TRUE)
+    foreach(REQUIRED IN ITEMS
+            "cache_fingerprint_worker->add_fixed_artifact("
+            "cache_fingerprint_worker->launch()"
+            "combine();"
+            "void server_cache_fingerprint_worker::combine() noexcept")
+        string(FIND "${TEXT}" "${REQUIRED}" FOUND)
+        if (FOUND EQUAL -1)
+            set(VALID FALSE)
+        endif()
+    endforeach()
+    foreach(FORBIDDEN IN ITEMS
+            "server_cache_fingerprint_descriptor"
+            "add_descriptor("
+            "set_scheduler_demand("
+            "std::thread"
+            "pread("
+            "llama_model_artifact_descriptor"
+            "llama_model_dup_artifact_descriptors"
+            "llama_file_integrity_exact"
+            "integrity_exact_at_open"
+            "llama_model_artifact_capture_")
+        string(FIND "${TEXT}" "${FORBIDDEN}" FOUND)
+        if (NOT FOUND EQUAL -1)
+            set(VALID FALSE)
+        endif()
+    endforeach()
+    set(${OUT} ${VALID} PARENT_SCOPE)
+endfunction()
+set(SYNCHRONOUS_STRUCTURE
+    "${FINGERPRINT_H}${FINGERPRINT_CPP}${PRODUCTION_START_REGION}${LLAMA_CPP}${LLAMA_MODEL_CPP}${LLAMA_MMAP_CPP}${LLAMA_EXT_H}")
+zc3_validate_synchronous_structure(
+    "${SYNCHRONOUS_STRUCTURE}" SYNCHRONOUS_STRUCTURE_VALID)
+if (NOT SYNCHRONOUS_STRUCTURE_VALID)
+    message(FATAL_ERROR
+        "ZC6 structural fingerprint retained descriptor, payload, or thread machinery")
+endif()
+set(MUTATED_SYNCHRONOUS_THREAD
+    "${SYNCHRONOUS_STRUCTURE}\nstd::thread verifier;")
+zc3_validate_synchronous_structure(
+    "${MUTATED_SYNCHRONOUS_THREAD}" MUTATED_SYNCHRONOUS_THREAD_VALID)
+if (MUTATED_SYNCHRONOUS_THREAD_VALID)
+    message(FATAL_ERROR
+        "ZC6 structural-fingerprint thread negative control did not trip")
+endif()
+set(MUTATED_SYNCHRONOUS_DESCRIPTOR
+    "${SYNCHRONOUS_STRUCTURE}\nvoid add_descriptor(int);")
+zc3_validate_synchronous_structure(
+    "${MUTATED_SYNCHRONOUS_DESCRIPTOR}" MUTATED_SYNCHRONOUS_DESCRIPTOR_VALID)
+if (MUTATED_SYNCHRONOUS_DESCRIPTOR_VALID)
+    message(FATAL_ERROR
+        "ZC6 structural-fingerprint descriptor negative control did not trip")
+endif()
 contract_find_forbidden(
-    "${BOUNDED_CONFIG_REGION}${WORKER_RUN_REGION}${PRODUCTION_START_REGION}"
+    "${BOUNDED_CONFIG_REGION}${WORKER_COMBINE_REGION}${PRODUCTION_START_REGION}"
     FINGERPRINT_HEAP_ESCAPE
     "std::vector<server_cache_fingerprint_field>"
-    "std::vector<server_cache_fingerprint_descriptor>"
     "std::vector<server_cache_fingerprint_artifact>"
-    "std::vector<llama_model_artifact_descriptor>"
     "server_cache_execution_fingerprint_v1("
     "server_cache_fingerprint_fields_v1(")
 if (FINGERPRINT_HEAP_ESCAPE)
@@ -222,20 +274,28 @@ contract_forbid_token("${OBSERVER_CPP}"
     "ZC3a global config root impersonated representation identity")
 
 foreach(GOLDEN IN ITEMS
-        "3c6440ad78d136e44565da591e0171606d66fe1d561be4663c65dc605bed5ab6"
+        "24edd1bcdebef3935c728040619352fc62926b5faa31103c9afcb9ceb0ee6a88"
         "6ca7e20b5bedd77c62565a8853b959e6d85d709dd25655293fa203fad7e12aff"
-        "bad581506275f13c4118cf01d56ba31bb1f0141dd4371250daf8adc4f4b15084"
+        "62d54604460a097936629ffbe1d6cc224e85c0b9866b895351b10362a833859b"
         "b3f15fa073cad9076b22cd15fae92ce16e48b7604e85bd84844d5910342dcdf4")
     contract_require_token("${TEST_CPP}" "${GOLDEN}"
         "ZC3a production-codec golden")
+endforeach()
+foreach(REQUIRED IN ITEMS
+        "std::memset(structural_tensor->data, 0xa5"
+        "CHECK(content_changed == structure_before)"
+        "structural_tensor->flags = GGML_TENSOR_FLAG_INPUT"
+        "CHECK(descriptor_changed != structure_before)")
+    contract_require_token("${TEST_CPP}" "${REQUIRED}"
+        "ZC6 cost-structure versus payload identity oracle")
 endforeach()
 
 # House-standard negative controls exercise the same predicate as production.
 function(zc3_validate_capture_guard TEXT OUT)
     count_literal("${TEXT}"
-        "if (llama_model_artifact_capture_enabled())" GUARD_COUNT)
+        "if (llama_model_cost_structure_capture_enabled())" GUARD_COUNT)
     count_literal("${TEXT}"
-        "model->capture_artifact_descriptors(ml)" CAPTURE_COUNT)
+        "model->capture_cost_structure_digest()" CAPTURE_COUNT)
     if (GUARD_COUNT EQUAL 1 AND CAPTURE_COUNT EQUAL 1)
         set(${OUT} TRUE PARENT_SCOPE)
     else()
@@ -264,7 +324,7 @@ if (NOT MUTATED_RESOLVED_EXACT EQUAL -1)
 endif()
 set(MUTATED_LLAMA "${LLAMA_CPP}")
 string(REPLACE
-    "if (llama_model_artifact_capture_enabled()) {"
+    "if (llama_model_cost_structure_capture_enabled()) {"
     "if (true) {"
     MUTATED_LLAMA "${MUTATED_LLAMA}")
 zc3_validate_capture_guard("${MUTATED_LLAMA}" MUTATED_CAPTURE_VALID)
@@ -272,8 +332,8 @@ if (MUTATED_CAPTURE_VALID)
     message(FATAL_ERROR "ZC3a capture-gate negative control did not trip")
 endif()
 
-set(MUTATED_FINGERPRINT "${FINGERPRINT_CPP}\nstatic constexpr char EXTRA[] = \"buun-zc-exec-v1\";")
-count_literal("${MUTATED_FINGERPRINT}" "buun-zc-exec-v1" MUTATED_DOMAIN_COUNT)
+set(MUTATED_FINGERPRINT "${FINGERPRINT_CPP}\nstatic constexpr char EXTRA[] = \"buun-zc-exec-v2\";")
+count_literal("${MUTATED_FINGERPRINT}" "buun-zc-exec-v2" MUTATED_DOMAIN_COUNT)
 if (MUTATED_DOMAIN_COUNT EQUAL 1)
     message(FATAL_ERROR "ZC3a domain-owner negative control did not trip")
 endif()
