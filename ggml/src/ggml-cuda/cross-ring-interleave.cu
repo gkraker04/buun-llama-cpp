@@ -252,6 +252,122 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
     return ring->d_staging;
 }
 
+// ---------------------------------------------------------------------------
+// Projected cross-KV cache: per-(drafter layer, ring slot) K/V projections.
+// Slots map 1:1 to the cross ring above (slot = committed pos % ring_size), so
+// a ring overwrite is invalidated simply by re-projecting the overwritten
+// slots — which the update path does for every newly written token.
+// K rows are pre-RoPE (positions are window-relative and slide every draft
+// call, so RoPE must stay in the drafter graph); V rows are final.
+// ---------------------------------------------------------------------------
+
+struct dflash_crosskv_cache {
+    int device;
+    int n_layers;
+    int ring_size;
+    int64_t k_row;      // floats per token (K)
+    int64_t v_row;      // floats per token (V)
+    float ** k_rings;   // host array of per-layer device pointers
+    float ** v_rings;
+};
+
+extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_row, int ring_size) {
+    auto * c = new dflash_crosskv_cache();
+    cudaGetDevice(&c->device);
+    c->n_layers  = n_layers;
+    c->ring_size = ring_size;
+    c->k_row     = k_row;
+    c->v_row     = v_row;
+    c->k_rings   = new float*[n_layers]();
+    c->v_rings   = new float*[n_layers]();
+
+    auto fail = [&]() {
+        for (int l = 0; l < n_layers; l++) {
+            if (c->k_rings[l]) cudaFree(c->k_rings[l]);
+            if (c->v_rings[l]) cudaFree(c->v_rings[l]);
+        }
+        delete[] c->k_rings;
+        delete[] c->v_rings;
+        delete c;
+        return (void *) nullptr;
+    };
+
+    for (int l = 0; l < n_layers; l++) {
+        if (cudaMalloc(&c->k_rings[l], (size_t)ring_size * k_row * sizeof(float)) != cudaSuccess) return fail();
+        if (cudaMalloc(&c->v_rings[l], (size_t)ring_size * v_row * sizeof(float)) != cudaSuccess) return fail();
+        // zero-init: cold slots must stay finite (they can be gathered as masked pad)
+        cudaMemset(c->k_rings[l], 0, (size_t)ring_size * k_row * sizeof(float));
+        cudaMemset(c->v_rings[l], 0, (size_t)ring_size * v_row * sizeof(float));
+    }
+
+    size_t total_mb = (size_t)n_layers * ring_size * (k_row + v_row) * sizeof(float) / (1024 * 1024);
+    fprintf(stderr, "dflash crosskv: allocated %d layers x %d slots (K %lld + V %lld floats/tok, ~%zu MB)\n",
+            n_layers, ring_size, (long long)k_row, (long long)v_row, total_mb);
+    return c;
+}
+
+extern "C" void dflash_crosskv_free(void * handle) {
+    if (!handle) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    for (int l = 0; l < c->n_layers; l++) {
+        cudaFree(c->k_rings[l]);
+        cudaFree(c->v_rings[l]);
+    }
+    delete[] c->k_rings;
+    delete[] c->v_rings;
+    delete c;
+}
+
+// Write n_tokens projected rows (device src, contiguous [n_tokens, row]) into the
+// K (which==0) or V (which==1) ring at [ring_pos, ring_pos+n) with wrap-around.
+extern "C" void dflash_crosskv_write(
+        void * handle, int layer, int which, int ring_pos,
+        const void * dev_src, int n_tokens) {
+    if (!handle || !dev_src || n_tokens <= 0) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
+
+    (void)cudaSetDevice(c->device);
+
+    float * dst = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row = which == 0 ? c->k_row : c->v_row;
+    const size_t stride = (size_t)row * sizeof(float);
+    const float * src = (const float *)dev_src;
+
+    ring_span_for_each(c->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
+        cudaMemcpyAsync(dst + (size_t)ring_tok * row, src + (size_t)src_tok * row,
+                        (size_t)n * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    });
+}
+
+// Gather the window [start, start+n_tokens) of the K/V ring into a device
+// destination (drafter graph input tensor) at byte offset dst_off.
+extern "C" void dflash_crosskv_read_window(
+        void * handle, int layer, int which, int start, int n_tokens,
+        void * dev_dst, size_t dst_off) {
+    if (!handle || !dev_dst || n_tokens <= 0) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
+
+    (void)cudaSetDevice(c->device);
+
+    const float * src = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row = which == 0 ? c->k_row : c->v_row;
+    const size_t stride = (size_t)row * sizeof(float);
+    char * dst = (char *)dev_dst + dst_off;
+
+    ring_span_for_each(c->ring_size, start, n_tokens, [&](int ring_tok, int dst_tok, int n) {
+        cudaMemcpyAsync(dst + (size_t)dst_tok * stride, src + (size_t)ring_tok * row,
+                        (size_t)n * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    });
+}
+
+// Synchronize the stream all ring/cache copies run on. Needed before handing
+// data to a compute path that runs on a different (backend) stream.
+extern "C" void dflash_crosskv_sync(void) {
+    cudaStreamSynchronize(cudaStreamPerThread);
+}
+
 // D2D copy: from device source to device destination (raw pointers).
 // Uses peer copy when source and destination are on different devices.
 extern "C" void dflash_cross_ring_gpu_set_tensor(

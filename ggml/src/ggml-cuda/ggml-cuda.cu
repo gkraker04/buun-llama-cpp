@@ -5548,6 +5548,11 @@ extern "C" void   dflash_cross_ring_gpu_write_d2d(void *, int, int, const void *
 extern "C" void   dflash_cross_ring_gpu_read(void *, int, int, float *, int, int);
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
+extern "C" void * dflash_crosskv_alloc(int, int64_t, int64_t, int);
+extern "C" void   dflash_crosskv_free(void *);
+extern "C" void   dflash_crosskv_write(void *, int, int, int, const void *, int);
+extern "C" void   dflash_crosskv_read_window(void *, int, int, int, int, void *, size_t);
+extern "C" void   dflash_crosskv_sync(void);
 
 // TurboQuant/VBR KV-cache backend interface (ggml-vbr.h): every slot filled — libllama
 // resolves this vtable via GGML_VBR_BACKEND_IFACE_PROC instead of linking CUDA symbols.
@@ -5636,6 +5641,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_gpu_set_tensor;
+    }
+    if (strcmp(name, "dflash_crosskv_alloc") == 0) {
+        return (void *)dflash_crosskv_alloc;
+    }
+    if (strcmp(name, "dflash_crosskv_free") == 0) {
+        return (void *)dflash_crosskv_free;
+    }
+    if (strcmp(name, "dflash_crosskv_write") == 0) {
+        return (void *)dflash_crosskv_write;
+    }
+    if (strcmp(name, "dflash_crosskv_read_window") == 0) {
+        return (void *)dflash_crosskv_read_window;
+    }
+    if (strcmp(name, "dflash_crosskv_sync") == 0) {
+        return (void *)dflash_crosskv_sync;
     }
     return nullptr;
 }

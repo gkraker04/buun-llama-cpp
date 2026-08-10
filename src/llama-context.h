@@ -662,6 +662,16 @@ public:
     void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
                             int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
 
+    // --- projected cross-KV cache for the DFlash drafter (this ctx = drafter) ---
+    // init returns an opaque handle or nullptr when unsupported (non-dflash-draft
+    // arch, no CUDA procs, weights not device-resident). project runs the aux
+    // fc+wk/wv projection graph over the n_new ring tokens ending at end_slot
+    // (exclusive) and scatters the results into the cache. set_cross flips the
+    // drafter graph into cache-consumer mode for the next decode.
+    void * crosskv_init(void * ring_handle, int ring_size);
+    bool   crosskv_project(void * handle, void * ring_handle, int end_slot, int n_new);
+    void   crosskv_set_cross(void * handle, llama_seq_id seq_id, int end_slot, int n_real);
+
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();
     void set_tree_parent_ids(const int32_t * parents, int n_tokens);
@@ -678,6 +688,9 @@ public:
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;
+
+    // aux projection graph state for the projected cross-KV cache (drafter ctx)
+    struct dflash_crosskv_proj * crosskv_proj = nullptr;
 
     llama_tree_mask tree_mask;
 
