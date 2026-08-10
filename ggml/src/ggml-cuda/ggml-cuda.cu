@@ -5548,7 +5548,7 @@ extern "C" void   dflash_cross_ring_gpu_write_d2d(void *, int, int, const void *
 extern "C" void   dflash_cross_ring_gpu_read(void *, int, int, float *, int, int);
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
-extern "C" void * dflash_crosskv_alloc(int, int64_t, int64_t, int);
+extern "C" void * dflash_crosskv_alloc(int, int64_t, int64_t, int, int);
 extern "C" void   dflash_crosskv_free(void *);
 extern "C" void   dflash_crosskv_write(void *, int, int, int, const void *, int);
 extern "C" void   dflash_crosskv_read_window(void *, int, int, int, int, void *, size_t);

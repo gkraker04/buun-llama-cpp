@@ -265,21 +265,73 @@ struct dflash_crosskv_cache {
     int device;
     int n_layers;
     int ring_size;
-    int64_t k_row;      // floats per token (K)
-    int64_t v_row;      // floats per token (V)
-    float ** k_rings;   // host array of per-layer device pointers
-    float ** v_rings;
+    int quant;            // 0 = f32 rows, 1 = q8_0 rows (32-elem blocks, half scale)
+    int64_t k_row;        // floats per token (K)
+    int64_t v_row;        // floats per token (V)
+    int64_t k_row_bytes;  // stored bytes per token
+    int64_t v_row_bytes;
+    uint8_t ** k_rings;   // host array of per-layer device pointers
+    uint8_t ** v_rings;
 };
 
-extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_row, int ring_size) {
+// q8_0 block: half scale + 32 int8 (matches ggml block_q8_0 semantics: d = amax/127)
+#define CKV_Q8_BLOCK   32
+#define CKV_Q8_BYTES   (2 + CKV_Q8_BLOCK)
+
+__global__ static void k_crosskv_quant_q8_0(
+        const float * __restrict__ src, uint8_t * __restrict__ dst,
+        const int groups_per_row, const int64_t row, const int n_tokens) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_tokens * groups_per_row) return;
+    const int tok = g / groups_per_row;
+    const int grp = g % groups_per_row;
+
+    const float * s = src + (size_t)tok * row + (size_t)grp * CKV_Q8_BLOCK;
+    uint8_t * d = dst + (size_t)tok * groups_per_row * CKV_Q8_BYTES + (size_t)grp * CKV_Q8_BYTES;
+
+    float amax = 0.0f;
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) amax = fmaxf(amax, fabsf(s[i]));
+    const float scale = amax / 127.0f;
+    const float id    = scale != 0.0f ? 1.0f/scale : 0.0f;
+
+    *(half *)d = __float2half(scale);
+    int8_t * q = (int8_t *)(d + 2);
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) q[i] = (int8_t)roundf(s[i] * id);
+}
+
+__global__ static void k_crosskv_dequant_q8_0(
+        const uint8_t * __restrict__ src, float * __restrict__ dst,
+        const int groups_per_row, const int64_t row, const int n_tokens) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_tokens * groups_per_row) return;
+    const int tok = g / groups_per_row;
+    const int grp = g % groups_per_row;
+
+    const uint8_t * s = src + (size_t)tok * groups_per_row * CKV_Q8_BYTES + (size_t)grp * CKV_Q8_BYTES;
+    float * d = dst + (size_t)tok * row + (size_t)grp * CKV_Q8_BLOCK;
+
+    const float scale = __half2float(*(const half *)s);
+    const int8_t * q = (const int8_t *)(s + 2);
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) d[i] = q[i] * scale;
+}
+
+extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_row, int ring_size, int quant) {
+    if (quant != 0 && (k_row % CKV_Q8_BLOCK != 0 || v_row % CKV_Q8_BLOCK != 0)) {
+        fprintf(stderr, "dflash crosskv: rows not divisible by %d — falling back to f32 storage\n", CKV_Q8_BLOCK);
+        quant = 0;
+    }
+
     auto * c = new dflash_crosskv_cache();
     cudaGetDevice(&c->device);
     c->n_layers  = n_layers;
     c->ring_size = ring_size;
+    c->quant     = quant;
     c->k_row     = k_row;
     c->v_row     = v_row;
-    c->k_rings   = new float*[n_layers]();
-    c->v_rings   = new float*[n_layers]();
+    c->k_row_bytes = quant ? (k_row/CKV_Q8_BLOCK)*CKV_Q8_BYTES : k_row*(int64_t)sizeof(float);
+    c->v_row_bytes = quant ? (v_row/CKV_Q8_BLOCK)*CKV_Q8_BYTES : v_row*(int64_t)sizeof(float);
+    c->k_rings   = new uint8_t*[n_layers]();
+    c->v_rings   = new uint8_t*[n_layers]();
 
     auto fail = [&]() {
         for (int l = 0; l < n_layers; l++) {
@@ -293,16 +345,17 @@ extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_ro
     };
 
     for (int l = 0; l < n_layers; l++) {
-        if (cudaMalloc(&c->k_rings[l], (size_t)ring_size * k_row * sizeof(float)) != cudaSuccess) return fail();
-        if (cudaMalloc(&c->v_rings[l], (size_t)ring_size * v_row * sizeof(float)) != cudaSuccess) return fail();
-        // zero-init: cold slots must stay finite (they can be gathered as masked pad)
-        cudaMemset(c->k_rings[l], 0, (size_t)ring_size * k_row * sizeof(float));
-        cudaMemset(c->v_rings[l], 0, (size_t)ring_size * v_row * sizeof(float));
+        if (cudaMalloc(&c->k_rings[l], (size_t)ring_size * c->k_row_bytes) != cudaSuccess) return fail();
+        if (cudaMalloc(&c->v_rings[l], (size_t)ring_size * c->v_row_bytes) != cudaSuccess) return fail();
+        // zero-init: cold slots must stay finite (they can be gathered as masked pad;
+        // an all-zero q8_0 block dequantizes to zeros)
+        cudaMemset(c->k_rings[l], 0, (size_t)ring_size * c->k_row_bytes);
+        cudaMemset(c->v_rings[l], 0, (size_t)ring_size * c->v_row_bytes);
     }
 
-    size_t total_mb = (size_t)n_layers * ring_size * (k_row + v_row) * sizeof(float) / (1024 * 1024);
-    fprintf(stderr, "dflash crosskv: allocated %d layers x %d slots (K %lld + V %lld floats/tok, ~%zu MB)\n",
-            n_layers, ring_size, (long long)k_row, (long long)v_row, total_mb);
+    size_t total_kb = (size_t)n_layers * ring_size * (c->k_row_bytes + c->v_row_bytes) / 1024;
+    fprintf(stderr, "dflash crosskv: allocated %d layers x %d slots (K %lld + V %lld floats/tok, %s, ~%zu KB)\n",
+            n_layers, ring_size, (long long)k_row, (long long)v_row, quant ? "q8_0" : "f32", total_kb);
     return c;
 }
 
@@ -318,8 +371,9 @@ extern "C" void dflash_crosskv_free(void * handle) {
     delete c;
 }
 
-// Write n_tokens projected rows (device src, contiguous [n_tokens, row]) into the
-// K (which==0) or V (which==1) ring at [ring_pos, ring_pos+n) with wrap-around.
+// Write n_tokens projected rows (device src, contiguous f32 [n_tokens, row]) into
+// the K (which==0) or V (which==1) ring at [ring_pos, ring_pos+n) with wrap-around.
+// f32 mode: plain D2D copies. q8_0 mode: quantize kernel per span.
 extern "C" void dflash_crosskv_write(
         void * handle, int layer, int which, int ring_pos,
         const void * dev_src, int n_tokens) {
@@ -329,18 +383,25 @@ extern "C" void dflash_crosskv_write(
 
     (void)cudaSetDevice(c->device);
 
-    float * dst = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
-    const int64_t row = which == 0 ? c->k_row : c->v_row;
-    const size_t stride = (size_t)row * sizeof(float);
+    uint8_t * dst = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row       = which == 0 ? c->k_row       : c->v_row;
+    const int64_t row_bytes = which == 0 ? c->k_row_bytes : c->v_row_bytes;
     const float * src = (const float *)dev_src;
 
     ring_span_for_each(c->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
-        cudaMemcpyAsync(dst + (size_t)ring_tok * row, src + (size_t)src_tok * row,
-                        (size_t)n * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        if (c->quant) {
+            const int gpr = (int)(row / CKV_Q8_BLOCK);
+            const int total = n * gpr;
+            k_crosskv_quant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                src + (size_t)src_tok * row, dst + (size_t)ring_tok * row_bytes, gpr, row, n);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)ring_tok * row_bytes, src + (size_t)src_tok * row,
+                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
     });
 }
 
-// Gather the window [start, start+n_tokens) of the K/V ring into a device
+// Gather the window [start, start+n_tokens) of the K/V ring into a device f32
 // destination (drafter graph input tensor) at byte offset dst_off.
 extern "C" void dflash_crosskv_read_window(
         void * handle, int layer, int which, int start, int n_tokens,
@@ -351,14 +412,22 @@ extern "C" void dflash_crosskv_read_window(
 
     (void)cudaSetDevice(c->device);
 
-    const float * src = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
-    const int64_t row = which == 0 ? c->k_row : c->v_row;
-    const size_t stride = (size_t)row * sizeof(float);
+    const uint8_t * src = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row       = which == 0 ? c->k_row       : c->v_row;
+    const int64_t row_bytes = which == 0 ? c->k_row_bytes : c->v_row_bytes;
     char * dst = (char *)dev_dst + dst_off;
 
     ring_span_for_each(c->ring_size, start, n_tokens, [&](int ring_tok, int dst_tok, int n) {
-        cudaMemcpyAsync(dst + (size_t)dst_tok * stride, src + (size_t)ring_tok * row,
-                        (size_t)n * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        if (c->quant) {
+            const int gpr = (int)(row / CKV_Q8_BLOCK);
+            const int total = n * gpr;
+            k_crosskv_dequant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                src + (size_t)ring_tok * row_bytes, (float *)(dst + (size_t)dst_tok * row * sizeof(float)),
+                gpr, row, n);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)dst_tok * row_bytes, src + (size_t)ring_tok * row_bytes,
+                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
     });
 }
 

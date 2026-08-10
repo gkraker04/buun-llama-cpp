@@ -6869,7 +6869,7 @@ void * llama_context::crosskv_init(void * ring_handle, int ring_size) {
         return nullptr;
     }
 
-    using alloc_fn_t = void * (*)(int, int64_t, int64_t, int);
+    using alloc_fn_t = void * (*)(int, int64_t, int64_t, int, int);
     using free_fn_t  = void   (*)(void *);
     using write_fn_t = void   (*)(void *, int, int, int, const void *, int);
     using read_fn_t  = void   (*)(void *, int, int, int, int, void *, size_t);
@@ -6903,7 +6903,17 @@ void * llama_context::crosskv_init(void * ring_handle, int ring_size) {
     const int64_t k_row = hparams.n_embd_k_gqa();
     const int64_t v_row = hparams.n_embd_v_gqa();
 
-    void * cache = fn_alloc(n_layer, k_row, v_row, ring_size);
+    // lossy storage experiment (back-port 2): GGML_DFLASH_CROSSKV_QUANT=q8_0|1
+    // stores the cached projections as q8_0 blocks. OFF by default — it changes
+    // drafter inputs, so acceptance must be re-measured whenever it is enabled.
+    int quant = 0;
+    if (const char * eq = getenv("GGML_DFLASH_CROSSKV_QUANT")) {
+        if (strcmp(eq, "q8_0") == 0 || atoi(eq) == 1) {
+            quant = 1;
+        }
+    }
+
+    void * cache = fn_alloc(n_layer, k_row, v_row, ring_size, quant);
     if (!cache) {
         return nullptr;
     }
