@@ -401,18 +401,9 @@ static void test_execution_seam_fallbacks() {
     CHECK(route_home.counters.fallback_reason[size_t(
               common_cache_plan_authority_fallback::stale_capability)] == 1);
 
-    server_cache_plan_execution checkpoint_execution;
-    checkpoint_execution.kind =
-        server_cache_plan_execution_kind::checkpoint_restore;
-    CHECK(server_cache_plan_checkpoint_superseded_by_window(
-        checkpoint_execution, true));
-    CHECK(!server_cache_plan_checkpoint_superseded_by_window(
-        checkpoint_execution, false));
     server_cache_plan_execution live_execution;
     live_execution.kind =
         server_cache_plan_execution_kind::live_replay;
-    CHECK(!server_cache_plan_checkpoint_superseded_by_window(
-        live_execution, true));
     CHECK(server_cache_plan_live_replay_lost_to_logits(
         live_execution, 0));
     CHECK(!server_cache_plan_live_replay_lost_to_logits(

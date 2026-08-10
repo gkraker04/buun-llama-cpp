@@ -224,36 +224,6 @@ static bool test_resume_plan_and_attn_trim(
     }
     llama_synchronize(ctx.get());
 
-    const uint32_t both =
-        LLAMA_MEMORY_RESUME_COMPONENT_ATTN |
-        LLAMA_MEMORY_RESUME_COMPONENT_RECURRENT;
-    const auto hit = llama_memory_plan_resume(
-        llama_get_memory(ctx.get()), 0, n_live);
-    if (!hit.resumable || hit.full_replay || hit.components != both ||
-        hit.reuse_tokens != n_live || hit.replay_tokens != 0 ||
-        hit.reject_reason != LLAMA_MEMORY_RESUME_REJECT_NONE) {
-        fprintf(stderr, "%s : plan_resume misreported an exact-frontier hit\n", __func__);
-        return false;
-    }
-
-    const auto partial = llama_memory_plan_resume(
-        llama_get_memory(ctx.get()), 0, n_checkpoint);
-    if (!partial.resumable || partial.full_replay || partial.components != both ||
-        partial.reuse_tokens != n_checkpoint ||
-        partial.replay_tokens != n_live - n_checkpoint ||
-        partial.reject_reason != LLAMA_MEMORY_RESUME_REJECT_NONE) {
-        fprintf(stderr, "%s : plan_resume misreported a partial restore\n", __func__);
-        return false;
-    }
-
-    const auto reject = llama_memory_plan_resume(
-        llama_get_memory(ctx.get()), 0, n_live + 1);
-    if (reject.resumable || !reject.full_replay ||
-        reject.components != LLAMA_MEMORY_RESUME_COMPONENT_NONE ||
-        reject.reject_reason != LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER) {
-        fprintf(stderr, "%s : plan_resume accepted an unavailable future frontier\n", __func__);
-        return false;
-    }
 
     if (llama_state_seq_set_data_ext(
             ctx.get(), checkpoint.data(), checkpoint.size(), 0, partial_flags) !=
@@ -284,7 +254,7 @@ static bool test_resume_plan_and_attn_trim(
     }
 
     fprintf(stderr,
-            "%s : PASS (resume hit/partial/reject truth table; hybrid recurrent state preserved)\n",
+            "%s : PASS (hybrid recurrent state preserved across attention-only trim)\n",
             __func__);
     return true;
 }
@@ -364,11 +334,47 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Tape buffers are context-lifetime scratch, but recording is transient.
+    // Poison one destination, disable recording, and prove a normal prefix
+    // decode neither re-arms its graph pointers nor writes the tape. Re-enable
+    // below so the existing exact rollback comparison still exercises the
+    // production topology transition in both directions.
+    auto * active_tape = ctx->dflash_capture->active_tape();
+    ggml_tensor * off_path_qkv =
+        active_tape && !active_tape->layers.empty()
+            ? active_tape->layers.front().qkv
+            : nullptr;
+    if (!off_path_qkv) {
+        fprintf(stderr, "%s : device-resident conv tape is unavailable\n", __func__);
+        return 1;
+    }
+    ggml_backend_tensor_memset(
+        off_path_qkv, 0xa5, 0, ggml_nbytes(off_path_qkv));
+    std::vector<uint8_t> tape_disabled_before(ggml_nbytes(off_path_qkv));
+    std::vector<uint8_t> tape_disabled_after(ggml_nbytes(off_path_qkv));
+    ggml_backend_tensor_get(
+        off_path_qkv, tape_disabled_before.data(), 0,
+        tape_disabled_before.size());
+
+    llama_set_tape_recording(ctx.get(), false);
+    if (ctx->get_cparams().tape_gpu != nullptr ||
+        ctx->get_cparams().tape_gpu_n_seqs != 0) {
+        fprintf(stderr, "%s : disabling tape left graph pointers armed\n", __func__);
+        return 1;
+    }
     if (!decode_range(ctx.get(), tokens, 0, n_prefix)) {
         fprintf(stderr, "%s : prefix decode failed\n", __func__);
         return 1;
     }
     llama_synchronize(ctx.get());
+    ggml_backend_tensor_get(
+        off_path_qkv, tape_disabled_after.data(), 0,
+        tape_disabled_after.size());
+    if (tape_disabled_before != tape_disabled_after) {
+        fprintf(stderr, "%s : tape-off prefix decode mutated rollback tape\n", __func__);
+        return 1;
+    }
+    llama_set_tape_recording(ctx.get(), true);
 
     // Mirror production's backup-sequence dance. Recurrent seq_cp deliberately does not
     // migrate planes; the backup is the active pre-verify row that replay must start from.
@@ -401,7 +407,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : recurrent model exposed no DFlash tape layers\n", __func__);
         return 1;
     }
-    auto * active_tape = ctx->dflash_capture->active_tape();
+    active_tape = ctx->dflash_capture->active_tape();
     if (active_tape == nullptr ||
         active_tape->layers.size() != ctx->dflash_capture->tape_layers.size() ||
         !active_tape->qkv_staged()) {
@@ -549,54 +555,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Gate 2: restore the same immutable boundary again, poison redundant K/V,
-    // and replay from qkv_mixed + gate + beta only. Poisoning makes an accidental
-    // read from either redundant tensor fail loudly rather than yielding a false pass.
-    if (!recurrent->seq_rm(0, -1, -1) ||
-        !recurrent->try_seq_cp(1, 0, -1, -1)) {
-        fprintf(stderr, "%s : failed to restore pre-verify backup for minimal replay\n", __func__);
-        return 1;
-    }
 
-    for (auto & layer : active_tape->layers) {
-        ggml_backend_tensor_memset(layer.k, 0xa5, 0, ggml_nbytes(layer.k));
-        ggml_backend_tensor_memset(layer.v, 0xa5, 0, ggml_nbytes(layer.v));
-    }
-    for (auto & tape : ctx->dflash_capture->tape_layers) {
-        tape.qkv_mixed.clear();
-        tape.n_tokens = 0;
-        tape.conv_channels = 0;
-    }
-
-    llama_set_tape_minimal_replay(ctx.get(), true);
-    if (!llama_tape_replay(ctx.get(), 0, n_accepted) ||
-        !llama_tape_replay_sync(ctx.get())) {
-        fprintf(stderr, "%s : minimal exact tape replay failed\n", __func__);
-        return 1;
-    }
-
-    if (!ctx->dflash_capture->replay_minimal_last) {
-        fprintf(stderr, "%s : requested minimal-F32 replay fell back to the redundant path\n", __func__);
-        return 1;
-    }
-    if (recurrent->rs_idx[0] != 0 || recurrent->seq_pos_max(0) != keep_end - 1) {
-        fprintf(stderr, "%s : minimal replay selected row %u at pos %d, expected row 0 at pos %d\n",
-                __func__, recurrent->rs_idx[0], recurrent->seq_pos_max(0), (int) keep_end - 1);
-        return 1;
-    }
-
-    std::vector<state_piece> minimal_state;
-    if (!read_state(recurrent, 0, minimal_state)) {
-        fprintf(stderr, "%s : failed to read minimal-F32 replay state\n", __func__);
-        return 1;
-    }
-    if (!states_bit_equal(redundant_state, minimal_state)) {
-        fprintf(stderr, "%s : minimal-F32 conv reconstruction is not bit-exact with redundant tape replay on %s\n",
-                __func__, gpu_name);
-        return 1;
-    }
-
-    fprintf(stderr, "%s : PASS (plane == redundant F32 tape == minimal-F32 conv replay bit-for-bit on %s)\n",
+    fprintf(stderr, "%s : PASS (plane == redundant F32 tape bit-for-bit on %s)\n",
             __func__, gpu_name);
     return 0;
 }

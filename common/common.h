@@ -759,9 +759,6 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
-    int32_t dflash_window_depth   = 0;     // retained rolling GDN records; 0 disables server integration
-    int32_t dflash_window_advance = 16;    // records per left-edge publication transaction
-    std::string dflash_window_codec = "f32"; // exact f32 or explicit approximate f16
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1336,10 +1333,6 @@ inline bool operator==(
            a.media_content_identity == b.media_content_identity;
 }
 
-// §9 checkpoint shadow holder: opaque wrapper around the VBR generation record (D-A2-7). All
-// definitions that touch it live in the single bridge TU common/common-checkpoint-shadow.cpp.
-struct common_checkpoint_shadow;
-
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1389,23 +1382,7 @@ struct common_prompt_checkpoint {
     };
     accel_state accel;
 
-    // §9.1 generation-record shadow. Copying a checkpoint deliberately DROPS it (the copy is a
-    // fresh generation-unknown state — invalidate-first host movement by construction); moving
-    // transfers it; clear() destroys it. Legacy behavior is untouched in every outcome.
-    std::unique_ptr<common_checkpoint_shadow> shadow;
-
-    common_prompt_checkpoint();
-    ~common_prompt_checkpoint();
-    common_prompt_checkpoint(const common_prompt_checkpoint & other);
-    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & other);
-    common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept;
-    common_prompt_checkpoint & operator=(common_prompt_checkpoint && other) noexcept;
-
     size_t size() const;
-
-    // Legacy-only bytes. Host-cache staging admission must price the invalidate-first copy it
-    // is about to make (which drops the shadow), byte-identical to pre-shadow accounting.
-    size_t size_without_shadow() const;
 
     bool empty() const;
     void clear();

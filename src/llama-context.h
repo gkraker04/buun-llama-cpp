@@ -69,12 +69,6 @@ struct dflash_tape_gpu_layer {
     ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * qkv  = nullptr;  // [conv_channels, max_tokens] (conv rebuild staging; null = eval-callback capture)
-    // Direct-GPU minimal-capture views into dflash_tape_gpu::minimal_packed.
-    // The token stride spans every recurrent layer, making one complete token
-    // record contiguous without changing the shipped redundant tape layout.
-    ggml_tensor * minimal_gate = nullptr; // [1, H_v, max_tokens]
-    ggml_tensor * minimal_beta = nullptr; // [1, H_v, max_tokens]
-    ggml_tensor * minimal_qkv  = nullptr; // [conv_channels, max_tokens]
 };
 
 struct dflash_tape_gpu {
@@ -82,8 +76,6 @@ struct dflash_tape_gpu {
     std::vector<int32_t> layer_ids;             // model layer indices → tape index mapping
     ggml_backend_buffer_t buf = nullptr;
     ggml_context * ctx = nullptr;               // owns the tensor descriptors
-    ggml_tensor * minimal_packed = nullptr;      // [minimal_record_floats, max_tokens]
-    int64_t minimal_record_floats = 0;
     int max_tokens = 0;                         // allocated capacity
     int n_tokens = 0;                           // actual tokens recorded this pass
 
@@ -96,145 +88,6 @@ struct dflash_tape_gpu {
     ~dflash_tape_gpu() {
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
-    }
-};
-
-// WS-2 Gate-3 prototype: one minimal-F32 record per physical ring slot.
-// Payload tensors are layer-major; this metadata supplies the logical identity
-// that a circular index alone cannot.
-struct dflash_window_record {
-    llama_pos pos = -1;
-    llama_seq_id seq_id = -1;
-    bool valid = false;
-};
-
-struct dflash_window_layer {
-    ggml_tensor * qkv  = nullptr; // [conv_channels, capacity]
-    ggml_tensor * gate = nullptr; // [H_v, capacity], pre-exp
-    ggml_tensor * beta = nullptr; // [H_v, capacity], pre-sigmoid
-    ggml_tensor * r[2] = {};      // two complete conv boundary copies
-    ggml_tensor * s[2] = {};      // two complete GDN boundary copies
-};
-
-struct dflash_window_apply_cache {
-    ggml_context * ctx = nullptr;
-    ggml_cgraph * graph = nullptr;
-    int n_records = 0;
-};
-
-struct dflash_window {
-    bool enabled = false;
-    // Persistent records are F32 in the exact namespace. F16 is an explicit,
-    // opt-in approximate namespace; replay always materializes it back to
-    // detached F32 staging before recurrent state is touched.
-    ggml_type record_type = GGML_TYPE_F32;
-    // Tensor-split Gate-4 mode captures/validates minimal payload ownership in
-    // host storage. It deliberately does not claim cross-device exact replay.
-    bool ownership_only = false;
-    llama_seq_id seq_id = -1;
-    int capacity = 0;       // physical records = retained_depth + advance_batch - 1
-    int retained_depth = 0; // minimum rollback depth guaranteed after an advance
-    int advance_batch = 1;  // records applied/published per full-ring transaction
-    int head = 0;
-    int count = 0;
-    llama_pos boundary_pos = -1;
-    llama_pos frontier_pos = -1;
-    int published_idx = 0;
-    uint64_t packed_record_copies = 0; // direct-GPU Gate-5 issuance oracle
-    // Harness A/B only: false keeps stable staging/layout but rebuilds the
-    // periodic advance graph every time.
-    bool advance_graph_cache_enabled = true;
-    // Harness-only phase attribution. Disabled by default so production takes
-    // no timer/syscall overhead.
-    bool profile_timing = false;
-    uint64_t profile_append_us = 0;
-    uint64_t profile_advance_us = 0;
-    uint64_t profile_stage_us = 0;
-    uint64_t profile_apply_us = 0;
-    uint64_t profile_append_calls = 0;
-    uint64_t profile_advance_calls = 0;
-    uint64_t profile_apply_calls = 0;
-    // One-shot fault point: after private GPU state is complete and fenced, but
-    // before published_idx / boundary_pos / head / count commit.
-    bool fail_publish_once = false;
-    bool last_publish_failed = false;
-
-    // Last non-published reconstruction target, for the Gate-3 oracle.
-    int reconstructed_idx = -1;
-    llama_pos reconstructed_pos = -1;
-
-    std::vector<dflash_window_record> records;
-    std::vector<dflash_window_layer> layers;
-    // Stable q-record source used only by periodic left-edge advancement.
-    // Its fixed addresses let the CUDA backend promote each private-copy graph
-    // through warmup into a reusable CUDA graph.
-    std::vector<dflash_window_layer> advance_layers;
-    std::vector<int32_t> layer_ids;
-    std::vector<int> gpu_layer_indices;
-
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * record_packed = nullptr; // record_type [record_floats, capacity]
-    ggml_tensor * append_packed = nullptr; // record_type [record_floats], private
-    ggml_tensor * advance_packed = nullptr; // F32 [record_floats, advance_batch]
-    int64_t record_floats = 0;
-    ggml_backend_buffer_t scratch = nullptr;
-    size_t scratch_size = 0;
-    ggml_backend_buffer_t advance_scratch = nullptr;
-    size_t advance_scratch_size = 0;
-    ggml_backend_buffer_t codec_scratch = nullptr;
-    size_t codec_scratch_size = 0;
-    dflash_window_apply_cache advance_cache[2];
-
-    ~dflash_window() {
-        for (auto & cache : advance_cache) {
-            if (cache.ctx) ggml_free(cache.ctx);
-        }
-        if (codec_scratch) ggml_backend_buffer_free(codec_scratch);
-        if (advance_scratch) ggml_backend_buffer_free(advance_scratch);
-        if (scratch) ggml_backend_buffer_free(scratch);
-        if (buf) ggml_backend_buffer_free(buf);
-        if (ctx) ggml_free(ctx);
-    }
-};
-
-// Gate-4 capture is a two-phase transaction. A successful decode first records
-// the absolute positions and their sequence owners here while the fixed per-seq
-// GPU tapes still hold the payload. Normal decode assigns commit_count eagerly;
-// speculative verification leaves it unset until the caller reports acceptance.
-struct dflash_window_pending_seq {
-    llama_seq_id seq_id = -1;
-    std::vector<llama_pos> positions;
-    int commit_count = -1;
-    int copied_count = 0;
-};
-
-struct dflash_window_pending {
-    bool active = false;
-    bool speculative = false;
-    // Snapshot the graph destination selected for this decode. A caller may
-    // toggle the prototype mode only after capture, but pending bytes must
-    // never be reinterpreted under the new mode.
-    bool minimal_packed = false;
-    bool qkv_materialized = false;
-    bool qkv_capture_failed = false;
-    std::vector<dflash_window_pending_seq> seqs;
-    // Decode-scoped callback accumulation. Each layer is preallocated as one
-    // packed [channels, tokens, pending owners] image before model mutation;
-    // qkv_received is [layer][owner] and permits owners to arrive in separate
-    // recurrent-memory ubatches without sharing/overwriting callback storage.
-    std::vector<dflash_tape_layer> qkv_layers;
-    std::vector<int> qkv_received;
-
-    void clear() {
-        active = false;
-        speculative = false;
-        minimal_packed = false;
-        qkv_materialized = false;
-        qkv_capture_failed = false;
-        seqs.clear();
-        qkv_layers.clear();
-        qkv_received.clear();
     }
 };
 
@@ -264,30 +117,12 @@ struct dflash_capture_data {
 
     // tape recording (for DeltaNet state rollback)
     bool tape_enabled = false;
-    // WS-2 gated prototype: reconstruct post-conv K/V from qkv_mixed at replay.
-    // False keeps the shipped redundant K/V tape path unchanged.
-    bool tape_minimal_replay = false;
-    bool replay_minimal_last = false;
     // Test-only one-shot fault used to prove exact GPU replay fails closed
     // without consuming the old scratch buffer or running the CPU recurrence.
     bool replay_force_alloc_failure_once = false;
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
-    // One independent rolling boundary/ring per sequence. Payload ownership is
-    // still redundantly stamped into every physical record and checked on use.
-    std::vector<std::unique_ptr<dflash_window>> windows;
-    // Private decode-scoped accumulator. It is moved into window_pending only
-    // after the complete forward succeeds, so callbacks from separate ubatches
-    // cannot last-write-win the shared legacy tape_layers buffer.
-    dflash_window_pending window_staging;
-    dflash_window_pending window_pending;
-    bool window_speculative_capture = false;
-    // Peak simultaneous host payload held by the legacy callback tape plus
-    // decode-scoped packed QKV staging. The latter is freed after publication,
-    // so post-hoc vector inspection alone undercounts Gate-5 peak bytes.
-    size_t window_host_staging_peak_bytes = 0;
-
     // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
     // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
     // (default), `tapes` has size 1 and `active_tape_idx` is always 0 — behavior is
@@ -327,13 +162,6 @@ struct dflash_capture_data {
     // eval callback. Consumers that specifically require device-staged QKV must
     // additionally test dflash_tape_gpu::qkv_staged().
     int tape_stage_n_tokens = 0;
-    bool tape_stage_minimal_packed = false;
-    // Gate-6 codec oracle counters. The prototype round-trips the captured
-    // minimal record through an approximate device format before replay.
-    ggml_type approx_codec_last = GGML_TYPE_COUNT;
-    uint64_t approx_codec_roundtrips = 0;
-    size_t approx_codec_storage_bytes_last = 0;
-
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
@@ -806,33 +634,6 @@ public:
     void dflash_ensure_recurrent_setup();
 
     void set_tape_recording(bool enable);
-    void set_tape_minimal_replay(bool enable);
-    // Gate-6 quality oracle: destructively round-trip the currently staged
-    // minimal-F32 tape through F16 or TURBO8_0 on the replay device.
-    bool dflash_tape_codec_roundtrip(ggml_type codec);
-    bool dflash_window_enable(llama_seq_id seq_id, int capacity);
-    bool dflash_window_enable_batched(
-            llama_seq_id seq_id, int retained_depth, int advance_batch);
-    bool dflash_window_enable_batched_f16(
-            llama_seq_id seq_id, int retained_depth, int advance_batch);
-    bool dflash_window_enable_batched_with_type(
-            llama_seq_id seq_id, int retained_depth, int advance_batch,
-            ggml_type record_type);
-    dflash_window * dflash_window_for_seq(llama_seq_id seq_id) const;
-    bool dflash_window_get_info(
-            llama_seq_id seq_id, llama_dflash_window_info & info) const;
-    bool dflash_window_discard_seq(llama_seq_id seq_id);
-    bool dflash_window_stage_decode(
-            dflash_window_pending && staged,
-            bool speculative);
-    bool dflash_window_commit(llama_seq_id seq_id, int n_accepted);
-    bool dflash_window_retry_capture();
-    bool dflash_window_reconstruct(llama_seq_id seq_id, llama_pos pos);
-    bool dflash_window_install_reconstructed(llama_seq_id seq_id, llama_pos pos);
-    bool dflash_window_restore_seq(
-            llama_seq_id seq_id, llama_pos pos, llama_pos attention_p0);
-    bool dflash_window_commit_branch(llama_seq_id seq_id, llama_pos pos);
-    void dflash_window_inject_publish_failure(llama_seq_id seq_id);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
     bool tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,

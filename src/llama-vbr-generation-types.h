@@ -19,7 +19,7 @@ enum class vbr_repr_domain : uint8_t {
 };
 
 // Durable admission provenance. Unlike the diagnostic operation history, this value is part of
-// the immutable unit tuple compared by checkpoint_vbr_eligibility().
+// the immutable unit tuple carried by explicit generation artifacts.
 enum class vbr_repr_transition : uint8_t {
     initial,
     degrade_f16_to_t8_admitted,
@@ -90,7 +90,7 @@ struct vbr_checkpoint_generation_record {
 
 // Record-vs-record deep equality (§9.2 dedup relation). This compares two captured checkpoint
 // records with each other — never a captured record against live tracker state, which remains
-// the exclusive province of checkpoint_vbr_eligibility().
+// the exclusive province of explicit artifact validation.
 inline bool operator==(const vbr_checkpoint_unit_generation & lhs, const vbr_checkpoint_unit_generation & rhs) {
     return lhs.repr_gen == rhs.repr_gen && lhs.current_type == rhs.current_type &&
            lhs.last_source_type == rhs.last_source_type && lhs.domain == rhs.domain &&

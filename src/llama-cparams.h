@@ -99,7 +99,6 @@ struct llama_cparams {
     int tape_gpu_n_seqs = 0;
     // Minimal-F32 mode omits redundant post-conv K/V graph copies. QKV,
     // gate, and beta remain authoritative for exact reconstruction.
-    bool tape_minimal_capture = false;
 
     // DFlash GPU capture staging: graph-embedded copies of each captured layer's l_out
     // into capture_stage[i] (one [n_embd, max_tokens] tensor per entry of

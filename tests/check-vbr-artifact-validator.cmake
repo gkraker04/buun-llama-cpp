@@ -49,8 +49,8 @@ endforeach()
 
 # The broad generation-isolation scan exempts this TU so it may copy captured
 # generation tuples into the proof. Restore the other half of that fence here:
-# live generation comparisons remain owned by checkpoint_vbr_eligibility().
-# The validator may consume only the inspector's closed compatibility bits.
+# live generation comparisons remain outside the import validator. The validator
+# may consume only the inspector's closed compatibility bits.
 function(find_live_generation_comparisons text output)
     set(hits "")
     foreach(symbol IN ITEMS

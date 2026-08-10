@@ -17,8 +17,6 @@
 #include "common.h"
 #include "common-cache-plan.h"
 #include "common-cache-plan-estimate.h"
-#include "common-checkpoint-shadow.h"
-#include "common-checkpoint-coordinator.h"
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
@@ -321,59 +319,6 @@ static inline bool prompt_save_durable(prompt_save_result r) {
     return r == prompt_save_result::published || r == prompt_save_result::already_durable;
 }
 
-// Commit-3 server-wide shadow qualification state (§8.3–8.5). Owned by server_context; slots
-// hold a const view for /slots emission only. Nothing here feeds shipped selection or either
-// live authority bit — pre-flip evidence only (the first G flip is A3), and the pending flip
-// below is stored state that no selector reads.
-struct server_shadow_global_state {
-    enum class applicability_state : uint8_t { unknown, applicable, not_applicable };
-    applicability_state applicability = applicability_state::unknown;
-
-    // §9.1–9.3 lifecycle counters (commit-2 vocabulary, unchanged semantics)
-    struct {
-        uint64_t capture_ok                              = 0;
-        uint64_t capture_failed                          = 0;
-        uint64_t qualification_reset                     = 0;
-        uint64_t distinct_but_legacy_dedup               = 0;
-        uint64_t duplicate_but_legacy_keep               = 0;
-        uint64_t refresh_ok                              = 0;
-        uint64_t refresh_refused                         = 0;
-        uint64_t refresh_nondeterministic_byte_mismatch  = 0;
-        uint64_t midlist_stale_no_refresh                = 0;
-    } counters;
-
-    // §8.5 versioned server-wide evidence; per-slot WS-4 evidence lives on server_slot
-    uint64_t authority_generation    = 0;
-    bool     pending_generation_flip = false;  // provably unable to change authority in A2
-    common_shadow_relation_evidence ws7_p;
-    common_shadow_relation_evidence ws7_f;
-    common_shadow_qualification_minima minima;  // production defaults: 1024 / 64 / 16
-
-    // top-level fault/availability observability (survives evidence resets)
-    uint64_t expected_unknown_total        = 0;
-    uint64_t shadow_unavailable_total      = 0;
-    uint64_t unexplained_disagreement_total = 0;
-    uint64_t coordinator_exceptions_total  = 0;
-
-    // class-keyed availability accounting (indexed by the closed tombstone enum)
-    std::array<uint64_t, 6> expected_tombstones = {};  // by common_checkpoint_shadow_tombstone
-    std::array<uint64_t, 6> lost_restores       = {};  // shipped restore whose G evaluation tombstoned
-    // §10.2 / verify r1 finding 8: replay-cost EVENTS caused by each strict tombstone class —
-    // the shipped-authority G axis paused on that tombstone this scan (event count, not tokens)
-    std::array<uint64_t, 6> extra_replay_events = {};
-
-    struct {
-        uint64_t set_pass    = 0;
-        uint64_t set_fail    = 0;
-        uint64_t hash_pass   = 0;
-        uint64_t hash_fail   = 0;
-        uint64_t unavailable = 0;
-    } oracle;
-
-    std::string last_outcome;
-    std::string last_reason;
-};
-
 // B0 shadow cache-plan observer state [P2 §7.7]. Debug-only record/serialization layer over the
 // authority substrate: records are allocated, populated, and serialized only under
 // params_base.cache_debug. Observer faults are caught outside the shipped decision path and become
@@ -475,12 +420,6 @@ struct server_slot {
         common_cache_plan_destruction_reason::mandatory_anchor;
     common_cache_plan_destruction_reason checkpoint_thinning_refusal =
         common_cache_plan_destruction_reason::none;
-
-    // commit-3 per-slot WS-4 qualification evidence + const view of the server-wide state
-    // (for /slots emission only)
-    common_shadow_relation_evidence shadow_ws4_l;
-    common_shadow_relation_evidence shadow_ws4_g;
-    const server_shadow_global_state * shadow_global = nullptr;
 
     // B0 shadow cache-plan record [P2]: in-flight (allocated per request only when the
     // observer is enabled — absence IS the disabled state) + this slot's last finalized
@@ -671,13 +610,6 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & adapter_config_key, common_cache_plan_record * obs = nullptr, int32_t required_source_id = -1) {
-        // A host snapshot replaces the live frontier wholesale. Any rolling
-        // tape rooted in the displaced frontier is no longer a valid lineage.
-        if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
-            SLT_ERR(*this, "%s", "cannot discard mixed-owner rolling-window capture before prompt load\n");
-            return false;
-        }
-        dflash_window_identity.clear();
         // No-restore is a successful identity operation. Seed the out-value
         // with the live lineage; a committed host restore overwrites it with
         // delivery.cache_family inside load_impl.
@@ -758,14 +690,6 @@ struct server_slot {
             retention_obs->retire_slot(id);
         }
 
-        if (!llama_dflash_window_discard_seq(ctx_tgt, id)) {
-            // The server integration currently rejects --parallel > 1, so a
-            // mixed-owner pending transaction is an invariant failure rather
-            // than an expected runtime case. Keep it loud; continuing would
-            // make the next decode consume a stale branch.
-            SLT_ERR(*this, "%s", "failed to discard rolling-window state while clearing slot\n");
-        }
-        dflash_window_identity.clear();
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
@@ -1131,7 +1055,6 @@ struct server_slot {
     // in GET /slots so a user can see WHY a request cold-processed instead of guessing. Set at the
     // prompt-reuse decision points; greppable by tests (e.g. the I9 VBR-reject reason).
     std::string cache_status;
-    std::string dflash_window_identity;
 
     // Phase-1 computation-frontier read ratchet [WS-4]. Only checkpoint-selection
     // decisions qualify the agreement streak; other consistency checks may
@@ -1215,19 +1138,6 @@ struct server_slot {
         return frontier_ratchet_flipped;
     }
 
-    // Last coordinated rolling-window restore. Exposed in GET /slots and
-    // logged as one structured line so quality gates can prove that their
-    // second request used the requested codec, identity and depth.
-    uint64_t dflash_window_restore_generation = 0;
-    llama_dflash_window_codec dflash_window_restore_codec = LLAMA_DFLASH_WINDOW_CODEC_NONE;
-    llama_pos dflash_window_restore_boundary = -1;
-    llama_pos dflash_window_restore_frontier = -1;
-    llama_pos dflash_window_restore_target = -1;
-    int32_t dflash_window_restore_depth = 0;
-    int32_t dflash_window_restore_task = -1;
-    std::string dflash_window_restore_identity;
-    std::string dflash_window_restore_result;
-
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -1273,14 +1183,6 @@ struct server_slot {
         // clear multimodal state
         mbatch.reset();
 
-        // §8.5 / verify r1 finding 4: slot reuse clears that slot's WS-4 qualification
-        // evidence — a recycled slot must never inherit the prior request's streak/classes
-        {
-            const uint64_t gen =
-                shadow_global != nullptr ? shadow_global->authority_generation : 0;
-            shadow_ws4_l.reset(gen);
-            shadow_ws4_g.reset(gen);
-        }
     }
 
     void init_sampler() const {
@@ -1754,72 +1656,6 @@ struct server_slot {
             }},
         };
 
-        // Commit-3 §8.3–8.5 qualification surface (read-only diagnostics; the
-        // computation_frontier_ratchet.read_path above remains the ONLY reported live L-axis
-        // authority — no G read path exists in A2). Emitted only once the applicability latch
-        // proves an armed run, so unarmed servers keep a byte-identical /slots response.
-        if (shadow_global != nullptr &&
-            shadow_global->applicability ==
-                server_shadow_global_state::applicability_state::applicable) {
-            const auto relation_json = [](const common_shadow_relation_evidence & ev) {
-                return json {
-                    { "agreement_streak",     ev.agreement_streak },
-                    { "agreements_total",     ev.agreements_total },
-                    { "disagreements_total",  ev.disagreements_total },
-                    { "class_counts", json {
-                        { "trivial_append",   ev.class_counts[size_t(common_checkpoint_shadow_observation::trivial_append)] },
-                        { "boundary_refined", ev.class_counts[size_t(common_checkpoint_shadow_observation::boundary_refined)] },
-                        { "destructive",      ev.class_counts[size_t(common_checkpoint_shadow_observation::destructive)] },
-                        { "import_refined",   ev.class_counts[size_t(common_checkpoint_shadow_observation::import_refined)] },
-                    } },
-                    { "boundary_refinements", ev.boundary_refinements },
-                    { "qualified",            ev.qualified },
-                };
-            };
-            const auto tombstone_json = [](const std::array<uint64_t, 6> & counts) {
-                json out = json::object();
-                for (size_t i = 0; i < counts.size(); ++i) {
-                    if (counts[i] > 0) {
-                        out[common_checkpoint_shadow_tombstone_name(
-                            common_checkpoint_shadow_tombstone(i))] = counts[i];
-                    }
-                }
-                return out;
-            };
-            res["vbr_generation_shadow"] = json {
-                { "applicability",            "applicable" },
-                { "authority_generation",     shadow_global->authority_generation },
-                { "evidence_version",         COMMON_SHADOW_EVIDENCE_VERSION },
-                { "qualification_state",      shadow_global->pending_generation_flip
-                                                  ? "qualified_pending" : "accumulating" },
-                { "pending_generation_flip",  shadow_global->pending_generation_flip },
-                { "last_outcome",             shadow_global->last_outcome },
-                { "last_reason",              shadow_global->last_reason },
-                { "relations", json {
-                    { "ws4_l", relation_json(shadow_ws4_l) },
-                    { "ws4_g", relation_json(shadow_ws4_g) },
-                    { "ws7_p", relation_json(shadow_global->ws7_p) },
-                    { "ws7_f", relation_json(shadow_global->ws7_f) },
-                } },
-                { "qualification_resets_total",     shadow_global->counters.qualification_reset },
-                { "expected_unknown_total",         shadow_global->expected_unknown_total },
-                { "shadow_unavailable_total",       shadow_global->shadow_unavailable_total },
-                { "unexplained_disagreement_total", shadow_global->unexplained_disagreement_total },
-                { "coordinator_exceptions_total",   shadow_global->coordinator_exceptions_total },
-                { "expected_tombstones",            tombstone_json(shadow_global->expected_tombstones) },
-                { "lost_restores",                  tombstone_json(shadow_global->lost_restores) },
-                { "extra_replay",                   tombstone_json(shadow_global->extra_replay_events) },
-                { "oracle", json {
-                    { "set_pass",    shadow_global->oracle.set_pass },
-                    { "set_fail",    shadow_global->oracle.set_fail },
-                    { "hash_pass",   shadow_global->oracle.hash_pass },
-                    { "hash_fail",   shadow_global->oracle.hash_fail },
-                    { "unavailable", shadow_global->oracle.unavailable },
-                } },
-                { "midlist_stale_no_refresh_total", shadow_global->counters.midlist_stale_no_refresh },
-            };
-        }
-
         // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
         if (ctx_tgt != nullptr) {
             const double kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
@@ -1864,25 +1700,6 @@ struct server_slot {
             // built once at finalize. Only ever non-null under --cache-debug.
             if (!cache_plan_json.is_null()) {
                 res["cache_plan"] = cache_plan_json;
-            }
-            if (dflash_window_restore_generation > 0) {
-                const char * restore_codec =
-                    dflash_window_restore_codec == LLAMA_DFLASH_WINDOW_CODEC_F16
-                        ? "f16"
-                        : dflash_window_restore_codec == LLAMA_DFLASH_WINDOW_CODEC_F32
-                            ? "f32"
-                            : "none";
-                res["dflash_window_restore"] = {
-                    { "generation", dflash_window_restore_generation },
-                    { "codec", restore_codec },
-                    { "boundary", dflash_window_restore_boundary },
-                    { "frontier", dflash_window_restore_frontier },
-                    { "target", dflash_window_restore_target },
-                    { "depth", dflash_window_restore_depth },
-                    { "id_task", dflash_window_restore_task },
-                    { "identity", dflash_window_restore_identity },
-                    { "result", dflash_window_restore_result },
-                };
             }
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = {
@@ -2266,10 +2083,6 @@ private:
     std::string frontier_execution_identity;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
-
-    // §9.1–9.3 + §8.3–8.5 shadow lifecycle/qualification state (commit 3): counters, the
-    // F5 applicability latch, versioned WS-7 evidence, and the /slots surface source.
-    server_shadow_global_state shadow_state;
 
     // P2 F0b authority substrate (C0 ledger + coordinator + leases + retention + destruction).
     // Constructed under (cache_debug || cache_lifecycle). Declared before cache_plan_obs and
@@ -3705,209 +3518,6 @@ private:
         }
     }
 
-    // Q2 consumer (accepted ruling, worklog:6763-6769): producer-delivered, reason-coded reset
-    // with an authenticated closed scope. An ordinary capture failure resets server-wide WS-7
-    // evidence plus ONLY the capturing slot's WS-4 evidence; an authenticated global
-    // availability failure clears every slot. Never inferred from a generic reason, never
-    // touches the shipped WS-4 authority bit.
-    // Verify r1 finding 5: the pending flip is a joint certification, never a last-scanning-
-    // slot bit — server-wide WS-7 plus EVERY applicable slot's WS-4 evidence. The applicable-
-    // slot rule: a slot is applicable once it has any WS-4 observation (agreement or
-    // disagreement); slots that never scanned do not veto, but at least one applicable slot
-    // must exist.
-    void shadow_recompute_pending_flip() {
-        bool pending        = shadow_state.ws7_p.qualified && shadow_state.ws7_f.qualified;
-        bool any_applicable = false;
-        for (const auto & s : slots) {
-            const bool observed =
-                s.shadow_ws4_l.agreements_total + s.shadow_ws4_l.disagreements_total +
-                s.shadow_ws4_g.agreements_total + s.shadow_ws4_g.disagreements_total > 0;
-            if (!observed) {
-                continue;
-            }
-            any_applicable = true;
-            pending = pending && s.shadow_ws4_l.qualified && s.shadow_ws4_g.qualified;
-        }
-        shadow_state.pending_generation_flip = pending && any_applicable;
-    }
-
-    void shadow_apply_qualification_reset(
-            server_slot *                   capturing,
-            common_checkpoint_reset_scope   scope,
-            common_checkpoint_shadow_reason reason) {
-        const uint64_t gen = shadow_state.authority_generation;
-        switch (scope) {
-            case common_checkpoint_reset_scope::none:
-                return;
-            case common_checkpoint_reset_scope::capturing_slot:
-                shadow_state.ws7_p.reset(gen);
-                shadow_state.ws7_f.reset(gen);
-                if (capturing != nullptr) {
-                    capturing->shadow_ws4_l.reset(gen);
-                    capturing->shadow_ws4_g.reset(gen);
-                }
-                break;
-            case common_checkpoint_reset_scope::global:
-                shadow_state.ws7_p.reset(gen);
-                shadow_state.ws7_f.reset(gen);
-                for (auto & s : slots) {
-                    s.shadow_ws4_l.reset(gen);
-                    s.shadow_ws4_g.reset(gen);
-                }
-                break;
-        }
-        // verify r1 finding 9: the reset consumer owns the Q2 counter — every delivered
-        // non-none reset increments exactly once, whatever the producer site
-        shadow_state.counters.qualification_reset++;
-        shadow_recompute_pending_flip();
-        SRV_WRN("SHADOW_LIFECYCLE event=qualification_reset scope=%s reason=%s total=%" PRIu64 "\n",
-                common_checkpoint_reset_scope_name(scope),
-                common_checkpoint_shadow_reason_name(reason),
-                shadow_state.counters.qualification_reset);
-    }
-
-    // §9.1 shadow capture with owned failure accounting. Never throws and never touches legacy
-    // checkpoint state; failure leaves the shadow null (generation unknown by representation).
-    // Unarmed memories return not_applicable: zero counters, zero log lines.
-    common_checkpoint_shadow_reason shadow_try_capture(
-            server_slot &                       slot,
-            common_prompt_checkpoint &          ckpt,
-            const common_computation_frontier & frontier) {
-        auto reason = common_checkpoint_shadow_reason::internal_error;
-        auto scope  = common_checkpoint_reset_scope::capturing_slot;
-        try {
-            reason = common_checkpoint_shadow_capture_scoped(ckpt, ctx_tgt, slot.id, frontier, scope);
-        } catch (...) {
-            reason = common_checkpoint_shadow_reason::internal_error;
-            scope  = common_checkpoint_reset_scope::capturing_slot;
-        }
-        // F5: applicability latched from capture OUTCOMES — `applicable` after any armed-path
-        // result, `not_applicable` after an unarmed result; truly unarmed runs stay silent.
-        switch (reason) {
-            case common_checkpoint_shadow_reason::not_applicable:
-                shadow_state.applicability = server_shadow_global_state::applicability_state::not_applicable;
-                break;
-            case common_checkpoint_shadow_reason::ok:
-            case common_checkpoint_shadow_reason::unarmed_live_covered:
-            case common_checkpoint_shadow_reason::child_capture_failed:
-            case common_checkpoint_shadow_reason::oracle_mismatch:
-            case common_checkpoint_shadow_reason::controller_unavailable:
-                shadow_state.applicability = server_shadow_global_state::applicability_state::applicable;
-                break;
-            default:
-                break;  // invalid_arguments/internal_error prove nothing about armed-ness
-        }
-        if (reason != common_checkpoint_shadow_reason::ok &&
-            reason != common_checkpoint_shadow_reason::not_applicable) {
-            shadow_state.counters.capture_failed++;
-            if (reason == common_checkpoint_shadow_reason::controller_unavailable) {
-                shadow_state.shadow_unavailable_total++;
-            }
-            SLT_WRN(slot,
-                    "SHADOW_LIFECYCLE event=capture_failed reason=%s scope=%s total_failed=%" PRIu64 "\n",
-                    common_checkpoint_shadow_reason_name(reason),
-                    common_checkpoint_reset_scope_name(scope),
-                    shadow_state.counters.capture_failed);
-            shadow_apply_qualification_reset(&slot, scope, reason);
-        }
-        return reason;
-    }
-
-    // §9.3 refresh attempt at the sole back-adoption site: prove the current state reproduces
-    // EVERY retained payload byte-identically, then swap ONLY the shadow record [§1.6]. All
-    // serialization is detached and dropped; payload bytes are read only when the proof will
-    // actually compare them (a size mismatch refuses on the size alone). Counts its own
-    // outcome; never throws into the request path.
-    void shadow_try_refresh(
-            server_slot &                       slot,
-            common_prompt_checkpoint &          last,
-            const common_computation_frontier & frontier) {
-        try {
-            common_checkpoint_refresh_observation obs;
-            std::vector<uint8_t> cur_tgt;
-            std::vector<uint8_t> cur_dft;
-            std::vector<uint8_t> cur_ring;
-            std::vector<uint8_t> cur_spec;
-            {
-                const size_t sz = llama_state_seq_get_size_ext(
-                    ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                if (sz > 0) {
-                    cur_tgt.resize(sz);
-                    if (sz != last.data_tgt.size() ||
-                        llama_state_seq_get_data_ext(ctx_tgt, cur_tgt.data(), sz, slot.id,
-                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == sz) {
-                        obs.tgt = &cur_tgt;
-                    }
-                }
-            }
-            obs.dft_applicable = ctx_dft != nullptr;
-            if (ctx_dft) {
-                const size_t sz = llama_state_seq_get_size_ext(
-                    ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                cur_dft.resize(sz);
-                if (sz == 0 || sz != last.data_dft.size() ||
-                    llama_state_seq_get_data_ext(ctx_dft.get(), cur_dft.data(), sz, slot.id,
-                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == sz) {
-                    obs.dft = &cur_dft;
-                }
-            }
-            obs.ring_applicable = slot.can_speculate();
-            if (obs.ring_applicable) {
-                const size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
-                cur_ring.resize(ring_size);
-                if (ring_size > 0 && ring_size == last.accel.ring.size()) {
-                    common_speculative_ring_state_save(slot.get_spec(), cur_ring.data(), ring_size);
-                }
-                obs.ring = &cur_ring;
-            }
-            obs.spec_applicable = slot.can_speculate();
-            if (obs.spec_applicable &&
-                common_speculative_get_state(slot.get_spec(), slot.id, cur_spec)) {
-                obs.spec = &cur_spec;
-            }
-
-            const auto verdict = common_checkpoint_shadow_refresh_proof(last, obs);
-            if (verdict == common_checkpoint_refresh_verdict::proven) {
-                // §9.3 steps 4-5 (F2, verify round): the published record is a FRESH stable
-                // snapshot captured strictly AFTER the byte proof — the pre-proof §9.2 relation
-                // candidate is never adopted. Recapture failure leaves the old record untouched
-                // and refuses the refresh.
-                common_prompt_checkpoint post_proof;
-                auto post_reason = common_checkpoint_shadow_reason::internal_error;
-                if (!server_fault("shadow_post_proof_recapture")) {
-                    post_reason = shadow_try_capture(slot, post_proof, frontier);
-                }
-                if (post_reason == common_checkpoint_shadow_reason::ok) {
-                    common_checkpoint_shadow_adopt(last, post_proof);
-                    shadow_state.counters.refresh_ok++;
-                    SLT_INF(slot, "SHADOW_LIFECYCLE event=refresh_ok total=%" PRIu64 "\n",
-                            shadow_state.counters.refresh_ok);
-                } else {
-                    shadow_state.counters.refresh_refused++;
-                    SLT_WRN(slot,
-                            "SHADOW_LIFECYCLE event=refresh_refused "
-                            "reason=post_proof_capture_unavailable total=%" PRIu64 "\n",
-                            shadow_state.counters.refresh_refused);
-                }
-            } else if (verdict == common_checkpoint_refresh_verdict::refused_byte_mismatch) {
-                shadow_state.counters.refresh_nondeterministic_byte_mismatch++;
-                SLT_WRN(slot,
-                        "SHADOW_LIFECYCLE event=refresh_refused "
-                        "reason=shadow_refresh_nondeterministic_byte_mismatch total=%" PRIu64 "\n",
-                        shadow_state.counters.refresh_nondeterministic_byte_mismatch);
-            } else {
-                shadow_state.counters.refresh_refused++;
-                SLT_WRN(slot,
-                        "SHADOW_LIFECYCLE event=refresh_refused "
-                        "reason=cannot_reproduce total=%" PRIu64 "\n",
-                        shadow_state.counters.refresh_refused);
-            }
-        } catch (...) {
-            shadow_state.counters.refresh_refused++;
-            SLT_WRN(slot, "%s", "SHADOW_LIFECYCLE event=refresh_refused reason=internal_error\n");
-        }
-    }
-
     uint64_t ensure_frontier_sequence_epoch(server_prompt & prompt) {
         if (prompt.sequence_epoch == 0) {
             GGML_ASSERT(frontier_next_sequence_epoch != 0);
@@ -3963,82 +3573,6 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
-
-    bool dflash_window_server_enabled() const {
-        return params_base.dflash_window_depth > 0;
-    }
-
-    bool dflash_window_lora_supported(
-            const std::vector<common_adapter_lora_info> & loras) const {
-        // The canonical identity is "0" only when no non-zero-scale adapter
-        // participates in computation. Rolling-window LoRA support is deferred:
-        // reject rather than publishing a binary adapter key as API evidence.
-        return lora_config_identity(loras) == "0";
-    }
-
-    bool dflash_window_enable_slot(server_slot & slot) {
-        if (!dflash_window_server_enabled()) {
-            return true;
-        }
-        if (slot.prompt.tokens.has_media() || slot.prompt.tokens.empty()) {
-            return false;
-        }
-
-        // Defense in depth for internal boundary-restart paths. Normal requests
-        // are rejected earlier, before adapter rebinding or token evaluation.
-        if (!dflash_window_lora_supported(slot.lora)) {
-            SLT_ERR(slot, "%s",
-                    "rolling DFlash tape server mode does not yet support active LoRA adapters\n");
-            return false;
-        }
-        const std::string identity = "base:no-lora";
-
-        llama_dflash_window_info info = {};
-        if (llama_dflash_window_get_info(ctx_tgt, slot.id, &info)) {
-            if (slot.dflash_window_identity != identity) {
-                SLT_ERR(slot,
-                        "rolling DFlash tape identity mismatch "
-                        "(window=%s live=%s)\n",
-                        slot.dflash_window_identity.c_str(),
-                        identity.c_str());
-                return false;
-            }
-            return true;
-        }
-
-        llama_dflash_set_active_slot(ctx_tgt, slot.id);
-        const bool ok = params_base.dflash_window_codec == "f16"
-            ? llama_dflash_window_enable_batched_f16(
-                ctx_tgt, slot.id,
-                params_base.dflash_window_depth,
-                params_base.dflash_window_advance)
-            : llama_dflash_window_enable_batched(
-                ctx_tgt, slot.id,
-                params_base.dflash_window_depth,
-                params_base.dflash_window_advance);
-        if (!ok) {
-            SLT_ERR(slot,
-                    "failed to snapshot rolling DFlash tape boundary "
-                    "(codec=%s depth=%d advance=%d)\n",
-                    params_base.dflash_window_codec.c_str(),
-                    params_base.dflash_window_depth,
-                    params_base.dflash_window_advance);
-            return false;
-        }
-
-        if (!llama_dflash_window_get_info(ctx_tgt, slot.id, &info)) {
-            SLT_ERR(slot, "%s", "rolling DFlash tape enabled without queryable identity\n");
-            return false;
-        }
-        slot.dflash_window_identity = identity;
-        SLT_INF(slot,
-                "DFLASH_WINDOW_BOUNDARY codec=%s seq=%d boundary=%d "
-                "frontier=%d depth=%d advance=%d\n",
-                info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16 ? "f16" : "f32",
-                info.seq_id, info.boundary_pos, info.frontier_pos,
-                info.retained_depth, info.advance_batch);
-        return true;
-    }
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -5308,7 +4842,6 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
-            slot.shadow_global = &shadow_state;
             slot.ctx_dft = ctx_dft.get();
             slot.n_ctx   = n_ctx_slot;
             slot.frontier_ratchet_min_agreements =
@@ -5345,10 +4878,6 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
-                // verify r2 finding 1: release-time reset() just cleared this slot's WS-4
-                // evidence (it runs before this callback) — the joint pending flip must be
-                // recomputed or a released sole-applicable slot leaves it stale-true
-                shadow_recompute_pending_flip();
             };
 
             slot.reset();
@@ -5390,60 +4919,6 @@ private:
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
         }
 
-        if (params_base.dflash_window_depth > 0) {
-            // Server prototype integration is intentionally narrower than the G4
-            // ownership prototype. Lazy boundary admission and host-cache
-            // replacement are coordinated for one live slot here; admitting a
-            // new slot into an already-windowed mixed batch needs a separate
-            // transaction and must not be implied by G4's replay arithmetic.
-            if (n_parallel_user != 1) {
-                SRV_ERR("rolling DFlash tape currently requires --parallel 1 (got %d)\n",
-                        n_parallel_user);
-                return false;
-            }
-            if (!needs_reeval) {
-                SRV_ERR("%s", "rolling DFlash tape requires a recurrent or hybrid target\n");
-                return false;
-            }
-            if (server_vbr_dynamic_active(params_base)) {
-                SRV_ERR("%s",
-                        "rolling DFlash tape is not yet coordinated with dynamic VBR retiering "
-                        "(WS-3); disable dynamic VBR or the rolling window\n");
-                return false;
-            }
-            if (!dflash_window_lora_supported(params_base.lora_adapters)) {
-                SRV_ERR("%s",
-                        "rolling DFlash tape server mode does not yet support active LoRA adapters; "
-                        "disable LoRA or the rolling window\n");
-                return false;
-            }
-            if (params_base.dflash_window_codec != "f32" &&
-                params_base.dflash_window_codec != "f16") {
-                SRV_ERR("invalid rolling DFlash tape codec '%s'\n",
-                        params_base.dflash_window_codec.c_str());
-                return false;
-            }
-
-            // A DFlash drafter already installed capture metadata. Standalone
-            // edit-window mode has no drafter, so create the same recurrent
-            // tape setup without requesting hidden-layer capture.
-            if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                llama_set_dflash_capture(ctx_tgt, nullptr, 0);
-            }
-            llama_set_tape_recording(ctx_tgt, true);
-            llama_dflash_allocate_slots(ctx_tgt, 1);
-
-            if (!llama_dflash_tape_replay_available(ctx_tgt)) {
-                SRV_ERR("%s", "rolling DFlash tape requires all recurrent state on one GPU\n");
-                return false;
-            }
-            SRV_INF(
-                "rolling DFlash tape enabled: codec=%s depth=%d advance=%d "
-                "(single-slot, text-only)\n",
-                params_base.dflash_window_codec.c_str(),
-                params_base.dflash_window_depth,
-                params_base.dflash_window_advance);
-        }
 
         // Under --split-mode tensor the load-time capability probe was predictive; now
         // that capture setup exists the tape allocation (with its shard-consistency
@@ -6464,7 +5939,7 @@ private:
                 checkpoint_evals.push_back(server_cache_plan_evaluate_checkpoint(
                     !checkpoint.empty(), true, recurrent, true,
                     checkpoint.pos_min, checkpoint.pos_max,
-                    int64_t(lcp), 0, checkpoint.size_without_shadow()));
+                    int64_t(lcp), 0, checkpoint.size()));
             }
 
             for (size_t target_i = 0; target_i < slots.size(); ++target_i) {
@@ -6571,7 +6046,7 @@ private:
                         !checkpoint.empty(), frontier_current, recurrent,
                         representation_matches, checkpoint.pos_min,
                         checkpoint.pos_max, pos_next, pos_min_threshold,
-                        checkpoint.size_without_shadow()));
+                        checkpoint.size()));
             }
         }
         rec.note_inventory_complete(
@@ -6775,7 +6250,7 @@ private:
                 !checkpoint.empty(), frontier_current, recurrent,
                 representation_matches, checkpoint.pos_min,
                 checkpoint.pos_max, pos_next, pos_min_threshold,
-                checkpoint.size_without_shadow()).reason);
+                checkpoint.size()).reason);
     }
 
     std::list<common_prompt_checkpoint>::reverse_iterator
@@ -7665,13 +7140,6 @@ private:
             return false;
         }
 
-        if (dflash_window_server_enabled() && task.tokens.has_media()) {
-            send_error(
-                task,
-                "rolling DFlash tape server mode is currently text-only",
-                ERROR_TYPE_INVALID_REQUEST);
-            return false;
-        }
 
         // process per-request lora adapters (fall back to the server's base adapters when the
         // request carries none). Identity is checked for BOTH branches [I6]: a slot that computed
@@ -7685,17 +7153,6 @@ private:
             ? params_base.lora_adapters
             : construct_lora_list(task.params.lora);
 
-        // Per-request adapter selection cannot be decided at server startup.
-        // Reject before rebinding the slot or evaluating any token so a failed
-        // admission cannot leave a window or recurrent frontier under LoRA.
-        if (dflash_window_server_enabled() &&
-            !dflash_window_lora_supported(task_loras)) {
-            send_error(
-                task,
-                "rolling DFlash tape server mode does not yet support active LoRA adapters",
-                ERROR_TYPE_INVALID_REQUEST);
-            return false;
-        }
 
         if (!are_lora_equal(task_loras, slot.lora)) {
             // called only after establishing inequality, as lora_should_clear_cache requires
@@ -9793,14 +9250,6 @@ private:
             case SERVER_TASK_TYPE_SET_LORA:
                 {
                     auto new_loras = construct_lora_list(task.set_lora);
-                    if (dflash_window_server_enabled() &&
-                        !dflash_window_lora_supported(new_loras)) {
-                        send_error(
-                            task,
-                            "rolling DFlash tape server mode does not yet support active LoRA adapters",
-                            ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
                     // logging
                     for (size_t i = 0; i < new_loras.size(); ++i) {
                         SRV_TRC("set lora adapter idx=%zu scale=%f\n", i, new_loras[i].scale);
@@ -10088,10 +9537,6 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
-                    throw std::runtime_error(
-                        "cannot discard rolling window before context shift");
-                }
                 slot.observe_live_range_drop(
                     server_cache_destruction_reason::context_shift, true);
                 ::server_cache_live_range_drop_impl(
@@ -10121,11 +9566,6 @@ private:
                 }
 
                 slot.truncated = true;
-                if (dflash_window_server_enabled() &&
-                    !dflash_window_enable_slot(slot)) {
-                    throw std::runtime_error(
-                        "cannot restart rolling window after context shift");
-                }
             }
         });
 
@@ -10384,17 +9824,6 @@ private:
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
-                        slot.dflash_window_restore_generation++;
-                        slot.dflash_window_restore_codec = LLAMA_DFLASH_WINDOW_CODEC_NONE;
-                        slot.dflash_window_restore_boundary = -1;
-                        slot.dflash_window_restore_frontier = -1;
-                        slot.dflash_window_restore_target = -1;
-                        slot.dflash_window_restore_depth = 0;
-                        slot.dflash_window_restore_task = slot.task->id;
-                        slot.dflash_window_restore_identity.clear();
-                        slot.dflash_window_restore_result =
-                            dflash_window_server_enabled() ? "not_used" : "disabled";
-
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -10499,13 +9928,7 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                // Chunk-shift reuse mutates the live attention
-                                // timeline before the rolling restore transaction
-                                // can validate and reconstruct its lineage. The
-                                // deep window is the reuse mechanism in this
-                                // mode; do not combine the two mutations.
                                 const bool can_cache_reuse =
-                                    !dflash_window_server_enabled() &&
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
                                     !slot.prompt.tokens.has_mtmd;
 
@@ -10620,146 +10043,7 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            bool window_restored = false;
-                            if (dflash_window_server_enabled() && n_past > 0) {
-                                // Preserve the logits contract up front. If the
-                                // whole prompt matches, state through its final
-                                // token cannot provide logits for that same token;
-                                // reconstruct one token earlier and re-evaluate it.
-                                int n_window_past = n_past;
-                                if (n_window_past == slot.task->n_tokens()) {
-                                    n_window_past--;
-                                }
-
-                                if (n_window_past > 0) {
-                                    const llama_pos attention_p0 =
-                                        slot.prompt.tokens.pos_next(n_window_past);
-                                    const llama_pos target_pos = attention_p0 - 1;
-                                    llama_dflash_window_info info = {};
-                                    if (llama_dflash_window_get_info(
-                                            ctx_tgt, slot.id, &info)) {
-                                        slot.dflash_window_restore_codec = info.codec;
-                                        slot.dflash_window_restore_boundary = info.boundary_pos;
-                                        slot.dflash_window_restore_frontier = info.frontier_pos;
-                                        slot.dflash_window_restore_target = target_pos;
-                                        slot.dflash_window_restore_depth =
-                                            info.frontier_pos - target_pos;
-                                        std::string live_identity =
-                                            lora_config_identity(slot.lora);
-                                        // no-lora identity is "0" (count
-                                        // prefix), never empty.
-                                        if (live_identity == "0") {
-                                            live_identity = "base:no-lora";
-                                        }
-                                        slot.dflash_window_restore_identity =
-                                            slot.dflash_window_identity;
-
-                                        if (slot.dflash_window_identity !=
-                                                live_identity) {
-                                            slot.dflash_window_restore_result =
-                                                "identity_mismatch";
-                                            if (!llama_dflash_window_discard_seq(
-                                                    ctx_tgt, slot.id)) {
-                                                SLT_ERR(slot, "%s", "cannot discard identity-mismatched rolling window\n");
-                                            }
-                                            slot.dflash_window_identity.clear();
-                                        } else if (!info.capture_pending &&
-                                            target_pos >= info.boundary_pos &&
-                                            target_pos <= info.frontier_pos) {
-                                            if (llama_dflash_window_restore_seq(
-                                                    ctx_tgt, slot.id,
-                                                    target_pos, attention_p0) &&
-                                                llama_dflash_window_commit_branch(
-                                                    ctx_tgt, slot.id,
-                                                    target_pos)) {
-                                                n_past = n_window_past;
-                                                n_past_keep = std::min(
-                                                    n_past_keep, (size_t) n_past);
-                                                pos_next = attention_p0;
-                                                window_restored = true;
-                                                slot.cache_status =
-                                                    "restored rolling DFlash window";
-                                                slot.dflash_window_restore_result =
-                                                    "installed";
-                                                SLT_INF(
-                                                    slot,
-                                                    "DFLASH_WINDOW_RESTORE "
-                                                    "result=installed task=%d seq=%d "
-                                                    "codec=%s boundary=%d frontier=%d "
-                                                    "target=%d depth=%d identity=%s\n",
-                                                    slot.task->id, slot.id,
-                                                    info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16
-                                                        ? "f16" : "f32",
-                                                    info.boundary_pos,
-                                                    info.frontier_pos,
-                                                    target_pos,
-                                                    info.frontier_pos - target_pos,
-                                                    slot.dflash_window_restore_identity.c_str());
-                                            } else {
-                                                // restore_seq may already have
-                                                // trimmed attention. A restart
-                                                // allocation can also fail after
-                                                // recurrent install. Never hand
-                                                // either split state to checkpoint
-                                                // selection: clear both timelines.
-                                                slot.dflash_window_restore_result =
-                                                    "failed_closed";
-                                                SLT_ERR(
-                                                    slot,
-                                                    "DFLASH_WINDOW_RESTORE "
-                                                    "result=failed_closed task=%d "
-                                                    "seq=%d codec=%s boundary=%d "
-                                                    "frontier=%d target=%d depth=%d\n",
-                                                    slot.task->id, slot.id,
-                                                    info.codec == LLAMA_DFLASH_WINDOW_CODEC_F16
-                                                        ? "f16" : "f32",
-                                                    info.boundary_pos,
-                                                    info.frontier_pos,
-                                                    target_pos,
-                                                    info.frontier_pos - target_pos);
-                                                slot.mandatory_recovery_reset(
-                                                    server_cache_destruction_reason::restore_failure);
-                                                n_past = 0;
-                                                n_past_common = 0;
-                                                n_past_keep = 0;
-                                                pos_next = 0;
-                                                slot.cache_status =
-                                                    "full reprocess: rolling DFlash restore failed closed";
-                                            }
-                                        } else {
-                                            slot.dflash_window_restore_result =
-                                                info.capture_pending
-                                                    ? "capture_pending"
-                                                    : "out_of_range";
-                                            if (!llama_dflash_window_discard_seq(
-                                                    ctx_tgt, slot.id)) {
-                                                SLT_ERR(slot, "%s", "cannot discard unusable rolling window\n");
-                                            }
-                                            slot.dflash_window_identity.clear();
-                                        }
-                                    } else {
-                                        slot.dflash_window_restore_result =
-                                            "no_window";
-                                        slot.dflash_window_identity.clear();
-                                    }
-                                }
-                            }
-
-                            if (server_cache_plan_checkpoint_superseded_by_window(
-                                    slot.cache_plan_execution,
-                                    window_restored)) {
-                                // The rolling-window recovery superseded the
-                                // planned checkpoint before its seam could run.
-                                // This is typed capability drift, not a failed
-                                // checkpoint execution.
-                                cache_plan_fallback_legacy(
-                                    slot,
-                                    common_cache_plan_authority_fallback::
-                                        stale_capability);
-                            }
-
-                            if (!window_restored &&
-                                n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     // [WS-1] fail-closed coordinated restore. The token ledger claims a
@@ -10913,7 +10197,7 @@ private:
                                             // complete. Old/foreign half-filled entries must never
                                             // reach the mutating restore path.
                                             [[maybe_unused]] uint64_t obs_bytes = 0;
-                                            if constexpr (Obs) { obs_bytes = (uint64_t) cur.size_without_shadow(); }
+                                            if constexpr (Obs) { obs_bytes = (uint64_t) cur.size(); }
                                             const bool representation_matches =
                                                 !recurrent ||
                                                 (cur.representation_epoch == vbr_now.representation_epoch &&
@@ -10966,7 +10250,7 @@ private:
                                             return [&, obs_c](const auto & cur) {
                                                 constexpr bool Obs = decltype(obs_c)::value;
                                                 [[maybe_unused]] uint64_t obs_bytes = 0;
-                                                if constexpr (Obs) { obs_bytes = (uint64_t) cur.size_without_shadow(); }
+                                                if constexpr (Obs) { obs_bytes = (uint64_t) cur.size(); }
                                                 if (slot.frontier_ratchet_flipped &&
                                                     server_fault(
                                                         "frontier_disagree_after_flip")) {
@@ -11132,330 +10416,6 @@ private:
                                         }
                                     }
 
-                                    // ---- commit-3 pre-flip qualification coordinator (§8.3–8.5).
-                                    // Shadow-only: the shipped selection above is final before this
-                                    // block runs, and a coordinator exception is isolated to a scoped
-                                    // evidence reset — it never changes the selector decision. Gated
-                                    // on the capture-outcome applicability latch so unarmed runs do
-                                    // zero generation work (settled-regime inertness, Pin 12).
-                                    // Memoized bridge evaluations (reverse-list index -> evaluation)
-                                    // keep the sole evaluator at ONE invocation per checkpoint per
-                                    // scan, shared with the mid-list consumer below.
-                                    std::vector<std::pair<bool, common_checkpoint_shadow_evaluation>>
-                                        scan_evals;
-                                    const bool shadow_scan_applicable =
-                                        shadow_state.applicability ==
-                                        server_shadow_global_state::applicability_state::applicable;
-                                    const auto scan_eval_at = [&](size_t i)
-                                            -> const common_checkpoint_shadow_evaluation & {
-                                        auto & slot_pair = scan_evals[i];
-                                        if (!slot_pair.first) {
-                                            slot_pair.first = true;
-                                            const auto & cur = *std::next(
-                                                slot.prompt.checkpoints.rbegin(), (int64_t) i);
-                                            slot_pair.second = common_checkpoint_shadow_evaluate(
-                                                cur, ctx_tgt, slot.id, cur.computation_frontier);
-                                        }
-                                        return slot_pair.second;
-                                    };
-                                    if (shadow_scan_applicable) {
-                                        try {
-                                            const bool recurrent =
-                                                llama_model_is_recurrent(model_tgt) ||
-                                                llama_model_is_hybrid(model_tgt);
-                                            scan_evals.assign(slot.prompt.checkpoints.size(), {});
-                                            // One immutable snapshot of the reverse list. The
-                                            // positional predicates and legacy validity mirror the
-                                            // shipped selectors above WITHOUT logging; the drift
-                                            // check below catches any divergence as a coordinator
-                                            // exception rather than trusting the replica.
-                                            std::vector<common_shadow_candidate_row> rows;
-                                            rows.reserve(slot.prompt.checkpoints.size());
-                                            for (auto rit = slot.prompt.checkpoints.rbegin();
-                                                 rit != slot.prompt.checkpoints.rend(); ++rit) {
-                                                const auto & cur = *rit;
-                                                common_shadow_candidate_row row;
-                                                const bool nonempty = !cur.empty();
-                                                if (recurrent) {
-                                                    row.p_pos = nonempty && cur.pos_max < pos_next;
-                                                    row.l_valid = nonempty &&
-                                                        cur.representation_epoch ==
-                                                            vbr_now.representation_epoch &&
-                                                        cur.representation_epoch_swa ==
-                                                            vbr_now.representation_epoch_swa;
-                                                } else {
-                                                    row.p_pos = nonempty && cur.pos_max <= pos_next &&
-                                                        (cur.pos_min < pos_min_thold || cur.pos_min == 0);
-                                                    row.l_valid = nonempty;
-                                                }
-                                                bool f_pos = nonempty &&
-                                                    checkpoint_frontier_is_current(
-                                                        slot, cur, frontier_adapter_identity);
-                                                if (f_pos && slot.frontier_ratchet_flipped &&
-                                                    server_fault("frontier_disagree_after_flip")) {
-                                                    f_pos = false;
-                                                }
-                                                if (f_pos) {
-                                                    f_pos = recurrent
-                                                        ? cur.computation_frontier.next_position <= pos_next
-                                                        : cur.computation_frontier.next_position - 1 <= pos_next &&
-                                                          (cur.pos_min < pos_min_thold || cur.pos_min == 0);
-                                                }
-                                                row.f_pos      = f_pos;
-                                                row.has_record = common_checkpoint_shadow_complete(cur);
-                                                rows.push_back(row);
-                                            }
-
-                                            auto candidates = common_shadow_compute_candidates(
-                                                rows, [&](size_t i) { return scan_eval_at(i); });
-                                            // verify r1 finding 3: the shipped WS-4 ratchet only
-                                            // counts eligible frontier observations; transport
-                                            // that side condition instead of inferring it from an
-                                            // absent candidate
-                                            if (!frontier_eligible) {
-                                                candidates.f_l.observed  = false;
-                                                candidates.f_l.candidate = -1;
-                                            }
-
-                                            if (candidates.p_l.candidate != legacy_choice ||
-                                                candidates.f_l.candidate != frontier_choice) {
-                                                // replica drifted from the shipped selectors: a
-                                                // coordinator-integrity failure — authenticated
-                                                // GLOBAL reset (verify r1 finding 9), shipped
-                                                // decision untouched
-                                                shadow_state.coordinator_exceptions_total++;
-                                                shadow_apply_qualification_reset(
-                                                    &slot, common_checkpoint_reset_scope::global,
-                                                    common_checkpoint_shadow_reason::internal_error);
-                                                SLT_WRN(slot,
-                                                        "SHADOW_LIFECYCLE event=coordinator_exception "
-                                                        "subreason=selector_replica_drift "
-                                                        "p_l=%" PRId64 "/%" PRId64 " f_l=%" PRId64 "/%" PRId64 "\n",
-                                                        candidates.p_l.candidate, legacy_choice,
-                                                        candidates.f_l.candidate, frontier_choice);
-                                            } else {
-                                                // verify r1 finding 6: relation-LOCAL observation
-                                                // classes — each relation is credited only with
-                                                // the evaluation that establishes its agreement
-                                                const auto obs_of_row = [&](int64_t row_idx)
-                                                        -> common_shadow_relation_observation {
-                                                    if (row_idx < 0 ||
-                                                        size_t(row_idx) >= scan_evals.size() ||
-                                                        !scan_evals[size_t(row_idx)].first ||
-                                                        !scan_evals[size_t(row_idx)].second.evaluated) {
-                                                        return {};
-                                                    }
-                                                    const auto & e = scan_evals[size_t(row_idx)].second;
-                                                    return { e.observation_class,
-                                                             e.refinement_used &&
-                                                                 e.observation_class ==
-                                                                     common_checkpoint_shadow_observation::boundary_refined };
-                                                };
-                                                std::array<common_shadow_relation_observation, 4> rel_obs;
-                                                rel_obs[2] = obs_of_row(candidates.p_g.verdict_row);  // ws7_p <- P/G
-                                                rel_obs[3] = obs_of_row(candidates.f_g.verdict_row);  // ws7_f <- F/G
-                                                if (candidates.p_g.candidate >= 0 &&
-                                                    candidates.p_g.candidate == candidates.f_g.candidate) {
-                                                    // ws4_g: the shared agreed row's evaluation
-                                                    rel_obs[1] = obs_of_row(candidates.p_g.candidate);
-                                                }
-                                                if (candidates.p_l.candidate >= 0 &&
-                                                    candidates.p_l.candidate == candidates.f_l.candidate) {
-                                                    // ws4_l (conservative): the agreed L row's
-                                                    // evaluation when one happened this scan,
-                                                    // else trivial_append = no class credit
-                                                    rel_obs[0] = obs_of_row(candidates.p_l.candidate);
-                                                }
-                                                // fault/availability accounting from the axis verdicts
-                                                for (const auto * axis : { &candidates.p_g, &candidates.f_g }) {
-                                                    switch (axis->verdict) {
-                                                        case common_shadow_g_verdict::unexplained:
-                                                            shadow_state.unexplained_disagreement_total++;
-                                                            break;
-                                                        case common_shadow_g_verdict::expected_unknown:
-                                                            if (axis->paused) {
-                                                                shadow_state.expected_unknown_total++;
-                                                            }
-                                                            break;
-                                                        case common_shadow_g_verdict::expected_tombstone: {
-                                                            const auto & pair =
-                                                                scan_evals[size_t(axis->verdict_row)];
-                                                            shadow_state.expected_tombstones[size_t(
-                                                                pair.second.tombstone_class)]++;
-                                                            break;
-                                                        }
-                                                        default:
-                                                            break;
-                                                    }
-                                                }
-                                                // closed oracle outcome accounting (server owns the
-                                                // durable counters; src supplies outcomes only [A6])
-                                                for (size_t i = 0; i < scan_evals.size(); ++i) {
-                                                    if (!scan_evals[i].first || !scan_evals[i].second.evaluated) {
-                                                        continue;
-                                                    }
-                                                    switch (scan_evals[i].second.oracle_outcome) {
-                                                        case common_checkpoint_oracle_outcome::pass:
-                                                            shadow_state.oracle.set_pass++;
-                                                            shadow_state.oracle.hash_pass++;
-                                                            break;
-                                                        case common_checkpoint_oracle_outcome::set_mismatch:
-                                                            shadow_state.oracle.set_fail++;
-                                                            break;
-                                                        case common_checkpoint_oracle_outcome::byte_mismatch:
-                                                            shadow_state.oracle.hash_fail++;
-                                                            break;
-                                                        case common_checkpoint_oracle_outcome::set_and_byte_mismatch:
-                                                            shadow_state.oracle.set_fail++;
-                                                            shadow_state.oracle.hash_fail++;
-                                                            break;
-                                                        case common_checkpoint_oracle_outcome::unavailable:
-                                                            shadow_state.oracle.unavailable++;
-                                                            break;
-                                                        default:
-                                                            break;
-                                                    }
-                                                }
-                                                // §8.3 lost-restore accounting: the shipped restore
-                                                // proceeds on L authority while its own G evaluation
-                                                // tombstoned
-                                                const int64_t shipped_choice =
-                                                    use_frontier ? frontier_choice : legacy_choice;
-                                                if (shipped_choice >= 0 &&
-                                                    size_t(shipped_choice) < scan_evals.size() &&
-                                                    scan_evals[size_t(shipped_choice)].first) {
-                                                    const auto & sel = scan_evals[size_t(shipped_choice)].second;
-                                                    // B0: transport the memoized A-track
-                                                    // evaluation of the SHIPPED choice into
-                                                    // the checkpoint row (one authority; the
-                                                    // evaluator ran in this scan, not for us)
-                                                    if (slot.cache_plan && sel.evaluated) {
-                                                        if (auto * row = slot.cache_plan->find_or_add(
-                                                                common_cache_plan_provider::live_context_checkpoint,
-                                                                (int32_t) shipped_choice,
-                                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
-                                                                slot.id, slot.cache_plan->selection)) {
-                                                            row->gen_eval = sel;
-                                                        }
-                                                    }
-                                                    // verify r2 finding 2: only the four NAMED
-                                                    // §5.5 classes count — the closed classifier
-                                                    // is the one authority on what a tombstone is
-                                                    if (sel.evaluated &&
-                                                        common_shadow_classify_evaluation(sel) ==
-                                                            common_shadow_g_verdict::expected_tombstone) {
-                                                        shadow_state.lost_restores[size_t(sel.tombstone_class)]++;
-                                                    }
-                                                }
-                                                // §10.2 extra-replay events (verify r1 finding 8):
-                                                // the G axis corresponding to the SHIPPED P/F
-                                                // authority paused on a strict tombstone — the
-                                                // restore G would have lost, keyed by tombstone
-                                                // class (event count, not tokens)
-                                                const auto & shipped_axis =
-                                                    use_frontier ? candidates.f_g : candidates.p_g;
-                                                if (shipped_axis.verdict ==
-                                                        common_shadow_g_verdict::expected_tombstone &&
-                                                    shipped_axis.verdict_row >= 0) {
-                                                    const auto & pair =
-                                                        scan_evals[size_t(shipped_axis.verdict_row)];
-                                                    shadow_state.extra_replay_events[size_t(
-                                                        pair.second.tombstone_class)]++;
-                                                }
-
-                                                std::array<common_shadow_relation_evidence *, 4> evidence = {
-                                                    &slot.shadow_ws4_l, &slot.shadow_ws4_g,
-                                                    &shadow_state.ws7_p, &shadow_state.ws7_f,
-                                                };
-                                                const auto scan_outcome = common_shadow_apply_scan(
-                                                    evidence, candidates, rel_obs,
-                                                    shadow_state.authority_generation,
-                                                    shadow_state.minima);
-                                                shadow_recompute_pending_flip();
-                                                shadow_state.last_outcome =
-                                                    common_shadow_g_verdict_name(candidates.f_g.verdict);
-                                                shadow_state.last_reason =
-                                                    candidates.f_g.verdict_row >= 0 &&
-                                                            scan_evals[size_t(candidates.f_g.verdict_row)].first
-                                                        ? common_checkpoint_shadow_eval_reason_name(
-                                                              scan_evals[size_t(candidates.f_g.verdict_row)]
-                                                                  .second.reason)
-                                                        : "none";
-                                                SLT_INF(slot,
-                                                        "SHADOW_LIFECYCLE event=qualification_scan "
-                                                        "ws4_l=%s ws4_g=%s ws7_p=%s ws7_f=%s "
-                                                        "g_evals=%u qualified_pending=%d\n",
-                                                        common_shadow_disposition_name(scan_outcome.disposition[0]),
-                                                        common_shadow_disposition_name(scan_outcome.disposition[1]),
-                                                        common_shadow_disposition_name(scan_outcome.disposition[2]),
-                                                        common_shadow_disposition_name(scan_outcome.disposition[3]),
-                                                        candidates.g_evaluations,
-                                                        shadow_state.pending_generation_flip ? 1 : 0);
-                                            }
-                                        } catch (const std::exception & e) {
-                                            // Pin 8: coordinator exception isolation — scoped reset,
-                                            // shipped selector decision unchanged.
-                                            shadow_state.coordinator_exceptions_total++;
-                                            shadow_apply_qualification_reset(
-                                                &slot, common_checkpoint_reset_scope::global,
-                                                common_checkpoint_shadow_reason::internal_error);
-                                            SLT_WRN(slot,
-                                                    "SHADOW_LIFECYCLE event=coordinator_exception "
-                                                    "subreason=scan_exception error=%s\n",
-                                                    e.what());
-                                        }
-                                    }
-
-                                    // §9.3 mid-list availability accounting [F8] + commit-3
-                                    // evaluator-proven staleness: refresh exists only at the
-                                    // back-adoption site, so a selected mid-list checkpoint is
-                                    // accounted here. A MISSING record keeps the commit-2 fallback
-                                    // (subreason midlist_record_absent); a PRESENT record uses the
-                                    // closed evaluator result — staleness is proven, never inferred
-                                    // from record inequality. Shares the scan memo above so the sole
-                                    // evaluator still runs at most once per checkpoint.
-                                    if (!do_reset && it != slot.prompt.checkpoints.rbegin() &&
-                                        shadow_scan_applicable) {
-                                        if (!common_checkpoint_shadow_complete(*it)) {
-                                            shadow_state.counters.midlist_stale_no_refresh++;
-                                            SLT_INF(slot,
-                                                    "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
-                                                    "subreason=midlist_record_absent total=%" PRIu64 "\n",
-                                                    shadow_state.counters.midlist_stale_no_refresh);
-                                        } else {
-                                            const auto midlist_index = (size_t) std::distance(
-                                                slot.prompt.checkpoints.rbegin(), it);
-                                            common_checkpoint_shadow_evaluation evaluation;
-                                            try {
-                                                if (scan_evals.size() == slot.prompt.checkpoints.size()) {
-                                                    evaluation = scan_eval_at(midlist_index);
-                                                }
-                                            } catch (...) {
-                                                evaluation = {};
-                                            }
-                                            if (!evaluation.evaluated) {
-                                                shadow_state.counters.midlist_stale_no_refresh++;
-                                                SLT_INF(slot,
-                                                        "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
-                                                        "subreason=midlist_not_evaluable reason=%s "
-                                                        "total=%" PRIu64 "\n",
-                                                        common_checkpoint_shadow_eval_reason_name(evaluation.reason),
-                                                        shadow_state.counters.midlist_stale_no_refresh);
-                                            } else if (evaluation.category ==
-                                                       common_checkpoint_shadow_category::strict_reject) {
-                                                shadow_state.counters.midlist_stale_no_refresh++;
-                                                SLT_INF(slot,
-                                                        "SHADOW_LIFECYCLE event=shadow_midlist_stale_no_refresh "
-                                                        "subreason=midlist_evaluator_stale reason=%s "
-                                                        "tombstone=%s total=%" PRIu64 "\n",
-                                                        common_checkpoint_shadow_eval_reason_name(evaluation.reason),
-                                                        common_checkpoint_shadow_tombstone_name(evaluation.tombstone_class),
-                                                        shadow_state.counters.midlist_stale_no_refresh);
-                                            }
-                                            // strict accept / live_rebased: proven fresh, no counter
-                                        }
-                                    }
-
                                     if (!do_reset) {
                                         // [WS-6] A live_rebased PARTIAL_ONLY restore keeps the
                                         // current attention representation. Prove the current-tier
@@ -11521,18 +10481,6 @@ private:
                                         // restore the context checkpoint
                                         // note: keep the raw size-checked restore (instead of it->load_tgt which aborts on
                                         //       mismatch) so a failed restore falls back to a full re-process (do_reset)
-                                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
-                                            SLT_ERR(slot, "%s", "cannot discard rolling window before checkpoint restore\n");
-                                            do_reset = true;
-                                            if (slot.cache_plan) {
-                                                if (auto * sel_row = slot.cache_plan->selected_row(
-                                                        common_cache_plan_provider::live_context_checkpoint)) {
-                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
-                                                }
-                                                slot.cache_plan->restore_attempt_failed = true;
-                                            }
-                                        }
-                                        slot.dflash_window_identity.clear();
                                         const size_t checkpoint_size = it->data_tgt.size();
                                         const size_t n = do_reset ? 0 :
                                             llama_state_seq_set_data_ext(
@@ -11631,7 +10579,7 @@ private:
                                                         sel_row->lcp_tokens =
                                                             llama_cache_acct_value::measured((uint64_t) std::max(n_past, 0));
                                                         sel_row->payload_bytes =
-                                                            llama_cache_acct_value::measured((uint64_t) it->size_without_shadow());
+                                                            llama_cache_acct_value::measured((uint64_t) it->size());
                                                         // rows the AUTHORITATIVE shipped scan
                                                         // actually visited (frontier after a
                                                         // WS-4 flip, else legacy) + that same
@@ -11652,10 +10600,6 @@ private:
                                     if (do_reset) {
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
-                                            SLT_ERR(slot, "%s", "cannot discard rolling window before full reprocess\n");
-                                        }
-                                        slot.dflash_window_identity.clear();
                                         // [obs] explain the cold reprocess: a checkpoint rejected for a
                                         // changed VBR representation [I9] is the common surprising cause
                                         slot.cache_status = vbr_preflight_rejected
@@ -11788,12 +10732,7 @@ private:
                                 // A VBR reset physically cleared state; do not let true-LCP token
                                 // retention claim the cleared prefix.
                                 n_past_keep = std::min(n_past_keep, (size_t) n_past);
-                                if (n_past == 0 &&
-                                    !llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
-                                    SLT_ERR(slot, "%s", "cannot discard rolling window for VBR full reprocess\n");
-                                }
                                 if (n_past == 0) {
-                                    slot.dflash_window_identity.clear();
                                     // B0/F1: the full reset physically discarded whatever any
                                     // provider installed — a policy reset, not a failed
                                     // attempt, but delivery is revoked either way
@@ -11917,10 +10856,6 @@ private:
                         // Full removal is infallible for memory implementations and retains
                         // common_context_seq_rm's asserting contract. Clear both target and
                         // draft so a failure on either side cannot leave them out of sync.
-                        if (!llama_dflash_window_discard_seq(ctx_tgt, slot.id)) {
-                            SLT_ERR(slot, "%s", "cannot discard rolling window after trim rejection\n");
-                        }
-                        slot.dflash_window_identity.clear();
                         slot.observe_mandatory_recovery_reset(
                             server_cache_destruction_reason::trim_rejection);
                         ::server_cache_mandatory_recovery_reset_impl(
@@ -12038,18 +10973,8 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    llama_dflash_window_info live_window = {};
-                    const bool window_batch_limited =
-                        dflash_window_server_enabled() &&
-                        llama_dflash_window_get_info(
-                            ctx_tgt, slot.id, &live_window);
-                    const int32_t slot_batch_end = window_batch_limited
-                        ? std::min<int32_t>(
-                            n_batch,
-                            n_tokens_prev + LLAMA_DFLASH_MAX_VERIFY_TOKENS)
-                        : n_batch;
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
-                           batch.size() < slot_batch_end) {
+                           batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -12260,26 +11185,6 @@ private:
                                     vbr_now.representation_epoch, vbr_now.representation_epoch_swa);
                             do_checkpoint = false;
 
-                            // §9.2 shadow opinion + §9.3 proven refresh, at the sole
-                            // back-adoption site. The legacy dedup decision above is final;
-                            // everything below is counters, logs, and (only on a completed
-                            // byte-proof) a swap of the retained SHADOW record [§1.6]. The
-                            // frontier/identity equality gate is the dedup condition itself.
-                            {
-                                common_prompt_checkpoint fresh;
-                                const auto sreason =
-                                    shadow_try_capture(slot, fresh, ckpt_frontier);
-                                if (sreason == common_checkpoint_shadow_reason::ok &&
-                                    !common_checkpoint_shadow_equal(fresh, last)) {
-                                    // fresh is complete; retained is absent/unknown or unequal
-                                    // (records agreeing is the serialization-free fast path)
-                                    shadow_state.counters.distinct_but_legacy_dedup++;
-                                    SLT_INF(slot,
-                                            "SHADOW_LIFECYCLE event=shadow_distinct_but_legacy_dedup total=%" PRIu64 "\n",
-                                            shadow_state.counters.distinct_but_legacy_dedup);
-                                    shadow_try_refresh(slot, last, ckpt_frontier);
-                                }
-                            }
                         }
                     }
 
@@ -12336,32 +11241,6 @@ private:
 
                         if (staged.empty()) {
                             do_checkpoint = false;
-                        }
-                    }
-
-                    if (do_checkpoint) {
-                        // §9.1 shadow capture on the staged, detached checkpoint. Every outcome
-                        // leaves the legacy checkpoint intact: failure keeps the shadow null
-                        // (generation unknown by representation) and never changes staging,
-                        // eviction, order, or the splice below.
-                        auto & next = staged.back();
-                        if (shadow_try_capture(slot, next, ckpt_frontier) ==
-                                common_checkpoint_shadow_reason::ok) {
-                            shadow_state.counters.capture_ok++;
-                            SLT_INF(slot,
-                                    "SHADOW_LIFECYCLE event=capture_ok n_tokens=%" PRId64
-                                    " total_ok=%" PRIu64 "\n",
-                                    ckpt_n_tokens, shadow_state.counters.capture_ok);
-                            // §9.2: legacy decided to KEEP a new checkpoint whose record a
-                            // complete retained back() proves equal (dedup condition was
-                            // false). Metadata compare only; no legacy decision changes.
-                            if (!slot.prompt.checkpoints.empty() &&
-                                common_checkpoint_shadow_equal(next, slot.prompt.checkpoints.back())) {
-                                shadow_state.counters.duplicate_but_legacy_keep++;
-                                SLT_INF(slot,
-                                        "SHADOW_LIFECYCLE event=shadow_duplicate_but_legacy_keep total=%" PRIu64 "\n",
-                                        shadow_state.counters.duplicate_but_legacy_keep);
-                            }
                         }
                     }
 
@@ -12608,16 +11487,6 @@ private:
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
         }
-        if (dflash_window_server_enabled()) {
-            const bool window_speculative = std::any_of(
-                slots.begin(), slots.end(),
-                [](const server_slot & slot) {
-                    return slot.state == SLOT_STATE_GENERATING &&
-                           !slot.spec_draft.empty();
-                });
-            llama_dflash_window_set_speculative(
-                ctx_tgt, window_speculative);
-        }
 
         // allow multi-seq batching when the batch is pure TG (no prompt tokens).
         // This lets concurrent slots' verify tokens be processed in a single
@@ -12751,60 +11620,6 @@ private:
             return false; // retry with the updated n_batch
         }
 
-        if (dflash_window_server_enabled()) {
-            const bool speculative_window_batch = std::any_of(
-                slots.begin(), slots.end(),
-                [](const server_slot & slot) {
-                    return slot.state == SLOT_STATE_GENERATING &&
-                           !slot.spec_draft.empty();
-                });
-            if (!speculative_window_batch &&
-                llama_dflash_window_capture_pending(ctx_tgt)) {
-                const bool retried =
-                    llama_dflash_window_retry_capture(ctx_tgt);
-                if (!retried ||
-                    llama_dflash_window_capture_pending(ctx_tgt)) {
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            SLT_ERR(slot, "%s",
-                                    "rolling-window publication remained pending; resetting slot\n");
-                            send_error(
-                                slot,
-                                "Compute error publishing rolling DFlash tape",
-                                ERROR_TYPE_SERVER);
-                            slot.release();
-                            slot.mandatory_recovery_reset(
-                                server_cache_destruction_reason::restore_failure);
-                        }
-                    }
-                    throw std::runtime_error(
-                        "rolling DFlash tape publication failed");
-                }
-            }
-
-            // The first prefill chunk establishes the boundary; subsequent
-            // chunks are then captured into the rolling ring. Waiting until
-            // DONE_PROMPT would make the entire first request older than the
-            // window and render a two-request edit gate vacuous.
-            for (auto & slot : slots) {
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
-                    llama_dflash_window_info info = {};
-                    if (!llama_dflash_window_get_info(
-                            ctx_tgt, slot.id, &info) &&
-                        !dflash_window_enable_slot(slot)) {
-                        send_error(
-                            slot,
-                            "Failed to establish rolling DFlash tape boundary",
-                            ERROR_TYPE_SERVER);
-                        slot.release();
-                        slot.mandatory_recovery_reset(
-                            server_cache_destruction_reason::restore_failure);
-                        throw std::runtime_error(
-                            "rolling DFlash tape boundary creation failed");
-                    }
-                }
-            }
-        }
 
         if (batch_view.logits != nullptr) {
             for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
@@ -12901,18 +11716,6 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (dflash_window_server_enabled() &&
-                    !dflash_window_enable_slot(slot)) {
-                    send_error(
-                        slot,
-                        "Failed to establish rolling DFlash tape boundary",
-                        ERROR_TYPE_SERVER);
-                    slot.release();
-                    slot.mandatory_recovery_reset(
-                        server_cache_destruction_reason::restore_failure);
-                    slot.i_batch = -1;
-                    return;
-                }
 
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
@@ -13113,27 +11916,6 @@ private:
             // the accepted tokens from the speculation
             const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
 
-            if (dflash_window_server_enabled() &&
-                !llama_dflash_window_commit(
-                    ctx_tgt, slot.id, (int) ids.size())) {
-                // The verification payload is still staged and the next decode
-                // is intentionally blocked. Clearing the sole server slot
-                // discards that undecided transaction and both live timelines.
-                SLT_ERR(slot,
-                        "failed to commit %zu accepted rolling-window record(s); "
-                        "resetting slot\n",
-                        ids.size());
-                send_error(
-                    slot,
-                    "Compute error committing rolling DFlash tape",
-                    ERROR_TYPE_SERVER);
-                slot.release();
-                slot.mandatory_recovery_reset(
-                    server_cache_destruction_reason::restore_failure);
-                slot.has_draft_backup = false;
-                slot.seq_id_backup = -1;
-                continue;
-            }
 
             // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
             // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
@@ -13710,11 +12492,8 @@ private:
         // after the first decode) keeps recording active across all sub-batches,
         // which matters when multiple slots share one pass and the combined
         // verify batch spans more than one ubatch.
-        if (dflash_tape_active && !dflash_window_server_enabled()) {
+        if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, false);
-        }
-        if (dflash_window_server_enabled()) {
-            llama_dflash_window_set_speculative(ctx_tgt, false);
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)

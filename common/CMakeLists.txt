@@ -71,10 +71,6 @@ add_library(${TARGET}
     common-cache-plan-estimate.h
     common-retention-sidecar.cpp
     common-retention-sidecar.h
-    common-checkpoint-coordinator.cpp
-    common-checkpoint-coordinator.h
-    common-checkpoint-shadow.cpp
-    common-checkpoint-shadow.h
     common.cpp
     common.h
     console.cpp
@@ -136,17 +132,13 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
-# common-checkpoint-shadow.cpp is the ONE common TU allowed to reach the internal VBR
-# checkpoint bridge header — the include path is granted to that single source file, so the
-# compiler (not just the CI symbol scans in tests/check-vbr-generation-isolation.cmake)
-# enforces that no OTHER common TU reaches libllama internals.
-# (the second grant is common-cache-plan-estimate.cpp: calibration identity hashes file
+# common-cache-plan-estimate.cpp hashes calibration identity file
 # CONTENT with the internal SHA-256 primitive and — deliberately — resolves schedule paths
 # through the SAME runtime resolver the VBR reader uses (llama-vbr-config.h), so identity
 # can never drift from behavior. That makes this TU depend on libllama at link time, which
-# libcommon already does. The retention codec is the third grant: it uses only the
-# internal SHA-256 primitive and carries no process-local accounting handles.)
-set_source_files_properties(common-checkpoint-shadow.cpp common-cache-plan-estimate.cpp common-retention-sidecar.cpp
+# libcommon already does. The retention codec uses only the internal SHA-256
+# primitive and carries no process-local accounting handles.
+set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 

@@ -1809,7 +1809,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     // so admission and eviction stay byte-identical to pre-shadow accounting.
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size_without_shadow();
+        checkpoints_size += ckpt.size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -2718,8 +2718,7 @@ bool checkpoint_payload_equal(
            a.data_tgt == b.data_tgt &&
            a.data_dft == b.data_dft &&
            a.accel.ring == b.accel.ring &&
-           a.accel.spec == b.accel.spec &&
-           !a.shadow && !b.shadow;
+           a.accel.spec == b.accel.spec;
 }
 
 bool build_host_destruction_artifact(

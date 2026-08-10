@@ -1316,94 +1316,6 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
     dflash_read_tensor_to(t, dst.data(), n_floats);
 }
 
-// For equal-sequence ubatches, graph tensor axis order follows the sequence-set
-// order chosen by split_equal(), which is not necessarily seq_id_unq's sorted
-// order. Rolling-window ownership must follow tensor axes, not the sorted set.
-static llama_seq_id dflash_ubatch_axis_seq(
-        const llama_ubatch * ub,
-        uint32_t             axis) {
-    if (!ub || axis >= ub->n_seqs) {
-        return -1;
-    }
-    const size_t token_idx = (size_t) axis * ub->n_seq_tokens;
-    if (ub->b_equal_seqs && token_idx < ub->n_tokens &&
-        ub->n_seq_id[token_idx] == 1) {
-        return ub->seq_id[token_idx][0];
-    }
-    return axis < ub->n_seqs_unq ? ub->seq_id_unq[axis] : -1;
-}
-
-static void dflash_window_accumulate_qkv(
-        dflash_capture_data *   cap,
-        int                     layer_idx,
-        const dflash_tape_layer & src) {
-    auto & staged = cap->window_staging;
-    if (!staged.active || staged.qkv_layers.empty() ||
-        staged.qkv_capture_failed) {
-        return;
-    }
-
-    auto fail = [&](const char * reason) {
-        LLAMA_LOG_ERROR(
-            "%s: layer %d rejected callback QKV chunk: %s\n",
-            __func__, layer_idx, reason);
-        staged.qkv_capture_failed = true;
-    };
-
-    const size_t n_owners = staged.seqs.size();
-    if (layer_idx < 0 || layer_idx >= (int) staged.qkv_layers.size() ||
-        n_owners == 0 ||
-        staged.qkv_received.size() != staged.qkv_layers.size() * n_owners) {
-        fail("invalid decode-scoped accumulator geometry");
-        return;
-    }
-
-    auto & dst = staged.qkv_layers[layer_idx];
-    if (src.conv_channels != dst.conv_channels ||
-        src.n_tokens <= 0 ||
-        src.n_seqs <= 0 ||
-        src.qkv_mixed.size() !=
-            (size_t) src.conv_channels * src.n_tokens * src.n_seqs ||
-        dst.qkv_mixed.size() !=
-            (size_t) dst.conv_channels * dst.n_tokens * dst.n_seqs) {
-        fail("callback/source dimensions disagree with preallocated image");
-        return;
-    }
-
-    for (int src_axis = 0; src_axis < src.n_seqs; ++src_axis) {
-        const llama_seq_id seq_id = src.seq_ids[src_axis];
-        const auto owner = std::find_if(
-            staged.seqs.begin(), staged.seqs.end(),
-            [seq_id](const dflash_window_pending_seq & seq) {
-                return seq.seq_id == seq_id;
-            });
-        if (owner == staged.seqs.end()) {
-            fail("callback owner is absent from the pending transaction");
-            return;
-        }
-        const size_t dst_axis =
-            (size_t) std::distance(staged.seqs.begin(), owner);
-        int & received =
-            staged.qkv_received[(size_t) layer_idx * n_owners + dst_axis];
-        if (received < 0 || received + src.n_tokens > dst.n_tokens) {
-            fail("callback owner supplied duplicate or excess tokens");
-            return;
-        }
-
-        const size_t chunk_elems =
-            (size_t) src.conv_channels * src.n_tokens;
-        const size_t src_off = (size_t) src_axis * chunk_elems;
-        const size_t dst_off =
-            ((size_t) dst_axis * dst.n_tokens + received) *
-            (size_t) dst.conv_channels;
-        std::memcpy(
-            dst.qkv_mixed.data() + dst_off,
-            src.qkv_mixed.data() + src_off,
-            chunk_elems * sizeof(float));
-        received += src.n_tokens;
-    }
-}
-
 // DFlash eval callback: captures hidden state tensors + tape data during graph execution
 // without modifying the compute graph (zero FP impact on model computation)
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -1434,10 +1346,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                 // Use the callback only if an owner lacks staging.
                 bool all_qkv_staged = ub && n_seqs_unq > 0;
                 for (uint32_t s = 0; all_qkv_staged && s < n_seqs_unq; ++s) {
-                    const llama_seq_id seq_id =
-                        cap->window_staging.active
-                            ? dflash_ubatch_axis_seq(ub, s)
-                            : ub->seq_id_unq[s];
+                    const llama_seq_id seq_id = ub->seq_id_unq[s];
                     all_qkv_staged =
                         seq_id >= 0 &&
                         seq_id < (llama_seq_id) cap->tapes.size() &&
@@ -1559,21 +1468,13 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                     if (ub && n_seqs_unq > 1) {
                         tape.n_seqs = std::min((int) n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
                         for (int s = 0; s < tape.n_seqs; ++s) {
-                            tape.seq_ids[s] =
-                                cap->window_staging.active
-                                    ? dflash_ubatch_axis_seq(ub, s)
-                                    : ub->seq_id_unq[s];
+                            tape.seq_ids[s] = ub->seq_id_unq[s];
                         }
                     } else {
                         tape.n_seqs = 1;
-                        tape.seq_ids[0] = ub
-                            ? (cap->window_staging.active
-                                ? dflash_ubatch_axis_seq(ub, 0)
-                                : ub->seq_id_unq[0])
-                            : 0;
+                        tape.seq_ids[0] = ub ? ub->seq_id_unq[0] : 0;
                     }
                     dflash_read_tensor(t, tape.qkv_mixed, n_elem);
-                    dflash_window_accumulate_qkv(cap, layer_idx, tape);
                     break;
             }
             return true;
@@ -1734,7 +1635,6 @@ void llama_context::dflash_reset_hidden_capture() {
     dflash_capture->stage_active = false;
     dflash_capture->stage_n_tokens = 0;
     dflash_capture->tape_stage_n_tokens = 0;
-    dflash_capture->tape_stage_minimal_packed = false;
 }
 
 // idempotent: populates recurrent-layer ids + tape name map the first time it's called.
@@ -1766,6 +1666,7 @@ void llama_context::set_tape_recording(bool enable) {
         return;
     }
 
+    const bool graph_changed = dflash_capture->tape_enabled != enable;
     dflash_capture->tape_enabled = enable;
 
     if (enable) {
@@ -1794,272 +1695,12 @@ void llama_context::set_tape_recording(bool enable) {
             cparams.tape_gpu_seqs[s] = nullptr;
         }
     }
-}
 
-void llama_context::set_tape_minimal_replay(bool enable) {
-    tape_replay_sync();
-    if (dflash_capture) {
-        const bool graph_changed = cparams.tape_minimal_capture != enable;
-        dflash_capture->tape_minimal_replay = enable;
-        dflash_capture->replay_minimal_last = false;
-        cparams.tape_minimal_capture = enable;
-        if (graph_changed && gf_res_prev) {
-            gf_res_prev->reset();
-        }
+    // Tape copies are graph topology, not runtime parameters. A cached graph
+    // built for the previous recording state must not survive the toggle.
+    if (graph_changed && gf_res_prev) {
+        gf_res_prev->reset();
     }
-}
-
-bool llama_context::dflash_tape_codec_roundtrip(ggml_type codec) {
-    if (codec != GGML_TYPE_F16 && codec != GGML_TYPE_TURBO8_0) {
-        return false;
-    }
-    if (!dflash_capture || !tape_replay_sync() ||
-        !dflash_capture->tape_stage_minimal_packed ||
-        dflash_capture->tape_stage_n_tokens <= 0) {
-        return false;
-    }
-
-    dflash_tape_gpu * tape = dflash_capture->active_tape();
-    ggml_backend_t gpu_backend = find_gpu_backend();
-    if (!tape || !gpu_backend || !tape->minimal_packed ||
-        tape->minimal_packed->type != GGML_TYPE_F32 ||
-        tape->minimal_record_floats <= 0 ||
-        dflash_capture->tape_stage_n_tokens > tape->max_tokens) {
-        return false;
-    }
-
-    const int64_t n_values = tape->minimal_record_floats;
-    const int64_t n_rows = dflash_capture->tape_stage_n_tokens;
-
-    struct codec_field {
-        ggml_tensor * tensor;
-        const char *  name;
-        int64_t       width;
-        int64_t       row_capacity;
-        size_t        row_stride;
-        ggml_type     storage_type;
-        int64_t       padded_width;
-    };
-
-    std::vector<codec_field> fields;
-    if (codec == GGML_TYPE_TURBO8_0) {
-        fields.reserve(tape->layers.size() * 3);
-        const int64_t block = ggml_blck_size(GGML_TYPE_TURBO8_0);
-        for (size_t li = 0; li < tape->layers.size(); ++li) {
-            const auto & layer = tape->layers[li];
-            if (!layer.minimal_qkv ||
-                !layer.minimal_gate ||
-                !layer.minimal_beta ||
-                layer.minimal_gate->ne[0] != 1 ||
-                layer.minimal_beta->ne[0] != 1 ||
-                layer.minimal_gate->nb[1] != sizeof(float) ||
-                layer.minimal_beta->nb[1] != sizeof(float)) {
-                return false;
-            }
-
-            // qkv is [conv_channels, tokens]. Gate and beta are
-            // [1, H_v, tokens], so flatten the first two contiguous axes and
-            // step tokens with nb[2]. On the 2B fixture H_v happens to be 1;
-            // it is not a format invariant.
-            fields.push_back({
-                layer.minimal_qkv, "qkv",
-                layer.minimal_qkv->ne[0],
-                layer.minimal_qkv->ne[1],
-                layer.minimal_qkv->nb[1],
-                GGML_TYPE_TURBO8_0, 0,
-            });
-            fields.push_back({
-                layer.minimal_gate, "gate",
-                layer.minimal_gate->ne[0] * layer.minimal_gate->ne[1],
-                layer.minimal_gate->ne[2],
-                layer.minimal_gate->nb[2],
-                GGML_TYPE_F16, 0,
-            });
-            fields.push_back({
-                layer.minimal_beta, "beta",
-                layer.minimal_beta->ne[0] * layer.minimal_beta->ne[1],
-                layer.minimal_beta->ne[2],
-                layer.minimal_beta->nb[2],
-                GGML_TYPE_F16, 0,
-            });
-
-            for (size_t fi = fields.size() - 3; fi < fields.size(); ++fi) {
-                auto & field = fields[fi];
-                if (field.tensor->type != GGML_TYPE_F32 ||
-                    field.width <= 0 ||
-                    field.row_capacity < n_rows ||
-                    field.tensor->nb[0] != sizeof(float)) {
-                    return false;
-                }
-                field.padded_width =
-                    field.storage_type == GGML_TYPE_TURBO8_0
-                        ? ((field.width + block - 1) / block) * block
-                        : field.width;
-            }
-        }
-    }
-
-    // Size both arenas from the field plan that the emitter below consumes.
-    // Per-field counts are the actual descriptor/node sequence beside the
-    // corresponding emit branch; padding contributes its own tensor and node.
-    // Keep one graph slot unused because ggml_build_forward_expand requires
-    // n_nodes < size.
-    size_t tensor_count = 0;
-    size_t max_nodes = 1;
-    if (codec == GGML_TYPE_F16) {
-        // src view, dst view, F16 cast, F32 cast, copy
-        tensor_count = 5;
-        max_nodes += 5;
-    } else {
-        // shared row-id tensor
-        tensor_count = 1;
-        // Every field's base tensor is itself a view into minimal_packed (see
-        // the ggml_view_2d/ggml_view_3d construction of minimal_qkv/gate/beta),
-        // so ggml_visit_parents walks it as one extra node per field on top of
-        // the tensors created here. minimal_packed itself is a leaf and costs
-        // no node. Count it explicitly so the two branches cannot drift.
-        const size_t base_view_node = 1;
-        for (const auto & field : fields) {
-            if (field.storage_type == GGML_TYPE_TURBO8_0) {
-                const size_t has_padding =
-                    field.padded_width != field.width ? 1 : 0;
-                // created here: source view, contiguous source, optional pad,
-                // encoded tensor, set_rows, get_rows, decoded view,
-                // destination view, copy. All become nodes except the encoded
-                // tensor, which stays a leaf until set_rows consumes it.
-                tensor_count += 9 + has_padding;
-                max_nodes += 7 + has_padding + base_view_node;
-            } else {
-                // created here: source view, F16 cast, F32 cast, destination
-                // view, copy -- all five become nodes.
-                tensor_count += 5;
-                max_nodes += 5 + base_view_node;
-            }
-        }
-    }
-    const size_t ctx_mem =
-        ggml_tensor_overhead() * tensor_count +
-        ggml_graph_overhead_custom(max_nodes, false);
-    ggml_init_params params = { ctx_mem, nullptr, true };
-    ggml_context * codec_ctx = ggml_init(params);
-    if (!codec_ctx) {
-        return false;
-    }
-
-    ggml_tensor * row_ids = nullptr;
-    size_t storage_bytes = 0;
-    ggml_cgraph * graph =
-        ggml_new_graph_custom(codec_ctx, max_nodes, false);
-
-    if (codec == GGML_TYPE_F16) {
-        ggml_tensor * src = ggml_view_2d(
-            codec_ctx, tape->minimal_packed,
-            n_values, n_rows, tape->minimal_packed->nb[1], 0);
-        ggml_tensor * dst = ggml_view_2d(
-            codec_ctx, tape->minimal_packed,
-            n_values, n_rows, tape->minimal_packed->nb[1], 0);
-        ggml_tensor * encoded =
-            ggml_cast(codec_ctx, src, GGML_TYPE_F16);
-        ggml_set_name(encoded, "dflash_tape_approx_f16");
-        storage_bytes = ggml_nbytes(encoded);
-        ggml_tensor * decoded =
-            ggml_cast(codec_ctx, encoded, GGML_TYPE_F32);
-        ggml_build_forward_expand(
-            graph, ggml_cpy(codec_ctx, decoded, dst));
-    } else {
-        row_ids = ggml_new_tensor_1d(
-            codec_ctx, GGML_TYPE_I32, n_rows);
-        ggml_set_input(row_ids);
-        for (size_t fi = 0; fi < fields.size(); ++fi) {
-            const auto & field = fields[fi];
-            ggml_tensor * field_src = ggml_view_2d(
-                codec_ctx, field.tensor,
-                field.width, n_rows, field.row_stride, 0);
-            if (field.storage_type == GGML_TYPE_TURBO8_0) {
-                ggml_tensor * dense =
-                    ggml_cont(codec_ctx, field_src);
-                ggml_tensor * padded = dense;
-                if (field.padded_width != field.width) {
-                    padded = ggml_pad(
-                        codec_ctx, dense,
-                        (int) (field.padded_width - field.width),
-                        0, 0, 0);
-                }
-
-                ggml_tensor * encoded = ggml_new_tensor_2d(
-                    codec_ctx, GGML_TYPE_TURBO8_0,
-                    field.padded_width, n_rows);
-                ggml_format_name(
-                    encoded, "dflash_tape_approx_turbo8_%s_l%zu",
-                    field.name, fi / 3);
-                storage_bytes += ggml_nbytes(encoded);
-                ggml_tensor * encoded_write =
-                    ggml_set_rows(
-                        codec_ctx, encoded, padded, row_ids);
-                ggml_tensor * decoded =
-                    ggml_get_rows(
-                        codec_ctx, encoded_write, row_ids);
-                ggml_tensor * decoded_field = ggml_view_2d(
-                    codec_ctx, decoded, field.width, n_rows,
-                    decoded->nb[1], 0);
-                ggml_tensor * field_dst = ggml_view_2d(
-                    codec_ctx, field.tensor,
-                    field.width, n_rows, field.row_stride, 0);
-                ggml_build_forward_expand(
-                    graph,
-                    ggml_cpy(
-                        codec_ctx, decoded_field, field_dst));
-            } else {
-                ggml_tensor * encoded =
-                    ggml_cast(codec_ctx, field_src, GGML_TYPE_F16);
-                ggml_format_name(
-                    encoded, "dflash_tape_approx_f16_%s_l%zu",
-                    field.name, fi / 3);
-                storage_bytes += ggml_nbytes(encoded);
-                ggml_tensor * decoded =
-                    ggml_cast(codec_ctx, encoded, GGML_TYPE_F32);
-                ggml_tensor * field_dst = ggml_view_2d(
-                    codec_ctx, field.tensor,
-                    field.width, n_rows, field.row_stride, 0);
-                ggml_build_forward_expand(
-                    graph, ggml_cpy(codec_ctx, decoded, field_dst));
-            }
-        }
-    }
-
-    ggml_backend_buffer_t codec_buf =
-        ggml_backend_alloc_ctx_tensors(codec_ctx, gpu_backend);
-    if (!codec_buf) {
-        ggml_free(codec_ctx);
-        return false;
-    }
-
-    if (row_ids) {
-        std::vector<int32_t> ids((size_t) n_rows);
-        for (int32_t i = 0; i < (int32_t) n_rows; ++i) {
-            ids[(size_t) i] = i;
-        }
-        ggml_backend_tensor_set(
-            row_ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
-    }
-
-    const ggml_status status =
-        ggml_backend_graph_compute(gpu_backend, graph);
-    ggml_backend_synchronize(gpu_backend);
-    ggml_backend_buffer_free(codec_buf);
-    ggml_free(codec_ctx);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR(
-            "%s: %s codec graph failed: %s\n",
-            __func__, ggml_type_name(codec),
-            ggml_status_to_string(status));
-        return false;
-    }
-
-    dflash_capture->approx_codec_last = codec;
-    dflash_capture->approx_codec_roundtrips++;
-    dflash_capture->approx_codec_storage_bytes_last = storage_bytes;
-    return true;
 }
 
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
@@ -2137,21 +1778,15 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
                        : H_v;                             // 8 (repeated)
     const int64_t conv_ch =
         (int64_t) hparams.n_embd_r() / (hparams.ssm_d_conv - 1);
-    const int64_t minimal_record_floats =
-        (int64_t) n_rec * (conv_ch + 2 * H_v);
-
     dflash_capture->tapes.clear();
     dflash_capture->tapes.reserve(n_slots);
 
     size_t total_size = 0;
 
     for (int slot = 0; slot < n_slots; ++slot) {
-        // allocate ggml context for this slot's tensor descriptors (k/v/gate/beta + qkv staging)
-        // Direct GPU additionally owns one packed minimal-record base and
-        // qkv/gate/beta views for every layer. Meta retains only the named
-        // legacy tensors because its split rules are layer/tensor scoped.
-        size_t ctx_mem = ggml_tensor_overhead() *
-            (n_rec * (gpu_backend ? 8 : 5) + (gpu_backend ? 4 : 2));
+        // allocate ggml context for this slot's tensor descriptors
+        // (k/v/gate/beta + qkv staging)
+        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 5 + 2);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * tape_ctx = ggml_init(ctx_params);
 
@@ -2160,17 +1795,6 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         tape->layer_ids = dflash_capture->recurrent_layer_ids;
         tape->max_tokens = max_tokens;
         tape->ctx = tape_ctx;
-        if (gpu_backend) {
-            tape->minimal_record_floats = minimal_record_floats;
-            tape->minimal_packed = ggml_new_tensor_2d(
-                tape_ctx, GGML_TYPE_F32,
-                minimal_record_floats, (int64_t) max_tokens);
-            ggml_set_name(tape->minimal_packed, "dflash_tape_minimal_packed");
-        }
-
-        size_t minimal_offset = 0;
-        const size_t minimal_stride =
-            (size_t) minimal_record_floats * sizeof(float);
         for (int li = 0; li < n_rec; ++li) {
             auto & tl = tape->layers[li];
             const int il = rec_ids[li];
@@ -2187,36 +1811,12 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             if (gpu_backend || meta_backend) {
                 // Stage QKV in the graph on every GPU path. Tensor split needs the
                 // authoritative name-rule layout to avoid a misordered inferred
-                // gather. Single-device rolling capture needs the same tensor so
-                // publication can remain D2D instead of chopping the forward graph,
-                // reading every recurrent layer to host, then uploading it again.
-                // Fixed-tape rollback gathers this tensor only when the host conv
-                // rebuild actually consumes it.
+                // gather. Fixed-tape rollback gathers this tensor only when the
+                // host conv rebuild actually consumes it.
                 tl.qkv = ggml_new_tensor_2d(tape_ctx, GGML_TYPE_F32, conv_ch, (int64_t)max_tokens);
                 ggml_format_name(tl.qkv, "dflash_tape_qkv_l%d", il);
             }
-            if (gpu_backend) {
-                tl.minimal_qkv = ggml_view_2d(
-                    tape_ctx, tape->minimal_packed,
-                    conv_ch, (int64_t) max_tokens,
-                    minimal_stride, minimal_offset);
-                minimal_offset += (size_t) conv_ch * sizeof(float);
-                tl.minimal_gate = ggml_view_3d(
-                    tape_ctx, tape->minimal_packed,
-                    (int64_t) 1, H_v, (int64_t) max_tokens,
-                    sizeof(float), minimal_stride, minimal_offset);
-                minimal_offset += (size_t) H_v * sizeof(float);
-                tl.minimal_beta = ggml_view_3d(
-                    tape_ctx, tape->minimal_packed,
-                    (int64_t) 1, H_v, (int64_t) max_tokens,
-                    sizeof(float), minimal_stride, minimal_offset);
-                minimal_offset += (size_t) H_v * sizeof(float);
-                ggml_format_name(tl.minimal_qkv,  "dflash_tape_min_qkv_l%d", il);
-                ggml_format_name(tl.minimal_gate, "dflash_tape_min_g_l%d", il);
-                ggml_format_name(tl.minimal_beta, "dflash_tape_min_b_l%d", il);
-            }
         }
-        GGML_ASSERT(!gpu_backend || minimal_offset == minimal_stride);
 
         tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend ? gpu_backend : meta_backend);
 
@@ -2396,8 +1996,7 @@ static void dflash_build_gdn_state_update(
     const int64_t n_embd_s = S * S * H_v;
     const size_t  s_esz    = ggml_element_size(s_tensor);
 
-    // A token-major packed rolling record gives gate and beta a pitch between
-    // tokens. GDN accepts pitched rows for Q/K/V but requires gate to be fully
+    // GDN accepts pitched rows for Q/K/V but requires gate to be fully
     // contiguous; CUDA sigmoid likewise requires its beta input contiguous.
     // One-token views already satisfy both contracts. Batched replay
     // materializes only these tiny [1,H_v,T] fields, leaving QKV transport
@@ -2421,1731 +2020,6 @@ static void dflash_build_gdn_state_update(
     ggml_tensor * s_write = ggml_view_1d(ctx, s_tensor, n_embd_s, s_byte_offset);
 
     ggml_build_forward_expand(graph, ggml_cpy(ctx, result_state, s_write));
-}
-
-static ggml_backend_dev_t dflash_tensor_device(const ggml_tensor * tensor) {
-    if (!tensor || !tensor->buffer) {
-        return nullptr;
-    }
-    auto * buft = ggml_backend_buffer_get_type(tensor->buffer);
-    return buft ? ggml_backend_buft_get_device(buft) : nullptr;
-}
-
-static bool dflash_window_copy_boundary(
-        llama_context * ctx,
-        dflash_window &  window,
-        int             src_idx,
-        int             dst_idx) {
-    if (src_idx == dst_idx) {
-        return true;
-    }
-
-    ggml_backend_t gpu_backend = ctx->find_gpu_backend();
-    if (!gpu_backend) {
-        return false;
-    }
-    for (auto & layer : window.layers) {
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend, layer.r[src_idx], layer.r[dst_idx]);
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend, layer.s[src_idx], layer.s[dst_idx]);
-    }
-    // The consumer graph/copy uses this same backend stream. Its eventual
-    // transaction fence orders these copies without one blocking fence per
-    // tensor (CUDA's synchronous buffer copy fences internally).
-    return true;
-}
-
-// Apply one physically-contiguous run of minimal-F32 records to one
-// non-published boundary copy. This is the Gate-2 reconstruction path with all
-// records in one graph launch, plus the final conv-window shift.
-static bool dflash_window_apply_records(
-        llama_context * ctx,
-        dflash_window &  window,
-        int             record_slot,
-        int             n_records,
-        int             dst_idx,
-        bool            stable_advance = false,
-        bool            staged_records = false) {
-    const int64_t profile_start =
-        stable_advance && window.profile_timing ? ggml_time_us() : 0;
-    const auto & hparams = ctx->get_model().hparams;
-    const int n_rec = (int) window.layer_ids.size();
-    ggml_backend_t gpu_backend = ctx->find_gpu_backend();
-    const auto & record_layers =
-        (stable_advance || staged_records)
-            ? window.advance_layers : window.layers;
-    const int record_capacity =
-        record_layers.empty() || !record_layers[0].qkv
-            ? 0
-            : (int) record_layers[0].qkv->ne[1];
-    if (!gpu_backend || record_slot < 0 || n_records <= 0 ||
-        record_slot + n_records > record_capacity ||
-        dst_idx < 0 || dst_idx > 1 ||
-        record_layers.size() != window.layers.size()) {
-        return false;
-    }
-    dflash_window_apply_cache * cache =
-        stable_advance && window.advance_graph_cache_enabled
-            ? &window.advance_cache[dst_idx]
-            : nullptr;
-    if (cache && cache->graph) {
-        if (cache->n_records != n_records || record_slot != 0) {
-            return false;
-        }
-        const bool ok = ggml_backend_graph_compute(
-                            gpu_backend, cache->graph) ==
-                        GGML_STATUS_SUCCESS;
-        if (profile_start) {
-            window.profile_apply_us +=
-                (uint64_t) (ggml_time_us() - profile_start);
-            window.profile_apply_calls++;
-        }
-        return ok;
-    }
-
-    // Gate-2 budgets 36 tensors / 32 nodes per layer for this same
-    // reconstruction+GDN tail. Allow the additional conv-state shift/copy and
-    // some descriptor headroom so an undersized no-alloc context cannot abort.
-    const size_t tensors_per_layer = 46;
-    const size_t nodes_per_layer = 42;
-    const size_t ctx_mem =
-        ggml_tensor_overhead() * ((size_t) n_rec * tensors_per_layer + 8) +
-        ggml_graph_overhead_custom((size_t) n_rec * nodes_per_layer, false);
-    ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-    ggml_context * graph_ctx = ggml_init(ctx_params);
-    if (!graph_ctx) {
-        return false;
-    }
-    ggml_cgraph * graph = ggml_new_graph_custom(
-        graph_ctx, (size_t) n_rec * nodes_per_layer, false);
-
-    for (int li = 0; li < n_rec; ++li) {
-        const int il = window.layer_ids[li];
-        auto & layer = window.layers[li];
-        const auto & record = record_layers[li];
-        ggml_tensor * conv_kernel = ctx->get_model().layers[il].ssm_conv1d;
-
-        const int64_t S = hparams.ssm_d_state;
-        const int64_t H_k = hparams.ssm_n_group;
-        const int64_t H_v = hparams.ssm_dt_rank;
-        const int64_t conv_channels = record.qkv->ne[0];
-        const int64_t conv_window = conv_kernel->ne[0] - 1;
-        const int64_t n_embd_r = conv_window * conv_channels;
-
-        ggml_tensor * r_state = layer.r[dst_idx];
-        ggml_tensor * s_state = layer.s[dst_idx];
-        GGML_ASSERT(r_state->ne[0] == n_embd_r);
-        GGML_ASSERT(s_state->ne[0] == S * S * H_v);
-        GGML_ASSERT(conv_channels == 2 * S * H_k + S * H_v);
-
-        ggml_tensor * r_view = ggml_reshape_3d(
-            graph_ctx, r_state, conv_window, conv_channels, (int64_t) 1);
-        ggml_tensor * qkv = ggml_view_2d(
-            graph_ctx, record.qkv, conv_channels, (int64_t) n_records,
-            record.qkv->nb[1],
-            (size_t) record_slot * record.qkv->nb[1]);
-        ggml_tensor * conv_input = ggml_concat(
-            graph_ctx, r_view, ggml_transpose(graph_ctx, qkv), 0);
-        ggml_tensor * conv_silu = ggml_silu(
-            graph_ctx, ggml_ssm_conv(graph_ctx, conv_input, conv_kernel));
-
-        const int64_t conv_row = conv_channels * ggml_element_size(conv_silu);
-        ggml_tensor * k = ggml_view_4d(
-            graph_ctx, conv_silu, S, H_k, (int64_t) n_records, (int64_t) 1,
-            ggml_row_size(conv_silu->type, S), conv_row,
-            conv_row * n_records,
-            S * H_k * ggml_element_size(conv_silu));
-        ggml_tensor * v = ggml_view_4d(
-            graph_ctx, conv_silu, S, H_v, (int64_t) n_records, (int64_t) 1,
-            ggml_row_size(conv_silu->type, S), conv_row,
-            conv_row * n_records,
-            2 * S * H_k * ggml_element_size(conv_silu));
-        k = ggml_l2_norm(graph_ctx, k, hparams.f_norm_rms_eps);
-
-        ggml_tensor * gate = ggml_view_3d(
-            graph_ctx, record.gate, (int64_t) 1, H_v,
-            (int64_t) n_records, sizeof(float), record.gate->nb[1],
-            (size_t) record_slot * record.gate->nb[1]);
-        ggml_tensor * beta = ggml_view_3d(
-            graph_ctx, record.beta, (int64_t) 1, H_v,
-            (int64_t) n_records, sizeof(float), record.beta->nb[1],
-            (size_t) record_slot * record.beta->nb[1]);
-        ggml_tensor * q = ggml_scale(graph_ctx, k, 0.0f);
-
-        dflash_build_gdn_state_update(
-            graph_ctx, graph, q, k, v, gate, beta,
-            s_state, 0, S, H_v, n_records);
-
-        // Shift the private conv boundary by the same record. conv_input is
-        // [old window | qkv]; dropping its first column yields the new window.
-        ggml_tensor * r_next = ggml_view_3d(
-            graph_ctx, conv_input, conv_window, conv_channels, (int64_t) 1,
-            conv_input->nb[1], conv_input->nb[2],
-            (size_t) n_records * conv_input->nb[0]);
-        ggml_build_forward_expand(
-            graph, ggml_cpy(graph_ctx, r_next, r_state));
-    }
-
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
-    const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(graph_ctx, buft);
-    ggml_backend_buffer_t & scratch =
-        (stable_advance || staged_records)
-            ? window.advance_scratch : window.scratch;
-    size_t & scratch_size =
-        (stable_advance || staged_records)
-            ? window.advance_scratch_size : window.scratch_size;
-    if (needed > scratch_size) {
-        if ((stable_advance || staged_records) &&
-            (window.advance_cache[0].ctx ||
-             window.advance_cache[1].ctx)) {
-            ggml_free(graph_ctx);
-            return false;
-        }
-        ggml_backend_buffer_t replacement = ggml_backend_buft_alloc_buffer(buft, needed);
-        if (!replacement) {
-            ggml_free(graph_ctx);
-            return false;
-        }
-        if (scratch) {
-            ggml_backend_buffer_free(scratch);
-        }
-        scratch = replacement;
-        scratch_size = ggml_backend_buffer_get_size(replacement);
-    }
-
-    {
-        ggml_tallocr talloc = ggml_tallocr_new(scratch);
-        for (ggml_tensor * tensor = ggml_get_first_tensor(graph_ctx);
-             tensor;
-             tensor = ggml_get_next_tensor(graph_ctx, tensor)) {
-            if (tensor->data == nullptr && tensor->view_src == nullptr) {
-                ggml_tallocr_alloc(&talloc, tensor);
-            } else if (tensor->view_src != nullptr && tensor->buffer == nullptr) {
-                ggml_backend_view_init(tensor);
-            }
-        }
-    }
-
-    if (cache) {
-        cache->ctx = graph_ctx;
-        cache->graph = graph;
-        cache->n_records = n_records;
-    }
-    const ggml_status status = ggml_backend_graph_compute(gpu_backend, graph);
-    if (!cache || status != GGML_STATUS_SUCCESS) {
-        if (cache) {
-            cache->ctx = nullptr;
-            cache->graph = nullptr;
-            cache->n_records = 0;
-        }
-        ggml_free(graph_ctx);
-    }
-    if (profile_start) {
-        window.profile_apply_us +=
-            (uint64_t) (ggml_time_us() - profile_start);
-        window.profile_apply_calls++;
-    }
-    return status == GGML_STATUS_SUCCESS;
-}
-
-// Convert a contiguous record run between the persistent codec and detached
-// replay staging. The destination is never published by this helper. A failed
-// graph may leave it partially written, but all authoritative ring metadata and
-// the published boundary remain untouched and a retry overwrites the complete
-// destination.
-static bool dflash_window_convert_records(
-        llama_context * ctx,
-        dflash_window & window,
-        ggml_tensor *   src_packed,
-        int             src_slot,
-        ggml_tensor *   dst_packed,
-        int             dst_slot,
-        int             n_records) {
-    ggml_backend_t gpu_backend = ctx->find_gpu_backend();
-    if (!gpu_backend || !src_packed || !dst_packed ||
-        src_slot < 0 || dst_slot < 0 || n_records <= 0 ||
-        src_slot + n_records > src_packed->ne[1] ||
-        dst_slot + n_records > dst_packed->ne[1] ||
-        src_packed->ne[0] != window.record_floats ||
-        dst_packed->ne[0] != window.record_floats) {
-        return false;
-    }
-
-    if (src_packed->type == dst_packed->type) {
-        const int64_t n_values =
-            window.record_floats * (int64_t) n_records;
-        const size_t ctx_mem = ggml_tensor_overhead() * 4;
-        ggml_init_params params = { ctx_mem, nullptr, true };
-        ggml_context * copy_ctx = ggml_init(params);
-        if (!copy_ctx) {
-            return false;
-        }
-        ggml_tensor * src = ggml_view_1d(
-            copy_ctx, src_packed, n_values,
-            (size_t) src_slot * src_packed->nb[1]);
-        ggml_tensor * dst = ggml_view_1d(
-            copy_ctx, dst_packed, n_values,
-            (size_t) dst_slot * dst_packed->nb[1]);
-        src->buffer = src_packed->buffer;
-        dst->buffer = dst_packed->buffer;
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend, src, dst);
-        ggml_free(copy_ctx);
-        return true;
-    }
-
-    if (!((src_packed->type == GGML_TYPE_F32 &&
-           dst_packed->type == GGML_TYPE_F16) ||
-          (src_packed->type == GGML_TYPE_F16 &&
-           dst_packed->type == GGML_TYPE_F32))) {
-        return false;
-    }
-
-    // src/dst views, their two external base views, cast, copy, plus headroom
-    // for graph traversal. Keep one node unused for build_forward_expand.
-    constexpr size_t tensor_count = 6;
-    constexpr size_t max_nodes = 8;
-    const size_t ctx_mem =
-        ggml_tensor_overhead() * tensor_count +
-        ggml_graph_overhead_custom(max_nodes, false);
-    ggml_init_params params = { ctx_mem, nullptr, true };
-    ggml_context * codec_ctx = ggml_init(params);
-    if (!codec_ctx) {
-        return false;
-    }
-
-    ggml_tensor * src = ggml_view_2d(
-        codec_ctx, src_packed, window.record_floats, n_records,
-        src_packed->nb[1], (size_t) src_slot * src_packed->nb[1]);
-    ggml_tensor * dst = ggml_view_2d(
-        codec_ctx, dst_packed, window.record_floats, n_records,
-        dst_packed->nb[1], (size_t) dst_slot * dst_packed->nb[1]);
-    ggml_tensor * converted =
-        ggml_cast(codec_ctx, src, dst_packed->type);
-    ggml_cgraph * graph =
-        ggml_new_graph_custom(codec_ctx, max_nodes, false);
-    ggml_build_forward_expand(
-        graph, ggml_cpy(codec_ctx, converted, dst));
-
-    ggml_backend_buffer_type_t buft =
-        ggml_backend_get_default_buffer_type(gpu_backend);
-    const size_t needed =
-        ggml_backend_alloc_ctx_tensors_from_buft_size(codec_ctx, buft);
-    if (needed > window.codec_scratch_size) {
-        ggml_backend_buffer_t replacement =
-            ggml_backend_buft_alloc_buffer(buft, needed);
-        if (!replacement) {
-            ggml_free(codec_ctx);
-            return false;
-        }
-        if (window.codec_scratch) {
-            ggml_backend_buffer_free(window.codec_scratch);
-        }
-        window.codec_scratch = replacement;
-        window.codec_scratch_size =
-            ggml_backend_buffer_get_size(replacement);
-    }
-
-    {
-        ggml_tallocr talloc =
-            ggml_tallocr_new(window.codec_scratch);
-        for (ggml_tensor * tensor = ggml_get_first_tensor(codec_ctx);
-             tensor;
-             tensor = ggml_get_next_tensor(codec_ctx, tensor)) {
-            if (tensor->data == nullptr && tensor->view_src == nullptr) {
-                ggml_tallocr_alloc(&talloc, tensor);
-            } else if (tensor->view_src != nullptr &&
-                       tensor->buffer == nullptr) {
-                ggml_backend_view_init(tensor);
-            }
-        }
-    }
-
-    const ggml_status status =
-        ggml_backend_graph_compute(gpu_backend, graph);
-    ggml_backend_synchronize(gpu_backend);
-    ggml_free(codec_ctx);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR(
-            "%s: %s -> %s record conversion failed: %s\n",
-            __func__, ggml_type_name(src_packed->type),
-            ggml_type_name(dst_packed->type),
-            ggml_status_to_string(status));
-        return false;
-    }
-    return true;
-}
-
-static bool dflash_window_stage_advance_records(
-        llama_context * ctx,
-        dflash_window & window,
-        int             n_records) {
-    const int64_t profile_start =
-        window.profile_timing ? ggml_time_us() : 0;
-    ggml_backend_t gpu_backend = ctx->find_gpu_backend();
-    if (!gpu_backend || !window.record_packed ||
-        !window.advance_packed || window.record_floats <= 0 ||
-        n_records <= 0 || n_records > window.advance_batch ||
-        n_records > window.count) {
-        return false;
-    }
-
-    int copied = 0;
-    if (window.record_type == GGML_TYPE_F32) {
-        // Preserve the exact namespace's original allocation/copy schedule.
-        const size_t copy_ctx_mem = ggml_tensor_overhead() * 6;
-        ggml_init_params params = { copy_ctx_mem, nullptr, true };
-        ggml_context * copy_ctx = ggml_init(params);
-        if (!copy_ctx) {
-            return false;
-        }
-        while (copied < n_records) {
-            const int slot = (window.head + copied) % window.capacity;
-            const int segment = std::min(
-                n_records - copied, window.capacity - slot);
-            const int64_t n_floats =
-                window.record_floats * (int64_t) segment;
-            ggml_tensor * src = ggml_view_1d(
-                copy_ctx, window.record_packed, n_floats,
-                (size_t) slot * window.record_packed->nb[1]);
-            ggml_tensor * dst = ggml_view_1d(
-                copy_ctx, window.advance_packed, n_floats,
-                (size_t) copied * window.advance_packed->nb[1]);
-            src->buffer = window.record_packed->buffer;
-            dst->buffer = window.advance_packed->buffer;
-            ggml_backend_tensor_copy_async(
-                gpu_backend, gpu_backend, src, dst);
-            copied += segment;
-        }
-        ggml_free(copy_ctx);
-    } else {
-        while (copied < n_records) {
-            const int slot = (window.head + copied) % window.capacity;
-            const int segment = std::min(
-                n_records - copied, window.capacity - slot);
-            if (!dflash_window_convert_records(
-                    ctx, window, window.record_packed, slot,
-                    window.advance_packed, copied, segment)) {
-                return false;
-            }
-            copied += segment;
-        }
-    }
-    if (profile_start) {
-        window.profile_stage_us +=
-            (uint64_t) (ggml_time_us() - profile_start);
-    }
-    return true;
-}
-
-static bool dflash_window_advance_boundary(
-        llama_context * ctx,
-        dflash_window &  window,
-        int             n_advance = 1) {
-    const int64_t profile_start =
-        window.profile_timing ? ggml_time_us() : 0;
-    if (n_advance <= 0 || n_advance > window.count) {
-        return false;
-    }
-
-    // Validate the complete logical transaction before mutating the private
-    // boundary. A wrap can require two physical graph segments, but publication
-    // and record retirement remain one atomic logical commit.
-    for (int i = 0; i < n_advance; ++i) {
-        const int slot = (window.head + i) % window.capacity;
-        const auto & record = window.records[slot];
-        if (!record.valid ||
-            record.seq_id != window.seq_id ||
-            record.pos != window.boundary_pos + i + 1) {
-            LLAMA_LOG_WARN(
-                "%s: non-contiguous or wrong-owner record at slot %d\n",
-                __func__, slot);
-            return false;
-        }
-    }
-
-    const int private_idx = 1 - window.published_idx;
-    if (!dflash_window_stage_advance_records(
-            ctx, window, n_advance)) {
-        return false;
-    }
-    if (!dflash_window_copy_boundary(
-            ctx, window, window.published_idx, private_idx)) {
-        return false;
-    }
-    if (!dflash_window_apply_records(
-            ctx, window, 0, n_advance, private_idx,
-            /*stable_advance=*/true,
-            /*staged_records=*/true)) {
-        // Descriptor/scratch allocation can fail after the staging and
-        // published->private copies were enqueued. Drain those private-only
-        // writes before returning so a retained pending transaction never
-        // carries unowned asynchronous work.
-        if (ggml_backend_t gpu_backend = ctx->find_gpu_backend()) {
-            ggml_backend_synchronize(gpu_backend);
-        }
-        return false;
-    }
-
-    // Fault point is deliberately after all private GPU writes are complete and
-    // fenced, but before any published metadata or ring-retirement mutation.
-    if (window.fail_publish_once) {
-        window.fail_publish_once = false;
-        window.last_publish_failed = true;
-        return false;
-    }
-
-    // Single decode-thread logical commit. Readers select one complete boundary
-    // exclusively through published_idx; the previous copy remained untouched
-    // through the fence and index swap.
-    window.published_idx = private_idx;
-    window.boundary_pos += n_advance;
-    window.reconstructed_idx = -1;
-    window.reconstructed_pos = -1;
-
-    // Retire only after publication.
-    for (int i = 0; i < n_advance; ++i) {
-        window.records[(window.head + i) % window.capacity].valid = false;
-    }
-    window.head = (window.head + n_advance) % window.capacity;
-    window.count -= n_advance;
-    window.last_publish_failed = false;
-    if (profile_start) {
-        window.profile_advance_us +=
-            (uint64_t) (ggml_time_us() - profile_start);
-        window.profile_advance_calls++;
-    }
-    return true;
-}
-
-dflash_window * llama_context::dflash_window_for_seq(llama_seq_id seq_id) const {
-    if (!dflash_capture || seq_id < 0 ||
-        seq_id >= (llama_seq_id) dflash_capture->windows.size()) {
-        return nullptr;
-    }
-    return dflash_capture->windows[seq_id].get();
-}
-
-bool llama_context::dflash_window_get_info(
-        llama_seq_id               seq_id,
-        llama_dflash_window_info & info) const {
-    const auto * window = dflash_window_for_seq(seq_id);
-    if (!window || !window->enabled) {
-        return false;
-    }
-
-    info.enabled          = true;
-    info.codec            = window->record_type == GGML_TYPE_F16
-        ? LLAMA_DFLASH_WINDOW_CODEC_F16
-        : LLAMA_DFLASH_WINDOW_CODEC_F32;
-    info.seq_id           = window->seq_id;
-    info.boundary_pos     = window->boundary_pos;
-    info.frontier_pos     = window->frontier_pos;
-    info.retained_depth   = window->retained_depth;
-    info.advance_batch    = window->advance_batch;
-    info.record_count     = window->count;
-    const auto capture_has_seq =
-        [seq_id](const dflash_window_pending & capture) {
-            return capture.active &&
-                std::any_of(
-                    capture.seqs.begin(), capture.seqs.end(),
-                    [seq_id](const dflash_window_pending_seq & seq) {
-                        return seq.seq_id == seq_id;
-                    });
-        };
-    info.capture_pending =
-        capture_has_seq(dflash_capture->window_staging) ||
-        capture_has_seq(dflash_capture->window_pending);
-    return true;
-}
-
-bool llama_context::dflash_window_discard_seq(llama_seq_id seq_id) {
-    if (!dflash_capture || seq_id < 0) {
-        return true;
-    }
-
-    auto pending_has_seq = [seq_id](const dflash_window_pending & pending) {
-        return pending.active &&
-            std::any_of(
-                pending.seqs.begin(), pending.seqs.end(),
-                [seq_id](const dflash_window_pending_seq & seq) {
-                    return seq.seq_id == seq_id;
-                });
-    };
-
-    // The pending payload is packed across owners. Removing one axis while
-    // retaining others would change its layout and can alias their records.
-    // The server integration is deliberately single-slot; keep the generic
-    // API fail-closed if a future multi-owner caller tries this.
-    if (pending_has_seq(dflash_capture->window_pending)) {
-        if (dflash_capture->window_pending.seqs.size() != 1) {
-            return false;
-        }
-        dflash_capture->window_pending.clear();
-    }
-    if (pending_has_seq(dflash_capture->window_staging)) {
-        if (dflash_capture->window_staging.seqs.size() != 1) {
-            return false;
-        }
-        dflash_capture->window_staging.clear();
-    }
-
-    if (seq_id < (llama_seq_id) dflash_capture->windows.size()) {
-        dflash_capture->windows[seq_id].reset();
-    }
-    if (std::none_of(
-            dflash_capture->windows.begin(), dflash_capture->windows.end(),
-            [](const std::unique_ptr<dflash_window> & window) {
-                return window && window->enabled;
-            })) {
-        dflash_capture->window_speculative_capture = false;
-    }
-    return true;
-}
-
-bool llama_context::dflash_window_enable(llama_seq_id seq_id, int capacity) {
-    return dflash_window_enable_batched(seq_id, capacity, 1);
-}
-
-bool llama_context::dflash_window_enable_batched(
-        llama_seq_id seq_id,
-        int          retained_depth,
-        int          advance_batch) {
-    return dflash_window_enable_batched_with_type(
-        seq_id, retained_depth, advance_batch, GGML_TYPE_F32);
-}
-
-bool llama_context::dflash_window_enable_batched_f16(
-        llama_seq_id seq_id,
-        int          retained_depth,
-        int          advance_batch) {
-    return dflash_window_enable_batched_with_type(
-        seq_id, retained_depth, advance_batch, GGML_TYPE_F16);
-}
-
-bool llama_context::dflash_window_enable_batched_with_type(
-        llama_seq_id seq_id,
-        int          retained_depth,
-        int          advance_batch,
-        ggml_type    record_type) {
-    if (retained_depth <= 0 || advance_batch <= 0 ||
-        (record_type != GGML_TYPE_F32 && record_type != GGML_TYPE_F16) ||
-        retained_depth > std::numeric_limits<int>::max() - advance_batch + 1) {
-        return false;
-    }
-    const int capacity = retained_depth + advance_batch - 1;
-    if (!dflash_capture || !dflash_capture->tape_enabled ||
-        dflash_capture->window_pending.active ||
-        seq_id < 0 || seq_id >= (llama_seq_id) dflash_capture->tapes.size() ||
-        !dflash_capture->tapes[seq_id] || capacity <= 0) {
-        return false;
-    }
-
-    auto * mem_recurrent = get_recurrent_mem(memory.get());
-    ggml_backend_t gpu_backend = find_gpu_backend();
-    ggml_backend_t meta_backend = find_meta_backend();
-    const bool exact_single_gpu =
-        mem_recurrent && gpu_backend &&
-        dflash_states_on_one_device(model.hparams, mem_recurrent);
-    const bool ownership_only = !exact_single_gpu && meta_backend;
-    if (!mem_recurrent || (!exact_single_gpu && !ownership_only) ||
-        seq_id < 0 || (uint32_t) seq_id >= mem_recurrent->size) {
-        return false;
-    }
-
-    const int32_t tail = mem_recurrent->cells[seq_id].tail;
-    if (tail < 0) {
-        return false;
-    }
-    synchronize();
-
-    const auto & hparams = model.hparams;
-    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
-    const int n_rec = (int) rec_ids.size();
-    const ggml_backend_dev_t gpu_dev =
-        exact_single_gpu ? ggml_backend_get_device(gpu_backend) : nullptr;
-    if (n_rec == 0) {
-        return false;
-    }
-
-    auto window = std::make_unique<dflash_window>();
-    window->ownership_only = ownership_only;
-    if (record_type == GGML_TYPE_F16 && ownership_only) {
-        // Gate-6 is single-device only; tensor-split remains an ownership
-        // oracle and must not silently acquire approximate arithmetic.
-        return false;
-    }
-    window->record_type = record_type;
-    window->seq_id = seq_id;
-    window->capacity = capacity;
-    window->retained_depth = retained_depth;
-    window->advance_batch = advance_batch;
-    window->records.resize(capacity);
-    window->layers.resize(n_rec);
-    if (!ownership_only) {
-        window->advance_layers.resize(n_rec);
-    }
-    window->layer_ids = rec_ids;
-    window->gpu_layer_indices.resize(n_rec, -1);
-
-    const auto & tape_gpu = *dflash_capture->tapes[seq_id];
-    for (int li = 0; li < n_rec; ++li) {
-        for (int i = 0; i < (int) tape_gpu.layer_ids.size(); ++i) {
-            if (tape_gpu.layer_ids[i] == rec_ids[li]) {
-                window->gpu_layer_indices[li] = i;
-                break;
-            }
-        }
-        if (window->gpu_layer_indices[li] < 0 ||
-            window->gpu_layer_indices[li] >= (int) tape_gpu.layers.size()) {
-            return false;
-        }
-    }
-
-    const size_t tensors_per_layer = ownership_only ? 3 : 10;
-    const size_t extra_tensors =
-        ownership_only ? 5 :
-        (record_type == GGML_TYPE_F16 ? 7 : 6);
-    const size_t ctx_mem =
-        ggml_tensor_overhead() *
-        ((size_t) n_rec * tensors_per_layer + extra_tensors);
-    ggml_init_params params = { ctx_mem, nullptr, true };
-    window->ctx = ggml_init(params);
-    if (!window->ctx) {
-        return false;
-    }
-
-    const int64_t record_conv_channels =
-        (int64_t) hparams.n_embd_r() / (hparams.ssm_d_conv - 1);
-    window->record_floats =
-        (int64_t) n_rec * (record_conv_channels + 2 * hparams.ssm_dt_rank);
-    window->record_packed = ggml_new_tensor_2d(
-        window->ctx, record_type, window->record_floats, capacity);
-    ggml_set_name(window->record_packed, "dflash_window_record_packed");
-    if (!ownership_only) {
-        if (record_type == GGML_TYPE_F16) {
-            window->append_packed = ggml_new_tensor_1d(
-                window->ctx, record_type, window->record_floats);
-            ggml_set_name(
-                window->append_packed, "dflash_window_append_packed");
-        }
-        window->advance_packed = ggml_new_tensor_2d(
-            window->ctx, GGML_TYPE_F32,
-            window->record_floats, advance_batch);
-        ggml_set_name(
-            window->advance_packed, "dflash_window_advance_packed");
-    }
-    const size_t record_stride =
-        ggml_row_size(record_type, window->record_floats);
-    const size_t record_element_size = ggml_type_size(record_type);
-    const size_t advance_stride =
-        (size_t) window->record_floats * sizeof(float);
-    size_t record_offset = 0;
-    size_t advance_offset = 0;
-
-    for (int li = 0; li < n_rec; ++li) {
-        const int il = rec_ids[li];
-        ggml_tensor * r_live = mem_recurrent->r_l[il];
-        ggml_tensor * s_live = mem_recurrent->s_l[il];
-        ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
-        if (!r_live || !s_live || !conv_kernel ||
-            r_live->type != GGML_TYPE_F32 ||
-            s_live->type != GGML_TYPE_F32 ||
-            conv_kernel->type != GGML_TYPE_F32 ||
-            (!ownership_only && dflash_tensor_device(r_live) != gpu_dev) ||
-            (!ownership_only && dflash_tensor_device(s_live) != gpu_dev) ||
-            (!ownership_only && dflash_tensor_device(conv_kernel) != gpu_dev) ||
-            conv_kernel->ne[0] <= 1 ||
-            hparams.n_embd_r() % (conv_kernel->ne[0] - 1) != 0 ||
-            (int64_t) hparams.n_embd_s() !=
-                hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank) {
-            return false;
-        }
-
-        const int64_t conv_channels =
-            (int64_t) hparams.n_embd_r() / (conv_kernel->ne[0] - 1);
-        const int64_t H_v = hparams.ssm_dt_rank;
-        if (conv_channels !=
-            2 * hparams.ssm_d_state * hparams.ssm_n_group +
-                hparams.ssm_d_state * H_v) {
-            return false;
-        }
-        auto & layer = window->layers[li];
-        layer.qkv = ggml_view_2d(
-            window->ctx, window->record_packed,
-            conv_channels, capacity, record_stride, record_offset);
-        record_offset += (size_t) conv_channels * record_element_size;
-        layer.gate = ggml_view_2d(
-            window->ctx, window->record_packed,
-            H_v, capacity, record_stride, record_offset);
-        record_offset += (size_t) H_v * record_element_size;
-        layer.beta = ggml_view_2d(
-            window->ctx, window->record_packed,
-            H_v, capacity, record_stride, record_offset);
-        if (!ownership_only) {
-            auto & advance = window->advance_layers[li];
-            advance.qkv = ggml_view_2d(
-                window->ctx, window->advance_packed,
-                conv_channels, advance_batch, advance_stride, advance_offset);
-            advance_offset += (size_t) conv_channels * sizeof(float);
-            advance.gate = ggml_view_2d(
-                window->ctx, window->advance_packed,
-                H_v, advance_batch, advance_stride, advance_offset);
-            advance_offset += (size_t) H_v * sizeof(float);
-            advance.beta = ggml_view_2d(
-                window->ctx, window->advance_packed,
-                H_v, advance_batch, advance_stride, advance_offset);
-            advance_offset += (size_t) H_v * sizeof(float);
-        }
-        record_offset += (size_t) H_v * record_element_size;
-        if (!ownership_only) {
-            for (int copy = 0; copy < 2; ++copy) {
-                layer.r[copy] = ggml_new_tensor_1d(
-                    window->ctx, GGML_TYPE_F32, hparams.n_embd_r());
-                layer.s[copy] = ggml_new_tensor_1d(
-                    window->ctx, GGML_TYPE_F32, hparams.n_embd_s());
-            }
-        }
-        ggml_format_name(layer.qkv, "dflash_window_qkv_l%d", il);
-        ggml_format_name(layer.gate, "dflash_window_gate_l%d", il);
-        ggml_format_name(layer.beta, "dflash_window_beta_l%d", il);
-    }
-    GGML_ASSERT(record_offset == record_stride);
-    GGML_ASSERT(ownership_only || advance_offset == advance_stride);
-
-    window->buf = ggml_backend_alloc_ctx_tensors(
-        window->ctx, ownership_only ? backend_cpu : gpu_backend);
-    if (!window->buf) {
-        return false;
-    }
-
-    const auto & cell = mem_recurrent->cells[tail];
-    if (!ownership_only) {
-        const uint32_t base_row =
-            cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail;
-        const uint32_t row =
-            mem_recurrent->rs_idx[seq_id] * mem_recurrent->size + base_row;
-        const size_t copy_ctx_mem =
-            ggml_tensor_overhead() * ((size_t) n_rec * 2 + 2);
-        ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
-        ggml_context * copy_ctx = ggml_init(copy_params);
-        if (!copy_ctx) {
-            return false;
-        }
-        for (int li = 0; li < n_rec; ++li) {
-            const int il = rec_ids[li];
-            ggml_tensor * r_live = mem_recurrent->r_l[il];
-            ggml_tensor * s_live = mem_recurrent->s_l[il];
-            ggml_tensor * r_src = ggml_view_1d(
-                copy_ctx, r_live, r_live->ne[0], (size_t) row * r_live->nb[1]);
-            ggml_tensor * s_src = ggml_view_1d(
-                copy_ctx, s_live, s_live->ne[0], (size_t) row * s_live->nb[1]);
-            r_src->buffer = r_live->buffer;
-            s_src->buffer = s_live->buffer;
-            ggml_backend_tensor_copy_async(
-                gpu_backend, gpu_backend, r_src, window->layers[li].r[0]);
-            ggml_backend_tensor_copy_async(
-                gpu_backend, gpu_backend, s_src, window->layers[li].s[0]);
-        }
-        ggml_free(copy_ctx);
-        ggml_backend_synchronize(gpu_backend);
-    }
-
-    window->boundary_pos = cell.pos;
-    window->frontier_pos = cell.pos;
-    window->published_idx = 0;
-
-    if (!ownership_only) {
-        // Every persistent single-GPU window stores the minimal
-        // qkv_mixed+gate+beta record. Make the matching forward-capture graph
-        // contract part of the API instead of letting an F32 control silently
-        // retain redundant post-conv k/v traffic. F16 additionally requires
-        // this layout for type-correct packed conversion.
-        // Do this only after every fallible window allocation/copy succeeds so
-        // a failed enable does not mutate the context's capture mode.
-        if (!cparams.tape_minimal_capture ||
-            !dflash_capture->tape_minimal_replay) {
-            set_tape_minimal_replay(true);
-        }
-        if (!cparams.tape_minimal_capture ||
-            !dflash_capture->tape_minimal_replay) {
-            return false;
-        }
-    }
-
-    window->enabled = true;
-    if (dflash_capture->windows.size() <= (size_t) seq_id) {
-        dflash_capture->windows.resize((size_t) seq_id + 1);
-    }
-    dflash_capture->windows[seq_id] = std::move(window);
-    return true;
-}
-
-static int dflash_window_tape_seq_axis(
-        const dflash_tape_layer & tape,
-        llama_seq_id              seq_id);
-
-static bool dflash_window_materialize_qkv(
-        llama_context *         ctx,
-        dflash_window_pending & pending) {
-    auto & cap = *ctx->dflash_capture;
-    if (pending.qkv_materialized) {
-        return true;
-    }
-    if (pending.seqs.empty() || cap.tape_layers.empty()) {
-        LLAMA_LOG_ERROR("%s: no pending owners or recurrent tape layers\n", __func__);
-        return false;
-    }
-    if (pending.seqs.size() > LLAMA_DFLASH_MAX_SLOTS) {
-        LLAMA_LOG_ERROR("%s: %zu pending owners exceed the packed-tape limit %d\n",
-            __func__, pending.seqs.size(), LLAMA_DFLASH_MAX_SLOTS);
-        return false;
-    }
-
-    const int n_tokens = (int) pending.seqs.front().positions.size();
-    if (n_tokens <= 0) {
-        LLAMA_LOG_ERROR("%s: pending owner has no token positions\n", __func__);
-        return false;
-    }
-    for (const auto & seq : pending.seqs) {
-        if ((int) seq.positions.size() != n_tokens ||
-            seq.seq_id < 0 ||
-            seq.seq_id >= (llama_seq_id) cap.tapes.size() ||
-            !cap.tapes[seq.seq_id]) {
-            LLAMA_LOG_ERROR(
-                "%s: invalid pending owner seq=%d tokens=%zu (expected %d)\n",
-                __func__, seq.seq_id, seq.positions.size(), n_tokens);
-            return false;
-        }
-    }
-
-    bool any_staged = false;
-    bool all_staged = true;
-    for (const auto & seq : pending.seqs) {
-        const bool staged = cap.tapes[seq.seq_id]->qkv_staged();
-        any_staged |= staged;
-        all_staged &= staged;
-    }
-    if (any_staged != all_staged) {
-        LLAMA_LOG_ERROR("%s: participating sequences mix staged and callback QKV\n", __func__);
-        return false;
-    }
-
-    if (!all_staged) {
-        // Callback QKV can arrive as one ubatch per sequence. It accumulated
-        // into a detached packed image during the decode; validate every
-        // layer/owner before publishing any of it to the legacy host tape.
-        if (pending.qkv_capture_failed ||
-            pending.qkv_layers.size() != cap.tape_layers.size() ||
-            pending.qkv_received.size() !=
-                pending.qkv_layers.size() * pending.seqs.size()) {
-            LLAMA_LOG_ERROR(
-                "%s: callback QKV accumulator is incomplete or failed\n",
-                __func__);
-            return false;
-        }
-        for (size_t li = 0; li < pending.qkv_layers.size(); ++li) {
-            const auto & tape = pending.qkv_layers[li];
-            if (tape.n_tokens != n_tokens ||
-                tape.n_seqs != (int) pending.seqs.size() ||
-                tape.conv_channels <= 0 ||
-                tape.qkv_mixed.size() !=
-                    (size_t) tape.conv_channels * n_tokens * tape.n_seqs) {
-                LLAMA_LOG_ERROR(
-                    "%s: layer %zu callback QKV geometry mismatch "
-                    "(tokens=%d/%d, seqs=%d/%zu, channels=%" PRId64 ", floats=%zu)\n",
-                    __func__, li, tape.n_tokens, n_tokens,
-                    tape.n_seqs, pending.seqs.size(), tape.conv_channels,
-                    tape.qkv_mixed.size());
-                return false;
-            }
-            for (size_t s = 0; s < pending.seqs.size(); ++s) {
-                if (tape.seq_ids[s] != pending.seqs[s].seq_id ||
-                    pending.qkv_received[
-                        li * pending.seqs.size() + s] != n_tokens) {
-                    LLAMA_LOG_ERROR(
-                        "%s: layer %zu callback QKV incomplete for seq %d "
-                        "(received=%d/%d)\n",
-                        __func__, li, pending.seqs[s].seq_id,
-                        pending.qkv_received[
-                            li * pending.seqs.size() + s],
-                        n_tokens);
-                    return false;
-                }
-            }
-        }
-
-        // Vector swaps and scalar metadata writes cannot allocate. Only now,
-        // after complete validation, publish the transaction-wide packed image.
-        for (size_t li = 0; li < pending.qkv_layers.size(); ++li) {
-            auto & src = pending.qkv_layers[li];
-            auto & dst = cap.tape_layers[li];
-            dst.qkv_mixed.swap(src.qkv_mixed);
-            dst.conv_channels = src.conv_channels;
-            dst.n_tokens = src.n_tokens;
-            dst.n_seqs = src.n_seqs;
-            for (int s = 0; s < src.n_seqs; ++s) {
-                dst.seq_ids[s] = src.seq_ids[s];
-            }
-        }
-        pending.qkv_layers.clear();
-        pending.qkv_received.clear();
-        pending.qkv_materialized = true;
-        return true;
-    }
-
-    const bool direct_single_device = std::all_of(
-        pending.seqs.begin(), pending.seqs.end(),
-        [ctx](const dflash_window_pending_seq & seq) {
-            const auto * window = ctx->dflash_window_for_seq(seq.seq_id);
-            return window && !window->ownership_only;
-        });
-    if (direct_single_device) {
-        // The graph already wrote each owner's authoritative QKV tensor on the
-        // same device as its rolling ring. append_staged() validates its shape
-        // and copies the selected row D2D; do not gather it to host merely to
-        // upload it again. The decode fence in retry_capture() makes the staged
-        // tensor visible before these copies.
-        for (const auto & seq : pending.seqs) {
-            const auto & tape_gpu = *cap.tapes[seq.seq_id];
-            if (tape_gpu.layers.size() != cap.tape_layers.size()) {
-                LLAMA_LOG_ERROR(
-                    "%s: seq %d staged QKV layer count mismatch\n",
-                    __func__, seq.seq_id);
-                return false;
-            }
-            for (size_t li = 0; li < tape_gpu.layers.size(); ++li) {
-                const ggml_tensor * qkv = pending.minimal_packed
-                    ? tape_gpu.layers[li].minimal_qkv
-                    : tape_gpu.layers[li].qkv;
-                if (!qkv || qkv->type != GGML_TYPE_F32 ||
-                    qkv->ne[0] <= 0 || qkv->ne[1] < n_tokens) {
-                    LLAMA_LOG_ERROR(
-                        "%s: seq %d layer %zu invalid device QKV shape\n",
-                        __func__, seq.seq_id, li);
-                    return false;
-                }
-            }
-        }
-        pending.qkv_materialized = true;
-        return true;
-    }
-
-    // Tensor split: every sequence owns an authoritative named QKV tape. Gather
-    // all owners into detached layer buffers first, then publish the packed host
-    // image as one transaction so no per-sequence materialization can clobber it.
-    struct staged_layer {
-        int64_t conv_channels = 0;
-        std::vector<float> qkv_mixed;
-    };
-    std::vector<staged_layer> staged;
-    try {
-        staged.resize(cap.tape_layers.size());
-        for (size_t li = 0; li < cap.tape_layers.size(); ++li) {
-            auto & layer = staged[li];
-            for (size_t s = 0; s < pending.seqs.size(); ++s) {
-                const llama_seq_id seq_id = pending.seqs[s].seq_id;
-                auto & tape_gpu = *cap.tapes[seq_id];
-                if (li >= tape_gpu.layers.size() || !tape_gpu.layers[li].qkv) {
-                    LLAMA_LOG_ERROR(
-                        "%s: layer %zu seq %d has no staged QKV tensor\n",
-                        __func__, li, seq_id);
-                    return false;
-                }
-                ggml_tensor * qkv = tape_gpu.layers[li].qkv;
-                if (qkv->ne[1] < n_tokens ||
-                    (layer.conv_channels != 0 &&
-                     layer.conv_channels != qkv->ne[0])) {
-                    LLAMA_LOG_ERROR(
-                        "%s: layer %zu seq %d staged QKV shape mismatch "
-                        "(channels=%" PRId64 ", capacity=%" PRId64 ", tokens=%d)\n",
-                        __func__, li, seq_id, qkv->ne[0], qkv->ne[1], n_tokens);
-                    return false;
-                }
-                if (layer.conv_channels == 0) {
-                    layer.conv_channels = qkv->ne[0];
-                    layer.qkv_mixed.resize(
-                        (size_t) layer.conv_channels * n_tokens *
-                        pending.seqs.size());
-                }
-                float * dst = layer.qkv_mixed.data() +
-                    s * (size_t) layer.conv_channels * n_tokens;
-                ggml_backend_tensor_get(
-                    qkv, dst, 0, (size_t) n_tokens * qkv->nb[1]);
-            }
-        }
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: could not allocate packed QKV staging: %s\n",
-            __func__, err.what());
-        return false;
-    }
-
-    for (size_t li = 0; li < staged.size(); ++li) {
-        auto & tape = cap.tape_layers[li];
-        tape.qkv_mixed.swap(staged[li].qkv_mixed);
-        tape.conv_channels = staged[li].conv_channels;
-        tape.n_tokens = n_tokens;
-        tape.n_seqs = (int) pending.seqs.size();
-        for (size_t s = 0; s < pending.seqs.size(); ++s) {
-            tape.seq_ids[s] = pending.seqs[s].seq_id;
-        }
-    }
-    pending.qkv_materialized = true;
-    return true;
-}
-
-static int dflash_window_tape_seq_axis(
-        const dflash_tape_layer & tape,
-        llama_seq_id              seq_id) {
-    for (int s = 0; s < tape.n_seqs; ++s) {
-        if (tape.seq_ids[s] == seq_id) {
-            return s;
-        }
-    }
-    return -1;
-}
-
-static bool dflash_window_append_staged(
-        llama_context * ctx,
-        dflash_window &  window,
-        llama_pos       pos,
-        int             source_token,
-        bool            minimal_packed) {
-    const int64_t profile_start =
-        window.profile_timing ? ggml_time_us() : 0;
-    auto & cap = *ctx->dflash_capture;
-    const llama_seq_id seq_id = window.seq_id;
-    dflash_tape_gpu * tape_gpu =
-        seq_id >= 0 && seq_id < (llama_seq_id) cap.tapes.size()
-            ? cap.tapes[seq_id].get()
-            : nullptr;
-    if (!tape_gpu) {
-        LLAMA_LOG_ERROR("%s: seq %d has no fixed GPU tape\n", __func__, seq_id);
-        return false;
-    }
-    ggml_backend_t gpu_backend =
-        window.ownership_only ? nullptr : ctx->find_gpu_backend();
-    if (!window.ownership_only && !gpu_backend) {
-        LLAMA_LOG_ERROR("%s: seq %d has no direct GPU backend\n", __func__, seq_id);
-        return false;
-    }
-    if (pos != window.frontier_pos + 1) {
-        LLAMA_LOG_ERROR(
-            "%s: seq %d non-contiguous record pos=%d after frontier=%d\n",
-            __func__, seq_id, pos, window.frontier_pos);
-        return false;
-    }
-    const bool packed_device =
-        minimal_packed && !window.ownership_only;
-    if (window.record_type == GGML_TYPE_F16 && !packed_device) {
-        // Never fall through to the legacy per-field D2D branch: its fixed
-        // tape sources are F32 while this ring's views are F16, and backend
-        // tensor copy correctly requires identical layouts. A caller that
-        // disables minimal capture after enabling an approximate window fails
-        // closed with its pending record retained.
-        LLAMA_LOG_ERROR(
-            "%s: seq %d F16 window requires minimal packed capture\n",
-            __func__, seq_id);
-        return false;
-    }
-    if (packed_device &&
-        (!tape_gpu->minimal_packed || !window.record_packed ||
-         tape_gpu->minimal_record_floats != window.record_floats ||
-         tape_gpu->layer_ids != window.layer_ids ||
-         source_token < 0 || source_token >= tape_gpu->max_tokens)) {
-        LLAMA_LOG_ERROR(
-            "%s: seq %d packed record geometry is unavailable or mismatched "
-            "(source=%d, source_floats=%" PRId64 ", ring_floats=%" PRId64 ")\n",
-            __func__, seq_id, source_token,
-            tape_gpu->minimal_record_floats, window.record_floats);
-        return false;
-    }
-
-    for (size_t li = 0; li < window.layers.size(); ++li) {
-        const int gpu_li = window.gpu_layer_indices[li];
-        const auto & dst = window.layers[li];
-        if (gpu_li < 0 || gpu_li >= (int) tape_gpu->layers.size()) {
-            LLAMA_LOG_ERROR(
-                "%s: seq %d layer %zu has invalid GPU tape index %d/%zu\n",
-                __func__, seq_id, li, gpu_li, tape_gpu->layers.size());
-            return false;
-        }
-        const auto & src = tape_gpu->layers[gpu_li];
-        const ggml_tensor * src_qkv =
-            packed_device ? src.minimal_qkv : src.qkv;
-        const ggml_tensor * src_gate =
-            packed_device ? src.minimal_gate : src.gate;
-        const ggml_tensor * src_beta =
-            packed_device ? src.minimal_beta : src.beta;
-        const bool qkv_device = src_qkv && !window.ownership_only;
-        const auto & host = cap.tape_layers[li];
-        const int seq_axis = qkv_device
-            ? -1
-            : dflash_window_tape_seq_axis(host, seq_id);
-        const int source_tokens = qkv_device
-            ? (int) src_qkv->ne[1]
-            : host.n_tokens;
-        if (source_token < 0 || source_token >= source_tokens) {
-            LLAMA_LOG_ERROR(
-                "%s: seq %d layer %zu source token %d outside staged tape length %d\n",
-                __func__, seq_id, li, source_token, source_tokens);
-            return false;
-        }
-        if (!qkv_device && seq_axis < 0) {
-            LLAMA_LOG_ERROR(
-                "%s: seq %d layer %zu absent from packed host QKV\n",
-                __func__, seq_id, li);
-            return false;
-        }
-        if (!qkv_device && (host.conv_channels <= 0 ||
-            host.qkv_mixed.size() !=
-                (size_t) host.conv_channels * host.n_tokens * host.n_seqs)) {
-            LLAMA_LOG_ERROR(
-                "%s: layer %zu invalid packed QKV geometry "
-                "(channels=%" PRId64 ", tokens=%d, seqs=%d, floats=%zu)\n",
-                __func__, li, host.conv_channels, host.n_tokens,
-                host.n_seqs, host.qkv_mixed.size());
-            return false;
-        }
-        const int64_t conv_channels =
-            qkv_device ? src_qkv->ne[0] : host.conv_channels;
-        if (dst.qkv->ne[0] != conv_channels ||
-            !src_gate || !src_beta ||
-            dst.gate->ne[0] != src_gate->ne[1] ||
-            dst.beta->ne[0] != src_beta->ne[1]) {
-            LLAMA_LOG_ERROR(
-                "%s: seq %d layer %zu ring/fixed-tape dimensions disagree\n",
-                __func__, seq_id, li);
-            return false;
-        }
-    }
-
-    ggml_context * copy_ctx = nullptr;
-    ggml_tensor * approximate_record_src = nullptr;
-    ggml_tensor * approximate_record_dst = nullptr;
-    if (!window.ownership_only) {
-        // Allocate every host descriptor before a full ring may advance. If the
-        // advance or copy then fails, the pending descriptor continues to own
-        // the fixed tape and blocks another decode from overwriting it.
-        const size_t copy_ctx_mem =
-            ggml_tensor_overhead() * (window.layers.size() * 6 + 6);
-        ggml_init_params copy_params = { copy_ctx_mem, nullptr, true };
-        copy_ctx = ggml_init(copy_params);
-        if (!copy_ctx) {
-            LLAMA_LOG_ERROR("%s: could not allocate copy descriptors for seq %d\n",
-                __func__, seq_id);
-            return false;
-        }
-    }
-
-    const int prospective_slot =
-        window.count == window.capacity
-            ? window.head
-            : (window.head + window.count) % window.capacity;
-    if (packed_device && window.record_type == GGML_TYPE_F16) {
-        // Encode into a detached one-record buffer before a full ring advances.
-        // Allocation/codec failure therefore cannot retire a good boundary or
-        // consume the record needed to construct its successor.
-        if (!window.append_packed ||
-            !dflash_window_convert_records(
-                ctx, window, tape_gpu->minimal_packed, source_token,
-                window.append_packed, 0, 1)) {
-            ggml_free(copy_ctx);
-            return false;
-        }
-        approximate_record_src = ggml_view_1d(
-            copy_ctx, window.append_packed, window.record_floats, 0);
-        approximate_record_dst = ggml_view_1d(
-            copy_ctx, window.record_packed, window.record_floats,
-            (size_t) prospective_slot * window.record_packed->nb[1]);
-        approximate_record_src->buffer = window.append_packed->buffer;
-        approximate_record_dst->buffer = window.record_packed->buffer;
-    }
-
-    if (window.count == window.capacity) {
-        // Tensor-split Gate-4 mode is intentionally an ownership/transfer
-        // trace, not a claim that the CPU arithmetic can publish an exact
-        // replacement for the cross-device forward state.
-        if (window.ownership_only ||
-            !dflash_window_advance_boundary(
-                ctx, window, window.advance_batch)) {
-            LLAMA_LOG_ERROR(
-                "%s: seq %d could not advance its full rolling window "
-                "(ownership_only=%d)\n",
-                __func__, seq_id, window.ownership_only ? 1 : 0);
-            if (copy_ctx) {
-                ggml_free(copy_ctx);
-            }
-            return false;
-        }
-    }
-
-    const int slot = (window.head + window.count) % window.capacity;
-    GGML_ASSERT(slot == prospective_slot);
-    if (approximate_record_src) {
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend,
-            approximate_record_src, approximate_record_dst);
-    } else if (packed_device) {
-        ggml_tensor * record_src = ggml_view_1d(
-            copy_ctx, tape_gpu->minimal_packed,
-            tape_gpu->minimal_record_floats,
-            (size_t) source_token * tape_gpu->minimal_packed->nb[1]);
-        ggml_tensor * record_dst = ggml_view_1d(
-            copy_ctx, window.record_packed,
-            window.record_floats,
-            (size_t) slot * window.record_packed->nb[1]);
-        record_src->buffer = tape_gpu->minimal_packed->buffer;
-        record_dst->buffer = window.record_packed->buffer;
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend, record_src, record_dst);
-    } else if (!packed_device) {
-        for (size_t li = 0; li < window.layers.size(); ++li) {
-            auto & src = tape_gpu->layers[window.gpu_layer_indices[li]];
-            auto & dst = window.layers[li];
-            const auto & host = cap.tape_layers[li];
-            const bool qkv_device = src.qkv && !window.ownership_only;
-            if (qkv_device) {
-                ggml_tensor * qkv_src = ggml_view_1d(
-                    copy_ctx, src.qkv, src.qkv->ne[0],
-                    (size_t) source_token * src.qkv->nb[1]);
-                ggml_tensor * qkv_dst = ggml_view_1d(
-                    copy_ctx, dst.qkv, dst.qkv->ne[0],
-                    (size_t) slot * dst.qkv->nb[1]);
-                qkv_src->buffer = src.qkv->buffer;
-                qkv_dst->buffer = dst.qkv->buffer;
-                ggml_backend_tensor_copy_async(
-                    gpu_backend, gpu_backend, qkv_src, qkv_dst);
-            } else {
-                const int seq_axis = dflash_window_tape_seq_axis(host, seq_id);
-                const size_t qkv_elem_offset =
-                    ((size_t) seq_axis * host.n_tokens + source_token) *
-                    (size_t) host.conv_channels;
-                const size_t qkv_bytes =
-                    (size_t) host.conv_channels * sizeof(float);
-                ggml_backend_tensor_set(
-                    dst.qkv, host.qkv_mixed.data() + qkv_elem_offset,
-                    (size_t) slot * dst.qkv->nb[1], qkv_bytes);
-            }
-
-            const int64_t H_v = dst.gate->ne[0];
-            const size_t source_offset = (size_t) source_token * src.gate->nb[2];
-            if (window.ownership_only) {
-                std::vector<float> transfer((size_t) H_v);
-                ggml_backend_tensor_get(
-                    src.gate, transfer.data(), source_offset,
-                    (size_t) H_v * sizeof(float));
-                ggml_backend_tensor_set(
-                    dst.gate, transfer.data(), (size_t) slot * dst.gate->nb[1],
-                    (size_t) H_v * sizeof(float));
-                ggml_backend_tensor_get(
-                    src.beta, transfer.data(), source_offset,
-                    (size_t) H_v * sizeof(float));
-                ggml_backend_tensor_set(
-                    dst.beta, transfer.data(), (size_t) slot * dst.beta->nb[1],
-                    (size_t) H_v * sizeof(float));
-            } else {
-                ggml_tensor * gate_src = ggml_view_1d(
-                    copy_ctx, src.gate, H_v, source_offset);
-                ggml_tensor * beta_src = ggml_view_1d(
-                    copy_ctx, src.beta, H_v, source_offset);
-                ggml_tensor * gate_dst = ggml_view_1d(
-                    copy_ctx, dst.gate, H_v, (size_t) slot * dst.gate->nb[1]);
-                ggml_tensor * beta_dst = ggml_view_1d(
-                    copy_ctx, dst.beta, H_v, (size_t) slot * dst.beta->nb[1]);
-                gate_src->buffer = src.gate->buffer;
-                beta_src->buffer = src.beta->buffer;
-                gate_dst->buffer = dst.gate->buffer;
-                beta_dst->buffer = dst.beta->buffer;
-                ggml_backend_tensor_copy_async(
-                    gpu_backend, gpu_backend, gate_src, gate_dst);
-                ggml_backend_tensor_copy_async(
-                    gpu_backend, gpu_backend, beta_src, beta_dst);
-            }
-        }
-    }
-    if (copy_ctx) {
-        ggml_free(copy_ctx);
-    }
-    if (!window.ownership_only) {
-        // One fence publishes every layer of this record atomically. The old
-        // blocking copy API fenced each qkv/gate/beta tensor separately.
-        ggml_backend_synchronize(gpu_backend);
-    }
-    if (packed_device) {
-        window.packed_record_copies++;
-    }
-
-    // Publish the payload's absolute identity only after all layer copies fence.
-    window.records[slot] = { pos, seq_id, true };
-    window.count++;
-    window.frontier_pos = pos;
-    if (profile_start) {
-        window.profile_append_us +=
-            (uint64_t) (ggml_time_us() - profile_start);
-        window.profile_append_calls++;
-    }
-    return true;
-}
-
-bool llama_context::dflash_window_stage_decode(
-        dflash_window_pending && staged,
-        bool speculative) {
-    if (!dflash_capture || staged.seqs.empty() ||
-        dflash_capture->window_pending.active) {
-        return false;
-    }
-
-    // Take ownership before validating the publication target. Decode already
-    // mutated the live recurrent state, so every post-decode failure must leave
-    // an explicit pending transaction that blocks the next decode and can be
-    // discarded fail-closed. Dropping `staged` on an invariant failure would
-    // make capture_pending() lie while the ring silently lagged the frontier.
-    staged.active = true;
-    staged.speculative = speculative;
-    auto & pending = dflash_capture->window_pending;
-    pending = std::move(staged);
-
-    for (const auto & seq : pending.seqs) {
-        auto * window = dflash_window_for_seq(seq.seq_id);
-        if (!window || !window->enabled || seq.positions.empty()) {
-            return false;
-        }
-    }
-
-    if (!speculative) {
-        for (auto & seq : pending.seqs) {
-            seq.commit_count = (int) seq.positions.size();
-        }
-        return dflash_window_retry_capture();
-    }
-    return true;
-}
-
-bool llama_context::dflash_window_commit(
-        llama_seq_id seq_id,
-        int          n_accepted) {
-    if (!dflash_capture || !dflash_capture->window_pending.active ||
-        !dflash_capture->window_pending.speculative) {
-        return false;
-    }
-    for (auto & seq : dflash_capture->window_pending.seqs) {
-        if (seq.seq_id != seq_id) {
-            continue;
-        }
-        if (seq.commit_count >= 0 ||
-            n_accepted < 0 || n_accepted > (int) seq.positions.size()) {
-            return false;
-        }
-        seq.commit_count = n_accepted;
-        return dflash_window_retry_capture();
-    }
-    return false;
-}
-
-bool llama_context::dflash_window_retry_capture() {
-    if (!dflash_capture) {
-        return false;
-    }
-    auto & pending = dflash_capture->window_pending;
-    if (!pending.active) {
-        return true;
-    }
-
-    const bool direct_single_device = std::all_of(
-        pending.seqs.begin(), pending.seqs.end(),
-        [this](const dflash_window_pending_seq & seq) {
-            const auto * window = dflash_window_for_seq(seq.seq_id);
-            return window && !window->ownership_only &&
-                   seq.seq_id >= 0 &&
-                   seq.seq_id < (llama_seq_id) dflash_capture->tapes.size() &&
-                   dflash_capture->tapes[seq.seq_id] &&
-                   dflash_capture->tapes[seq.seq_id]->qkv_staged();
-        });
-    if (!direct_single_device) {
-        // Host materialization and tensor-split ownership transfer read the
-        // completed decode payload immediately.
-        synchronize();
-    }
-    // On one GPU, the fixed-tape graph writes and append_staged()'s D2D copies
-    // use the same backend stream. The append transaction's final fence orders
-    // both, so a separate pre-copy pipeline drain is redundant.
-    if (!dflash_window_materialize_qkv(this, pending)) {
-        LLAMA_LOG_ERROR(
-            "%s: failed to materialize packed QKV for %zu pending owner(s)\n",
-            __func__, pending.seqs.size());
-        return false;
-    }
-    for (auto & seq : pending.seqs) {
-        if (seq.commit_count < 0) {
-            continue; // speculative owner has not supplied its decision yet
-        }
-        auto * window = dflash_window_for_seq(seq.seq_id);
-        if (!window) {
-            LLAMA_LOG_ERROR("%s: pending seq %d has no rolling window\n",
-                __func__, seq.seq_id);
-            return false;
-        }
-        while (seq.copied_count < seq.commit_count) {
-            const int source_token = seq.copied_count;
-            bool appended = false;
-            try {
-                appended = dflash_window_append_staged(
-                    this, *window, seq.positions[source_token], source_token,
-                    pending.minimal_packed);
-            } catch (const std::exception & err) {
-                LLAMA_LOG_WARN("%s: staged window copy failed: %s\n",
-                    __func__, err.what());
-            }
-            if (!appended) {
-                LLAMA_LOG_ERROR(
-                    "%s: failed to append seq %d token %d/%d at pos %d; "
-                    "pending capture retained\n",
-                    __func__, seq.seq_id, source_token,
-                    seq.commit_count, seq.positions[source_token]);
-                return false;
-            }
-            seq.copied_count++;
-        }
-    }
-
-    const bool complete = std::all_of(
-        pending.seqs.begin(), pending.seqs.end(),
-        [](const dflash_window_pending_seq & seq) {
-            return seq.commit_count >= 0 &&
-                   seq.copied_count == seq.commit_count;
-        });
-    if (complete) {
-        pending.clear(); // rejected suffixes were never copied
-    }
-    return true;
-}
-
-void llama_context::dflash_window_inject_publish_failure(llama_seq_id seq_id) {
-    if (auto * window = dflash_window_for_seq(seq_id)) {
-        window->fail_publish_once = true;
-    }
-}
-
-bool llama_context::dflash_window_reconstruct(
-        llama_seq_id seq_id,
-        llama_pos    pos) {
-    auto * window_ptr = dflash_window_for_seq(seq_id);
-    if (!window_ptr) {
-        return false;
-    }
-    auto & window = *window_ptr;
-    if (!window.enabled || window.ownership_only ||
-        (dflash_capture->window_pending.active &&
-         std::any_of(
-             dflash_capture->window_pending.seqs.begin(),
-             dflash_capture->window_pending.seqs.end(),
-             [seq_id](const dflash_window_pending_seq & seq) {
-                 return seq.seq_id == seq_id;
-             })) ||
-        pos < window.boundary_pos || pos > window.frontier_pos) {
-        return false;
-    }
-
-    const int private_idx = 1 - window.published_idx;
-    if (!dflash_window_copy_boundary(
-            this, window, window.published_idx, private_idx)) {
-        return false;
-    }
-
-    llama_pos expected = window.boundary_pos + 1;
-    int logical = 0;
-    bool applied_records = false;
-    while (logical < window.count && expected <= pos) {
-        const int slot = (window.head + logical) % window.capacity;
-        const int needed = (int) std::min<llama_pos>(
-            window.count - logical, pos - expected + 1);
-        int segment = std::min(needed, window.capacity - slot);
-        if (window.record_type == GGML_TYPE_F16) {
-            segment = std::min(segment, window.advance_batch);
-        }
-        for (int i = 0; i < segment; ++i) {
-            const auto & record = window.records[slot + i];
-            if (!record.valid ||
-                record.seq_id != window.seq_id ||
-                record.pos != expected + i) {
-                return false;
-            }
-        }
-        if (window.record_type == GGML_TYPE_F16) {
-            if (!dflash_window_convert_records(
-                    this, window, window.record_packed, slot,
-                    window.advance_packed, 0, segment) ||
-                !dflash_window_apply_records(
-                    this, window, 0, segment, private_idx,
-                    /*stable_advance=*/false,
-                    /*staged_records=*/true)) {
-                return false;
-            }
-        } else {
-            if (!dflash_window_apply_records(
-                    this, window, slot, segment, private_idx)) {
-                return false;
-            }
-        }
-        applied_records = true;
-        logical += segment;
-        expected += segment;
-    }
-    if (expected != pos + 1) {
-        return false;
-    }
-    if (!applied_records) {
-        // No replay graph supplied the transaction fence for a boundary-only
-        // reconstruction. Preserve reconstruct()'s completed-on-return API.
-        ggml_backend_synchronize(find_gpu_backend());
-    }
-
-    window.reconstructed_idx = private_idx;
-    window.reconstructed_pos = pos;
-    return true;
-}
-
-bool llama_context::dflash_window_install_reconstructed(
-        llama_seq_id seq_id,
-        llama_pos    pos) {
-    auto * window_ptr = dflash_window_for_seq(seq_id);
-    auto * mem_recurrent = get_recurrent_mem(memory.get());
-    if (!window_ptr || !mem_recurrent) {
-        return false;
-    }
-    auto & window = *window_ptr;
-    if (!window.enabled || window.ownership_only ||
-        mem_recurrent->n_rs_seq != 0 ||
-        window.reconstructed_idx < 0 ||
-        window.reconstructed_idx == window.published_idx ||
-        window.reconstructed_pos != pos ||
-        seq_id < 0 || (uint32_t) seq_id >= mem_recurrent->size) {
-        return false;
-    }
-
-    const int32_t tail = mem_recurrent->cells[seq_id].tail;
-    if (tail < 0) {
-        return false;
-    }
-    const auto & cell = mem_recurrent->cells[tail];
-    if (cell.seq_id.size() != 1 || !cell.has_seq_id(seq_id)) {
-        // Installing in-place into a shared recurrent row would mutate another
-        // sequence's frontier. Product coordination must detach it first.
-        return false;
-    }
-    const uint32_t base_row =
-        cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail;
-    const int private_idx = window.reconstructed_idx;
-    ggml_backend_t gpu_backend = find_gpu_backend();
-    if (!gpu_backend) {
-        return false;
-    }
-
-    // The private copy is complete and fenced by reconstruct(). Create only
-    // descriptors for the live row; all state copies are allocation-free D2D.
-    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> copies;
-    try {
-        copies.reserve(window.layers.size() * 2);
-    } catch (const std::exception &) {
-        return false;
-    }
-    const size_t ctx_mem =
-        ggml_tensor_overhead() * (window.layers.size() * 2 + 2);
-    ggml_init_params params = { ctx_mem, nullptr, true };
-    ggml_context * copy_ctx = ggml_init(params);
-    if (!copy_ctx) {
-        return false;
-    }
-
-    for (size_t li = 0; li < window.layers.size(); ++li) {
-        const int il = window.layer_ids[li];
-        ggml_tensor * r_live = mem_recurrent->r_l[il];
-        ggml_tensor * s_live = mem_recurrent->s_l[il];
-        if (!r_live || !s_live) {
-            ggml_free(copy_ctx);
-            return false;
-        }
-        ggml_tensor * r_dst = ggml_view_1d(
-            copy_ctx, r_live, r_live->ne[0],
-            (size_t) base_row * r_live->nb[1]);
-        ggml_tensor * s_dst = ggml_view_1d(
-            copy_ctx, s_live, s_live->ne[0],
-            (size_t) base_row * s_live->nb[1]);
-        r_dst->buffer = r_live->buffer;
-        s_dst->buffer = s_live->buffer;
-        copies.emplace_back(window.layers[li].r[private_idx], r_dst);
-        copies.emplace_back(window.layers[li].s[private_idx], s_dst);
-    }
-    for (const auto & copy : copies) {
-        ggml_backend_tensor_copy_async(
-            gpu_backend, gpu_backend, copy.first, copy.second);
-    }
-
-    ggml_free(copy_ctx);
-    ggml_backend_synchronize(gpu_backend);
-
-    // Publish metadata only after every layer's R/S copy is device-visible.
-    mem_recurrent->reset_rollback_state(seq_id);
-    mem_recurrent->cells[tail].pos = pos;
-    return true;
-}
-
-bool llama_context::dflash_window_restore_seq(
-        llama_seq_id seq_id,
-        llama_pos    pos,
-        llama_pos    attention_p0) {
-    if (attention_p0 != pos + 1 ||
-        !dflash_window_reconstruct(seq_id, pos)) {
-        return false;
-    }
-
-    // Reconstruct is private and fenced. Only after it succeeds may the live
-    // attention timeline be trimmed. If the subsequent recurrent install
-    // fails, the caller must full-clear/reprocess rather than continue from
-    // the now-shorter attention timeline.
-    if (!memory->seq_rm_attn(seq_id, attention_p0, -1)) {
-        return false;
-    }
-
-    return dflash_window_install_reconstructed(seq_id, pos);
-}
-
-bool llama_context::dflash_window_commit_branch(
-        llama_seq_id seq_id,
-        llama_pos    pos) {
-    auto * window_ptr = dflash_window_for_seq(seq_id);
-    if (!window_ptr || !window_ptr->enabled ||
-        window_ptr->ownership_only ||
-        window_ptr->reconstructed_idx < 0 ||
-        window_ptr->reconstructed_pos != pos ||
-        (dflash_capture->window_pending.active &&
-         std::any_of(
-             dflash_capture->window_pending.seqs.begin(),
-             dflash_capture->window_pending.seqs.end(),
-             [seq_id](const dflash_window_pending_seq & seq) {
-                 return seq.seq_id == seq_id;
-             }))) {
-        return false;
-    }
-
-    auto & window = *window_ptr;
-    // restore_seq fenced the private state before installing the identical
-    // bytes into the live row. Publishing this copy is therefore a metadata
-    // transaction; the old boundary stays in the other copy until commit.
-    window.published_idx = window.reconstructed_idx;
-    window.boundary_pos = pos;
-    window.frontier_pos = pos;
-    window.head = 0;
-    window.count = 0;
-    for (auto & record : window.records) {
-        record = {};
-    }
-    window.reconstructed_idx = -1;
-    window.reconstructed_pos = -1;
-    window.last_publish_failed = false;
-    return true;
 }
 
 static bool dflash_prepare_staged_qkv_replay(
@@ -4175,12 +2049,9 @@ static bool dflash_prepare_staged_qkv_replay(
     try {
         for (size_t li = 0; li < tape_gpu->layers.size(); ++li) {
             const auto & layer = tape_gpu->layers[li];
-            const ggml_tensor * qkv = cap.tape_stage_minimal_packed
-                ? layer.minimal_qkv
-                : layer.qkv;
-            const size_t expected_stride = cap.tape_stage_minimal_packed
-                ? (size_t) tape_gpu->minimal_record_floats * sizeof(float)
-                : qkv ? (size_t) qkv->ne[0] * sizeof(float) : 0;
+            const ggml_tensor * qkv = layer.qkv;
+            const size_t expected_stride =
+                qkv ? (size_t) qkv->ne[0] * sizeof(float) : 0;
             if (!qkv || qkv->type != GGML_TYPE_F32 ||
                 qkv->ne[0] <= 0 || qkv->ne[1] < n_recorded ||
                 qkv->nb[1] != expected_stride) {
@@ -4390,7 +2261,6 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     if (!tape_replay_sync()) {
         return false;
     }
-    dflash_capture->replay_minimal_last = false;
 
     if (dflash_capture->tape_layers.empty()) {
         return false;
@@ -4422,14 +2292,6 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     dflash_tape_gpu * replay_tape = nullptr;
     if (seq_id >= 0 && seq_id < (llama_seq_id) dflash_capture->tapes.size()) {
         replay_tape = dflash_capture->tapes[seq_id].get();
-    }
-    if (dflash_capture->tape_stage_minimal_packed &&
-        !dflash_capture->tape_minimal_replay) {
-        LLAMA_LOG_ERROR(
-            "%s: seq %d was captured without redundant K/V; "
-            "minimal replay is required\n",
-            __func__, seq_id);
-        return false;
     }
     if (!dflash_prepare_staged_qkv_replay(
             *dflash_capture, replay_tape, seq_id, n_accepted)) {
@@ -4490,11 +2352,8 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     if (n_rec == 0) goto conv_rebuild;
 
     {
-        // Minimal replay adds qkv upload/view + conv-state view + transpose/concat +
-        // SSM_CONV/SILU + K/V split + L2 normalization before the existing GDN tail.
-        const bool minimal_requested = dflash_capture->tape_minimal_replay;
-        const size_t tensors_per_layer = minimal_requested ? 38 : 14;
-        const size_t nodes_per_layer   = minimal_requested ? 34 : 12;
+        const size_t tensors_per_layer = 14;
+        const size_t nodes_per_layer   = 12;
         size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * tensors_per_layer + 8) +
                          ggml_graph_overhead_custom(n_rec * nodes_per_layer, false);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
@@ -4508,11 +2367,8 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             ggml_tensor * v;
             ggml_tensor * g;
             ggml_tensor * b;
-            ggml_tensor * qkv;
             size_t tape_li;
-            size_t qkv_host_offset;
             bool gpu_tape; // k/v/g/b are views into GPU tape (skip CPU upload)
-            bool qkv_host; // qkv is a replay input populated from the host minimal record
         };
         std::vector<replay_input> inputs;
         inputs.reserve(n_rec);
@@ -4520,107 +2376,6 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         // look up GPU tape for this seq_id (graph-embedded copies wrote k/v/g/b here)
         dflash_tape_gpu * tgpu = replay_tape;
 
-        // Fail the prototype mode closed as one unit: never mix reconstructed and
-        // redundant layers in a replay advertised as minimal. Reconstructing on this
-        // direct-backend path also requires every conv weight and R-state row on the
-        // same device as the replay backend.
-        bool use_minimal = minimal_requested && tgpu != nullptr;
-        if (use_minimal) {
-            const ggml_backend_dev_t replay_dev = ggml_backend_get_device(gpu_backend);
-            for (int li = 0; li < n_rec && use_minimal; ++li) {
-                const int il = rec_ids[li];
-                auto & tape = tape_layers[li];
-
-                int gpu_li = -1;
-                for (int i = 0; i < (int) tgpu->layer_ids.size(); ++i) {
-                    if (tgpu->layer_ids[i] == il) {
-                        gpu_li = i;
-                        break;
-                    }
-                }
-
-                ggml_tensor * r_tensor = mem_recurrent->r_l[il];
-                ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
-                auto tensor_device = [](const ggml_tensor * t) -> ggml_backend_dev_t {
-                    if (!t || !t->buffer) {
-                        return nullptr;
-                    }
-                    auto * buft = ggml_backend_buffer_get_type(t->buffer);
-                    return buft ? ggml_backend_buft_get_device(buft) : nullptr;
-                };
-
-                if (gpu_li < 0 || tape.n_tokens <= 0 || n_accepted > tape.n_tokens ||
-                    !r_tensor || !conv_kernel ||
-                    tensor_device(r_tensor) != replay_dev ||
-                    tensor_device(conv_kernel) != replay_dev) {
-                    use_minimal = false;
-                    break;
-                }
-
-                auto & tl = tgpu->layers[gpu_li];
-                const int64_t S = tl.k->ne[0];
-                const int64_t H_k = tl.k->ne[1];
-                const int64_t H_v = tl.v->ne[1];
-                ggml_tensor * staged_qkv =
-                    dflash_capture->tape_stage_minimal_packed
-                        ? tl.minimal_qkv
-                        : tl.qkv;
-                ggml_tensor * staged_gate =
-                    dflash_capture->tape_stage_minimal_packed
-                        ? tl.minimal_gate
-                        : tl.gate;
-                ggml_tensor * staged_beta =
-                    dflash_capture->tape_stage_minimal_packed
-                        ? tl.minimal_beta
-                        : tl.beta;
-                const int64_t conv_channels = tape.conv_channels > 0
-                    ? tape.conv_channels
-                    : (staged_qkv ? staged_qkv->ne[0] : 0);
-                if (r_tensor->type != GGML_TYPE_F32 ||
-                    !staged_gate || !staged_beta ||
-                    conv_kernel->type != GGML_TYPE_F32 ||
-                    conv_kernel->ne[0] <= 1 ||
-                    conv_channels != 2 * S * H_k + S * H_v ||
-                    (conv_kernel->ne[0] - 1) * conv_channels != (int64_t) hparams.n_embd_r()) {
-                    use_minimal = false;
-                    break;
-                }
-
-                if (staged_qkv == nullptr) {
-                    size_t qkv_seq_offset = 0;
-                    bool found = tape.n_seqs <= 1;
-                    if (tape.n_seqs > 1) {
-                        for (int s = 0; s < tape.n_seqs; ++s) {
-                            if (tape.seq_ids[s] == seq_id) {
-                                found = true;
-                                break;
-                            }
-                            qkv_seq_offset += (size_t) tape.n_tokens * (size_t) tape.conv_channels;
-                        }
-                    }
-                    const size_t qkv_elems = (size_t) tape.n_tokens * (size_t) tape.conv_channels;
-                    if (!found || tape.conv_channels <= 0 ||
-                        qkv_seq_offset + qkv_elems > tape.qkv_mixed.size()) {
-                        use_minimal = false;
-                    }
-                } else if (staged_qkv->type != GGML_TYPE_F32 ||
-                           staged_qkv->ne[0] != conv_channels ||
-                           staged_qkv->ne[1] < tape.n_tokens) {
-                    use_minimal = false;
-                }
-            }
-            if (!use_minimal) {
-                if (dflash_capture->tape_stage_minimal_packed) {
-                    LLAMA_LOG_ERROR(
-                        "%s: packed minimal capture is not reconstructable; "
-                        "redundant K/V were not recorded\n",
-                        __func__);
-                    ggml_free(ctx);
-                    return false;
-                }
-                LLAMA_LOG_WARN("%s: minimal-F32 reconstruction unavailable; using redundant K/V tape\n", __func__);
-            }
-        }
 
         for (int li = 0; li < n_rec; ++li) {
             int il = rec_ids[li];
@@ -4638,98 +2393,24 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             int64_t S, H_k, H_v;
             ggml_tensor * k_in, * v_in, * g_in, * b_in;
-            ggml_tensor * qkv_in = nullptr;
-            size_t qkv_host_offset = 0;
-            bool qkv_host = false;
             bool use_gpu_tape = (gpu_li >= 0);
 
             if (use_gpu_tape) {
                 auto & tl = tgpu->layers[gpu_li];
-                const bool packed_inputs =
-                    use_minimal &&
-                    dflash_capture->tape_stage_minimal_packed;
-                ggml_tensor * staged_qkv =
-                    packed_inputs ? tl.minimal_qkv : tl.qkv;
-                ggml_tensor * staged_gate =
-                    packed_inputs ? tl.minimal_gate : tl.gate;
-                ggml_tensor * staged_beta =
-                    packed_inputs ? tl.minimal_beta : tl.beta;
                 S   = tl.k->ne[0];
                 H_k = tl.k->ne[1];
                 H_v = tl.v->ne[1];
-
-                if (use_minimal) {
-                    const int n_recorded = tape.n_tokens;
-                    const int64_t conv_channels = tape.conv_channels > 0
-                        ? tape.conv_channels
-                        : (staged_qkv ? staged_qkv->ne[0] : 0);
-                    ggml_tensor * conv_kernel = model.layers[il].ssm_conv1d;
-                    ggml_tensor * r_tensor = mem_recurrent->r_l[il];
-                    const int64_t conv_kernel_size = conv_kernel->ne[0];
-                    const int64_t conv_window = conv_kernel_size - 1;
-                    const int64_t n_embd_r = conv_window * conv_channels;
-                    const size_t r_esz = ggml_element_size(r_tensor);
-                    const size_t r_byte_offset = (size_t) cell_idx * n_embd_r * r_esz;
-
-                    GGML_ASSERT(conv_channels == 2 * S * H_k + S * H_v);
-                    GGML_ASSERT((int64_t) hparams.n_embd_r() == n_embd_r);
-
-                    ggml_tensor * r_view = ggml_view_3d(
-                        ctx, r_tensor, conv_window, conv_channels, (int64_t) 1,
-                        conv_window * r_esz, n_embd_r * r_esz, r_byte_offset);
-
-                    if (staged_qkv != nullptr) {
-                        qkv_in = ggml_view_2d(
-                            ctx, staged_qkv, conv_channels, n_recorded,
-                            staged_qkv->nb[1], 0);
-                    } else {
-                        qkv_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_channels, n_recorded);
-                        ggml_set_input(qkv_in);
-                        qkv_host = true;
-                        if (tape.n_seqs > 1) {
-                            for (int s = 0; s < tape.n_seqs; ++s) {
-                                if (tape.seq_ids[s] == seq_id) {
-                                    break;
-                                }
-                                qkv_host_offset += (size_t) n_recorded * (size_t) conv_channels;
-                            }
-                        }
-                    }
-
-                    // Rebuild the full captured verify length, not merely n_accepted.
-                    // This preserves the forward SSM_CONV kernel specialization/grid and
-                    // the L2_NORM grid/reduction shape; only then slice the accepted prefix.
-                    ggml_tensor * conv_input = ggml_concat(ctx, r_view, ggml_transpose(ctx, qkv_in), 0);
-                    ggml_tensor * conv_silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv_kernel));
-                    const int64_t conv_row = conv_channels * ggml_element_size(conv_silu);
-
-                    ggml_tensor * k_full = ggml_view_4d(
-                        ctx, conv_silu, S, H_k, n_recorded, (int64_t) 1,
-                        ggml_row_size(conv_silu->type, S), conv_row,
-                        conv_row * n_recorded, S * H_k * ggml_element_size(conv_silu));
-                    ggml_tensor * v_full = ggml_view_4d(
-                        ctx, conv_silu, S, H_v, n_recorded, (int64_t) 1,
-                        ggml_row_size(conv_silu->type, S), conv_row,
-                        conv_row * n_recorded, 2 * S * H_k * ggml_element_size(conv_silu));
-
-                    k_full = ggml_l2_norm(ctx, k_full, hparams.f_norm_rms_eps);
-                    k_in = ggml_view_3d(ctx, k_full, S, H_k, (int64_t) n_accepted,
-                                       k_full->nb[1], k_full->nb[2], 0);
-                    v_in = ggml_view_3d(ctx, v_full, S, H_v, (int64_t) n_accepted,
-                                       v_full->nb[1], v_full->nb[2], 0);
-                } else {
-                    // views into GPU tape buffers — already populated by graph-embedded copies
-                    k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
-                                        tl.k->nb[1], tl.k->nb[2], 0);
-                    v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
-                                        tl.v->nb[1], tl.v->nb[2], 0);
-                }
+                // views into GPU tape buffers — already populated by graph-embedded copies
+                k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
+                                    tl.k->nb[1], tl.k->nb[2], 0);
+                v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
+                                    tl.v->nb[1], tl.v->nb[2], 0);
                 g_in = ggml_view_3d(
-                    ctx, staged_gate, (int64_t) 1, H_v, (int64_t) n_accepted,
-                    staged_gate->nb[1], staged_gate->nb[2], 0);
+                    ctx, tl.gate, (int64_t) 1, H_v, (int64_t) n_accepted,
+                    tl.gate->nb[1], tl.gate->nb[2], 0);
                 b_in = ggml_view_3d(
-                    ctx, staged_beta, (int64_t) 1, H_v, (int64_t) n_accepted,
-                    staged_beta->nb[1], staged_beta->nb[2], 0);
+                    ctx, tl.beta, (int64_t) 1, H_v, (int64_t) n_accepted,
+                    tl.beta->nb[1], tl.beta->nb[2], 0);
             } else {
                 S   = tape.S_k;
                 H_k = tape.H_k;
@@ -4756,8 +2437,8 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 s_tensor, s_byte_offset, S, H_v, n_accepted);
 
             inputs.push_back({
-                q_in, k_in, v_in, g_in, b_in, qkv_in,
-                (size_t) li, qkv_host_offset, use_gpu_tape, qkv_host,
+                q_in, k_in, v_in, g_in, b_in,
+                (size_t) li, use_gpu_tape,
             });
         }
 
@@ -4796,7 +2477,7 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         if (!dflash_capture->replay_buf || allocation_failed) {
             // The hand-written CPU recurrence uses a different reduction order
             // and is not an exact substitute for the CUDA graph. Fail closed
-            // for both redundant and minimal records.
+            // for redundant records.
             LLAMA_LOG_ERROR(
                 "%s: failed to allocate exact GPU replay scratch; "
                 "state left at the restored boundary\n",
@@ -4843,15 +2524,6 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
                 ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
             }
-            if (inp.qkv_host) {
-                auto & tape = tape_layers[inp.tape_li];
-                const size_t qkv_elems = (size_t) tape.conv_channels * (size_t) tape.n_tokens;
-                ggml_backend_tensor_set(
-                    inp.qkv,
-                    tape.qkv_mixed.data() + inp.qkv_host_offset,
-                    0,
-                    qkv_elems * sizeof(float));
-            }
         }
 
         // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
@@ -4874,7 +2546,6 @@ bool llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         dflash_capture->replay_cell_idx = cell_idx;
         dflash_capture->replay_seq_id = seq_id;
         dflash_capture->replay_mem_recurrent = mem_recurrent;
-        dflash_capture->replay_minimal_last = use_minimal;
         return true; // conv rebuild deferred to tape_replay_sync()
     }
 
@@ -4969,10 +2640,7 @@ bool llama_context::tape_replay_sync() {
                 n_tok > 0 &&
                 tg->layers.size() == dflash_capture->tape_layers.size();
             for (size_t li = 0; gather_valid && li < tg->layers.size(); ++li) {
-                const ggml_tensor * qkv =
-                    dflash_capture->tape_stage_minimal_packed
-                        ? tg->layers[li].minimal_qkv
-                        : tg->layers[li].qkv;
+                const ggml_tensor * qkv = tg->layers[li].qkv;
                 const auto & host = dflash_capture->tape_layers[li];
                 gather_valid =
                     qkv && qkv->type == GGML_TYPE_F32 &&
@@ -4995,32 +2663,11 @@ bool llama_context::tape_replay_sync() {
                 return false;
             }
             for (size_t li = 0; li < tg->layers.size(); ++li) {
-                const ggml_tensor * qkv =
-                    dflash_capture->tape_stage_minimal_packed
-                        ? tg->layers[li].minimal_qkv
-                        : tg->layers[li].qkv;
+                const ggml_tensor * qkv = tg->layers[li].qkv;
                 auto & host = dflash_capture->tape_layers[li];
-                if (dflash_capture->tape_stage_minimal_packed) {
-                    const size_t row_bytes =
-                        (size_t) qkv->ne[0] * sizeof(float);
-                    for (int tok = 0; tok < n_tok; ++tok) {
-                        ggml_backend_tensor_get_async(
-                            dflash_capture->replay_gpu_backend,
-                            qkv,
-                            host.qkv_mixed.data() +
-                                (size_t) tok * (size_t) qkv->ne[0],
-                            (size_t) tok * qkv->nb[1],
-                            row_bytes);
-                    }
-                } else {
-                    ggml_backend_tensor_get(
-                        qkv, host.qkv_mixed.data(), 0,
-                        host.qkv_mixed.size() * sizeof(float));
-                }
-            }
-            if (dflash_capture->tape_stage_minimal_packed) {
-                ggml_backend_synchronize(
-                    dflash_capture->replay_gpu_backend);
+                ggml_backend_tensor_get(
+                    qkv, host.qkv_mixed.data(), 0,
+                    host.qkv_mixed.size() * sizeof(float));
             }
         } else if (dflash_capture->replay_tape_n_tokens != 0) {
             LLAMA_LOG_ERROR(
@@ -6364,183 +4011,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
-    // Rolling-window capture owns the fixed tape until every normal record has
-    // been copied, or every speculative sequence has supplied its accepted
-    // prefix. No later decode may overwrite an unresolved payload.
-    bool window_capture = false;
-    bool window_speculative = false;
-    std::vector<dflash_window_pending_seq> window_seqs;
-    if (dflash_capture) {
-        const bool any_window = std::any_of(
-            dflash_capture->windows.begin(), dflash_capture->windows.end(),
-            [](const std::unique_ptr<dflash_window> & window) {
-                return window && window->enabled;
-            });
-        if (dflash_capture->window_pending.active) {
-            LLAMA_LOG_ERROR("%s: rolling-window capture is pending; retry before decoding\n", __func__);
-            return -1;
-        }
-        dflash_capture->window_staging.clear();
-        if (any_window) {
-            // Gate-4's bounded path requires one owner per token and one equal
-            // contiguous run per enabled sequence. Recurrent memory may still
-            // split owners into separate ubatches; decode-scoped QKV staging
-            // accumulates those callbacks by absolute sequence ownership.
-            for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-                const int n_seq_id = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
-                const llama_seq_id seq_id =
-                    batch_inp.seq_id ? batch_inp.seq_id[i][0] : 0;
-                auto * window = dflash_window_for_seq(seq_id);
-                if (n_seq_id != 1 || !window || !window->enabled) {
-                    LLAMA_LOG_ERROR(
-                        "%s: windowed batch token %d has no unique enabled owner "
-                        "(n_seq_id=%d, seq=%d)\n",
-                        __func__, i, n_seq_id, seq_id);
-                    return -1;
-                }
-                auto it = std::find_if(
-                    window_seqs.begin(), window_seqs.end(),
-                    [seq_id](const dflash_window_pending_seq & seq) {
-                        return seq.seq_id == seq_id;
-                    });
-                if (it == window_seqs.end()) {
-                    window_seqs.push_back({ seq_id, {}, -1, 0 });
-                    it = std::prev(window_seqs.end());
-                }
-                const llama_pos pos = batch_inp.pos
-                    ? batch_inp.pos[i]
-                    : window->frontier_pos + (llama_pos) it->positions.size() + 1;
-                const llama_pos expected =
-                    window->frontier_pos + (llama_pos) it->positions.size() + 1;
-                if (pos != expected) {
-                    LLAMA_LOG_ERROR(
-                        "%s: non-contiguous window position for seq %d "
-                        "(got %d, expected %d)\n",
-                        __func__, seq_id, pos, expected);
-                    return -1;
-                }
-                it->positions.push_back(pos);
-            }
-
-            const size_t n_seq_tokens = window_seqs.empty()
-                ? 0 : window_seqs.front().positions.size();
-            const bool equal_runs = n_seq_tokens > 0 &&
-                std::all_of(
-                    window_seqs.begin(), window_seqs.end(),
-                    [n_seq_tokens](const dflash_window_pending_seq & seq) {
-                        return seq.positions.size() == n_seq_tokens;
-                    });
-            const dflash_tape_gpu * tape = window_seqs.empty()
-                ? nullptr
-                : dflash_capture->tapes[window_seqs.front().seq_id].get();
-            if (!equal_runs || !tape ||
-                n_seq_tokens > (size_t) tape->max_tokens ||
-                batch_inp.n_tokens > (int32_t) cparams.n_ubatch) {
-                LLAMA_LOG_ERROR(
-                    "%s: windowed decode must fit one equal-sequence tape ubatch "
-                    "(tokens=%d, per_seq=%zu, ubatch=%u)\n",
-                    __func__, batch_inp.n_tokens, n_seq_tokens, cparams.n_ubatch);
-                return -1;
-            }
-
-            bool any_qkv_staged = false;
-            bool all_qkv_staged = true;
-            for (const auto & seq : window_seqs) {
-                const bool staged =
-                    dflash_capture->tapes[seq.seq_id]->qkv_staged();
-                any_qkv_staged |= staged;
-                all_qkv_staged &= staged;
-            }
-            if (any_qkv_staged != all_qkv_staged) {
-                LLAMA_LOG_ERROR(
-                    "%s: windowed batch mixes callback and graph-staged QKV owners\n",
-                    __func__);
-                return -1;
-            }
-
-            dflash_window_pending staged;
-            staged.active = true;
-            staged.seqs = std::move(window_seqs);
-            staged.minimal_packed =
-                cparams.tape_minimal_capture &&
-                std::all_of(
-                    staged.seqs.begin(), staged.seqs.end(),
-                    [this](const dflash_window_pending_seq & seq) {
-                        const auto & tape = dflash_capture->tapes[seq.seq_id];
-                        return tape && tape->minimal_packed &&
-                            tape->minimal_record_floats > 0 &&
-                            std::all_of(
-                                tape->layers.begin(), tape->layers.end(),
-                                [](const dflash_tape_gpu_layer & layer) {
-                                    return layer.minimal_qkv &&
-                                           layer.minimal_gate &&
-                                           layer.minimal_beta;
-                                });
-                    });
-            if (!all_qkv_staged) {
-                const int64_t conv_window =
-                    (int64_t) model.hparams.ssm_d_conv - 1;
-                const int64_t conv_channels = conv_window > 0
-                    ? (int64_t) model.hparams.n_embd_r() / conv_window
-                    : 0;
-                if (conv_channels <= 0 ||
-                    dflash_capture->tape_layers.empty() ||
-                    staged.seqs.size() > LLAMA_DFLASH_MAX_SLOTS) {
-                    LLAMA_LOG_ERROR(
-                        "%s: cannot size decode-scoped callback QKV staging\n",
-                        __func__);
-                    return -1;
-                }
-                try {
-                    staged.qkv_layers.resize(
-                        dflash_capture->tape_layers.size());
-                    staged.qkv_received.assign(
-                        staged.qkv_layers.size() * staged.seqs.size(), 0);
-                    const size_t packed_elems =
-                        (size_t) conv_channels * n_seq_tokens *
-                        staged.seqs.size();
-                    for (size_t li = 0; li < staged.qkv_layers.size(); ++li) {
-                        auto & layer = staged.qkv_layers[li];
-                        layer.conv_channels = conv_channels;
-                        layer.n_tokens = (int) n_seq_tokens;
-                        layer.n_seqs = (int) staged.seqs.size();
-                        layer.qkv_mixed.resize(packed_elems);
-                        // The legacy callback still reads each ubatch through
-                        // cap.tape_layers before scattering it. Reserve its
-                        // worst-case chunk now so no vector allocation can fail
-                        // after the live forward has started.
-                        dflash_capture->tape_layers[li].qkv_mixed.reserve(
-                            packed_elems);
-                        for (size_t s = 0; s < staged.seqs.size(); ++s) {
-                            layer.seq_ids[s] = staged.seqs[s].seq_id;
-                        }
-                    }
-                    size_t peak_host_payload = 0;
-                    for (const auto & layer : dflash_capture->tape_layers) {
-                        peak_host_payload +=
-                            layer.qkv_mixed.capacity() * sizeof(float);
-                    }
-                    for (const auto & layer : staged.qkv_layers) {
-                        peak_host_payload +=
-                            layer.qkv_mixed.capacity() * sizeof(float);
-                    }
-                    dflash_capture->window_host_staging_peak_bytes = std::max(
-                        dflash_capture->window_host_staging_peak_bytes,
-                        peak_host_payload);
-                } catch (const std::exception & err) {
-                    LLAMA_LOG_ERROR(
-                        "%s: could not preallocate callback QKV staging: %s\n",
-                        __func__, err.what());
-                    return -1;
-                }
-            }
-            dflash_capture->window_staging = std::move(staged);
-            window_capture = true;
-            window_speculative = dflash_capture->window_speculative_capture;
-        }
-    }
-
-    if (!memory) {
+     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
@@ -6696,17 +4167,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (dflash_capture) {
             dflash_capture->ubatch = &ubatch;
 
-            // populate per-seq tape pointers for graph builder
-            if (!dflash_capture->tapes.empty()) {
+            // Populate per-seq tape pointers only while transient rollback
+            // recording is armed. Allocated tape buffers outlive a verify cycle,
+            // but their mere existence must not add copy nodes to ordinary
+            // prompt or target-only decodes.
+            if (dflash_capture->tape_enabled && !dflash_capture->tapes.empty()) {
                 const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
                 bool seqs_changed = (ns != cparams.tape_gpu_n_seqs);
                 cparams.tape_gpu_n_seqs = ns;
 
                 for (int s = 0; s < ns; ++s) {
-                    const llama_seq_id seq =
-                        dflash_capture->window_staging.active
-                            ? dflash_ubatch_axis_seq(&ubatch, s)
-                            : ubatch.seq_id_unq[s];
+                    const llama_seq_id seq = ubatch.seq_id_unq[s];
                     dflash_tape_gpu * tp = nullptr;
                     if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                         tp = dflash_capture->tapes[seq].get();
@@ -6735,19 +4206,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 if (all_tapes_covered) {
                     dflash_capture->tape_stage_n_tokens =
                         (int) ubatch.n_seq_tokens;
-                    dflash_capture->tape_stage_minimal_packed =
-                        cparams.tape_minimal_capture &&
-                        std::all_of(
-                            cparams.tape_gpu_seqs,
-                            cparams.tape_gpu_seqs + ns,
-                            [](const dflash_tape_gpu * tape) {
-                                return tape && tape->minimal_packed &&
-                                       tape->minimal_record_floats > 0;
-                            });
                 }
 
                 // graph nodes hold references to tape tensors — invalidate if set changed
                 if (seqs_changed && gf_res_prev) {
+                    gf_res_prev->reset();
+                }
+            } else if (!dflash_capture->tape_enabled &&
+                       (cparams.tape_gpu != nullptr ||
+                        cparams.tape_gpu_n_seqs != 0)) {
+                // Defensive repair for callers that toggle capture around an
+                // in-flight ubatch boundary. The public setter normally clears
+                // this state before decode reaches here.
+                cparams.tape_gpu = nullptr;
+                cparams.tape_gpu_n_seqs = 0;
+                for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                    cparams.tape_gpu_seqs[s] = nullptr;
+                }
+                if (gf_res_prev) {
                     gf_res_prev->reset();
                 }
             }
@@ -7060,18 +4536,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // C1: the decode transaction succeeds exactly here; its destructor delivers
     // finish(true) -> extents submitted, owners awaiting the synchronize fence.
     decode_txn.succeed();
-
-    if (window_capture &&
-        !dflash_window_stage_decode(
-            std::move(dflash_capture->window_staging),
-            window_speculative)) {
-        // The model decode itself succeeded. Keep the fixed-tape payload
-        // reserved and report pending status rather than claiming the live
-        // recurrent mutation failed after the fact.
-        LLAMA_LOG_WARN(
-            "%s: decoded %d rolling-window token(s), but publication is pending\n",
-            __func__, batch_inp.n_tokens);
-    }
 
     return 0;
 }
@@ -8543,38 +6007,6 @@ llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
         }
     }
 
-    if (dflash_capture) {
-        const auto add_buffer = [&ret](ggml_backend_buffer_t buf) {
-            if (!buf) {
-                return;
-            }
-            if (ggml_backend_buffer_is_meta(buf)) {
-                const size_t n = ggml_backend_meta_buffer_n_bufs(buf);
-                for (size_t i = 0; i < n; ++i) {
-                    ggml_backend_buffer_t child =
-                        ggml_backend_meta_buffer_simple_buffer(buf, i);
-                    if (child) {
-                        ret[ggml_backend_buffer_get_type(child)].rolling_window_tape +=
-                            ggml_backend_buffer_get_size(child);
-                    }
-                }
-                return;
-            }
-            ret[ggml_backend_buffer_get_type(buf)].rolling_window_tape +=
-                ggml_backend_buffer_get_size(buf);
-        };
-
-        for (const auto & window : dflash_capture->windows) {
-            if (!window || !window->enabled) {
-                continue;
-            }
-            add_buffer(window->buf);
-            add_buffer(window->scratch);
-            add_buffer(window->advance_scratch);
-            add_buffer(window->codec_scratch);
-        }
-    }
-
     return ret;
 }
 
@@ -9178,9 +6610,6 @@ void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
 }
 
-void llama_set_tape_minimal_replay(llama_context * ctx, bool enable) {
-    ctx->set_tape_minimal_replay(enable);
-}
 
 void llama_set_force_split_seq(llama_context * ctx, bool force) {
     auto * mem = llama_get_memory(ctx);
@@ -9201,121 +6630,6 @@ bool llama_dflash_tape_replay_available(llama_context * ctx) {
     return ctx->tape_replay_available();
 }
 
-bool llama_dflash_window_enable(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        int             capacity) {
-    return ctx->dflash_window_enable(seq_id, capacity);
-}
-
-bool llama_dflash_window_enable_batched(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        int             retained_depth,
-        int             advance_batch) {
-    return ctx->dflash_window_enable_batched(
-        seq_id, retained_depth, advance_batch);
-}
-
-bool llama_dflash_window_enable_batched_f16(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        int             retained_depth,
-        int             advance_batch) {
-    return ctx->dflash_window_enable_batched_f16(
-        seq_id, retained_depth, advance_batch);
-}
-
-bool llama_dflash_window_get_info(
-        llama_context *            ctx,
-        llama_seq_id               seq_id,
-        llama_dflash_window_info * info) {
-    if (!ctx || !info) {
-        return false;
-    }
-    *info = {};
-    info->codec = LLAMA_DFLASH_WINDOW_CODEC_NONE;
-    info->seq_id = seq_id;
-    info->boundary_pos = -1;
-    info->frontier_pos = -1;
-    return ctx->dflash_window_get_info(seq_id, *info);
-}
-
-bool llama_dflash_window_discard_seq(
-        llama_context * ctx,
-        llama_seq_id    seq_id) {
-    return ctx && ctx->dflash_window_discard_seq(seq_id);
-}
-
-bool llama_dflash_window_capture_pending(llama_context * ctx) {
-    return ctx->dflash_capture &&
-           ctx->dflash_capture->window_pending.active;
-}
-
-void llama_dflash_window_set_speculative(
-        llama_context * ctx,
-        bool            speculative) {
-    if (ctx->dflash_capture) {
-        ctx->dflash_capture->window_speculative_capture = speculative;
-    }
-}
-
-bool llama_dflash_window_commit(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        int             n_accepted) {
-    return ctx->dflash_window_commit(seq_id, n_accepted);
-}
-
-bool llama_dflash_window_retry_capture(llama_context * ctx) {
-    return ctx->dflash_window_retry_capture();
-}
-
-void llama_dflash_window_inject_publish_failure(llama_context * ctx) {
-    ctx->dflash_window_inject_publish_failure(0);
-}
-
-void llama_dflash_window_inject_publish_failure_seq(
-        llama_context * ctx,
-        llama_seq_id    seq_id) {
-    ctx->dflash_window_inject_publish_failure(seq_id);
-}
-
-bool llama_dflash_window_reconstruct(
-        llama_context * ctx,
-        llama_pos       pos) {
-    return ctx->dflash_window_reconstruct(0, pos);
-}
-
-bool llama_dflash_window_reconstruct_seq(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        llama_pos       pos) {
-    return ctx->dflash_window_reconstruct(seq_id, pos);
-}
-
-bool llama_dflash_window_install_reconstructed(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        llama_pos       pos) {
-    return ctx->dflash_window_install_reconstructed(seq_id, pos);
-}
-
-bool llama_dflash_window_restore_seq(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        llama_pos       pos,
-        llama_pos       attention_p0) {
-    return ctx && ctx->dflash_window_restore_seq(
-        seq_id, pos, attention_p0);
-}
-
-bool llama_dflash_window_commit_branch(
-        llama_context * ctx,
-        llama_seq_id    seq_id,
-        llama_pos       pos) {
-    return ctx && ctx->dflash_window_commit_branch(seq_id, pos);
-}
 
 bool llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {
     return ctx->tape_replay(seq_id, n_accepted);
@@ -9632,20 +6946,6 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
-}
-
-llama_memory_resume_plan llama_memory_plan_resume(
-        llama_memory_t mem,
-          llama_seq_id seq_id,
-             llama_pos target_pos) {
-    if (!mem) {
-        llama_memory_resume_plan plan = {};
-        plan.full_replay = true;
-        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_NO_MEMORY;
-        return plan;
-    }
-
-    return mem->plan_resume(seq_id, target_pos);
 }
 
 bool llama_memory_seq_rm_attn(

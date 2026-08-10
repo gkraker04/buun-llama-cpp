@@ -1,6 +1,5 @@
 #include "llama-kv-cache.h"
 
-#include "llama-vbr-generation-oracle.h"
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama-vbr-artifact-validate.h"
@@ -5661,10 +5660,6 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
         return fail(
             vbr_explicit_generation_failure::ownership_cardinality_mismatch);
     }
-    if (vbr_generation_oracle_enabled()) {
-        GGML_ASSERT(expected_rank == cells.seq_pos_count_before(seq_id, computation_frontier) &&
-                    "ownership index diverged from canonical cell scan at capture");
-    }
 
     vbr_checkpoint_generation_stream captured_stream;
     if (!vbr_generation_capture_stream(
@@ -6236,11 +6231,7 @@ bool llama_kv_cache::vbr_capture_generation_record(
 }
 // VBR_EXPLICIT_CAPTURE_STABILITY_REGION_END
 
-// VBR_GENERATION_ORACLE_OBSERVER_REGION_BEGIN
-// Oracle trust domain (§6.2): the canonical observation builder must be a direct cell scan —
-// the production ownership index is a forbidden input here (the CI scan re-checks exactly this
-// region) — and must hold the same stable-read contract as ordinary capture: controller stable
-// before the scan and unchanged after it, else the observation is unavailable.
+// Keep the sequence-state writer's SWA visibility predicate in one place.
 bool llama_kv_cache::state_write_includes_cell(
         const llama_kv_cells & cells,
         uint32_t cell,
@@ -6254,188 +6245,6 @@ bool llama_kv_cache::state_write_includes_cell(
     return !llama_hparams::is_masked_swa(
             n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
 }
-
-bool llama_kv_cache::vbr_generation_oracle_observations(
-        llama_seq_id seq_id,
-        llama_pos computation_frontier,
-        std::vector<vbr_generation_oracle_cell> & output) const {
-    if (other != nullptr) {
-        return other->vbr_generation_oracle_observations(
-                seq_id, computation_frontier, output);
-    }
-    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || computation_frontier < 0 ||
-            static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
-        return false;
-    }
-    const uint32_t stream = seq_to_stream[seq_id];
-    if (stream >= v_cells.size()) {
-        return false;
-    }
-    const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || tracker->shadow_unavailable() || !tracker->stable()) {
-        return false;
-    }
-    const uint64_t serial_at_scan_start = tracker->mutation_serial();
-    std::vector<uint64_t> unit_seq_at_scan_start;
-    unit_seq_at_scan_start.reserve(tracker->unit_count());
-    for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
-        const uint64_t seq = tracker->unit_generation(unit).publish_seq;
-        if ((seq & 1u) != 0) {
-            return false;
-        }
-        unit_seq_at_scan_start.push_back(seq);
-    }
-
-    const auto & cells = v_cells[stream];
-    auto append_bytes = [](std::vector<uint8_t> & dst, const void * src, size_t size) {
-        const auto * first = static_cast<const uint8_t *>(src);
-        dst.insert(dst.end(), first, first + size);
-    };
-    auto append_tensor = [&](std::vector<uint8_t> & dst, const ggml_tensor * tensor,
-                             size_t offset, size_t size) {
-        const size_t old_size = dst.size();
-        dst.resize(old_size + size);
-        ggml_backend_tensor_get(tensor, dst.data() + old_size, offset, size);
-    };
-
-    output.clear();
-    output.reserve(cells.size());
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        vbr_generation_oracle_cell cell;
-        cell.physical_cell = i;
-        const bool empty = cells.is_empty(i);
-        cell.position           = empty ? -1 : cells.pos_get(i);
-        cell.has_dependency_seq = !empty && cells.seq_has(i, seq_id);
-        // This is the exact sequence-serializer predicate, including SWA masking. The
-        // observer still discovers membership by a direct cell scan and never imports the
-        // ownership index or production covered-mask builder. Payload-complete children are
-        // excluded by collect_children(): only live_guarded children invoke this observer.
-        cell.attention_visible  = state_write_includes_cell(cells, i, seq_id);
-        if (cell.has_dependency_seq && cell.attention_visible && cell.position >= 0 &&
-                cell.position < computation_frontier) {
-            // Canonical byte order deliberately mirrors state_write_data for one physical
-            // cell: envelope, all K rows, then all V rows/elements. This reads the actual
-            // current-tier dependency bytes; no ownership index, generation mask, or cached
-            // manifest participates.
-            const uint32_t trans   = v_trans ? 1u : 0u;
-            const uint32_t n_layer = static_cast<uint32_t>(layers.size());
-            append_bytes(cell.dependency_bytes, &trans, sizeof(trans));
-            append_bytes(cell.dependency_bytes, &n_layer, sizeof(n_layer));
-            for (const auto & layer : layers) {
-                auto * k = layer.k_stream[stream];
-                const int32_t  type = static_cast<int32_t>(k->type);
-                const uint64_t row_size =
-                    ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
-                append_bytes(cell.dependency_bytes, &type, sizeof(type));
-                append_bytes(cell.dependency_bytes, &row_size, sizeof(row_size));
-                append_tensor(cell.dependency_bytes, k, size_t(i) * row_size, row_size);
-            }
-            if (!v_trans) {
-                for (const auto & layer : layers) {
-                    auto * v = layer.v_stream[stream];
-                    if (v == nullptr) {
-                        continue;
-                    }
-                    const int32_t  type = static_cast<int32_t>(v->type);
-                    const uint64_t row_size =
-                        ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
-                    append_bytes(cell.dependency_bytes, &type, sizeof(type));
-                    append_bytes(cell.dependency_bytes, &row_size, sizeof(row_size));
-                    append_tensor(cell.dependency_bytes, v, size_t(i) * row_size, row_size);
-                }
-            } else {
-                const uint32_t kv_size = cells.size();
-                for (const auto & layer : layers) {
-                    auto * v = layer.v_stream[stream];
-                    if (v == nullptr) {
-                        continue;
-                    }
-                    const int32_t  type   = static_cast<int32_t>(v->type);
-                    const uint32_t elsize = ggml_type_size(v->type);
-                    const uint32_t n_embd = hparams.n_embd_v_gqa(layer.il);
-                    append_bytes(cell.dependency_bytes, &type, sizeof(type));
-                    append_bytes(cell.dependency_bytes, &elsize, sizeof(elsize));
-                    append_bytes(cell.dependency_bytes, &n_embd, sizeof(n_embd));
-                    for (uint32_t j = 0; j < n_embd; ++j) {
-                        const size_t offset = (size_t(i) + size_t(j) * kv_size) * elsize;
-                        append_tensor(cell.dependency_bytes, v, offset, elsize);
-                    }
-                }
-            }
-        }
-        output.push_back(cell);
-    }
-    bool units_stable = unit_seq_at_scan_start.size() == tracker->unit_count();
-    for (uint32_t unit = 0; units_stable && unit < tracker->unit_count(); ++unit) {
-        units_stable = tracker->unit_generation(unit).publish_seq == unit_seq_at_scan_start[unit];
-    }
-    if (!units_stable || tracker->shadow_unavailable() ||
-            tracker->mutation_serial() != serial_at_scan_start || !tracker->stable()) {
-        output.clear();
-        return false;
-    }
-    return true;
-}
-// VBR_GENERATION_ORACLE_OBSERVER_REGION_END
-
-bool llama_kv_cache::vbr_generation_shadow_globally_unavailable() const {
-    if (other != nullptr) {
-        return other->vbr_generation_shadow_globally_unavailable();
-    }
-    const auto * tracker = vbr_generation_tracker_get();
-    return tracker != nullptr && tracker->shadow_unavailable();
-}
-
-bool llama_kv_cache::vbr_generation_live_guarded_view(
-        uint32_t child_id,
-        llama_seq_id seq_id,
-        llama_pos computation_frontier,
-        vbr_generation_live_controller_view & output) const {
-    if (other != nullptr) {
-        return other->vbr_generation_live_guarded_view(
-                child_id, seq_id, computation_frontier, output);
-    }
-
-    const auto * tracker = vbr_generation_tracker_get();
-    if (tracker == nullptr || tracker->shadow_unavailable() ||
-            seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
-            computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
-        return false;
-    }
-
-    const uint32_t stream = seq_to_stream[seq_id];
-    if (stream >= v_cells.size()) {
-        return false;
-    }
-
-    vbr_generation_live_stream_view live_stream;
-    live_stream.stream_index           = stream;
-    live_stream.dependency_seq_id      = seq_id;
-    live_stream.computation_frontier   = computation_frontier;
-    // A2 (§5.3): exact dependency cardinality comes from the scan-free ownership index; the
-    // legacy cell scan remains ONLY as the independent oracle cross-check (env-gated). An
-    // unavailable index view makes generation capture unavailable for this checkpoint.
-    uint32_t index_rank = 0;
-    if (vbr_ownership_ == nullptr ||
-        !vbr_ownership_->rank_below(stream, seq_id, computation_frontier, index_rank)) {
-        return false;
-    }
-    live_stream.exact_dependency_count = index_rank;
-    if (vbr_generation_oracle_enabled()) {
-        const uint32_t scan_rank = v_cells[stream].seq_pos_count_before(seq_id, computation_frontier);
-        GGML_ASSERT(scan_rank == index_rank && "ownership index diverged from canonical cell scan");
-    }
-    live_stream.membership_context = this;
-    live_stream.cell_has_seq       = vbr_generation_cell_has_seq_cb;
-    live_stream.cell_pos           = vbr_generation_cell_pos_cb;
-
-    output.child_id        = child_id;
-    output.dependency_mode = checkpoint_child_dependency_mode::live_guarded;
-    output.tracker         = tracker;
-    output.streams         = {live_stream};
-    return true;
-}
-
 
 bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
                                                     vbr_controller_instance_id instance,

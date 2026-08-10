@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common-checkpoint-shadow.h"      // A2 evaluation authority types (gen_eval subfields)
 #include "../src/llama-cache-accounting.h" // staging API precedent: fit.cpp / speculative.cpp
 
 #include <nlohmann/json_fwd.hpp>
@@ -692,8 +691,7 @@ common_cache_plan_default_cost_terms() {
 // One candidate-plan row: a candidate instance the shipped path actually visited (or a
 // derived chain over such instances). Membership in the inventory IS presence — no row, no
 // observation, never a vacuous verdict. `delivered` = this candidate actually applied state
-// to the slot — recorded as data at the delivery site, never inferred. gen_eval transports
-// the A2 evaluator's own typed result (`evaluated == false` = evaluator did not run).
+// to the slot — recorded as data at the delivery site, never inferred.
 // Trivially copyable and written only through noexcept record methods (A2 transport).
 struct common_cache_plan_candidate {
     common_cache_plan_provider provider = common_cache_plan_provider::cold_replay;
@@ -736,8 +734,6 @@ struct common_cache_plan_candidate {
     // (not the container size) + how many it rejected for a changed representation epoch
     uint32_t siblings_rejected_epoch = 0;
     uint32_t siblings_scanned        = 0;
-
-    common_checkpoint_shadow_evaluation gen_eval;
 
     // composed plan: ordinals of this chain's component rows (-1 = unused slot); only rows
     // with the CHAIN phase bit use these

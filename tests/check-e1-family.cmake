@@ -4,7 +4,7 @@ endif()
 
 file(READ "${SOURCE_ROOT}/common/common.h" common_header)
 file(READ "${SOURCE_ROOT}/common/common-cache-family.h" family_header)
-file(READ "${SOURCE_ROOT}/common/common-checkpoint-shadow.cpp" checkpoint_source)
+file(READ "${SOURCE_ROOT}/common/common.cpp" checkpoint_source)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.h" task_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.cpp" task_source)
 file(READ "${SOURCE_ROOT}/tools/server/server-context.h" context_header)
@@ -42,14 +42,10 @@ function(checkpoint_carrier_valid header source output)
     string(FIND "${header}"
         "common_cache_family_binding cache_family;" field)
     extract_region("${source}"
-        "common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other)"
-        "common_prompt_checkpoint & common_prompt_checkpoint::operator=" copy_ctor)
-    extract_region("${source}"
         "void common_prompt_checkpoint::clear()"
-        "common_checkpoint_shadow_reason common_checkpoint_shadow_capture_scoped" clear_body)
-    string(FIND "${copy_ctor}" "cache_family(other.cache_family)" copied)
+        "void common_prompt_checkpoint::update_pos(" clear_body)
     string(FIND "${clear_body}" "cache_family = {};" cleared)
-    if(field EQUAL -1 OR copied EQUAL -1 OR cleared EQUAL -1)
+    if(field EQUAL -1 OR cleared EQUAL -1)
         set(${output} FALSE PARENT_SCOPE)
     else()
         set(${output} TRUE PARENT_SCOPE)
@@ -185,14 +181,8 @@ if(NOT test_door_absent)
         "E1.1b test-only slot door has production callers")
 endif()
 
-# House-standard negative controls rerun the actual predicates.
-string(REPLACE "cache_family(other.cache_family)"
-    "cache_family()" bad_copy "${checkpoint_source}")
-checkpoint_carrier_valid("${common_header}" "${bad_copy}" bad_copy_ok)
-if(bad_copy_ok)
-    message(FATAL_ERROR "checkpoint-copy negative control did not trip")
-endif()
-
+# House-standard negative controls rerun the actual predicates. Copy propagation
+# is compiler-generated and exercised by the runtime checkpoint round-trip test.
 string(REPLACE "cache_family = {};"
     "/* family clear removed */" bad_clear "${checkpoint_source}")
 checkpoint_carrier_valid("${common_header}" "${bad_clear}" bad_clear_ok)

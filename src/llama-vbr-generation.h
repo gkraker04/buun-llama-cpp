@@ -106,8 +106,8 @@ struct vbr_generation_event {
     vbr_generation_tracker *  owner_          = nullptr;
 };
 
-// Armed-only dual-write store. The raw arrays stay private so every read comparison can be
-// isolated in checkpoint_vbr_eligibility(). Mutation sites use the closed A0 registrant table
+// Armed-only dual-write store. The raw arrays stay private behind value-returning accessors.
+// Mutation sites use the closed A0 registrant table
 // through begin_event(); no caller supplies an open-ended family string.
 class vbr_generation_tracker {
   public:
@@ -240,8 +240,8 @@ class vbr_generation_tracker {
     void install_import_image_swap(
         vbr_tracker_import_image & image) noexcept;
 
-    // Read-only accessors are intentionally value-returning. Callers may capture them, but CI
-    // forbids comparison of raw stamp fields outside checkpoint_vbr_eligibility().
+    // Read-only accessors are intentionally value-returning. Callers may capture them, but
+    // mutation still goes exclusively through authenticated tracker events and imports.
     uint32_t            page_generation(uint32_t stream, uint32_t page) const;
     uint32_t            page_destructive_generation(uint32_t stream, uint32_t page) const;
     uint32_t            page_import_generation(uint32_t stream, uint32_t page) const;
@@ -294,117 +294,3 @@ bool vbr_generation_capture_controller(const vbr_generation_tracker &           
                                        checkpoint_child_dependency_mode                      dependency_mode,
                                        const std::vector<vbr_checkpoint_generation_stream> & streams,
                                        vbr_checkpoint_generation_controller &                output);
-
-using vbr_generation_cell_has_seq_fn = bool (*)(const void * context,
-                                                uint32_t     stream,
-                                                uint32_t     cell,
-                                                llama_seq_id seq_id);
-
-// A2: current logical position of a cell's occupant, or -1 when empty. Needed by the swa_wrap
-// expected-tombstone predicate (same-seq occupant at strictly higher position).
-using vbr_generation_cell_pos_fn = llama_pos (*)(const void * context,
-                                                 uint32_t     stream,
-                                                 uint32_t     cell);
-
-struct vbr_generation_live_stream_view {
-    uint32_t                       stream_index           = 0;
-    llama_seq_id                   dependency_seq_id      = -1;
-    llama_pos                      computation_frontier   = -1;
-    uint32_t                       exact_dependency_count = 0;
-    const void *                   membership_context     = nullptr;
-    vbr_generation_cell_has_seq_fn cell_has_seq           = nullptr;
-    vbr_generation_cell_pos_fn     cell_pos               = nullptr;
-};
-
-struct vbr_generation_live_controller_view {
-    uint32_t                                     child_id        = 0;
-    checkpoint_child_dependency_mode             dependency_mode = checkpoint_child_dependency_mode::absent;
-    const vbr_generation_tracker *               tracker         = nullptr;
-    std::vector<vbr_generation_live_stream_view> streams;
-};
-
-struct vbr_generation_live_view {
-    bool                                             legacy_eligible              = false;
-    bool                                             identity_frontier_eligible   = true;
-    bool                                             capability_applicable        = true;
-    std::array<uint8_t, 32>                          identity_policy_order_digest = {};
-    std::vector<vbr_generation_live_controller_view> controllers;
-};
-
-enum class vbr_checkpoint_eligibility_category : uint8_t {
-    not_applicable,
-    generation_unknown,
-    strict_accept,
-    live_rebased_shadow_accept,
-    strict_reject,
-};
-
-enum class vbr_checkpoint_eligibility_reason : uint8_t {
-    none,
-    capability_not_applicable,
-    record_unknown,
-    record_version,
-    identity_or_frontier,
-    controller_shape,
-    child_order,
-    dependency_mode,
-    controller_inactive,
-    controller_unstable,
-    // Frozen schema-4 wire ordinal/spelling; semantic meaning is lineage mismatch.
-    pool_uuid,
-    global_generation,
-    unit_shape,
-    unit_unstable,
-    unit_generation,
-    live_rebased_transition,
-    stream_shape,
-    stream_order,
-    malformed_page_refs,
-    page_out_of_range,
-    dependency_changed,
-    dependency_membership_lost,
-    dependency_cardinality,
-};
-
-// A2 expected-tombstone classes (§5.5 closed allowlist). `none` = the strict reject is NOT an
-// expected tombstone; `unexplained` = provenance was mixed/overwritten/mismatched — fail-closed
-// disagreement, never availability accounting.
-enum class vbr_expected_tombstone_class : uint8_t {
-    none,
-    restore_one_behind,
-    swa_wrap,
-    explicit_destructive_trim,
-    dependency_seq_removed,
-    unexplained,
-};
-
-// A2 observation class for qualification accounting (§8.4): which class minima an agreement
-// observation can satisfy. Derived inside the evaluator from covered-page refinement geometry
-// and intervening mutation provenance — never by the server scan site.
-enum class vbr_observation_class : uint8_t {
-    trivial_append,
-    boundary_refined,
-    destructive,
-    import_refined,
-};
-
-struct vbr_checkpoint_eligibility {
-    bool                                legacy              = false;
-    bool                                strict              = false;
-    bool                                live_rebased_shadow = false;
-    vbr_checkpoint_eligibility_category category            = vbr_checkpoint_eligibility_category::strict_reject;
-    vbr_checkpoint_eligibility_reason   reason              = vbr_checkpoint_eligibility_reason::none;
-
-    // A2 audit metadata (design finding 7): populated by the sole evaluator; the server
-    // consumes this closed result and never derives classes from tracker fields.
-    vbr_observation_class        observation_class = vbr_observation_class::trivial_append;
-    vbr_expected_tombstone_class tombstone_class   = vbr_expected_tombstone_class::none;
-    bool                         refinement_used   = false;  // per-cell mask path exercised
-    uint32_t                     rejecting_cells   = 0;      // every rejecting covered cell inspected
-    // provenance uniformity is derivable: tombstone_class != unexplained (simplification review)
-};
-
-// The sole raw-generation comparison authority. A1 does not route any live selector here; A2
-// migrates every reader and flips only after the four-way ratchet qualifies.
-vbr_checkpoint_eligibility checkpoint_vbr_eligibility(const vbr_checkpoint_generation_record & checkpoint,
-                                                      const vbr_generation_live_view &         live);

@@ -105,7 +105,7 @@ static void test_inventory_merge() {
     // rows carry typed-unknown measured fields until a shipped loop fills them
     CHECK(h->lcp_tokens.state == llama_cache_acct_known::unknown);
     CHECK(h->t_last_used_us.state == llama_cache_acct_known::unknown);
-    CHECK(!h->delivered && !h->gen_eval.evaluated);
+    CHECK(!h->delivered);
 }
 
 // capacity exhaustion: overflow latches, append stops, shipped-side calls keep succeeding

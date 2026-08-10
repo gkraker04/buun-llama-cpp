@@ -539,11 +539,10 @@ static bool test_seq_file_integrity(
     return true;
 }
 
-// Test 7: non-hybrid attention-only trim equivalence + resume planning
-// - plan an exact-frontier hit, a partial reuse, and an unavailable future target
+// Test 7: non-hybrid attention-only trim equivalence
 // - clone the same attention state into two contexts
 // - compare the new attention-only operation with the legacy whole-memory operation
-static bool test_resume_plan_attn_trim_nonhybrid(
+static bool test_attn_trim_nonhybrid(
         struct llama_model         * model,
         const struct common_params & params,
         const llama_tokens         & tokens) {
@@ -564,7 +563,7 @@ static bool test_resume_plan_attn_trim_nonhybrid(
         return false;
     }
 
-    LOG("\n=== Test 7: non-hybrid resume plan + attention trim equivalence ===\n");
+    LOG("\n=== Test 7: non-hybrid attention trim equivalence ===\n");
 
     const size_t n_tokens = std::min<size_t>(tokens.size(), 8);
     if (n_tokens < 4) {
@@ -583,24 +582,6 @@ static bool test_resume_plan_attn_trim_nonhybrid(
     llama_synchronize(ctx_attn.get());
 
     const llama_pos target = (llama_pos) n_tokens - 2;
-    const auto hit = llama_memory_plan_resume(
-        llama_get_memory(ctx_attn.get()), 0, (llama_pos) n_tokens);
-    const auto partial = llama_memory_plan_resume(
-        llama_get_memory(ctx_attn.get()), 0, target);
-    const auto reject = llama_memory_plan_resume(
-        llama_get_memory(ctx_attn.get()), 0, (llama_pos) n_tokens + 1);
-    if (!hit.resumable || hit.full_replay ||
-        hit.components != LLAMA_MEMORY_RESUME_COMPONENT_ATTN ||
-        hit.reuse_tokens != (int64_t) n_tokens || hit.replay_tokens != 0 ||
-        !partial.resumable || partial.full_replay ||
-        partial.components != LLAMA_MEMORY_RESUME_COMPONENT_ATTN ||
-        partial.reuse_tokens != target || partial.replay_tokens != 2 ||
-        reject.resumable || !reject.full_replay ||
-        reject.components != LLAMA_MEMORY_RESUME_COMPONENT_NONE ||
-        reject.reject_reason != LLAMA_MEMORY_RESUME_REJECT_TARGET_AFTER_FRONTIER) {
-        LOG_ERR("%s: plan_resume truth table mismatch\n", __func__);
-        return false;
-    }
 
     std::vector<uint8_t> initial(llama_state_seq_get_size(ctx_attn.get(), 0));
     if (initial.empty() ||
@@ -735,8 +716,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Test 7: non-hybrid plan truth table and trim equivalence
-    if (!test_resume_plan_attn_trim_nonhybrid(model, params, tokens)) {
+    // Test 7: non-hybrid attention trim equivalence
+    if (!test_attn_trim_nonhybrid(model, params, tokens)) {
         return 1;
     }
 

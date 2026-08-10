@@ -33,35 +33,6 @@ foreach(path IN LISTS controller_scan_files)
     endforeach()
 endforeach()
 
-# The bare pool_uuid spelling is frozen wire/reason compatibility vocabulary only.
-# No new identity-bearing field or helper may reuse it.
-set(pool_uuid_reason_files
-    "${SOURCE_ROOT}/src/llama-vbr-generation.h"
-    "${SOURCE_ROOT}/src/llama-vbr-generation.cpp"
-    "${SOURCE_ROOT}/src/llama-vbr-checkpoint-types.h"
-    "${SOURCE_ROOT}/src/llama-vbr-checkpoint.cpp"
-    "${SOURCE_ROOT}/common/common-checkpoint-shadow.h"
-    "${SOURCE_ROOT}/common/common-checkpoint-shadow.cpp")
-foreach(path IN LISTS controller_scan_files)
-    file(READ "${path}" text)
-    if (path MATCHES "/tests/test-vbr-representation-epoch\\.cpp$")
-        count_literal("${text}"
-            "vbr_checkpoint_eligibility_reason::pool_uuid" reason_test_uses)
-        if (NOT reason_test_uses EQUAL 1)
-            message(FATAL_ERROR
-                "F4.0 lineage-rejection test must cite the frozen reason exactly once")
-        endif()
-        string(REPLACE "vbr_checkpoint_eligibility_reason::pool_uuid" "" text "${text}")
-    endif()
-    string(FIND "${text}" "pool_uuid" found)
-    if (NOT found EQUAL -1)
-        list(FIND pool_uuid_reason_files "${path}" allowed_index)
-        if (allowed_index EQUAL -1)
-            message(FATAL_ERROR "pool_uuid escaped the frozen reason allowlist: ${path}")
-        endif()
-    endif()
-endforeach()
-
 file(READ "${SOURCE_ROOT}/src/llama-vbr-controller-id.h" id_header)
 file(READ "${SOURCE_ROOT}/src/llama-vbr-controller-id.cpp" id_source)
 file(READ "${SOURCE_ROOT}/src/llama-vbr-generation.cpp" generation_source)
@@ -99,7 +70,6 @@ endif()
 # artifact codec, and canonical lineage-digest surfaces at F4.0.
 set(durable_identity_files
     "${SOURCE_ROOT}/src/llama-vbr-generation-types.h"
-    "${SOURCE_ROOT}/src/llama-vbr-checkpoint-compose.inc"
     "${SOURCE_ROOT}/src/llama-vbr-artifact.h"
     "${SOURCE_ROOT}/src/llama-vbr-artifact.cpp"
     "${SOURCE_ROOT}/src/llama-vbr-identity-digest.h")

@@ -2146,11 +2146,30 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-// common_prompt_checkpoint size()/clear() and its special members live in
-// common-checkpoint-shadow.cpp (the one TU that sees the shadow holder's insides).
-
 bool common_prompt_checkpoint::empty() const {
     return data_tgt.empty();
+}
+
+size_t common_prompt_checkpoint::size() const {
+    return data_tgt.size() + data_dft.size() + accel.size();
+}
+
+void common_prompt_checkpoint::clear() {
+    n_tokens = 0;
+    id_task  = -1;
+
+    pos_min = 0;
+    pos_max = 0;
+
+    representation_epoch     = 0;
+    representation_epoch_swa = 0;
+
+    computation_frontier.clear();
+    cache_family = {};
+
+    data_tgt.clear();
+    data_dft.clear();
+    accel.clear();
 }
 
 void common_prompt_checkpoint::update_pos(

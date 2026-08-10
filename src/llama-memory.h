@@ -228,10 +228,6 @@ struct llama_memory_i {
     // ops
     //
 
-    // Default memory kind is attention-only. Composite/recurrent implementations override the
-    // component contract while reusing the same position/frontier arithmetic.
-    virtual llama_memory_resume_plan plan_resume(llama_seq_id seq_id, llama_pos target_pos) const;
-
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 

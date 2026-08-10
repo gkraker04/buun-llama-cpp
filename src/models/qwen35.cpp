@@ -18,33 +18,13 @@ void build_dflash_tape_copies(ggml_context * ctx0, ggml_cgraph * gf, const llama
         if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
 
         auto & tl = tgpu->layers[li];
-        const bool packed_minimal =
-            cparams.tape_minimal_capture &&
-            tl.minimal_qkv && tl.minimal_gate && tl.minimal_beta;
-        ggml_tensor * gate_tape = packed_minimal ? tl.minimal_gate : tl.gate;
-        ggml_tensor * beta_tape = packed_minimal ? tl.minimal_beta : tl.beta;
-        ggml_tensor * qkv_tape  = packed_minimal ? tl.minimal_qkv  : tl.qkv;
 
-        ggml_tensor * k_cont = nullptr;
-        ggml_tensor * v_cont = nullptr;
-        ggml_tensor * k_dst = nullptr;
-        ggml_tensor * v_dst = nullptr;
-        if (!cparams.tape_minimal_capture) {
-            ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
-                k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
-                k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
-            ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
-                v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
-                v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
-            k_cont = ggml_cont(ctx0, k_slice);
-            v_cont = ggml_cont(ctx0, v_slice);
-            k_dst = ggml_view_3d(ctx0, tl.k,
-                tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
-                tl.k->nb[1], tl.k->nb[2], 0);
-            v_dst = ggml_view_3d(ctx0, tl.v,
-                tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
-                tl.v->nb[1], tl.v->nb[2], 0);
-        }
+        ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
+            k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
+            k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
+        ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
+            v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
+            v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
         ggml_tensor * g_slice = ggml_view_3d(ctx0, gate,
             gate->ne[0], gate->ne[1], n_seq_tokens,
             gate->nb[1], gate->nb[2], s * gate->nb[3]);
@@ -52,40 +32,38 @@ void build_dflash_tape_copies(ggml_context * ctx0, ggml_cgraph * gf, const llama
             beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
             beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
 
-        // The direct-GPU packed destination is pitched by a complete token
-        // record. CUDA cpy handles matching F32 shapes with arbitrary source
-        // and destination pitches (cudaMemcpy2DAsync or its strided kernel);
-        // materializing each slice first only doubles record traffic. Keep the
-        // legacy contiguous intermediates for redundant/meta capture.
-        ggml_tensor * g_src =
-            packed_minimal ? g_slice : ggml_cont(ctx0, g_slice);
-        ggml_tensor * b_src =
-            packed_minimal ? b_slice : ggml_cont(ctx0, b_slice);
+        ggml_tensor * k_cont = ggml_cont(ctx0, k_slice);
+        ggml_tensor * v_cont = ggml_cont(ctx0, v_slice);
+        ggml_tensor * g_cont = ggml_cont(ctx0, g_slice);
+        ggml_tensor * b_cont = ggml_cont(ctx0, b_slice);
 
-        ggml_tensor * g_dst = ggml_view_3d(ctx0, gate_tape,
-            gate_tape->ne[0], gate_tape->ne[1], (int64_t)n_seq_tokens,
-            gate_tape->nb[1], gate_tape->nb[2], 0);
-        ggml_tensor * b_dst = ggml_view_3d(ctx0, beta_tape,
-            beta_tape->ne[0], beta_tape->ne[1], (int64_t)n_seq_tokens,
-            beta_tape->nb[1], beta_tape->nb[2], 0);
+        ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
+            tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
+            tl.k->nb[1], tl.k->nb[2], 0);
+        ggml_tensor * v_dst = ggml_view_3d(ctx0, tl.v,
+            tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
+            tl.v->nb[1], tl.v->nb[2], 0);
+        ggml_tensor * g_dst = ggml_view_3d(ctx0, tl.gate,
+            tl.gate->ne[0], tl.gate->ne[1], (int64_t)n_seq_tokens,
+            tl.gate->nb[1], tl.gate->nb[2], 0);
+        ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
+            tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
+            tl.beta->nb[1], tl.beta->nb[2], 0);
 
-        if (!cparams.tape_minimal_capture) {
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
-        }
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_src, g_dst));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_src, b_dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
 
         // qkv staging (tensor split): conv-rebuild source, replaces the eval-callback
         // capture whose meta get_tensor gather misorders the segmented channels
-        if (qkv_tape) {
+        if (tl.qkv) {
             ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed,
                 qkv_mixed->ne[0], n_seq_tokens, qkv_mixed->nb[1], s * qkv_mixed->nb[2]);
-            ggml_tensor * qkv_src =
-                packed_minimal ? qkv_slice : ggml_cont(ctx0, qkv_slice);
-            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, qkv_tape,
-                qkv_tape->ne[0], (int64_t)n_seq_tokens, qkv_tape->nb[1], 0);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_src, qkv_dst));
+            ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
+            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv,
+                tl.qkv->ne[0], (int64_t)n_seq_tokens, tl.qkv->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
         }
     }
 }

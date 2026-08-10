@@ -2314,45 +2314,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--dflash-window-depth"}, "N",
-        string_format(
-            "retained rolling GDN input-tape depth per server slot "
-            "(default: %d, 0 = disabled; currently requires --parallel 1)",
-            params.dflash_window_depth),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("dflash-window-depth must be non-negative");
-            }
-            params.dflash_window_depth = value;
-        }
-    ).set_env("LLAMA_ARG_DFLASH_WINDOW_DEPTH").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--dflash-window-advance"}, "N",
-        string_format(
-            "rolling GDN tape records per left-edge publication "
-            "(default: %d)", params.dflash_window_advance),
-        [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("dflash-window-advance must be positive");
-            }
-            params.dflash_window_advance = value;
-        }
-    ).set_env("LLAMA_ARG_DFLASH_WINDOW_ADVANCE").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--dflash-window-codec"}, "{f32,f16}",
-        string_format(
-            "rolling GDN tape storage codec (default: %s; f16 is an "
-            "explicit approximate restore namespace)",
-            params.dflash_window_codec.c_str()),
-        [](common_params & params, const std::string & value) {
-            if (value != "f32" && value != "f16") {
-                throw std::invalid_argument(
-                    "dflash-window-codec must be f32 or f16");
-            }
-            params.dflash_window_codec = value;
-        }
-    ).set_env("LLAMA_ARG_DFLASH_WINDOW_CODEC").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

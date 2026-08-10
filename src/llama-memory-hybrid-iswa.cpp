@@ -150,41 +150,6 @@ void llama_memory_hybrid_iswa::clear(bool data) {
     mem_recr->clear(data);
 }
 
-llama_memory_resume_plan llama_memory_hybrid_iswa::plan_resume(
-        llama_seq_id seq_id,
-        llama_pos    target_pos) const {
-    const auto attention = mem_attn->plan_resume(seq_id, target_pos);
-    const auto recurrent = mem_recr->plan_resume(seq_id, target_pos);
-    auto plan = attention;
-    plan.components = attention.components | recurrent.components;
-
-    if (!attention.resumable) {
-        plan.resumable = false;
-        plan.full_replay = true;
-        plan.reuse_tokens = 0;
-        plan.reject_reason = attention.reject_reason == LLAMA_MEMORY_RESUME_REJECT_NONE
-            ? LLAMA_MEMORY_RESUME_REJECT_ATTN_NOT_READY
-            : attention.reject_reason;
-        return plan;
-    }
-    if (!recurrent.resumable) {
-        plan.resumable = false;
-        plan.full_replay = true;
-        plan.reuse_tokens = 0;
-        plan.reject_reason = recurrent.reject_reason == LLAMA_MEMORY_RESUME_REJECT_NONE
-            ? LLAMA_MEMORY_RESUME_REJECT_RECURRENT_NOT_READY
-            : recurrent.reject_reason;
-        return plan;
-    }
-    if (plan.replay_tokens != recurrent.replay_tokens) {
-        plan.resumable = false;
-        plan.full_replay = true;
-        plan.reuse_tokens = 0;
-        plan.reject_reason = LLAMA_MEMORY_RESUME_REJECT_COMPONENT_MISMATCH;
-    }
-    return plan;
-}
-
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.

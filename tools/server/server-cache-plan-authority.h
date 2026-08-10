@@ -274,12 +274,6 @@ bool server_cache_plan_demote_for_vbr_low_lcp_reset(
     server_cache_plan_execution & execution,
     bool reset_applied) noexcept;
 
-constexpr bool server_cache_plan_checkpoint_superseded_by_window(
-        const server_cache_plan_execution & execution,
-        bool window_restored) noexcept {
-    return window_restored && execution.restores_checkpoint();
-}
-
 constexpr bool server_cache_plan_live_replay_lost_to_logits(
         const server_cache_plan_execution & execution,
         int64_t n_past_after_decrement) noexcept {

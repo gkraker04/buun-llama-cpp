@@ -915,14 +915,6 @@ json common_cache_plan_record_json(const common_cache_plan_record & rec) {
             }
             jc["components"] = std::move(comps);
         }
-        if (c.gen_eval.evaluated) {
-            jc["generation_eval"] = json {
-                { "category",   common_checkpoint_shadow_category_name(c.gen_eval.category) },
-                { "reason",     common_checkpoint_shadow_eval_reason_name(c.gen_eval.reason) },
-                { "tombstone",  common_checkpoint_shadow_tombstone_name(c.gen_eval.tombstone_class) },
-                { "refinement", c.gen_eval.refinement_used },
-            };
-        }
         // per-candidate economics only once an estimator produced them — absence on the wire
         // IS the typed-unavailable state; emitting five unavailable slots per row would bloat
         // every pre-planner record

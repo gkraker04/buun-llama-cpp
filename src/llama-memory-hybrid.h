@@ -125,8 +125,6 @@ public:
 
     void clear(bool data) override;
 
-    llama_memory_resume_plan plan_resume(llama_seq_id seq_id, llama_pos target_pos) const override;
-
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;

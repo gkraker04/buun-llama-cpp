@@ -41,7 +41,6 @@ add_library(llama
             llama-cache-accounting.cpp
             llama-cache-budget.cpp
             llama-cache-authority.cpp
-            llama-vbr-checkpoint.cpp
             llama-vbr-hard-seal.cpp
             llama-vbr-extent.cpp
             llama-vbr-artifact.cpp
@@ -55,7 +54,6 @@ add_library(llama
             llama-vbr-explicit-capture.cpp
             llama-vbr-controller-id.cpp
             llama-vbr-generation.cpp
-            llama-vbr-generation-oracle.cpp
             llama-vbr-operation.cpp
             llama-vram-demand.cpp
             llama-vram-ledger.cpp

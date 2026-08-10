@@ -14,7 +14,6 @@ file(READ "${SOURCE_ROOT}/tools/server/server-task.h" task_header)
 file(READ "${SOURCE_ROOT}/tools/server/server-task.cpp" task_source)
 file(READ "${SOURCE_ROOT}/tools/server/server-context.cpp" context_source)
 file(READ "${SOURCE_ROOT}/src/llama-vbr-identity-digest.h" identity_header)
-file(READ "${SOURCE_ROOT}/src/llama-vbr-checkpoint-compose.inc" checkpoint_compose)
 file(READ "${SOURCE_ROOT}/src/llama-vbr-explicit-capture.cpp" capture_source)
 file(READ "${SOURCE_ROOT}/src/llama-kv-cache.cpp" kv_cache_source)
 file(READ "${SOURCE_ROOT}/src/llama-memory-recurrent.cpp" recurrent_source)
@@ -107,7 +106,7 @@ if (NOT server_identity_override EQUAL -1)
         "F3.3 server must not invent the canonical child-policy digest")
 endif()
 count_literal(
-    "${identity_header}${checkpoint_compose}${capture_source}"
+    "${identity_header}${capture_source}"
     "vbr checkpoint identity/policy/order digest v1"
     identity_domain_count)
 if (NOT identity_domain_count EQUAL 1)

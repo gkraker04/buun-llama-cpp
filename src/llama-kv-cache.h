@@ -199,9 +199,8 @@ public:
         return other ? other->vbr_representation_epoch() : vbr_representation_epoch_;
     }
 
-    // Revision-9 A1 adapters over the cache's canonical dependency index. These are
-    // read-only shadow helpers: A2 will compose child controllers and route selectors
-    // through checkpoint_vbr_eligibility(), but A1 changes no read authority.
+    // Revision-9 adapter over the cache's canonical dependency index used by
+    // explicit VBR artifact capture.
     bool vbr_generation_capture_live_guarded(
             uint32_t child_id,
             llama_seq_id seq_id,
@@ -209,23 +208,6 @@ public:
             vbr_checkpoint_generation_controller & output,
             vbr_artifact_stream_placement * placement = nullptr,
             vbr_explicit_generation_failure * failure = nullptr) const;
-    bool vbr_generation_live_guarded_view(
-            uint32_t child_id,
-            llama_seq_id seq_id,
-            llama_pos computation_frontier,
-            vbr_generation_live_controller_view & output) const;
-
-    // Debug-oracle trust domain (env-gated callers only): canonical per-cell observations built
-    // by a direct cell scan, deliberately WITHOUT the ownership index, so the independent
-    // reconstruction can catch an index that drifted from the canonical cells.
-    bool vbr_generation_oracle_observations(
-            llama_seq_id seq_id,
-            llama_pos computation_frontier,
-            std::vector<struct vbr_generation_oracle_cell> & output) const;
-    // Producer-authenticated reset-scope source for the checkpoint bridge. True only for the
-    // pool/controller-wide availability latch, never for a transient capture race.
-    bool vbr_generation_shadow_globally_unavailable() const;
-
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
