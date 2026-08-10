@@ -4607,12 +4607,20 @@ private:
 
             SRV_TRC("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
-            auto params_dft = params_base;
+            // common_base_params_to_speculative copies the draft-side model/devices/ngl/cache
+            // types/threads/overrides AND strips the base params' default-on dynamic-VBR flags —
+            // a raw params_base copy here used to arm a second dynamic-VBR context and trip the
+            // one-marker-per-process co-tenancy guard, failing draft-context creation.
+            auto params_dft = common_base_params_to_speculative(params_base);
+
+            // the helper pins n_outputs_max to the base n_parallel (MTP-path semantics);
+            // this path historically inherited the base value — keep that (0 = derive from
+            // n_batch), a DFlash drafter emits logits for whole blocks
+            params_dft.n_outputs_max = params_base.n_outputs_max;
 
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
-            params_dft.devices      = params_spec.devices;
 
             // SPLIT_MODE_TENSOR is target-only: drafter archs have no meta split rules, and the
             // hidden-state feed runs through host buffers anyway — run the drafter as a normal
@@ -4622,17 +4630,6 @@ private:
                 SRV_INF("%s", "tensor-split target: draft model falls back to layer split "
                         "(use --spec-draft-device to pin it to one GPU)\n");
             }
-            params_dft.model        = params_spec.mparams;
-            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
-            params_dft.cache_type_k = params_spec.cache_type_k;
-            params_dft.cache_type_v = params_spec.cache_type_v;
-
-            if (params_spec.cpuparams.n_threads > 0) {
-                params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
-                params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
-            }
-
-            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
 
