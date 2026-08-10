@@ -1259,6 +1259,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (staged && !use_stage) {
             llama_set_dflash_inject_stage(ctx_dft, nullptr);
         }
+        if (use_stage) {
+            // the drafter's sched reads the stage on its own streams: fence the target's
+            // in-flight compute (the host path synced implicitly via the D2H readback)
+            llama_synchronize(ctx_tgt);
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
