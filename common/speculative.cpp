@@ -960,6 +960,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // encoder (fc + enc-norm) in-graph — no llama_encode round-trip per prefill chunk
     bool fused_inject = false;
 
+    // adaptive draft length (fork cab1fb597): halve the per-seq draft cap after 3
+    // consecutive low-acceptance rounds (<30%), recover +1 per good round (>60%);
+    // never exceeds params.n_max, so the default fixed-depth behavior is the ceiling
+    bool adaptive = false;
+    std::vector<int32_t> adpt_n_draft_last; // [n_seq] size of the last emitted draft
+    std::vector<int32_t> adpt_n_low_acc;    // [n_seq] consecutive low-acceptance rounds
+    std::vector<int32_t> adpt_cap;          // [n_seq] current draft cap (-1 = n_max)
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
     int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
@@ -1082,6 +1090,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // adaptive draft length controller. Kill switch: GGML_DFLASH_DRAFT_ADAPTIVE=0.
+        {
+            const char * env = getenv("GGML_DFLASH_DRAFT_ADAPTIVE");
+            adaptive = !(env && atoi(env) == 0);
+        }
+        adpt_n_draft_last.assign(n_seq, 0);
+        adpt_n_low_acc   .assign(n_seq, 0);
+        adpt_cap         .assign(n_seq, -1);
+
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -1089,6 +1106,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // warm up both drafter graph modes (embd inject + token draft) so the first
+        // request doesn't pay backend module load / pool growth (fork 2a491077d).
+        // Kill switch: GGML_DFLASH_DRAFT_WARMUP=0.
+        {
+            const char * env = getenv("GGML_DFLASH_DRAFT_WARMUP");
+            if (!(env && atoi(env) == 0)) {
+                llama_set_warmup(ctx_dft, true);
+
+                // injection graph: one zero-feature row at pos 0
+                batch_inject.n_tokens = 1;
+                std::memset(batch_inject.embd, 0,
+                        (size_t) (fused_inject ? n_embd_enc : n_embd_dec) * sizeof(float));
+                batch_inject.pos[0]       = 0;
+                batch_inject.n_seq_id[0]  = 1;
+                batch_inject.seq_id[0][0] = 0;
+                batch_inject.logits[0]    = false;
+                if (llama_decode(ctx_dft, batch_inject) != 0) {
+                    LOG_WRN("%s: drafter inject warmup decode failed (non-fatal)\n", __func__);
+                }
+
+                // draft graph: one noise block (mask tokens are valid vocab ids)
+                if (mask_token_id >= 0) {
+                    common_batch_clear(batch);
+                    const int32_t n_wtok = this->params.n_max + (is_dspark ? 0 : 1);
+                    for (int32_t i = 0; i < n_wtok; ++i) {
+                        common_batch_add(batch, mask_token_id, i + 1, { 0 }, true);
+                    }
+                    if (llama_decode(ctx_dft, batch) != 0) {
+                        LOG_WRN("%s: drafter draft warmup decode failed (non-fatal)\n", __func__);
+                    }
+                }
+
+                llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+                if (mem_dft) {
+                    llama_memory_clear(mem_dft, true);
+                }
+                llama_synchronize(ctx_dft);
+                llama_perf_context_reset(ctx_dft);
+                llama_set_warmup(ctx_dft, false);
+
+                LOG_INF("%s: - drafter warmup complete (inject + draft graphs)\n", __func__);
+            }
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1100,6 +1161,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // fresh request: reset the adaptive draft-length state for this seq
+        adpt_n_draft_last[seq_id] = 0;
+        adpt_n_low_acc   [seq_id] = 0;
+        adpt_cap         [seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1151,6 +1217,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        const int64_t t_proc0 = ggml_time_us();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1238,6 +1306,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        LOG_DBG("%s: process (capture+%s+inject) %.2f ms (%d tokens)\n",
+                __func__, fused_inject ? "fused" : "encode",
+                (ggml_time_us() - t_proc0) / 1e3, (int) n_tokens);
+
         return true;
     }
 
@@ -1263,7 +1335,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = (adaptive && adpt_cap[seq_id] > 0)
+                ? std::min(adpt_cap[seq_id], params.n_max)
+                : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1278,11 +1352,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const int64_t t_dec0 = ggml_time_us();
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
+        llama_synchronize(ctx_dft);
+        LOG_DBG("%s: draft decode %.2f ms (%d tokens)\n",
+                __func__, (ggml_time_us() - t_dec0) / 1e3, (int) batch.n_tokens);
         last_draft_model_decode_succeeded = true;
 
         // GPU sampling results: K ids + log-probs per batch row, row order == batch order
@@ -1405,11 +1483,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+
+            adpt_n_draft_last[seq_id] = (int32_t) result.size();
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (!adaptive || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t n_last = adpt_n_draft_last[seq_id];
+        adpt_n_draft_last[seq_id] = 0;
+        if (n_last <= 0) {
+            return;
+        }
+
+        const float f_acc = (float) n_accepted / (float) n_last;
+        if (f_acc < 0.3f) {
+            if (++adpt_n_low_acc[seq_id] >= 3) {
+                const int32_t base = adpt_cap[seq_id] > 0 ? adpt_cap[seq_id] : params.n_max;
+                adpt_cap[seq_id] = std::max(1, base / 2);
+                adpt_n_low_acc[seq_id] = 0;
+                LOG_DBG("%s: seq %d low-acceptance streak - draft cap -> %d\n",
+                        __func__, (int) seq_id, adpt_cap[seq_id]);
+            }
+        } else {
+            adpt_n_low_acc[seq_id] = 0;
+            if (f_acc > 0.6f && adpt_cap[seq_id] > 0) {
+                adpt_cap[seq_id]++;
+                if (adpt_cap[seq_id] >= params.n_max) {
+                    adpt_cap[seq_id] = -1; // fully recovered
+                }
+            }
+        }
     }
 
     bool need_embd() const override {
