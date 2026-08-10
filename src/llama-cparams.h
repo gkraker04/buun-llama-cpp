@@ -80,6 +80,30 @@ struct llama_cparams {
     // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
     int dflash_topk = 1;
 
+    // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
+    // tail (t_logits_argmax) on the decode graph so the draft loop reads K ids+logprobs
+    // per position instead of the full-vocab logits. Opt-in from the speculative impl;
+    // default off keeps raw-logits behavior for every other consumer.
+    bool dflash_argmax = false;
+
+    // Upstream block-diffusion drafter: fused encoder+injection. Decode embd batches
+    // carry raw concatenated target features (n_embd_inp_enc wide); the injection graph
+    // applies fc + enc-norm itself, replacing the separate llama_encode round-trip.
+    bool dflash_fused_inject = false;
+
+    // Upstream drafter device-staged capture (TARGET context): when set, the target
+    // graph copies each captured layer's input into this persistent [n_embd_enc, T]
+    // tensor with an interleaved (strided) layout — the interleave happens inside the
+    // D2D capture copies. Layer order in dflash_draft_stage_layers (k -> layer id).
+    ggml_tensor *        dflash_draft_stage = nullptr;
+    std::vector<int32_t> dflash_draft_stage_layers;
+
+    // Upstream drafter staged injection (DRAFTER context): the fused inject graph
+    // gathers its feature rows from this tensor (the target's stage) via a per-decode
+    // row-index input instead of a host embd upload.
+    ggml_tensor *        dflash_inject_stage = nullptr;
+    std::vector<int32_t> dflash_inject_rows;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
     // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the

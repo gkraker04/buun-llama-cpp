@@ -4,6 +4,29 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <atomic>
+
+// GPU top-K/argmax draft sampling tail (opt-in via llama_set_dflash_argmax): computes
+// K ids + log-probs per draft position in-graph so the draft loop skips the full-vocab
+// logits transfer + CPU scan. Mirrors the fork drafter's tail (dflash_draft.cpp).
+static void build_dflash_draft_argmax(llm_graph_context & g) {
+    if (!g.cparams.dflash_argmax || !g.res->t_logits) {
+        return;
+    }
+
+    const float sample_temp = g.cparams.dflash_sample_temp;
+    static std::atomic<uint64_t> gumbel_counter{1};
+    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+
+    const int topk = g.cparams.dflash_topk;
+    ggml_tensor * t = topk > 1
+        ? ggml_topk_ext  (g.ctx0, g.res->t_logits, topk, sample_temp, seed)
+        : ggml_argmax_ext(g.ctx0, g.res->t_logits,       sample_temp, seed);
+
+    g.res->t_logits_argmax = t;
+    ggml_build_forward_expand(g.gf, t);
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -227,6 +250,43 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+// Injection-graph feature input, three flavors:
+//   * staged (fused + inject_stage bound): gather rows on-device from the target's
+//     capture stage via a per-decode row-index input — no host feature upload at all
+//   * fused: raw concatenated target features from the batch (H2D), fc + enc-norm here
+//   * unfused: pre-encoded g rows from the batch (H2D)
+static ggml_tensor * build_dflash_inject_input(llm_graph_context & g, const llama_model & model, int64_t n_embd) {
+    const auto & cparams = g.cparams;
+    const bool fused = cparams.dflash_fused_inject;
+
+    ggml_tensor * cur = nullptr;
+    if (fused && cparams.dflash_inject_stage) {
+        auto inp = std::make_unique<llm_graph_input_dflash_stage_rows>(cparams);
+        inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
+        ggml_set_input(inp->rows);
+        cur = ggml_get_rows(g.ctx0, cparams.dflash_inject_stage, inp->rows);
+        g.res->add_input(std::move(inp));
+    } else {
+        const int64_t n_embd_in = fused ? g.hparams.n_embd_inp_enc() : n_embd;
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_in);
+        inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_in, g.n_tokens);
+        ggml_set_input(inp->embd);
+        cur = inp->embd;
+        g.res->add_input(std::move(inp));
+    }
+    g.cb(cur, "inp_g_embeddings", -1);
+
+    if (fused) {
+        cur = g.build_lora_mm(model.fc, cur);
+        g.cb(cur, "fc_out", -1);
+
+        cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        g.cb(cur, "enc_norm_out", -1);
+    }
+
+    return cur;
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
@@ -341,15 +401,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
-
-        res->add_input(std::move(inp));
+        ggml_tensor * inp_g = build_dflash_inject_input(*this, model, n_embd);
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -507,6 +559,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+
+    build_dflash_draft_argmax(*this);
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
@@ -524,15 +578,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
-
-        res->add_input(std::move(inp));
+        ggml_tensor * inp_g = build_dflash_inject_input(*this, model, n_embd);
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -682,4 +728,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+
+    build_dflash_draft_argmax(*this);
 }
