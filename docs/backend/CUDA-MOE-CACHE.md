@@ -1,5 +1,11 @@
 # CUDA MoE expert cache
 
+> **Credit.** MoE expert cache by leloch (github.com/leloch/llama.cpp, branch
+> `moe-cache-v2-pr`; RFC ggml-org/llama.cpp#24528); soft-mode partial-eviction fit by
+> giveen (TheTom/llama-cpp-turboquant#284). MIT. Ported into this fork with the original
+> commit series and authorship preserved; the Metal/Vulkan v1 backends from that PR were
+> not ported (CUDA/ROCm fork).
+
 The CUDA MoE expert cache accelerates decode when routed expert weights remain in host memory. A cache hit runs the selected expert matvec on CUDA while the CPU computes the miss rows through the normal `MUL_MAT_ID` kernel. Exact gate/up/SwiGLU subgraphs can fuse rows resident in both weight tensors while half-resident and missing rows stay on the stock CPU path. The cache belongs to one backend scheduler and persists until that scheduler is destroyed.
 
 This is an opportunistic path. Unsupported nodes, unavailable cache capacity, contention, and cache failures fall back to CPU execution.

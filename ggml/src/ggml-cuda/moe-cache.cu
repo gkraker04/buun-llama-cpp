@@ -1,3 +1,7 @@
+// MoE expert cache by leloch (github.com/leloch/llama.cpp, branch moe-cache-v2-pr;
+// RFC ggml-org/llama.cpp#24528); soft-mode partial-eviction fit by giveen
+// (TheTom/llama-cpp-turboquant#284). MIT.
+
 #include "moe-cache.cuh"
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
