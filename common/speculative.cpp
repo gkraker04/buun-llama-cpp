@@ -2704,6 +2704,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     // GPU cross-attention ring (nullptr = CPU fallback)
     void * gpu_ring_handle = nullptr;
 
+    // Projected cross-KV cache (nullptr = legacy full-recompute path).
+    // crosskv_projected_len counts committed tokens whose projections are cached;
+    // ring resets / checkpoint loads zero it, forcing a cold window refill.
+    void * crosskv_handle = nullptr;
+    int crosskv_projected_len = 0;
+
     // true when D2D staged writes have bypassed the host ring since the last
     // sync_cpu_ring_from_gpu() (checkpoint save rebuilds the host mirror lazily)
     bool cpu_ring_stale = false;
@@ -2720,6 +2726,29 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         if (gpu_ring_handle) {
             int gpu_write_pos = ring_write_pos % ctx_window;
             int gpu_filled = std::min(ring_filled, ctx_window);
+            if (crosskv_handle) {
+                // project only the tokens ringed since the last draft call; a cold or
+                // desynced counter (reset, prefill burst > window) refills the window
+                int n_new = committed_len - crosskv_projected_len;
+                if (n_new < 0 || n_new > gpu_filled) {
+                    n_new = gpu_filled;
+                }
+                bool ok = true;
+                if (n_new > 0) {
+                    ok = llama_dflash_crosskv_project(ctx, crosskv_handle, gpu_ring_handle,
+                                                      gpu_write_pos, n_new);
+                }
+                if (ok) {
+                    crosskv_projected_len = committed_len;
+                    llama_dflash_crosskv_set_cross(ctx, crosskv_handle, seq_id,
+                                                   gpu_write_pos, gpu_filled);
+                    return gpu_filled;
+                }
+                // projection failed — permanently fall back to the legacy path
+                LOG_WRN("dflash: cross-KV projection failed, disabling the projected cache\n");
+                llama_dflash_crosskv_free(crosskv_handle);
+                crosskv_handle = nullptr;
+            }
             llama_dflash_cross_ring_gpu_set_cross(ctx, gpu_ring_handle, seq_id,
                 gpu_write_pos, gpu_filled, n_target_layers, n_embd, ctx_window);
             return gpu_filled;
@@ -2792,6 +2821,17 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             LOG_INF("dflash: GPU capture staging enabled (device-side l_out -> ring)\n");
         }
 
+        // projected cross-KV cache: single-slot GPU-ring path only; GGML_DFLASH_CROSSKV=0 kills it
+        if (gpu_ring_handle && n_seq == 1) {
+            const char * env_ckv = getenv("GGML_DFLASH_CROSSKV");
+            if (!env_ckv || atoi(env_ckv) != 0) {
+                crosskv_handle = llama_dflash_crosskv_init(ctx_dft, gpu_ring_handle, ctx_window);
+                if (crosskv_handle) {
+                    LOG_INF("dflash: projected cross-KV cache enabled (%d slots)\n", ctx_window);
+                }
+            }
+        }
+
         {
             std::string ids_str;
             for (int i = 0; i < n_target_layers; ++i) {
@@ -2804,6 +2844,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_dflash() override {
+        llama_dflash_crosskv_free(crosskv_handle);
         llama_dflash_cross_ring_gpu_free(gpu_ring_handle);
         llama_batch_free(batch_dft);
         if (owns_ctx_dft) {
@@ -2855,6 +2896,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
+            crosskv_projected_len = 0; // ring reset invalidates all cached projections
         }
 
         ring_write((int)n_tokens);
@@ -2956,6 +2998,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         // mark as flushed so subsequent flush_prefill() calls from suffix
         // decoding APPEND to the restored ring instead of resetting it
         prefill_flushed = true;
+
+        // restored ring contents are new to the projected cache — force cold refill
+        crosskv_projected_len = 0;
 
         return true;
     }
@@ -3363,6 +3408,7 @@ private:
 
         ring_write_pos = 0;
         ring_filled = 0;
+        crosskv_projected_len = 0; // ring reset invalidates all cached projections
         ring_write(to_store, start_offset);
         committed_len = (int)n_tokens;
     }

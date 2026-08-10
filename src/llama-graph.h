@@ -93,6 +93,24 @@ struct llama_cross {
     int64_t v_embd_gpu_n_enc_real = 0;
     void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
 
+    // Projected cross-KV cache (DFlash drafter, single-slot GPU path).
+    // When active, the drafter graph reads per-layer projected K (pre-RoPE,
+    // post k-norm) and V windows from a GPU side cache instead of re-running
+    // dflash_fc + wk/wv over the whole hidden-state ring on every draft call.
+    // Any legacy set_cross_data*() call deactivates it (mode exclusivity).
+    struct {
+        bool    active = false;
+        int     n_layer = 0;     // drafter layers
+        int64_t k_row = 0;       // floats per token (n_embd_k_gqa)
+        int64_t v_row = 0;       // floats per token (n_embd_v_gqa)
+        int     ring_size = 0;
+        int     read_start = 0;  // ring slot of the oldest window entry
+        int     n_real = 0;      // valid window length
+        void  * cache = nullptr; // opaque dflash_crosskv cache handle
+        // proc: (cache, layer, which 0=K/1=V, start, n_tokens, dev_dst, dst_off_bytes)
+        void (*fn_read_window)(void *, int, int, int, int, void *, size_t) = nullptr;
+    } ckv;
+
     // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot
     // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.

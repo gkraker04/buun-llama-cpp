@@ -661,11 +661,37 @@ llama_context::llama_context(
     }
 }
 
+// Aux projection graph state for the DFlash projected cross-KV cache: one lazily
+// built fixed-width graph per chunk-width bucket, reused across draft calls on a
+// private gallocr so the main drafter graph's scheduler reuse is never disturbed.
+struct dflash_crosskv_proj {
+    ggml_backend_t backend = nullptr;
+
+    struct graph_slot {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph  * gf  = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        ggml_tensor * in_x = nullptr;
+        std::vector<ggml_tensor *> out_k;
+        std::vector<ggml_tensor *> out_v;
+    };
+    std::map<int, graph_slot> graphs; // chunk width -> graph
+
+    ~dflash_crosskv_proj() {
+        for (auto & it : graphs) {
+            if (it.second.galloc) ggml_gallocr_free(it.second.galloc);
+            if (it.second.ctx)    ggml_free(it.second.ctx);
+        }
+    }
+};
+
 llama_context::~llama_context() {
     // Context teardown is a terminal lifecycle boundary. Drain pending decode work while both the
     // scheduler and memory tree are still alive, so deferred VBR work reaches its normal fence and
     // pending asynchronous copies into the output buffers finish before those buffers are freed.
     synchronize();
+
+    delete crosskv_proj;
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -2846,6 +2872,7 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     cross.n_embd    = n_embd;
     cross.n_enc     = bucket;
     cross.n_enc_real = n_tokens;  // actual full data length (for windowing in set_input)
+    cross.ckv.active = false;     // legacy path owns the cross state now
     cross.v_embd.resize(n_embd * n_tokens);
     if (data) {
         memcpy(cross.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
@@ -2887,6 +2914,7 @@ void llama_context::set_cross_data_gpu(
     cross.n_embd     = n_target_features;
     cross.n_enc      = bucket;
     cross.n_enc_real = cross_len;
+    cross.ckv.active = false;     // legacy GPU path owns the cross state now
     cross.v_embd_gpu = d_staging;
     cross.v_embd_gpu_n_enc_real = cross_len;
     cross.fn_set_tensor_d2d = fn_d2d;
@@ -6806,6 +6834,270 @@ void llama_dflash_cross_ring_gpu_set_cross(
 
     int cross_len = ring_filled < ctx_window ? ring_filled : ctx_window;
     ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor);
+}
+
+// --- DFlash projected cross-KV cache ---
+
+struct llama_dflash_crosskv_handle {
+    void * cache = nullptr;
+    void (*fn_free)(void *) = nullptr;
+    void (*fn_write)(void *, int, int, int, const void *, int) = nullptr;
+    void (*fn_read)(void *, int, int, int, int, void *, size_t) = nullptr;
+    void (*fn_sync)(void) = nullptr;
+    int     ring_size = 0;
+    int     n_layer = 0;
+    int64_t k_row = 0;
+    int64_t v_row = 0;
+};
+
+void * llama_context::crosskv_init(void * ring_handle, int ring_size) {
+    if (!ring_handle || ring_size <= 0) {
+        return nullptr;
+    }
+    // the aux projection graph replicates the qwen dflash-draft compute chain —
+    // other drafter archs (gemma4 grafts) keep the legacy full-recompute path
+    if (model.arch != LLM_ARCH_DFLASH_DRAFT) {
+        return nullptr;
+    }
+
+    ggml_backend_t backend = find_gpu_backend();
+    if (!backend) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (!reg) {
+        return nullptr;
+    }
+
+    using alloc_fn_t = void * (*)(int, int64_t, int64_t, int, int);
+    using free_fn_t  = void   (*)(void *);
+    using write_fn_t = void   (*)(void *, int, int, int, const void *, int);
+    using read_fn_t  = void   (*)(void *, int, int, int, int, void *, size_t);
+    using sync_fn_t  = void   (*)(void);
+
+    auto fn_alloc = (alloc_fn_t) ggml_backend_reg_get_proc_address(reg, "dflash_crosskv_alloc");
+    auto fn_free  = (free_fn_t)  ggml_backend_reg_get_proc_address(reg, "dflash_crosskv_free");
+    auto fn_write = (write_fn_t) ggml_backend_reg_get_proc_address(reg, "dflash_crosskv_write");
+    auto fn_read  = (read_fn_t)  ggml_backend_reg_get_proc_address(reg, "dflash_crosskv_read_window");
+    auto fn_sync  = (sync_fn_t)  ggml_backend_reg_get_proc_address(reg, "dflash_crosskv_sync");
+    if (!fn_alloc || !fn_free || !fn_write || !fn_read || !fn_sync) {
+        return nullptr;
+    }
+
+    // the aux graph computes on `backend` directly — every weight it reads must be
+    // resident on a buffer that backend can consume (rules out host/other-GPU splits)
+    const auto & hparams = model.hparams;
+    const int n_layer = hparams.n_layer();
+    std::vector<ggml_tensor *> weights = { model.dflash_fc, model.dflash_hidden_norm };
+    for (int il = 0; il < n_layer; ++il) {
+        weights.push_back(model.layers[il].wk);
+        weights.push_back(model.layers[il].wv);
+        weights.push_back(model.layers[il].attn_k_norm);
+    }
+    for (ggml_tensor * w : weights) {
+        if (!w || !w->buffer || !ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(w->buffer))) {
+            return nullptr;
+        }
+    }
+
+    const int64_t k_row = hparams.n_embd_k_gqa();
+    const int64_t v_row = hparams.n_embd_v_gqa();
+
+    // lossy storage experiment (back-port 2): GGML_DFLASH_CROSSKV_QUANT=q8_0|1
+    // stores the cached projections as q8_0 blocks. OFF by default — it changes
+    // drafter inputs, so acceptance must be re-measured whenever it is enabled.
+    int quant = 0;
+    if (const char * eq = getenv("GGML_DFLASH_CROSSKV_QUANT")) {
+        if (strcmp(eq, "q8_0") == 0 || atoi(eq) == 1) {
+            quant = 1;
+        }
+    }
+
+    void * cache = fn_alloc(n_layer, k_row, v_row, ring_size, quant);
+    if (!cache) {
+        return nullptr;
+    }
+
+    auto * h = new llama_dflash_crosskv_handle();
+    h->cache     = cache;
+    h->fn_free   = fn_free;
+    h->fn_write  = fn_write;
+    h->fn_read   = fn_read;
+    h->fn_sync   = fn_sync;
+    h->ring_size = ring_size;
+    h->n_layer   = n_layer;
+    h->k_row     = k_row;
+    h->v_row     = v_row;
+
+    if (!crosskv_proj) {
+        crosskv_proj = new dflash_crosskv_proj();
+        crosskv_proj->backend = backend;
+    }
+    return h;
+}
+
+// Build (or fetch) the fixed-width aux projection graph. Ops replicate the main
+// drafter graph's cross chain exactly (build_lora_mm == plain mul_mat with no
+// adapters loaded, build_norm == rms_norm+mul) so cached projections match the
+// full-recompute values up to matmul batch-width numerics.
+static dflash_crosskv_proj::graph_slot * crosskv_get_graph(
+        dflash_crosskv_proj * proj, const llama_model & model, int width) {
+    auto it = proj->graphs.find(width);
+    if (it != proj->graphs.end()) {
+        return it->second.gf ? &it->second : nullptr;
+    }
+
+    auto & g = proj->graphs[width]; // default slot doubles as a failure marker
+
+    const auto & hparams = model.hparams;
+    const int     n_layer = hparams.n_layer();
+    const int64_t n_feat  = hparams.dflash_n_target_features;
+    const float   eps     = hparams.f_norm_rms_eps;
+
+    const size_t mem = ggml_tensor_overhead()*(size_t)(16 + 8*n_layer) + ggml_graph_overhead();
+    ggml_init_params ip = { mem, nullptr, true };
+    g.ctx = ggml_init(ip);
+    if (!g.ctx) {
+        return nullptr;
+    }
+
+    ggml_tensor * in_x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_feat, width);
+    ggml_set_input(in_x);
+
+    ggml_tensor * fused = ggml_mul_mat(g.ctx, model.dflash_fc, in_x);
+    fused = ggml_rms_norm(g.ctx, fused, eps);
+    fused = ggml_mul(g.ctx, fused, model.dflash_hidden_norm);
+
+    g.gf = ggml_new_graph_custom(g.ctx, GGML_DEFAULT_GRAPH_SIZE, false);
+
+    for (int il = 0; il < n_layer; ++il) {
+        const int64_t head_dim  = hparams.n_embd_head_k(il);
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+
+        ggml_tensor * k = ggml_mul_mat(g.ctx, model.layers[il].wk, fused);
+        k = ggml_reshape_3d(g.ctx, k, head_dim, n_head_kv, width);
+        k = ggml_rms_norm(g.ctx, k, eps);
+        k = ggml_mul(g.ctx, k, model.layers[il].attn_k_norm);
+        ggml_set_output(k);
+
+        ggml_tensor * v = ggml_mul_mat(g.ctx, model.layers[il].wv, fused);
+        ggml_set_output(v);
+
+        ggml_build_forward_expand(g.gf, k);
+        ggml_build_forward_expand(g.gf, v);
+        g.out_k.push_back(k);
+        g.out_v.push_back(v);
+    }
+
+    g.in_x   = in_x;
+    g.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(proj->backend));
+    if (!g.galloc || !ggml_gallocr_alloc_graph(g.galloc, g.gf)) {
+        g.gf = nullptr;
+        return nullptr;
+    }
+    return &g;
+}
+
+bool llama_context::crosskv_project(void * handle, void * ring_handle, int end_slot, int n_new) {
+    auto * h  = (llama_dflash_crosskv_handle *) handle;
+    auto * rh = (dflash_cross_ring_handle *) ring_handle;
+    if (!h || !rh || !crosskv_proj || n_new <= 0 || n_new > h->ring_size) {
+        return false;
+    }
+
+    const int64_t n_feat = model.hparams.dflash_n_target_features;
+    const int rs = h->ring_size;
+
+    int remaining = n_new;
+    int pos = ((end_slot - n_new) % rs + rs) % rs;
+
+    while (remaining > 0) {
+        const int chunk = std::min(remaining, 512);
+        // width bucket: min 32 keeps the matmuls on the same batched kernel family
+        // (MMQ / cuBLAS) the full-recompute path uses, never the small-batch mmvq/mmf
+        int width = 32;
+        while (width < chunk) width <<= 1;
+
+        auto * g = crosskv_get_graph(crosskv_proj, model, width);
+        if (!g) {
+            return false;
+        }
+
+        // interleave exactly the [pos, pos+chunk) ring span into the staging buffer
+        const float * d_x = rh->fn_interleave(rh->gpu_ring, (pos + chunk) % rs, chunk, rs);
+        if (!d_x) {
+            return false;
+        }
+        rh->fn_set_tensor(g->in_x->data, d_x, 0, (size_t) chunk * n_feat * sizeof(float));
+        // ring copies run on a different stream than backend compute — fence them
+        // (also fences the previous iteration's cache scatters before out_* reuse)
+        h->fn_sync();
+
+        if (ggml_backend_graph_compute(crosskv_proj->backend, g->gf) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+
+        // compute is host-synchronous: scatters below see finished outputs
+        for (int il = 0; il < h->n_layer; ++il) {
+            h->fn_write(h->cache, il, 0, pos, g->out_k[il]->data, chunk);
+            h->fn_write(h->cache, il, 1, pos, g->out_v[il]->data, chunk);
+        }
+
+        pos = (pos + chunk) % rs;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+void llama_context::crosskv_set_cross(void * handle, llama_seq_id seq_id, int end_slot, int n_real) {
+    auto * h = (llama_dflash_crosskv_handle *) handle;
+    if (!h) {
+        return;
+    }
+
+    const int64_t max_ctx = dflash_max_cross_ctx();
+    const int64_t capped  = (max_ctx > 0 && n_real > max_ctx) ? max_ctx : n_real;
+    const int64_t bucket  = cross_bucket(capped);
+
+    if (cross.n_enc != bucket) {
+        sched_need_reserve = true;
+    }
+    cross.n_embd     = model.hparams.dflash_n_target_features;
+    cross.n_enc      = bucket;
+    cross.n_enc_real = n_real;
+    cross.v_embd_gpu = nullptr;
+
+    const int rs = h->ring_size;
+    cross.ckv.active         = true;
+    cross.ckv.n_layer        = h->n_layer;
+    cross.ckv.k_row          = h->k_row;
+    cross.ckv.v_row          = h->v_row;
+    cross.ckv.ring_size      = rs;
+    cross.ckv.read_start     = ((end_slot - n_real) % rs + rs) % rs;
+    cross.ckv.n_real         = n_real;
+    cross.ckv.cache          = h->cache;
+    cross.ckv.fn_read_window = h->fn_read;
+
+    GGML_UNUSED(seq_id); // single-slot only; the per-call set fully owns the state
+}
+
+void * llama_dflash_crosskv_init(llama_context * ctx, void * ring_handle, int ring_size) {
+    return ctx->crosskv_init(ring_handle, ring_size);
+}
+
+void llama_dflash_crosskv_free(void * handle) {
+    if (!handle) return;
+    auto * h = (llama_dflash_crosskv_handle *) handle;
+    h->fn_free(h->cache);
+    delete h;
+}
+
+bool llama_dflash_crosskv_project(llama_context * ctx, void * handle, void * ring_handle, int end_slot, int n_new) {
+    return ctx->crosskv_project(handle, ring_handle, end_slot, n_new);
+}
+
+void llama_dflash_crosskv_set_cross(llama_context * ctx, void * handle, llama_seq_id seq_id, int end_slot, int n_real) {
+    ctx->crosskv_set_cross(handle, seq_id, end_slot, n_real);
 }
 
 void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {

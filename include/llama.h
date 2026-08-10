@@ -1324,6 +1324,19 @@ extern "C" {
     LLAMA_API bool   llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd);
     LLAMA_API bool   llama_dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd);
 
+    // DFlash projected cross-KV cache: per-(drafter layer, ring slot) K/V projections
+    // cached on GPU so each draft call projects only the newly ringed tokens instead of
+    // re-running dflash_fc + wk/wv over the whole ring. Single-slot GPU-ring path only.
+    // init returns NULL when unsupported (non dflash-draft arch, CPU drafter, missing
+    // backend procs); callers must then keep the legacy path. Kill: GGML_DFLASH_CROSSKV=0.
+    LLAMA_API void * llama_dflash_crosskv_init(struct llama_context * ctx, void * ring_handle, int ring_size);
+    LLAMA_API void   llama_dflash_crosskv_free(void * handle);
+    // project the n_new ring tokens ending at ring slot end_slot (exclusive) into the cache
+    LLAMA_API bool   llama_dflash_crosskv_project(struct llama_context * ctx, void * handle, void * ring_handle, int end_slot, int n_new);
+    // flip the drafter graph into cache-consumer mode for the next decode: window of
+    // n_real tokens ending at end_slot (exclusive)
+    LLAMA_API void   llama_dflash_crosskv_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int end_slot, int n_real);
+
     // DFlash GPU capture staging: graph-embedded l_out copies on the target context.
     // Enable only when a device-side consumer route exists (see write_d2d); the getter
     // reports tokens staged by the last staged decode (0 = host capture was used) and
