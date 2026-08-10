@@ -1627,6 +1627,14 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         const size_t v_size = (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
         v_fp16 = kv_dequant_scratch(ctx, v_size, ctx.fattn_scratch.v);
         dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+        // Coupled K==V cache (dsv4 latent / gemma4 attention_k_eq_v: build_attn gets the SAME
+        // tensor for K and V): the shared tensor was encoded ONCE through the K path (set-rows
+        // keys the trellis codebook off the cache_k_ tensor name), so this V-side read must
+        // decode with the K codebook + K decode-alpha. t2/t3's separately-trained K/V books are
+        // near-identical (corr>0.998), which masked the mismatch as a small quality tax;
+        // turbo1_tcq's K/V books are unrelated (different training seeds), so the V book
+        // decodes K-encoded trellis bits as noise -> incoherent output.
+        const bool v_is_k_encoded = V->data == K->data && V->type == K->type;
         if (V->type == GGML_TYPE_TURBO2_0) {
             k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -1644,7 +1652,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
         } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
             // Runtime codebook loading for 2-bit V decode (in case K is a different type)
             {
@@ -1656,7 +1665,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 }
             }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
         } else if (V->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -1668,7 +1678,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // attention output, same contract as turbo2/3_tcq. Must stay in lockstep with the
             // turbo_v_rotated set in llama-graph.cpp.
             k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
         } else if (V->type == GGML_TYPE_BF16) {
             // bf16 V (mixed K/V): cast to f16 in original domain. Not rotated, and the graph-level
             // inverse WHT is gated on V being a turbo type (llama-graph.cpp), so none is applied.
@@ -2465,8 +2476,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const bool quant_kv_pre_volta = pre_volta_nv && Q->ne[0] <= 256 &&
             (K->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q8_0 ||
              K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16);
+        // Coupled K==V tensors (dsv4 latent) must take the dequant path even under
+        // GGML_TURBO_DECODE_NATIVE: only the dequant sites carry the K-codebook aliasing fix —
+        // the native vec kernels decode V in-kernel with the V book and would reintroduce the
+        // codebook cross. Lift this only when a v-uses-K-book flag is threaded through the vec
+        // and MMA template instances.
+        const bool coupled_kv_tensor = V->data == K->data && V->type == K->type;
         const bool do_decode_dequant =
-            ((!turbo_decode_native || turbo8_involved) && turbo_kv &&
+            (((!turbo_decode_native || turbo8_involved) || coupled_kv_tensor) && turbo_kv &&
              (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512)))
             || quant_kv_pre_volta;
 
@@ -2584,15 +2601,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
                 // ggml_turbo_wht inverse op (added in build_attn) un-rotates the attention output.
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+                // Coupled K==V cache: same-tensor V read of K-encoded data must use the K
+                // codebook + K decode-alpha — see the matching comment on the prefill site.
+                // (This is the live dsv4 D=512 path; without it turbo1_tcq is incoherent.)
+                const bool v_is_k_encoded = V->data == K->data && V->type == K->type;
                 if (V->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
                 } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
                 } else if (V->type == GGML_TYPE_TURBO4_0) {
                     k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
@@ -2602,7 +2625,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
                     // ROTATED-domain V — see the prefill site; graph un-rotation keyed on v->type.
                     k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
+                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
         } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], 1);
