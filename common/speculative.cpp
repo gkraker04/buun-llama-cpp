@@ -1117,7 +1117,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (want_oneg) {
                     carry_rows_per_seq = this->params.n_max + 1;
                 }
-                stage_handle = llama_dflash_draft_stage_init(ctx_tgt,
+                stage_handle = llama_dflash_draft_stage_init(ctx_tgt, ctx_dft,
                         target_layer_ids, (int32_t) target_layer_ids_n, n_embd_enc,
                         (int32_t) n_seq * carry_rows_per_seq);
                 if (stage_handle) {

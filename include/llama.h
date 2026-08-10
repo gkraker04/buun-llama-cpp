@@ -1246,9 +1246,11 @@ extern "C" {
     // host extraction whenever the whole batch fits one ubatch (stage_valid_n returns the
     // covered rows, 0 = use the host path). The DRAFTER binds the stage via
     // set_inject_stage and passes per-decode row indices via set_inject_rows; its fused
-    // injection graph gathers the rows on-device. Returns nullptr when unsupported
-    // (CPU-only or tensor-parallel target).
-    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
+    // injection graph gathers the rows on-device. The stage is allocated on a GPU that
+    // both contexts can schedule (the drafter may be pinned to a subset of the target's
+    // devices via --spec-draft-device). Returns nullptr when unsupported (CPU-only or
+    // tensor-parallel target, or no GPU shared with the drafter).
+    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, struct llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
     LLAMA_API int32_t llama_dflash_draft_stage_valid_n(struct llama_context * ctx);
     LLAMA_API void    llama_set_dflash_inject_stage(struct llama_context * ctx, void * stage);
     LLAMA_API void    llama_set_dflash_inject_rows(struct llama_context * ctx, const int32_t * rows, int32_t n);

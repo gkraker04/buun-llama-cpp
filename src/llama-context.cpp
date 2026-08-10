@@ -1536,7 +1536,7 @@ void llama_context::set_dflash_fused_inject(bool enable) {
     cparams.dflash_fused_inject = enable;
 }
 
-ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
+ggml_tensor * llama_context::dflash_draft_stage_init(llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
     if (cparams.dflash_draft_stage) {
         return cparams.dflash_draft_stage; // idempotent
     }
@@ -1547,8 +1547,37 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
         return nullptr; // shards hold partial rows; host capture handles TP
     }
 
-    ggml_backend_t gpu_backend = find_gpu_backend();
+    // both scheds touch the stage: this context's graph writes it (D2D capture copies)
+    // and the drafter's graph reads it (get_rows) — a pre-allocated tensor on a device
+    // absent from either sched aborts at graph split. Pick the first GPU present in
+    // both backend sets; the target's primary GPU stays preferred when the drafter is
+    // unpinned (its devices then cover the target's).
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                     ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            continue;
+        }
+        bool dft_has_dev = ctx_dft == nullptr;
+        if (ctx_dft) {
+            for (auto & b : ctx_dft->backends) {
+                if (ggml_backend_get_device(b.get()) == dev) {
+                    dft_has_dev = true;
+                    break;
+                }
+            }
+        }
+        if (dft_has_dev) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
     if (!gpu_backend) {
+        if (find_gpu_backend()) {
+            // e.g. --spec-draft-device pinned the drafter off every target GPU, or a CPU drafter
+            LLAMA_LOG_INFO("%s: no target GPU is schedulable by the drafter - keeping host capture path\n", __func__);
+        }
         return nullptr; // CPU-only: host capture is already sync-free
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
@@ -1582,9 +1611,10 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
     cparams.dflash_draft_stage = stage;
     cparams.dflash_draft_stage_layers.assign(layer_ids, layer_ids + n_layers);
 
-    LLAMA_LOG_INFO("%s: draft capture staging: %d layers x %" PRId64 " embd x %" PRId64 " rows (%.1f MB, device-resident)\n",
+    LLAMA_LOG_INFO("%s: draft capture staging: %d layers x %" PRId64 " embd x %" PRId64 " rows (%.1f MB, device-resident on %s)\n",
             __func__, n_layers, n_embd_enc / n_layers, max_rows,
-            ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+            ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0),
+            ggml_backend_dev_name(ggml_backend_get_device(gpu_backend)));
 
     return stage;
 }
@@ -6812,8 +6842,8 @@ void llama_set_dflash_fused_inject(llama_context * ctx, bool enable) {
     ctx->set_dflash_fused_inject(enable);
 }
 
-void * llama_dflash_draft_stage_init(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
-    return (void *) ctx->dflash_draft_stage_init(layer_ids, n_layers, n_embd_enc, n_carry_rows);
+void * llama_dflash_draft_stage_init(llama_context * ctx, llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
+    return (void *) ctx->dflash_draft_stage_init(ctx_dft, layer_ids, n_layers, n_embd_enc, n_carry_rows);
 }
 
 int32_t llama_dflash_draft_stage_valid_n(llama_context * ctx) {

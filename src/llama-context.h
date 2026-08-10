@@ -633,9 +633,12 @@ public:
 
     // upstream drafter device-staged capture (this ctx = target): allocate the
     // interleaved [n_embd_enc, T] staging tensor and register the capture layers.
-    // Returns the stage tensor (opaque) or nullptr when unsupported (CPU-only,
-    // tensor-parallel split, or allocation failure). Idempotent.
-    ggml_tensor * dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
+    // The stage lives on a GPU schedulable by both this context (writer) and the
+    // drafter (reader) — a drafter pinned via --spec-draft-device cannot schedule
+    // tensors on the target's other devices. Returns the stage tensor (opaque) or
+    // nullptr when unsupported (CPU-only, tensor-parallel split, no GPU shared
+    // with the drafter, or allocation failure). Idempotent.
+    ggml_tensor * dflash_draft_stage_init(llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
     // rows staged by the last decode (0 = host fallback was used)
     int32_t dflash_draft_stage_valid_n() const { return dflash_stage_valid_n; }
     // staged injection (this ctx = drafter): bind the target's stage + set rows
