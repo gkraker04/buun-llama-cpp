@@ -235,6 +235,8 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_opt_out, LLAMA_EXAMPLE_COMMON));
         assert(!vbr_opt_out.vbr_cache_type_k);
         assert(!vbr_opt_out.vbr_cache_type_v);
+        assert(vbr_opt_out.cache_type_k_explicit);
+        assert(vbr_opt_out.cache_type_v_explicit);
         assert(!vbr_opt_out.vbr_enabled());
 
         // Explicit VBR preserves the historical full ladder: the cache STARTS at F16 (full quality
@@ -323,6 +325,35 @@ static void test(void) {
         assert(vbr_pin_v.cache_type_k == GGML_TYPE_F16);
         assert(vbr_pin_v.cache_type_v == GGML_TYPE_Q8_0);
 
+        // An explicit F16 side is a pin, not an untouched default. This must work both with
+        // the side-specific spelling and when -ct establishes F16 before one side selects VBR.
+        common_params vbr_pin_k_f16;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "f16", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_k_f16, LLAMA_EXAMPLE_COMMON));
+        assert(!vbr_pin_k_f16.vbr_cache_type_k);
+        assert(vbr_pin_k_f16.vbr_cache_type_v);
+        assert(vbr_pin_k_f16.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_pin_k_f16.cache_type_k_explicit);
+        assert(vbr_pin_k_f16.vbr_pin_k());
+
+        common_params vbr_pin_k_f16_shorthand;
+        argv = {"binary_name", "-m", "model.gguf", "-ct", "f16", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_k_f16_shorthand, LLAMA_EXAMPLE_COMMON));
+        assert(!vbr_pin_k_f16_shorthand.vbr_cache_type_k);
+        assert(vbr_pin_k_f16_shorthand.vbr_cache_type_v);
+        assert(vbr_pin_k_f16_shorthand.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_pin_k_f16_shorthand.cache_type_k_explicit);
+        assert(vbr_pin_k_f16_shorthand.vbr_pin_k());
+
+        common_params vbr_pin_v_f16;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "f16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_v_f16, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_pin_v_f16.vbr_cache_type_k);
+        assert(!vbr_pin_v_f16.vbr_cache_type_v);
+        assert(vbr_pin_v_f16.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_pin_v_f16.cache_type_v_explicit);
+        assert(vbr_pin_v_f16.vbr_pin_v());
+
         // --vbr-vram alone implies -ctk/-ctv vbr (dynamic)
         common_params vbr_vram_budget;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-vram", "24G"};
@@ -333,6 +364,11 @@ static void test(void) {
         assert(vbr_vram_budget.vbr_vram_budget_bytes == 25769803776ull);
         assert(vbr_vram_budget.vbr_dynamic());
         assert(vbr_vram_budget.vbr_min_bits_value == 4.125);
+
+        // Explicitly opting both sides out cannot be silently undone by a VBR sizing flag.
+        common_params vbr_f16_conflict;
+        argv = {"binary_name", "-m", "model.gguf", "-ct", "f16", "--vbr-vram", "24G"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_f16_conflict, LLAMA_EXAMPLE_COMMON));
 
         // A fixed --vbr-budget is an explicit static codec choice and does not inherit the
         // implicit dynamic t4 floor.
