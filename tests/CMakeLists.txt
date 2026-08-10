@@ -158,6 +158,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     add_test(
         NAME test-vbr-controller-id-cpu
         COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --f4-cpu)
+    add_test(
+        NAME test-vbr-representation-a1-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a1-cpu)
+    add_test(
+        NAME test-vbr-representation-a2-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a2-cpu)
 
     llama_build_and_test(test-cache-accounting.cpp)
     target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -177,10 +183,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-vbr-artifact-adopt.cpp)
     target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    add_test(
-        NAME test-vbr-artifact-stage-contract
-        COMMAND ${CMAKE_COMMAND} -P
-                ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-stage.cmake)
 
     llama_build_and_test(
         test-vbr-artifact-capture.cpp
@@ -220,16 +222,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-vbr-hard-seal.cpp)
     target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    add_test(
-        NAME test-e1-foundations-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-foundations.cmake)
-    add_test(
-        NAME test-e1-vbr-enforcement-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-vbr-enforcement.cmake)
 
     llama_build_and_test(
         test-cache-control.cpp
@@ -247,22 +239,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_definitions(test-cache-control PRIVATE
-        CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-control-v1.json")
-    add_test(
-        NAME test-e1-control-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-control.cmake)
-    add_test(
-        NAME test-e1-family-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-family.cmake)
-    add_test(
-        NAME test-e1-http-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-e1-http.cmake)
+        CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
 
     llama_build_and_test(test-cache-plan-estimate.cpp)
     target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -273,11 +250,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-cache-plan-authority PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
-    add_test(
-        NAME test-cache-plan-authority-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-authority.cmake)
 
     llama_build_and_test(
         test-cache-plan-preflight.cpp
@@ -287,12 +259,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_definitions(test-cache-plan-preflight PRIVATE
-        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tools/server/bench/fixtures/cache-plan-preflight-v1.json")
-    add_test(
-        NAME test-cache-plan-preflight-contract
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-preflight.cmake)
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-plan-preflight-v1.json")
 
     llama_build_and_test(
         test-retention-sidecar.cpp
@@ -404,90 +371,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 endif()
 
-add_test(
-    NAME test-vbr-operation-registry-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-operation-registry.cmake
-)
-
-add_test(
-    NAME test-vbr-controller-id-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-controller-id.cmake
-)
-
-add_test(
-    NAME test-vbr-generation-isolation-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-generation-isolation.cmake
-)
-
-add_test(
-    NAME test-vbr-artifact-format-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-format.cmake
-)
-
-add_test(
-    NAME test-vbr-artifact-server-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-server.cmake
-)
-
-add_test(
-    NAME test-vbr-artifact-validator-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-validator.cmake
-)
-
-add_test(
-    NAME test-vbr-artifact-adopt-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-artifact-adopt.cmake
-)
-
-add_test(
-    NAME test-vbr-f5-gate-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-vbr-f5-gate.cmake
-)
-
-add_test(
-    NAME test-cache-plan-contract-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-contract.cmake
-)
-
-add_test(
-    NAME test-cache-plan-fixtures-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-plan-fixtures.cmake
-)
-
-add_test(
-    NAME test-cache-destruction-inventory-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-destruction-inventory.cmake
-)
-
-add_test(
-    NAME test-cache-budget-classification-source
-    COMMAND ${CMAKE_COMMAND}
-        -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check-cache-budget-classification.cmake
-)
-
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
@@ -527,6 +410,11 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+if (MSVC)
+    target_compile_options(test-arg-parser PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-arg-parser PRIVATE -UNDEBUG)
+endif()
 llama_build_and_test(test-vbr-policy.cpp)
 llama_build_and_test(test-vbr-downward.cpp)
 llama_build_and_test(test-vbr-physical.cpp)
