@@ -1669,6 +1669,11 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
 }
 
 void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+    // fork: under the fit-probe dry context (hparams.no_alloc) buffers are sized but never
+    // allocated — writing the zero-fill would trip GGML_ASSERT(tensor->data != NULL). The
+    // metadata side (seq_rm, rs_idx) still runs so probe-time pricing stays consistent.
+    data = data && !hparams_raw.no_alloc;
+
     if (seq_id < 0) {
         kv_csa->clear(data);
         kv_hca->clear(data);
