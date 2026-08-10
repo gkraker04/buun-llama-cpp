@@ -1339,6 +1339,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 ? std::min(adpt_cap[seq_id], params.n_max)
                 : params.n_max;
 
+            // trim stale drafter cells at/after the anchor position (rejected verify
+            // tokens' injections and any prior noise) — without this the batch position
+            // continuity check rejects the draft decode after every partial-accept
+            // cycle (~1/3 of cycles on Muse). Same pre-decode seq_rm draft_simple does.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n, -1);
+
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
