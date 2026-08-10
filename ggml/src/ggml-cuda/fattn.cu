@@ -2031,11 +2031,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally
-    if (Q->ne[0] == 512) {
-        return BEST_FATTN_KERNEL_VEC;
-    }
-
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
@@ -2062,6 +2057,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // D=512 (DSV4 latent head): Turing+ routes to the MMA <512,512> case above; TILE and the
+    // remaining pre-Turing/AMD tensor paths have no 512 templates, so fall back to our vec
+    // instances (dd3b8c880) here.
+    if (Q->ne[0] == 512) {
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
