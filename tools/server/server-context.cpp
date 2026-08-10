@@ -4510,6 +4510,7 @@ private:
                         params_base.model.path.c_str(), &mparams_fit, &cparams_fit,
                         params_base.tensor_split,
                         params_base.tensor_buft_overrides.data(),
+                        &params_base.moe_cache,
                         margins_work.data(),
                         params_base.fit_params_min_ctx,
                         params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
@@ -4718,6 +4719,7 @@ private:
                         params_trial.model.path.c_str(), &mparams_trial, &cparams_trial,
                         params_trial.tensor_split,
                         params_trial.tensor_buft_overrides.data(),
+                        &params_trial.moe_cache,
                         margins_work.data(),
                         params_trial.fit_params_min_ctx,
                         params_trial.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
