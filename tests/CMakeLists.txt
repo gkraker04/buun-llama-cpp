@@ -165,6 +165,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         NAME test-vbr-representation-a2-cpu
         COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a2-cpu)
 
+    add_test(
+        NAME check-memory-tree-coverage
+        COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check-memory-tree-coverage.cmake)
+
     llama_build_and_test(test-cache-accounting.cpp)
     target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
