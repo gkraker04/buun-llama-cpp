@@ -1528,6 +1528,10 @@ void llama_context::set_dflash_sample_temp(float temp) {
     cparams.dflash_sample_temp = temp;
 }
 
+void llama_context::set_dflash_argmax(bool enable) {
+    cparams.dflash_argmax = enable;
+}
+
 void llama_context::set_dflash_topk(int k) {
     cparams.dflash_topk = (k >= 1) ? k : 1;
     // invalidate graph cache since output tensor shape changes with K
@@ -6670,6 +6674,10 @@ void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
 
 void llama_set_dflash_topk(llama_context * ctx, int k) {
     ctx->set_dflash_topk(k);
+}
+
+void llama_set_dflash_argmax(llama_context * ctx, bool enable) {
+    ctx->set_dflash_argmax(enable);
 }
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {

@@ -1227,6 +1227,12 @@ extern "C" {
     // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
     LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
 
+    // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
+    // tail on the drafter's decode graph. When enabled, the full-vocab logits transfer
+    // is skipped and llama_get_logits_argmax* returns K ids + log-probs per draft
+    // position. Set on the drafter context by the speculative impl. Default off.
+    LLAMA_API void llama_set_dflash_argmax(struct llama_context * ctx, bool enable);
+
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
     // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
     // Increases drafter ctx_len (and attention cost) linearly — set to the max slots

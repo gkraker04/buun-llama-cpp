@@ -80,6 +80,12 @@ struct llama_cparams {
     // DFlash: top-K candidates per position (1 = argmax only, >1 = tree branching)
     int dflash_topk = 1;
 
+    // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
+    // tail (t_logits_argmax) on the decode graph so the draft loop reads K ids+logprobs
+    // per position instead of the full-vocab logits. Opt-in from the speculative impl;
+    // default off keeps raw-logits behavior for every other consumer.
+    bool dflash_argmax = false;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
     // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the

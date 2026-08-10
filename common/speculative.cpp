@@ -951,6 +951,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // GPU draft sampling: top-K ids + log-probs computed in-graph (t_logits_argmax tail),
+    // skipping the full-vocab logits D2H + CPU top-k scan per draft position
+    bool    gpu_sample = false;
+    int32_t gpu_topk   = 10; // matches the CPU sampler chain's top_k
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
     int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
@@ -1041,6 +1046,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
+        }
+
+        // GPU draft sampling: build the in-graph top-K tail on the drafter decode graph.
+        // draft() then reads K ids + log-probs per position (tiny transfer) instead of
+        // pulling full-vocab logits to the host and scanning them per position.
+        // Kill switches: --no-spec-draft-backend-sampling or GGML_DFLASH_DRAFT_GPUSAMPLE=0.
+        {
+            const char * env = getenv("GGML_DFLASH_DRAFT_GPUSAMPLE");
+            gpu_sample = this->params.backend_sampling && !(env && atoi(env) == 0);
+            if (gpu_sample) {
+                llama_set_dflash_topk(ctx_dft, gpu_topk);
+                llama_set_dflash_argmax(ctx_dft, true);
+                LOG_INF("%s: - GPU draft sampling enabled (in-graph top-%d)\n", __func__, gpu_topk);
+            }
         }
 
         // turn on extraction of the target layers' input embeddings
@@ -1195,7 +1214,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            common_sampler_reset(smpls[seq_id].get());
+            if (!gpu_sample) {
+                common_sampler_reset(smpls[seq_id].get());
+            }
 
             const int32_t n = (int32_t) dp.n_past;
 
@@ -1221,6 +1242,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         last_draft_model_decode_succeeded = true;
 
+        // GPU sampling results: K ids + log-probs per batch row, row order == batch order
+        // (every draft token requests logits, so output rows track batch indices 1:1)
+        const int32_t * g_ids = nullptr;
+        const float   * g_lps = nullptr;
+        int32_t         g_K   = 0;
+        if (gpu_sample) {
+            g_ids = llama_get_logits_argmax(ctx_dft);
+            g_lps = llama_get_logits_argmax_probs(ctx_dft);
+            g_K   = llama_get_logits_argmax_k(ctx_dft);
+            if (!g_ids || !g_lps || g_K <= 0 || llama_get_logits_argmax_n(ctx_dft) != batch.n_tokens) {
+                // raw logits were skipped in favor of the in-graph tail, so there is no
+                // CPU fallback for THIS decode — produce no drafts (safe) and warn
+                LOG_WRN("%s: GPU draft sampling results unavailable (rows=%d, batch=%d) - skipping draft\n",
+                        __func__, (int) llama_get_logits_argmax_n(ctx_dft), (int) batch.n_tokens);
+                return;
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1234,6 +1273,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            // top-1 prob renormalized over the row's top-K == the CPU chain's softmax over
+            // its top-k candidates (the full-vocab log-normalizer cancels in the ratio)
+            auto gpu_top_p = [&](int32_t idx) {
+                const float * lp = g_lps + (size_t) idx * g_K;
+                float sum = 0.0f;
+                for (int32_t j = 0; j < g_K; ++j) {
+                    sum += expf(lp[j] - lp[0]);
+                }
+                return 1.0f / sum;
+            };
+
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
@@ -1244,6 +1294,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                         break;
+                    }
+
+                    if (g_ids) {
+                        const llama_token id = (llama_token) g_ids[(size_t) idx * g_K];
+                        LOG_DBG(" - seq_id %d, draft pos %3d: %6d (lp %8.3f) '%s'\n",
+                                seq_id, i, id, g_lps[(size_t) idx * g_K],
+                                common_token_to_piece(ctx_dft, id).c_str());
+                        result.push_back(id);
+                        continue;
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -1265,6 +1324,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    if (g_ids) {
+                        const int32_t idx = beg + i;
+                        const llama_token id = (llama_token) g_ids[(size_t) idx * g_K];
+                        if (params.p_min > 0.0f && gpu_top_p(idx) < params.p_min) {
+                            break;
+                        }
+                        LOG_DBG(" - seq_id %d, draft pos %3d: %6d (lp %8.3f) '%s'\n",
+                                seq_id, i - 1, id, g_lps[(size_t) idx * g_K],
+                                common_token_to_piece(ctx_dft, id).c_str());
+                        result.push_back(id);
+                        continue;
+                    }
+
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);

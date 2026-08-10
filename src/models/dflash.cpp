@@ -4,6 +4,29 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <atomic>
+
+// GPU top-K/argmax draft sampling tail (opt-in via llama_set_dflash_argmax): computes
+// K ids + log-probs per draft position in-graph so the draft loop skips the full-vocab
+// logits transfer + CPU scan. Mirrors the fork drafter's tail (dflash_draft.cpp).
+static void build_dflash_draft_argmax(llm_graph_context & g) {
+    if (!g.cparams.dflash_argmax || !g.res->t_logits) {
+        return;
+    }
+
+    const float sample_temp = g.cparams.dflash_sample_temp;
+    static std::atomic<uint64_t> gumbel_counter{1};
+    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+
+    const int topk = g.cparams.dflash_topk;
+    ggml_tensor * t = topk > 1
+        ? ggml_topk_ext  (g.ctx0, g.res->t_logits, topk, sample_temp, seed)
+        : ggml_argmax_ext(g.ctx0, g.res->t_logits,       sample_temp, seed);
+
+    g.res->t_logits_argmax = t;
+    ggml_build_forward_expand(g.gf, t);
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -507,6 +530,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+
+    build_dflash_draft_argmax(*this);
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
@@ -682,4 +707,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+
+    build_dflash_draft_argmax(*this);
 }

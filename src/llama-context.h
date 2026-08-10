@@ -628,6 +628,7 @@ public:
     int32_t dflash_capture_stage_get(int32_t layer_idx, const void ** data);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
+    void set_dflash_argmax(bool enable);
     void set_dflash_n_slots(int n);
 
     void dflash_reset_hidden_capture();
