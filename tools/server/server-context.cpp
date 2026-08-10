@@ -4709,13 +4709,16 @@ private:
                 // keep the drafter KV unified so the mixed-seq fused batch stays a
                 // single ubatch (n_stream must be 1). The impl enables the fused path
                 // only when it sees the spare seq, so ONEGRAPH=0 also skips this.
-                // DSV4-backbone drafters always decline (no fused-cycle graph), so do
-                // not reshape their cache; stage-init failures (CPU/TP targets) are not
-                // knowable here and leave a harmless unused seq.
+                // DSV4-backbone drafters carry their own kill switch on top
+                // (GGML_DFLASH_ONEGRAPH_DSV4=0 restores their two-decode path — do not
+                // reshape their cache then); stage-init failures (CPU/TP targets) are
+                // not knowable here and leave a harmless unused seq.
                 {
-                    const char * env_og = getenv("GGML_DFLASH_ONEGRAPH");
-                    if (!(env_og && atoi(env_og) == 0) &&
-                        !llama_model_dflash_dsv4_backbone(model_dft.get())) {
+                    const char * env_og   = getenv("GGML_DFLASH_ONEGRAPH");
+                    const char * env_og4  = getenv("GGML_DFLASH_ONEGRAPH_DSV4");
+                    const bool   oneg     = !(env_og  && atoi(env_og)  == 0);
+                    const bool   oneg4    = !(env_og4 && atoi(env_og4) == 0);
+                    if (oneg && (oneg4 || !llama_model_dflash_dsv4_backbone(model_dft.get()))) {
                         params_dft.n_parallel += 1;
                         params_dft.kv_unified  = true;
                     }

@@ -1263,8 +1263,8 @@ extern "C" {
     LLAMA_API bool    llama_dflash_draft_stage_carry(struct llama_context * ctx, int32_t src_row0, int32_t n_rows, int32_t dst_row0);
     LLAMA_API void    llama_set_dflash_oneg_inject(struct llama_context * ctx, void * carry, int32_t n_inject);
 
-    // true when the dflash drafter runs on the DeepSeek-V4 DSpark backbone (fused
-    // single-graph cycles are not implemented for its MLA/ring injection graph)
+    // true when the dflash drafter runs on the DeepSeek-V4 DSpark backbone (its fused
+    // single-graph cycle has its own kill switch, GGML_DFLASH_ONEGRAPH_DSV4)
     LLAMA_API bool    llama_model_dflash_dsv4_backbone(const struct llama_model * model);
 
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
