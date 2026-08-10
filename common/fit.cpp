@@ -40,6 +40,10 @@ struct common_vbr_fit_costs {
     ggml_type entry_v = GGML_TYPE_COUNT;
     double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
     double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
+    // out: model requires matching K/V cache types (MLA-family). Such caches run a static cap
+    // under dynamic VBR (no per-tier degrade), so the dry-load KV bytes are already the truth
+    // and the floor/price capacity scaling must not be applied.
+    bool      types_coupled = false;
     // #88: per-token bytes of the fattn f16 dequant scratch at the settled deep-fill state — a
     // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
     // the total-VRAM wall constraint only, never in the budget-capacity solves.
@@ -220,6 +224,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
         vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx, cparams->type_k, cparams->type_v, 1e30);
         vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
+        vbr_costs->types_coupled = llama_model_kv_cache_types_coupled(model);
     }
 
     llama_free(ctx);
@@ -285,7 +290,12 @@ static void common_params_fit_impl(
     // capacity estimates must scale measured KV cost up by mix/price or they over-advertise
     // (e.g. floor 6: price t4 = 4.125 bpv vs an achievable mix of ~6.04)
     double vbr_kv_scale = 1.0;
-    if (vbr_costs.bits_pt_floor > 0.0 && vbr_costs.bits_pt_price > 0.0) {
+    if (vbr_costs.types_coupled) {
+        // coupled-KV model (MLA family): dynamic VBR runs a static cap there, the dry-load
+        // bytes are already the achievable cost — floor/price scaling would over-advertise
+        LOG_INF("%s: VBR dynamic: coupled-KV model runs a static cap — pricing KV at dry-load bytes\n",
+                __func__);
+    } else if (vbr_costs.bits_pt_floor > 0.0 && vbr_costs.bits_pt_price > 0.0) {
         vbr_kv_scale = std::max(1.0, vbr_costs.bits_pt_floor / vbr_costs.bits_pt_price);
         if (vbr_kv_scale > 1.0 + 1e-6) {
             LOG_INF("%s: VBR dynamic: floor mix costs %.4g bits/token vs %.4g at the pricing tier "
