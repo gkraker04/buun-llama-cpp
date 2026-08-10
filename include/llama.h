@@ -672,6 +672,8 @@ extern "C" {
     LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
     // fills layer_ids[0..n-1], returns n (capped by capacity)
     LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
+    // true if a dflash-arch drafter carries the DSpark Markov-head tensors (markov_w1/w2)
+    LLAMA_API bool    llama_model_dspark_has_markov_head  (const struct llama_model * model);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

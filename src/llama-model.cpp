@@ -2939,6 +2939,10 @@ int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t *
     return n;
 }
 
+bool llama_model_dspark_has_markov_head(const llama_model * model) {
+    return model->dspark_markov_w1 != nullptr;
+}
+
 int32_t llama_model_meta_val_str(const llama_model * model, const char * key, char * buf, size_t buf_size) {
     const auto & it = model->gguf_kv.find(key);
     if (it == model->gguf_kv.end()) {

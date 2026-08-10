@@ -4650,18 +4650,30 @@ private:
 
             // Auto-detect DFlash from drafter model architecture. This tree carries TWO
             // DFlash implementations: the fork DeltaNet cross-attention drafter (arches
-            // dflash-draft / gemma4-dflash-draft, which publish their capture layers via
-            // the %s.dflash.target_layer_ids hparams) and upstream's block-diffusion
-            // drafter (LLM_ARCH_DFLASH, which publishes %s.target_layers via the model
-            // vector only). Both report dflash_block_size > 0, so discriminate on the
-            // fork hparams: routing an upstream-format drafter into the fork impl leaves
-            // it with 0 capture layers and it silently never drafts.
+            // dflash-draft / gemma4-dflash-draft) and upstream's block-diffusion drafter
+            // (arch dflash, which is also the DSpark backbone). Both report
+            // dflash_block_size > 0, so discriminate on the architecture — it selects the
+            // model graph, and each graph only works under its own driving protocol
+            // (routing an upstream-format drafter into the fork impl leaves it with 0
+            // capture layers and it silently never drafts). For arch dflash, a sidecar
+            // carrying the DSpark Markov head must run the anchor-first DSpark protocol
+            // (mirrors the download-plan rule: "dspark outranks dflash"); markov-less
+            // sidecars run plain block-diffusion.
             if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
                 params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
-                !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
-                if (llama_model_dflash_n_target_layers(model_dft.get()) > 0) {
+                !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
+                !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+                char arch_buf[128] = {};
+                llama_model_meta_val_str(model_dft.get(), "general.architecture", arch_buf, sizeof(arch_buf));
+                const std::string arch_dft = arch_buf;
+
+                if (arch_dft == "dflash-draft" || arch_dft == "gemma4-dflash-draft") {
                     params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
                     SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
+                            llama_model_dflash_block_size(model_dft.get()));
+                } else if (llama_model_dspark_has_markov_head(model_dft.get())) {
+                    params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+                    SRV_INF("auto-detected upstream DSpark drafter (block_size=%d)\n",
                             llama_model_dflash_block_size(model_dft.get()));
                 } else {
                     params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
@@ -4686,7 +4698,8 @@ private:
                 }
             }
 
-            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
                 // the shared multi-seq speculative state addresses drafter sequences by
                 // slot id, so the drafter context needs one sequence per server slot
                 params_dft.n_parallel = params_base.n_parallel;
@@ -4696,13 +4709,37 @@ private:
                 // full trained block (71.5 t/s @3 vs 66.8 @15 vs 62.2 @7; acceptance
                 // falls 68% -> 22% with depth), unlike the fork DeltaNet impl where
                 // full depth wins (EXP-37i). Only resolve a negative auto value.
+                // DSpark's anchor-first layout yields a full block_size of drafts
+                // (block-diffusion yields block_size - 1).
                 if (params_base.speculative.draft.n_max < 0) {
                     const int block_size = llama_model_dflash_block_size(model_dft.get());
-                    params_base.speculative.draft.n_max = block_size > 1 ? block_size - 1 : 12;
+                    const int depth_max  = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+                                         ? block_size : block_size - 1;
+                    params_base.speculative.draft.n_max = depth_max > 0 ? depth_max : 12;
                 }
                 if (params_base.speculative.n_max < 0) {
                     params_base.speculative.n_max = params_base.speculative.draft.n_max;
                 }
+            }
+
+            // The fork DeltaNet drafter doesn't need the target's full context (it has no
+            // KV cache — hidden states ride the cross ring): its buffers cost ~1 MiB/token,
+            // so inheriting a large -c wastes GiBs and OOMs outright at 16k (measured
+            // 2026-08-10, crosskv A/B). Auto-detected fork drafters get the same small
+            // default the --spec-dflash-default handler applies in arg.cpp; an explicit
+            // -cd N still wins (it lands in params_spec.n_ctx).
+            // Do NOT apply this to the upstream draft-dflash/draft-dspark impls: they
+            // inject target features into the drafter KV at absolute prompt positions, so
+            // the drafter context must span the target prompt — at -cd 256 any prompt
+            // past ~256 tokens fails decode ("failed to find a memory slot") and the
+            // request 500s. Their per-token drafter KV is small (DSpark: 3 MLA layers,
+            // ~3.4 KiB/token), so inheriting -c is cheap there.
+            if (params_spec.n_ctx == 0 &&
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_dft.n_ctx   = 256;
+                params_dft.n_batch = std::max(params_dft.n_ctx, params_dft.n_ubatch);
+                SRV_INF("draft ctx auto (DFlash): %d (drafter doesn't need the full main ctx; pass -cd N to override)\n",
+                        params_dft.n_ctx);
             }
 
             params_base.speculative.model_dft = model_dft.get();
@@ -4714,11 +4751,12 @@ private:
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 
-            // Upstream block-diffusion DFlash: create the drafter context here (it shares
-            // tok_embd/output with the target through cparams_dft.ctx_other) and wire the
-            // draft params so the shared speculative init below picks the draft-dflash
-            // implementation.
-            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+            // Upstream block-diffusion DFlash / DSpark: create the drafter context here
+            // (it shares tok_embd/output with the target through cparams_dft.ctx_other)
+            // and wire the draft params so the shared speculative init below picks the
+            // draft-dflash / draft-dspark implementation.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
                 params_base.speculative.cparams_dft.n_rs_seq = 0;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), params_base.speculative.cparams_dft));
                 if (ctx_dft == nullptr) {
@@ -9766,10 +9804,11 @@ private:
                 if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
                 } else if (!slot.spec && spec &&
-                           params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
-                    // upstream shared multi-seq state (block-diffusion DFlash): arm this
-                    // slot's per-seq draft params — the fork single-seq wrapper below
-                    // always drives drafter seq 0, which only matches slot 0
+                           (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK))) {
+                    // upstream shared multi-seq state (block-diffusion DFlash / DSpark):
+                    // arm this slot's per-seq draft params — the fork single-seq wrapper
+                    // below always drives drafter seq 0, which only matches slot 0
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
                     dp.drafting = true;

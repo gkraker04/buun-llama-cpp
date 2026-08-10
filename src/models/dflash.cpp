@@ -10,8 +10,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     // DFlash block size: default 16, overridable via GGUF. Must be set here (not as a
     // struct default) so only genuine DFlash drafters report block_size > 0.
+    // Upstream conversions write the bare %s.block_size key (e.g. "dflash.block_size" —
+    // DSpark sidecars carry 5 there); the fork-prefixed %s.dflash.block_size flavor is
+    // kept as a fallback. Missing both keys keeps the historic default of 16.
     hparams.dflash_block_size = 16;
-    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE, hparams.dflash_block_size, false);
+    if (!ml.get_key(LLM_KV_BLOCK_SIZE, hparams.dflash_block_size, false)) {
+        ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE, hparams.dflash_block_size, false);
+    }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
