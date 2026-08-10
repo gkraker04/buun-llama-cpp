@@ -1226,6 +1226,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
+            // trim stale drafter cells at/after this injection's start (leftover noise
+            // or rejected-draft injections from cycles where the server truncated or
+            // skipped drafting) — otherwise the batch position-continuity check rejects
+            // the injection. Mirrors eagle3's process()-side seq_rm.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
+                    batch_in.pos[i_batch_beg[seq_id]], -1);
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1335,9 +1342,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = (adaptive && adpt_cap[seq_id] > 0)
+            int32_t n_draft = (adaptive && adpt_cap[seq_id] > 0)
                 ? std::min(adpt_cap[seq_id], params.n_max)
                 : params.n_max;
+            // honor the per-call cap (e.g. remaining token budget) instead of drafting
+            // past it and having the wrapper truncate — avoids wasted mask positions
+            // and stale drafter cells beyond the verify range
+            if (dp.n_max >= 0) {
+                n_draft = std::min(n_draft, dp.n_max);
+            }
+            if (n_draft <= 0) {
+                continue;
+            }
 
             // trim stale drafter cells at/after the anchor position (rejected verify
             // tokens' injections and any prior noise) — without this the batch position
