@@ -28,9 +28,13 @@ endif()
 #                         the inner caches accept turbo/VBR types (epoch already
 #                         forwarded as the sum of both) — supporting this is a
 #                         real design task, not a ladder entry.
-#   llama_kv_cache_dsv4 — postdates the walker; composition unaudited; no VBR
-#                         wiring in its header today, so capture is unreachable
-#                         for it until that changes.
+#   llama_kv_cache_dsv4 — postdates the walker. VBR IS threaded to its four kv
+#                         children since 2026-08-10 (per-cache controllers need no
+#                         walker), but checkpoint capture stays uncovered: the csa/
+#                         hca/lid caches co-depend on compressor states the tree
+#                         has no slot for — declaring them payload_complete would
+#                         let capture claim completeness it doesn't have. Same
+#                         design task family as dsa.
 #   llama_kv_cache_msa  — arrived with the 2026-08-09 sync (74ce15741); same
 #                         status as dsv4.
 set(KNOWN_UNCOVERED

@@ -101,7 +101,8 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_memory_vbr_params & vbr = {});
 
     ~llama_kv_cache_dsv4() = default;
 
@@ -122,8 +123,8 @@ public:
     // Compressed caches support only state-dependent suffix removals, not arbitrary ranges.
     bool can_seq_rm_partial() const override { return false; }
 
-    // no VBR params are threaded to the children today, so this is a no-op — kept for
-    // coverage symmetry should that ever change
+    // VBR params are threaded to all four children (footprint-weighted split in the ctor),
+    // so each child's controller gets its breathe tick
     void breathe() override { kv_raw->breathe(); kv_csa->breathe(); kv_hca->breathe(); kv_lid->breathe(); }
 
     void clear(bool data) override;

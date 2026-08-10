@@ -1169,7 +1169,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_pad,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    const llama_memory_vbr_params & vbr) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -1196,6 +1197,28 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
+    // Turbo/VBR cap (2026-08-10): dsv4 cannot hold turbo tiers anywhere today. The attention
+    // graph concatenates raw-window K with compressed-cache K into one tensor (ggml_concat
+    // requires matching types, deepseek4.cpp), and the compressor/indexer subgraphs read cache
+    // rows via plain mul_mat, where turbo types have no vec_dot by design (fused-attention-only
+    // decode). Any turbo/dynamic-VBR request therefore degrades the WHOLE dsv4 complex to
+    // static q8_0 — proven working, half of f16, deterministic. The full ladder needs a
+    // turbo-aware concat (or split-attention merge) plus a dequant-wrapped mul_mat read path.
+    llama_memory_vbr_params vbr_raw = vbr;
+    vbr_raw.trace_label = "raw";
+    const bool comp_cap = ggml_is_turbo_kv_type(type_k) || ggml_is_turbo_kv_type(type_v) || vbr.dynamic;
+    const ggml_type type_comp = comp_cap ? GGML_TYPE_Q8_0 : type_k; // K==V enforced for this arch at init
+    if (comp_cap) {
+        type_k = type_comp;
+        type_v = type_comp;
+        vbr_raw = {};
+        vbr_raw.compute_backend_for_buft = vbr.compute_backend_for_buft;
+        LLAMA_LOG_INFO("%s: DSV4 KV runs static q8_0 (turbo/dynamic-VBR requested, but dsv4 "
+                "concatenates raw+compressed K and reads caches via mul_mat — turbo tiers decode "
+                "only inside fused attention; full-ladder support is future work)\n",
+                __func__);
+    }
+
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
     dsv4_make_k_only(hparams_raw);
@@ -1203,7 +1226,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr);
+            nullptr, filter_raw, reuse, nullptr, vbr_raw);
 
     dsv4_make_k_only(hparams_csa);
     dsv4_make_k_only(hparams_hca);
@@ -1238,25 +1261,25 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_csa = std::make_unique<llama_kv_cache>(
-            model, hparams_csa, type_k, type_v,
+            model, hparams_csa, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, llama_memory_vbr_params{});
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
 
     kv_hca = std::make_unique<llama_kv_cache>(
-            model, hparams_hca, type_k, type_v,
+            model, hparams_hca, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, llama_memory_vbr_params{});
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, llama_memory_vbr_params{});
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
