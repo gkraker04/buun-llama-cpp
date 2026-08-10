@@ -635,12 +635,19 @@ public:
     // interleaved [n_embd_enc, T] staging tensor and register the capture layers.
     // Returns the stage tensor (opaque) or nullptr when unsupported (CPU-only,
     // tensor-parallel split, or allocation failure). Idempotent.
-    ggml_tensor * dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc);
+    ggml_tensor * dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
     // rows staged by the last decode (0 = host fallback was used)
     int32_t dflash_draft_stage_valid_n() const { return dflash_stage_valid_n; }
     // staged injection (this ctx = drafter): bind the target's stage + set rows
     void set_dflash_inject_stage(ggml_tensor * stage);
     void set_dflash_inject_rows(const int32_t * rows, int32_t n);
+    // single-graph fused cycle (this ctx = target): carry deferred inject rows out of
+    // the stage so they survive the next target decode (D2D; the caller must fence
+    // this ctx's capture decode first — process() syncs before its per-seq loop)
+    ggml_tensor * dflash_draft_stage_carry_tensor() const { return dflash_stage_carry; }
+    bool dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, int32_t dst_row0);
+    // (this ctx = drafter): arm/disarm the fused decode for the next graph build
+    void set_dflash_oneg_inject(ggml_tensor * carry, int32_t n_inject);
     void set_dflash_n_slots(int n);
 
     void dflash_reset_hidden_capture();
@@ -703,6 +710,9 @@ public:
     ggml_context_ptr           dflash_stage_ctx;
     ggml_backend_buffer_ptr    dflash_stage_buf;
     int32_t                    dflash_stage_valid_n = 0;
+
+    // phase-C carry: deferred-inject row storage
+    ggml_tensor *              dflash_stage_carry   = nullptr;
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;
