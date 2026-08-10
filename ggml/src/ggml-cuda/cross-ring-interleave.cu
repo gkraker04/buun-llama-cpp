@@ -2,7 +2,9 @@
 #include "vendors/hip.h"
 #else
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #endif
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
