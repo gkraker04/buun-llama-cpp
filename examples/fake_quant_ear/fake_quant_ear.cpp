@@ -685,13 +685,14 @@ static recipe parse_recipe_file(const std::string & path) {
 }
 
 static bool target_requires_imatrix(ggml_type t) {
+    // mirrors llama-quant.cpp tensor_requires_imatrix: IQ4_XS (and IQ4_NL)
+    // quantize without an imatrix in this fork; IQ2/3 family requires one.
     switch (t) {
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ4_XS:
             return true;
         default:
             return false;
@@ -1211,6 +1212,16 @@ int llama_fake_quant_ear(int argc, char ** argv) {
         if (params.use_mmap) {
             params.use_mmap = false;
             LOG_INF("%s: forcing --no-mmap: in-place fake-quant must not write through to the source GGUF", __func__);
+        }
+
+        // the EAR protocol (climb pipeline) ran with `-dev none`: no CUDA device
+        // exists, so flash-attention AUTO resolves off and the graph numerics are
+        // the CPU (unfused) path. `-ngl 0` alone still leaves the CUDA backend
+        // registered, which flips FA on and changes logits by ~3e-3 median —
+        // enough to move EAR by ~4e-3. Force the same device-less state.
+        if (!params.devices.empty() || params.n_gpu_layers != 0) {
+            params.devices = { nullptr };
+            LOG_INF("%s: forcing -dev none: EAR protocol equivalence requires no CUDA device (flash-attn off)", __func__);
         }
 
         // in-place fake-quant writes into tensor->data from the host. GPU
