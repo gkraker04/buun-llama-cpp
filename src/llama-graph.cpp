@@ -293,6 +293,20 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+bool llm_graph_input_dflash_stage_rows::can_reuse(const llm_graph_params & params) {
+    return rows && rows->ne[0] == params.ubatch.n_tokens;
+}
+
+void llm_graph_input_dflash_stage_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(rows);
+    GGML_ASSERT((int64_t) cparams.dflash_inject_rows.size() == rows->ne[0] &&
+            "dflash staged inject: row count mismatch (llama_set_dflash_inject_rows before decode)");
+    GGML_UNUSED(ubatch);
+
+    ggml_backend_tensor_set(rows, cparams.dflash_inject_rows.data(), 0,
+            rows->ne[0] * ggml_element_size(rows));
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1602,6 +1616,26 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
+            }
+        }
+
+        // upstream drafter device-staged capture: copy each captured layer's input into
+        // the persistent stage tensor with an interleaved (strided) layout — the
+        // interleave happens inside these D2D copies. The host output above is kept as
+        // the fallback for batches the stage cannot cover (multi-ubatch prefill).
+        ggml_tensor * stage = params.cparams.dflash_draft_stage;
+        if (stage != nullptr) {
+            const auto  & layers   = params.cparams.dflash_draft_stage_layers;
+            const int64_t n_layers = (int64_t) layers.size();
+            const int64_t n_embd   = stage->ne[0] / n_layers;
+            for (int64_t k = 0; k < n_layers; ++k) {
+                ggml_tensor * src = t_layer_inp[layers[k]];
+                if (!src || src->ne[1] > stage->ne[1]) {
+                    continue;
+                }
+                ggml_tensor * dst = ggml_view_2d(ctx_compute.get(), stage,
+                        n_embd, src->ne[1], stage->nb[1], (size_t) k * n_embd * stage->nb[0]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx_compute.get(), src, dst));
             }
         }
     }

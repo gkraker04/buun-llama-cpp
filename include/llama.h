@@ -1240,6 +1240,19 @@ extern "C" {
     // the speculative impl. Default off.
     LLAMA_API void llama_set_dflash_fused_inject(struct llama_context * ctx, bool enable);
 
+    // Upstream drafter device-staged capture chain. stage_init (TARGET ctx) allocates a
+    // persistent [n_embd_enc, n_ubatch] device tensor; the target graph then writes each
+    // captured layer's input into it interleaved (D2D, no host round-trip) and skips the
+    // host extraction whenever the whole batch fits one ubatch (stage_valid_n returns the
+    // covered rows, 0 = use the host path). The DRAFTER binds the stage via
+    // set_inject_stage and passes per-decode row indices via set_inject_rows; its fused
+    // injection graph gathers the rows on-device. Returns nullptr when unsupported
+    // (CPU-only or tensor-parallel target).
+    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc);
+    LLAMA_API int32_t llama_dflash_draft_stage_valid_n(struct llama_context * ctx);
+    LLAMA_API void    llama_set_dflash_inject_stage(struct llama_context * ctx, void * stage);
+    LLAMA_API void    llama_set_dflash_inject_rows(struct llama_context * ctx, const int32_t * rows, int32_t n);
+
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
     // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
     // Increases drafter ctx_len (and attention cost) linearly — set to the max slots

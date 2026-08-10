@@ -960,6 +960,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // encoder (fc + enc-norm) in-graph — no llama_encode round-trip per prefill chunk
     bool fused_inject = false;
 
+    // device-staged capture->inject chain: target graph writes captured features into a
+    // persistent device tensor (interleaved); the inject decode gathers rows on-device.
+    // No host D2H capture, no host interleave, no H2D feature upload.
+    bool                 staged = false;
+    void *               stage_handle = nullptr;
+    std::vector<int32_t> stage_rows;
+
     // adaptive draft length (fork cab1fb597): halve the per-seq draft cap after 3
     // consecutive low-acceptance rounds (<30%), recover +1 per good round (>60%);
     // never exceeds params.n_max, so the default fixed-depth behavior is the ceiling
@@ -1060,6 +1067,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // device-staged capture->inject: keep the whole capture->interleave->inject
+        // chain on the GPU whenever a target batch fits one ubatch (all generation-phase
+        // verify batches). Multi-ubatch prefill chunks fall back to the host path per
+        // decode. Kill switch: GGML_DFLASH_STAGED=0 (requires fused injection).
+        if (fused_inject) {
+            const char * env = getenv("GGML_DFLASH_STAGED");
+            if (!(env && atoi(env) == 0)) {
+                stage_handle = llama_dflash_draft_stage_init(ctx_tgt,
+                        target_layer_ids, (int32_t) target_layer_ids_n, n_embd_enc);
+                if (stage_handle) {
+                    llama_set_dflash_inject_stage(ctx_dft, stage_handle);
+                    staged = true;
+                    LOG_INF("%s: - device-staged capture->inject enabled\n", __func__);
+                }
+            }
+        }
+
         batch = llama_batch_init(llama_n_batch(ctx_dft), 0, n_seq);
         // process() chunks by n_ubatch, so the (wider) fused injection batch only needs
         // n_ubatch rows; the unfused batch keeps the historic n_batch sizing
@@ -1119,6 +1143,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 batch_inject.n_tokens = 1;
                 std::memset(batch_inject.embd, 0,
                         (size_t) (fused_inject ? n_embd_enc : n_embd_dec) * sizeof(float));
+                if (staged) {
+                    // staged inject graph reads stage row 0 (content irrelevant here)
+                    const int32_t r0 = 0;
+                    llama_set_dflash_inject_rows(ctx_dft, &r0, 1);
+                }
                 batch_inject.pos[0]       = 0;
                 batch_inject.n_seq_id[0]  = 1;
                 batch_inject.seq_id[0][0] = 0;
@@ -1220,6 +1249,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int64_t t_proc0 = ggml_time_us();
 
+        // device-staged path: the target graph already wrote this batch's features into
+        // the stage tensor (interleaved) — the inject decodes gather rows on-device and
+        // the whole host gather is skipped. Multi-ubatch target batches (stage_valid_n
+        // == 0) fall back to the host path: unbind the stage so the inject graph builds
+        // its H2D feature input, rebind at the end.
+        const bool use_stage = staged &&
+                llama_dflash_draft_stage_valid_n(ctx_tgt) == batch_in.n_tokens;
+        if (staged && !use_stage) {
+            llama_set_dflash_inject_stage(ctx_dft, nullptr);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1236,23 +1276,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer;
-                // fused mode writes straight into the injection batch (the decode graph
-                // applies the encoder itself), unfused goes through features_buf + encode
-                float * gather_dst = fused_inject ? batch_inject.embd : nullptr;
-                if (!fused_inject) {
-                    features_buf.resize((size_t) n_chunk * n_embd_enc);
-                    gather_dst = features_buf.data();
-                }
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
+                if (use_stage) {
+                    stage_rows.resize(n_chunk);
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = gather_dst + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        stage_rows[i] = i_batch_beg[seq_id] + offset + i;
+                    }
+                    llama_set_dflash_inject_rows(ctx_dft, stage_rows.data(), n_chunk);
+                } else {
+                    // gather this chunk's target features, interleaved by extract layer;
+                    // fused mode writes straight into the injection batch (the decode
+                    // graph applies the encoder itself), unfused goes through
+                    // features_buf + encode
+                    float * gather_dst = fused_inject ? batch_inject.embd : nullptr;
+                    if (!fused_inject) {
+                        features_buf.resize((size_t) n_chunk * n_embd_enc);
+                        gather_dst = features_buf.data();
+                    }
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = gather_dst + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
                     }
                 }
 
@@ -1313,8 +1362,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (staged && !use_stage) {
+            llama_set_dflash_inject_stage(ctx_dft, stage_handle);
+        }
+
         LOG_DBG("%s: process (capture+%s+inject) %.2f ms (%d tokens)\n",
-                __func__, fused_inject ? "fused" : "encode",
+                __func__, use_stage ? "staged" : fused_inject ? "fused" : "encode",
                 (ggml_time_us() - t_proc0) / 1e3, (int) n_tokens);
 
         return true;

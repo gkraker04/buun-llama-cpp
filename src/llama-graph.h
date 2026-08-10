@@ -174,6 +174,22 @@ public:
     const int64_t n_embd = 0;
 };
 
+// upstream drafter staged injection: per-decode row indices into the target's
+// device-resident capture stage (data set from cparams.dflash_inject_rows)
+class llm_graph_input_dflash_stage_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_stage_rows(const llama_cparams & cparams) : cparams(cparams) {}
+    virtual ~llm_graph_input_dflash_stage_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows = nullptr; // I32 [n_batch]
+
+    const llama_cparams & cparams;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:

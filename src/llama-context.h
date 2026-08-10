@@ -630,6 +630,17 @@ public:
     void set_dflash_topk(int k);
     void set_dflash_argmax(bool enable);
     void set_dflash_fused_inject(bool enable);
+
+    // upstream drafter device-staged capture (this ctx = target): allocate the
+    // interleaved [n_embd_enc, T] staging tensor and register the capture layers.
+    // Returns the stage tensor (opaque) or nullptr when unsupported (CPU-only,
+    // tensor-parallel split, or allocation failure). Idempotent.
+    ggml_tensor * dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc);
+    // rows staged by the last decode (0 = host fallback was used)
+    int32_t dflash_draft_stage_valid_n() const { return dflash_stage_valid_n; }
+    // staged injection (this ctx = drafter): bind the target's stage + set rows
+    void set_dflash_inject_stage(ggml_tensor * stage);
+    void set_dflash_inject_rows(const int32_t * rows, int32_t n);
     void set_dflash_n_slots(int n);
 
     void dflash_reset_hidden_capture();
@@ -687,6 +698,11 @@ public:
     std::vector<float>   logits_argmax_prob_buf;
     int32_t logits_argmax_count = 0;
     int32_t logits_argmax_k = 1;
+
+    // upstream drafter device-staged capture (target ctx)
+    ggml_context_ptr           dflash_stage_ctx;
+    ggml_backend_buffer_ptr    dflash_stage_buf;
+    int32_t                    dflash_stage_valid_n = 0;
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;

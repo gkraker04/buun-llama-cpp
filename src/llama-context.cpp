@@ -1536,6 +1536,60 @@ void llama_context::set_dflash_fused_inject(bool enable) {
     cparams.dflash_fused_inject = enable;
 }
 
+ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc) {
+    if (cparams.dflash_draft_stage) {
+        return cparams.dflash_draft_stage; // idempotent
+    }
+    if (!layer_ids || n_layers <= 0 || n_embd_enc <= 0) {
+        return nullptr;
+    }
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return nullptr; // shards hold partial rows; host capture handles TP
+    }
+
+    ggml_backend_t gpu_backend = find_gpu_backend();
+    if (!gpu_backend) {
+        return nullptr; // CPU-only: host capture is already sync-free
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
+
+    const int64_t max_rows = cparams.n_ubatch;
+
+    ggml_init_params ctx_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * stage_ctx = ggml_init(ctx_params);
+
+    ggml_tensor * stage = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd_enc, max_rows);
+    ggml_format_name(stage, "dflash_draft_stage");
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(stage_ctx, buft);
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate draft capture staging (%.1f MB) - host capture stays\n",
+                __func__, n_embd_enc * max_rows * sizeof(float) / (1024.0 * 1024.0));
+        ggml_free(stage_ctx);
+        return nullptr;
+    }
+
+    dflash_stage_ctx.reset(stage_ctx);
+    dflash_stage_buf.reset(buf);
+
+    cparams.dflash_draft_stage = stage;
+    cparams.dflash_draft_stage_layers.assign(layer_ids, layer_ids + n_layers);
+
+    LLAMA_LOG_INFO("%s: draft capture staging: %d layers x %" PRId64 " embd x %" PRId64 " rows (%.1f MB, device-resident)\n",
+            __func__, n_layers, n_embd_enc / n_layers, max_rows,
+            ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+
+    return stage;
+}
+
+void llama_context::set_dflash_inject_stage(ggml_tensor * stage) {
+    cparams.dflash_inject_stage = stage;
+}
+
+void llama_context::set_dflash_inject_rows(const int32_t * rows, int32_t n) {
+    cparams.dflash_inject_rows.assign(rows, rows + n);
+}
+
 void llama_context::set_dflash_topk(int k) {
     cparams.dflash_topk = (k >= 1) ? k : 1;
     // invalidate graph cache since output tensor shape changes with K
@@ -4216,6 +4270,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // device-staged draft capture is valid only when the whole batch lands in one
+    // ubatch (stage rows then mirror batch rows); reset per decode
+    dflash_stage_valid_n = 0;
+    const bool dflash_stage_covered = cparams.dflash_draft_stage &&
+            n_tokens_all <= (uint32_t) cparams.dflash_draft_stage->ne[1] &&
+            n_tokens_all <= cparams.n_ubatch;
+
     // DFlash: reset hidden-state capture so this decode()'s eval callback
     // accumulates across ubatches (prefill with n_tokens > n_ubatch would
     // otherwise leave only the last ubatch's hiddens in layer_hiddens).
@@ -4489,6 +4550,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (dflash_stage_covered && n_tokens_prev == 0 && ubatch.n_tokens == n_tokens_all) {
+            // the graph copied the captured layers into the device stage (interleaved);
+            // skip the host D2H for those layers and mark the stage rows valid
+            dflash_stage_valid_n = (int32_t) n_tokens_all;
+        }
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
@@ -4774,6 +4840,13 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
+        }
+        if (dflash_stage_valid_n > 0) {
+            // covered by the device stage this decode - no host D2H for staged layers
+            const auto & sl = cparams.dflash_draft_stage_layers;
+            if (std::find(sl.begin(), sl.end(), (int32_t) il) != sl.end()) {
+                continue;
+            }
         }
         if (!embd_layer_inp[il].has_data()) {
             GGML_ABORT("output layer input buffer not allocated");
@@ -6690,6 +6763,22 @@ void llama_set_dflash_argmax(llama_context * ctx, bool enable) {
 
 void llama_set_dflash_fused_inject(llama_context * ctx, bool enable) {
     ctx->set_dflash_fused_inject(enable);
+}
+
+void * llama_dflash_draft_stage_init(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc) {
+    return (void *) ctx->dflash_draft_stage_init(layer_ids, n_layers, n_embd_enc);
+}
+
+int32_t llama_dflash_draft_stage_valid_n(llama_context * ctx) {
+    return ctx->dflash_draft_stage_valid_n();
+}
+
+void llama_set_dflash_inject_stage(llama_context * ctx, void * stage) {
+    ctx->set_dflash_inject_stage((ggml_tensor *) stage);
+}
+
+void llama_set_dflash_inject_rows(llama_context * ctx, const int32_t * rows, int32_t n) {
+    ctx->set_dflash_inject_rows(rows, n);
 }
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {
