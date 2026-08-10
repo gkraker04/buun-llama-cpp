@@ -104,6 +104,14 @@ struct llama_cparams {
     ggml_tensor *        dflash_inject_stage = nullptr;
     std::vector<int32_t> dflash_inject_rows;
 
+    // Upstream drafter single-graph fused cycle (DRAFTER context): when n_inject > 0 a
+    // token-batch decode builds the fused graph — rows [0, n_inject) are staged KV
+    // injections gathered from the carry tensor (dflash_inject_rows holds their carry
+    // row indices), the remaining rows are the noise block. Constant n_inject keeps the
+    // graph topology stable across generation cycles (gf_res_prev + CUDA graph reuse).
+    ggml_tensor * dflash_oneg_stage    = nullptr;
+    int32_t       dflash_oneg_n_inject = 0;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
     // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the

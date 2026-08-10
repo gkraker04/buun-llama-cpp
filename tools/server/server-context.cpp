@@ -4704,6 +4704,19 @@ private:
                 // slot id, so the drafter context needs one sequence per server slot
                 params_dft.n_parallel = params_base.n_parallel;
 
+                // phase C single-graph fused cycle (GGML_DFLASH_ONEGRAPH, default on):
+                // reserve one extra drafter seq for the fused decode's padding rows and
+                // keep the drafter KV unified so the mixed-seq fused batch stays a
+                // single ubatch (n_stream must be 1). The impl enables the fused path
+                // only when it sees the spare seq, so ONEGRAPH=0 also skips this.
+                {
+                    const char * env_og = getenv("GGML_DFLASH_ONEGRAPH");
+                    if (!(env_og && atoi(env_og) == 0)) {
+                        params_dft.n_parallel += 1;
+                        params_dft.kv_unified  = true;
+                    }
+                }
+
                 // draft depth: keep upstream's draft.n_max default (3) / the user's
                 // --draft-max — on Muse-Glimmer the shallow depth clearly beats the
                 // full trained block (71.5 t/s @3 vs 66.8 @15 vs 62.2 @7; acceptance
