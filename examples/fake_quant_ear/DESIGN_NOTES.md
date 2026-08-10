@@ -207,6 +207,14 @@ The compile flag comes from `find_package(OpenMP)` / `OpenMP::OpenMP_CXX`
    across very different recipes, not a delta effect. F16 baseline
    byte-identical → forward pass exact; only requantized states carry the
    small bias. **Step 4 VERDICT: PASS with documented bias.**
+   **2026-08-10 perf path — `--allow-fa`:** opt-in flag keeps the CUDA
+   backend (flash-attn engages) while still forcing `-ngl 0` + static f16
+   KV, giving ~14× faster passes (3.5 s/pass vs 46 s/pass). Measured EAR
+   distortion vs the `-dev none` protocol: r1 −0.000091, r10 −0.000129 —
+   sub-1e-4, well under the writeback bias itself. The pure-F16 baseline is
+   NOT byte-identical under FA (the ~3e-3 median logp divergence returns),
+   so equivalence proofs keep the default; the Algorithm-1 φ-table may run
+   `--allow-fa` at ~3 h instead of ~35 h. Default remains `-dev none`.
 5. **Perf expectation:** with `--keep-f16-copy`, a one-class step = class
    quantize (seconds, 12 OpenMP threads) + one forward pass over the
    calibration text (~seconds/minutes at `-t 6`, same cost as one

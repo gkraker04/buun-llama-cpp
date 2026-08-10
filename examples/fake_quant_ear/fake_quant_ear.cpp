@@ -1079,6 +1079,7 @@ struct custom_cli {
     std::string outdir;
     std::string imatrix_path;
     bool keep_f16_copy = false;
+    bool allow_fa      = false;  // opt-in: keep CUDA backend (flash-attn on) for speed; candidates within ~1.3e-4 EAR of -dev none
 };
 
 static void usage(const char * exe) {
@@ -1090,6 +1091,7 @@ static void usage(const char * exe) {
         "    [--imatrix <imatrix.gguf>]        # optional, required for IQ-family targets\n"
         "    [--outdir <dir>]                  # plan mode: per-step logits written here\n"
         "    [--keep-f16-copy]                 # retain pristine F16 data in RAM for reset between steps\n",
+        "    [--allow-fa]                      # keep CUDA backend (flash-attn on) for 14x faster passes; candidates within ~1.3e-4 EAR of -dev none\n",
         exe);
 }
 
@@ -1116,6 +1118,8 @@ static void extract_custom_args(int argc, char ** argv, custom_cli & cli, std::v
             cli.imatrix_path = argv[++i];
         } else if (a == "--keep-f16-copy") {
             cli.keep_f16_copy = true;
+        } else if (a == "--allow-fa") {
+            cli.allow_fa = true;
         } else {
             rest.push_back(argv[i]);
         }
@@ -1219,9 +1223,15 @@ int llama_fake_quant_ear(int argc, char ** argv) {
         // the CPU (unfused) path. `-ngl 0` alone still leaves the CUDA backend
         // registered, which flips FA on and changes logits by ~3e-3 median —
         // enough to move EAR by ~4e-3. Force the same device-less state.
-        if (!params.devices.empty() || params.n_gpu_layers != 0) {
+        // (--allow-fa opts out: candidates then sit within ~1.3e-4 EAR of the
+        // -dev none state — measured on climb2 r10 — while running ~14x faster;
+        // the pure-F16 baseline is NOT byte-identical under FA, so equivalence
+        // proofs should keep the default.)
+        if (!cli.allow_fa && (!params.devices.empty() || params.n_gpu_layers != 0)) {
             params.devices = { nullptr };
             LOG_INF("%s: forcing -dev none: EAR protocol equivalence requires no CUDA device (flash-attn off)", __func__);
+        } else if (cli.allow_fa) {
+            LOG_INF("%s: --allow-fa: keeping CUDA backend (flash-attn may engage); EAR within ~1.3e-4 of -dev none protocol", __func__);
         }
 
         // in-place fake-quant writes into tensor->data from the host. GPU
