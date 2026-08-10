@@ -3886,8 +3886,19 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
         // has no auto re-derivation path. At N_live > 1 the budget base also relaxes to a fair
         // share of its own spare — mapped-anchored and 64 MiB-quantized.
         const uint32_t n_live = vbr_pool_n_live(p);
+        // Explicit budgets reserve the fit growth target, but never more than the pool could
+        // still MAP (budget - mapped): the fit margin prices consumers that have already
+        // materialized by decode time (the spec drafter's model+context+compute raise
+        // fit_params_target before the fit, then allocate at load) — free VRAM already
+        // reflects them, so re-reserving their full size double-counts and strangles a
+        // comfortably-fitting pool to the --vbr-floor. Measured 2026-08-10 (27B + DFlash
+        // drafter at inherited -cd, --vbr-vram-budget 1024M): margin 3309 MiB vs 1937 MiB
+        // free -> budget_eff collapsed to mapped (4 MiB) against a 68 MiB need and the first
+        // boundary cascaded all 71 clamped steps to the floor.
+        const size_t grow_room = p.budget > mapped_now ? p.budget - mapped_now : 0;
         const size_t own_headroom = vbr_budget_explicit_
-                ? std::max(vbr_growth_headroom_, ledger_headroom) : ledger_headroom;
+                ? std::max(std::min(vbr_growth_headroom_, grow_room), ledger_headroom)
+                : ledger_headroom;
         const size_t headroom_eff = own_headroom + ledger_headroom * (n_live - 1);
         if (n_live > 1) {
             constexpr size_t quantum = 64ull * 1024 * 1024;
