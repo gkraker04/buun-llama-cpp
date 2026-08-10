@@ -1197,27 +1197,43 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
-    // Turbo/VBR cap (2026-08-10): dsv4 cannot hold turbo tiers anywhere today. The attention
-    // graph concatenates raw-window K with compressed-cache K into one tensor (ggml_concat
-    // requires matching types, deepseek4.cpp), and the compressor/indexer subgraphs read cache
-    // rows via plain mul_mat, where turbo types have no vec_dot by design (fused-attention-only
-    // decode). Any turbo/dynamic-VBR request therefore degrades the WHOLE dsv4 complex to
-    // static q8_0 — proven working, half of f16, deterministic. The full ladder needs a
-    // turbo-aware concat (or split-attention merge) plus a dequant-wrapped mul_mat read path.
+    // Turbo/VBR policy (2026-08-10). Reader map: raw/csa/hca are read ONLY through fused
+    // attention (deepseek4.cpp concats them into k_all for build_attn_mha; ggml_concat handles
+    // same-type quantized tensors block-aligned), and the compressor reads only the untyped
+    // comp-state streams — so STATIC turbo tiers are legal on raw/csa/hca. The lightning-indexer
+    // cache (lid) is read by mul_mat (or the fused_lid op, which has no turbo decode yet) and its
+    // rows are indexer-head-sized — pin it at F16. The DYNAMIC ladder stays q8_0-capped: per-child
+    // controllers degrade independently, and the concat requires raw/csa/hca to agree per layer —
+    // cross-child tier ganging is the remaining work for full VBR on this arch.
     llama_memory_vbr_params vbr_raw = vbr;
     vbr_raw.trace_label = "raw";
-    const bool comp_cap = ggml_is_turbo_kv_type(type_k) || ggml_is_turbo_kv_type(type_v) || vbr.dynamic;
-    const ggml_type type_comp = comp_cap ? GGML_TYPE_Q8_0 : type_k; // K==V enforced for this arch at init
-    if (comp_cap) {
-        type_k = type_comp;
-        type_v = type_comp;
+    const bool turbo_req = ggml_is_turbo_kv_type(type_k) || ggml_is_turbo_kv_type(type_v);
+    ggml_type type_comp = type_k; // K==V enforced for this arch at init
+    ggml_type type_lid  = type_k;
+    if (turbo_req) {
+        type_lid = GGML_TYPE_F16;
         vbr_raw = {};
         vbr_raw.compute_backend_for_buft = vbr.compute_backend_for_buft;
-        LLAMA_LOG_INFO("%s: DSV4 KV runs static q8_0 (turbo/dynamic-VBR requested, but dsv4 "
-                "concatenates raw+compressed K and reads caches via mul_mat — turbo tiers decode "
-                "only inside fused attention; full-ladder support is future work)\n",
+        LLAMA_LOG_INFO("%s: DSV4 static turbo KV: raw/csa/hca hold %s (fused-attention read), "
+                "lid pinned at f16 (indexer reads via mul_mat/fused_lid)\n",
+                __func__, ggml_type_name(type_k));
+    } else if (vbr.dynamic) {
+        type_k    = GGML_TYPE_Q8_0;
+        type_v    = GGML_TYPE_Q8_0;
+        type_comp = GGML_TYPE_Q8_0;
+        type_lid  = GGML_TYPE_Q8_0;
+        vbr_raw = {};
+        vbr_raw.compute_backend_for_buft = vbr.compute_backend_for_buft;
+        LLAMA_LOG_INFO("%s: DSV4 KV runs static q8_0 under dynamic VBR (per-child tier ganging "
+                "for the concat'd raw/csa/hca caches is not built yet; use an explicit static "
+                "-ctk/-ctv turbo type for lower-bit KV on this arch)\n",
                 __func__);
     }
+
+    // children need the backend-binding callback even without dynamic VBR: static turbo
+    // K/V types resolve their decode backend through it (refused at init otherwise)
+    llama_memory_vbr_params vbr_child = {};
+    vbr_child.compute_backend_for_buft = vbr.compute_backend_for_buft;
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
@@ -1263,7 +1279,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, llama_memory_vbr_params{});
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, vbr_child);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1271,15 +1287,15 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, llama_memory_vbr_params{});
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, vbr_child);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_comp, type_comp,
+            model, hparams_lid, type_lid, type_lid,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, llama_memory_vbr_params{});
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, vbr_child);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 

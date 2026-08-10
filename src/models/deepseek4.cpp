@@ -731,6 +731,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     return kq_mask_top_k;
 }
 
+// TurboQuant V un-rotation, mirroring llama-graph.cpp's build_attn wrap: the fused kernels
+// decode turbo V in FWHT domain and rely on a graph-level inverse (Q's forward rotation is
+// inline in the kernels). K==V for this arch, so the K cache type gates it. Must run BEFORE
+// the dsv4 k_rot hadamard: encode order was k_rot then FWHT, decode inverts in reverse.
+// No V-mean tap add-back — deepseek4 has no baked meansub table.
+static ggml_tensor * dsv4_turbo_unrotate(ggml_context * ctx0, ggml_tensor * out, ggml_tensor * k) {
+    if (ggml_is_turbo_kv_type(k->type) && out->ne[0] % 128 == 0) {
+        out = ggml_cont(ctx0, out); // force copy to break potential aliasing
+        out = ggml_turbo_wht(ctx0, out, 1); // 1 = inverse
+    }
+    return out;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -784,6 +797,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    out = dsv4_turbo_unrotate(ctx0, out, k_all);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -839,6 +853,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(kq_mask, "hca_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    out = dsv4_turbo_unrotate(ctx0, out, k_all);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -875,6 +890,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
     ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    out = dsv4_turbo_unrotate(ctx0, out, k);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
