@@ -1001,6 +1001,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int32_t> adpt_n_low_acc;    // [n_seq] consecutive low-acceptance rounds
     std::vector<int32_t> adpt_cap;          // [n_seq] current draft cap (-1 = n_max)
 
+    // pre-gate: after consecutive p_min-gated EMPTY drafts, skip whole draft calls with
+    // exponential backoff (1,2,4,8 cap) — on expensive-verify targets (cpu-moe MoE) the
+    // wasted calls are the entire speculative overhead. Reset on any emit; re-probes at
+    // least every 9 cycles. Kill switch: GGML_DFLASH_DRAFT_PREGATE=0.
+    bool                 pregate = false;
+    std::vector<int32_t> pregate_empty; // [n_seq] consecutive attempted-but-empty drafts
+    std::vector<int32_t> pregate_skip;  // [n_seq] draft calls left to skip
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
     int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
@@ -1171,6 +1179,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         adpt_n_low_acc   .assign(n_seq, 0);
         adpt_cap         .assign(n_seq, -1);
 
+        pregate = env_on("GGML_DFLASH_DRAFT_PREGATE");
+        pregate_empty.assign(n_seq, 0);
+        pregate_skip .assign(n_seq, 0);
+
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -1311,6 +1323,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         adpt_n_draft_last[seq_id] = 0;
         adpt_n_low_acc   [seq_id] = 0;
         adpt_cap         [seq_id] = -1;
+
+        pregate_empty[seq_id] = 0;
+        pregate_skip [seq_id] = 0;
 
         // back to prefill: injections go through the standalone path again
         seq_in_gen[seq_id] = false;
@@ -1529,6 +1544,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+
+        // pre-gate: decline the whole call for seqs in backoff (like a null draft —
+        // the server re-arms drafting every cycle; a pending stash flushes through the
+        // standard paths). Note: clearing the flag also skips later-chained impls.
+        if (pregate) {
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].drafting && pregate_skip[s] > 0) {
+                    pregate_skip[s]--;
+                    dparams[s].drafting = false;
+                }
+            }
+        }
 
         // phase C: fuse the deferred injection into this decode when the batch has the
         // single-drafting-seq shape (the server drives this path per slot). Other
@@ -1783,6 +1810,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             adpt_n_draft_last[seq_id] = (int32_t) result.size();
+
+            // pre-gate accounting (attempted drafts only — skipped/declined seqs never
+            // reach this loop): first empty is free, then backoff 1,2,4,8
+            if (pregate) {
+                if (result.empty()) {
+                    pregate_empty[seq_id] = std::min(pregate_empty[seq_id] + 1, 5);
+                    if (pregate_empty[seq_id] >= 2) {
+                        pregate_skip[seq_id] = 1 << (pregate_empty[seq_id] - 2);
+                    }
+                } else {
+                    pregate_empty[seq_id] = 0;
+                    pregate_skip [seq_id] = 0;
+                }
+            }
         }
     }
 
