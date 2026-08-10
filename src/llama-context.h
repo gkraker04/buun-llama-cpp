@@ -642,7 +642,8 @@ public:
     void set_dflash_inject_stage(ggml_tensor * stage);
     void set_dflash_inject_rows(const int32_t * rows, int32_t n);
     // single-graph fused cycle (this ctx = target): carry deferred inject rows out of
-    // the stage so they survive the next target decode (D2D, fenced)
+    // the stage so they survive the next target decode (D2D; the caller must fence
+    // this ctx's capture decode first — process() syncs before its per-seq loop)
     ggml_tensor * dflash_draft_stage_carry_tensor() const { return dflash_stage_carry; }
     bool dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, int32_t dst_row0);
     // (this ctx = drafter): arm/disarm the fused decode for the next graph build
@@ -710,11 +711,8 @@ public:
     ggml_backend_buffer_ptr    dflash_stage_buf;
     int32_t                    dflash_stage_valid_n = 0;
 
-    // phase-C carry: deferred-inject row storage + reusable alias pair for the
-    // strided D2D range copies (data/ne mutated per copy, storage unused)
+    // phase-C carry: deferred-inject row storage
     ggml_tensor *              dflash_stage_carry   = nullptr;
-    ggml_tensor *              dflash_stage_cp_src  = nullptr;
-    ggml_tensor *              dflash_stage_cp_dst  = nullptr;
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;

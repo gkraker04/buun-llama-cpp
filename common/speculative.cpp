@@ -933,6 +933,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
+// default-on env kill switches: set NAME=0 to disable
+static bool env_on(const char * name) {
+    const char * v = getenv(name);
+    return !(v && atoi(v) == 0);
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
 
@@ -973,11 +979,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // gf_res_prev reuse and CUDA graph capture hold. Only committed rows get injected;
     // padding rows repeat the last committed row into a scratch seq the KV mask hides
     // from real attention. Kill switch: GGML_DFLASH_ONEGRAPH=0 (requires staged).
-    bool         oneg               = false;
     void *       carry_handle       = nullptr;
-    int32_t      oneg_n_inject      = 0;  // fixed inject rows per fused decode (n_max + 2)
+    int32_t      oneg_n_inject      = 0;  // fixed inject rows per fused decode (carry_rows_per_seq + 1)
     int32_t      carry_rows_per_seq = 0;  // carry capacity per seq (n_max + 1)
     llama_seq_id oneg_scratch_seq   = -1;
+
+    bool oneg() const { return carry_handle != nullptr; }
     struct oneg_stash {
         bool      pending = false;
         llama_pos pos0    = 0;
@@ -1078,8 +1085,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // features and applies fc + enc-norm in-graph, replacing the per-chunk
         // llama_encode + readback round-trip. Kill switch: GGML_DFLASH_FUSE=0.
         {
-            const char * env = getenv("GGML_DFLASH_FUSE");
-            fused_inject = !(env && atoi(env) == 0);
+            fused_inject = env_on("GGML_DFLASH_FUSE");
             if (fused_inject) {
                 llama_set_dflash_fused_inject(ctx_dft, true);
                 LOG_INF("%s: - fused encoder+injection enabled\n", __func__);
@@ -1091,18 +1097,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // verify batches). Multi-ubatch prefill chunks fall back to the host path per
         // decode. Kill switch: GGML_DFLASH_STAGED=0 (requires fused injection).
         if (fused_inject) {
-            const char * env = getenv("GGML_DFLASH_STAGED");
-            if (!(env && atoi(env) == 0)) {
+            if (env_on("GGML_DFLASH_STAGED")) {
                 // phase C wants a scratch drafter seq (the server reserves one when the
                 // env is on) and a carry buffer for the deferred inject rows
-                const char * env_og = getenv("GGML_DFLASH_ONEGRAPH");
-                const bool want_oneg = !(env_og && atoi(env_og) == 0) &&
+                const bool want_oneg = env_on("GGML_DFLASH_ONEGRAPH") &&
                         llama_n_seq_max(ctx_dft) > n_seq &&
                         !llama_model_dflash_dsv4_backbone(model_dft);
-                carry_rows_per_seq = this->params.n_max + 1;
+                if (want_oneg) {
+                    carry_rows_per_seq = this->params.n_max + 1;
+                }
                 stage_handle = llama_dflash_draft_stage_init(ctx_tgt,
                         target_layer_ids, (int32_t) target_layer_ids_n, n_embd_enc,
-                        want_oneg ? (int32_t) n_seq * carry_rows_per_seq : 0);
+                        (int32_t) n_seq * carry_rows_per_seq);
                 if (stage_handle) {
                     llama_set_dflash_inject_stage(ctx_dft, stage_handle);
                     staged = true;
@@ -1110,8 +1116,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (want_oneg) {
                         carry_handle = llama_dflash_draft_stage_carry_tensor(ctx_tgt);
                         if (carry_handle) {
-                            oneg             = true;
-                            oneg_n_inject    = this->params.n_max + 2;
+                            // always >= 1 padding row, so the scratch seq is present in
+                            // every fused batch (build_dspark_markov_head counts on it)
+                            oneg_n_inject    = carry_rows_per_seq + 1;
                             oneg_scratch_seq = (llama_seq_id) n_seq;
                             llama_set_dflash_oneg_inject(ctx_dft, carry_handle, 0);
                             LOG_INF("%s: - single-graph fused cycle enabled (inject rows=%d, scratch seq=%d)\n",
@@ -1145,8 +1152,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // pulling full-vocab logits to the host and scanning them per position.
         // Kill switches: --no-spec-draft-backend-sampling or GGML_DFLASH_DRAFT_GPUSAMPLE=0.
         {
-            const char * env = getenv("GGML_DFLASH_DRAFT_GPUSAMPLE");
-            gpu_sample = this->params.backend_sampling && !(env && atoi(env) == 0);
+            gpu_sample = this->params.backend_sampling && env_on("GGML_DFLASH_DRAFT_GPUSAMPLE");
             if (gpu_sample) {
                 llama_set_dflash_topk(ctx_dft, gpu_topk);
                 llama_set_dflash_argmax(ctx_dft, true);
@@ -1156,8 +1162,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // adaptive draft length controller. Kill switch: GGML_DFLASH_DRAFT_ADAPTIVE=0.
         {
-            const char * env = getenv("GGML_DFLASH_DRAFT_ADAPTIVE");
-            adaptive = !(env && atoi(env) == 0);
+            adaptive = env_on("GGML_DFLASH_DRAFT_ADAPTIVE");
         }
         adpt_n_draft_last.assign(n_seq, 0);
         adpt_n_low_acc   .assign(n_seq, 0);
@@ -1175,8 +1180,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // request doesn't pay backend module load / pool growth (fork 2a491077d).
         // Kill switch: GGML_DFLASH_DRAFT_WARMUP=0.
         {
-            const char * env = getenv("GGML_DFLASH_DRAFT_WARMUP");
-            if (!(env && atoi(env) == 0)) {
+            if (env_on("GGML_DFLASH_DRAFT_WARMUP")) {
                 llama_set_warmup(ctx_dft, true);
 
                 // injection graph: one zero-feature row at pos 0
@@ -1209,7 +1213,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     // fused single-graph cycle: warm the steady-state shape (carry
                     // contents are junk here; every output is discarded)
-                    if (oneg) {
+                    if (oneg()) {
                         llama_memory_t mem = llama_get_memory(ctx_dft);
                         if (mem) {
                             llama_memory_clear(mem, true);
@@ -1376,7 +1380,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // phase C: flush stashes the fused draft did not consume (skipped-draft cycles,
         // request tails, multi-view iterations) — the carry keeps their rows valid, so
         // this is the old immediate injection one cycle late
-        if (oneg) {
+        if (oneg()) {
             for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                 if (stash[s].pending && !flush_stash(s)) {
                     return false;
@@ -1403,7 +1407,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // Only rows committed by then get injected, dropping the historical
             // inject-rejected-then-trim round trip on this path. The carry copy keeps
             // the rows alive past the next target decode.
-            if (oneg && use_stage && seq_in_gen[seq_id] &&
+            if (oneg() && use_stage && seq_in_gen[seq_id] &&
                 n_rows <= carry_rows_per_seq &&
                 llama_dflash_draft_stage_carry(ctx_tgt, i_batch_beg[seq_id], n_rows,
                         (int32_t) seq_id * carry_rows_per_seq)) {
@@ -1527,7 +1531,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // single-drafting-seq shape (the server drives this path per slot). Other
         // shapes flush their stashes standalone and keep the two-decode path.
         llama_seq_id seq_fused = -1;
-        if (oneg) {
+        if (oneg()) {
             int n_armed = 0;
             for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
                 if (dparams[s].drafting) {
@@ -3336,8 +3340,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         // projected cross-KV cache: single-slot GPU-ring path only; GGML_DFLASH_CROSSKV=0 kills it
         if (gpu_ring_handle && n_seq == 1) {
-            const char * env_ckv = getenv("GGML_DFLASH_CROSSKV");
-            if (!env_ckv || atoi(env_ckv) != 0) {
+            if (env_on("GGML_DFLASH_CROSSKV")) {
                 crosskv_handle = llama_dflash_crosskv_init(ctx_dft, gpu_ring_handle, ctx_window);
                 if (crosskv_handle) {
                     LOG_INF("dflash: projected cross-KV cache enabled (%d slots)\n", ctx_window);

@@ -1555,7 +1555,7 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
 
     const int64_t max_rows = cparams.n_ubatch;
 
-    ggml_init_params ctx_params = { 5 * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ctx_params = { 3 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * stage_ctx = ggml_init(ctx_params);
 
     ggml_tensor * stage = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd_enc, max_rows);
@@ -1565,17 +1565,12 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
     if (n_carry_rows > 0) {
         carry = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd_enc, n_carry_rows);
         ggml_format_name(carry, "dflash_draft_carry");
-        // alias pair for the carry range copies — data/ne overridden per copy
-        dflash_stage_cp_src = ggml_new_tensor_1d(stage_ctx, GGML_TYPE_F32, 1);
-        dflash_stage_cp_dst = ggml_new_tensor_1d(stage_ctx, GGML_TYPE_F32, 1);
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(stage_ctx, buft);
     if (!buf) {
         LLAMA_LOG_WARN("%s: failed to allocate draft capture staging (%.1f MB) - host capture stays\n",
                 __func__, n_embd_enc * max_rows * sizeof(float) / (1024.0 * 1024.0));
-        dflash_stage_cp_src = nullptr;
-        dflash_stage_cp_dst = nullptr;
         ggml_free(stage_ctx);
         return nullptr;
     }
@@ -1602,10 +1597,12 @@ void llama_context::set_dflash_inject_rows(const int32_t * rows, int32_t n) {
     cparams.dflash_inject_rows.assign(rows, rows + n);
 }
 
+// caller must have fenced this context's in-flight compute after the capture decode
+// (common_speculative's process() synchronizes before its per-seq loop)
 bool llama_context::dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, int32_t dst_row0) {
     ggml_tensor * stage = cparams.dflash_draft_stage;
     ggml_tensor * carry = dflash_stage_carry;
-    if (!stage || !carry || !dflash_stage_cp_src || n_rows <= 0) {
+    if (!stage || !carry || n_rows <= 0) {
         return false;
     }
     if (src_row0 < 0 || src_row0 + n_rows > stage->ne[1] ||
@@ -1613,23 +1610,24 @@ bool llama_context::dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, i
         return false;
     }
 
-    // fence the in-flight target compute that writes the stage
-    synchronize();
-
-    // both row ranges are contiguous — one flat D2D copy through the alias pair
+    // both row ranges are contiguous — one flat D2D copy through stack-local aliases
+    // borrowing the stage/carry buffers (same idiom as llama-vbr-artifact-adopt)
     const int64_t ne0 = stage->ne[0] * n_rows;
-    for (ggml_tensor * t : { dflash_stage_cp_src, dflash_stage_cp_dst }) {
+    ggml_tensor cp_src = {};
+    ggml_tensor cp_dst = {};
+    for (ggml_tensor * t : { &cp_src, &cp_dst }) {
+        t->type  = GGML_TYPE_F32;
         t->ne[0] = ne0;
         t->ne[1] = t->ne[2] = t->ne[3] = 1;
         t->nb[0] = ggml_type_size(GGML_TYPE_F32);
         t->nb[1] = t->nb[2] = t->nb[3] = t->nb[0] * ne0;
     }
-    dflash_stage_cp_src->data   = (char *) stage->data + (size_t) src_row0 * stage->nb[1];
-    dflash_stage_cp_src->buffer = stage->buffer;
-    dflash_stage_cp_dst->data   = (char *) carry->data + (size_t) dst_row0 * carry->nb[1];
-    dflash_stage_cp_dst->buffer = carry->buffer;
+    cp_src.data   = (char *) stage->data + (size_t) src_row0 * stage->nb[1];
+    cp_src.buffer = stage->buffer;
+    cp_dst.data   = (char *) carry->data + (size_t) dst_row0 * carry->nb[1];
+    cp_dst.buffer = carry->buffer;
 
-    ggml_backend_tensor_copy(dflash_stage_cp_src, dflash_stage_cp_dst);
+    ggml_backend_tensor_copy(&cp_src, &cp_dst);
 
     return true;
 }

@@ -255,25 +255,40 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 //     capture stage via a per-decode row-index input — no host feature upload at all
 //   * fused: raw concatenated target features from the batch (H2D), fc + enc-norm here
 //   * unfused: pre-encoded g rows from the batch (H2D)
+// staged-rows gather + encoder (fc + enc-norm): shared by the standalone staged inject
+// graph and the fused-cycle inject rows so the two paths' math cannot drift
+static ggml_tensor * build_dflash_staged_enc(llm_graph_context & g, const llama_model & model,
+        ggml_tensor * stage, int64_t n_rows) {
+    auto inp = std::make_unique<llm_graph_input_dflash_stage_rows>(g.cparams);
+    inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_rows);
+    ggml_set_input(inp->rows);
+    ggml_tensor * cur = ggml_get_rows(g.ctx0, stage, inp->rows);
+    g.res->add_input(std::move(inp));
+    g.cb(cur, "inp_g_embeddings", -1);
+
+    cur = g.build_lora_mm(model.fc, cur);
+    g.cb(cur, "fc_out", -1);
+
+    cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+    g.cb(cur, "enc_norm_out", -1);
+
+    return cur;
+}
+
 static ggml_tensor * build_dflash_inject_input(llm_graph_context & g, const llama_model & model, int64_t n_embd) {
     const auto & cparams = g.cparams;
     const bool fused = cparams.dflash_fused_inject;
 
-    ggml_tensor * cur = nullptr;
     if (fused && cparams.dflash_inject_stage) {
-        auto inp = std::make_unique<llm_graph_input_dflash_stage_rows>(cparams);
-        inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
-        ggml_set_input(inp->rows);
-        cur = ggml_get_rows(g.ctx0, cparams.dflash_inject_stage, inp->rows);
-        g.res->add_input(std::move(inp));
-    } else {
-        const int64_t n_embd_in = fused ? g.hparams.n_embd_inp_enc() : n_embd;
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_in);
-        inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_in, g.n_tokens);
-        ggml_set_input(inp->embd);
-        cur = inp->embd;
-        g.res->add_input(std::move(inp));
+        return build_dflash_staged_enc(g, model, cparams.dflash_inject_stage, g.n_tokens);
     }
+
+    const int64_t n_embd_in = fused ? g.hparams.n_embd_inp_enc() : n_embd;
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_in);
+    inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_in, g.n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_tensor * cur = inp->embd;
+    g.res->add_input(std::move(inp));
     g.cb(cur, "inp_g_embeddings", -1);
 
     if (fused) {
@@ -479,16 +494,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_g = nullptr;
     if (n_inj > 0) {
-        auto inp_rows = std::make_unique<llm_graph_input_dflash_stage_rows>(cparams);
-        inp_rows->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_inj);
-        ggml_set_input(inp_rows->rows);
-        inp_g = ggml_get_rows(ctx0, cparams.dflash_oneg_stage, inp_rows->rows);
-        res->add_input(std::move(inp_rows));
-
-        // encoder (fc + enc-norm), same math as the standalone inject graph
-        inp_g = build_lora_mm(model.fc, inp_g);
-        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-        cb(inp_g, "oneg_enc_out", -1);
+        inp_g = build_dflash_staged_enc(*this, model, cparams.dflash_oneg_stage, n_inj);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
