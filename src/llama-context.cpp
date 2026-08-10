@@ -1532,6 +1532,10 @@ void llama_context::set_dflash_argmax(bool enable) {
     cparams.dflash_argmax = enable;
 }
 
+void llama_context::set_dflash_fused_inject(bool enable) {
+    cparams.dflash_fused_inject = enable;
+}
+
 void llama_context::set_dflash_topk(int k) {
     cparams.dflash_topk = (k >= 1) ? k : 1;
     // invalidate graph cache since output tensor shape changes with K
@@ -4076,7 +4080,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    // DFlash fused injection: embd batches carry raw concatenated target features
+    // (encoder input width); the decode graph applies fc + enc-norm itself
+    const bool    dflash_fused = cparams.dflash_fused_inject && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd     ? hparams.n_embd_out()     :
+                            dflash_fused ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -6678,6 +6686,10 @@ void llama_set_dflash_topk(llama_context * ctx, int k) {
 
 void llama_set_dflash_argmax(llama_context * ctx, bool enable) {
     ctx->set_dflash_argmax(enable);
+}
+
+void llama_set_dflash_fused_inject(llama_context * ctx, bool enable) {
+    ctx->set_dflash_fused_inject(enable);
 }
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {

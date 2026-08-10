@@ -629,6 +629,7 @@ public:
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
     void set_dflash_argmax(bool enable);
+    void set_dflash_fused_inject(bool enable);
     void set_dflash_n_slots(int n);
 
     void dflash_reset_hidden_capture();

@@ -1233,6 +1233,13 @@ extern "C" {
     // position. Set on the drafter context by the speculative impl. Default off.
     LLAMA_API void llama_set_dflash_argmax(struct llama_context * ctx, bool enable);
 
+    // Upstream block-diffusion drafter: fused encoder+injection. When enabled, decode
+    // embd batches carry raw concatenated target features (encoder input width) and the
+    // injection graph applies the fc + enc-norm encoder itself — one decode replaces the
+    // llama_encode + readback + inject-decode round-trip. Set on the drafter context by
+    // the speculative impl. Default off.
+    LLAMA_API void llama_set_dflash_fused_inject(struct llama_context * ctx, bool enable);
+
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
     // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
     // Increases drafter ctx_len (and attention cost) linearly — set to the max slots

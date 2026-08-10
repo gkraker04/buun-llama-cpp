@@ -86,6 +86,11 @@ struct llama_cparams {
     // default off keeps raw-logits behavior for every other consumer.
     bool dflash_argmax = false;
 
+    // Upstream block-diffusion drafter: fused encoder+injection. Decode embd batches
+    // carry raw concatenated target features (n_embd_inp_enc wide); the injection graph
+    // applies fc + enc-norm itself, replacing the separate llama_encode round-trip.
+    bool dflash_fused_inject = false;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
     // for. ctx_len in the drafter graph = dflash_n_slots * LLAMA_DFLASH_PER_SLOT_CTX,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the

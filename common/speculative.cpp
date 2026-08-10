@@ -956,6 +956,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    gpu_sample = false;
     int32_t gpu_topk   = 10; // matches the CPU sampler chain's top_k
 
+    // fused encoder+injection: inject decode takes raw target features and applies the
+    // encoder (fc + enc-norm) in-graph — no llama_encode round-trip per prefill chunk
+    bool fused_inject = false;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
     int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
@@ -1036,8 +1040,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        // fused encoder+injection: the inject decode carries raw concatenated target
+        // features and applies fc + enc-norm in-graph, replacing the per-chunk
+        // llama_encode + readback round-trip. Kill switch: GGML_DFLASH_FUSE=0.
+        {
+            const char * env = getenv("GGML_DFLASH_FUSE");
+            fused_inject = !(env && atoi(env) == 0);
+            if (fused_inject) {
+                llama_set_dflash_fused_inject(ctx_dft, true);
+                LOG_INF("%s: - fused encoder+injection enabled\n", __func__);
+            }
+        }
+
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, n_seq);
+        // process() chunks by n_ubatch, so the (wider) fused injection batch only needs
+        // n_ubatch rows; the unfused batch keeps the historic n_batch sizing
+        batch_inject = fused_inject
+            ? llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq)
+            : llama_batch_init(llama_n_batch (ctx_dft), n_embd_dec, n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1141,18 +1161,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                // gather this chunk's target features, interleaved by extract layer;
+                // fused mode writes straight into the injection batch (the decode graph
+                // applies the encoder itself), unfused goes through features_buf + encode
+                float * gather_dst = fused_inject ? batch_inject.embd : nullptr;
+                if (!fused_inject) {
+                    features_buf.resize((size_t) n_chunk * n_embd_enc);
+                    gather_dst = features_buf.data();
+                }
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        float       * dst = gather_dst + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
+                }
+
+                if (fused_inject) {
+                    batch_inject.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) fused inject failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
                 }
 
                 // fuse extracted features through DFlash encoder
