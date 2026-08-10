@@ -666,8 +666,19 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         return;
     }
 
-    // fused single-graph cycles are not implemented for the MLA/ring injection graph
-    GGML_ASSERT(cparams.dflash_oneg_n_inject == 0 && "DSV4 backbone does not support the fused cycle graph");
+    // single-graph fused cycle (see the plain-backbone token branch): rows [0, n_inj)
+    // are staged injections gathered from the carry tensor. They are spliced into the
+    // post-attn-norm stream each layer, so their MLA latent takes the SAME
+    // wkv/kv_norm/rope path as the standalone inject graph and the single cpy_k write
+    // inside build_attn (the cached K is read back as V — one write, no K/V divergence).
+    // Their q/attention outputs are row-local garbage, dropped by the output slice.
+    const int64_t n_inj = cparams.dflash_oneg_stage ? cparams.dflash_oneg_n_inject : 0;
+    GGML_ASSERT(n_inj < n_tokens);
+
+    ggml_tensor * inp_g = nullptr;
+    if (n_inj > 0) {
+        inp_g = build_dflash_staged_enc(*this, model, cparams.dflash_oneg_stage, n_inj);
+    }
 
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
@@ -712,6 +723,14 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+
+        if (inp_g) {
+            // rows [0, n_inj) take the injection math: wkv applies to the encoder
+            // output directly (no attn_norm), as in the standalone inject graph
+            ggml_tensor * tail = ggml_view_2d(ctx0, cur, n_embd, n_tokens - n_inj,
+                    cur->nb[1], (size_t) n_inj * cur->nb[1]);
+            cur = ggml_concat(ctx0, inp_g, tail, 1);
+        }
 
         cur = build_attention(model, inp_attn, cur, inp_pos, il);
 
@@ -759,6 +778,12 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
     cb(cur, "hc_head", -1);
 
+    if (n_inj > 0) {
+        // only the noise rows produce outputs — drop the injection rows here so the
+        // logits/nextn tails line up with the batch's output rows
+        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens - n_inj, cur->nb[1], (size_t) n_inj * cur->nb[1]);
+    }
+
     // confidence head input: the reference scores the pre-norm collapsed hidden state
     res->t_embd = cur;
 
@@ -781,7 +806,11 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, cur);
 
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        ggml_tensor * tok = inp_tokens;
+        if (n_inj > 0) {
+            tok = ggml_view_1d(ctx0, inp_tokens, n_tokens - n_inj, (size_t) n_inj * inp_tokens->nb[0]);
+        }
+        build_dspark_markov_head(*this, model, tok);
     }
 
     build_dflash_draft_argmax(*this);

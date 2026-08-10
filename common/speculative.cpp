@@ -1099,10 +1099,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (fused_inject) {
             if (env_on("GGML_DFLASH_STAGED")) {
                 // phase C wants a scratch drafter seq (the server reserves one when the
-                // env is on) and a carry buffer for the deferred inject rows
+                // env is on) and a carry buffer for the deferred inject rows. The DSV4
+                // backbone's fused cycle has its own kill switch on top of the master
+                // one: GGML_DFLASH_ONEGRAPH_DSV4=0 restores its two-decode path.
                 const bool want_oneg = env_on("GGML_DFLASH_ONEGRAPH") &&
                         llama_n_seq_max(ctx_dft) > n_seq &&
-                        !llama_model_dflash_dsv4_backbone(model_dft);
+                        (!llama_model_dflash_dsv4_backbone(model_dft) ||
+                          env_on("GGML_DFLASH_ONEGRAPH_DSV4"));
                 if (want_oneg) {
                     carry_rows_per_seq = this->params.n_max + 1;
                 }
