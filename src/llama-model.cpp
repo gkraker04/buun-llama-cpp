@@ -2286,7 +2286,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             cparams.n_rs_seq,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            vbr);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2603,6 +2604,10 @@ int32_t llama_model_n_head(const llama_model * model) {
 
 int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
+}
+
+bool llama_model_kv_cache_types_coupled(const llama_model * model) {
+    return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4;
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {

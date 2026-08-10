@@ -1308,6 +1308,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
+    // types — llama_init_from_model hard-errors on a mismatch. When exactly one side was set
+    // explicitly, mirror it to the other instead of failing; two conflicting explicit types
+    // still error at init. When the mirror leaves both sides explicit-static and no --vbr-*
+    // knob was given, dynamic VBR is disarmed (a fully pinned cache has nothing to degrade).
+    if (llama_model_kv_cache_types_coupled(model) && cparams.type_k != cparams.type_v &&
+            params.cache_type_k_explicit != params.cache_type_v_explicit) {
+        const ggml_type t = params.cache_type_k_explicit ? cparams.type_k : cparams.type_v;
+        COM_WRN("model requires matching K/V cache types: mirroring %s to both sides\n", ggml_type_name(t));
+        cparams.type_k = t;
+        cparams.type_v = t;
+        if (!params.vbr_budget_explicit && !params.vbr_min_bits_explicit &&
+            !params.vbr_vram_budget_explicit && !params.vbr_policy_explicit &&
+            !params.vbr_cache_type_k_explicit && !params.vbr_cache_type_v_explicit) {
+            cparams.vbr_dynamic = false;
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
