@@ -607,6 +607,11 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -922,10 +927,10 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes — never a re-scan [B-a].
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the pre-B0 loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
 
     // D-A1's two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.

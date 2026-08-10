@@ -450,7 +450,13 @@ constexpr uint32_t vbr_operation_kind_registrants(vbr_operation_kind kind) {
                  vbr_registrant_bit(vbr_mutation_registrant::state_read_cleanup) |
                  vbr_registrant_bit(vbr_mutation_registrant::explicit_restore_adopt)
          : kind == vbr_operation_kind::state_import
-               ? vbr_registrant_bit(vbr_mutation_registrant::state_read_meta) |
+               // seq_rm belongs here for the same reason it leads checkpoint_restore's mask:
+               // the per-seq branch of state_read_meta clears the destination sequence as its
+               // first act. Missing bit = GGML_ASSERT(event) on any per-seq import with the
+               // generation tracker armed (pre-existing on master since the checkpoint merge;
+               // exposed by test-state-restore-fragmented in the 2026-08-09 sync gate).
+               ? vbr_registrant_bit(vbr_mutation_registrant::seq_rm) |
+                 vbr_registrant_bit(vbr_mutation_registrant::state_read_meta) |
                  vbr_registrant_bit(vbr_mutation_registrant::state_read_data) |
                  vbr_registrant_bit(vbr_mutation_registrant::state_read_install) |
                  vbr_registrant_bit(vbr_mutation_registrant::state_read_cleanup) |

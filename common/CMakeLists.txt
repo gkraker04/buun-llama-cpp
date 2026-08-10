@@ -106,9 +106,13 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    subproc.cpp
+    subproc.h
     suffix-tree.cpp
     suffix-tree.h
     int32-map.h
+    trie.cpp
+    trie.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
@@ -141,6 +145,10 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
 set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)

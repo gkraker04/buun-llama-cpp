@@ -79,6 +79,8 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
+            {"adaptive_target",           sampling.adaptive_target},
+            {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
@@ -130,6 +132,8 @@ json task_params::to_json(bool only_metrics) const {
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
+        {"adaptive_target",           sampling.adaptive_target},
+        {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
@@ -1594,6 +1598,11 @@ json server_task_result_metrics::to_json() {
 
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
+
+        { "n_draft_tokens_total",            n_draft_tokens_total },
+        { "n_draft_accepted_total",          n_draft_accepted_total },
+        { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
+        { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
 
         { "slots",                           slots_data },
     };
@@ -4132,9 +4141,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
@@ -4208,7 +4217,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         }
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -4222,16 +4233,16 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
                 // guards above, but do not re-run the legacy two-axis choice.
                 it_best = it;
                 f_keep_best = f_keep_cur;
-                sim_best = sim_cur;
+                f_sim_best = f_sim_cur;
                 obs_source_best = obs_source;
                 obs_lcp_sel = lcp_cur;
                 continue;
             }
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
-            sim_best    = sim_cur;
+            f_sim_best  = f_sim_cur;
 
             it_best = it;
             if constexpr (Observed) {
@@ -4270,7 +4281,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
         return true;
     }
 
-    SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     // D-A1 stages the immutable source copy before either main or draft
     // context is touched. Allocation failure therefore leaves the source and

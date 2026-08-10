@@ -1883,11 +1883,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
+    BEST_FATTN_KERNEL_NONE    =   0,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -2080,9 +2080,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // fork: rocWMMA FA kept after upstream #26046 removed it (RDNA4 f16 prefill widening rides it).
     // Use the WMMA kernel if possible:
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
+        // (master's can_use_vector_kernel predicate, inlined — upstream's refactor
+        //  dissolved the named flag; the stride term lives in the outer condition)
+        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_WMMA_F16;

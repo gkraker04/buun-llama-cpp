@@ -18,12 +18,25 @@ endif()
 # Classes deliberately NOT covered by the walker. Every entry needs a reason and
 # an owner decision; stale entries (class gone, or class now in the ladder) fail
 # the scan so this list cannot rot.
-#   llama_kv_cache_dsa  — DeepSeek sparse-attention cache; checkpoint capture
-#                         unsupported pending an indexer-state companion design.
-#   llama_kv_cache_dsv4 — DeepSeek V4 MLA cache; same status.
+# None of these were ever *decided* unsupported — they postdate the walker and no
+# one extended it. This list records that fact instead of letting it stay silent.
+# The walker only feeds the VBR artifact capture/adopt paths; ordinary context
+# checkpoints do not route through it.
+#   llama_kv_cache_dsa  — composes TWO coupled llama_kv_cache children (kv_mla +
+#                         kv_lid lightning-indexer keys, layer-filtered); the
+#                         walker taxonomy has no coupled-attention-pair kind, and
+#                         the inner caches accept turbo/VBR types (epoch already
+#                         forwarded as the sum of both) — supporting this is a
+#                         real design task, not a ladder entry.
+#   llama_kv_cache_dsv4 — postdates the walker; composition unaudited; no VBR
+#                         wiring in its header today, so capture is unreachable
+#                         for it until that changes.
+#   llama_kv_cache_msa  — arrived with the 2026-08-09 sync (74ce15741); same
+#                         status as dsv4.
 set(KNOWN_UNCOVERED
     llama_kv_cache_dsa
-    llama_kv_cache_dsv4)
+    llama_kv_cache_dsv4
+    llama_kv_cache_msa)
 
 file(GLOB memory_headers
     "${SOURCE_ROOT}/src/llama-memory*.h"

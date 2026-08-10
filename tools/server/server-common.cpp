@@ -1202,27 +1202,12 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // if the assistant message appears at the end of list, we do not add end-of-turn token
-    // for ex. this can be useful to modify the reasoning process in reasoning models
-    bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
-    common_chat_msg last_message;
-    if (prefill_assistant_message) {
-        last_message = inputs.messages.back();
-        inputs.messages.pop_back();
-
-        /* sanity check, max one assistant message at the end of the list */
-        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
-            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
-        }
-
-        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
-
-        // Upstream guarded against assistant prefill + enable_thinking with a
-        // blanket error, but harnesses that track thinking tokens themselves
-        // (hermes, etc.) drive prefill-to-continue for thinking-only responses
-        // and need both on at once. Experimental fork: allow it.
-
-        inputs.add_generation_prompt = true;
+    // Parse also the OAI "reasoning_effort": "none" specific value
+    if (body.contains("reasoning_effort")) {
+        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        if (reasoning_effort == "none") {
+            inputs.enable_thinking = false;
+        } // other reasoning_effort values are model-specific and not yet handled
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1262,10 +1247,10 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
-        if (!chat_params.thinking_end_tag.empty()) {
+        if (!chat_params.thinking_end_tags.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
+            llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }

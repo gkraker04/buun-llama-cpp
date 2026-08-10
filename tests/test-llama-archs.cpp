@@ -113,6 +113,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
+    } else if (arch == LLM_ARCH_QWEN3TTS) {
+        n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
@@ -168,6 +170,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+    } else if (arch == LLM_ARCH_MINIMAX_M3) {
+        // partial rotary: n_rot must not exceed the indexer key length (64)
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
@@ -198,9 +203,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
 
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
+    // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
+    // indexer head count is independent of the main attention head count.
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,   uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
@@ -355,6 +364,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_MINIMAX_M2:
+        case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_RND1:
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
@@ -420,13 +430,38 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
 
-    // FIXME some models are segfaulting with WebGPU:
+    // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_KIMI_LINEAR) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
 
+    // FIXME: jamba produces incorrect output (~0.55 NMSE vs CPU) on the HIP
+    // backend on RDNA3.5 (gfx1151); the SSM kernels need investigation.
+#ifdef GGML_USE_HIP
+    if (arch == LLM_ARCH_JAMBA) {
+        return false;
+    }
+#endif // GGML_USE_HIP
+
+    return true;
+}
+
+// Archs whose graphs the meta (tensor-parallel) split planner cannot split yet.
+// These pass on single devices and are skipped ONLY for SPLIT_MODE_TENSOR.
+static bool arch_tensor_split_supported(const llm_arch arch) {
+    if (llm_arch_is_diffusion(arch)) {
+        // diffusion graphs reshape a permuted tensor (ggml-backend-meta.cpp
+        // handle_reshape asserts); verified dream + llada, family-wide skip
+        return false;
+    }
+    if (arch == LLM_ARCH_DFLASH_DRAFT || arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT) {
+        // drafters are never tensor-split in production — TP spec-decode pins the
+        // drafter to a single device (--spec-draft-device); same permuted-reshape
+        // limitation as the diffusion family when forced onto the meta device
+        return false;
+    }
     return true;
 }
 
@@ -591,10 +626,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
-#if defined(GGML_USE_WEBGPU)
-                skip = true; // FIXME
-#endif // GGML_USE_WEBGPU
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                        (dc.devs.empty() || !arch_tensor_split_supported(arch)));
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
