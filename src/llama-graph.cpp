@@ -1540,12 +1540,13 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
-    t_h_nextn     = nullptr;
+    t_inp_tokens    = nullptr;
+    t_inp_embd      = nullptr;
+    t_logits        = nullptr;
+    t_logits_argmax = nullptr;
+    t_embd          = nullptr;
+    t_embd_pooled   = nullptr;
+    t_h_nextn       = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
