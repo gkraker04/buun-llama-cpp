@@ -4151,6 +4151,11 @@ private:
                 } catch (const std::exception & e) {
                     SRV_WRN("[spec] failed to measure %s memory: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
+                    // benign for ctx_other-family drafters (dflash/eagle3): they borrow the
+                    // target's tok_embd/output, so a standalone context cannot be created
+                    // before the target exists (llama_init_from_model logs the reason at
+                    // WARN, which the measurement's log filter demotes to DEBUG). The only
+                    // effect is that the draft model VRAM is not charged to the fit reserve.
                 }
             }
         }
@@ -4643,12 +4648,26 @@ private:
                 return false;
             }
 
-            // Auto-detect DFlash from drafter model architecture
+            // Auto-detect DFlash from drafter model architecture. This tree carries TWO
+            // DFlash implementations: the fork DeltaNet cross-attention drafter (arches
+            // dflash-draft / gemma4-dflash-draft, which publish their capture layers via
+            // the %s.dflash.target_layer_ids hparams) and upstream's block-diffusion
+            // drafter (LLM_ARCH_DFLASH, which publishes %s.target_layers via the model
+            // vector only). Both report dflash_block_size > 0, so discriminate on the
+            // fork hparams: routing an upstream-format drafter into the fork impl leaves
+            // it with 0 capture layers and it silently never drafts.
             if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
-                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
-                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
-                        llama_model_dflash_block_size(model_dft.get()));
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+                if (llama_model_dflash_n_target_layers(model_dft.get()) > 0) {
+                    params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+                    SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
+                            llama_model_dflash_block_size(model_dft.get()));
+                } else {
+                    params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+                    SRV_INF("auto-detected upstream block-diffusion DFlash drafter (block_size=%d)\n",
+                            llama_model_dflash_block_size(model_dft.get()));
+                }
             }
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -4667,6 +4686,25 @@ private:
                 }
             }
 
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+                // the shared multi-seq speculative state addresses drafter sequences by
+                // slot id, so the drafter context needs one sequence per server slot
+                params_dft.n_parallel = params_base.n_parallel;
+
+                // draft depth: keep upstream's draft.n_max default (3) / the user's
+                // --draft-max — on Muse-Glimmer the shallow depth clearly beats the
+                // full trained block (71.5 t/s @3 vs 66.8 @15 vs 62.2 @7; acceptance
+                // falls 68% -> 22% with depth), unlike the fork DeltaNet impl where
+                // full depth wins (EXP-37i). Only resolve a negative auto value.
+                if (params_base.speculative.draft.n_max < 0) {
+                    const int block_size = llama_model_dflash_block_size(model_dft.get());
+                    params_base.speculative.draft.n_max = block_size > 1 ? block_size - 1 : 12;
+                }
+                if (params_base.speculative.n_max < 0) {
+                    params_base.speculative.n_max = params_base.speculative.draft.n_max;
+                }
+            }
+
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
             // share buffers with the target context (upstream #24922 family)
@@ -4674,6 +4712,22 @@ private:
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
+            }
+
+            // Upstream block-diffusion DFlash: create the drafter context here (it shares
+            // tok_embd/output with the target through cparams_dft.ctx_other) and wire the
+            // draft params so the shared speculative init below picks the draft-dflash
+            // implementation.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+                params_base.speculative.cparams_dft.n_rs_seq = 0;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), params_base.speculative.cparams_dft));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create DFlash draft context\n");
+                    return false;
+                }
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
 
             // Upstream MTP: create draft context from target model's MTP heads
@@ -9711,6 +9765,30 @@ private:
                 llama_tokens draft;
                 if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
+                } else if (!slot.spec && spec &&
+                           params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+                    // upstream shared multi-seq state (block-diffusion DFlash): arm this
+                    // slot's per-seq draft params — the fork single-seq wrapper below
+                    // always drives drafter seq 0, which only matches slot 0
+                    const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                    auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
+                    dp.drafting = true;
+                    dp.n_max    = n_draft_max;
+                    dp.n_past   = slot.prompt.tokens.pos_next();
+                    dp.id_last  = slot.sampled;
+                    dp.prompt   = &cached_text_tokens;
+                    dp.result   = &draft;
+                    common_speculative_draft(spec.get());
+
+                    // the draft decode wrote its noise block into the drafter KV at the
+                    // frontier positions; trim back to the committed target frontier so
+                    // the verify-batch injection in common_speculative_process stays the
+                    // only source of drafter cells (upstream's server does this same
+                    // post-draft seq_rm; it was dropped in the fork-owned merge)
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id,
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1, -1);
+                    }
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;

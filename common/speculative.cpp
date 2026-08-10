@@ -4186,11 +4186,15 @@ common_speculative * common_speculative_init(
     }
 
     if (impls.empty()) {
-        // Upstream self-speculation (draft-mtp) is driven by the shared member context set up at
-        // load and consumed via slot.spec_shared, not by a per-slot implementation — so an empty
-        // per-slot impl set is the expected path there, not a misconfiguration. Only warn when a
-        // per-slot (fork-type) drafter was requested and yielded nothing.
-        if (!params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        // Upstream types (draft-mtp, draft-dflash, eagle3, ...) are driven by the shared
+        // multi-seq state initialized separately and consumed via slot.spec_shared, not by
+        // a per-slot implementation — an empty per-slot impl set is the expected path
+        // there, not a misconfiguration. Only warn when a per-slot (fork-type) drafter was
+        // requested and yielded nothing.
+        if (params.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX)   ||
+            params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) ||
+            params.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE)  ||
+            params.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
             LOG_WRN("%s", "no implementations specified for speculative decoding\n");
         }
         return nullptr;
