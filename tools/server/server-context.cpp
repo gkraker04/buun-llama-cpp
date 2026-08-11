@@ -11698,10 +11698,25 @@ private:
         // single-slot, raw-argmax case. The batch-shape checks prove that every
         // requested output belongs to this one speculative verification; all
         // other requests retain host sampling and full-logits extraction.
+        //
+        // The whole DFlash family qualifies: the fork DeltaNet drafter (DFLASH)
+        // and the upstream block-diffusion drafters (DRAFT_DFLASH, and
+        // DRAFT_DSPARK — its anchor-first block layout only shapes the drafter
+        // decode; the target verify batch is built by the shared code above as
+        // [sampled, draft...], so the coverage proof is unchanged). All of them
+        // verify through the shared spec_i_batch accept loop below.
+        //
+        // A recycle impl alongside (types is a list) reads raw target logits in
+        // its update_logits(); keep those configurations on host sampling.
         dflash_target_argmax_active = false;
         dflash_target_argmax_slot = -1;
-        if (params_base.n_parallel == 1 &&
-            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        const common_speculative_type spec_type = params_base.speculative.type();
+        const bool spec_type_target_argmax =
+            spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+            spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        if (params_base.n_parallel == 1 && spec_type_target_argmax &&
+            !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE)) {
             server_slot * verify_slot = nullptr;
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING ||
