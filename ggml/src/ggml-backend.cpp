@@ -825,6 +825,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+#ifndef GGML_SCHED_MAX_PROFILE_SPLITS
+#define GGML_SCHED_MAX_PROFILE_SPLITS 512
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -884,6 +888,11 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    // opt-in per-split timing (ggml_backend_sched_set_profiling)
+    bool profiling;
+    int  n_profile_splits;
+    struct ggml_backend_sched_split_timing profile_splits[GGML_SCHED_MAX_PROFILE_SPLITS];
 
     int debug;
 
@@ -1681,6 +1690,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     } cache_scope(sched->moe_cache_session);
 
+    const bool profiling = sched->profiling;
+    if (profiling) {
+        sched->n_profile_splits = 0;
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1689,6 +1703,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        int64_t t_profile_start = 0;
+        if (profiling) {
+            // serialize so that the copy and compute phases of this split are measured in isolation
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+            t_profile_start = ggml_time_us();
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1813,6 +1836,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t t_profile_compute = 0;
+        if (profiling) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+            t_profile_compute = ggml_time_us();
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1849,6 +1880,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+        }
+
+        if (profiling) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t t_profile_end = ggml_time_us();
+            if (sched->n_profile_splits < GGML_SCHED_MAX_PROFILE_SPLITS) {
+                struct ggml_backend_sched_split_timing * st = &sched->profile_splits[sched->n_profile_splits++];
+                st->backend_index = split_backend_id;
+                st->n_nodes       = split->graph.n_nodes;
+                st->copy_us       = t_profile_compute - t_profile_start;
+                st->exec_us       = t_profile_end - t_profile_compute;
+                st->first_node    = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : NULL;
+                st->last_node     = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : NULL;
             }
         }
 
@@ -2106,6 +2151,22 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_profiling(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->profiling = enable;
+    if (enable) {
+        sched->n_profile_splits = 0;
+    }
+}
+
+int ggml_backend_sched_get_profile(ggml_backend_sched_t sched, struct ggml_backend_sched_split_timing * timings, int max_timings) {
+    GGML_ASSERT(sched);
+    if (timings != NULL && max_timings > 0) {
+        memcpy(timings, sched->profile_splits, std::min(sched->n_profile_splits, max_timings) * sizeof(timings[0]));
+    }
+    return sched->n_profile_splits;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

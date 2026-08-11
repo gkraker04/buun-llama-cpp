@@ -351,6 +351,26 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Opt-in per-split timing. While enabled, the scheduler serializes execution around every
+    // split (all backends are synchronized before the input-copy phase and after the compute
+    // phase) so that each phase is measured in isolation - do not benchmark with it enabled.
+    // When disabled, the only cost is one branch per split.
+    struct ggml_backend_sched_split_timing {
+        int          backend_index; // scheduler backend index (see ggml_backend_sched_get_backend)
+        int          n_nodes;       // number of graph nodes in the split
+        int64_t      copy_us;       // time spent copying inputs to the split backend
+        int64_t      exec_us;       // time spent computing the split
+        const char * first_node;    // name of the first node (valid until the next sched reset/alloc)
+        const char * last_node;     // name of the last node (valid until the next sched reset/alloc)
+    };
+
+    // Enable or disable per-split timing for subsequent graph computes; enabling clears prior results
+    GGML_API void                 ggml_backend_sched_set_profiling(ggml_backend_sched_t sched, bool enable);
+
+    // Returns the number of splits recorded by the last profiled compute and copies up to
+    // max_timings of them into timings (which may be NULL to only query the count)
+    GGML_API int                  ggml_backend_sched_get_profile(ggml_backend_sched_t sched, struct ggml_backend_sched_split_timing * timings, int max_timings);
+
     //
     // Meta backend
     //

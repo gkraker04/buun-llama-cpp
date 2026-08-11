@@ -617,6 +617,8 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
+    int32_t n_sched_profile = 0; // graph computes counted for [GGML_SCHED_PROFILE] sampling
+
 public:
     // --- fork: DFlash / tree speculative decoding ---
 
