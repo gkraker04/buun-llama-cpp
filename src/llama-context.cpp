@@ -1633,7 +1633,7 @@ void llama_context::set_dflash_fused_inject(bool enable) {
     cparams.dflash_fused_inject = enable;
 }
 
-ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc) {
+ggml_tensor * llama_context::dflash_draft_stage_init(llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
     if (cparams.dflash_draft_stage) {
         return cparams.dflash_draft_stage; // idempotent
     }
@@ -1644,19 +1644,54 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
         return nullptr; // shards hold partial rows; host capture handles TP
     }
 
-    ggml_backend_t gpu_backend = find_gpu_backend();
+    // both scheds touch the stage: this context's graph writes it (D2D capture copies)
+    // and the drafter's graph reads it (get_rows) — a pre-allocated tensor on a device
+    // absent from either sched aborts at graph split. Pick the first GPU present in
+    // both backend sets; the target's primary GPU stays preferred when the drafter is
+    // unpinned (its devices then cover the target's).
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                     ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            continue;
+        }
+        bool dft_has_dev = ctx_dft == nullptr;
+        if (ctx_dft) {
+            for (auto & b : ctx_dft->backends) {
+                if (ggml_backend_get_device(b.get()) == dev) {
+                    dft_has_dev = true;
+                    break;
+                }
+            }
+        }
+        if (dft_has_dev) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
     if (!gpu_backend) {
+        if (find_gpu_backend()) {
+            // e.g. --spec-draft-device pinned the drafter off every target GPU, or a CPU drafter
+            LLAMA_LOG_INFO("%s: no target GPU is schedulable by the drafter - keeping host capture path\n", __func__);
+        }
         return nullptr; // CPU-only: host capture is already sync-free
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
 
     const int64_t max_rows = cparams.n_ubatch;
 
-    ggml_init_params ctx_params = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ctx_params = { 3 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * stage_ctx = ggml_init(ctx_params);
 
     ggml_tensor * stage = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd_enc, max_rows);
     ggml_format_name(stage, "dflash_draft_stage");
+
+    ggml_tensor * carry = nullptr;
+    if (n_carry_rows > 0) {
+        carry = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd_enc, n_carry_rows);
+        ggml_format_name(carry, "dflash_draft_carry");
+    }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(stage_ctx, buft);
     if (!buf) {
@@ -1668,13 +1703,15 @@ ggml_tensor * llama_context::dflash_draft_stage_init(const int32_t * layer_ids, 
 
     dflash_stage_ctx.reset(stage_ctx);
     dflash_stage_buf.reset(buf);
+    dflash_stage_carry = carry;
 
     cparams.dflash_draft_stage = stage;
     cparams.dflash_draft_stage_layers.assign(layer_ids, layer_ids + n_layers);
 
-    LLAMA_LOG_INFO("%s: draft capture staging: %d layers x %" PRId64 " embd x %" PRId64 " rows (%.1f MB, device-resident)\n",
+    LLAMA_LOG_INFO("%s: draft capture staging: %d layers x %" PRId64 " embd x %" PRId64 " rows (%.1f MB, device-resident on %s)\n",
             __func__, n_layers, n_embd_enc / n_layers, max_rows,
-            ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+            ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0),
+            ggml_backend_dev_name(ggml_backend_get_device(gpu_backend)));
 
     return stage;
 }
@@ -1685,6 +1722,46 @@ void llama_context::set_dflash_inject_stage(ggml_tensor * stage) {
 
 void llama_context::set_dflash_inject_rows(const int32_t * rows, int32_t n) {
     cparams.dflash_inject_rows.assign(rows, rows + n);
+}
+
+// caller must have fenced this context's in-flight compute after the capture decode
+// (common_speculative's process() synchronizes before its per-seq loop)
+bool llama_context::dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, int32_t dst_row0) {
+    ggml_tensor * stage = cparams.dflash_draft_stage;
+    ggml_tensor * carry = dflash_stage_carry;
+    if (!stage || !carry || n_rows <= 0) {
+        return false;
+    }
+    if (src_row0 < 0 || src_row0 + n_rows > stage->ne[1] ||
+        dst_row0 < 0 || dst_row0 + n_rows > carry->ne[1]) {
+        return false;
+    }
+
+    // both row ranges are contiguous — one flat D2D copy through stack-local aliases
+    // borrowing the stage/carry buffers (same idiom as llama-vbr-artifact-adopt)
+    const int64_t ne0 = stage->ne[0] * n_rows;
+    ggml_tensor cp_src = {};
+    ggml_tensor cp_dst = {};
+    for (ggml_tensor * t : { &cp_src, &cp_dst }) {
+        t->type  = GGML_TYPE_F32;
+        t->ne[0] = ne0;
+        t->ne[1] = t->ne[2] = t->ne[3] = 1;
+        t->nb[0] = ggml_type_size(GGML_TYPE_F32);
+        t->nb[1] = t->nb[2] = t->nb[3] = t->nb[0] * ne0;
+    }
+    cp_src.data   = (char *) stage->data + (size_t) src_row0 * stage->nb[1];
+    cp_src.buffer = stage->buffer;
+    cp_dst.data   = (char *) carry->data + (size_t) dst_row0 * carry->nb[1];
+    cp_dst.buffer = carry->buffer;
+
+    ggml_backend_tensor_copy(&cp_src, &cp_dst);
+
+    return true;
+}
+
+void llama_context::set_dflash_oneg_inject(ggml_tensor * carry, int32_t n_inject) {
+    cparams.dflash_oneg_stage    = carry;
+    cparams.dflash_oneg_n_inject = n_inject;
 }
 
 void llama_context::set_dflash_topk(int k) {
@@ -6864,8 +6941,8 @@ void llama_set_dflash_fused_inject(llama_context * ctx, bool enable) {
     ctx->set_dflash_fused_inject(enable);
 }
 
-void * llama_dflash_draft_stage_init(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc) {
-    return (void *) ctx->dflash_draft_stage_init(layer_ids, n_layers, n_embd_enc);
+void * llama_dflash_draft_stage_init(llama_context * ctx, llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows) {
+    return (void *) ctx->dflash_draft_stage_init(ctx_dft, layer_ids, n_layers, n_embd_enc, n_carry_rows);
 }
 
 int32_t llama_dflash_draft_stage_valid_n(llama_context * ctx) {
@@ -6878,6 +6955,18 @@ void llama_set_dflash_inject_stage(llama_context * ctx, void * stage) {
 
 void llama_set_dflash_inject_rows(llama_context * ctx, const int32_t * rows, int32_t n) {
     ctx->set_dflash_inject_rows(rows, n);
+}
+
+void * llama_dflash_draft_stage_carry_tensor(llama_context * ctx) {
+    return (void *) ctx->dflash_draft_stage_carry_tensor();
+}
+
+bool llama_dflash_draft_stage_carry(llama_context * ctx, int32_t src_row0, int32_t n_rows, int32_t dst_row0) {
+    return ctx->dflash_draft_stage_carry(src_row0, n_rows, dst_row0);
+}
+
+void llama_set_dflash_oneg_inject(llama_context * ctx, void * carry, int32_t n_inject) {
+    ctx->set_dflash_oneg_inject((ggml_tensor *) carry, n_inject);
 }
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {

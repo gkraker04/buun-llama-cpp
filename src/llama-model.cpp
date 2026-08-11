@@ -2943,6 +2943,10 @@ bool llama_model_dspark_has_markov_head(const llama_model * model) {
     return model->dspark_markov_w1 != nullptr;
 }
 
+bool llama_model_dflash_dsv4_backbone(const llama_model * model) {
+    return model->hparams.dsv4_hc_mult > 0;
+}
+
 int32_t llama_model_meta_val_str(const llama_model * model, const char * key, char * buf, size_t buf_size) {
     const auto & it = model->gguf_kv.find(key);
     if (it == model->gguf_kv.end()) {

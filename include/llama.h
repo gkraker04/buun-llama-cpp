@@ -1256,12 +1256,28 @@ extern "C" {
     // host extraction whenever the whole batch fits one ubatch (stage_valid_n returns the
     // covered rows, 0 = use the host path). The DRAFTER binds the stage via
     // set_inject_stage and passes per-decode row indices via set_inject_rows; its fused
-    // injection graph gathers the rows on-device. Returns nullptr when unsupported
-    // (CPU-only or tensor-parallel target).
-    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc);
+    // injection graph gathers the rows on-device. The stage is allocated on a GPU that
+    // both contexts can schedule (the drafter may be pinned to a subset of the target's
+    // devices via --spec-draft-device). Returns nullptr when unsupported (CPU-only or
+    // tensor-parallel target, or no GPU shared with the drafter).
+    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, struct llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
     LLAMA_API int32_t llama_dflash_draft_stage_valid_n(struct llama_context * ctx);
     LLAMA_API void    llama_set_dflash_inject_stage(struct llama_context * ctx, void * stage);
     LLAMA_API void    llama_set_dflash_inject_rows(struct llama_context * ctx, const int32_t * rows, int32_t n);
+
+    // Upstream drafter single-graph fused cycle (phase C). The carry tensor (allocated by
+    // stage_init when n_carry_rows > 0, TARGET ctx) holds deferred inject rows copied out
+    // of the capture stage (D2D) so they survive the next target decode. The DRAFTER's
+    // fused decode gathers them via set_dflash_oneg_inject(carry, n_inject): a token batch
+    // whose first n_inject rows are staged KV injections and the rest the noise block —
+    // one constant-topology graph per generation cycle. n_inject = 0 disables (default).
+    LLAMA_API void *  llama_dflash_draft_stage_carry_tensor(struct llama_context * ctx);
+    LLAMA_API bool    llama_dflash_draft_stage_carry(struct llama_context * ctx, int32_t src_row0, int32_t n_rows, int32_t dst_row0);
+    LLAMA_API void    llama_set_dflash_oneg_inject(struct llama_context * ctx, void * carry, int32_t n_inject);
+
+    // true when the dflash drafter runs on the DeepSeek-V4 DSpark backbone (its fused
+    // single-graph cycle has its own kill switch, GGML_DFLASH_ONEGRAPH_DSV4)
+    LLAMA_API bool    llama_model_dflash_dsv4_backbone(const struct llama_model * model);
 
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
     // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.

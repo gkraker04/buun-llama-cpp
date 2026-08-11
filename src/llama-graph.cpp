@@ -294,7 +294,12 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 bool llm_graph_input_dflash_stage_rows::can_reuse(const llm_graph_params & params) {
-    return rows && rows->ne[0] == params.ubatch.n_tokens;
+    // fused single-graph cycles gather a fixed n_inject rows; standalone injects
+    // gather one row per ubatch token
+    const int64_t n_expected = params.cparams.dflash_oneg_n_inject > 0
+        ? params.cparams.dflash_oneg_n_inject
+        : (int64_t) params.ubatch.n_tokens;
+    return rows && rows->ne[0] == n_expected;
 }
 
 void llm_graph_input_dflash_stage_rows::set_input(const llama_ubatch * ubatch) {
