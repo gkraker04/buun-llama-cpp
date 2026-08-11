@@ -5077,7 +5077,18 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            // The upstream draft-dflash/draft-dspark graphs also read the target's
+            // tok_embd/output — through the ctx_other fallback, which references the
+            // target tensors directly. A -sm layer target puts output.weight on the
+            // last GPU, and a drafter pinned elsewhere (--spec-draft-device) then
+            // aborts at sched split ("pre-allocated tensor in a buffer that cannot
+            // run the operation"). Route them through the same share/gather helper
+            // the fork DFlash type uses: it shares by pointer when the drafter can
+            // schedule the tensor (identical graphs to the ctx_other fallback) and
+            // gathers a drafter-device copy (one INFO log) when it cannot.
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 

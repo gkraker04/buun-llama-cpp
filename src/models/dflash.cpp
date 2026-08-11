@@ -475,7 +475,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    // tok_embd from the target model (shared via ctx_other)
+    // tok_embd from the target model — llama_model_share_tensors fills model.tok_embd
+    // with a drafter-schedulable pointer/copy; the raw ctx_other fallback references the
+    // target tensor directly and aborts at sched split when it lives on a device this
+    // context cannot schedule (e.g. -sm layer target + pinned drafter)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
@@ -588,7 +591,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->t_embd = cur;
 
-    // lm_head from the target model (shared via ctx_other)
+    // lm_head from the target model — see the tok_embd note above (share_tensors
+    // provides a drafter-schedulable model.output; the fallback is not device-safe)
     auto * output = model.output;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
@@ -680,7 +684,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         inp_g = build_dflash_staged_enc(*this, model, cparams.dflash_oneg_stage, n_inj);
     }
 
-    // tok_embd from the target model (shared via ctx_other)
+    // tok_embd from the target model — llama_model_share_tensors fills model.tok_embd
+    // with a drafter-schedulable pointer/copy (the ctx_other fallback is not device-safe,
+    // see the DFlash decoder above)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
@@ -790,7 +796,8 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    // lm_head from the target model (shared via ctx_other)
+    // lm_head from the target model — see the tok_embd note above (share_tensors
+    // provides a drafter-schedulable model.output; the fallback is not device-safe)
     auto * output = model.output;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
