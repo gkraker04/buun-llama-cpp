@@ -3957,13 +3957,15 @@ static void sched_profile_log(ggml_backend_sched_t sched, uint32_t n_tokens, con
         total_exec += ts[i].exec_us;
     }
 
-    LLAMA_LOG_INFO("sched-profile: model=%s n_tokens=%u splits=%d total=%.2f ms (exec %.2f ms, copy %.2f ms)\n",
+    // emit at WARN: the common-log tools map core-llama INFO to the trace verbosity (-lv 4),
+    // which would hide this explicitly opted-in diagnostic at default server verbosity
+    LLAMA_LOG_WARN("sched-profile: model=%s n_tokens=%u splits=%d total=%.2f ms (exec %.2f ms, copy %.2f ms)\n",
             model_name, n_tokens, n, (total_copy + total_exec)/1000.0, total_exec/1000.0, total_copy/1000.0);
     for (int b = 0; b < n_backends; b++) {
         if (b_splits[b] == 0) {
             continue;
         }
-        LLAMA_LOG_INFO("sched-profile:   %-10s %4d splits  exec %9.2f ms  copy %9.2f ms\n",
+        LLAMA_LOG_WARN("sched-profile:   %-10s %4d splits  exec %9.2f ms  copy %9.2f ms\n",
                 ggml_backend_name(ggml_backend_sched_get_backend(sched, b)),
                 b_splits[b], b_exec[b]/1000.0, b_copy[b]/1000.0);
     }
@@ -3989,7 +3991,7 @@ static void sched_profile_log(ggml_backend_sched_t sched, uint32_t n_tokens, con
                     r.first_node != NULL ? r.first_node : "?",
                     r.last_node  != NULL ? r.last_node  : "?");
         }
-        LLAMA_LOG_INFO("sched-profile:   run %3zu %-10s %3d splits %4d nodes  exec %8" PRId64 " us  copy %6" PRId64 " us  %s\n",
+        LLAMA_LOG_WARN("sched-profile:   run %3zu %-10s %3d splits %4d nodes  exec %8" PRId64 " us  copy %6" PRId64 " us  %s\n",
                 order[k], ggml_backend_name(ggml_backend_sched_get_backend(sched, r.backend_index)),
                 r.n_splits, r.n_nodes, r.exec_us, r.copy_us, range);
     }
