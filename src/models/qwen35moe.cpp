@@ -474,7 +474,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    build_dflash_tape_copies(ctx0, gf, cparams, il, n_seqs, n_seq_tokens,
+    build_dflash_tape_copies(il, n_seqs, n_seq_tokens,
         k_conv, v_conv, gate, beta_presigmoid, qkv_mixed);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
