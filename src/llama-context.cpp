@@ -1163,10 +1163,26 @@ float * llama_context::get_logits_ith(int32_t i) {
 
 int32_t * llama_context::get_logits_argmax() {
     synchronize();
+    output_reorder();
     if (logits_argmax_buf.empty()) {
         return nullptr;
     }
     return logits_argmax_buf.data();
+}
+
+llama_token llama_context::get_logits_argmax_ith(int32_t i) {
+    output_reorder();
+    try {
+        const int64_t row = output_resolve_row(i);
+        const size_t offset = (size_t) row * logits_argmax_k;
+        if (logits_argmax_k <= 0 || offset >= logits_argmax_buf.size()) {
+            throw std::runtime_error("no GPU argmax result for output row");
+        }
+        return (llama_token) logits_argmax_buf[offset];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
 }
 
 int32_t llama_context::get_logits_argmax_n() {
@@ -1179,6 +1195,7 @@ int32_t llama_context::get_logits_argmax_k() {
 
 float * llama_context::get_logits_argmax_probs() {
     synchronize();
+    output_reorder();
     if (logits_argmax_prob_buf.empty()) {
         return nullptr;
     }
@@ -1530,7 +1547,23 @@ void llama_context::set_dflash_sample_temp(float temp) {
 }
 
 void llama_context::set_dflash_argmax(bool enable) {
+    if (cparams.dflash_argmax == enable) {
+        return;
+    }
     cparams.dflash_argmax = enable;
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+void llama_context::set_dflash_target_argmax(bool enable) {
+    if (cparams.dflash_target_argmax == enable) {
+        return;
+    }
+    cparams.dflash_target_argmax = enable;
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 void llama_context::set_dflash_fused_inject(bool enable) {
@@ -3782,6 +3815,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    logits_argmax_buf.clear();
+    logits_argmax_prob_buf.clear();
+    logits_argmax_count = 0;
+    logits_argmax_k = 1;
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -3866,12 +3904,17 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax_enc);
         GGML_ASSERT(backend_argmax != nullptr);
         const int64_t total_elems = ggml_nelements(t_argmax_enc);
-        const int K = (int)(total_elems / (2 * n_tokens));
+        const bool ids_only = total_elems == n_tokens;
+        const int K = ids_only ? 1 : (int)(total_elems / (2 * n_tokens));
         const int n_ids = K * n_tokens;
+        GGML_ASSERT(K > 0);
         logits_argmax_buf.resize(n_ids);
         ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_buf.data(), 0, n_ids * sizeof(int32_t));
-        logits_argmax_prob_buf.resize(n_ids);
-        ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_prob_buf.data(), n_ids * sizeof(int32_t), n_ids * sizeof(float));
+        logits_argmax_prob_buf.clear();
+        if (!ids_only) {
+            logits_argmax_prob_buf.resize(n_ids);
+            ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_prob_buf.data(), n_ids * sizeof(int32_t), n_ids * sizeof(float));
+        }
         logits_argmax_count = n_tokens;
         logits_argmax_k = K;
     }
@@ -4128,6 +4171,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // Results belong to exactly one decode. Retain vector capacity, but never
+    // let a graph without an argmax tail expose ids from the previous batch.
+    logits_argmax_buf.clear();
+    logits_argmax_prob_buf.clear();
+    logits_argmax_count = 0;
+    logits_argmax_k = 1;
 
      if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -4473,15 +4523,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (t_argmax && n_outputs > 0) {
             ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
             GGML_ASSERT(backend_argmax != nullptr);
-            // tensor size = 2*K*nrows; derive K
             const int64_t total_elems = ggml_nelements(t_argmax);
-            const int K = (int)(total_elems / (2 * n_outputs));
+            const bool ids_only = total_elems == n_outputs;
+            const int K = ids_only ? 1 : (int)(total_elems / (2 * n_outputs));
             const int n_ids = K * n_outputs;
-            logits_argmax_buf.resize(n_ids);
-            ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_buf.data(), 0, n_ids * sizeof(int32_t));
-            logits_argmax_prob_buf.resize(n_ids);
-            ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_prob_buf.data(), n_ids * sizeof(int32_t), n_ids * sizeof(float));
-            logits_argmax_count = n_outputs;
+            GGML_ASSERT(K > 0);
+            if (n_outputs_prev > 0) {
+                GGML_ASSERT(logits_argmax_k == K);
+                GGML_ASSERT(logits_argmax_buf.size() == (size_t) n_outputs_all * K);
+                GGML_ASSERT(logits_argmax_prob_buf.empty() == ids_only);
+                GGML_ASSERT(ids_only || logits_argmax_prob_buf.size() == (size_t) n_outputs_all * K);
+            } else {
+                // Allocate the final destinations before the first async copy.
+                // Growing either vector between ubatches could invalidate a
+                // host pointer while a backend transfer is still in flight.
+                logits_argmax_buf.resize((size_t) n_outputs_all * K);
+                if (ids_only) {
+                    logits_argmax_prob_buf.clear();
+                } else {
+                    logits_argmax_prob_buf.resize((size_t) n_outputs_all * K);
+                }
+            }
+            const size_t dst_offset = (size_t) n_outputs_prev * K;
+            ggml_backend_tensor_get_async(backend_argmax, t_argmax,
+                    logits_argmax_buf.data() + dst_offset,
+                    0, n_ids * sizeof(int32_t));
+            if (!ids_only) {
+                ggml_backend_tensor_get_async(backend_argmax, t_argmax,
+                        logits_argmax_prob_buf.data() + dst_offset,
+                        n_ids * sizeof(int32_t), n_ids * sizeof(float));
+            }
+            logits_argmax_count = n_outputs_prev + n_outputs;
             logits_argmax_k = K;
         }
 
@@ -4915,6 +4987,28 @@ void llama_context::output_reorder() {
                         std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
                     }
                 }
+            }
+        }
+
+        if (!logits_argmax_buf.empty()) {
+            GGML_ASSERT(logits_argmax_k > 0);
+            GGML_ASSERT(i0 < (uint64_t) logits_argmax_count);
+            GGML_ASSERT(i1 < (uint64_t) logits_argmax_count);
+            for (int k = 0; k < logits_argmax_k; ++k) {
+                std::swap(
+                    logits_argmax_buf[i0*logits_argmax_k + k],
+                    logits_argmax_buf[i1*logits_argmax_k + k]);
+            }
+        }
+
+        if (!logits_argmax_prob_buf.empty()) {
+            GGML_ASSERT(logits_argmax_k > 0);
+            GGML_ASSERT(i0 < (uint64_t) logits_argmax_count);
+            GGML_ASSERT(i1 < (uint64_t) logits_argmax_count);
+            for (int k = 0; k < logits_argmax_k; ++k) {
+                std::swap(
+                    logits_argmax_prob_buf[i0*logits_argmax_k + k],
+                    logits_argmax_prob_buf[i1*logits_argmax_k + k]);
             }
         }
 

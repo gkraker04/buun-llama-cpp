@@ -111,6 +111,11 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    // True when the configured chain is provably equivalent to selecting the
+    // largest raw model logit. Computed once from the chain configuration at
+    // construction so callers do not have to duplicate sampler semantics.
+    bool raw_argmax_exact;
+
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -436,6 +441,7 @@ struct common_sampler * common_sampler_init(
 
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .raw_argmax_exact = */ false,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -444,7 +450,47 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (grmr == nullptr && rbudget == nullptr && n_suppress == 0 &&
+        params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f &&
+        params.penalty_present == 0.0f && params.dry_multiplier == 0.0f &&
+        params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
+        params.top_n_sigma < 0.0f && params.adaptive_target < 0.0f &&
+        params.mirostat == 0 && params.n_probs == 0 &&
+        params.logit_bias.empty()) {
+        bool has_greedy_selector = false;
+        bool supported = true;
+        for (const auto sampler : params.samplers) {
+            switch (sampler) {
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    has_greedy_selector = true;
+                    break;
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                case COMMON_SAMPLER_TYPE_DRY:
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                case COMMON_SAMPLER_TYPE_XTC:
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    break;
+                case COMMON_SAMPLER_TYPE_NONE:
+                case COMMON_SAMPLER_TYPE_INFILL:
+                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    supported = false;
+                    break;
+            }
+        }
+        result->raw_argmax_exact = supported && has_greedy_selector;
+    }
+
     return result;
+}
+
+bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->raw_argmax_exact;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -523,6 +569,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .raw_argmax_exact = */ gsmpl->raw_argmax_exact,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -669,15 +716,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
-
+template <typename Sample>
+static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
+        struct common_sampler * gsmpl,
+        const llama_tokens & draft,
+        Sample && sample) {
     std::vector<llama_token> result;
-    result.reserve(idxs.size());
+    result.reserve(draft.size() + 1);
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -689,7 +738,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -697,6 +746,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+    });
+}
+
+std::vector<llama_token> common_sampler_accept_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & sampled,
+        const llama_tokens & draft) {
+    GGML_ASSERT(sampled.size() == draft.size() + 1 && "sampled.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return sampled[i];
+    });
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
