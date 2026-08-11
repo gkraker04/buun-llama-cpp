@@ -9500,6 +9500,7 @@ private:
     bool dflash_tape_active = false;
     // Target-side argmax for one pure-greedy DFlash verify batch.
     bool dflash_target_argmax_active = false;
+    bool dflash_target_argmax_logged = false;
     llama_seq_id dflash_target_argmax_slot = -1;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
     // no tape is recorded and rollback re-decodes the accepted tokens instead
@@ -11739,6 +11740,10 @@ private:
                 if (covers_batch) {
                     dflash_target_argmax_active = true;
                     dflash_target_argmax_slot = verify_slot->id;
+                    if (!dflash_target_argmax_logged) {
+                        SRV_INF("%s", "speculative verification: on-device target argmax active\n");
+                        dflash_target_argmax_logged = true;
+                    }
                 }
             }
         }
