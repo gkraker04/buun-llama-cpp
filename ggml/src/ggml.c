@@ -6606,6 +6606,44 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+// ggml_dsv4_hc_params
+
+struct ggml_tensor * ggml_dsv4_hc_params(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->ne[0] == 24);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(scale->ne[1] == 1);
+    GGML_ASSERT(scale->ne[2] == 1);
+    GGML_ASSERT(scale->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == 24);
+    GGML_ASSERT(base->ne[1] == 1);
+    GGML_ASSERT(base->ne[2] == 1);
+    GGML_ASSERT(base->ne[3] == 1);
+    GGML_ASSERT(n_iter > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, mixes->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_DSV4_HC_COMB;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(

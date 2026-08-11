@@ -367,6 +367,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
+    if (cparams.fused_dsv4_hc_comb) {
+        ggml_tensor * params = ggml_dsv4_hc_params(ctx0, mixes, hc_scale, hc_base,
+                hparams.dsv4_hc_eps, (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, params, il});
+
+        ggml_tensor * pre = ggml_view_2d(ctx0, params, hc, nt, params->nb[1], 0);
+        *post = ggml_view_2d(ctx0, params, hc, nt, params->nb[1], hc*params->nb[0]);
+        *comb = ggml_view_3d(ctx0, params, hc, hc, nt,
+                hc*params->nb[0], params->nb[1], 2*hc*params->nb[0]);
+
+        cb(pre, "hc_pre", il);
+        cb(*post, "hc_post", il);
+        cb(*comb, "hc_comb", il);
+        return build_hc_pre(x, pre, il);
+    }
+
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
     ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
 

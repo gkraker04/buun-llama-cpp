@@ -33,6 +33,87 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
+static __global__ void dsv4_hc_params_f32(
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * dst,
+        int64_t n_tokens,
+        int64_t sm0,
+        int64_t sm1,
+        int64_t ss0,
+        int64_t sb0,
+        int64_t sd0,
+        int64_t sd1,
+        float eps,
+        int32_t n_iter) {
+    constexpr int comb_offset = 2*DSV4_HC;
+
+    ggml_cuda_pdl_lc();
+    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (it >= n_tokens) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const float scale_pre  = scale[0*ss0];
+    const float scale_post = scale[1*ss0];
+    const float scale_comb = scale[2*ss0];
+
+    for (int i = 0; i < DSV4_HC; ++i) {
+        // The unfused graph stores between MUL and ADD. Explicit round-to-nearest
+        // intrinsics preserve that two-kernel arithmetic instead of contracting an FMA.
+        const float pre_mul = __fmul_rn(mixes[i*sm0 + it*sm1], scale_pre);
+        const float pre_affine = __fadd_rn(pre_mul, base[i*sb0]);
+        const float pre = __fadd_rn(1.0f/(1.0f + expf(-pre_affine)), eps);
+        dst[i*sd0 + it*sd1] = pre;
+
+        const int post_idx = DSV4_HC + i;
+        const float post_mul = __fmul_rn(mixes[post_idx*sm0 + it*sm1], scale_post);
+        const float post_affine = __fadd_rn(post_mul, base[post_idx*sb0]);
+        const float post = __fmul_rn(1.0f/(1.0f + expf(-post_affine)), 2.0f);
+        dst[post_idx*sd0 + it*sd1] = post;
+    }
+
+    float comb[DSV4_HC*DSV4_HC];
+    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+        float max = -INFINITY;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            const float v = mixes[(comb_offset + idx)*sm0 + it*sm1] * scale_comb +
+                base[(comb_offset + idx)*sb0];
+            comb[idx] = v;
+            max = fmaxf(max, v);
+        }
+
+        float sum = 0.0f;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            const float v = expf(comb[idx] - max);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0f/sum;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            comb[idx] = comb[idx]*inv_sum + eps;
+        }
+    }
+
+    dsv4_hc_comb_norm_cols(comb, eps);
+    for (int32_t i = 1; i < n_iter; ++i) {
+        dsv4_hc_comb_norm_rows(comb, eps);
+        dsv4_hc_comb_norm_cols(comb, eps);
+    }
+
+    for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
+        dst[(comb_offset + idx)*sd0 + it*sd1] = comb[idx];
+    }
+}
+
 static __global__ void dsv4_hc_comb_f32(
         const float * mixes,
         const float * scale,
@@ -181,7 +262,51 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+static void ggml_cuda_op_dsv4_hc_params(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->ne[0] == 24);
+    GGML_ASSERT(dst->ne[0] == 24);
+    GGML_ASSERT(dst->ne[1] == mixes->ne[1]);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(base->ne[0] == 24);
+
+    GGML_TENSOR_LOCALS(size_t, nbm, mixes, nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, scale, nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, base,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    const int64_t n_tokens = mixes->ne[1];
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
+
+    const int block_size = 256;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            grid_dims, block_dims, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(dsv4_hc_params_f32, launch_params,
+            (const float *) mixes->data, (const float *) scale->data, (const float *) base->data,
+            (float *) dst->data, n_tokens,
+            nbm0 / sizeof(float), nbm1 / sizeof(float),
+            nbs0 / sizeof(float), nbb0 / sizeof(float),
+            nbd0 / sizeof(float), nbd1 / sizeof(float),
+            eps, n_iter);
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->ne[0] == 24) {
+        ggml_cuda_op_dsv4_hc_params(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
     const ggml_tensor * base  = dst->src[2];
