@@ -5018,6 +5018,38 @@ private:
                 if (params_base.speculative.n_max < 0) {
                     params_base.speculative.n_max = params_base.speculative.draft.n_max;
                 }
+
+                // Bound the draft context's compute buffers. The drafter's KV must span
+                // the target prompt (features are injected at absolute positions, so
+                // n_ctx stays inherited), but no single drafter decode ever carries more
+                // than one speculative cycle's rows: draft() batches every drafting
+                // sequence's [anchor + noise block] and process() chunks prefill
+                // injection by n_ubatch. Inheriting n_batch = n_ctx blew the ubatch up
+                // to the full target context (LLM_ARCH_DFLASH used to hit the encoder
+                // n_ubatch clamp), sizing pp compute buffers at ~1 MiB/token — ~8.5 GiB
+                // at -c 8192 and an aborted ggml_backend_sched_new at -c 131072.
+                {
+                    const int32_t block_size = llama_model_dflash_block_size(model_dft.get());
+                    // floor: one full cycle for every sequence in a single non-causal
+                    // decode (draft() emits at most block_size + 1 rows per sequence)
+                    const int32_t n_rows_cycle = params_dft.n_parallel * (std::max(block_size, 1) + 1);
+
+                    int32_t n_ubatch_cap = 512;
+                    if (const char * env = getenv("GGML_DFLASH_DRAFT_UBATCH")) {
+                        const int v = atoi(env);
+                        if (v > 0) {
+                            n_ubatch_cap = (int32_t) v;
+                        }
+                    }
+
+                    params_dft.n_ubatch = std::max(n_rows_cycle, std::min(params_dft.n_ubatch, n_ubatch_cap));
+                    params_dft.n_batch  = params_dft.n_ubatch;
+
+                    SRV_INF("draft ctx buffers bounded: n_ubatch %d, n_batch %d (compute buffers scale with "
+                            "ubatch; drafter prefill chunks by ubatch; KV spans target ctx %d; "
+                            "override cap with GGML_DFLASH_DRAFT_UBATCH)\n",
+                            params_dft.n_ubatch, params_dft.n_batch, params_dft.n_ctx);
+                }
             }
 
             // The fork DeltaNet drafter doesn't need the target's full context (it has no

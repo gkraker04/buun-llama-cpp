@@ -315,7 +315,13 @@ llama_context::llama_context(
     // memoryless context routes to encode() (first seen: dflash-draft standalone in
     // test-llama-archs). has_encoder itself stays false for them — flipping it would
     // change the harness's encode-first handling.
-    if (llama_model_has_encoder(&model) ||
+    // The upstream DFlash/DSpark drafter (LLM_ARCH_DFLASH) is exempt: it has real KV
+    // memory, so decode() micro-batches normally, and its only encode() caller
+    // (common_speculative_impl_draft_dflash::process) already chunks by n_ubatch.
+    // Clamping it up ties the drafter's compute buffers to n_batch — the server sets
+    // draft n_batch = target n_ctx, which cost GiBs of pp buffers at large -c and
+    // aborted context creation outright at -c 131072 (graph_max_nodes ~ n_ubatch).
+    if ((llama_model_has_encoder(&model) && model.arch != LLM_ARCH_DFLASH) ||
         model.arch == LLM_ARCH_DFLASH_DRAFT || model.arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT) {
         cparams.n_ubatch = cparams.n_batch;
     }
