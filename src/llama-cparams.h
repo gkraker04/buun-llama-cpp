@@ -89,6 +89,11 @@ struct llama_cparams {
     // default off keeps raw-logits behavior for every other consumer.
     bool dflash_argmax = false;
 
+    // DFlash target verification: append a raw greedy argmax to the ordinary
+    // target graph. Unlike dflash_argmax, this is architecture-independent and
+    // deliberately ignores the drafter's temperature/top-K controls.
+    bool dflash_target_argmax = false;
+
     // Upstream block-diffusion drafter: fused encoder+injection. Decode embd batches
     // carry raw concatenated target features (n_embd_inp_enc wide); the injection graph
     // applies fc + enc-norm itself, replacing the separate llama_encode round-trip.
