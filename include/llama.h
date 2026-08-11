@@ -1195,6 +1195,11 @@ extern "C" {
     LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
     // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
+    // True when the last decode computed the argmax/top-K tail on a GPU backend.
+    // Only the GPU argmax kernels implement the extended [ids + log-probs] output
+    // layout; a tail scheduled on the CPU backend (e.g. a drafter with -ngld 0)
+    // runs the plain per-row argmax and leaves the extended layout uninitialized.
+    LLAMA_API bool      llama_get_logits_argmax_gpu(struct llama_context * ctx);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

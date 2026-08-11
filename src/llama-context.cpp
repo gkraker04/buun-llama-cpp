@@ -1281,6 +1281,10 @@ float * llama_context::get_logits_argmax_probs() {
     return logits_argmax_prob_buf.data();
 }
 
+bool llama_context::get_logits_argmax_gpu() {
+    return logits_argmax_gpu;
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1627,6 +1631,10 @@ void llama_context::set_dflash_sample_temp(float temp) {
 
 void llama_context::set_dflash_argmax(bool enable) {
     cparams.dflash_argmax = enable;
+    // invalidate graph cache: the tail's presence changes graph topology and the
+    // reuse check does not compare cparams (a stale reused graph would keep
+    // producing t_logits_argmax and skip the raw logits extraction)
+    gf_res_prev->reset();
 }
 
 void llama_context::set_dflash_fused_inject(bool enable) {
@@ -4029,6 +4037,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     if (t_argmax_enc && n_tokens > 0) {
         ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax_enc);
         GGML_ASSERT(backend_argmax != nullptr);
+        {
+            auto * dev = ggml_backend_get_device(backend_argmax);
+            logits_argmax_gpu = dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
         const int64_t total_elems = ggml_nelements(t_argmax_enc);
         const int K = (int)(total_elems / (2 * n_tokens));
         const int n_ids = K * n_tokens;
@@ -4637,6 +4649,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (t_argmax && n_outputs > 0) {
             ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
             GGML_ASSERT(backend_argmax != nullptr);
+            {
+                auto * dev = ggml_backend_get_device(backend_argmax);
+                logits_argmax_gpu = dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+            }
             // tensor size = 2*K*nrows; derive K
             const int64_t total_elems = ggml_nelements(t_argmax);
             const int K = (int)(total_elems / (2 * n_outputs));
@@ -6846,6 +6862,10 @@ int32_t llama_get_logits_argmax_k(llama_context * ctx) {
 float * llama_get_logits_argmax_probs(llama_context * ctx) {
     ctx->synchronize();
     return ctx->get_logits_argmax_probs();
+}
+
+bool llama_get_logits_argmax_gpu(llama_context * ctx) {
+    return ctx->get_logits_argmax_gpu();
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

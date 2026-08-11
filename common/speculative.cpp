@@ -1224,6 +1224,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     if (llama_decode(ctx_dft, batch) != 0) {
                         LOG_WRN("%s: drafter draft warmup decode failed (non-fatal)\n", __func__);
+                    } else if (gpu_sample && !llama_get_logits_argmax_gpu(ctx_dft)) {
+                        // the sched placed the sampling tail on the CPU backend (e.g. -ngld 0
+                        // or --spec-draft-device none): only the GPU argmax kernels implement
+                        // the extended top-K ids/log-probs layout, so the in-graph results
+                        // would be uninitialized garbage — sample on the host instead
+                        gpu_sample = false;
+                        llama_set_dflash_argmax(ctx_dft, false);
+                        llama_set_dflash_topk(ctx_dft, 1);
+                        LOG_INF("%s: - draft sampling on host (drafter logits on CPU)\n", __func__);
                     }
 
                     // fused single-graph cycle: warm the steady-state shape (carry
@@ -1692,6 +1701,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t * g_ids = nullptr;
         const float   * g_lps = nullptr;
         int32_t         g_K   = 0;
+        if (gpu_sample && !llama_get_logits_argmax_gpu(ctx_dft)) {
+            // the sched placed the sampling tail on the CPU backend, whose plain argmax
+            // kernel leaves the extended top-K layout uninitialized (the warmup decode
+            // normally catches this at init; cover the warmup-disabled path too). Raw
+            // logits were skipped for THIS decode, so produce no drafts this round and
+            // sample on the host from the next decode on
+            gpu_sample = false;
+            llama_set_dflash_argmax(ctx_dft, false);
+            llama_set_dflash_topk(ctx_dft, 1);
+            LOG_INF("%s: draft sampling on host (drafter logits on CPU)\n", __func__);
+            return;
+        }
         if (gpu_sample) {
             g_ids = llama_get_logits_argmax(ctx_dft);
             g_lps = llama_get_logits_argmax_probs(ctx_dft);

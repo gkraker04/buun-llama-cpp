@@ -287,6 +287,7 @@ struct llama_context {
     int32_t   get_logits_argmax_n();
     int32_t   get_logits_argmax_k();
     float   * get_logits_argmax_probs();
+    bool      get_logits_argmax_gpu();
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -708,6 +709,9 @@ public:
     std::vector<float>   logits_argmax_prob_buf;
     int32_t logits_argmax_count = 0;
     int32_t logits_argmax_k = 1;
+    // whether the last argmax/top-K tail ran on a GPU backend (only the GPU kernels
+    // implement the extended ids + log-probs layout; the CPU kernel does not)
+    bool logits_argmax_gpu = false;
 
     // upstream drafter device-staged capture (target ctx)
     ggml_context_ptr           dflash_stage_ctx;
