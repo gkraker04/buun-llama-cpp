@@ -757,6 +757,43 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
     }
 }
 
+// Coupled latent K/V materialization: emit rotated-domain V while the same
+// Turbo4 source value is resident for K's inverse FWHT. The 128-thread geometry
+// follows the existing K kernel's four D128 groups.
+static __global__ void k_turbo4_dequant_f16_kv_inv_fwht(
+        const char * __restrict__ src,
+        half * __restrict__ dst_k, half * __restrict__ dst_v,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int tid = threadIdx.x;
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    for (int group = 0; group < ne0 / 128; ++group) {
+        const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + group;
+        const float norm = __half2float(blk->norm);
+        const uint8_t idx = (tid & 1) ? (blk->qs[tid / 2] >> 4) : (blk->qs[tid / 2] & 0xF);
+        const float centroid = d_turbo_centroids_4bit_fattn[idx];
+
+        fwht128_store_half(centroid * norm, dst_v + dst_base + group * 128);
+
+        float val = fwht128_butterfly_inplace(centroid * s2[tid], smem);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst_k + dst_base + group * 128);
+        __syncthreads();
+    }
+}
+
 // turbo8 V dequant: simple centroid×norm (rotated domain, V un-rotation done at graph level).
 static __global__ void k_turbo8_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
@@ -2508,6 +2545,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_vbr_kv_dequant_sides(K->type, V->type, &mat_k_dec, &mat_v_dec);
             const bool k_needs_dequant = mat_k_dec || ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || quant_kv_pre_volta));
             const bool v_needs_dequant = mat_v_dec || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || quant_kv_pre_volta));
+            const bool use_coupled_turbo4 = k_needs_dequant && v_needs_dequant &&
+                K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0 &&
+                K->data == V->data && Q->ne[0] == 512 &&
+                K->ne[0] == V->ne[0] && K->ne[1] == V->ne[1] &&
+                K->ne[2] == V->ne[2] && K->ne[3] == V->ne[3] &&
+                K->nb[1] == V->nb[1] && K->nb[2] == V->nb[2] && K->nb[3] == V->nb[3];
+            bool coupled_turbo4_materialized = false;
             if (k_needs_dequant) {
                 // Size for the CURRENT attended KV range (this call's view) — NOT the full
                 // root/kv_size capacity. The dequant kernel below writes exactly K->ne[1] rows and
@@ -2525,6 +2569,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // happens in an eager pass; the capture pass sees a stable, already-mapped size).
                 const size_t k_max_bytes = (size_t) K->ne[0] * (size_t) K->ne[1] * (size_t) K->ne[2] * (size_t) K->ne[3] * sizeof(half);
                 k_fp16_dec = kv_dequant_scratch(ctx, k_max_bytes, ctx.fattn_scratch.k);
+                if (use_coupled_turbo4) {
+                    const size_t v_max_bytes = (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
+                    v_fp16_dec = kv_dequant_scratch(ctx, v_max_bytes, ctx.fattn_scratch.v);
+                }
                 // K dequant to fp16 in ORIGINAL (unrotated) domain via inverse FWHT.
                 // All turbo K types use inv-FWHT kernels so K matches native f16/q8_0 layout
                 // and Q stays unrotated. This mirrors the prefill path's encode→decode chain
@@ -2541,7 +2589,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 const bool k_t3_use_rotated = (K->type == GGML_TYPE_TURBO3_0) &&
                     (V->type == GGML_TYPE_TURBO2_0);
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
-                if (K->type == GGML_TYPE_TURBO2_0 && k_t2_use_rotated) {
+                if (use_coupled_turbo4) {
+                    k_turbo4_dequant_f16_kv_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, v_fp16_dec,
+                        K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    coupled_turbo4_materialized = true;
+                } else if (K->type == GGML_TYPE_TURBO2_0 && k_t2_use_rotated) {
                     // Rotated-domain dequant: K stays in WHT-rotated space; Q is pre-rotated below.
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
@@ -2592,52 +2645,64 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dst->src[1] = &K_f16_dec;
             }
             if (v_needs_dequant) {
-                // Same exact-width, VMM-backed sizing as K above — see kv_dequant_scratch() for why
-                // root/kv_size sizing was wrong and why growth is fragmentation-proof and capture-safe.
-                // This V grow is the exact call (fattn.cu cudaMalloc of kv_dequant_v_buf) that OOM'd at
-                // the 131072->262144 doubling; it now maps pages into pre-reserved VA instead.
-                const size_t v_max_bytes = (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
-                v_fp16_dec = kv_dequant_scratch(ctx, v_max_bytes, ctx.fattn_scratch.v);
-                // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
-                // ggml_turbo_wht inverse op (added in build_attn) un-rotates the attention output.
-                dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
-                // Coupled K==V cache: same-tensor V read of K-encoded data must use the K
-                // codebook + K decode-alpha — see the matching comment on the prefill site.
-                // (This is the live dsv4 D=512 path; without it turbo1_tcq is incoherent.)
-                const bool v_is_k_encoded = V->data == K->data && V->type == K->type;
-                if (V->type == GGML_TYPE_TURBO2_0) {
-                    k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
-                    k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
-                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
-                } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
-                    k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
-                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
-                } else if (V->type == GGML_TYPE_TURBO4_0) {
-                    k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_TURBO8_0) {
-                    k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
-                    // ROTATED-domain V — see the prefill site; graph un-rotation keyed on v->type.
-                    k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3],
-                        v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]), v_is_k_encoded ? 0 : 1);
-        } else if (V->type == GGML_TYPE_TURBO3_0) {
-                    k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], 1);
-                } else if (V->type == GGML_TYPE_Q8_0) {
-                    // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
-                    k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_BF16) {
-                    // bf16 V cast to f16 (mixed turbo-K + bf16-V) → dispatches as F16/F16.
-                    k_bf16_to_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                if (!coupled_turbo4_materialized) {
+                    // Same exact-width, VMM-backed sizing as K above — see kv_dequant_scratch() for why
+                    // root/kv_size sizing was wrong and why growth is fragmentation-proof and capture-safe.
+                    // This V grow is the exact call (fattn.cu cudaMalloc of kv_dequant_v_buf) that OOM'd at
+                    // the 131072->262144 doubling; it now maps pages into pre-reserved VA instead.
+                    const size_t v_max_bytes =
+                        (size_t) V->ne[0] * (size_t) V->ne[1] * (size_t) V->ne[2] * (size_t) V->ne[3] * sizeof(half);
+                    v_fp16_dec = kv_dequant_scratch(ctx, v_max_bytes, ctx.fattn_scratch.v);
+                    // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
+                    // ggml_turbo_wht inverse op (added in build_attn) un-rotates the attention output.
+                    dim3       grid_v(V->ne[1], V->ne[2], V->ne[3]);
+                    // Coupled K==V cache: same-tensor V read of K-encoded data must use the K
+                    // codebook + K decode-alpha — see the matching comment on the prefill site.
+                    // (This is the live dsv4 D=512 path; without it turbo1_tcq is incoherent.)
+                    const bool v_is_k_encoded = V->data == K->data && V->type == K->type;
+                    if (V->type == GGML_TYPE_TURBO2_0) {
+                        k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                              V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                              V->nb[2], V->nb[3]);
+                    } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
+                        k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                            (const char *) V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2],
+                            V->nb[3], v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]),
+                            v_is_k_encoded ? 0 : 1);
+                    } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
+                        k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                            (const char *) V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2],
+                            V->nb[3], v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]),
+                            v_is_k_encoded ? 0 : 1);
+                    } else if (V->type == GGML_TYPE_TURBO4_0) {
+                        k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                              V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                              V->nb[2], V->nb[3]);
+                    } else if (V->type == GGML_TYPE_TURBO8_0) {
+                        k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                              V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                              V->nb[2], V->nb[3]);
+                    } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
+                        // ROTATED-domain V — see the prefill site; graph un-rotation keyed on v->type.
+                        k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
+                            (const char *) V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2],
+                            V->nb[3], v_is_k_encoded ? d_tcq_decode_alpha_k : tcq_compute_alpha_v(V->type, V->ne[1]),
+                            v_is_k_encoded ? 0 : 1);
+                    } else if (V->type == GGML_TYPE_TURBO3_0) {
+                        k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                              V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                              V->nb[2], V->nb[3], 1);
+                    } else if (V->type == GGML_TYPE_Q8_0) {
+                        // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
+                        k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                                 V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                                 V->nb[2], V->nb[3]);
+                    } else if (V->type == GGML_TYPE_BF16) {
+                        // bf16 V cast to f16 (mixed turbo-K + bf16-V) → dispatches as F16/F16.
+                        k_bf16_to_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>((const char *) V->data, v_fp16_dec,
+                                                                            V->ne[0], V->ne[1], V->ne[2], V->nb[1],
+                                                                            V->nb[2], V->nb[3]);
+                    }
                 }
                 V_f16_dec = *V;
                 V_f16_dec.type = GGML_TYPE_F16;
