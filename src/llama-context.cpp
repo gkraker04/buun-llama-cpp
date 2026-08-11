@@ -1642,6 +1642,14 @@ void llama_context::set_dflash_argmax(bool enable) {
     // reuse check does not compare cparams (a stale reused graph would keep
     // producing t_logits_argmax and skip the raw logits extraction)
     gf_res_prev->reset();
+    if (!enable) {
+        // drop stale tail results: subsequent decodes will not refill these, and
+        // consumers key the GPU-vs-host sampling path on get_logits_argmax()
+        // returning non-null
+        logits_argmax_buf.clear();
+        logits_argmax_prob_buf.clear();
+        logits_argmax_count = 0;
+    }
 }
 
 void llama_context::set_dflash_fused_inject(bool enable) {
