@@ -553,6 +553,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    // Largest DFlash cross-attention bucket covered by the current scheduler
+    // allocation. Smaller graph shapes can reuse that allocation without
+    // rebuilding the scheduler and replacing its host staging buffer.
+    int64_t dflash_cross_reserved_bucket = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

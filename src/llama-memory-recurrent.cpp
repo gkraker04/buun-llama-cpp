@@ -796,6 +796,7 @@ void llama_memory_recurrent::reset_rollback_state(llama_seq_id seq_id) {
 }
 
 void llama_memory_recurrent::bump_tensor_binding_epoch() noexcept {
+    copy_graph_cache_.clear();
     tensor_binding_epoch_ = tensor_binding_epoch_ == UINT64_MAX
         ? 1
         : tensor_binding_epoch_ + 1;
@@ -839,8 +840,94 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
-    // create one shared ggml context for all view pairs (meta caches need 2 views per shard)
     const uint32_t n_recur = hparams.n_layer();
+
+    ggml_backend_dev_t copy_dev = nullptr;
+    bool compatible = true;
+    size_t n_tensors = 0;
+    auto inspect = [&](ggml_tensor * t) {
+        if (!t || !compatible) {
+            return;
+        }
+        if (!t->buffer || ggml_backend_buffer_is_host(t->buffer) ||
+            ggml_backend_buffer_is_meta(t->buffer)) {
+            compatible = false;
+            return;
+        }
+        auto * buft = ggml_backend_buffer_get_type(t->buffer);
+        auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (!dev || (copy_dev && copy_dev != dev)) {
+            compatible = false;
+            return;
+        }
+        copy_dev = dev;
+        ++n_tensors;
+    };
+    for (uint32_t il = 0; il < n_recur; ++il) {
+        inspect(r_l[il]);
+        inspect(s_l[il]);
+    }
+
+    if (compatible && copy_dev && n_tensors > 0) {
+        auto backend_it = copy_backends_.find(copy_dev);
+        if (backend_it == copy_backends_.end()) {
+            backend_it = copy_backends_.emplace(
+                copy_dev, ggml_backend_ptr(ggml_backend_dev_init(copy_dev, nullptr))).first;
+        }
+        ggml_backend_t backend = backend_it->second.get();
+        if (backend) {
+            const auto key = std::make_tuple(copy_dev, i_src, i_dst);
+            auto cached = copy_graph_cache_.find(key);
+            if (cached != copy_graph_cache_.end()) {
+                const ggml_status status = ggml_backend_graph_compute_async(
+                    cached->second.backend, cached->second.graph);
+                ggml_backend_synchronize(cached->second.backend);
+                if (status == GGML_STATUS_SUCCESS) {
+                    return;
+                }
+                copy_graph_cache_.erase(cached);
+            }
+
+            const size_t graph_size = n_tensors * 5 + 8;
+            const size_t ctx_mem = 3 * n_tensors * ggml_tensor_overhead() +
+                ggml_graph_overhead_custom(graph_size, false);
+            ggml_init_params batch_params = {ctx_mem, nullptr, true};
+            ggml_context * ctx = ggml_init(batch_params);
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+
+            auto add_copy = [&](ggml_tensor * t) {
+                if (!t) {
+                    return;
+                }
+                ggml_tensor * src_v = ggml_view_1d(
+                    ctx, t, t->ne[0], (size_t) i_src * t->nb[1]);
+                ggml_tensor * dst_v = ggml_view_1d(
+                    ctx, t, t->ne[0], (size_t) i_dst * t->nb[1]);
+                src_v->buffer = t->buffer;
+                dst_v->buffer = t->buffer;
+                ggml_build_forward_expand(graph, ggml_cpy(ctx, src_v, dst_v));
+            };
+            for (uint32_t il = 0; il < n_recur; ++il) {
+                add_copy(r_l[il]);
+                add_copy(s_l[il]);
+            }
+
+            const ggml_status status =
+                ggml_backend_graph_compute_async(backend, graph);
+            if (status == GGML_STATUS_SUCCESS) {
+                ggml_backend_synchronize(backend);
+                copy_graph_cache_.emplace(key, copy_graph_entry {
+                    ggml_context_ptr(ctx), graph, backend,
+                });
+                return;
+            }
+            ggml_backend_synchronize(backend);
+            ggml_free(ctx);
+        }
+    }
+
+    // create one shared ggml context for all fallback view pairs (meta caches
+    // need two views per shard)
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(64 * n_recur * ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
@@ -994,6 +1081,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
     }
 
     ctxs_bufs = std::move(new_ctxs_bufs);
+    bump_tensor_binding_epoch();
     cells.resize(new_mem_size);
     size = new_mem_size;
 
