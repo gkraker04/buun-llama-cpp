@@ -11956,17 +11956,20 @@ private:
             });
         }
 
-        // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
-        // turned off in post_cycle() so recording stays active across ALL sub-batches.
+        // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback).
+        // The state stays enabled across consecutive speculative cycles and is disabled by the
+        // next pre-decode batch that does not need rollback.
         // Only when GPU tape replay is available (see llama_dflash_tape_replay_available) —
         // otherwise rollback re-decodes the accepted tokens (partial-accept branch below).
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
             && dflash_tape_ok
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
-        if (dflash_tape_active) {
-            llama_set_tape_recording(ctx_tgt, true);
-        }
+        // Keep the capture-enabled verification graph installed across
+        // consecutive speculative cycles. This setter is idempotent; it only
+        // changes the graph when the assembled batch enters or leaves a
+        // rollback-capable DFlash phase.
+        llama_set_tape_recording(ctx_tgt, dflash_tape_active);
 
         // allow multi-seq batching when the batch is pure TG (no prompt tokens).
         // This lets concurrent slots' verify tokens be processed in a single
@@ -12974,15 +12977,6 @@ private:
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                     t_other / 1e3, t_cycle_total / 1e3);
-        }
-
-        // turn off DFlash tape recording after all sub-batches — was turned on
-        // before the sub-batch for loop. Placing it outside the loop (vs inside,
-        // after the first decode) keeps recording active across all sub-batches,
-        // which matters when multiple slots share one pass and the combined
-        // verify batch spans more than one ubatch.
-        if (dflash_tape_active) {
-            llama_set_tape_recording(ctx_tgt, false);
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)

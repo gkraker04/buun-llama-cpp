@@ -1044,6 +1044,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    dflash_cross_reserved_bucket = cross.n_enc;
 }
 
 void llama_context::synchronize() {
@@ -3097,6 +3098,11 @@ static int64_t cross_bucket(int64_t n) {
     return b;
 }
 
+static bool is_dflash_drafter_arch(llm_arch arch) {
+    return arch == LLM_ARCH_DFLASH_DRAFT ||
+           arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT;
+}
+
 static int64_t dflash_max_cross_ctx() {
     static const int64_t max_ctx = [] {
         const char * e = getenv("GGML_DFLASH_MAX_CTX");
@@ -3110,7 +3116,9 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     const int64_t capped = (max_ctx > 0 && n_tokens > max_ctx) ? max_ctx : n_tokens;
     const int64_t bucket = cross_bucket(capped);
 
-    if (cross.n_enc != bucket) {
+    if (cross.n_enc != bucket &&
+        (!is_dflash_drafter_arch(model.arch) ||
+         bucket > dflash_cross_reserved_bucket)) {
         sched_need_reserve = true;
     }
     cross.n_embd    = n_embd;
@@ -3152,7 +3160,9 @@ void llama_context::set_cross_data_gpu(
     const int64_t capped = (max_ctx > 0 && cross_len > max_ctx) ? max_ctx : cross_len;
     const int64_t bucket = cross_bucket(capped);
 
-    if (cross.n_enc != bucket) {
+    if (cross.n_enc != bucket &&
+        (!is_dflash_drafter_arch(model.arch) ||
+         bucket > dflash_cross_reserved_bucket)) {
         sched_need_reserve = true;
     }
     cross.n_embd     = n_target_features;
@@ -7376,7 +7386,9 @@ void llama_context::crosskv_set_cross(void * handle, llama_seq_id seq_id, int en
     const int64_t capped  = (max_ctx > 0 && n_real > max_ctx) ? max_ctx : n_real;
     const int64_t bucket  = cross_bucket(capped);
 
-    if (cross.n_enc != bucket) {
+    if (cross.n_enc != bucket &&
+        (!is_dflash_drafter_arch(model.arch) ||
+         bucket > dflash_cross_reserved_bucket)) {
         sched_need_reserve = true;
     }
     cross.n_embd     = model.hparams.dflash_n_target_features;

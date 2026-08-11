@@ -6,6 +6,7 @@
 
 #include <map>
 #include <set>
+#include <tuple>
 #include <vector>
 
 class vbr_recurrent_prepared_image;
@@ -147,6 +148,21 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // Cell backup pairs repeat throughout speculative decoding. Keep a small
+    // device-local copy backend and graph per fixed source/destination pair so
+    // copying all recurrent layers requires one submission rather than one
+    // synchronous backend copy per tensor.
+    std::map<ggml_backend_dev_t, ggml_backend_ptr> copy_backends_;
+
+    struct copy_graph_entry {
+        ggml_context_ptr ctx;
+        ggml_cgraph * graph = nullptr;
+        ggml_backend_t backend = nullptr;
+    };
+
+    std::map<std::tuple<ggml_backend_dev_t, int32_t, int32_t>, copy_graph_entry>
+        copy_graph_cache_;
 
     bool resize(uint32_t new_mem_size);
 
