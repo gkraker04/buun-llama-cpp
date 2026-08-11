@@ -9498,6 +9498,9 @@ private:
 
     // DFlash tape recording armed for this cycle (turned off in post_cycle())
     bool dflash_tape_active = false;
+    // Target-side argmax for one pure-greedy DFlash verify batch.
+    bool dflash_target_argmax_active = false;
+    llama_seq_id dflash_target_argmax_slot = -1;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
     // no tape is recorded and rollback re-decodes the accepted tokens instead
     bool dflash_tape_ok = false;
@@ -11676,17 +11679,55 @@ private:
             });
         }
 
-        // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
-        // turned off in post_cycle() so recording stays active across ALL sub-batches.
+        // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback).
+        // The state stays enabled across consecutive speculative cycles and is disabled by the
+        // next pre-decode batch that does not need rollback.
         // Only when GPU tape replay is available (see llama_dflash_tape_replay_available) —
         // otherwise rollback re-decodes the accepted tokens (partial-accept branch below).
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
             && dflash_tape_ok
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
-        if (dflash_tape_active) {
-            llama_set_tape_recording(ctx_tgt, true);
+        // Keep the capture-enabled verification graph installed across
+        // consecutive speculative cycles. This setter is idempotent; it only
+        // changes the graph when the assembled batch enters or leaves a
+        // rollback-capable DFlash phase.
+        llama_set_tape_recording(ctx_tgt, dflash_tape_active);
+
+        // Keep target verification logits on the device for the
+        // single-slot, raw-argmax case. The batch-shape checks prove that every
+        // requested output belongs to this one speculative verification; all
+        // other requests retain host sampling and full-logits extraction.
+        dflash_target_argmax_active = false;
+        dflash_target_argmax_slot = -1;
+        if (params_base.n_parallel == 1 &&
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            server_slot * verify_slot = nullptr;
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING ||
+                    !slot.can_speculate() || slot.spec_draft.empty()) {
+                    continue;
+                }
+                if (verify_slot != nullptr) {
+                    verify_slot = nullptr;
+                    break;
+                }
+                verify_slot = &slot;
+            }
+            if (verify_slot && verify_slot->task &&
+                verify_slot->spec_i_batch.size() == (size_t) batch.size() &&
+                common_sampler_raw_argmax_exact(verify_slot->smpl.get())) {
+                bool covers_batch = true;
+                for (size_t i = 0; i < verify_slot->spec_i_batch.size(); ++i) {
+                    covers_batch &= verify_slot->spec_i_batch[i] == (int32_t) i;
+                }
+                if (covers_batch) {
+                    dflash_target_argmax_active = true;
+                    dflash_target_argmax_slot = verify_slot->id;
+                }
+            }
         }
+        ctx_tgt->set_dflash_target_argmax(dflash_target_argmax_active);
 
         // allow multi-seq batching when the batch is pure TG (no prompt tokens).
         // This lets concurrent slots' verify tokens be processed in a single
@@ -12122,8 +12163,45 @@ private:
                 }
             }
 
-            // the accepted tokens from the speculation
-            const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+            // The accepted tokens from the speculation. For the narrowly
+            // proven raw-argmax case, verification copied only token ids from
+            // the target graph; advance the ordinary sampler history with the
+            // exact same accepted sequence. Unsupported configurations never
+            // arm this path and continue sampling the full host logits.
+            std::vector<llama_token> ids;
+            bool accepted_from_target_argmax = false;
+            if (dflash_target_argmax_active &&
+                dflash_target_argmax_slot == slot.id) {
+                const int32_t * argmax = llama_get_logits_argmax(ctx_tgt);
+                if (argmax != nullptr) {
+                    if (llama_get_logits_argmax_k(ctx_tgt) != 1 ||
+                        llama_get_logits_argmax_n(ctx_tgt) !=
+                            (int32_t) slot.spec_i_batch.size()) {
+                        throw std::runtime_error(
+                            "DFlash target argmax output shape mismatch");
+                    }
+
+                    llama_tokens sampled;
+                    sampled.reserve(slot.spec_i_batch.size());
+                    for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                        const llama_token id = ctx_tgt->get_logits_argmax_ith(
+                            slot.spec_i_batch[i]);
+                        if (id == LLAMA_TOKEN_NULL) {
+                            throw std::runtime_error(
+                                "DFlash target argmax row lookup failed");
+                        }
+                        sampled.push_back(id);
+                    }
+                    ids = common_sampler_accept_draft(
+                        slot.smpl.get(), sampled, slot.spec_draft);
+                    accepted_from_target_argmax = true;
+                }
+            }
+            if (!accepted_from_target_argmax) {
+                ids = common_sampler_sample_and_accept_n(
+                    slot.smpl.get(), ctx_tgt,
+                    slot.spec_i_batch, slot.spec_draft);
+            }
 
 
             // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
@@ -12694,15 +12772,6 @@ private:
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                     t_other / 1e3, t_cycle_total / 1e3);
-        }
-
-        // turn off DFlash tape recording after all sub-batches — was turned on
-        // before the sub-batch for loop. Placing it outside the loop (vs inside,
-        // after the first decode) keeps recording active across all sub-batches,
-        // which matters when multiple slots share one pass and the combined
-        // verify batch spans more than one ubatch.
-        if (dflash_tape_active) {
-            llama_set_tape_recording(ctx_tgt, false);
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)

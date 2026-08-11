@@ -2523,6 +2523,17 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add backend sampling layers (if any)
     llm->build_sampling();
 
+    // A speculative target can request raw greedy token IDs for every output
+    // row. This is intentionally separate from the DFlash drafter sampler:
+    // target verification has already proved that no active sampler transform
+    // can change the raw-logit maximum.
+    if (llm->cparams.dflash_target_argmax && llm->res->t_logits) {
+        GGML_ASSERT(llm->res->t_logits_argmax == nullptr);
+        llm->res->t_logits_argmax = ggml_argmax(
+                llm->ctx0, llm->res->t_logits);
+        ggml_build_forward_expand(llm->gf, llm->res->t_logits_argmax);
+    }
+
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
     // dense linear projections are applied after pooling

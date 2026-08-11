@@ -284,6 +284,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     int32_t * get_logits_argmax();
+    llama_token get_logits_argmax_ith(int32_t i);
     int32_t   get_logits_argmax_n();
     int32_t   get_logits_argmax_k();
     float   * get_logits_argmax_probs();
@@ -553,6 +554,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    // Largest DFlash cross-attention bucket covered by the current scheduler
+    // allocation. Smaller graph shapes can reuse that allocation without
+    // rebuilding the scheduler and replacing its host staging buffer.
+    int64_t dflash_cross_reserved_bucket = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -629,6 +634,7 @@ public:
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
     void set_dflash_argmax(bool enable);
+    void set_dflash_target_argmax(bool enable);
     void set_dflash_fused_inject(bool enable);
 
     // upstream drafter device-staged capture (this ctx = target): allocate the
