@@ -5001,6 +5001,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-dspark-gpu-assist"},
+        {"--no-spec-dspark-gpu-assist"},
+        "place the lightweight DSpark tail on a GPU when --moe-cache is explicit and "
+        "the draft backbone is CPU-resident (default: enabled)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.dspark_gpu_assist = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DSPARK_GPU_ASSIST"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

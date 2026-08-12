@@ -4213,6 +4213,23 @@ private:
                     params_dft.n_gpu_layers = 0;
                 }
 
+                // The DSpark experts remain CPU-resident, but its output and final
+                // lightweight layer are substantially faster on the selected draft GPU.
+                // Preserve an explicit device=none request and provide a dedicated opt-out
+                // for users who prefer the previous, smaller GPU allocation.
+                const bool dspark_gpu_assist =
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) &&
+                    params_base.speculative.draft.dspark_gpu_assist &&
+                    params_base.speculative.draft.n_gpu_layers == 0 &&
+                    params_base.moe_cache.mode_explicit &&
+                    params_base.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&
+                    shared_draft_devices.n_weight_devices > 0;
+                if (dspark_gpu_assist) {
+                    params_dft.n_gpu_layers = 2;
+                    SRV_INF("[spec] enabling DSpark GPU assist on %s (disable with --no-spec-dspark-gpu-assist)\n",
+                            ggml_backend_dev_name(shared_draft_devices.devices[0]));
+                }
+
                 // A CPU-layer DSpark drafter is dominated by its vocabulary-sized
                 // output/Markov tail. Keep the 3-layer backbone (including its large
                 // expert tensors) on the CPU, but place the small Markov/confidence
@@ -5017,7 +5034,10 @@ private:
                     const char * env_og4  = getenv("GGML_DFLASH_ONEGRAPH_DSV4");
                     const bool   oneg     = !(env_og  && atoi(env_og)  == 0);
                     const bool   oneg4    = !(env_og4 && atoi(env_og4) == 0);
-                    const bool cpu_dspark = params_dft.n_gpu_layers == 0 &&
+                    // Test the requested placement, not the resolved one: GPU assist
+                    // changes the effective count to two, but the CPU backbone still
+                    // loses badly from the padded single-graph schedule.
+                    const bool cpu_dspark = params_spec.n_gpu_layers == 0 &&
                             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
                     if (oneg && !cpu_dspark &&
                         (oneg4 || !llama_model_dflash_dsv4_backbone(model_dft.get()))) {
