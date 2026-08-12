@@ -1936,42 +1936,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
-// [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-// True if ggml_cuda_mul_mat_id will take a kernel path that never synchronizes the stream
-// (MMVQ/MMVF/MMQ/MMF) and is therefore safe to record into a CUDA graph. Must mirror the
-// dispatch order in ggml_cuda_mul_mat_id below; the remaining fallback path sorts the ids
-// on the host and synchronizes the stream.
-static bool ggml_cuda_mul_mat_id_supports_cuda_graph(const ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                return true; // MMVQ
-            }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-            return true; // MMVF
-        }
-    }
-
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
-        return true; // MMQ
-    }
-
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-        return true; // MMF
-    }
-
-    return false;
-}
-
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2447,6 +2411,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV_TREE:
             ggml_cuda_op_ssm_conv_tree(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_PARAMS:
+            ggml_cuda_op_dsv4_hc_params(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -2635,32 +2602,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            // Opt-in (GGML_CUDA_GRAPH_MMID_WIDE=1): allow any MUL_MAT_ID that dispatches to a
-            // stream-sync-free kernel path (MMVQ/MMVF/MMQ/MMF), matching the dispatch in
-            // ggml_cuda_mul_mat_id. The default gate only accepts the MMVQ path even though
-            // the MMQ/MMF paths are equally capture-safe; small-batch MoE graphs (e.g.
-            // speculative drafters) fall on the wrong side of it.
-            // TODO: make the wide gate the default once validated across architectures.
-            // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-            static const bool mmid_wide_gate = [] {
-                const char * env = getenv("GGML_CUDA_GRAPH_MMID_WIDE");
-                return env != nullptr && atoi(env) != 0;
-            }();
-
-            bool mmid_supported;
-            if (mmid_wide_gate) {
-                mmid_supported = ggml_cuda_mul_mat_id_supports_cuda_graph(node);
-            } else {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-                mmid_supported = ggml_is_quantized(node->src[0]->type) && node->ne[2] <= mmvq_mmid_max;
-            }
-
-            if (!mmid_supported) {
+            // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+            // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
@@ -3406,6 +3353,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             mode == GGML_ROPE_TYPE_NORMAL && concat_dim == 0 &&
             prefix->type == GGML_TYPE_F32 && rope_src->type == GGML_TYPE_F32 &&
             node->type == GGML_TYPE_F32 && concat->type == GGML_TYPE_F32 &&
+            prefix->nb[0] == sizeof(float) &&
             prefix->ne[0] > 0 && prefix->ne[0] % 2 == 0 &&
             rope_src->ne[0] > 0 && rope_src->ne[0] % 2 == 0 &&
             n_dims == rope_src->ne[0] &&
@@ -5461,9 +5409,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_DSV4_HC_PARAMS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->ne[0] == 24;
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->ne[0] == 4 && op->ne[1] == 4;
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;

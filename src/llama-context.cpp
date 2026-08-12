@@ -3928,107 +3928,6 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-// [GGML_SCHED_PROFILE] per-split scheduler timing consumer
-// parse a layer index from a node name ("blk.17...." or the "...-17" graph-cb suffix), -1 if none
-static int sched_profile_node_layer(const char * name) {
-    if (name == NULL) {
-        return -1;
-    }
-    const char * p = strstr(name, "blk.");
-    if (p != NULL) {
-        return atoi(p + 4);
-    }
-    p = strrchr(name, '-');
-    if (p != NULL && p[1] >= '0' && p[1] <= '9') {
-        return atoi(p + 1);
-    }
-    return -1;
-}
-
-static void sched_profile_log(ggml_backend_sched_t sched, uint32_t n_tokens, const char * model_name) {
-    std::vector<ggml_backend_sched_split_timing> ts(512);
-    const int n = std::min(ggml_backend_sched_get_profile(sched, ts.data(), (int) ts.size()), (int) ts.size());
-    if (n <= 0) {
-        return;
-    }
-
-    // aggregate runs of consecutive splits on the same backend
-    struct sched_profile_run {
-        int backend_index;
-        int n_splits;
-        int n_nodes;
-        int64_t copy_us;
-        int64_t exec_us;
-        const char * first_node;
-        const char * last_node;
-    };
-    std::vector<sched_profile_run> runs;
-    for (int i = 0; i < n; i++) {
-        if (runs.empty() || runs.back().backend_index != ts[i].backend_index) {
-            runs.push_back({ ts[i].backend_index, 0, 0, 0, 0, ts[i].first_node, ts[i].last_node });
-        }
-        sched_profile_run & r = runs.back();
-        r.n_splits += 1;
-        r.n_nodes  += ts[i].n_nodes;
-        r.copy_us  += ts[i].copy_us;
-        r.exec_us  += ts[i].exec_us;
-        r.last_node = ts[i].last_node;
-    }
-
-    const int n_backends = ggml_backend_sched_get_n_backends(sched);
-    std::vector<int64_t> b_copy  (n_backends, 0);
-    std::vector<int64_t> b_exec  (n_backends, 0);
-    std::vector<int>     b_splits(n_backends, 0);
-    int64_t total_copy = 0;
-    int64_t total_exec = 0;
-    for (int i = 0; i < n; i++) {
-        b_copy  [ts[i].backend_index] += ts[i].copy_us;
-        b_exec  [ts[i].backend_index] += ts[i].exec_us;
-        b_splits[ts[i].backend_index] += 1;
-        total_copy += ts[i].copy_us;
-        total_exec += ts[i].exec_us;
-    }
-
-    // emit at WARN: the common-log tools map core-llama INFO to the trace verbosity (-lv 4),
-    // which would hide this explicitly opted-in diagnostic at default server verbosity
-    LLAMA_LOG_WARN("sched-profile: model=%s n_tokens=%u splits=%d total=%.2f ms (exec %.2f ms, copy %.2f ms)\n",
-            model_name, n_tokens, n, (total_copy + total_exec)/1000.0, total_exec/1000.0, total_copy/1000.0);
-    for (int b = 0; b < n_backends; b++) {
-        if (b_splits[b] == 0) {
-            continue;
-        }
-        LLAMA_LOG_WARN("sched-profile:   %-10s %4d splits  exec %9.2f ms  copy %9.2f ms\n",
-                ggml_backend_name(ggml_backend_sched_get_backend(sched, b)),
-                b_splits[b], b_exec[b]/1000.0, b_copy[b]/1000.0);
-    }
-
-    // top aggregated runs by total time, in graph order rank
-    std::vector<size_t> order(runs.size());
-    for (size_t i = 0; i < runs.size(); i++) {
-        order[i] = i;
-    }
-    const size_t n_top = std::min<size_t>(12, runs.size());
-    std::partial_sort(order.begin(), order.begin() + n_top, order.end(), [&runs](size_t a, size_t b) {
-        return runs[a].copy_us + runs[a].exec_us > runs[b].copy_us + runs[b].exec_us;
-    });
-    for (size_t k = 0; k < n_top; k++) {
-        const sched_profile_run & r = runs[order[k]];
-        const int il0 = sched_profile_node_layer(r.first_node);
-        const int il1 = sched_profile_node_layer(r.last_node);
-        char range[192];
-        if (il0 >= 0 && il0 == il1) {
-            snprintf(range, sizeof(range), "blk.%d", il0);
-        } else {
-            snprintf(range, sizeof(range), "%s .. %s",
-                    r.first_node != NULL ? r.first_node : "?",
-                    r.last_node  != NULL ? r.last_node  : "?");
-        }
-        LLAMA_LOG_WARN("sched-profile:   run %3zu %-10s %3d splits %4d nodes  exec %8" PRId64 " us  copy %6" PRId64 " us  %s\n",
-                order[k], ggml_backend_name(ggml_backend_sched_get_backend(sched, r.backend_index)),
-                r.n_splits, r.n_nodes, r.exec_us, r.copy_us, range);
-    }
-}
-
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -4094,30 +3993,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
     }
 
-    // [GGML_SCHED_PROFILE] opt-in per-split scheduler timing: when set, profile one graph
-    // compute out of every N (N = env value; 64 when the value is 1) and log a per-split
-    // table. Profiled computes run serialized - not for use while benchmarking.
-    static const int sched_profile_every = [] {
-        const char * env = getenv("GGML_SCHED_PROFILE");
-        const int    val = env != NULL ? atoi(env) : 0;
-        return val > 1 ? val : val == 1 ? 64 : 0;
-    }();
-    bool sched_profile_this = false;
-    if (sched_profile_every > 0) {
-        sched_profile_this = n_sched_profile++ % sched_profile_every == 0;
-        ggml_backend_sched_set_profiling(sched.get(), sched_profile_this);
-    }
-
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
-    }
-
-    if (sched_profile_this) {
-        ggml_backend_sched_set_profiling(sched.get(), false);
-        sched_profile_log(sched.get(), ubatch.n_tokens, model.name.c_str());
     }
 
     ret = GGML_STATUS_SUCCESS;

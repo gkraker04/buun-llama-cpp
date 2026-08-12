@@ -726,6 +726,8 @@ void ggml_cuda_op_rope_back_concat(
     const ggml_tensor * pos_src = rope->src[1];
     const ggml_tensor * freq_src = rope->src[2];
 
+    GGML_ASSERT(prefix->nb[0] == sizeof(float));
+
     const int n_dims = ((int32_t *) rope->op_params)[1];
     const int n_ctx_orig = ((int32_t *) rope->op_params)[4];
     float freq_base;

@@ -1902,8 +1902,13 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results
+    // DSV4_HC_PARAMS is currently implemented only by CPU and CUDA. Claiming it
+    // unconditionally can route a fused graph to an unsupported remote backend,
+    // preventing the generic graph from being selected during model probing.
+    if (op->op == GGML_OP_DSV4_HC_PARAMS) {
+        return false;
+    }
     return true;
 }
 

@@ -209,6 +209,26 @@ struct server_shared_draft_device_config {
     std::vector<float> tensor_split;
 };
 
+struct server_resolved_draft_params {
+    common_params params;
+    bool cpu_dspark_backbone = false;
+};
+
+static bool server_has_cpu_dspark_backbone(const common_params & params) {
+    return params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) &&
+           params.speculative.draft.n_gpu_layers == 0;
+}
+
+static void server_append_tensor_override(
+        common_params & params, llama_model_tensor_buft_override tensor_override) {
+    if (!params.tensor_buft_overrides.empty() &&
+        params.tensor_buft_overrides.back().pattern == nullptr) {
+        params.tensor_buft_overrides.pop_back();
+    }
+    params.tensor_buft_overrides.push_back(tensor_override);
+    params.tensor_buft_overrides.push_back({ nullptr, nullptr });
+}
+
 static std::vector<ggml_backend_dev_t> server_configured_devices(const common_params & params) {
     std::vector<ggml_backend_dev_t> result;
     if (!params.devices.empty()) {
@@ -4200,8 +4220,9 @@ private:
         const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
-        auto make_params_dft = [&]() {
+        auto make_params_dft = [&]() -> server_resolved_draft_params {
             common_params params_dft = common_base_params_to_speculative(params_base);
+            const bool cpu_dspark_backbone = server_has_cpu_dspark_backbone(params_base);
             if (shared_draft_devices.prepared) {
                 params_dft.devices = shared_draft_devices.devices;
                 params_dft.main_gpu = 0;
@@ -4225,6 +4246,11 @@ private:
                     params_base.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&
                     shared_draft_devices.n_weight_devices > 0;
                 if (dspark_gpu_assist) {
+                    // n_gpu_layers=2 includes the last repeating layer, whose expert
+                    // tensors are several GiB. Keep those experts on CPU so GPU assist
+                    // moves only the inexpensive dense/tail tensors. User overrides
+                    // remain first in the list and therefore retain precedence.
+                    server_append_tensor_override(params_dft, llm_ffn_exps_cpu_override());
                     params_dft.n_gpu_layers = 2;
                     SRV_INF("[spec] enabling DSpark GPU assist on %s (disable with --no-spec-dspark-gpu-assist)\n",
                             ggml_backend_dev_name(shared_draft_devices.devices[0]));
@@ -4237,21 +4263,16 @@ private:
                 // An explicit --spec-draft-device none remains fully CPU-resident.
                 if (params_dft.n_gpu_layers == 0 &&
                     shared_draft_devices.n_weight_devices > 0) {
-                    if (!params_dft.tensor_buft_overrides.empty() &&
-                        params_dft.tensor_buft_overrides.back().pattern == nullptr) {
-                        params_dft.tensor_buft_overrides.pop_back();
-                    }
-                    params_dft.tensor_buft_overrides.push_back({
+                    server_append_tensor_override(params_dft, {
                             "^(markov_w[12]|conf_proj)\\.",
                             ggml_backend_dev_buffer_type(shared_draft_devices.devices[0]) });
-                    params_dft.tensor_buft_overrides.push_back({ nullptr, nullptr });
                     if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
                         SRV_INF("[spec] keeping CPU DSpark Markov/confidence tail on %s\n",
                                 ggml_backend_dev_name(shared_draft_devices.devices[0]));
                     }
                 }
             }
-            return params_dft;
+            return { std::move(params_dft), cpu_dspark_backbone };
         };
 
         // One server load includes the target, linked draft/MTP, multimodal,
@@ -4328,7 +4349,7 @@ private:
                 // MTP draft context lives on the target model, only context+compute are new
                 bool measure_model_bytes = has_draft;
 
-                common_params params_dft = make_params_dft();
+                common_params params_dft = std::move(make_params_dft().params);
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -4932,7 +4953,8 @@ private:
             // types/threads/overrides AND strips the base params' default-on dynamic-VBR flags —
             // a raw params_base copy here used to arm a second dynamic-VBR context and trip the
             // one-marker-per-process co-tenancy guard, failing draft-context creation.
-            auto params_dft = make_params_dft();
+            auto resolved_dft = make_params_dft();
+            auto & params_dft = resolved_dft.params;
 
             // the helper pins n_outputs_max to the base n_parallel (MTP-path semantics);
             // this path historically inherited the base value — keep that (0 = derive from
@@ -4998,6 +5020,10 @@ private:
                 }
             }
 
+            // Architecture-based detection happens after draft parameter resolution.
+            // Refresh the semantic placement flag now that DSpark is known.
+            resolved_dft.cpu_dspark_backbone = server_has_cpu_dspark_backbone(params_base);
+
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
@@ -5034,12 +5060,7 @@ private:
                     const char * env_og4  = getenv("GGML_DFLASH_ONEGRAPH_DSV4");
                     const bool   oneg     = !(env_og  && atoi(env_og)  == 0);
                     const bool   oneg4    = !(env_og4 && atoi(env_og4) == 0);
-                    // Test the requested placement, not the resolved one: GPU assist
-                    // changes the effective count to two, but the CPU backbone still
-                    // loses badly from the padded single-graph schedule.
-                    const bool cpu_dspark = params_spec.n_gpu_layers == 0 &&
-                            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
-                    if (oneg && !cpu_dspark &&
+                    if (oneg && !resolved_dft.cpu_dspark_backbone &&
                         (oneg4 || !llama_model_dflash_dsv4_backbone(model_dft.get()))) {
                         params_dft.n_parallel += 1;
                         params_dft.kv_unified  = true;
@@ -9867,7 +9888,6 @@ private:
     bool dflash_tape_active = false;
     // Target-side argmax for one pure-greedy DFlash verify batch.
     bool dflash_target_argmax_active = false;
-    bool dflash_target_argmax_logged = false;
     llama_seq_id dflash_target_argmax_slot = -1;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
     // no tape is recorded and rollback re-decodes the accepted tokens instead
@@ -12107,10 +12127,6 @@ private:
                 if (covers_batch) {
                     dflash_target_argmax_active = true;
                     dflash_target_argmax_slot = verify_slot->id;
-                    if (!dflash_target_argmax_logged) {
-                        SRV_INF("%s", "speculative verification: on-device target argmax active\n");
-                        dflash_target_argmax_logged = true;
-                    }
                 }
             }
         }

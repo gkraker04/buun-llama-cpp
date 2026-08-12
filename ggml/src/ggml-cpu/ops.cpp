@@ -11442,7 +11442,7 @@ static void ggml_compute_forward_dsv4_hc_params_f32(
     }
 }
 
-static void ggml_compute_forward_dsv4_hc_params(
+void ggml_compute_forward_dsv4_hc_params(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     switch (dst->src[0]->type) {
@@ -11544,11 +11544,6 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
 void ggml_compute_forward_dsv4_hc_comb(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    if (dst->ne[0] == 24) {
-        ggml_compute_forward_dsv4_hc_params(params, dst);
-        return;
-    }
-
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
