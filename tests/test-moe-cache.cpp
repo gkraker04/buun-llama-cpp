@@ -292,13 +292,20 @@ static size_t count_occurrences(const std::string & text, const char * pattern) 
     return result;
 }
 
+static bool is_cache_gpu(ggml_backend_dev_t device) {
+    if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    const char * name = ggml_backend_reg_name(
+            ggml_backend_dev_backend_reg(device));
+    return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0;
+}
+
 static ggml_backend_dev_t find_cuda_device() {
     ggml_backend_load_all();
     for (size_t index = 0; index < ggml_backend_dev_count(); index++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+        if (is_cache_gpu(device)) {
             return device;
         }
     }
@@ -309,10 +316,7 @@ static ggml_backend_dev_t find_other_cuda_device(
         ggml_backend_dev_t excluded) {
     for (size_t index = 0; index < ggml_backend_dev_count(); index++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (device != excluded &&
-            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+        if (device != excluded && is_cache_gpu(device)) {
             return device;
         }
     }
@@ -3041,7 +3045,7 @@ int main() {
 
     ggml_backend_dev_t cuda_device = find_cuda_device();
     if (!cuda_device) {
-        printf("SKIP: CUDA backend unavailable\n");
+        printf("SKIP: CUDA/HIP backend unavailable\n");
         return 0;
     }
     ggml_backend_reg_t cuda_reg =
@@ -3050,7 +3054,7 @@ int main() {
     ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
     ggml_backend_t cpu = init_cpu_backend();
     if (!cuda || !cpu) {
-        fprintf(stderr, "failed to initialize CUDA and CPU backends\n");
+        fprintf(stderr, "failed to initialize GPU and CPU backends\n");
         if (cuda) {
             ggml_backend_free(cuda);
         }
