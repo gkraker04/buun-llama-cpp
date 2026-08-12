@@ -1345,6 +1345,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
+                op->ne[0] == 4 && op->ne[1] == 4 &&
                 op->src[0]->ne[0] == 24 &&
                 op->src[1]->ne[0] >= 3 &&
                 op->src[2]->ne[0] == 24 &&

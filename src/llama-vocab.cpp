@@ -1930,7 +1930,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         // empty model name falls through to the no_vocab path below (which reads
         // vocab_size and installs dummy tokens). All other archs still require it.
         const bool vocab_required = kv.arch != LLM_ARCH_DFLASH_DRAFT &&
-                                    kv.arch != LLM_ARCH_GEMMA4_DFLASH_DRAFT;
+                                    kv.arch != LLM_ARCH_GEMMA4_DFLASH_DRAFT &&
+                                    !ml.is_deepseek4_dspark_support();
         ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model, vocab_required);
         if (tokenizer_model.empty()) {
             tokenizer_model = "none";

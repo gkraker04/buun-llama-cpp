@@ -1224,6 +1224,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     if (llama_decode(ctx_dft, batch) != 0) {
                         LOG_WRN("%s: drafter draft warmup decode failed (non-fatal)\n", __func__);
+                    } else if (gpu_sample && !llama_get_logits_argmax_gpu(ctx_dft)) {
+                        // the sched placed the sampling tail on the CPU backend (e.g. -ngld 0
+                        // or --spec-draft-device none): only the GPU argmax kernels implement
+                        // the extended top-K ids/log-probs layout, so the in-graph results
+                        // would be uninitialized garbage — sample on the host instead
+                        gpu_sample = false;
+                        llama_set_dflash_argmax(ctx_dft, false);
+                        llama_set_dflash_topk(ctx_dft, 1);
+                        LOG_INF("%s: - draft sampling on host (drafter logits on CPU)\n", __func__);
                     }
 
                     // fused single-graph cycle: warm the steady-state shape (carry
@@ -1692,6 +1701,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t * g_ids = nullptr;
         const float   * g_lps = nullptr;
         int32_t         g_K   = 0;
+        if (gpu_sample && !llama_get_logits_argmax_gpu(ctx_dft)) {
+            // the sched placed the sampling tail on the CPU backend, whose plain argmax
+            // kernel leaves the extended top-K layout uninitialized (the warmup decode
+            // normally catches this at init; cover the warmup-disabled path too). Raw
+            // logits were skipped for THIS decode, so produce no drafts this round and
+            // sample on the host from the next decode on
+            gpu_sample = false;
+            llama_set_dflash_argmax(ctx_dft, false);
+            llama_set_dflash_topk(ctx_dft, 1);
+            LOG_INF("%s: draft sampling on host (drafter logits on CPU)\n", __func__);
+            return;
+        }
         if (gpu_sample) {
             g_ids = llama_get_logits_argmax(ctx_dft);
             g_lps = llama_get_logits_argmax_probs(ctx_dft);
@@ -3613,6 +3634,17 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
             {
                 int32_t * argmax = llama_get_logits_argmax(ctx_dft);
+                if (argmax && !llama_get_logits_argmax_gpu(ctx_dft)) {
+                    // the sched ran the sampling tail on the CPU backend, whose plain
+                    // argmax kernel leaves the extended ids/log-probs layout
+                    // uninitialized (the init warmup normally catches this; cover the
+                    // failed-warmup path too). Raw logits were skipped for THIS decode,
+                    // so draft nothing this round; disabling the tail drops the stale
+                    // results and routes every later round through the host fallback
+                    llama_set_dflash_argmax(ctx_dft, false);
+                    LOG_INF("dflash: draft sampling on host (drafter sampling tail on CPU)\n");
+                    continue;
+                }
                 float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
                 const int K_flat = llama_get_logits_argmax_k(ctx_dft);
                 if (argmax) {
@@ -3709,6 +3741,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         // Use GPU argmax/topk for tree building
         int32_t * argmax = llama_get_logits_argmax(ctx_dft);
+        if (argmax && !llama_get_logits_argmax_gpu(ctx_dft)) {
+            // CPU-scheduled tail — the extended layout is uninitialized (see draft())
+            llama_set_dflash_argmax(ctx_dft, false);
+            LOG_INF("dflash: draft sampling on host (drafter sampling tail on CPU)\n");
+            argmax = nullptr;
+        }
         if (!argmax) {
             LOG_ERR("draft_tree: no GPU argmax available\n");
             return;
@@ -4671,6 +4709,11 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
         llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
     }
 
+    // the fork drafter graphs gate their in-graph argmax/top-K sampling tail on this
+    // flag — enable it here (the historical default) and let the warmup below verify
+    // that the sched actually runs it on a GPU backend
+    llama_set_dflash_argmax(ctx_dft, true);
+
     // warmup the draft context
     {
         const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
@@ -4688,6 +4731,14 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
         int ret = llama_decode(ctx_dft, llama_batch_get_one(tmp, n_tmp));
         if (ret != 0) {
             LOG_WRN("%s: draft warmup decode failed: %d (non-fatal)\n", __func__, ret);
+        } else if (llama_get_logits_argmax(ctx_dft) && !llama_get_logits_argmax_gpu(ctx_dft)) {
+            // the sched placed the sampling tail on the CPU backend (e.g. -ngld 0):
+            // only the GPU argmax kernels implement the extended top-K ids/log-probs
+            // layout, so the in-graph results would be uninitialized garbage —
+            // disable the tail (dropping the warmup's stale results with it) and
+            // sample on the host from raw logits instead
+            llama_set_dflash_argmax(ctx_dft, false);
+            LOG_INF("%s: draft sampling on host (drafter sampling tail on CPU)\n", __func__);
         }
 
         llama_memory_t mem_dft = llama_get_memory(ctx_dft);

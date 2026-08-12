@@ -3858,6 +3858,39 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+struct test_dsv4_hc_params : public test_dsv4_hc {
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PARAMS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, n_iter, eps);
+    }
+
+    test_dsv4_hc_params(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        out = ggml_dsv4_hc_params(ctx, mixes, scale, base, eps, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -5245,6 +5278,64 @@ struct test_rope : public test_case {
     bool grad_precise() override {
         return true;
     }
+};
+
+// GGML_OP_ROPE_BACK + GGML_OP_CONCAT
+struct test_rope_back_concat : public test_case {
+    bool noncontiguous_prefix;
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(noncontiguous_prefix);
+    }
+
+    explicit test_rope_back_concat(bool noncontiguous_prefix)
+        : noncontiguous_prefix(noncontiguous_prefix) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t prefix_ne0 = 8;
+        constexpr int64_t rope_ne0   = 16;
+        constexpr int64_t ne1        = 4;
+        constexpr int64_t ne2        = 3;
+
+        ggml_tensor * prefix;
+        if (noncontiguous_prefix) {
+            prefix = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne1, prefix_ne0, ne2, 1);
+            ggml_set_name(prefix, "prefix_storage");
+            prefix = ggml_permute(ctx, prefix, 1, 0, 2, 3);
+            ggml_set_name(prefix, "prefix_noncontiguous");
+        } else {
+            prefix = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, prefix_ne0, ne1, ne2, 1);
+            ggml_set_name(prefix, "prefix");
+        }
+
+        ggml_tensor * rope_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, rope_ne0, ne1, ne2, 1);
+        ggml_set_name(rope_src, "rope_src");
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne2);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * rope = ggml_rope_ext_back(
+                ctx, rope_src, pos, nullptr, rope_ne0, GGML_ROPE_TYPE_NORMAL,
+                512, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        ggml_set_name(rope, "rope_back");
+        ggml_tensor * out = ggml_concat(ctx, prefix, rope, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                const int32_t pos[] = { 3, 17, 511 };
+                ggml_backend_tensor_set(t, pos, 0, sizeof(pos));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_maa_err() override { return 1e-3; }
 };
 
 // GGML_OP_POOL2D
@@ -8069,6 +8160,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    test_cases.emplace_back(new test_dsv4_hc_params(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_params(17, 4));
+    test_cases.emplace_back(new test_dsv4_hc_params(257, 8));
+    test_cases.emplace_back(new test_dsv4_hc_params(17, 20));
+
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
@@ -9321,6 +9417,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_rope_back_concat(false));
+    test_cases.emplace_back(new test_rope_back_concat(true));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {

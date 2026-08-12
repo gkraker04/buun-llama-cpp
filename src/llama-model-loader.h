@@ -82,6 +82,11 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // antirez/ds4 standalone DeepSeek-V4-Flash DSpark support GGUF.  This
+    // container intentionally omits the target model's architectural and
+    // tokenizer metadata and retains the original mtp.* tensor names.
+    bool deepseek4_dspark_support = false;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -169,6 +174,8 @@ struct llama_model_loader {
     std::string get_arch_name() const;
 
     enum llm_arch get_arch() const;
+
+    bool is_deepseek4_dspark_support() const;
 
     const llama_tensor_weight * get_weight(const char * name) const;
 

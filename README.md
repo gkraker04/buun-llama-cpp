@@ -167,6 +167,126 @@ On VRAM-constrained GPUs, MTP speculative decoding and the vision encoder (mmpro
 
 When combined with auto-fit (no `-c` flag), the server automatically sizes context to leave room for the swap. With a single slot, it also auto-enables `--kv-unified` to avoid splitting the KV cache into separate streams, which doubles usable per-slot context.
 
+## DeepSeek V4 Flash — MoE cache and DSpark
+
+DeepSeek V4 Flash is much larger than a typical consumer-GPU model, but its routed experts can stay
+in system RAM while the hot expert tensors are cached in spare VRAM. On a multi-GPU machine, use
+layer splitting: tensor splitting was substantially slower for this CPU-expert workload even with
+NVLink.
+
+### Choose the MoE cache mode
+
+Use `--moe-cache auto` with two or more GPUs. Automatic mode is deliberately conservative and
+requires two eligible devices. On a single GPU, use `--moe-cache on`; otherwise the cache remains
+off and most of the card can sit unused.
+
+### Target model only (two or more GPUs)
+
+```sh
+./build/bin/llama-server \
+  -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ctk f16 -ctv f16 \
+  -ot 'exps=CPU' --moe-cache auto \
+  --host 0.0.0.0 --port 8081
+```
+
+`-ot 'exps=CPU'` leaves the routed experts in system RAM while keeping the remaining offloaded
+weights on GPU. `--moe-cache auto` then fills otherwise spare VRAM with the hottest expert tensors
+and adapts their residency as routing changes. For one GPU, change it to `--moe-cache on`.
+
+### Dual RTX 3090 + DSpark
+
+```sh
+GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 \
+./build/bin/llama-server \
+  -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
+  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ctk f16 -ctv f16 \
+  -ot 'exps=CPU' --moe-cache auto \
+  --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
+  --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  -t 22 -tb 22 -td 22 -tbd 22 \
+  --host 0.0.0.0 --port 8081
+```
+
+This is the best measured dual-RTX-3090 configuration for the IQ2_M target: its warmed code
+generation averaged about **41.1 tokens/s** on a 24-core EPYC 7443. With the safer default 3 GiB
+cache reserve, the same 22-thread configuration averaged about 41.0 tokens/s. The thread count is
+machine-specific; using all 24 physical cores reduced this host to about 36.9 tokens/s. Prompt
+processing measured **326 pp/s at 2,048 tokens**.
+
+Although the command requests `-ngld 0`, `--spec-type draft-dspark` lets the server recognize the
+CPU-backbone DSpark configuration before model loading. The default GPU assist keeps the large
+draft experts on CPU while placing two lightweight draft layers and the Markov/output tail in about
+316 MiB of GPU memory. This was about 6% faster than the smaller placement. Use
+`--no-spec-dspark-gpu-assist` when that roughly 204 MiB incremental allocation is more valuable as
+KV capacity; use `--spec-draft-device none` to keep the entire drafter on CPU.
+
+### Single RTX 3090 + DSpark
+
+```sh
+./build/bin/llama-server \
+  -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
+  -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
+  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ctk f16 -ctv f16 \
+  -ot 'exps=CPU' --moe-cache on \
+  --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
+  --spec-draft-n-max 2 --spec-draft-p-min 0 \
+  -t 20 -tb 20 -td 20 -tbd 20 \
+  --host 0.0.0.0 --port 8081
+```
+
+On an RTX 3090 with a 24-core EPYC 7443, this configuration averaged **31.5 tokens/s** after
+warmup. Target-only inference with the same forced cache averaged about 24.0 tokens/s. Depth two
+slightly beat depth three and four; depth five was slower. Twenty CPU threads beat 12, 16, 24 and
+32 on this host, but the ideal count is machine-specific—benchmark around your number of physical
+cores while leaving capacity for cache service and server work. Prompt processing measured
+**333 pp/s at 2,048 tokens**.
+
+The CUDA MoE cache normally keeps a 3 GiB safety reserve. Advanced users can try a 2 GiB reserve:
+
+```sh
+GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 ./build/bin/llama-server ...
+```
+
+That raised the tested result only slightly, from 31.5 to 31.8 tokens/s. Do not eliminate the
+reserve: CUDA graphs, workspaces and transient allocations still need headroom.
+
+### Tuning on another host
+
+Change one group at a time and restart the server between configurations. Use the same prompt,
+temperature and output length throughout; discard the first completion after each load and compare
+at least three warmed 512-token completions. Record both generation speed and accepted/drafted token
+counts—a faster result caused only by a luckier generation is not a reliable configuration win.
+
+1. Select the cache mode first: `--moe-cache on` for one GPU, `--moe-cache auto` for two or more.
+2. Keep the safe 3 GiB reserve and sweep CPU concurrency. Set all four pools together with
+   `-t N -tb N -td N -tbd N`. Start around physical cores minus 8, minus 4, minus 2, and all
+   physical cores; avoid assuming SMT threads help.
+3. With the best thread count, sweep `--spec-draft-n-max 2`, `3`, and `4`. Depth five was already
+   clearly worse on the tested host.
+4. Only then try cache reserves of 2560 and 2048 MiB using
+   `GGML_CUDA_MOE_CACHE_RESERVE_MB`. Keep the larger reserve unless the smaller value wins
+   repeatedly, and verify long generation without an allocation failure.
+5. Recheck the winner in reverse order against the original configuration to catch temperature,
+   power and host-load drift.
+
+The reported PP figures used `-ub 4096`, five distinct 2,048-token prompts per server, no reusable
+prefix, and one discarded cold prompt. Two server loads were run in reverse single/dual order; the
+eight warmed measurements averaged 332.8 pp/s on one 3090 and 326.3 pp/s on two. Layer splitting
+helps decode but adds device handoffs during the already-efficient large-batch prefill path, so a
+second 3090 did not improve PP in this configuration.
+
+The tested IQ2_M target plus Q8_0 DSpark sidecar occupied **95.3 GiB of process RSS/PSS**, including
+about 94.4 GiB of file-backed model data. **128 GiB of system RAM is recommended.** Around
+100–104 GiB usable is the practical floor for keeping this working set resident; a nominal 96 GiB
+machine will rely on reclaim/reload or swap and can slow down sharply. More slots, `--no-mmap`, and
+other resident models require additional headroom. Context length, KV type, host memory bandwidth,
+CPU threads, and expert-cache hit rate all affect the final speed.
+
 ## Build
 
 ### NVIDIA (CUDA)

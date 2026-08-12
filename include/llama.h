@@ -218,6 +218,13 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO = 1,
+        LLAMA_MOE_CACHE_MODE_ON = 2,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -383,6 +390,9 @@ extern "C" {
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
                                           // a VBR pool at decode boundaries (0 = 1 GiB default)
+
+        enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1185,6 +1195,11 @@ extern "C" {
     LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
     // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
+    // True when the last decode computed the argmax/top-K tail on a GPU backend.
+    // Only the GPU argmax kernels implement the extended [ids + log-probs] output
+    // layout; a tail scheduled on the CPU backend (e.g. a drafter with -ngld 0)
+    // runs the plain per-row argmax and leaves the extended layout uninitialized.
+    LLAMA_API bool      llama_get_logits_argmax_gpu(struct llama_context * ctx);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

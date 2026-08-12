@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -504,6 +505,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            if (err == cudaErrorMemoryAllocation) {
+                // Last resort: surrender cache storage before aborting on allocation failure.
+
+                (void)cudaGetLastError();
+                if (ggml_moe_cache_trim(device) > 0) {
+                    err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                }
+            }
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
@@ -599,7 +608,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            // On OOM, surrender MoE cache storage and retry once. Each vendor
+            // returns its own error enum from cuMemCreate (CUresult on CUDA,
+            // hipError_t on HIP, MUresult on MUSA); auto + the per-vendor
+            // cudaErrorMemoryAllocation alias keeps this portable.
+            auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_result == cudaErrorMemoryAllocation &&
+                ggml_moe_cache_trim(device) > 0) {
+                create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            }
+            CU_CHECK(create_result);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -2393,6 +2411,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV_TREE:
             ggml_cuda_op_ssm_conv_tree(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_PARAMS:
+            ggml_cuda_op_dsv4_hc_params(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -2581,14 +2602,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+            // TODO: figure out a way to enable for larger batch sizes, without hurting performance
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
@@ -3319,6 +3338,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (i + 1 < cgraph->n_nodes && node->op == GGML_OP_ROPE_BACK) {
+        ggml_tensor * concat = cgraph->nodes[i + 1];
+        const ggml_tensor * prefix = concat->src[0];
+        const ggml_tensor * rope_src = node->src[0];
+        const int mode = ((int32_t *) node->op_params)[2];
+        const int n_dims = ((int32_t *) node->op_params)[1];
+        const int concat_dim = ((int32_t *) concat->op_params)[0];
+        const enum ggml_op ops[] = { GGML_OP_ROPE_BACK, GGML_OP_CONCAT };
+        const int output = i + 1;
+        if (concat->op == GGML_OP_CONCAT && concat->src[1] == node &&
+            prefix && rope_src && node->src[1] &&
+            mode == GGML_ROPE_TYPE_NORMAL && concat_dim == 0 &&
+            prefix->type == GGML_TYPE_F32 && rope_src->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 && concat->type == GGML_TYPE_F32 &&
+            prefix->nb[0] == sizeof(float) &&
+            prefix->ne[0] > 0 && prefix->ne[0] % 2 == 0 &&
+            rope_src->ne[0] > 0 && rope_src->ne[0] % 2 == 0 &&
+            n_dims == rope_src->ne[0] &&
+            prefix->ne[1] == rope_src->ne[1] &&
+            prefix->ne[2] == rope_src->ne[2] &&
+            prefix->ne[3] == rope_src->ne[3] &&
+            concat->ne[0] == prefix->ne[0] + rope_src->ne[0] &&
+            concat->ne[1] == rope_src->ne[1] &&
+            concat->ne[2] == rope_src->ne[2] &&
+            concat->ne[3] == rope_src->ne[3] &&
+            ggml_is_contiguous(concat) &&
+            ggml_can_fuse_subgraph(cgraph, i, 2, ops, &output, 1)) {
+            int out_nodes[] = { output };
+            if (ggml_cuda_check_fusion_memory_ranges(
+                    cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_op_rope_back_concat(*cuda_ctx, node, concat);
+                return 1;
+            }
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -5354,9 +5409,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_DSV4_HC_PARAMS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->ne[0] == 24;
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->ne[0] == 4 && op->ne[1] == 4;
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
@@ -5718,6 +5778,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         }
 
         initialized = true;
+#if !defined(GGML_USE_MUSA)
+        ggml_moe_cache_register(&reg);
+#endif
     }
 
     return &reg;
