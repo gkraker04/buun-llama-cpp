@@ -4242,7 +4242,6 @@ private:
                     params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) &&
                     params_base.speculative.draft.dspark_gpu_assist &&
                     params_base.speculative.draft.n_gpu_layers == 0 &&
-                    params_base.moe_cache.mode_explicit &&
                     params_base.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&
                     shared_draft_devices.n_weight_devices > 0;
                 if (dspark_gpu_assist) {

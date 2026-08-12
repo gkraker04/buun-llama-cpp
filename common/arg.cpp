@@ -5003,8 +5003,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-dspark-gpu-assist"},
         {"--no-spec-dspark-gpu-assist"},
-        "place the lightweight DSpark tail on a GPU when --moe-cache is explicit and "
-        "the draft backbone is CPU-resident (default: enabled)",
+        "place the lightweight DSpark tail on a GPU when the MoE cache is not disabled "
+        "and the draft backbone is CPU-resident (default: enabled)",
         [](common_params & params, bool value) {
             params.speculative.draft.dspark_gpu_assist = value;
         }
