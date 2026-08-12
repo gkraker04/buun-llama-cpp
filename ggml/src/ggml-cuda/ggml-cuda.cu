@@ -3392,6 +3392,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (i + 1 < cgraph->n_nodes && node->op == GGML_OP_ROPE_BACK) {
+        ggml_tensor * concat = cgraph->nodes[i + 1];
+        const ggml_tensor * prefix = concat->src[0];
+        const ggml_tensor * rope_src = node->src[0];
+        const int mode = ((int32_t *) node->op_params)[2];
+        const int n_dims = ((int32_t *) node->op_params)[1];
+        const int concat_dim = ((int32_t *) concat->op_params)[0];
+        const enum ggml_op ops[] = { GGML_OP_ROPE_BACK, GGML_OP_CONCAT };
+        const int output = i + 1;
+        if (concat->op == GGML_OP_CONCAT && concat->src[1] == node &&
+            prefix && rope_src && node->src[1] &&
+            mode == GGML_ROPE_TYPE_NORMAL && concat_dim == 0 &&
+            prefix->type == GGML_TYPE_F32 && rope_src->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 && concat->type == GGML_TYPE_F32 &&
+            prefix->ne[0] > 0 && prefix->ne[0] % 2 == 0 &&
+            rope_src->ne[0] > 0 && rope_src->ne[0] % 2 == 0 &&
+            n_dims == rope_src->ne[0] &&
+            prefix->ne[1] == rope_src->ne[1] &&
+            prefix->ne[2] == rope_src->ne[2] &&
+            prefix->ne[3] == rope_src->ne[3] &&
+            concat->ne[0] == prefix->ne[0] + rope_src->ne[0] &&
+            concat->ne[1] == rope_src->ne[1] &&
+            concat->ne[2] == rope_src->ne[2] &&
+            concat->ne[3] == rope_src->ne[3] &&
+            ggml_is_contiguous(concat) &&
+            ggml_can_fuse_subgraph(cgraph, i, 2, ops, &output, 1)) {
+            int out_nodes[] = { output };
+            if (ggml_cuda_check_fusion_memory_ranges(
+                    cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_op_rope_back_concat(*cuda_ctx, node, concat);
+                return 1;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
