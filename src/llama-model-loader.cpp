@@ -18,6 +18,133 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static std::string deepseek4_dspark_tensor_name(const char * name) {
+    const std::string canonical(name);
+
+    static const std::map<std::string, std::string> roots = {
+        { "fc.weight",             "mtp.0.main_proj.weight" },
+        { "enc.output_norm.weight", "mtp.0.main_norm.weight" },
+        { "output_norm.weight",    "mtp.2.norm.weight" },
+        { "output_hc_base.weight", "mtp.2.hc_head_base.weight" },
+        { "output_hc_fn.weight",   "mtp.2.hc_head_fn.weight" },
+        { "output_hc_scale.weight", "mtp.2.hc_head_scale.weight" },
+        { "markov_w1.weight",      "mtp.2.markov_head.markov_w1.weight" },
+        { "markov_w2.weight",      "mtp.2.markov_head.markov_w2.weight" },
+        { "conf_proj.weight",      "mtp.2.confidence_head.proj.weight" },
+    };
+
+    if (const auto it = roots.find(canonical); it != roots.end()) {
+        return it->second;
+    }
+
+    int stage = -1;
+    int suffix_at = -1;
+    if (sscanf(name, "blk.%d.%n", &stage, &suffix_at) == 1 &&
+            stage >= 0 && stage < 3 && suffix_at > 0) {
+        return format("mtp.%d.%s", stage, name + suffix_at);
+    }
+
+    return {};
+}
+
+static void normalize_deepseek4_dspark_support_metadata(gguf_context * metadata) {
+    // The standalone support format deliberately carries only these identifying
+    // values.  Its tensors are tied to the published Flash-0731 architecture;
+    // validate the contract before supplying the metadata omitted by the sidecar.
+    auto require_u32 = [&](const char * key, uint32_t expected) {
+        const int id = gguf_find_key(metadata, key);
+        if (id < 0 || gguf_get_kv_type(metadata, id) != GGUF_TYPE_UINT32) {
+            throw std::runtime_error(format("DeepSeek-V4 DSpark support GGUF is missing uint32 metadata '%s'", key));
+        }
+        const uint32_t value = gguf_get_val_u32(metadata, id);
+        if (value != expected) {
+            throw std::runtime_error(format(
+                    "unsupported DeepSeek-V4 DSpark support GGUF: %s is %u, expected %u",
+                    key, value, expected));
+        }
+    };
+
+    require_u32("dspark.stage_count",    3);
+    require_u32("dspark.n_layers",       3);
+    require_u32("dspark.block_size",     5);
+    require_u32("dspark.markov_rank",  256);
+    require_u32("dspark.noise_token_id", 128799);
+
+    const int target_id = gguf_find_key(metadata, "dspark.target_layer_ids");
+    if (target_id < 0 || gguf_get_kv_type(metadata, target_id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(metadata, target_id) != GGUF_TYPE_UINT32 ||
+            gguf_get_arr_n(metadata, target_id) != 3) {
+        throw std::runtime_error(
+                "DeepSeek-V4 DSpark support GGUF requires three uint32 target_layer_ids");
+    }
+    const auto * raw_targets = static_cast<const uint32_t *>(gguf_get_arr_data(metadata, target_id));
+    if (raw_targets[0] != 40 || raw_targets[1] != 41 || raw_targets[2] != 42) {
+        throw std::runtime_error(format(
+                "unsupported DeepSeek-V4 DSpark target layers: [%u, %u, %u]",
+                raw_targets[0], raw_targets[1], raw_targets[2]));
+    }
+
+    // llama.cpp's target_layers are graph-output indices, one greater than the
+    // zero-based transformer layer ids stored by the ds4 sidecar.
+    const int32_t target_layers[] = { 41, 42, 43 };
+    const int32_t compress_ratios[] = { 0, 0, 0 };
+    const float swiglu_clamp[] = { 10.0f, 10.0f, 10.0f };
+
+    gguf_set_val_u32(metadata, "dflash.context_length", 1048576);
+    gguf_set_val_u32(metadata, "dflash.embedding_length", 4096);
+    gguf_set_val_u32(metadata, "dflash.block_count", 3);
+    gguf_set_val_u32(metadata, "dflash.vocab_size", 129280);
+    gguf_set_val_u32(metadata, "dflash.attention.head_count", 64);
+    gguf_set_val_u32(metadata, "dflash.attention.head_count_kv", 1);
+    gguf_set_val_u32(metadata, "dflash.attention.key_length", 512);
+    gguf_set_val_u32(metadata, "dflash.attention.value_length", 512);
+    gguf_set_val_u32(metadata, "dflash.rope.dimension_count", 64);
+    gguf_set_val_f32(metadata, "dflash.rope.freq_base", 10000.0f);
+    gguf_set_val_str(metadata, "dflash.rope.scaling.type", "yarn");
+    gguf_set_val_f32(metadata, "dflash.rope.scaling.factor", 16.0f);
+    gguf_set_val_u32(metadata, "dflash.rope.scaling.original_context_length", 65536);
+    gguf_set_val_f32(metadata, "dflash.rope.scaling.yarn_beta_fast", 32.0f);
+    gguf_set_val_f32(metadata, "dflash.rope.scaling.yarn_beta_slow", 1.0f);
+    gguf_set_val_f32(metadata, "dflash.attention.layer_norm_rms_epsilon", 1.0e-6f);
+    gguf_set_val_u32(metadata, "dflash.expert_count", 256);
+    gguf_set_val_u32(metadata, "dflash.expert_used_count", 6);
+    gguf_set_val_u32(metadata, "dflash.expert_gating_func", 4);
+    gguf_set_val_u32(metadata, "dflash.expert_feed_forward_length", 2048);
+    gguf_set_val_u32(metadata, "dflash.expert_shared_count", 1);
+    gguf_set_val_f32(metadata, "dflash.expert_weights_scale", 1.5f);
+    gguf_set_val_bool(metadata, "dflash.expert_weights_norm", true);
+    gguf_set_arr_data(metadata, "dflash.swiglu_clamp_exp", GGUF_TYPE_FLOAT32,
+            swiglu_clamp, 3);
+    gguf_set_arr_data(metadata, "dflash.swiglu_clamp_shexp", GGUF_TYPE_FLOAT32,
+            swiglu_clamp, 3);
+    gguf_set_val_u32(metadata, "dflash.attention.q_lora_rank", 1024);
+    gguf_set_val_u32(metadata, "dflash.attention.sliding_window", 128);
+    gguf_set_val_u32(metadata, "dflash.attention.output_group_count", 8);
+    gguf_set_val_u32(metadata, "dflash.attention.output_lora_rank", 1024);
+    gguf_set_arr_data(metadata, "dflash.attention.compress_ratios", GGUF_TYPE_INT32,
+            compress_ratios, 3);
+    gguf_set_val_u32(metadata, "dflash.hyper_connection.count", 4);
+    gguf_set_val_u32(metadata, "dflash.hyper_connection.sinkhorn_iterations", 20);
+    gguf_set_val_f32(metadata, "dflash.hyper_connection.epsilon", 1.0e-6f);
+    gguf_set_val_u32(metadata, "dflash.block_size", 5);
+    gguf_set_arr_data(metadata, "dflash.target_layers", GGUF_TYPE_INT32,
+            target_layers, 3);
+    gguf_set_val_u32(metadata, "dflash.dflash.mask_token_id", 128799);
+    gguf_set_val_str(metadata, "tokenizer.ggml.model", "none");
+}
+
+static void resolve_model_architecture(llama_model_loader & loader) {
+    loader.get_key(loader.llm_kv(LLM_KV_GENERAL_ARCHITECTURE), loader.arch_name, false);
+    loader.deepseek4_dspark_support = loader.arch_name == "deepseek4-dspark";
+    loader.llm_kv = LLM_KV(loader.deepseek4_dspark_support
+            ? LLM_ARCH_DFLASH
+            : llm_arch_from_string(loader.arch_name));
+
+    if (loader.deepseek4_dspark_support) {
+        normalize_deepseek4_dspark_support_metadata(loader.metadata);
+    }
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -560,8 +687,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
@@ -672,8 +798,7 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(file));
         contexts.emplace_back(ctx);
@@ -690,8 +815,7 @@ llama_model_loader::llama_model_loader(
             weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
         }
     } else {
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        resolve_model_architecture(*this);
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -825,10 +949,24 @@ enum llm_arch llama_model_loader::get_arch() const {
     return llm_kv.arch;
 }
 
+bool llama_model_loader::is_deepseek4_dspark_support() const {
+    return deepseek4_dspark_support;
+}
+
 const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
     auto pos = weights_map.find(name);
     if (pos != weights_map.end()) {
         return &pos->second;
+    }
+
+    if (deepseek4_dspark_support) {
+        const std::string raw_name = deepseek4_dspark_tensor_name(name);
+        if (!raw_name.empty()) {
+            pos = weights_map.find(raw_name);
+            if (pos != weights_map.end()) {
+                return &pos->second;
+            }
+        }
     }
 
     return nullptr;
@@ -1309,7 +1447,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
-    ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (deepseek4_dspark_support) {
+        ggml_set_name(tensor, tn.str().c_str());
+    } else {
+        ggml_set_name(tensor, ggml_get_name(&t_meta));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

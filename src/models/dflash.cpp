@@ -40,6 +40,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_key(LLM_KV_BLOCK_SIZE, hparams.dflash_block_size, false)) {
         ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE, hparams.dflash_block_size, false);
     }
+    ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID, hparams.dflash_mask_token_id, false);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
