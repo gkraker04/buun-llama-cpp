@@ -236,6 +236,8 @@ struct moe_cache_device {
     long long pair_neither = 0;
     long long fused_attempts = 0;
     long long fused_nodes = 0;
+    long long full_fused_rows = 0;
+    long long full_fused_nodes = 0;
     long long nodes = 0;
     long long collect_calls = 0;
     // Dispatch mutex contention that turned a potential cache hit into a
@@ -279,17 +281,20 @@ struct moe_cache_node {
     moe_cache_session * session = nullptr;
     moe_cache_device * device = nullptr;
     moe_cache_pool * pool = nullptr;
+    moe_cache_pool * down_pool = nullptr;
     int pool_index = -1;
     const void * host_base = nullptr;
     const void * host_base2 = nullptr;
+    const void * host_base3 = nullptr;
     size_t expert_size = 0;
     int64_t n_in = 0;
+    int64_t n_mid = 0;
     int64_t n_out = 0;
     int64_t n_expert = 0;
     int64_t n_tokens = 0;
     int wtype = -1;
     std::unique_lock<std::mutex> dispatch_lock;
-    moe_cache_pin pins[2 * moe_cache_node_rows_max];
+    moe_cache_pin pins[3 * moe_cache_node_rows_max];
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
@@ -312,7 +317,6 @@ struct moe_cache_scope_frame {
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
-
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 
@@ -852,7 +856,7 @@ static bool moe_cache_scratch_requirements(
         return false;
     }
 
-    const size_t ids_bytes = 3 * max_rows * sizeof(int32_t);
+    const size_t ids_bytes = 4 * max_rows * sizeof(int32_t);
     const size_t act_bytes = max_rows * (size_t)n_in * sizeof(float);
     if (ids_bytes > SIZE_MAX - act_bytes) {
         return false;
@@ -1459,7 +1463,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld bypass=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld full-fusion=%lld/%lld bypass=%lld\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
@@ -1471,7 +1475,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.pair_both, device.pair_up_only,
             device.pair_gate_only, device.pair_neither,
             device.fused_attempts,
-            device.fused_nodes, device.contention_bypasses);
+            device.fused_nodes,
+            device.full_fused_rows, device.full_fused_nodes,
+            device.contention_bypasses);
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -2131,6 +2137,7 @@ static void * moe_cache_begin(
     node->host_base = host_base;
     node->expert_size = expert_size;
     node->n_in = n_in;
+    node->n_mid = n_out;
     node->n_out = n_out;
     node->n_expert = n_expert;
     node->n_tokens = n_tokens;
@@ -2331,13 +2338,15 @@ static int moe_cache_dispatch_internal(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows,
         moe_cache_pool * gate_pool, const int32_t * gate_slot_indices,
+        moe_cache_pool * down_pool, const int32_t * down_slot_indices,
         int glu_op, float up_min, float up_max,
         float gate_min, float gate_max) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     const bool fused = gate_pool != nullptr;
+    const bool full = down_pool != nullptr;
     if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
         n_hits > moe_cache_node_rows_max ||
-        n_hits * (fused ? 2 : 1) != node->n_pins ||
+        n_hits * (full ? 3 : fused ? 2 : 1) != node->n_pins ||
         !slot_indices || !act_rows ||
         (fused && (!gate_slot_indices ||
                    gate_pool->wtype != wtype ||
@@ -2346,9 +2355,13 @@ static int moe_cache_dispatch_internal(
                    std::isnan(up_min) || std::isnan(up_max) ||
                    std::isnan(gate_min) || std::isnan(gate_max) ||
                    up_min > up_max || gate_min > gate_max)) ||
-        wtype != node->wtype || n_in != node->n_in || n_out != node->n_out ||
-        n_in > INT_MAX || n_out > INT_MAX ||
-        n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
+        (full && (!down_slot_indices || node->down_pool != down_pool ||
+                  !moe_cache_type_supported((ggml_type)down_pool->wtype) ||
+                  down_pool->expert_size == 0)) ||
+        wtype != node->wtype || n_in != node->n_in || n_out != node->n_mid ||
+        n_in > INT_MAX || n_out > INT_MAX || node->n_out > INT_MAX ||
+        n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1) ||
+        (full && n_out > INT64_MAX - (MATRIX_ROW_PADDING - 1))) {
         return 0;
     }
 
@@ -2380,6 +2393,8 @@ static int moe_cache_dispatch_internal(
         if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
             (fused && (gate_slot_indices[index] < 0 ||
                        gate_slot_indices[index] >= gate_pool->n_slots)) ||
+            (full && (down_slot_indices[index] < 0 ||
+                      down_slot_indices[index] >= down_pool->n_slots)) ||
             !act_rows[index]) {
             return 0;
         }
@@ -2397,7 +2412,12 @@ static int moe_cache_dispatch_internal(
 
     const int64_t padded_n_in =
         ((n_in + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+    const int64_t padded_n_mid = full
+        ? ((n_out + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING
+        : 0;
     const size_t type_size = ggml_type_size((ggml_type)wtype);
+    const size_t down_type_size = full
+        ? ggml_type_size((ggml_type)down_pool->wtype) : type_size;
     if (type_size == 0 || node->expert_size % type_size != 0 ||
         ggml_row_size((ggml_type)wtype, n_in) % type_size != 0 ||
         node->expert_size / type_size > INT_MAX ||
@@ -2405,7 +2425,16 @@ static int moe_cache_dispatch_internal(
         padded_n_in / QK8_1 > INT_MAX ||
         (uint64_t)activation_rows * (padded_n_in / QK8_1) > INT_MAX ||
         (uint64_t)n_out * n_hits > INT_MAX ||
-        (uint64_t)(node->expert_size / type_size) * pool.n_slots > INT_MAX) {
+        (uint64_t)(node->expert_size / type_size) * pool.n_slots > INT_MAX ||
+        (full && (padded_n_mid / QK8_1 > INT_MAX ||
+                  (uint64_t)n_hits * (padded_n_mid / QK8_1) > INT_MAX ||
+                  (uint64_t)node->n_out * n_hits > INT_MAX ||
+                  down_type_size == 0 ||
+                  down_pool->expert_size % down_type_size != 0 ||
+                  ggml_row_size((ggml_type)down_pool->wtype, n_out) !=
+                      down_pool->expert_size / (size_t)node->n_out ||
+                  (uint64_t)(down_pool->expert_size / down_type_size) *
+                      down_pool->n_slots > INT_MAX))) {
         return 0;
     }
 
@@ -2413,13 +2442,17 @@ static int moe_cache_dispatch_internal(
         (uint64_t)n_in * activation_rows > SIZE_MAX / sizeof(float) ||
         n_out > INT64_MAX / n_hits ||
         (uint64_t)n_out * n_hits > SIZE_MAX / sizeof(float) ||
+        (full && (node->n_out > INT64_MAX / n_hits ||
+                  (uint64_t)node->n_out * n_hits > SIZE_MAX / sizeof(float) ||
+                  (uint64_t)n_hits * (padded_n_mid / QK8_1) >
+                      SIZE_MAX / sizeof(block_q8_1))) ||
         (uint64_t)activation_rows * (padded_n_in / QK8_1) >
             SIZE_MAX / sizeof(block_q8_1)) {
         return 0;
     }
     const bool use_activation_map =
         session.config.force_dedicated_mmv || !modulo_activation;
-    const size_t id_arrays = 1 + (fused ? 1 : 0) +
+    const size_t id_arrays = 1 + (fused ? 1 : 0) + (full ? 1 : 0) +
         (use_activation_map ? 1 : 0);
     const size_t ids_bytes = (size_t)n_hits * sizeof(int32_t) * id_arrays;
     const size_t act_bytes = (size_t)activation_rows * n_in * sizeof(float);
@@ -2427,9 +2460,15 @@ static int moe_cache_dispatch_internal(
         return 0;
     }
     const size_t input_bytes = ids_bytes + act_bytes;
-    const size_t q8_bytes =
+    size_t q8_bytes =
         (size_t)activation_rows * (padded_n_in / QK8_1) * sizeof(block_q8_1);
-    const size_t out_bytes = (size_t)n_hits * n_out * sizeof(float);
+    if (full) {
+        q8_bytes = std::max(q8_bytes,
+                (size_t)n_hits * (padded_n_mid / QK8_1) * sizeof(block_q8_1));
+    }
+    const size_t final_bytes = (size_t)n_hits * node->n_out * sizeof(float);
+    const size_t out_bytes = std::max(
+            (size_t)n_hits * n_out * sizeof(float), final_bytes);
 
     const size_t desired_caps[] = {
         moe_cache_growth_capacity(device.d_input_cap, input_bytes),
@@ -2463,7 +2502,7 @@ static int moe_cache_dispatch_internal(
         !moe_cache_grow_device(device, (void **)&device.d_out, device.d_out_cap,
                                out_bytes, "output device allocation") ||
         !moe_cache_grow_host(device, (void **)&device.h_out, device.h_out_cap,
-                             out_bytes, "output host allocation")) {
+                             final_bytes, "output host allocation")) {
         std::lock_guard<std::mutex> lock(session.mu);
         device.dispatch_failures++;
         device.dead.store(true);
@@ -2479,8 +2518,11 @@ static int moe_cache_dispatch_internal(
         if (fused) {
             h_ids[n_hits + index] = gate_slot_indices[index];
         }
+        if (full) {
+            h_ids[2 * n_hits + index] = down_slot_indices[index];
+        }
         if (use_activation_map) {
-            h_ids[(fused ? 2 : 1) * n_hits + index] =
+            h_ids[(full ? 3 : fused ? 2 : 1) * n_hits + index] =
                 activation_indices[index];
         }
     }
@@ -2509,7 +2551,7 @@ static int moe_cache_dispatch_internal(
                     pool.slab, gate_pool->slab, (ggml_type)wtype,
                     (const char *)device.d_act_q8,
                     d_ids, d_ids + n_hits,
-                    use_activation_map ? d_ids + 2 * n_hits : nullptr,
+                    use_activation_map ? d_ids + (full ? 3 : 2) * n_hits : nullptr,
                     device.d_out, n_in, n_out,
                     (int64_t)pool.expert_size, n_hits, activation_rows,
                     up_min, up_max, gate_min, gate_max,
@@ -2525,6 +2567,25 @@ static int moe_cache_dispatch_internal(
         }
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
+    }
+    if (ok && full) {
+        quantize_row_q8_1_cuda(
+                device.d_out, nullptr, device.d_act_q8, (ggml_type)wtype,
+                n_out, n_out, (int64_t)n_hits * n_out,
+                (int64_t)n_hits * n_out, padded_n_mid,
+                n_hits, 1, 1, device.compute_stream);
+        ok = moe_cache_cuda_ok(
+                device, cudaPeekAtLastError(), "intermediate activation quantization", true);
+    }
+    if (ok && full) {
+        ggml_cuda_moe_cache_mmv(
+                down_pool->slab, (ggml_type)down_pool->wtype,
+                (const char *)device.d_act_q8, d_ids + 2 * n_hits,
+                nullptr, device.d_out, n_out, node->n_out,
+                down_pool->n_slots, (int64_t)down_pool->expert_size,
+                n_hits, n_hits, device.compute_stream);
+        ok = moe_cache_cuda_ok(
+                device, cudaPeekAtLastError(), "down expert matvec launch", true);
     }
 
     if (!ok) {
@@ -2544,14 +2605,15 @@ static int moe_cache_dispatch(
         const int32_t * slot_indices, const float * const * act_rows) {
     return moe_cache_dispatch_internal(
             opaque, wtype, n_in, n_out, n_hits,
-            slot_indices, act_rows, nullptr, nullptr, -1,
+            slot_indices, act_rows, nullptr, nullptr, nullptr, nullptr, -1,
             0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    const int pins_per_hit = node && node->host_base2 ? 2 : 1;
+    const int pins_per_hit = node && node->host_base3 ? 3 :
+        node && node->host_base2 ? 2 : 1;
     if (!node || !node->dispatched || n_hits <= 0 ||
         n_hits > moe_cache_node_rows_max ||
         n_hits * pins_per_hit != node->n_pins ||
@@ -2635,7 +2697,8 @@ static void moe_cache_end(void * opaque) {
                 }
             }
         }
-        for (const void * base : {node->host_base, node->host_base2}) {
+        for (const void * base : {
+                node->host_base, node->host_base2, node->host_base3}) {
             if (!base) {
                 continue;
             }
@@ -2657,6 +2720,7 @@ static void moe_cache_end(void * opaque) {
 static void * moe_cache_fused_begin(
         const ggml_moe_cache_tensor_desc * up,
         const ggml_moe_cache_tensor_desc * gate,
+        const ggml_moe_cache_tensor_desc * down,
         int glu_op, float up_min, float up_max,
         float gate_min, float gate_max,
         const int32_t * ids, int n_ids, int64_t n_tokens,
@@ -2683,6 +2747,21 @@ static void * moe_cache_fused_begin(
         up->n_expert <= 0 ||
         up->type == GGML_TYPE_NVFP4 ||
         !moe_cache_type_supported((ggml_type)up->type)) {
+        return nullptr;
+    }
+    if (down && (!down->name || !down->data ||
+                 down->data == up->data || down->data == gate->data ||
+                 !moe_cache_tensor_name_supported(down->name) ||
+                 down->n_in != up->n_out || down->n_out != up->n_in ||
+                 down->n_expert != up->n_expert ||
+                 !moe_cache_type_supported((ggml_type)down->type) ||
+                 down->expert_size == 0 ||
+                 (uint64_t)down->n_expert > SIZE_MAX / down->expert_size ||
+                 ggml_row_size((ggml_type)down->type, down->n_in) == 0 ||
+                 (uint64_t)down->n_out >
+                     SIZE_MAX / ggml_row_size((ggml_type)down->type, down->n_in) ||
+                 down->expert_size != (size_t)down->n_out *
+                     ggml_row_size((ggml_type)down->type, down->n_in))) {
         return nullptr;
     }
     for (int index = 0; index < n_ids; index++) {
@@ -2715,12 +2794,17 @@ static void * moe_cache_fused_begin(
         return nullptr;
     }
     const size_t tensor_size = (size_t)up->n_expert * up->expert_size;
+    const size_t down_tensor_size = down
+        ? (size_t)down->n_expert * down->expert_size : 0;
 
     int up_layer = -1;
     int gate_layer = -1;
+    int down_layer = -1;
     if (!moe_cache_layer_number(up->name, up_layer) ||
         !moe_cache_layer_number(gate->name, gate_layer) ||
-        up_layer != gate_layer) {
+        up_layer != gate_layer ||
+        (down && (!moe_cache_layer_number(down->name, down_layer) ||
+                  down_layer != up_layer))) {
         return nullptr;
     }
 
@@ -2731,6 +2815,7 @@ static void * moe_cache_fused_begin(
 
     moe_cache_device * selected = nullptr;
     moe_cache_pool * pool = nullptr;
+    moe_cache_pool * down_pool = nullptr;
     int pool_index = -1;
     {
         std::lock_guard<std::mutex> lock(session->mu);
@@ -2749,7 +2834,9 @@ static void * moe_cache_fused_begin(
         };
         const int up_device = route_for(up->data);
         const int gate_device = route_for(gate->data);
-        if (up_device < 0 || up_device != gate_device) {
+        const int down_device = down ? route_for(down->data) : up_device;
+        if (up_device < 0 || up_device != gate_device ||
+            up_device != down_device) {
             return nullptr;
         }
         for (const auto & device_ptr : session->devices) {
@@ -2770,26 +2857,48 @@ static void * moe_cache_fused_begin(
         if (!pool || !pool->slab) {
             return nullptr;
         }
+        if (down) {
+            const int down_pool_index = moe_cache_find_pool(
+                    *selected, down->expert_size, down->type);
+            if (down_pool_index < 0 ||
+                down_pool_index >= (int)selected->pools.size()) {
+                return nullptr;
+            }
+            down_pool = selected->pools[down_pool_index].get();
+            if (!down_pool || !down_pool->slab) {
+                return nullptr;
+            }
+        }
 
-        auto acquire_source = [&](const void * base) {
+        auto acquire_source = [&](const void * base, size_t bytes) {
             try {
                 moe_cache_session::active_source & source =
                     session->active_sources[base];
-                source.bytes = std::max(source.bytes, tensor_size);
+                source.bytes = std::max(source.bytes, bytes);
                 source.references++;
                 return true;
             } catch (...) {
                 return false;
             }
         };
-        if (!acquire_source(up->data)) {
+        if (!acquire_source(up->data, tensor_size)) {
             return nullptr;
         }
-        if (!acquire_source(gate->data)) {
+        if (!acquire_source(gate->data, tensor_size)) {
             auto source = session->active_sources.find(up->data);
             if (source != session->active_sources.end() &&
                 --source->second.references == 0) {
                 session->active_sources.erase(source);
+            }
+            return nullptr;
+        }
+        if (down && !acquire_source(down->data, down_tensor_size)) {
+            for (const void * base : {up->data, gate->data}) {
+                auto source = session->active_sources.find(base);
+                if (source != session->active_sources.end() &&
+                    --source->second.references == 0) {
+                    session->active_sources.erase(source);
+                }
             }
             return nullptr;
         }
@@ -2798,7 +2907,11 @@ static void * moe_cache_fused_begin(
 
     auto release_active = [&] {
         std::lock_guard<std::mutex> lock(session->mu);
-        for (const void * base : {up->data, gate->data}) {
+        for (const void * base : {up->data, gate->data,
+                                  down ? down->data : nullptr}) {
+            if (!base) {
+                continue;
+            }
             auto source = session->active_sources.find(base);
             if (source != session->active_sources.end() &&
                 --source->second.references == 0) {
@@ -2829,12 +2942,15 @@ static void * moe_cache_fused_begin(
     node->session = session;
     node->device = selected;
     node->pool = pool;
+    node->down_pool = down_pool;
     node->pool_index = pool_index;
     node->host_base = up->data;
     node->host_base2 = gate->data;
+    node->host_base3 = down ? down->data : nullptr;
     node->expert_size = up->expert_size;
     node->n_in = up->n_in;
-    node->n_out = up->n_out;
+    node->n_mid = up->n_out;
+    node->n_out = down ? down->n_out : up->n_out;
     node->n_expert = up->n_expert;
     node->n_tokens = n_tokens;
     node->wtype = up->type;
@@ -2843,11 +2959,14 @@ static void * moe_cache_fused_begin(
 
     int32_t up_slots[moe_cache_node_rows_max];
     int32_t gate_slots[moe_cache_node_rows_max];
+    int32_t down_slots[moe_cache_node_rows_max];
     int32_t resident_up[moe_cache_node_rows_max];
     int32_t resident_gate[moe_cache_node_rows_max];
+    int32_t resident_down[moe_cache_node_rows_max];
     const float * hit_acts[moe_cache_node_rows_max];
     uint64_t mask = 0;
     int hits = 0;
+    bool full_ready = true;
     int inserts_left = session->config.inserts_per_plan;
     bool wake_worker = false;
     {
@@ -2856,12 +2975,16 @@ static void * moe_cache_fused_begin(
             for (int index = 0; index < n_ids; index++) {
                 resident_up[index] = -1;
                 resident_gate[index] = -1;
+                resident_down[index] = -1;
                 const int32_t expert = ids[index];
                 if (expert < 0 || expert >= up->n_expert) {
                     continue;
                 }
                 const auto up_found = pool->map.find({up->data, expert});
                 const auto gate_found = pool->map.find({gate->data, expert});
+                const auto down_found = down
+                    ? down_pool->map.find({down->data, expert})
+                    : pool->map.end();
                 if (up_found != pool->map.end() &&
                     pool->slots[up_found->second].state == moe_cache_slot_state::valid) {
                     resident_up[index] = up_found->second;
@@ -2870,19 +2993,38 @@ static void * moe_cache_fused_begin(
                     pool->slots[gate_found->second].state == moe_cache_slot_state::valid) {
                     resident_gate[index] = gate_found->second;
                 }
-                if (resident_up[index] >= 0 && resident_gate[index] >= 0) {
-                    selected->pair_both++;
+                if (down && down_found != down_pool->map.end() &&
+                    down_pool->slots[down_found->second].state == moe_cache_slot_state::valid) {
+                    resident_down[index] = down_found->second;
+                }
+                if (resident_up[index] >= 0 && resident_gate[index] >= 0 &&
+                    (!down || resident_down[index] >= 0)) {
+                    if (!down) {
+                        selected->pair_both++;
+                    }
                 } else if (resident_up[index] >= 0) {
-                    selected->pair_up_only++;
+                    if (!down) {
+                        selected->pair_up_only++;
+                    }
                 } else if (resident_gate[index] >= 0) {
-                    selected->pair_gate_only++;
+                    if (!down) {
+                        selected->pair_gate_only++;
+                    }
                 } else {
-                    selected->pair_neither++;
+                    if (!down) {
+                        selected->pair_neither++;
+                    }
+                }
+                if (down && (resident_up[index] < 0 ||
+                             resident_gate[index] < 0 ||
+                             resident_down[index] < 0)) {
+                    full_ready = false;
                 }
             }
 
-            for (int index = 0; index < n_ids; index++) {
-                if (resident_up[index] < 0 || resident_gate[index] < 0) {
+            for (int index = 0; index < n_ids && (!down || full_ready); index++) {
+                if (resident_up[index] < 0 || resident_gate[index] < 0 ||
+                    (down && resident_down[index] < 0)) {
                     continue;
                 }
                 moe_cache_slot & up_slot = pool->slots[resident_up[index]];
@@ -2903,7 +3045,23 @@ static void * moe_cache_fused_begin(
                 hits++;
             }
 
-            for (int index = 0; index < n_ids && hits > 0; index++) {
+            // Preserve the unfused access order when all three tensors happen
+            // to share one pool: pair rows first, then down rows.
+            if (down && full_ready) {
+                for (int index = 0; index < n_ids; index++) {
+                    moe_cache_slot & down_slot =
+                        down_pool->slots[resident_down[index]];
+                    down_slot.readers++;
+                    moe_cache_lru_remove(*down_pool, resident_down[index]);
+                    moe_cache_lru_push_back(*down_pool, resident_down[index]);
+                    node->pins[node->n_pins++] = {
+                        down_pool, resident_down[index]};
+                    down_slots[index] = resident_down[index];
+                    selected->hits++;
+                }
+            }
+
+            for (int index = 0; index < n_ids && hits > 0 && !down; index++) {
                 if (mask & (UINT64_C(1) << index)) {
                     continue;
                 }
@@ -2960,7 +3118,8 @@ static void * moe_cache_fused_begin(
 
     if (hits == 0 || !moe_cache_dispatch_internal(
             node.get(), up->type, up->n_in, up->n_out, hits,
-            up_slots, hit_acts, pool, gate_slots, glu_op,
+            up_slots, hit_acts, pool, gate_slots,
+            down_pool, down ? down_slots : nullptr, glu_op,
             up_min, up_max, gate_min, gate_max)) {
         moe_cache_end(node.release());
         return nullptr;
@@ -2971,6 +3130,10 @@ static void * moe_cache_fused_begin(
         selected->fused_rows += hits;
         selected->fused_candidates += n_ids;
         selected->fused_nodes++;
+        if (down) {
+            selected->full_fused_rows += hits;
+            selected->full_fused_nodes++;
+        }
     }
 
     *hit_mask = mask;

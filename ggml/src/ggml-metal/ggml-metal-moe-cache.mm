@@ -124,12 +124,14 @@ static void metal_end(void * node) {
 
 static void * metal_fused_begin(const ggml_moe_cache_tensor_desc * up,
                                  const ggml_moe_cache_tensor_desc * gate,
+                                 const ggml_moe_cache_tensor_desc * down,
                                  int glu_op, float up_min, float up_max,
                                  float gate_min, float gate_max,
                                  const int32_t * ids, int n_rows, int64_t n_tokens,
                                  const float * const * act_rows, uint64_t * hit_mask) {
     (void) up;
     (void) gate;
+    (void) down;
     (void) glu_op;
     (void) up_min;
     (void) up_max;

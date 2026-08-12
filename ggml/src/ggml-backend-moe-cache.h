@@ -87,9 +87,10 @@ struct ggml_moe_cache_api {
     // Releases slot pins and all per-node ownership. Must be called exactly once for every non-NULL begin result, on every success or failure path.
     void (*end)(void * node);
 
-    // Dispatch one fused up * GLU(gate) operation over experts resident for both tensors. This is used only after the CPU backend proves that the two MUL_MAT_ID nodes and GLU form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
+    // Dispatch one fused up * GLU(gate) operation over experts resident for both tensors. When down is non-NULL, continue through the down projection for rows resident in all three tensors. This is used only after the CPU backend proves that the corresponding nodes form an elidable subgraph. ids and act_rows contain n_rows flattened token-major routed rows. Returns a regular node accepted by collect/end and marks the skipped logical rows in hit_mask.
     void * (*fused_begin)(const struct ggml_moe_cache_tensor_desc * up,
                           const struct ggml_moe_cache_tensor_desc * gate,
+                          const struct ggml_moe_cache_tensor_desc * down,
                           int glu_op, float up_min, float up_max,
                           float gate_min, float gate_max,
                           const int32_t * ids, int n_rows, int64_t n_tokens,

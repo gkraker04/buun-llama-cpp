@@ -539,6 +539,51 @@ static test_graph make_fused_graph(
     return result;
 }
 
+static test_graph make_full_fused_graph(
+        ggml_backend_t cpu,
+        ggml_tensor * up_weights,
+        ggml_tensor * gate_weights,
+        ggml_tensor * down_weights,
+        ggml_tensor * activations,
+        ggml_tensor * ids,
+        bool clamped) {
+    ggml_init_params params = {
+        16 * ggml_tensor_overhead() + ggml_graph_overhead(),
+        nullptr,
+        true,
+    };
+    test_graph result;
+    result.ctx = ggml_init(params);
+    if (!result.ctx) {
+        return result;
+    }
+    ggml_tensor * up = ggml_mul_mat_id(
+            result.ctx, up_weights, activations, ids);
+    ggml_tensor * gate = ggml_mul_mat_id(
+            result.ctx, gate_weights, activations, ids);
+    ggml_tensor * glu = nullptr;
+    if (clamped) {
+        ggml_tensor * up_clamped =
+            ggml_clamp(result.ctx, up, -0.25f, 0.25f);
+        ggml_tensor * gate_clamped = ggml_clamp(
+                result.ctx, gate,
+                -std::numeric_limits<float>::infinity(), 0.20f);
+        glu = ggml_swiglu_split(result.ctx, gate_clamped, up_clamped);
+    } else {
+        glu = ggml_swiglu_split(result.ctx, gate, up);
+    }
+    result.out = ggml_mul_mat_id(
+            result.ctx, down_weights, glu, ids);
+    ggml_set_name(up, "moe_cache_full_up");
+    ggml_set_name(gate, "moe_cache_full_gate");
+    ggml_set_name(glu, "moe_cache_full_glu");
+    ggml_set_name(result.out, "moe_cache_full_down");
+    result.graph = ggml_new_graph(result.ctx);
+    ggml_build_forward_expand(result.graph, result.out);
+    result.buffer = ggml_backend_alloc_ctx_tensors(result.ctx, cpu);
+    return result;
+}
+
 static test_graph make_clamped_fused_graph(
         ggml_backend_t cpu,
         ggml_tensor * up_weights,
@@ -2022,7 +2067,7 @@ static bool run_fused_partial_invalidation(
                        const int * reference_rows) {
         uint64_t hit_mask = 0;
         void * node = ggml_moe_cache.fused_begin(
-                &up, &gate, GGML_GLU_OP_SWIGLU,
+                &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
                 -std::numeric_limits<float>::infinity(),
@@ -2083,7 +2128,7 @@ static bool run_fused_partial_invalidation(
         const int32_t expert = 0;
         uint64_t hit_mask = 0;
         void * node = ggml_moe_cache.fused_begin(
-                &up, &gate, GGML_GLU_OP_SWIGLU,
+                &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
                 -std::numeric_limits<float>::infinity(),
@@ -2116,6 +2161,193 @@ static bool run_fused_partial_invalidation(
     printf("cache-fused-gate-invalidate: %s\n",
             gate_invalidation_ok && stats_ok ? "OK" : "FAIL");
     return gate_invalidation_ok && stats_ok;
+}
+
+static bool run_fused_full_ffn(
+        ggml_backend_t cuda,
+        ggml_backend_t cpu,
+        ggml_tensor * up_weights,
+        ggml_tensor * gate_weights,
+        ggml_tensor * down_weights,
+        ggml_tensor * activations,
+        const uint8_t * down_row) {
+    configure_cache(nullptr);
+    void * session = create_direct_session(cuda, cpu);
+    if (!session) {
+        fprintf(stderr, "cache-fused-full-ffn: failed to create session\n");
+        return false;
+    }
+
+    auto desc = [](ggml_tensor * weights) {
+        return ggml_moe_cache_tensor_desc {
+            weights->name, weights->data,
+            ggml_nbytes(weights) / (size_t) weights->ne[2],
+            weights->ne[0], weights->ne[1], weights->ne[2],
+            (int32_t) weights->type,
+        };
+    };
+    const ggml_moe_cache_tensor_desc up = desc(up_weights);
+    const ggml_moe_cache_tensor_desc gate = desc(gate_weights);
+    const ggml_moe_cache_tensor_desc down = desc(down_weights);
+    const int32_t expert = 0;
+    const float * act_rows[] = { (const float *) activations->data };
+    bool ok = true;
+
+    ggml_moe_cache.session_enter(session);
+    for (ggml_tensor * weights : { up_weights, gate_weights, down_weights }) {
+        ok &= wait_for_direct_pool(
+                weights->name, weights->data,
+                ggml_nbytes(weights) / (size_t) weights->ne[2],
+                weights->ne[0], weights->ne[1], weights->type,
+                weights->ne[2]);
+        ok &= wait_for_direct_resident(weights, expert);
+    }
+
+    float intermediate[n_out] = {};
+    float reference[n_in] = {};
+    if (ok) {
+        uint64_t pair_mask = 0;
+        void * pair = ggml_moe_cache.fused_begin(
+                &up, &gate, nullptr, GGML_GLU_OP_SWIGLU,
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                &expert, 1, 1, act_rows, &pair_mask);
+        float * pair_rows[] = { intermediate };
+        ok = pair && pair_mask == UINT64_C(1) &&
+            ggml_moe_cache.collect(pair, 1, pair_rows, n_out) == 1;
+        if (pair) {
+            ggml_moe_cache.end(pair);
+        }
+    }
+    if (ok) {
+        void * down_node = ggml_moe_cache.begin(
+                down.name, down.data, down.expert_size,
+                down.n_in, down.n_out, down.type, down.n_expert, 1, 1);
+        int32_t slot = -1;
+        ok = down_node &&
+            ggml_moe_cache.plan(down_node, &expert, 1, &slot) == 1;
+        const float * down_acts[] = { intermediate };
+        if (ok) {
+            ok = ggml_moe_cache.dispatch(
+                    down_node, down.type, down.n_in, down.n_out,
+                    1, &slot, down_acts) == 1;
+        }
+        float * down_rows[] = { reference };
+        if (ok) {
+            ok = ggml_moe_cache.collect(
+                    down_node, 1, down_rows, down.n_out) == 1;
+        }
+        if (down_node) {
+            ggml_moe_cache.end(down_node);
+        }
+    }
+
+    auto execute_full = [&](float * output) {
+        uint64_t full_mask = 0;
+        void * full = ggml_moe_cache.fused_begin(
+                &up, &gate, &down, GGML_GLU_OP_SWIGLU,
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                &expert, 1, 1, act_rows, &full_mask);
+        float * full_rows[] = { output };
+        const bool result = full && full_mask == UINT64_C(1) &&
+            ggml_moe_cache.collect(full, 1, full_rows, n_in) == 1;
+        if (full) {
+            ggml_moe_cache.end(full);
+        }
+        return result;
+    };
+
+    float actual[n_in] = {};
+    if (ok) {
+        ok = execute_full(actual);
+    }
+
+    bool down_invalidation_ok = false;
+    if (ok) {
+        uint64_t full_mask = 0;
+        void * full = ggml_moe_cache.fused_begin(
+                &up, &gate, &down, GGML_GLU_OP_SWIGLU,
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                &expert, 1, 1, act_rows, &full_mask);
+        std::atomic<bool> mutation_started{false};
+        std::atomic<bool> mutation_done{false};
+        std::thread mutator;
+        if (full && full_mask == UINT64_C(1)) {
+            mutator = std::thread([&] {
+                mutation_started.store(true);
+                ggml_backend_tensor_set(
+                        down_weights, down_row, 0, down.expert_size);
+                mutation_done.store(true);
+            });
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!mutation_started.load() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const bool mutation_blocked =
+            mutation_started.load() && !mutation_done.load();
+        float pinned_output[n_in] = {};
+        float * full_rows[] = { pinned_output };
+        const bool collected = full &&
+            ggml_moe_cache.collect(full, 1, full_rows, n_in) == 1;
+        if (full) {
+            ggml_moe_cache.end(full);
+        }
+        if (mutator.joinable()) {
+            mutator.join();
+        }
+
+        uint64_t invalid_mask = 0;
+        void * invalid = ggml_moe_cache.fused_begin(
+                &up, &gate, &down, GGML_GLU_OP_SWIGLU,
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                &expert, 1, 1, act_rows, &invalid_mask);
+        if (invalid) {
+            ggml_moe_cache.end(invalid);
+        }
+        const bool invalidated = !invalid && invalid_mask == 0;
+        const bool repopulated = invalidated &&
+            wait_for_direct_resident(down_weights, expert);
+        float repopulated_output[n_in] = {};
+        const bool recomputed = repopulated &&
+            execute_full(repopulated_output);
+        down_invalidation_ok = mutation_blocked && collected &&
+            mutation_done.load() && recomputed &&
+            memcmp(actual, pinned_output, sizeof(actual)) == 0 &&
+            memcmp(actual, repopulated_output, sizeof(actual)) == 0;
+    }
+
+    ggml_moe_cache.session_leave(session);
+    ggml_moe_cache.session_destroy(session);
+    if (ok && memcmp(reference, actual, sizeof(reference)) != 0) {
+        float max_error = 0.0f;
+        for (int index = 0; index < n_in; index++) {
+            max_error = std::max(max_error,
+                    std::abs(reference[index] - actual[index]));
+        }
+        fprintf(stderr,
+                "cache-fused-full-ffn: output mismatch (max error %.9g)\n",
+                max_error);
+        ok = false;
+    }
+    printf("cache-fused-full-ffn: %s\n", ok ? "OK" : "FAIL");
+    printf("cache-fused-full-ffn-down-invalidate: %s\n",
+            down_invalidation_ok ? "OK" : "FAIL");
+    return ok && down_invalidation_ok;
 }
 
 static bool run_cpu_overlap_policy(
@@ -2844,12 +3076,15 @@ int main() {
             static_ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
     ggml_tensor * gate_weights = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_Q5_0, n_out, n_in, n_expert);
     ggml_tensor * ids = ggml_new_tensor_2d(
             static_ctx, GGML_TYPE_I32, n_used, n_tokens);
     ggml_tensor * activations = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_F32, n_in, 1, n_tokens);
     ggml_set_name(weights, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
     ggml_set_name(ids, "moe_cache_test_ids");
     ggml_set_name(activations, "moe_cache_test_activations");
 
@@ -2909,6 +3144,29 @@ int main() {
     ggml_backend_tensor_set(
             gate_weights, gate_weights_q4.data(), 0,
             gate_weights_q4.size());
+
+    std::vector<float> down_weights_f32(ggml_nelements(down_weights));
+    for (size_t index = 0; index < down_weights_f32.size(); index++) {
+        down_weights_f32[index] =
+            0.09f * std::sin((float) (index % 787) * 0.019f) +
+            0.06f * std::cos((float) (index % 353) * 0.023f);
+    }
+    std::vector<uint8_t> down_weights_q5(ggml_nbytes(down_weights));
+    const size_t down_quantized = ggml_quantize_chunk(
+            GGML_TYPE_Q5_0, down_weights_f32.data(), down_weights_q5.data(),
+            0, n_in * n_expert, n_out, nullptr);
+    if (down_quantized != down_weights_q5.size()) {
+        fprintf(stderr, "unexpected down quantized size: %zu != %zu\n",
+                down_quantized, down_weights_q5.size());
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return 1;
+    }
+    ggml_backend_tensor_set(
+            down_weights, down_weights_q5.data(), 0,
+            down_weights_q5.size());
 
     const int32_t ids_data[n_used] = { 0, 1 };
     ggml_backend_tensor_set(ids, ids_data, 0, sizeof(ids_data));
@@ -3008,6 +3266,77 @@ int main() {
             clamped_fused_graph.out, clamped_fused_reference.data(), 0,
             clamped_fused_reference.size() * sizeof(float));
 
+    test_graph full_fused_graph = make_full_fused_graph(
+            cpu, weights, gate_weights, down_weights, activations, ids, false);
+    if (!full_fused_graph.ctx || !full_fused_graph.buffer) {
+        fprintf(stderr, "failed to create full fused test graph\n");
+        free_graph(full_fused_graph);
+        free_graph(clamped_fused_graph);
+        free_graph(fused_graph);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return 1;
+    }
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, full_fused_graph.graph) !=
+            GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "full fused CPU reference compute failed\n");
+        free_graph(full_fused_graph);
+        free_graph(clamped_fused_graph);
+        free_graph(fused_graph);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return 1;
+    }
+    std::vector<float> full_fused_reference(
+            ggml_nelements(full_fused_graph.out));
+    ggml_backend_tensor_get(
+            full_fused_graph.out, full_fused_reference.data(), 0,
+            full_fused_reference.size() * sizeof(float));
+
+    test_graph clamped_full_fused_graph = make_full_fused_graph(
+            cpu, weights, gate_weights, down_weights, activations, ids, true);
+    if (!clamped_full_fused_graph.ctx || !clamped_full_fused_graph.buffer) {
+        fprintf(stderr, "failed to create clamped full fused test graph\n");
+        free_graph(clamped_full_fused_graph);
+        free_graph(full_fused_graph);
+        free_graph(clamped_fused_graph);
+        free_graph(fused_graph);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return 1;
+    }
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, clamped_full_fused_graph.graph) !=
+            GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "clamped full fused CPU reference compute failed\n");
+        free_graph(clamped_full_fused_graph);
+        free_graph(full_fused_graph);
+        free_graph(clamped_fused_graph);
+        free_graph(fused_graph);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_backend_free(cuda);
+        ggml_backend_free(cpu);
+        return 1;
+    }
+    std::vector<float> clamped_full_fused_reference(
+            ggml_nelements(clamped_full_fused_graph.out));
+    ggml_backend_tensor_get(
+            clamped_full_fused_graph.out,
+            clamped_full_fused_reference.data(), 0,
+            clamped_full_fused_reference.size() * sizeof(float));
+
     bool ok = run_capability_queries(cuda_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
@@ -3038,10 +3367,25 @@ int main() {
             "cache-fused-clamped-collect-fallback", "collect", cuda, cpu,
             clamped_fused_graph, clamped_fused_reference, capture,
             "1", "fusion-nodes=");
+    ok &= run_scenario(
+            "cache-fused-full-ffn-graph", nullptr, cuda, cpu,
+            full_fused_graph, full_fused_reference, capture,
+            "1", "full-fusion=");
+    ok &= run_scenario(
+            "cache-fused-full-ffn-collect-fallback", "collect", cuda, cpu,
+            full_fused_graph, full_fused_reference, capture,
+            "1", "full-fusion=");
+    ok &= run_scenario(
+            "cache-fused-clamped-full-ffn-graph", nullptr, cuda, cpu,
+            clamped_full_fused_graph, clamped_full_fused_reference, capture,
+            "1", "full-fusion=");
     ok &= run_fused_partial_invalidation(
             cuda, cpu, weights, gate_weights, activations,
             weights_q4.data(), gate_weights_q4.data(),
             fused_reference, capture);
+    ok &= run_fused_full_ffn(
+            cuda, cpu, weights, gate_weights, down_weights, activations,
+            down_weights_q5.data());
     ok &= run_fused_concurrent_sessions(
             cuda_device, cuda, cpu, weights, gate_weights,
             activations, ids, fused_graph, fused_reference, capture);
@@ -3111,6 +3455,8 @@ int main() {
     ok &= run_route_override(cuda_device, cuda, cpu, capture);
     ok &= run_admission_policy(cuda, cpu, capture);
 
+    free_graph(clamped_full_fused_graph);
+    free_graph(full_fused_graph);
     free_graph(clamped_fused_graph);
     free_graph(fused_graph);
     free_graph(graph);

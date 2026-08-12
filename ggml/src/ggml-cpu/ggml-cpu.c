@@ -1855,6 +1855,8 @@ struct moe_cache_fused_state {
     uint64_t hit_mask;
     int n_hits;
     int collect_ok;
+    int skipped;
+    int full;
     int32_t ids[MOE_CACHE_MAX_TOPK];
     const float * acts[MOE_CACHE_MAX_TOPK];
     float * rows[MOE_CACHE_MAX_TOPK];
@@ -3220,6 +3222,7 @@ struct ggml_moe_cache_fusion {
     struct ggml_tensor * up;
     struct ggml_tensor * gate;
     struct ggml_tensor * glu;
+    struct ggml_tensor * down;
     float up_min;
     float up_max;
     float gate_min;
@@ -3348,6 +3351,50 @@ static bool ggml_moe_cache_can_fuse(
         up_weight->ne[2] <= 0) {
         return false;
     }
+
+    int down_n = node_n + fusion->skipped + 1;
+    if (down_n < cgraph->n_nodes) {
+        struct ggml_tensor * down = cgraph->nodes[down_n];
+        bool subgraph = false;
+        if (fusion->clamped) {
+            const enum ggml_op interleaved[] = {
+                GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP,
+                GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP,
+                GGML_OP_GLU, GGML_OP_MUL_MAT_ID,
+            };
+            const enum ggml_op grouped[] = {
+                GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID,
+                GGML_OP_CLAMP, GGML_OP_CLAMP,
+                GGML_OP_GLU, GGML_OP_MUL_MAT_ID,
+            };
+            subgraph =
+                ggml_can_fuse_subgraph(cgraph, node_n, 6,
+                        interleaved, &down_n, 1) ||
+                ggml_can_fuse_subgraph(cgraph, node_n, 6,
+                        grouped, &down_n, 1);
+        } else {
+            const enum ggml_op ops[] = {
+                GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID,
+                GGML_OP_GLU, GGML_OP_MUL_MAT_ID,
+            };
+            subgraph = ggml_can_fuse_subgraph(
+                    cgraph, node_n, 4, ops, &down_n, 1);
+        }
+        if (subgraph && down && down->op == GGML_OP_MUL_MAT_ID &&
+            down->src[1] == fusion->glu &&
+            down->src[2] == fusion->up->src[2] &&
+            ggml_moe_cache_weight_is_eligible(down->src[0]) &&
+            down->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous_1(down) &&
+            down->src[0]->ne[0] == fusion->glu->ne[0] &&
+            down->src[0]->ne[1] == down->ne[0] &&
+            down->src[0]->ne[2] == fusion->up->src[0]->ne[2] &&
+            down->ne[1] == fusion->glu->ne[1] &&
+            down->ne[2] == fusion->glu->ne[2] &&
+            ggml_nrows(down) == ggml_nrows(fusion->glu)) {
+            fusion->down = down;
+        }
+    }
     return true;
 }
 
@@ -3411,6 +3458,7 @@ static int ggml_cpu_try_fuse_moe_cache(
     struct ggml_tensor * up = fusion.up;
     struct ggml_tensor * gate = fusion.gate;
     struct ggml_tensor * glu = fusion.glu;
+    struct ggml_tensor * down = fusion.down;
     struct moe_cache_fused_state * state =
         (struct moe_cache_fused_state *)params->wdata;
     const struct ggml_tensor * up_weight = up->src[0];
@@ -3441,6 +3489,19 @@ static int ggml_cpu_try_fuse_moe_cache(
             gate_weight->ne[2],
             (int32_t)gate_weight->type,
         };
+        struct ggml_moe_cache_tensor_desc down_desc = { 0 };
+        if (down) {
+            const struct ggml_tensor * down_weight = down->src[0];
+            down_desc = (struct ggml_moe_cache_tensor_desc) {
+                down_weight->name,
+                down_weight->data,
+                down_weight->nb[2],
+                down_weight->ne[0],
+                down_weight->ne[1],
+                down_weight->ne[2],
+                (int32_t)down_weight->type,
+            };
+        }
         for (int token = 0; token < n_tokens; token++) {
             for (int id = 0; id < n_ids; id++) {
                 const int row = token*n_ids + id;
@@ -3449,16 +3510,31 @@ static int ggml_cpu_try_fuse_moe_cache(
             }
         }
         state->node = ggml_moe_cache.fused_begin(
-                &up_desc, &gate_desc, (int)GGML_GLU_OP_SWIGLU,
+                &up_desc, &gate_desc, down ? &down_desc : NULL,
+                (int)GGML_GLU_OP_SWIGLU,
                 fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max,
                 state->ids, n_rows, n_tokens,
                 state->acts, &state->hit_mask);
+        if (!state->node && down) {
+            state->hit_mask = 0;
+            state->node = ggml_moe_cache.fused_begin(
+                    &up_desc, &gate_desc, NULL,
+                    (int)GGML_GLU_OP_SWIGLU,
+                    fusion.up_min, fusion.up_max,
+                    fusion.gate_min, fusion.gate_max,
+                    state->ids, n_rows, n_tokens,
+                    state->acts, &state->hit_mask);
+        } else if (state->node && down) {
+            state->full = 1;
+        }
+        state->skipped = fusion.skipped + state->full;
         if (state->node) {
+            struct ggml_tensor * output = state->full ? down : glu;
             for (int row = 0; row < n_rows; row++) {
                 if (state->hit_mask & (UINT64_C(1) << row)) {
                     state->rows[state->n_hits++] =
-                        (float *)((char *)glu->data + row*glu->nb[1]);
+                        (float *)((char *)output->data + row*output->nb[1]);
                 }
             }
         }
@@ -3478,20 +3554,23 @@ static int ggml_cpu_try_fuse_moe_cache(
         ? UINT64_MAX : (UINT64_C(1) << n_rows) - 1;
     const uint64_t miss_mask = valid_mask & ~state->hit_mask;
 
-    ggml_compute_forward_mul_mat_id_impl(
-            &sub_params, up, miss_mask, true, false);
-    ggml_barrier(params->threadpool);
-    ggml_compute_forward_mul_mat_id_impl(
-            &sub_params, gate, miss_mask, true, false);
-    ggml_barrier(params->threadpool);
+    if (!state->full) {
+        ggml_compute_forward_mul_mat_id_impl(
+                &sub_params, up, miss_mask, true, false);
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward_mul_mat_id_impl(
+                &sub_params, gate, miss_mask, true, false);
+        ggml_barrier(params->threadpool);
 
-    ggml_compute_forward_swiglu_masked(
-            params, gate, up, glu, miss_mask, true,
-            fusion.clamped, fusion.up_min, fusion.up_max,
-            fusion.gate_min, fusion.gate_max);
+        ggml_compute_forward_swiglu_masked(
+                params, gate, up, glu, miss_mask, true,
+                fusion.clamped, fusion.up_min, fusion.up_max,
+                fusion.gate_min, fusion.gate_max);
+    }
     if (params->ith == 0) {
         state->collect_ok = ggml_moe_cache.collect(
-                state->node, state->n_hits, state->rows, glu->ne[0]);
+                state->node, state->n_hits, state->rows,
+                state->full ? down->ne[0] : glu->ne[0]);
         ggml_moe_cache.end(state->node);
         state->node = NULL;
     }
@@ -3508,9 +3587,14 @@ static int ggml_cpu_try_fuse_moe_cache(
                 params, gate, up, glu, state->hit_mask, false,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
+        if (state->full) {
+            ggml_barrier(params->threadpool);
+            ggml_compute_forward_mul_mat_id_impl(
+                    &sub_params, down, state->hit_mask, true, false);
+        }
     }
 
-    return fusion.skipped;
+    return state->skipped;
 }
 
 static int ggml_cpu_try_fuse_ops(
