@@ -4212,6 +4212,27 @@ private:
                 if (shared_draft_devices.n_weight_devices == 0) {
                     params_dft.n_gpu_layers = 0;
                 }
+
+                // A CPU-layer DSpark drafter is dominated by its vocabulary-sized
+                // output/Markov tail. Keep the 3-layer backbone (including its large
+                // expert tensors) on the CPU, but place the small Markov/confidence
+                // weights with the shared target output on the selected draft GPU.
+                // An explicit --spec-draft-device none remains fully CPU-resident.
+                if (params_dft.n_gpu_layers == 0 &&
+                    shared_draft_devices.n_weight_devices > 0) {
+                    if (!params_dft.tensor_buft_overrides.empty() &&
+                        params_dft.tensor_buft_overrides.back().pattern == nullptr) {
+                        params_dft.tensor_buft_overrides.pop_back();
+                    }
+                    params_dft.tensor_buft_overrides.push_back({
+                            "^(markov_w[12]|conf_proj)\\.",
+                            ggml_backend_dev_buffer_type(shared_draft_devices.devices[0]) });
+                    params_dft.tensor_buft_overrides.push_back({ nullptr, nullptr });
+                    if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+                        SRV_INF("[spec] keeping CPU DSpark Markov/confidence tail on %s\n",
+                                ggml_backend_dev_name(shared_draft_devices.devices[0]));
+                    }
+                }
             }
             return params_dft;
         };
@@ -4894,7 +4915,7 @@ private:
             // types/threads/overrides AND strips the base params' default-on dynamic-VBR flags —
             // a raw params_base copy here used to arm a second dynamic-VBR context and trip the
             // one-marker-per-process co-tenancy guard, failing draft-context creation.
-            auto params_dft = common_base_params_to_speculative(params_base);
+            auto params_dft = make_params_dft();
 
             // the helper pins n_outputs_max to the base n_parallel (MTP-path semantics);
             // this path historically inherited the base value — keep that (0 = derive from
@@ -4996,7 +5017,10 @@ private:
                     const char * env_og4  = getenv("GGML_DFLASH_ONEGRAPH_DSV4");
                     const bool   oneg     = !(env_og  && atoi(env_og)  == 0);
                     const bool   oneg4    = !(env_og4 && atoi(env_og4) == 0);
-                    if (oneg && (oneg4 || !llama_model_dflash_dsv4_backbone(model_dft.get()))) {
+                    const bool cpu_dspark = params_dft.n_gpu_layers == 0 &&
+                            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+                    if (oneg && !cpu_dspark &&
+                        (oneg4 || !llama_model_dflash_dsv4_backbone(model_dft.get()))) {
                         params_dft.n_parallel += 1;
                         params_dft.kv_unified  = true;
                     }
