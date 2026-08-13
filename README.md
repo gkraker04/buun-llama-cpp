@@ -188,12 +188,16 @@ off and most of the card can sit unused.
   -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
   -ctk f16 -ctv f16 \
   -ot 'exps=CPU' --moe-cache auto \
+  --moe-cache-expert-parallel auto \
   --host 0.0.0.0 --port 8081
 ```
 
 `-ot 'exps=CPU'` leaves the routed experts in system RAM while keeping the remaining offloaded
 weights on GPU. `--moe-cache auto` then fills otherwise spare VRAM with the hottest expert tensors
-and adapts their residency as routing changes. For one GPU, change it to `--moe-cache on`.
+and adapts their residency as routing changes. Expert-parallel mode divides resident rows within a
+layer across the selected cache devices while the CPU computes misses. `auto` uses both devices on
+a dual-GPU host and caps larger hosts at three-way dispatch. For one GPU, change the cache mode to
+`--moe-cache on` and omit expert parallelism.
 
 ### Dual RTX 3090 + DSpark
 
@@ -205,17 +209,29 @@ GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 \
   -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
   -ctk f16 -ctv f16 \
   -ot 'exps=CPU' --moe-cache auto \
+  --moe-cache-expert-parallel auto \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
   -t 22 -tb 22 -td 22 -tbd 22 \
   --host 0.0.0.0 --port 8081
 ```
 
-This is the best measured dual-RTX-3090 configuration for the IQ2_M target: its warmed code
-generation averaged about **41.1 tokens/s** on a 24-core EPYC 7443. With the safer default 3 GiB
-cache reserve, the same 22-thread configuration averaged about 41.0 tokens/s. The thread count is
-machine-specific; using all 24 physical cores reduced this host to about 36.9 tokens/s. Prompt
-processing measured **326 pp/s at 2,048 tokens**.
+Without expert-parallel dispatch, the best measured dual-RTX-3090 configuration for the IQ2_M
+target averaged about **41.1 tokens/s** on a 24-core EPYC 7443. A finalized same-binary
+correctness-fixed comparison using the command above measured **42.32 versus 44.28 tokens/s**
+(**+4.6%**) across five warm 500-token completions per arm. Aggregate draft acceptance was 67.53%
+and 68.34%, respectively, so some of the end-to-end spread is trajectory-dependent; an
+identical-output pair measured **+2.3%**. A diverse target-only replay measured **33.80 versus
+34.32 tokens/s** (**+1.5%**). With two concurrent DSpark slots, warmed aggregate throughput was
+**48.62 versus 52.25 tokens/s** (**+7.5%**); acceptance was 65.21% versus 66.58%.
+With the safer default 3 GiB reserve, the original 22-thread configuration averaged about 41.0
+tokens/s. The thread count is machine-specific; using all 24 physical cores reduced this host to
+about 36.9 tokens/s. Prompt processing measured **326 pp/s at 2,048 tokens** before expert
+parallelism was added.
+
+On four or more eligible GPUs, `auto` selects three-way dispatch. Fanout and CPU-thread optima are
+host-specific, so compare fanouts two, three, and four rather than assuming every card should join
+each expert operation.
 
 Although the command requests `-ngld 0`, `--spec-type draft-dspark` lets the server recognize the
 CPU-backbone DSpark configuration before model loading. The default GPU assist keeps the large
@@ -263,15 +279,18 @@ at least three warmed 512-token completions. Record both generation speed and ac
 counts—a faster result caused only by a luckier generation is not a reliable configuration win.
 
 1. Select the cache mode first: `--moe-cache on` for one GPU, `--moe-cache auto` for two or more.
-2. Keep the safe 3 GiB reserve and sweep CPU concurrency. Set all four pools together with
+2. On two or more GPUs, try `--moe-cache-expert-parallel auto`. The option is deliberately not the
+   default: it changes cache placement and the CPU/GPU numerical path, and models other than the
+   tested DeepSeek V4 Flash IQ2_M may have a different working-set tradeoff. Compare it against 0.
+3. Keep the safe 3 GiB reserve and sweep CPU concurrency. Set all four pools together with
    `-t N -tb N -td N -tbd N`. Start around physical cores minus 8, minus 4, minus 2, and all
    physical cores; avoid assuming SMT threads help.
-3. With the best thread count, sweep `--spec-draft-n-max 2`, `3`, and `4`. Depth five was already
+4. With the best thread count, sweep `--spec-draft-n-max 2`, `3`, and `4`. Depth five was already
    clearly worse on the tested host.
-4. Only then try cache reserves of 2560 and 2048 MiB using
+5. Only then try cache reserves of 2560 and 2048 MiB using
    `GGML_CUDA_MOE_CACHE_RESERVE_MB`. Keep the larger reserve unless the smaller value wins
    repeatedly, and verify long generation without an allocation failure.
-5. Recheck the winner in reverse order against the original configuration to catch temperature,
+6. Recheck the winner in reverse order against the original configuration to catch temperature,
    power and host-load drift.
 
 The reported PP figures used `-ub 4096`, five distinct 2,048-token prompts per server, no reusable

@@ -3559,7 +3559,7 @@ static int ggml_cpu_try_fuse_moe_cache(
         ? UINT64_MAX : (UINT64_C(1) << n_rows) - 1;
     const uint64_t miss_mask = valid_mask & ~state->hit_mask;
 
-    if (!state->full) {
+    if (miss_mask != 0) {
         ggml_compute_forward_mul_mat_id_impl(
                 &sub_params, up, miss_mask, true, false);
         ggml_barrier(params->threadpool);
@@ -3568,9 +3568,19 @@ static int ggml_cpu_try_fuse_moe_cache(
         ggml_barrier(params->threadpool);
 
         ggml_compute_forward_swiglu_masked(
-                params, gate, up, glu, miss_mask, true,
+                params, gate, up, glu, miss_mask, !state->full,
                 fusion.clamped, fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max);
+
+        if (state->full) {
+            // A full cache node may still cover only some routed rows. Finish the
+            // uncached rows through down while the GPUs compute the cached rows;
+            // collect() then writes only the complementary hit rows.
+            ggml_barrier(params->threadpool);
+            ggml_compute_forward_mul_mat_id_impl(
+                    &sub_params, down, miss_mask, true, false);
+            ggml_barrier(params->threadpool);
+        }
     }
     if (params->ith == 0) {
         state->collect_ok = ggml_moe_cache.collect(

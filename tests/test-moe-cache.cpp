@@ -267,6 +267,30 @@ static long long max_field_value(const std::string & text, const char * field) {
     return result;
 }
 
+static bool has_partial_fraction(const std::string & text, const char * field) {
+    size_t position = 0;
+    while ((position = text.find(field, position)) != std::string::npos) {
+        position += strlen(field);
+        char * numerator_end = nullptr;
+        const long long numerator =
+            strtoll(text.c_str() + position, &numerator_end, 10);
+        if (numerator_end == text.c_str() + position ||
+            *numerator_end != '/') {
+            position++;
+            continue;
+        }
+        char * denominator_end = nullptr;
+        const long long denominator =
+            strtoll(numerator_end + 1, &denominator_end, 10);
+        if (denominator_end != numerator_end + 1 &&
+            numerator > 0 && numerator < denominator) {
+            return true;
+        }
+        position = denominator_end - text.c_str();
+    }
+    return false;
+}
+
 static size_t count_field_at_least(
         const std::string & text, const char * field, long long minimum) {
     size_t result = 0;
@@ -394,6 +418,7 @@ static void configure_cache(
     set_env("GGML_CUDA_MOE_CACHE_QUEUE", "16");
     set_env("GGML_CUDA_MOE_CACHE_STATS", "1");
     set_env("GGML_CUDA_MOE_CACHE_NDEV", "1");
+    set_env("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_MIN_CC", "0");
     set_env("GGML_CUDA_MOE_CACHE_SERIAL_FILL", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_DEDICATED_MMV", dedicated_mmv);
@@ -646,13 +671,20 @@ static bool run_scenario(
         log_capture & capture,
         const char * max_batch = "1",
         const char * required_field = nullptr,
-        const char * dedicated_mmv = "1") {
+        const char * dedicated_mmv = "1",
+        const char * expert_parallel = nullptr,
+        const char * n_devices = "1",
+        const std::vector<ggml_backend_t> * supplied_backends = nullptr) {
     configure_cache(fail_stage, max_batch, dedicated_mmv);
+    set_env("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", expert_parallel);
+    set_env("GGML_CUDA_MOE_CACHE_NDEV", n_devices);
     capture.clear();
 
-    ggml_backend_t backends[] = { cuda, cpu };
+    std::vector<ggml_backend_t> backends = supplied_backends
+        ? *supplied_backends : std::vector<ggml_backend_t>{ cuda, cpu };
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
-            backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+            backends.data(), nullptr, (int)backends.size(),
+            GGML_DEFAULT_GRAPH_SIZE, false, false);
     if (!scheduler) {
         fprintf(stderr, "%s: failed to create scheduler\n", name);
         return false;
@@ -669,6 +701,12 @@ static bool run_scenario(
     bool live_hit = false;
     std::vector<float> actual(reference.size());
     for (int step = 0; step < max_steps; step++) {
+        // Do not let a partial-cache bug hide behind correct rows retained from the
+        // preceding iteration. Every fused execution must produce every output row.
+        std::fill(actual.begin(), actual.end(),
+                  std::numeric_limits<float>::quiet_NaN());
+        ggml_backend_tensor_set(
+                graph.out, actual.data(), 0, actual.size() * sizeof(float));
         const enum ggml_status status =
             ggml_backend_sched_graph_compute(scheduler, graph.graph);
         if (status != GGML_STATUS_SUCCESS) {
@@ -720,11 +758,71 @@ static bool run_scenario(
     return output_ok && stage_ok;
 }
 
+static bool run_expert_parallel_partial_scenario(
+        ggml_backend_dev_t first_device,
+        ggml_backend_t cuda,
+        ggml_backend_t cpu,
+        test_graph & graph,
+        const std::vector<float> & reference,
+        log_capture & capture) {
+    std::vector<ggml_backend_t> backends = { cuda };
+    std::vector<ggml_backend_t> owned;
+    for (size_t index = 0;
+         index < ggml_backend_dev_count() && backends.size() < 2;
+         index++) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        if (device == first_device || !is_cache_gpu(device)) {
+            continue;
+        }
+        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+        if (!backend) {
+            continue;
+        }
+        backends.push_back(backend);
+        owned.push_back(backend);
+    }
+    if (backends.size() < 2) {
+        for (ggml_backend_t backend : owned) {
+            ggml_backend_free(backend);
+        }
+        printf("cache-expert-parallel-partial: SKIP (fewer than two GPUs)\n");
+        return true;
+    }
+    backends.push_back(cpu);
+
+    const bool output_ok = run_scenario(
+            "cache-expert-parallel-partial", nullptr, cuda, cpu,
+            graph, reference, capture, "8", "full-fusion=", "1",
+            "2", "2", &backends);
+    const bool partial_seen = has_partial_fraction(capture.get(), "fusion=");
+    if (output_ok && !partial_seen) {
+        fprintf(stderr,
+                "cache-expert-parallel-partial: partial dispatch was not observed\n%s",
+                capture.get().c_str());
+    }
+    const bool dispatch_fallback = run_scenario(
+            "cache-expert-parallel-dispatch-fallback", "dispatch",
+            cuda, cpu, graph, reference, capture, "8", nullptr, "1",
+            "2", "2", &backends);
+    const bool collect_fallback = run_scenario(
+            "cache-expert-parallel-collect-fallback", "collect",
+            cuda, cpu, graph, reference, capture, "8", nullptr, "1",
+            "2", "2", &backends);
+
+    configure_cache(nullptr);
+    for (ggml_backend_t backend : owned) {
+        ggml_backend_free(backend);
+    }
+    return output_ok && partial_seen && dispatch_fallback && collect_fallback;
+}
+
 static bool run_multi_token_scenario(
+        ggml_backend_dev_t cuda_device,
         ggml_backend_t cuda,
         ggml_backend_t cpu,
         ggml_tensor * weights,
         ggml_tensor * gate_weights,
+        ggml_tensor * down_weights,
         log_capture & capture) {
     const ggml_init_params params = {
         4 * ggml_tensor_overhead(),
@@ -777,9 +875,13 @@ static bool run_multi_token_scenario(
             cpu, weights, gate_weights, activations, ids);
     test_graph clamped_fused_graph = make_clamped_fused_graph(
             cpu, weights, gate_weights, activations, ids);
+    test_graph full_fused_graph = make_full_fused_graph(
+            cpu, weights, gate_weights, down_weights,
+            activations, ids, false);
     bool ok = graph.ctx && graph.buffer &&
         fused_graph.ctx && fused_graph.buffer &&
-        clamped_fused_graph.ctx && clamped_fused_graph.buffer;
+        clamped_fused_graph.ctx && clamped_fused_graph.buffer &&
+        full_fused_graph.ctx && full_fused_graph.buffer;
     if (!ok) {
         fprintf(stderr, "cache-multi-token: failed to create graphs\n");
     } else {
@@ -800,13 +902,17 @@ static bool run_multi_token_scenario(
         std::vector<float> reference;
         std::vector<float> fused_reference;
         std::vector<float> clamped_fused_reference;
+        std::vector<float> full_fused_reference;
         ok = make_reference("cache-multi-token", graph, reference) &&
             make_reference(
                     "cache-fused-multi-token", fused_graph,
                     fused_reference) &&
             make_reference(
                     "cache-fused-clamped-multi-token",
-                    clamped_fused_graph, clamped_fused_reference);
+                    clamped_fused_graph, clamped_fused_reference) &&
+            make_reference(
+                    "cache-fused-full-ffn-multi-token",
+                    full_fused_graph, full_fused_reference);
         ok = ok && run_scenario(
                 "cache-multi-token", nullptr, cuda, cpu,
                 graph, reference, capture, nullptr, "act-dedup=");
@@ -818,8 +924,16 @@ static bool run_multi_token_scenario(
                 "cache-fused-clamped-multi-token", nullptr, cuda, cpu,
                 clamped_fused_graph, clamped_fused_reference, capture,
                 nullptr, "fusion-nodes=");
+        ok = ok && run_scenario(
+                "cache-fused-full-ffn-multi-token", nullptr, cuda, cpu,
+                full_fused_graph, full_fused_reference, capture,
+                nullptr, "full-fusion=");
+        ok = ok && run_expert_parallel_partial_scenario(
+                cuda_device, cuda, cpu, full_fused_graph,
+                full_fused_reference, capture);
     }
 
+    free_graph(full_fused_graph);
     free_graph(clamped_fused_graph);
     free_graph(fused_graph);
     free_graph(graph);
@@ -1843,6 +1957,15 @@ static bool run_explicit_session_config(
         }
     }
     config.overlap_cpu_rows = 0;
+    for (int expert_parallel : { -2, 9 }) {
+        config.expert_parallel = expert_parallel;
+        void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
+        invalid_rejected &= invalid == nullptr;
+        if (invalid) {
+            ggml_moe_cache.session_destroy(invalid);
+        }
+    }
+    config.expert_parallel = 0;
     for (int min_expert_explicit : { -1, 2 }) {
         config.min_expert_explicit = min_expert_explicit;
         void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
@@ -3396,7 +3519,8 @@ int main() {
     ok &= run_fused_repeated_lifecycle(
             cuda, cpu, fused_graph, fused_reference, capture);
     ok &= run_multi_token_scenario(
-            cuda, cpu, weights, gate_weights, capture);
+            cuda_device, cuda, cpu, weights, gate_weights,
+            down_weights, capture);
     ok &= run_mxfp4_shared_pool(cuda, cpu, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(

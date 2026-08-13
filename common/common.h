@@ -533,6 +533,7 @@ enum common_moe_cache_mode {
 struct common_moe_cache_params {
     common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
     size_t budget_mib          = 0;
+    int expert_parallel        = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
 };

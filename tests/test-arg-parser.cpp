@@ -540,12 +540,37 @@ static void test(void) {
         {"binary_name", "--moe-cache", "1048577"},
         {"binary_name", "--moe-cache", "256x"},
         {"binary_name", "--moe-cache", "999999999999999999999999"},
+        {"binary_name", "--moe-cache-expert-parallel", "-1"},
+        {"binary_name", "--moe-cache-expert-parallel", "9"},
+        {"binary_name", "--moe-cache-expert-parallel", "invalid"},
     };
     for (auto invalid_argv : invalid_moe_cache_args) {
         common_params mode_params;
         assert(false == common_params_parse(
                 invalid_argv.size(), list_str_to_char(invalid_argv).data(),
                 mode_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "auto"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == -1);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == -1);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "3"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == 3);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == 3);
     }
 
     {

@@ -1944,7 +1944,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_set_moe_cache(
-        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
+        size_t budget_mib, int expert_parallel) {
     GGML_ASSERT(sched);
     if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
         return;
@@ -1964,6 +1965,7 @@ void ggml_backend_sched_set_moe_cache(
     if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
         return;
     }
+    config.expert_parallel = expert_parallel;
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
     for (int index = 0; index < sched->n_backends; index++) {

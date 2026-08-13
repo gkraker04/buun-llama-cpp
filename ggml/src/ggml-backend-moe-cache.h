@@ -21,6 +21,8 @@ struct ggml_moe_cache_config {
     int32_t min_devices;
     // -1 selects the provider policy; 0..8 is a fixed total per node.
     int32_t overlap_cpu_rows;
+    // -1 selects the provider policy; 0 disables expert-parallel dispatch.
+    int32_t expert_parallel;
 };
 
 struct ggml_moe_cache_device_caps {
@@ -103,7 +105,8 @@ struct ggml_moe_cache_api {
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
-        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
+        size_t budget_mib, int expert_parallel);
 
 #ifdef __cplusplus
 }

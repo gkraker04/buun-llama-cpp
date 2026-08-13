@@ -1827,6 +1827,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
 
     return cparams;
 }

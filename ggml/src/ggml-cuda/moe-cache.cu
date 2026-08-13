@@ -162,6 +162,7 @@ struct moe_cache_config {
     bool force_dedicated_mmv = false;
     int overlap_cpu_rows = -1;
     bool overlap_cpu_rows_explicit = false;
+    int expert_parallel = 0;
     std::string fail_stage;
 };
 
@@ -298,6 +299,11 @@ struct moe_cache_node {
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
+    bool owns_active = true;
+    bool composite = false;
+    int n_result_rows = 0;
+    int row_indices[moe_cache_node_rows_max];
+    std::vector<std::unique_ptr<moe_cache_node>> children;
 };
 
 static std::mutex g_registry_mu;
@@ -610,6 +616,9 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", 0, 8, value)) {
         config.overlap_cpu_rows = (int)value;
         config.overlap_cpu_rows_explicit = true;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", -1, 8, value)) {
+        config.expert_parallel = (int)value;
     }
     moe_cache_apply_mode_defaults(config);
     config.min_compute_capability = moe_cache_min_compute_capability(config.automatic);
@@ -925,6 +934,7 @@ static int moe_cache_query_config(
     result->min_compute_capability = config.min_compute_capability;
     result->min_devices = config.automatic ? 2 : 1;
     result->overlap_cpu_rows = config.overlap_cpu_rows;
+    result->expert_parallel = config.expert_parallel;
     return 1;
 }
 
@@ -1496,7 +1506,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s expert-parallel=%d\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
@@ -1505,7 +1515,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             session.config.max_batch,
             admission.c_str(),
             overlap_cpu_rows.c_str(),
-            session.config.serial_fill ? "serial" : "parallel");
+            session.config.serial_fill ? "serial" : "parallel",
+            session.config.expert_parallel);
 }
 
 static void * moe_cache_session_create(
@@ -1527,7 +1538,9 @@ static void * moe_cache_session_create(
                 supplied_config->min_compute_capability < 0 ||
                 supplied_config->min_compute_capability > 999 ||
                 supplied_config->overlap_cpu_rows < -1 ||
-                supplied_config->overlap_cpu_rows > 8) {
+                supplied_config->overlap_cpu_rows > 8 ||
+                supplied_config->expert_parallel < -1 ||
+                supplied_config->expert_parallel > 8) {
                 return nullptr;
             }
             config.enabled = true;
@@ -1540,6 +1553,7 @@ static void * moe_cache_session_create(
             config.max_batch = supplied_config->max_batch;
             config.min_compute_capability = supplied_config->min_compute_capability;
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
+            config.expert_parallel = supplied_config->expert_parallel;
         }
         if (!config.enabled) {
             return nullptr;
@@ -1598,6 +1612,10 @@ static void * moe_cache_session_create(
         if (!session->config.serial_fill_explicit) {
             session->config.serial_fill =
                 session->devices.size() < 2 || minimum_capability < moe_cache_cc_ampere;
+        }
+        if (session->config.expert_parallel < 0) {
+            session->config.expert_parallel = std::min<int>(
+                    3, session->devices.size());
         }
         if (!moe_cache_budget_register(*session)) {
             return nullptr;
@@ -1824,6 +1842,13 @@ static void * moe_cache_begin(
     }
     moe_cache_session * session = g_session_stack.back().active;
     if (!session || session->stopping || session->dormant) {
+        return nullptr;
+    }
+    // Expert-parallel mode owns discovery and admission through the complete
+    // up/gate/down path. Letting the single-device fallback see these nodes would
+    // allocate a pool after the first tensor is revisited, before all layer shapes
+    // have been counted, and permanently strand most of that device's capacity.
+    if (session->config.expert_parallel && session->devices.size() >= 2) {
         return nullptr;
     }
     moe_cache_log_configuration(*session);
@@ -2612,6 +2637,30 @@ static int moe_cache_dispatch(
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    if (node && node->composite) {
+        if (!node->dispatched || n_hits != node->n_result_rows ||
+            !dst_rows || n_out != node->n_out) {
+            return 0;
+        }
+        bool ok = true;
+        for (const auto & child : node->children) {
+            float * child_rows[moe_cache_node_rows_max];
+            for (int row = 0; row < child->n_result_rows; row++) {
+                const int dst = child->row_indices[row];
+                if (dst < 0 || dst >= n_hits || !dst_rows[dst]) {
+                    ok = false;
+                    break;
+                }
+                child_rows[row] = dst_rows[dst];
+            }
+            if (!ok || !moe_cache_collect(
+                    child.get(), child->n_result_rows, child_rows, n_out)) {
+                ok = false;
+            }
+        }
+        node->dispatched = false;
+        return ok ? 1 : 0;
+    }
     const int pins_per_hit = node && node->host_base3 ? 3 :
         node && node->host_base2 ? 2 : 1;
     if (!node || !node->dispatched || n_hits <= 0 ||
@@ -2676,7 +2725,13 @@ static void moe_cache_end(void * opaque) {
         return;
     }
 
-    if (node->dispatched) {
+    if (node->composite) {
+        for (auto & child : node->children) {
+            moe_cache_end(child.release());
+        }
+        node->children.clear();
+        node->dispatched = false;
+    } else if (node->dispatched) {
         ggml_cuda_set_device(node->device->logical);
         moe_cache_cuda_ok(
                 *node->device, cudaStreamSynchronize(node->device->compute_stream),
@@ -2685,7 +2740,7 @@ static void moe_cache_end(void * opaque) {
     }
 
     moe_cache_session & session = *node->session;
-    const bool trim = node->device->dead.load();
+    const bool trim = node->device && node->device->dead.load();
     {
         std::lock_guard<std::mutex> lock(session.mu);
         for (int index = 0; index < node->n_pins; index++) {
@@ -2697,24 +2752,410 @@ static void moe_cache_end(void * opaque) {
                 }
             }
         }
-        for (const void * base : {
-                node->host_base, node->host_base2, node->host_base3}) {
-            if (!base) {
-                continue;
+        if (node->owns_active) {
+            for (const void * base : {
+                    node->host_base, node->host_base2, node->host_base3}) {
+                if (!base) {
+                    continue;
+                }
+                auto source = session.active_sources.find(base);
+                if (source != session.active_sources.end() &&
+                    --source->second.references == 0) {
+                    session.active_sources.erase(source);
+                }
             }
-            auto source = session.active_sources.find(base);
-            if (source != session.active_sources.end() &&
-                --source->second.references == 0) {
-                session.active_sources.erase(source);
-            }
+            session.active_nodes--;
+            session.idle_cv.notify_all();
         }
-        session.active_nodes--;
-        session.idle_cv.notify_all();
     }
     if (trim && node->dispatch_lock.owns_lock()) {
         node->dispatch_lock.unlock();
         moe_cache_trim_session(session, node->device->physical);
     }
+}
+
+static void * moe_cache_fused_begin_expert_parallel(
+        moe_cache_session & session,
+        const ggml_moe_cache_tensor_desc * up,
+        const ggml_moe_cache_tensor_desc * gate,
+        const ggml_moe_cache_tensor_desc * down,
+        int layer, int glu_op, float up_min, float up_max,
+        float gate_min, float gate_max,
+        const int32_t * ids, int n_ids, int64_t n_tokens,
+        const float * const * act_rows, uint64_t * hit_mask) {
+    if (!down || session.devices.size() < 2) {
+        return nullptr;
+    }
+
+    const size_t up_tensor_size = (size_t)up->n_expert * up->expert_size;
+    const size_t down_tensor_size = (size_t)down->n_expert * down->expert_size;
+    moe_cache_scratch up_scratch;
+    moe_cache_scratch down_scratch;
+    if (!moe_cache_scratch_requirements(up->n_in, up->n_out, up_scratch) ||
+        !moe_cache_scratch_requirements(down->n_in, down->n_out, down_scratch)) {
+        return nullptr;
+    }
+
+    struct route {
+        moe_cache_device * device = nullptr;
+        moe_cache_pool * pair_pool = nullptr;
+        moe_cache_pool * down_pool = nullptr;
+        int pair_pool_index = -1;
+        int down_pool_index = -1;
+        int rows[moe_cache_node_rows_max];
+        int n_rows = 0;
+        int n_hits = 0;
+        int up_slots[moe_cache_node_rows_max];
+        int gate_slots[moe_cache_node_rows_max];
+        int down_slots[moe_cache_node_rows_max];
+        const float * acts[moe_cache_node_rows_max];
+        moe_cache_pin pins[3 * moe_cache_node_rows_max];
+        int n_pins = 0;
+        std::unique_lock<std::mutex> dispatch_lock;
+        moe_cache_node * child = nullptr;
+    };
+    std::vector<route> routes;
+    try {
+        routes.reserve(session.devices.size());
+    } catch (...) {
+        return nullptr;
+    }
+
+    // Every participating device sees every tensor shape, but actual expert rows are
+    // deterministically sharded below. This gives each device a correctly-sized slice
+    // of every layer without replicating hot rows across all devices.
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (const auto & device_ptr : session.devices) {
+            moe_cache_device & device = *device_ptr;
+            if (device.dead.load() || !moe_cache_prepare_budget(session, device)) {
+                continue;
+            }
+            device.scratch_reserve.input = std::max(
+                    device.scratch_reserve.input,
+                    std::max(up_scratch.input, down_scratch.input));
+            device.scratch_reserve.q8 = std::max(
+                    device.scratch_reserve.q8,
+                    std::max(up_scratch.q8, down_scratch.q8));
+            device.scratch_reserve.out = std::max(
+                    device.scratch_reserve.out,
+                    std::max(up_scratch.out, down_scratch.out));
+
+            int up_pool = -1;
+            int down_pool = -1;
+            try {
+                up_pool = moe_cache_discover_pool(
+                        session, device, up->data, up_tensor_size,
+                        up->expert_size, up->type, up->n_expert);
+                (void)moe_cache_discover_pool(
+                        session, device, gate->data, up_tensor_size,
+                        gate->expert_size, gate->type, gate->n_expert);
+                down_pool = moe_cache_discover_pool(
+                        session, device, down->data, down_tensor_size,
+                        down->expert_size, down->type, down->n_expert);
+            } catch (...) {
+                device.insert_skips++;
+                continue;
+            }
+            if (up_pool < 0 || down_pool < 0 ||
+                up_pool >= (int)device.pools.size() ||
+                down_pool >= (int)device.pools.size()) {
+                continue;
+            }
+            routes.emplace_back();
+            route & result = routes.back();
+            result.device = &device;
+            result.pair_pool = device.pools[up_pool].get();
+            result.down_pool = device.pools[down_pool].get();
+            result.pair_pool_index = up_pool;
+            result.down_pool_index = down_pool;
+        }
+    }
+    if (routes.size() < 2) {
+        return nullptr;
+    }
+
+    const size_t fanout = std::min<size_t>(
+            (size_t)std::max(session.config.expert_parallel, 1), routes.size());
+    if (fanout < routes.size()) {
+        std::vector<route> selected;
+        try {
+            selected.reserve(fanout);
+            const size_t first = ((size_t)layer * fanout) % routes.size();
+            for (size_t index = 0; index < fanout; index++) {
+                selected.push_back(std::move(routes[(first + index) % routes.size()]));
+            }
+        } catch (...) {
+            return nullptr;
+        }
+        routes = std::move(selected);
+    }
+
+    for (int row = 0; row < n_ids; row++) {
+        if (ids[row] < 0 || ids[row] >= up->n_expert) {
+            return nullptr;
+        }
+        const uint64_t key =
+            ((uint64_t)(uint32_t)ids[row] + 1) * UINT64_C(0x9e3779b97f4a7c15) ^
+            ((uint64_t)(uint32_t)layer + 1) * UINT64_C(0xbf58476d1ce4e5b9);
+        route & selected = routes[key % routes.size()];
+        selected.rows[selected.n_rows++] = row;
+    }
+
+    // Lock all selected devices in physical-device order. The launches remain
+    // asynchronous; holding these locks only prevents another graph from reusing a
+    // device's shared scratch buffers until collect completes.
+    for (route & current : routes) {
+        if (current.n_rows == 0) {
+            continue;
+        }
+        try {
+            current.dispatch_lock = std::unique_lock<std::mutex>(
+                    current.device->dispatch_mu, std::try_to_lock);
+        } catch (...) {
+            current.device->contention_bypasses++;
+            return nullptr;
+        }
+        if (!current.dispatch_lock.owns_lock()) {
+            current.device->contention_bypasses++;
+            return nullptr;
+        }
+    }
+
+    const void * source_bases[] = {up->data, gate->data, down->data};
+    const size_t source_bytes[] = {
+        up_tensor_size, up_tensor_size, down_tensor_size};
+    bool active_node = false;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        bool source_acquired[3] = {};
+        auto acquire_source = [&](int index) {
+            try {
+                moe_cache_session::active_source & source =
+                    session.active_sources[source_bases[index]];
+                source.bytes = std::max(source.bytes, source_bytes[index]);
+                source.references++;
+                source_acquired[index] = true;
+                return true;
+            } catch (...) {
+                return false;
+            }
+        };
+        if (!acquire_source(0) || !acquire_source(1) || !acquire_source(2)) {
+            for (int index = 0; index < 3; index++) {
+                if (!source_acquired[index]) {
+                    continue;
+                }
+                auto found = session.active_sources.find(source_bases[index]);
+                if (found != session.active_sources.end() &&
+                    --found->second.references == 0) {
+                    session.active_sources.erase(found);
+                }
+            }
+            return nullptr;
+        }
+        session.active_nodes++;
+        active_node = true;
+    }
+    auto release_active = [&] {
+        if (!active_node) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (const void * base : source_bases) {
+            auto found = session.active_sources.find(base);
+            if (found != session.active_sources.end() &&
+                --found->second.references == 0) {
+                session.active_sources.erase(found);
+            }
+        }
+        session.active_nodes--;
+        session.idle_cv.notify_all();
+        active_node = false;
+    };
+
+    bool wake_worker = false;
+    uint64_t mask = 0;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (route & current : routes) {
+            int inserts_left = session.config.inserts_per_plan;
+            for (int local = 0; local < current.n_rows; local++) {
+                const int row = current.rows[local];
+                const int32_t expert = ids[row];
+                const int up_slot = moe_cache_lookup_or_queue_locked(
+                        session, *current.device, *current.pair_pool,
+                        current.pair_pool_index, up->data, expert,
+                        up->expert_size, inserts_left, wake_worker);
+                const int gate_slot = moe_cache_lookup_or_queue_locked(
+                        session, *current.device, *current.pair_pool,
+                        current.pair_pool_index, gate->data, expert,
+                        gate->expert_size, inserts_left, wake_worker);
+                const int down_slot = moe_cache_lookup_or_queue_locked(
+                        session, *current.device, *current.down_pool,
+                        current.down_pool_index, down->data, expert,
+                        down->expert_size, inserts_left, wake_worker);
+                current.device->misses += up_slot < 0;
+                current.device->misses += gate_slot < 0;
+                current.device->misses += down_slot < 0;
+                if (up_slot < 0 || gate_slot < 0 || down_slot < 0) {
+                    continue;
+                }
+                const int hit = current.n_hits++;
+                current.rows[hit] = row;
+                current.up_slots[hit] = up_slot;
+                current.gate_slots[hit] = gate_slot;
+                current.down_slots[hit] = down_slot;
+                current.acts[hit] = act_rows[row];
+                for (const moe_cache_pin pin : {
+                        moe_cache_pin{current.pair_pool, up_slot},
+                        moe_cache_pin{current.pair_pool, gate_slot},
+                        moe_cache_pin{current.down_pool, down_slot}}) {
+                    moe_cache_slot & slot = pin.pool->slots[pin.slot];
+                    slot.readers++;
+                    moe_cache_lru_remove(*pin.pool, pin.slot);
+                    moe_cache_lru_push_back(*pin.pool, pin.slot);
+                    current.pins[current.n_pins++] = pin;
+                }
+                mask |= UINT64_C(1) << row;
+            }
+        }
+    }
+    if (wake_worker) {
+        session.cv.notify_all();
+    }
+    if (mask == 0) {
+        release_active();
+        return nullptr;
+    }
+    int total_hits = 0;
+    for (const route & current : routes) {
+        total_hits += current.n_hits;
+    }
+    auto release_route_pins = [&] {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (route & current : routes) {
+            for (int index = 0; index < current.n_pins; index++) {
+                const moe_cache_pin & pin = current.pins[index];
+                moe_cache_slot & slot = pin.pool->slots[pin.slot];
+                GGML_ASSERT(slot.readers > 0);
+                slot.readers--;
+            }
+            current.n_pins = 0;
+        }
+    };
+
+    std::unique_ptr<moe_cache_node> root(new (std::nothrow) moe_cache_node());
+    if (!root) {
+        release_route_pins();
+        release_active();
+        return nullptr;
+    }
+    root->session = &session;
+    root->host_base = up->data;
+    root->host_base2 = gate->data;
+    root->host_base3 = down->data;
+    root->n_out = down->n_out;
+    root->n_result_rows = total_hits;
+    root->composite = true;
+    root->planned = true;
+    active_node = false;
+
+    size_t n_children = 0;
+    for (const route & current : routes) {
+        n_children += current.n_hits > 0;
+    }
+    try {
+        root->children.reserve(n_children);
+    } catch (...) {
+        release_route_pins();
+        moe_cache_end(root.release());
+        return nullptr;
+    }
+    int hit_ranks[moe_cache_node_rows_max];
+    int hit_rank = 0;
+    for (int row = 0; row < n_ids; row++) {
+        hit_ranks[row] = mask & (UINT64_C(1) << row) ? hit_rank++ : -1;
+    }
+    for (route & current : routes) {
+        if (current.n_hits == 0) {
+            continue;
+        }
+        std::unique_ptr<moe_cache_node> child(new (std::nothrow) moe_cache_node());
+        if (!child) {
+            release_route_pins();
+            moe_cache_end(root.release());
+            return nullptr;
+        }
+        child->session = &session;
+        child->device = current.device;
+        child->pool = current.pair_pool;
+        child->down_pool = current.down_pool;
+        child->pool_index = current.pair_pool_index;
+        child->host_base = up->data;
+        child->host_base2 = gate->data;
+        child->host_base3 = down->data;
+        child->expert_size = up->expert_size;
+        child->n_in = up->n_in;
+        child->n_mid = up->n_out;
+        child->n_out = down->n_out;
+        child->n_expert = up->n_expert;
+        child->n_tokens = n_tokens;
+        child->wtype = up->type;
+        child->planned = true;
+        child->owns_active = false;
+        child->n_result_rows = current.n_hits;
+        child->dispatch_lock = std::move(current.dispatch_lock);
+        for (int local = 0; local < current.n_hits; local++) {
+            child->row_indices[local] = hit_ranks[current.rows[local]];
+        }
+        current.child = child.get();
+        root->children.push_back(std::move(child));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (route & current : routes) {
+            if (current.n_hits == 0) {
+                continue;
+            }
+            moe_cache_node * child = current.child;
+            GGML_ASSERT(current.n_pins == 3 * current.n_hits);
+            for (int index = 0; index < current.n_pins; index++) {
+                child->pins[child->n_pins++] = current.pins[index];
+            }
+            current.n_pins = 0;
+            current.device->hits += 3 * current.n_hits;
+            current.device->nodes++;
+            current.device->fused_attempts++;
+        }
+    }
+
+    for (route & current : routes) {
+        if (current.n_hits == 0) {
+            continue;
+        }
+        if (!moe_cache_dispatch_internal(
+                current.child, up->type, up->n_in, up->n_out,
+                current.child->n_result_rows,
+                current.up_slots, current.acts,
+                current.pair_pool, current.gate_slots,
+                current.down_pool, current.down_slots,
+                glu_op, up_min, up_max, gate_min, gate_max)) {
+            moe_cache_end(root.release());
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(session.mu);
+        current.device->fused_rows += current.child->n_result_rows;
+        current.device->fused_candidates += current.n_rows;
+        current.device->fused_nodes++;
+        current.device->full_fused_rows += current.child->n_result_rows;
+        current.device->full_fused_nodes++;
+    }
+
+    root->dispatched = true;
+    *hit_mask = mask;
+    return root.release();
 }
 
 static void * moe_cache_fused_begin(
@@ -2774,6 +3215,11 @@ static void * moe_cache_fused_begin(
     if (!session || session->stopping || session->dormant) {
         return nullptr;
     }
+    const bool expert_parallel = session->config.expert_parallel &&
+        session->devices.size() >= 2;
+    if (expert_parallel && !down) {
+        return nullptr;
+    }
     moe_cache_log_configuration(*session);
     if (up->expert_size < session->config.min_expert_bytes) {
         return nullptr;
@@ -2806,6 +3252,13 @@ static void * moe_cache_fused_begin(
         (down && (!moe_cache_layer_number(down->name, down_layer) ||
                   down_layer != up_layer))) {
         return nullptr;
+    }
+
+    if (expert_parallel && down) {
+        return moe_cache_fused_begin_expert_parallel(
+                *session, up, gate, down, up_layer, glu_op,
+                up_min, up_max, gate_min, gate_max,
+                ids, n_ids, n_tokens, act_rows, hit_mask);
     }
 
     std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());

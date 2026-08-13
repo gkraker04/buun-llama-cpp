@@ -151,6 +151,7 @@ llama_context::llama_context(
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.moe_cache_mode          = params.moe_cache_mode;
     cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
+    cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -915,7 +916,8 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
-            cparams.moe_cache_budget_mib);
+            cparams.moe_cache_budget_mib,
+            cparams.moe_cache_expert_parallel);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -986,7 +988,8 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
-                        cparams.moe_cache_budget_mib);
+                        cparams.moe_cache_budget_mib,
+                        cparams.moe_cache_expert_parallel);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -6713,6 +6716,7 @@ llama_context_params llama_context_default_params() {
         /*.vbr_growth_headroom_bytes   =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
+        /*.moe_cache_expert_parallel   =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
