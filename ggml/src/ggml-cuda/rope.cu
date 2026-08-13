@@ -678,6 +678,7 @@ static __global__ void rope_back_concat_norm_f32(
         float freq_scale, float ext_factor, float attn_factor,
         rope_corr_dims corr_dims, float theta_scale,
         const float * freq_factors) {
+    ggml_cuda_pdl_lc();
     const int output_i0 = 2 * (blockDim.y * blockIdx.y + threadIdx.y);
     const int output_ne0 = prefix_ne0 + rope_ne0;
     if (output_i0 >= output_ne0) {
@@ -689,6 +690,7 @@ static __global__ void rope_back_concat_norm_f32(
     const int i2 = (row - i3 * ne01 * ne02) / ne01;
     const int i1 = row - i3 * ne01 * ne02 - i2 * ne01;
     const int idst = output_i0 + i1 * dst_s1 + i2 * dst_s2 + i3 * dst_s3;
+    ggml_cuda_pdl_sync();
 
     if (output_i0 < prefix_ne0) {
         const int isrc = output_i0 + i1 * prefix_s1 + i2 * prefix_s2 + i3 * prefix_s3;
