@@ -1569,7 +1569,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
               struct ggml_tensor * dst,
                             uint64_t row_mask,
                                 bool use_row_mask,
-                                bool allow_moe_cache) {
+                                bool allow_moe_cache,
+                                bool convert_src1) {
 
     if (use_row_mask && row_mask == 0) {
         return;
@@ -1638,7 +1639,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
-    if (src1->type != vec_dot_type) {
+    if (src1->type != vec_dot_type && convert_src1) {
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -1847,7 +1848,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
-    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true);
+    ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, true);
 }
 
 struct moe_cache_fused_state {
@@ -3561,10 +3562,12 @@ static int ggml_cpu_try_fuse_moe_cache(
 
     if (miss_mask != 0) {
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, miss_mask, true, false);
+                &sub_params, up, miss_mask, true, false, true);
         ggml_barrier(params->threadpool);
+        // Up and gate share src1 and vec_dot_type, so the quantized activation
+        // prefix produced above remains valid while the matrix metadata is rebuilt.
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, gate, miss_mask, true, false);
+                &sub_params, gate, miss_mask, true, false, false);
         ggml_barrier(params->threadpool);
 
         ggml_compute_forward_swiglu_masked(
@@ -3578,7 +3581,7 @@ static int ggml_cpu_try_fuse_moe_cache(
             // collect() then writes only the complementary hit rows.
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, miss_mask, true, false);
+                    &sub_params, down, miss_mask, true, false, true);
             ggml_barrier(params->threadpool);
         }
     }
@@ -3593,10 +3596,11 @@ static int ggml_cpu_try_fuse_moe_cache(
 
     if (!state->collect_ok) {
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, up, state->hit_mask, true, false);
+                &sub_params, up, state->hit_mask, true, false, true);
         ggml_barrier(params->threadpool);
+        // Reuse the identical converted activation for the gate fallback.
         ggml_compute_forward_mul_mat_id_impl(
-                &sub_params, gate, state->hit_mask, true, false);
+                &sub_params, gate, state->hit_mask, true, false, false);
         ggml_barrier(params->threadpool);
         ggml_compute_forward_swiglu_masked(
                 params, gate, up, glu, state->hit_mask, false,
@@ -3605,7 +3609,7 @@ static int ggml_cpu_try_fuse_moe_cache(
         if (state->full) {
             ggml_barrier(params->threadpool);
             ggml_compute_forward_mul_mat_id_impl(
-                    &sub_params, down, state->hit_mask, true, false);
+                    &sub_params, down, state->hit_mask, true, false, true);
         }
     }
 
