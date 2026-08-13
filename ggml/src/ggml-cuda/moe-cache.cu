@@ -57,6 +57,7 @@ static constexpr int    moe_cache_batch_max                   = 8;
 static constexpr int    moe_cache_pool_slots_min              = 64;
 static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
 static constexpr int    moe_cache_node_rows_max               = 64;
+static constexpr int    moe_cache_expert_parallel_max         = 8;
 static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
 
 enum class moe_cache_slot_state : uint8_t {
@@ -621,7 +622,9 @@ static moe_cache_config moe_cache_read_config() {
         config.overlap_cpu_rows = (int)value;
         config.overlap_cpu_rows_explicit = true;
     }
-    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", -1, 8, value)) {
+    if (moe_cache_env_i64(
+            "GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL",
+            -1, moe_cache_expert_parallel_max, value)) {
         config.expert_parallel = (int)value;
     }
     moe_cache_apply_mode_defaults(config);
@@ -1545,7 +1548,7 @@ static void * moe_cache_session_create(
                 supplied_config->overlap_cpu_rows < -1 ||
                 supplied_config->overlap_cpu_rows > 8 ||
                 supplied_config->expert_parallel < -1 ||
-                supplied_config->expert_parallel > 8) {
+                supplied_config->expert_parallel > moe_cache_expert_parallel_max) {
                 return nullptr;
             }
             config.enabled = true;
@@ -2651,61 +2654,49 @@ static int moe_cache_dispatch(
             0.0f, 0.0f, 0.0f, 0.0f);
 }
 
-static int moe_cache_collect(
-        void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
-    moe_cache_node * node = (moe_cache_node *)opaque;
-    if (node && node->composite) {
-        if (!node->dispatched || n_hits != node->n_result_rows ||
-            !dst_rows || n_out != node->n_out) {
-            return 0;
-        }
-        bool ok = true;
-        for (const auto & child : node->children) {
-            float * child_rows[moe_cache_node_rows_max];
-            for (int row = 0; row < child->n_result_rows; row++) {
-                const int dst = child->row_indices[row];
-                if (dst < 0 || dst >= n_hits || !dst_rows[dst]) {
-                    ok = false;
-                    break;
-                }
-                child_rows[row] = dst_rows[dst];
-            }
-            if (!ok || !moe_cache_collect(
-                    child.get(), child->n_result_rows, child_rows, n_out)) {
-                ok = false;
-            }
-        }
-        node->dispatched = false;
-        return ok ? 1 : 0;
-    }
-    const int pins_per_hit = node && node->host_base3 ? 3 :
-        node && node->host_base2 ? 2 : 1;
-    if (!node || !node->dispatched || n_hits <= 0 ||
+static bool moe_cache_collect_preflight(
+        const moe_cache_node & node, int n_hits,
+        float * const * dst_rows, int64_t n_out,
+        const int * row_indices, int n_dst_rows) {
+    const int pins_per_hit = node.host_base3 ? 3 : node.host_base2 ? 2 : 1;
+    if (node.composite || !node.dispatched || n_hits <= 0 ||
         n_hits > moe_cache_node_rows_max ||
-        n_hits * pins_per_hit != node->n_pins ||
-        !dst_rows || n_out != node->n_out) {
-        return 0;
+        n_hits * pins_per_hit != node.n_pins ||
+        !dst_rows || n_out != node.n_out) {
+        return false;
     }
-    for (int index = 0; index < n_hits; index++) {
-        if (!dst_rows[index]) {
-            return 0;
+    for (int row = 0; row < n_hits; row++) {
+        const int dst = row_indices ? row_indices[row] : row;
+        if (dst < 0 || (row_indices && dst >= n_dst_rows) || !dst_rows[dst]) {
+            return false;
         }
     }
+    return true;
+}
 
-    moe_cache_session & session = *node->session;
-    moe_cache_device & device = *node->device;
-    ggml_cuda_set_device(device.logical);
+static bool moe_cache_collect_enqueue(moe_cache_node & node, int n_hits) {
+    moe_cache_session & session = *node.session;
+    moe_cache_device & device = *node.device;
 
-    bool ok = !device.dead.load();
-    if (moe_cache_fail(session, "collect")) {
-        ok = false;
-    }
-    const size_t bytes = (size_t)n_hits * n_out * sizeof(float);
+    bool ok = !device.dead.load() && !moe_cache_fail(session, "collect");
     if (ok) {
+        // CUDA memory copies may use a stream owned by a non-current device.
+        // finish() selects the device before synchronizing that stream.
+        const size_t bytes =
+            (size_t)n_hits * node.n_out * sizeof(float);
         ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
                 device.h_out, device.d_out, bytes,
-                cudaMemcpyDeviceToHost, device.compute_stream), "output download", true);
+                cudaMemcpyDeviceToHost, device.compute_stream),
+                "output download", true);
     }
+    return ok;
+}
+
+static bool moe_cache_collect_finish(moe_cache_node & node, bool ok) {
+    moe_cache_session & session = *node.session;
+    moe_cache_device & device = *node.device;
+    ggml_cuda_set_device(device.logical);
+
     if (ok) {
         ok = moe_cache_cuda_ok(
                 device, cudaStreamSynchronize(device.compute_stream),
@@ -2713,14 +2704,7 @@ static int moe_cache_collect(
     } else {
         cudaStreamSynchronize(device.compute_stream);
     }
-    node->dispatched = false;
-
-    if (ok) {
-        for (int index = 0; index < n_hits; index++) {
-            memcpy(dst_rows[index], device.h_out + (size_t)index * n_out,
-                   n_out * sizeof(float));
-        }
-    }
+    node.dispatched = false;
 
     {
         std::lock_guard<std::mutex> lock(session.mu);
@@ -2732,6 +2716,77 @@ static int moe_cache_collect(
             device.collect_calls % session.config.stats_every == 0) {
             moe_cache_log_stats(device);
         }
+    }
+    return ok;
+}
+
+static void moe_cache_collect_scatter(
+        const moe_cache_node & node, int n_hits, float * const * dst_rows,
+        const int * row_indices) {
+    for (int row = 0; row < n_hits; row++) {
+        const int dst = row_indices ? row_indices[row] : row;
+        memcpy(dst_rows[dst],
+               node.device->h_out + (size_t)row * node.n_out,
+               node.n_out * sizeof(float));
+    }
+}
+
+static int moe_cache_collect(
+        void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
+    moe_cache_node * node = (moe_cache_node *)opaque;
+    if (node && node->composite) {
+        if (!node->dispatched || n_hits != node->n_result_rows ||
+            !dst_rows || n_out != node->n_out) {
+            return 0;
+        }
+
+        // Queue every device's result download before waiting for any one of
+        // them. The expert-parallel launches are concurrent, so serializing
+        // copy+wait per child needlessly puts the later downloads behind the
+        // first device's completion.
+        if (node->children.size() > moe_cache_expert_parallel_max) {
+            return 0;
+        }
+        bool child_ok[moe_cache_expert_parallel_max] = {};
+        for (size_t index = 0; index < node->children.size(); index++) {
+            moe_cache_node * child = node->children[index].get();
+            if (!child || !moe_cache_collect_preflight(
+                    *child, child->n_result_rows, dst_rows, n_out,
+                    child->row_indices, n_hits)) {
+                node->dispatched = false;
+                return 0;
+            }
+        }
+
+        for (size_t index = 0; index < node->children.size(); index++) {
+            child_ok[index] = moe_cache_collect_enqueue(
+                    *node->children[index],
+                    node->children[index]->n_result_rows);
+        }
+        bool ok = true;
+        for (size_t index = 0; index < node->children.size(); index++) {
+            child_ok[index] = moe_cache_collect_finish(
+                    *node->children[index], child_ok[index]);
+            ok = ok && child_ok[index];
+        }
+        if (ok) {
+            for (const auto & child : node->children) {
+                moe_cache_collect_scatter(
+                        *child, child->n_result_rows,
+                        dst_rows, child->row_indices);
+            }
+        }
+        node->dispatched = false;
+        return ok ? 1 : 0;
+    }
+    if (!node || !moe_cache_collect_preflight(
+            *node, n_hits, dst_rows, n_out, nullptr, n_hits)) {
+        return 0;
+    }
+    bool ok = moe_cache_collect_enqueue(*node, n_hits);
+    ok = moe_cache_collect_finish(*node, ok);
+    if (ok) {
+        moe_cache_collect_scatter(*node, n_hits, dst_rows, nullptr);
     }
     return ok ? 1 : 0;
 }
