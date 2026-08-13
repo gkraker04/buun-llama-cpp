@@ -4234,8 +4234,8 @@ private:
                     params_dft.n_gpu_layers = 0;
                 }
 
-                // The DSpark experts remain CPU-resident, but its output and final
-                // lightweight layer are substantially faster on the selected draft GPU.
+                // The DSpark experts remain CPU-resident, but its output and
+                // lightweight layers are substantially faster on the selected draft GPU.
                 // Preserve an explicit device=none request and provide a dedicated opt-out
                 // for users who prefer the previous, smaller GPU allocation.
                 const bool dspark_gpu_assist =
@@ -4245,12 +4245,12 @@ private:
                     params_base.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&
                     shared_draft_devices.n_weight_devices > 0;
                 if (dspark_gpu_assist) {
-                    // n_gpu_layers=2 includes the last repeating layer, whose expert
-                    // tensors are several GiB. Keep those experts on CPU so GPU assist
-                    // moves only the inexpensive dense/tail tensors. User overrides
-                    // remain first in the list and therefore retain precedence.
+                    // n_gpu_layers=4 includes every lightweight repeating layer, whose
+                    // expert tensors are several GiB. Keep those experts on CPU so GPU
+                    // assist moves only the inexpensive dense/tail tensors. User
+                    // overrides remain first in the list and retain precedence.
                     server_append_tensor_override(params_dft, llm_ffn_exps_cpu_override());
-                    params_dft.n_gpu_layers = 2;
+                    params_dft.n_gpu_layers = 4;
                     SRV_INF("[spec] enabling DSpark GPU assist on %s (disable with --no-spec-dspark-gpu-assist)\n",
                             ggml_backend_dev_name(shared_draft_devices.devices[0]));
                 }

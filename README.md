@@ -202,7 +202,7 @@ a dual-GPU host and caps larger hosts at three-way dispatch. For one GPU, change
 ### Dual RTX 3090 + DSpark
 
 ```sh
-GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 \
+GGML_CUDA_MOE_CACHE_RESERVE_MB=1024 \
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
@@ -217,17 +217,17 @@ GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 \
 ```
 
 Without expert-parallel dispatch, the best measured dual-RTX-3090 configuration for the IQ2_M
-target averaged about **41.1 tokens/s** on a 24-core EPYC 7443. A finalized same-binary
-correctness-fixed comparison using the command above measured **42.32 versus 44.28 tokens/s**
-(**+4.6%**) across five warm 500-token completions per arm. Aggregate draft acceptance was 67.53%
-and 68.34%, respectively, so some of the end-to-end spread is trajectory-dependent; an
-identical-output pair measured **+2.3%**. A diverse target-only replay measured **33.80 versus
-34.32 tokens/s** (**+1.5%**). With two concurrent DSpark slots, warmed aggregate throughput was
-**48.62 versus 52.25 tokens/s** (**+7.5%**); acceptance was 65.21% versus 66.58%.
-With the safer default 3 GiB reserve, the original 22-thread configuration averaged about 41.0
-tokens/s. The thread count is machine-specific; using all 24 physical cores reduced this host to
-about 36.9 tokens/s. Prompt processing measured **326 pp/s at 2,048 tokens** before expert
-parallelism was added.
+target averaged about **41.1 tokens/s** on a 24-core EPYC 7443. With complete miss-row accounting,
+the command above produced seven warm 500-token completions at **50.26--52.28 tokens/s**
+(**51.48 mean**). A 2 GiB reserve reduced the mean to **49.94 tokens/s** but leaves more allocation
+headroom. The expert-parallel cache defaults to admitting up to 16 entries per node and requires 40
+fresh misses before replacing a resident entry; these settings reduce expensive cache churn in
+both one- and two-slot testing. Two concurrent DSpark slots averaged **59.20 aggregate tokens/s**
+over four warm 1,000-token waves and completed every response cleanly.
+
+The 1 GiB reserve is an aggressive performance setting, not the global default. The thread count is
+also machine-specific; using all 24 physical cores reduced this host sharply. Prompt processing
+measured **326 pp/s at 2,048 tokens** before expert parallelism was added.
 
 On four or more eligible GPUs, `auto` selects three-way dispatch. Fanout and CPU-thread optima are
 host-specific, so compare fanouts two, three, and four rather than assuming every card should join
@@ -235,10 +235,10 @@ each expert operation.
 
 Although the command requests `-ngld 0`, `--spec-type draft-dspark` lets the server recognize the
 CPU-backbone DSpark configuration before model loading. The default GPU assist keeps the large
-draft experts on CPU while placing two lightweight draft layers and the Markov/output tail in about
-316 MiB of GPU memory. This was about 6% faster than the smaller placement. Use
-`--no-spec-dspark-gpu-assist` when that roughly 204 MiB incremental allocation is more valuable as
-KV capacity; use `--spec-draft-device none` to keep the entire drafter on CPU.
+draft experts on CPU while placing all lightweight draft layers and the Markov/output tail in about
+594 MiB of GPU memory. This raised the corrected, cache-tuned dual-3090 result from 48.7 to 51.5
+tokens/s. Use `--no-spec-dspark-gpu-assist` when that allocation is more valuable as KV capacity;
+use `--spec-draft-device none` to keep the entire drafter on CPU.
 
 ### Single RTX 3090 + DSpark
 
@@ -268,8 +268,9 @@ The CUDA MoE cache normally keeps a 3 GiB safety reserve. Advanced users can try
 GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 ./build/bin/llama-server ...
 ```
 
-That raised the tested result only slightly, from 31.5 to 31.8 tokens/s. Do not eliminate the
-reserve: CUDA graphs, workspaces and transient allocations still need headroom.
+That raised the tested single-GPU result only slightly, from 31.5 to 31.8 tokens/s. The dual-GPU
+headline above uses 1 GiB, but 2 GiB is the safer starting point. Do not eliminate the reserve:
+CUDA graphs, workspaces and transient allocations still need headroom.
 
 ### Tuning on another host
 
@@ -288,7 +289,8 @@ counts—a faster result caused only by a luckier generation is not a reliable c
 4. With the best thread count, sweep `--spec-draft-n-max 2`, `3`, and `4`. Depth five was already
    clearly worse on the tested host.
 5. Only then try cache reserves of 2560 and 2048 MiB using
-   `GGML_CUDA_MOE_CACHE_RESERVE_MB`. Keep the larger reserve unless the smaller value wins
+   `GGML_CUDA_MOE_CACHE_RESERVE_MB`. On a dedicated, well-characterized host, 1536 and 1024 MiB are
+   additional performance points. Keep the larger reserve unless the smaller value wins
    repeatedly, and verify long generation without an allocation failure.
 6. Recheck the winner in reverse order against the original configuration to catch temperature,
    power and host-load drift.
