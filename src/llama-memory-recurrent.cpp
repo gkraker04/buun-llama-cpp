@@ -811,7 +811,14 @@ void llama_memory_recurrent::invalidate_rollback(const llama_ubatch & ubatch) {
     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
         const uint32_t i = s * n_seq_tokens;
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            reset_rollback_state(ubatch.seq_id[i][j]);
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rollback_valid_depth.size());
+
+            // The graph about to run will overwrite the snapshot planes, so their old
+            // validity ends here. Do not clear rs_idx: a preceding seq_rm() may have
+            // selected one of those planes as this graph's input. s_copy() consumes and
+            // clears that pending selector while constructing the graph.
+            rollback_valid_depth[seq_id] = 0;
         }
     }
 }

@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "llama-batch.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
@@ -212,6 +213,31 @@ int main(int argc, char ** argv) {
         return 0;
     }
     const uint32_t n_rs_seq = recurrent->n_rs_seq;
+
+    // Starting a graph invalidates the planes that graph is about to overwrite, but a
+    // rollback selected by the preceding seq_rm() is an input to that graph. Keep its
+    // selector alive until s_copy() consumes it while constructing the graph.
+    {
+        llama_seq_id seq_id = 0;
+        llama_seq_id * seq_ids[] = { &seq_id };
+        int32_t n_seq_id[] = { 1 };
+        llama_ubatch ubatch = {};
+        ubatch.b_equal_seqs = 1;
+        ubatch.n_tokens = 1;
+        ubatch.n_seq_tokens = 1;
+        ubatch.n_seqs = 1;
+        ubatch.n_seq_id = n_seq_id;
+        ubatch.seq_id = seq_ids;
+
+        recurrent->set_rs_idx(0, 2);
+        recurrent->rollback_valid_depth[0] = 2;
+        recurrent->invalidate_rollback(ubatch);
+        if (recurrent->rs_idx[0] != 2 || recurrent->rollback_valid_depth[0] != 0) {
+            fprintf(stderr, "%s : graph invalidation discarded a pending rollback selector\n", __func__);
+            return 1;
+        }
+        recurrent->reset_rollback_state(0);
+    }
 
     // Preserve the original regression: a selected rollback plane must serialize as the
     // logical active row and replay identically after restore.
