@@ -149,9 +149,11 @@ struct moe_cache_config {
     int max_batch = moe_cache_batch_max;
     bool max_batch_explicit = false;
     int inserts_per_plan = 8;
+    bool inserts_per_plan_explicit = false;
     int admit_after = 2;
     bool admit_after_explicit = false;
     int readmit_after = 8;
+    bool readmit_after_explicit = false;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -586,6 +588,7 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_INSERTS", 1, 1024, value)) {
         config.inserts_per_plan = (int)value;
+        config.inserts_per_plan_explicit = true;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", 1, 255, value)) {
         config.admit_after = (int)value;
@@ -593,6 +596,7 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_THROTTLE", 1, 1024, value)) {
         config.readmit_after = (int)value;
+        config.readmit_after_explicit = true;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_QUEUE", 1, 65536, value)) {
         config.queue_max = (int)value;
@@ -1506,13 +1510,14 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s expert-parallel=%d\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d inserts=%d admit=%s cpu-overlap=%s fills=%s expert-parallel=%d\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
             session.config.minimum_slab_bytes >> 20,
             session.config.min_expert_bytes >> 10,
             session.config.max_batch,
+            session.config.inserts_per_plan,
             admission.c_str(),
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel",
@@ -1616,6 +1621,18 @@ static void * moe_cache_session_create(
         if (session->config.expert_parallel < 0) {
             session->config.expert_parallel = std::min<int>(
                     3, session->devices.size());
+        }
+        if (session->config.expert_parallel > 0) {
+            // Expert-parallel verification probes more routed rows per node and
+            // consumes complete up/gate/down bundles. Admit enough rows to warm a
+            // bundle promptly, then require sustained demand before displacing a
+            // resident bundle. Serial cache policy keeps its established defaults.
+            if (!session->config.inserts_per_plan_explicit) {
+                session->config.inserts_per_plan = 16;
+            }
+            if (!session->config.readmit_after_explicit) {
+                session->config.readmit_after = 40;
+            }
         }
         if (!moe_cache_budget_register(*session)) {
             return nullptr;

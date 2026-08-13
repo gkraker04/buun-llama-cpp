@@ -674,8 +674,13 @@ static bool run_scenario(
         const char * dedicated_mmv = "1",
         const char * expert_parallel = nullptr,
         const char * n_devices = "1",
-        const std::vector<ggml_backend_t> * supplied_backends = nullptr) {
+        const std::vector<ggml_backend_t> * supplied_backends = nullptr,
+        bool use_expert_parallel_policy_defaults = false) {
     configure_cache(fail_stage, max_batch, dedicated_mmv);
+    if (use_expert_parallel_policy_defaults) {
+        set_env("GGML_CUDA_MOE_CACHE_INSERTS", nullptr);
+        set_env("GGML_CUDA_MOE_CACHE_THROTTLE", nullptr);
+    }
     set_env("GGML_CUDA_MOE_CACHE_EXPERT_PARALLEL", expert_parallel);
     set_env("GGML_CUDA_MOE_CACHE_NDEV", n_devices);
     capture.clear();
@@ -793,11 +798,14 @@ static bool run_expert_parallel_partial_scenario(
     const bool output_ok = run_scenario(
             "cache-expert-parallel-partial", nullptr, cuda, cpu,
             graph, reference, capture, "8", "full-fusion=", "1",
-            "2", "2", &backends);
+            "2", "2", &backends, true);
     const bool partial_seen = has_partial_fraction(capture.get(), "fusion=");
-    if (output_ok && !partial_seen) {
+    const bool policy_defaults =
+        capture.get().find("inserts=16") != std::string::npos &&
+        capture.get().find("40-replace") != std::string::npos;
+    if (output_ok && (!partial_seen || !policy_defaults)) {
         fprintf(stderr,
-                "cache-expert-parallel-partial: partial dispatch was not observed\n%s",
+                "cache-expert-parallel-partial: partial dispatch or policy defaults were not observed\n%s",
                 capture.get().c_str());
     }
     const bool dispatch_fallback = run_scenario(
@@ -813,7 +821,8 @@ static bool run_expert_parallel_partial_scenario(
     for (ggml_backend_t backend : owned) {
         ggml_backend_free(backend);
     }
-    return output_ok && partial_seen && dispatch_fallback && collect_fallback;
+    return output_ok && partial_seen && policy_defaults &&
+        dispatch_fallback && collect_fallback;
 }
 
 static bool run_multi_token_scenario(

@@ -201,9 +201,9 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | VRAM left outside the cache on each device |
 | `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | hardware dependent | Minimum bytes per expert, in KiB; `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
 | `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `8` | Maximum tokens in an eligible node |
-| `GGML_CUDA_MOE_CACHE_INSERTS` | `8` | Maximum admissions per node |
+| `GGML_CUDA_MOE_CACHE_INSERTS` | `8` (`16` with expert parallelism) | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |
-| `GGML_CUDA_MOE_CACHE_THROTTLE` | `8` | Fresh misses required before replacing a full-pool entry |
+| `GGML_CUDA_MOE_CACHE_THROTTLE` | `8` (`40` with expert parallelism) | Fresh misses required before replacing a full-pool entry |
 | `GGML_CUDA_MOE_CACHE_QUEUE` | `128` | Maximum queued jobs per device |
 | `GGML_CUDA_MOE_CACHE_QUEUE_MB` | `512` | Maximum queued source bytes per device |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` | Collection-call interval for periodic statistics, or `0` for teardown only |
