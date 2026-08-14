@@ -957,7 +957,115 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
+enum class mmq_stream_mode {
+    config,
+    tiled,
+};
+
+// Sparse expert tiles are independent: a small persistent grid can consume the
+// compact valid-tile space dynamically without making it part of Stream-K's K
+// partition. expert_bounds is produced on-device, so build the tiny prefix on
+// the same stream instead of synchronizing it back to the host.
+template <int J>
+static __global__ void build_sparse_tile_prefix(
+        const int32_t * __restrict__ expert_bounds,
+        unsigned int * __restrict__ tile_prefix,
+        unsigned int * __restrict__ work_counter,
+        const int n_experts, const int nty) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    unsigned int prefix = 0;
+    tile_prefix[0] = 0;
+    for (int expert = 0; expert < n_experts; ++expert) {
+        const int ncols = expert_bounds[expert + 1] - expert_bounds[expert];
+        prefix += ((ncols + J - 1)/J)*nty;
+        tile_prefix[expert + 1] = prefix;
+    }
+    *work_counter = 0;
+}
+
 template <ggml_type type, int J, bool fallback>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+static __global__ void mul_mat_q_sparse_persistent(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const unsigned int * __restrict__ tile_prefix,
+        unsigned int * __restrict__ work_counter, const float * __restrict__ y_scale,
+        const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x,
+        const int ncols_y, const int stride_col_dst, const uint3 channel_ratio,
+        const int stride_channel_x, const uint3 nty, const int n_experts) {
+    if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    extern __shared__ int ids_dst_shared[];
+    int * task_shared = ids_dst_shared + J;
+
+    while (true) {
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            *task_shared = atomicAdd(work_counter, 1U);
+        }
+        __syncthreads();
+        const unsigned int task = *task_shared;
+        if (task >= tile_prefix[n_experts]) {
+            return;
+        }
+
+        int lo = 0;
+        int hi = n_experts;
+        while (lo + 1 < hi) {
+            const int mid = (lo + hi)/2;
+            if (tile_prefix[mid] <= task) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const int zt = lo;
+        const uint2 div = fast_div_modulo(task - tile_prefix[zt], nty);
+        const int jt = div.x;
+        const int it = div.y;
+
+        const int col_low  = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+        if (jt*J >= col_diff) {
+            continue;
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+            if (j0 + nwarps*warp_size > J && j >= J) {
+                break;
+            }
+            const int col = col_low + jt*J + j;
+            ids_dst_shared[j] = col < col_high ? ids_dst[col] : 0;
+        }
+        __syncthreads();
+
+        const int offset_y = (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = it*I;
+        const int offset_x = fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        const int tile_x_max_i = nrows_x - it*I - 1;
+        const int tile_y_max_j = col_diff - jt*J - 1;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, J, fallback, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst,
+            nullptr, y_scale, stride_row_x, ncols_y, stride_col_dst,
+            tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        __syncthreads();
+    }
+}
+
+template <ggml_type type, int J, bool fallback, mmq_stream_mode stream_mode = mmq_stream_mode::config>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -997,7 +1105,7 @@ static __global__ void mul_mat_q(
     }
     __syncthreads();
 
-    if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
+    if constexpr (stream_mode == mmq_stream_mode::tiled || !ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
@@ -1415,6 +1523,22 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
 
+    // Stream-K partitions the dense rectangular grid, including empty per-expert tiles. For
+    // sparse MUL_MAT_ID on SM86 this creates more imbalance than it removes; launch the same
+    // J128 kernel as independent output tiles instead. Keep ordinary MMQ and other GPU families
+    // on their architecture-tuned configuration.
+    constexpr bool has_sparse_tiled_kernel =
+        !fallback &&
+        J == 128 &&
+        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS);
+    const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
+        args.nsamples_y == 1 && cc == 860;
+    const bool use_sparse_persistent_kernel = use_sparse_tiled_kernel && args.ncols_max >= 1024;
+    if constexpr (has_sparse_tiled_kernel) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, mmq_stream_mode::tiled>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_sparse_persistent<type, J, fallback>), nbytes_shared + sizeof(int));
+    }
+
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
@@ -1431,6 +1555,30 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if constexpr (has_sparse_tiled_kernel) {
+        if (use_sparse_tiled_kernel) {
+            if (!use_sparse_persistent_kernel) {
+                mul_mat_q<type, J, fallback, mmq_stream_mode::tiled><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     ntx_fd);
+                return;
+            }
+            ggml_cuda_pool_alloc<unsigned int> tile_prefix(ctx.pool(), args.nchannels_y + 1);
+            ggml_cuda_pool_alloc<unsigned int> work_counter(ctx.pool(), 1);
+            const uint3 nty_fd = init_fastdiv_values(nty);
+            build_sparse_tile_prefix<J><<<1, 1, 0, stream>>>(
+                args.expert_bounds, tile_prefix.get(), work_counter.get(), args.nchannels_y, nty);
+            mul_mat_q_sparse_persistent<type, J, fallback><<<nsm, block_dims, nbytes_shared + sizeof(int), stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_prefix.get(), work_counter.get(), args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, args.stride_channel_x, nty_fd, args.nchannels_y);
+            return;
+        }
+    }
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
