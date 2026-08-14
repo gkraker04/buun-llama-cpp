@@ -1009,28 +1009,34 @@ static __global__ void mul_mat_q_sparse_persistent(
 
     while (true) {
         if (threadIdx.x == 0 && threadIdx.y == 0) {
-            *task_shared = atomicAdd(work_counter, 1U);
+            const unsigned int task = atomicAdd(work_counter, 1U);
+            task_shared[0] = task;
+            if (task < tile_prefix[n_experts]) {
+                int lo = 0;
+                int hi = n_experts;
+                while (lo + 1 < hi) {
+                    const int mid = (lo + hi)/2;
+                    if (tile_prefix[mid] <= task) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                const uint2 div = fast_div_modulo(task - tile_prefix[lo], nty);
+                task_shared[1] = lo;
+                task_shared[2] = div.x;
+                task_shared[3] = div.y;
+            }
         }
         __syncthreads();
-        const unsigned int task = *task_shared;
+        const unsigned int task = task_shared[0];
         if (task >= tile_prefix[n_experts]) {
             return;
         }
 
-        int lo = 0;
-        int hi = n_experts;
-        while (lo + 1 < hi) {
-            const int mid = (lo + hi)/2;
-            if (tile_prefix[mid] <= task) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        const int zt = lo;
-        const uint2 div = fast_div_modulo(task - tile_prefix[zt], nty);
-        const int jt = div.x;
-        const int it = div.y;
+        const int zt = task_shared[1];
+        const int jt = task_shared[2];
+        const int it = task_shared[3];
 
         const int col_low  = expert_bounds[zt + 0];
         const int col_high = expert_bounds[zt + 1];
@@ -1530,15 +1536,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     constexpr bool has_sparse_tiled_kernel =
         !fallback &&
         J == 128 &&
-        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS);
+        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
     const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
-        args.nsamples_y == 1 && cc == 860;
-    const bool use_sparse_persistent_kernel = use_sparse_tiled_kernel && args.ncols_max >= 1024;
-    if constexpr (has_sparse_tiled_kernel) {
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, mmq_stream_mode::tiled>), nbytes_shared);
-        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_sparse_persistent<type, J, fallback>), nbytes_shared + sizeof(int));
-    }
-
+        args.nsamples_y == 1 && cc == 860 &&
+        (type != GGML_TYPE_MXFP4 || args.ncols_max >= 1024);
+    constexpr bool has_sparse_persistent_kernel = has_sparse_tiled_kernel &&
+        type != GGML_TYPE_MXFP4;
+    // MXFP4's independent tiled launch remains faster across the measured prompt
+    // range; its compact persistent queue loses at 1024/2048 and is neutral deeper.
+    const bool use_sparse_persistent_kernel = has_sparse_persistent_kernel &&
+        use_sparse_tiled_kernel && args.ncols_max >= 1024;
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
@@ -1558,24 +1565,31 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if constexpr (has_sparse_tiled_kernel) {
         if (use_sparse_tiled_kernel) {
-            if (!use_sparse_persistent_kernel) {
-                mul_mat_q<type, J, fallback, mmq_stream_mode::tiled><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
-                     blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                     channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                     sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                     ntx_fd);
-                return;
+            if constexpr (has_sparse_persistent_kernel) {
+                if (use_sparse_persistent_kernel) {
+                    constexpr size_t persistent_header = 4*sizeof(int);
+                    CUDA_SET_SHARED_MEMORY_LIMIT(
+                        (mul_mat_q_sparse_persistent<type, J, fallback>), nbytes_shared + persistent_header);
+                    ggml_cuda_pool_alloc<unsigned int> tile_prefix(ctx.pool(), args.nchannels_y + 1);
+                    ggml_cuda_pool_alloc<unsigned int> work_counter(ctx.pool(), 1);
+                    const uint3 nty_fd = init_fastdiv_values(nty);
+                    build_sparse_tile_prefix<J><<<1, 1, 0, stream>>>(
+                        args.expert_bounds, tile_prefix.get(), work_counter.get(), args.nchannels_y, nty);
+                    mul_mat_q_sparse_persistent<type, J, fallback><<<nsm, block_dims, nbytes_shared + persistent_header, stream>>>
+                        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_prefix.get(), work_counter.get(), args.y_scale,
+                         blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                         channel_ratio_fd, args.stride_channel_x, nty_fd, args.nchannels_y);
+                    return;
+                }
             }
-            ggml_cuda_pool_alloc<unsigned int> tile_prefix(ctx.pool(), args.nchannels_y + 1);
-            ggml_cuda_pool_alloc<unsigned int> work_counter(ctx.pool(), 1);
-            const uint3 nty_fd = init_fastdiv_values(nty);
-            build_sparse_tile_prefix<J><<<1, 1, 0, stream>>>(
-                args.expert_bounds, tile_prefix.get(), work_counter.get(), args.nchannels_y, nty);
-            mul_mat_q_sparse_persistent<type, J, fallback><<<nsm, block_dims, nbytes_shared + sizeof(int), stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_prefix.get(), work_counter.get(), args.y_scale,
-                 blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio_fd, args.stride_channel_x, nty_fd, args.nchannels_y);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q<type, J, fallback, mmq_stream_mode::tiled>), nbytes_shared);
+            mul_mat_q<type, J, fallback, mmq_stream_mode::tiled><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd);
             return;
         }
     }
