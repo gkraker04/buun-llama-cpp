@@ -26,7 +26,7 @@ constexpr int64_t n_expert  = 64;
 constexpr int64_t n_used    = 2;
 constexpr int64_t n_tokens  = 1;
 constexpr int64_t multi_n_used   = 6;
-constexpr int64_t multi_n_tokens = 6;
+constexpr int64_t multi_n_tokens = 10;
 constexpr int     max_steps = 160;
 
 struct log_capture {
@@ -405,10 +405,11 @@ static bool compare_output(
 static void configure_cache(
         const char * fail_stage,
         const char * max_batch = "1",
-        const char * dedicated_mmv = "1") {
+        const char * dedicated_mmv = "1",
+        const char * budget_mb = "4") {
     set_env("GGML_CUDA_MOE_CACHE", "1");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "on");
-    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "4");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", budget_mb);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "0");
     set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
     set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", max_batch);
@@ -486,7 +487,7 @@ static bool run_capability_queries(
     ok &= config.min_compute_capability == 800;
     ok &= config.min_expert_bytes == 512u * 1024;
     ok &= config.min_expert_explicit == 0;
-    ok &= config.max_batch == 8;
+    ok &= config.max_batch == 10;
     ok &= config.overlap_cpu_rows == -1;
     ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == 512u * 1024;
@@ -497,7 +498,7 @@ static bool run_capability_queries(
     ok &= config.min_compute_capability == 700;
     ok &= config.min_expert_bytes == 1024u * 1024;
     ok &= config.min_expert_explicit == 0;
-    ok &= config.max_batch == 8;
+    ok &= config.max_batch == 10;
     ok &= config.overlap_cpu_rows == -1;
     ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == (device.compute_capability >= 800
@@ -675,8 +676,9 @@ static bool run_scenario(
         const char * expert_parallel = nullptr,
         const char * n_devices = "1",
         const std::vector<ggml_backend_t> * supplied_backends = nullptr,
-        bool use_expert_parallel_policy_defaults = false) {
-    configure_cache(fail_stage, max_batch, dedicated_mmv);
+        bool use_expert_parallel_policy_defaults = false,
+        const char * budget_mb = "4") {
+    configure_cache(fail_stage, max_batch, dedicated_mmv, budget_mb);
     if (use_expert_parallel_policy_defaults) {
         set_env("GGML_CUDA_MOE_CACHE_INSERTS", nullptr);
         set_env("GGML_CUDA_MOE_CACHE_THROTTLE", nullptr);
@@ -797,7 +799,7 @@ static bool run_expert_parallel_partial_scenario(
 
     const bool output_ok = run_scenario(
             "cache-expert-parallel-partial", nullptr, cuda, cpu,
-            graph, reference, capture, "8", "full-fusion=", "1",
+            graph, reference, capture, "10", "full-fusion=", "1",
             "2", "2", &backends, true);
     const bool partial_seen = has_partial_fraction(capture.get(), "fusion=");
     const bool policy_defaults =
@@ -810,11 +812,11 @@ static bool run_expert_parallel_partial_scenario(
     }
     const bool dispatch_fallback = run_scenario(
             "cache-expert-parallel-dispatch-fallback", "dispatch",
-            cuda, cpu, graph, reference, capture, "8", nullptr, "1",
+            cuda, cpu, graph, reference, capture, "10", nullptr, "1",
             "2", "2", &backends);
     const bool collect_fallback = run_scenario(
             "cache-expert-parallel-collect-fallback", "collect",
-            cuda, cpu, graph, reference, capture, "8", nullptr, "1",
+            cuda, cpu, graph, reference, capture, "10", nullptr, "1",
             "2", "2", &backends);
 
     configure_cache(nullptr);
@@ -936,7 +938,8 @@ static bool run_multi_token_scenario(
         ok = ok && run_scenario(
                 "cache-fused-full-ffn-multi-token", nullptr, cuda, cpu,
                 full_fused_graph, full_fused_reference, capture,
-                nullptr, "full-fusion=");
+                nullptr, "full-fusion=", "1", nullptr, "1",
+                nullptr, false, "8");
         ok = ok && run_expert_parallel_partial_scenario(
                 cuda_device, cuda, cpu, full_fused_graph,
                 full_fused_reference, capture);
@@ -2542,7 +2545,7 @@ static bool run_cpu_overlap_policy(
 static bool run_adaptive_cpu_overlap_policy(
         ggml_backend_t cuda, ggml_backend_t cpu,
         ggml_tensor * weights, log_capture & capture) {
-    configure_cache(nullptr, "8");
+    configure_cache(nullptr, "10");
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
     capture.clear();
 
@@ -2596,7 +2599,7 @@ static bool run_adaptive_cpu_overlap_policy(
                 weights->name, weights->data, expert_size,
                 weights->ne[0], weights->ne[1], weights->type,
                 weights->ne[2], multi_token_experts,
-                multi_n_used * multi_n_tokens, multi_n_tokens) == 30;
+                multi_n_used * multi_n_tokens, multi_n_tokens) == 50;
     }
     ggml_moe_cache.session_leave(session);
     ggml_moe_cache.session_destroy(session);
