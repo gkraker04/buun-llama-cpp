@@ -433,12 +433,16 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 // offsets, so same-source views with different permutations are rejected.
 static inline bool ggml_cuda_fattn_V_is_K_view(const ggml_tensor * K, const ggml_tensor * V) {
     return K && V
-        && (V->view_src == K ? V->view_offs == 0
+        && V->data == K->data
+        && V->type == K->type
+        && (V == K ? true
+            : V->view_src == K ? V->view_offs == 0
                              : (V->view_src && V->view_src == K->view_src && V->view_offs == K->view_offs))
         && V->ne[0] <= K->ne[0]
         && V->ne[1] == K->ne[1]
         && V->ne[2] == K->ne[2]
         && V->ne[3] == K->ne[3]
+        && V->nb[0] == K->nb[0]
         && V->nb[1] == K->nb[1]
         && V->nb[2] == K->nb[2]
         && V->nb[3] == K->nb[3];

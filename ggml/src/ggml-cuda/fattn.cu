@@ -361,15 +361,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 32>(ctx, dst);
             }
             break;
-        case 512:
+        case 512: {
             GGML_ASSERT(V->ne[0] == 512);
-            if (ggml_cuda_fattn_V_is_K_view(K, V)) {
+            const bool uses_ncols2_8 = Q->ne[2] % K->ne[2] == 0 && Q->ne[2] / K->ne[2] > 4;
+            if (uses_ncols2_8 && ggml_cuda_fattn_V_is_K_view(K, V)) {
                 // V is K (e.g. DeepSeek V4 Flash, K-only attention): reuse K data in the PV phase.
-                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, true>(ctx, dst);
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 8, true>(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512, false>(ctx, dst);
             }
-            break;
+        } break;
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.
             GGML_ASSERT(V->ne[0] == 512);
@@ -2528,7 +2529,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (((!turbo_decode_native || turbo8_involved) || coupled_kv_tensor) && turbo_kv &&
              (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512)))
             || quant_kv_pre_volta;
-
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
         ggml_tensor K_f16_dec, V_f16_dec;
@@ -2552,10 +2552,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const bool v_needs_dequant = mat_v_dec || ((V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_BF16) && (Q->ne[0] > 256 || quant_kv_pre_volta));
             const bool use_coupled_turbo4 = k_needs_dequant && v_needs_dequant &&
                 K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0 &&
-                K->data == V->data && Q->ne[0] == 512 &&
-                K->ne[0] == V->ne[0] && K->ne[1] == V->ne[1] &&
-                K->ne[2] == V->ne[2] && K->ne[3] == V->ne[3] &&
-                K->nb[1] == V->nb[1] && K->nb[2] == V->nb[2] && K->nb[3] == V->nb[3];
+                Q->ne[0] == 512 && ggml_cuda_fattn_V_is_K_view(K, V);
             bool coupled_turbo4_materialized = false;
             if (k_needs_dequant) {
                 // Size for the CURRENT attended KV range (this call's view) — NOT the full

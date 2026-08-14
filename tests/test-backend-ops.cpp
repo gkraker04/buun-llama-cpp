@@ -189,6 +189,39 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// Generate a mask with fully empty 32-row KV tiles interspersed with occupied
+// tiles. This exercises sparse attention implementations that skip empty tiles.
+static void init_tensor_sparse_kq_mask(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+
+    GGML_TENSOR_LOCALS(int32_t, ne, tensor, ne);
+
+    std::vector<float>       data_f32(ne0*ne1*ne2*ne3, 0.0f);
+    std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
+
+    constexpr int tile_size = 32;
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    const int64_t idx = ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0;
+                    const int64_t tile = i0/tile_size;
+
+                    // Every third tile is empty for every query. In the next
+                    // tile only alternating queries are active, exercising the
+                    // block-wide union of per-query occupancy maps.
+                    if (tile % 3 == 1 || (tile % 3 == 2 && i1 % 2 != 0)) {
+                        data_f32[idx] = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+
+    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 // generate a lower triangular matrix
 static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
@@ -2179,6 +2212,51 @@ struct test_glu_split : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check for NaNs in GELU
             init_tensor_uniform(t, -150.f, 150.f);
+        }
+    }
+};
+
+struct test_clamp_swiglu_fusion : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float limit;
+
+    test_clamp_swiglu_fusion(
+            ggml_type type,
+            std::array<int64_t, 4> ne,
+            float limit = 10.0f)
+        : type(type), ne(ne), limit(limit) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLAMP_SWIGLU_FUSION";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, limit);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(gate, "gate");
+        ggml_set_name(up, "up");
+
+        gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+        up   = ggml_clamp(ctx, up, -limit, limit);
+        ggml_set_name(gate, "gate_clamped");
+        ggml_set_name(up, "up_clamped");
+
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f*limit, 2.0f*limit);
         }
     }
 };
@@ -6920,9 +6998,10 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
 
     const bool v_is_k_view; // V is a view of K (K-only attention, e.g. DeepSeek V4 Flash)
+    const bool sparse_mask; // mask contains fully empty KV tiles
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, v_is_k_view);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, v_is_k_view, sparse_mask);
     }
 
     double max_nmse_err() override {
@@ -6939,9 +7018,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool v_is_k_view = false)
+                        bool v_is_k_view = false, bool sparse_mask = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), v_is_k_view(v_is_k_view) {}
+          type_K(type_K), type_V(type_V), permute(permute), v_is_k_view(v_is_k_view), sparse_mask(sparse_mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7006,6 +7085,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_flash_attn_ext_set_sparse_mask(out, sparse_mask);
         ggml_set_name(out, "out");
 
         return out;
@@ -7017,7 +7097,11 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (sparse_mask) {
+                    init_tensor_sparse_kq_mask(t);
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -8147,7 +8231,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-
     // fused relu + sqr (squared ReLU)
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
@@ -8189,6 +8272,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_clamp_swiglu_fusion(type, { 128, 2, 2, 2 }));
+        test_cases.emplace_back(new test_clamp_swiglu_fusion(type, { 5, 7, 11, 13 }));
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
                 if (op == GGML_GLU_OP_SWIGLU_OAI) {
@@ -9731,6 +9816,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512,   2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512,   4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true));
+    // Explicit sparse-hint coverage: 32 KV tiles with fully masked internal tiles.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,1,2,3}, true, true));
     // permuted variant (the DSV4 graph permutes K and V identically before the op)
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {16, 1}, 512, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0,2,1,3}, true));
 

@@ -2474,6 +2474,15 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Hint that the mask selects a sparse, non-contiguous subset of KV rows.
+    // Backends may use this to skip fully masked work; it does not change results.
+    GGML_API void ggml_flash_attn_ext_set_sparse_mask(
+            struct ggml_tensor * a,
+            bool                 sparse);
+
+    GGML_API bool ggml_flash_attn_ext_get_sparse_mask(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

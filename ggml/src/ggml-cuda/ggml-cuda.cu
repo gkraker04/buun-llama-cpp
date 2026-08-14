@@ -3389,6 +3389,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Clamp the up lane while evaluating SwiGLU. The gate lane is already
+    // materialized because the expert projections can be assigned to
+    // different backend graph segments.
+    if (i + 1 < cgraph->n_nodes) {
+        const int out_nodes[] = { i + 1 };
+        ggml_tensor * up_clamp = cgraph->nodes[i + 0];
+        ggml_tensor * glu      = cgraph->nodes[i + 1];
+        const ggml_tensor * gate = glu->src[0];
+
+        if (up_clamp->op == GGML_OP_CLAMP &&
+            glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            !ggml_get_op_params_i32(glu, 1) &&
+            glu->src[1] == up_clamp && gate && up_clamp->src[0] &&
+            ggml_are_same_shape(gate, up_clamp->src[0]) &&
+            ggml_are_same_shape(gate, glu) &&
+            gate->type == up_clamp->src[0]->type && gate->type == glu->type &&
+            (glu->type == GGML_TYPE_F32 || glu->type == GGML_TYPE_F16) &&
+            ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up_clamp->src[0]) &&
+            ggml_is_contiguous(glu) &&
+            (up_clamp->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            !(up_clamp->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            (glu->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            ggml_cuda_op_up_clamp_swiglu(*cuda_ctx, glu);
+            return 1;
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {

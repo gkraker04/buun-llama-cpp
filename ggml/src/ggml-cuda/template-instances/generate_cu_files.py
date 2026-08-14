@@ -120,12 +120,8 @@ for ncols in [8, 16, 32, 64]:
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
-# DSV4 (head size 512, K-only attention): compile the V-is-K-view kernel variants for
-# every (ncols1, ncols2) combo reachable from the DKQ = 512 dispatch.
-for ncols1, ncols2 in [
-        (1, 8), (2, 8), (4, 8), (8, 8),
-        (2, 4), (4, 4), (8, 4), (16, 4),
-        (4, 2), (8, 2), (16, 2), (32, 2)]:
+# DSV4 (head size 512, K-only attention) uses GQA 16 and therefore ncols2 = 8.
+for ncols1, ncols2 in [(1, 8), (2, 8), (4, 8), (8, 8)]:
     with open(f"fattn-mma-f16-instance-vkv-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
         f.write(SOURCE_FATTN_MMA_START)
         f.write(SOURCE_FATTN_MMA_CASE_VKV.format(head_size_kq=512, head_size_v=512, ncols1=ncols1, ncols2=ncols2))
