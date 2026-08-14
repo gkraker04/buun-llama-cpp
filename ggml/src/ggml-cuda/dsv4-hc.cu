@@ -3,6 +3,7 @@
 
 
 static constexpr int DSV4_HC = 4;
+static constexpr int DSV4_HC_POST_TILE_EMBD = 64;
 
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
@@ -225,8 +226,7 @@ static __global__ void dsv4_hc_post_f32(
         const float * comb,
         float * dst,
         int64_t n_embd,
-        int64_t hc,
-        int64_t n_tokens,
+        int64_t tiles_per_token,
         int64_t sx0,
         int64_t sx1,
         int64_t sr0,
@@ -241,24 +241,21 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sd1,
         int64_t sd2) {
     ggml_cuda_pdl_lc();
-    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t nr = n_embd * hc * n_tokens;
-
-    if (ir >= nr) {
-        return;
-    }
+    const int64_t it = (int64_t) blockIdx.x / tiles_per_token;
+    const int64_t tile = (int64_t) blockIdx.x - it*tiles_per_token;
+    const int64_t i0 = tile*DSV4_HC_POST_TILE_EMBD + threadIdx.x;
+    const int64_t idst = threadIdx.y;
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0   = ir % n_embd;
-    const int64_t idst = (ir / n_embd) % hc;
-    const int64_t it   = ir / (n_embd * hc);
-
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
-    for (int64_t isrc = 0; isrc < hc; ++isrc) {
-        sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+    if (i0 >= n_embd) {
+        return;
     }
 
+    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    for (int64_t isrc = 0; isrc < DSV4_HC; ++isrc) {
+        sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+    }
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
@@ -395,17 +392,17 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
+    GGML_ASSERT(hc == DSV4_HC);
 
-    const int block_size = 256;
-    const int64_t nr = n_embd * hc * n_tokens;
-    const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const int64_t tiles_per_token = (n_embd + DSV4_HC_POST_TILE_EMBD - 1) / DSV4_HC_POST_TILE_EMBD;
+    const dim3 block_dims(DSV4_HC_POST_TILE_EMBD, DSV4_HC, 1);
+    const dim3 grid_dims(tiles_per_token*n_tokens, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     ggml_cuda_kernel_launch(dsv4_hc_post_f32, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, (const float *) comb->data, (float *) dst->data,
-            n_embd, hc, n_tokens,
+            n_embd, tiles_per_token,
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
