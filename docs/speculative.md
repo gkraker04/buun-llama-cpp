@@ -52,6 +52,34 @@ Supported EAGLE-3 draft models include:
 
 For the full and up-to-date list of supported models, see #18039.
 
+### Native MTP (`draft-mtp`)
+
+Qwen3.5, Qwen3.6, and Qwen3.8 27B models can use their native next-token-prediction
+layer as an external MTP sidecar. For a standalone Qwen-27B MTP GGUF with a full
+output head, `llama-server` automatically creates a smaller derived sidecar in the
+llama.cpp cache directory. The original GGUF is never modified. Subsequent starts
+reuse the derivative.
+
+The derivative scores a frequency-ranked 32,768-token subset in the draft model and
+maps those logits back to the full target vocabulary with `d2t`. The map is the
+MIT-licensed [public balanced map](https://huggingface.co/Avifenesh/memra-bench/blob/main/mtp-Qwen3.6-27B-Q4_K_M-frspec-balanced32768.gguf)
+from Avifenesh/memra-bench, built from a reproducible 50/50 code-prose corpus for
+the Qwen3.6/3.8 tokenizer family. The target
+model still verifies every proposed token over its complete vocabulary, so speculative
+decoding remains lossless; an omitted draft token can reduce acceptance but cannot
+change accepted target output.
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \
+    --spec-type draft-mtp --spec-mtp-vocab-size 32768
+```
+
+`--spec-mtp-vocab-size` defaults to the measured 32768 map. `0` disables automatic
+repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
+Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads saved.
+Unsupported architectures, model sizes, split files, and already-trimmed sidecars
+fall back to their original behavior.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
@@ -228,6 +256,10 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-mtp-vocab-size                   N
+                                        Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables
+                                        (default: 32768)
+                                        (env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

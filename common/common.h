@@ -335,6 +335,10 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // Qwen-27B MTP-only sidecars: 32768 enables the experimental public
+    // balanced FR-Spec map; 0 keeps the full vocabulary (default).
+    uint32_t mtp_vocab_size = 0;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

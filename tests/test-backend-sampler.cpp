@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
@@ -337,6 +339,116 @@ static void test_backend_top_k_sampling(const test_params & params) {
     GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
 
     printf("backend top-k hybrid sampling test PASSED\n");
+}
+
+static void test_backend_candidate_remap(const test_params & params) {
+    GGML_UNUSED(params);
+
+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    GGML_ASSERT(backend != nullptr);
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ 128 * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(ctx_params));
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * logits     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+    ggml_tensor * candidates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 4);
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(2));
+    GGML_ASSERT(chain->iface->backend_init(
+            chain.get(), ggml_backend_get_default_buffer_type(backend.get())));
+
+    llama_sampler_data data = {
+        /*.logits     =*/ logits,
+        /*.probs      =*/ nullptr,
+        /*.sampled    =*/ nullptr,
+        /*.candidates =*/ candidates,
+    };
+    ggml_cgraph * gf = ggml_new_graph(ctx.get());
+    chain->iface->backend_apply(chain.get(), ctx.get(), gf, &data);
+    GGML_ASSERT(data.logits != nullptr && data.candidates != nullptr);
+    GGML_ASSERT(ggml_nelements(data.logits) == 2 && ggml_nelements(data.candidates) == 2);
+    GGML_ASSERT(data.candidates->type == GGML_TYPE_I32);
+    ggml_build_forward_expand(gf, data.logits);
+    ggml_build_forward_expand(gf, data.candidates);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    GGML_ASSERT(buffer != nullptr);
+
+    const float   logits_data[]     = { 0.1f, 9.0f, 2.0f, 8.0f };
+    const int32_t candidates_data[] = { 7, 101, 1007, 50000 };
+    ggml_backend_tensor_set(logits,     logits_data,     0, sizeof(logits_data));
+    ggml_backend_tensor_set(candidates, candidates_data, 0, sizeof(candidates_data));
+    GGML_ASSERT(ggml_backend_graph_compute(backend.get(), gf) == GGML_STATUS_SUCCESS);
+
+    float   top_logits[2] = {};
+    int32_t top_ids[2]    = {};
+    ggml_backend_tensor_get(data.logits,     top_logits, 0, sizeof(top_logits));
+    ggml_backend_tensor_get(data.candidates, top_ids,    0, sizeof(top_ids));
+
+    std::unordered_map<int32_t, float> selected;
+    for (size_t i = 0; i < 2; ++i) {
+        selected[top_ids[i]] = top_logits[i];
+    }
+    GGML_ASSERT(selected.size() == 2);
+    GGML_ASSERT(fabsf(selected.at(101)   - 9.0f) < 1e-6f);
+    GGML_ASSERT(fabsf(selected.at(50000) - 8.0f) < 1e-6f);
+
+    printf("backend compact-candidate remap test PASSED\n");
+}
+
+static void test_backend_unsupported_prefix(const test_params & params) {
+    std::vector<llama_sampler_seq_config> configs;
+    test_context test_ctx(params, configs, 1);
+
+    llama_sampler_ptr supported(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(supported.get(), llama_sampler_init_top_k(4));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), 0, supported.get()));
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    // Typical sampling has no backend implementation, so the chain has no
+    // usable backend prefix. Replacing a valid sampler with it must rebuild the
+    // graph topology and must not suppress raw logits.
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(0.95f, 1));
+    GGML_ASSERT(!llama_set_sampler(test_ctx.ctx.get(), 0, chain.get()));
+
+    GGML_ASSERT(test_ctx.decode_token(0));
+    llama_synchronize(test_ctx.ctx.get());
+    const int32_t idx = test_ctx.idx_for_seq(0);
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
+    GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx) == nullptr);
+    GGML_ASSERT(llama_get_logits_ith(test_ctx.ctx.get(), idx) != nullptr);
+
+    printf("backend unsupported-prefix raw-logits fallback test PASSED\n");
+}
+
+static void test_backend_partial_prefix(const test_params & params) {
+    std::vector<llama_sampler_seq_config> configs;
+    test_context test_ctx(params, configs, 1);
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(4));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(0.95f, 1));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(88));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), 0, chain.get()));
+
+    GGML_ASSERT(test_ctx.decode_token(0));
+    llama_synchronize(test_ctx.ctx.get());
+    const int32_t idx = test_ctx.idx_for_seq(0);
+    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
+    GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == 4);
+    GGML_ASSERT(llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx) != nullptr);
+
+    // Top-k ran on the backend; typical + dist remain a valid CPU tail.
+    const llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), idx);
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+
+    printf("backend partial-prefix CPU-tail test PASSED\n");
 }
 
 static void test_backend_temp_sampling(const test_params & params) {
@@ -1579,6 +1691,9 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "temp",            test_backend_temp_sampling,           true  },
     { "temp_ext",        test_backend_temp_ext_sampling,       true  },
     { "top_k",           test_backend_top_k_sampling,          true  },
+    { "candidate_remap", test_backend_candidate_remap,         true  },
+    { "unsupported",     test_backend_unsupported_prefix,      true  },
+    { "partial_prefix",  test_backend_partial_prefix,          true  },
     { "multi_sequence",  test_backend_multi_sequence_sampling, true  },
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },

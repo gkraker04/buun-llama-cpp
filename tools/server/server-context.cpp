@@ -18,6 +18,7 @@
 #include "common.h"
 #include "common-cache-plan.h"
 #include "common-cache-plan-estimate.h"
+#include "mtp-vocab-trim.h"
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
@@ -4232,6 +4233,33 @@ private:
 
         params_base = params_load;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        // Qwen-27B external MTP sidecars can derive and reuse a frequency-prior
+        // vocabulary-trimmed copy. This runs before fit/placement so the first
+        // launch also accounts the smaller LM head. The source GGUF is immutable;
+        // unsupported inputs and conversion failures retain the original path.
+        if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+            params_base.speculative.has_dft()) {
+            if (params_base.speculative.draft.mtp_vocab_size > 0) {
+                SRV_INF("[spec] checking Qwen MTP vocabulary-trim cache (requested vocab=%u)\n",
+                        params_base.speculative.draft.mtp_vocab_size);
+            }
+            auto trim = common_mtp_vocab_trim_prepare(
+                    params_base.speculative.draft.mparams.path,
+                    params_base.speculative.draft.mtp_vocab_size);
+            if (trim.status == common_mtp_vocab_trim_status::created) {
+                SRV_INF("[spec] created Qwen MTP vocabulary-trim derivative '%s' (%s)\n",
+                        trim.path.c_str(), trim.detail.c_str());
+                params_base.speculative.draft.mparams.path = std::move(trim.path);
+            } else if (trim.status == common_mtp_vocab_trim_status::cached) {
+                SRV_INF("[spec] using cached Qwen MTP vocabulary-trim derivative '%s' (%s)\n",
+                        trim.path.c_str(), trim.detail.c_str());
+                params_base.speculative.draft.mparams.path = std::move(trim.path);
+            } else if (trim.status == common_mtp_vocab_trim_status::failed) {
+                SRV_WRN("[spec] Qwen MTP vocabulary trim unavailable: %s; using original sidecar\n",
+                        trim.detail.c_str());
+            }
+        }
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool has_draft = params_base.speculative.has_dft();

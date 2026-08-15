@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-sampler.h"
 
 #include <cassert>
 #include <algorithm>
@@ -1559,12 +1560,13 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens    = nullptr;
-    t_inp_embd      = nullptr;
-    t_logits        = nullptr;
-    t_logits_argmax = nullptr;
-    t_embd          = nullptr;
-    t_embd_pooled   = nullptr;
+    t_inp_tokens        = nullptr;
+    t_inp_embd          = nullptr;
+    t_logits            = nullptr;
+    t_logits_candidates = nullptr;
+    t_logits_argmax     = nullptr;
+    t_embd              = nullptr;
+    t_embd_pooled       = nullptr;
     t_h_nextn       = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
@@ -1591,6 +1593,30 @@ void llm_graph_result::reset() {
     ctx_compute.reset(ggml_init(params));
 
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+}
+
+bool llm_graph_all_outputs_have_samplers(
+        const llama_ubatch & ubatch,
+        const std::map<llama_seq_id, llama_sampler *> & samplers,
+        bool require_candidate_support) {
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+
+        const int32_t n_seq_id = ubatch.n_seq_id ? ubatch.n_seq_id[i] : 1;
+        for (int32_t j = 0; j < n_seq_id; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id ? ubatch.seq_id[i][j] : 0;
+            const auto sampler = samplers.find(seq_id);
+            if (sampler == samplers.end() ||
+                    (require_candidate_support &&
+                     !llama_sampler_chain_supports_candidates(sampler->second))) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
@@ -4109,6 +4135,11 @@ void llm_graph_context::build_sampling() const {
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
+    if (res->t_logits_candidates) {
+        GGML_ASSERT(res->t_logits_candidates->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_vector(res->t_logits_candidates));
+        GGML_ASSERT(res->t_logits_candidates->ne[0] == res->t_logits->ne[0]);
+    }
 
     // add a dummy row of logits
     // this trick makes the graph static, regardless of which samplers are activated
@@ -4129,7 +4160,7 @@ void llm_graph_context::build_sampling() const {
             /*.logits      =*/ logits_seq,
             /*.probs       =*/ nullptr,
             /*.sampled     =*/ nullptr,
-            /*.candidates  =*/ nullptr,
+            /*.candidates  =*/ res->t_logits_candidates,
         };
 
         assert(sampler->iface->backend_apply);
