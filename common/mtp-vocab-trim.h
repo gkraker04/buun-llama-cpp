@@ -28,3 +28,7 @@ bool common_mtp_vocab_trim_repack_for_test(const std::string &          source_p
                                            const std::string &          destination_path,
                                            const std::vector<int64_t> & draft_to_target,
                                            std::string &                error);
+
+// Canonical tokenizer-token digest seam. Production admission reads the same
+// serialization directly from GGUF metadata without materializing this vector.
+std::string common_mtp_vocab_trim_tokenizer_digest_for_test(const std::vector<std::string> & tokens);

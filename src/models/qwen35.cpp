@@ -669,12 +669,26 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
         GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
 
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
-        cb(cur, "result_output_d2t", -1);
+        const bool compact_backend_sampling =
+                model.d2t->type == GGML_TYPE_I32 &&
+                !samplers.empty() &&
+                llm_graph_all_outputs_have_samplers(ubatch, samplers, true);
+        if (compact_backend_sampling) {
+            // Backend samplers already support an explicit candidate-id domain.
+            // Keep the 32K logits compact and let filtering map only its winners
+            // to target token ids, avoiding a full-vocab fill/scatter and scan.
+            res->t_logits_candidates = model.d2t;
+        } else {
+            // Raw-logits consumers, mixed backend/CPU batches, and legacy I64
+            // mappings retain the exact dense representation.
+            ggml_tensor * logits = ggml_fill(ctx0,
+                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+            cur = ggml_set_rows(ctx0, logits,
+                    ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
+            cb(cur, "result_output_d2t", -1);
+        }
     }
 
     res->t_logits = cur;

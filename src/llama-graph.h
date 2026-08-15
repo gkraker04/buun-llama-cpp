@@ -980,6 +980,10 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    // Optional I32 token ids for a compact logits domain. Backend samplers
+    // preserve these ids while filtering/sampling instead of treating compact
+    // row indices as vocabulary ids.
+    ggml_tensor * t_logits_candidates = nullptr;
     ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
@@ -1020,6 +1024,14 @@ private:
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
 };
+
+// True when every requested output row belongs only to sequences with an
+// attached backend sampler. A compact logits tensor is safe only in this case;
+// otherwise at least one caller still needs dense raw logits.
+bool llm_graph_all_outputs_have_samplers(
+        const llama_ubatch & ubatch,
+        const std::map<llama_seq_id, llama_sampler *> & samplers,
+        bool require_candidate_support = false);
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 

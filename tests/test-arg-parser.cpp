@@ -201,6 +201,11 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    {
+        common_params default_params;
+        assert(default_params.speculative.draft.mtp_vocab_size == 0);
+    }
+
     argv = {"binary_name", "--spec-mtp-vocab-size", "32768"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.draft.mtp_vocab_size == 32768);

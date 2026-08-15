@@ -27,6 +27,13 @@ struct files_cleanup {
 }  // namespace
 
 int main() {
+    std::vector<std::string> digest_tokens = { "!", "hello", "▁world" };
+    assert(common_mtp_vocab_trim_tokenizer_digest_for_test(digest_tokens) ==
+           "7954b97c711bbcb1c5197e525208e499600bf8e405c2724d8afa8e29e626f119");
+    digest_tokens[1] = "Hello";
+    assert(common_mtp_vocab_trim_tokenizer_digest_for_test(digest_tokens) !=
+           "7954b97c711bbcb1c5197e525208e499600bf8e405c2724d8afa8e29e626f119");
+
     const auto disabled = common_mtp_vocab_trim_prepare("missing.gguf", 0);
     assert(disabled.status == common_mtp_vocab_trim_status::not_applicable);
     assert(disabled.path == "missing.gguf");
@@ -54,6 +61,9 @@ int main() {
 
     gguf_set_val_str(source_gguf, "general.architecture", "test");
     gguf_set_val_str(source_gguf, "test.marker", "preserved");
+    // The derivative writer always normalizes its declaration and layout to
+    // GGUF_DEFAULT_ALIGNMENT, even when the source declares it explicitly.
+    gguf_set_val_u32(source_gguf, GGUF_KEY_GENERAL_ALIGNMENT, GGUF_DEFAULT_ALIGNMENT);
 
     constexpr int64_t n_embd     = 32;
     constexpr int64_t n_vocab    = 64;
@@ -96,6 +106,7 @@ int main() {
     const int64_t marker_id = gguf_find_key(output_gguf, "test.marker");
     assert(marker_id >= 0);
     assert(std::string(gguf_get_val_str(output_gguf, marker_id)) == "preserved");
+    assert(gguf_find_key(output_gguf, GGUF_KEY_GENERAL_ALIGNMENT) < 0);
 
     ggml_tensor * trimmed = ggml_get_tensor(output_meta_raw, "output.weight");
     assert(trimmed != nullptr);
@@ -112,9 +123,10 @@ int main() {
 
     ggml_tensor * d2t = ggml_get_tensor(output_meta_raw, "d2t");
     assert(d2t != nullptr);
-    assert(d2t->type == GGML_TYPE_I64);
+    assert(d2t->type == GGML_TYPE_I32);
     assert(d2t->ne[0] == static_cast<int64_t>(map.size()));
-    assert(std::memcmp(d2t->data, map.data(), map.size() * sizeof(map[0])) == 0);
+    const std::vector<int32_t> expected_d2t(map.begin(), map.end());
+    assert(std::memcmp(d2t->data, expected_d2t.data(), expected_d2t.size() * sizeof(expected_d2t[0])) == 0);
 
     ggml_tensor * copied_marker = ggml_get_tensor(output_meta_raw, "blk.64.nextn_eh_proj.weight");
     assert(copied_marker != nullptr);

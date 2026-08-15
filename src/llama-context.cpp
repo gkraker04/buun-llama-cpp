@@ -14,6 +14,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-sampler.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -3850,6 +3851,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft);
 
+        // A partially supported chain is useful when it has a backend prefix
+        // (for example GPU top-k followed by CPU sampling). If its first stage
+        // is unsupported, however, backend_apply() emits nothing; registering
+        // it would also incorrectly suppress the raw-logits fallback.
+        if (!llama_sampler_chain_has_backend_prefix(sampler)) {
+            LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d has no supported backend prefix\n",
+                    __func__, llama_sampler_name(sampler), seq_id);
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
+        }
+
         sampling.samplers[seq_id] = sampler;
 
         sched_need_reserve = true;
@@ -4369,20 +4384,7 @@ static void copy_tensor_async_candidates(
 }
 
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
-    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-        if (!ubatch.output[i]) {
-            continue;
-        }
-
-        // Check if the output token has at least one sequence without a backend sampler.
-        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
-                return true;
-            }
-        }
-    }
-    return false; // all sequences use backend sampling
+    return !llm_graph_all_outputs_have_samplers(ubatch, samplers);
 }
 
 namespace {
