@@ -9237,6 +9237,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // IQ2/IQ3 use the compact persistent scheduler at this depth.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 32, 6, false, 512, 1024, 256));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 6, false, 512, 1024, 256));
+    // The Blackwell J64 policy uses the same sparse tiled scheduler below the
+    // persistent crossover; keep a ragged final tile in the correctness gate.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 32, 6, false, 512, 129, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 6, false, 512, 129, 256));
+    // IQ2_XS enters the SM120 persistent scheduler only at large batches.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 32, 6, false, 512, 2049, 256));
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
@@ -9868,6 +9874,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // SM120 shares route preparation and activation quantization across paired
+    // gate/up MMQ launches. Use a ragged batch above the MMVQ crossover.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_IQ2_XXS, GGML_GLU_OP_SWIGLU, 129, 512, 256,
+        true, 32, 6, false, false, true, false));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
