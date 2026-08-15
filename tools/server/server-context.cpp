@@ -610,7 +610,7 @@ static bool server_cache_transient_seq_rm_impl(
         llama_seq_id seq_id,
         llama_pos p0,
         llama_pos p1) {
-    return llama_memory_seq_rm(mem, seq_id, p0, p1);
+    return llama_memory_seq_rm_transient(mem, seq_id, p0, p1);
 }
 
 static server_cache_control_status server_cache_family_resolve_for_launch(
@@ -6634,10 +6634,9 @@ private:
             }
             int32_t checkpoint_ordinal = 0;
             for (const auto & checkpoint : candidate_target.prompt.checkpoints) {
-                const bool representation_matches =
+                const bool checkpoint_lineage_matches =
                     !recurrent ||
-                    (checkpoint.representation_epoch == vbr_now.representation_epoch &&
-                     checkpoint.representation_epoch_swa == vbr_now.representation_epoch_swa);
+                    common_prompt_checkpoint_lineage_matches(checkpoint, vbr_now);
                 const bool frontier_current =
                     !candidate_target.frontier_ratchet_flipped ||
                     (adapter_known && checkpoint_frontier_is_current(
@@ -6653,7 +6652,7 @@ private:
                 server_cache_plan_apply_checkpoint(row,
                     server_cache_plan_evaluate_checkpoint(
                         !checkpoint.empty(), frontier_current, recurrent,
-                        representation_matches, checkpoint.pos_min,
+                        checkpoint_lineage_matches, checkpoint.pos_min,
                         checkpoint.pos_max, pos_next, pos_min_threshold,
                         checkpoint.size()));
             }
@@ -6839,11 +6838,9 @@ private:
                                llama_model_is_hybrid(model_tgt);
         const auto vbr_now = llama_memory_vbr_state(
             llama_get_memory(ctx_tgt), slot.id, 0);
-        const bool representation_matches =
+        const bool checkpoint_lineage_matches =
             !recurrent ||
-            (checkpoint.representation_epoch == vbr_now.representation_epoch &&
-             checkpoint.representation_epoch_swa ==
-                 vbr_now.representation_epoch_swa);
+            common_prompt_checkpoint_lineage_matches(checkpoint, vbr_now);
         bool frontier_current = false;
         try {
             // Authority requires current durable frontier evidence even while
@@ -6857,7 +6854,7 @@ private:
         return server_cache_plan_viable(
             server_cache_plan_evaluate_checkpoint(
                 !checkpoint.empty(), frontier_current, recurrent,
-                representation_matches, checkpoint.pos_min,
+                checkpoint_lineage_matches, checkpoint.pos_min,
                 checkpoint.pos_max, pos_next, pos_min_threshold,
                 checkpoint.size()).reason);
     }
@@ -10404,7 +10401,7 @@ private:
                                 // Arm rollback only after both cleanup and copy succeed. Non-RS
                                 // recurrent targets have no plane-based rollback substitute.
                                 if (backup_cleared &&
-                                    llama_memory_try_seq_cp(mem, slot.id, seq_backup, -1, -1)) {
+                                    llama_memory_try_seq_cp_transient(mem, slot.id, seq_backup, -1, -1)) {
                                     slot.has_draft_backup = true;
                                     slot.seq_id_backup = seq_backup;
                                 } else {
@@ -10813,17 +10810,17 @@ private:
 
                                 if (pos_min >= pos_min_thold ||
                                     slot.cache_plan_execution.restores_checkpoint()) {
-                                    // [I9] current VBR representation epoch(s); a recurrent-only checkpoint
-                                    // captured against a different epoch is stale (its attention KV moved
-                                    // tier / cells were reused / the controller was reset). All-zero when
-                                    // VBR is inactive, so this rejects nothing then.
+                                    // [I9] current attention-content lineage epoch(s). A recurrent-only
+                                    // checkpoint remains valid across a lossless in-place retier, but not
+                                    // across occupied-cell reuse, clear/reset, or state adoption. All-zero
+                                    // when VBR is inactive, so this rejects nothing then.
                                     const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
                                     const bool recurrent =
                                         llama_model_is_recurrent(model_tgt) ||
                                         llama_model_is_hybrid(model_tgt);
 
-                                    // [obs] count checkpoints rejected specifically for a changed VBR
-                                    // representation, to explain a resulting cold reprocess in /slots
+                                    // [obs] count checkpoints rejected specifically for changed attention
+                                    // lineage, to explain a resulting cold reprocess in /slots
                                     int n_ckpt_rejected_vbr = 0;
 
                                     // B/A2 candidate transport: which scan is authoritative
@@ -10873,19 +10870,18 @@ private:
                                             // reach the mutating restore path.
                                             [[maybe_unused]] uint64_t obs_bytes = 0;
                                             if constexpr (Obs) { obs_bytes = (uint64_t) cur.size(); }
-                                            const bool representation_matches =
+                                            const bool checkpoint_lineage_matches =
                                                 !recurrent ||
-                                                (cur.representation_epoch == vbr_now.representation_epoch &&
-                                                 cur.representation_epoch_swa == vbr_now.representation_epoch_swa);
+                                                common_prompt_checkpoint_lineage_matches(cur, vbr_now);
                                             const auto evaluation =
                                                 server_cache_plan_evaluate_checkpoint(
                                                     !cur.empty(), true, recurrent,
-                                                    representation_matches,
+                                                    checkpoint_lineage_matches,
                                                     cur.pos_min, cur.pos_max, pos_next,
                                                     pos_min_thold, obs_bytes);
                                             const bool ok = server_cache_plan_viable(
                                                 evaluation.reason);
-                                            if (!cur.empty() && !representation_matches) {
+                                            if (!cur.empty() && !checkpoint_lineage_matches) {
                                                 n_ckpt_rejected_vbr++;
                                             }
                                             if constexpr (Obs) {
@@ -10911,7 +10907,7 @@ private:
                                     // from next_position rather than pos_max.
                                     std::string frontier_adapter_identity;
                                     bool frontier_eligible = false;
-                                    // per-selector [I9] rejection count: after a WS-4 flip
+                                    // per-selector [I9] lineage-rejection count: after a WS-4 flip
                                     // the authoritative scan is this one, and its epoch
                                     // rejections are NOT the legacy scan's
                                     int n_ckpt_rejected_vbr_frontier = 0;
@@ -10945,10 +10941,8 @@ private:
                                                 }
                                                 frontier_eligible = true;
                                                 if (recurrent) {
-                                                    if (cur.representation_epoch !=
-                                                            vbr_now.representation_epoch ||
-                                                        cur.representation_epoch_swa !=
-                                                            vbr_now.representation_epoch_swa) {
+                                                    if (!common_prompt_checkpoint_lineage_matches(
+                                                            cur, vbr_now)) {
                                                         n_ckpt_rejected_vbr_frontier++;
                                                         if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED, cur.pos_max, obs_bytes); }
                                                         return false;
@@ -11280,7 +11274,7 @@ private:
                                         slot.cache_status = vbr_preflight_rejected
                                             ? "full reprocess: VBR frozen-footprint preflight rejected"
                                             : n_ckpt_rejected_vbr > 0
-                                                ? "full reprocess: checkpoint(s) rejected -- VBR representation changed [I9]"
+                                                ? "full reprocess: checkpoint(s) rejected -- attention lineage changed [I9]"
                                                 : "full reprocess: no reusable context checkpoint";
                                         // B0 stage-3: the same shipped classification, as a
                                         // closed reason on the checkpoint candidate row. A
@@ -11516,6 +11510,11 @@ private:
                                 trim_tgt_attn_only ? 1u : 0u,
                                 trim_dft_attn_only ? 1u : 0u);
                     }
+                    const auto checkpoint_lineage_before_trim =
+                        trim_tgt_attn_only
+                            ? llama_memory_vbr_state(
+                                llama_get_memory(ctx_tgt), slot.id, 0)
+                            : llama_memory_vbr_state_data{};
                     bool trim_ok = ::server_cache_live_range_drop_impl(
                         llama_get_memory(ctx_tgt), slot.id, p0, -1,
                         trim_tgt_attn_only);
@@ -11523,6 +11522,19 @@ private:
                         trim_ok = ::server_cache_live_range_drop_impl(
                             llama_get_memory(ctx_dft.get()), slot.id, p0, -1,
                             trim_dft_attn_only);
+                    }
+
+                    if (trim_ok && trim_tgt_attn_only) {
+                        const auto checkpoint_lineage_after_trim =
+                            llama_memory_vbr_state(
+                                llama_get_memory(ctx_tgt), slot.id, 0);
+                        if (server_cache_checkpoint_rebase_preserved_suffix(
+                                slot.prompt.checkpoints,
+                                checkpoint_lineage_before_trim,
+                                checkpoint_lineage_after_trim,
+                                p0) > 0) {
+                            slot.checkpoint_ring_changed();
+                        }
                     }
 
                     if (!trim_ok) {
@@ -11849,15 +11861,15 @@ private:
                             last.n_tokens                == ckpt_n_tokens &&
                             last.pos_min                 == ckpt_pos_min &&
                             last.pos_max                 == pos_max &&
-                            last.representation_epoch     == vbr_now.representation_epoch &&
-                            last.representation_epoch_swa == vbr_now.representation_epoch_swa &&
+                            last.checkpoint_epoch     == vbr_now.checkpoint_epoch &&
+                            last.checkpoint_epoch_swa == vbr_now.checkpoint_epoch_swa &&
                             computation_frontiers_equal(
                                 last.computation_frontier,
                                 ckpt_frontier)) {
                             last.id_task = ckpt_id_task;
-                            SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, VBR epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
+                            SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, checkpoint epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
                                     ckpt_n_tokens, ckpt_pos_min, pos_max,
-                                    vbr_now.representation_epoch, vbr_now.representation_epoch_swa);
+                                    vbr_now.checkpoint_epoch, vbr_now.checkpoint_epoch_swa);
                             do_checkpoint = false;
 
                         }
@@ -11876,8 +11888,8 @@ private:
                             next.pos_min  = ckpt_pos_min;
                             next.pos_max  = pos_max;
                             next.n_tokens = ckpt_n_tokens;
-                            next.representation_epoch     = vbr_now.representation_epoch;
-                            next.representation_epoch_swa = vbr_now.representation_epoch_swa;
+                            next.checkpoint_epoch     = vbr_now.checkpoint_epoch;
+                            next.checkpoint_epoch_swa = vbr_now.checkpoint_epoch_swa;
                             next.computation_frontier = ckpt_frontier;
                             next.cache_family = slot.cache_family;
 
@@ -11953,15 +11965,13 @@ private:
                                 const bool frontier_current =
                                     checkpoint_frontier_is_current(
                                         slot, *it, adapter);
-                                const bool representation_matches =
-                                    it->representation_epoch ==
-                                        vbr_now.representation_epoch &&
-                                    it->representation_epoch_swa ==
-                                        vbr_now.representation_epoch_swa;
+                                const bool checkpoint_lineage_matches =
+                                    common_prompt_checkpoint_lineage_matches(
+                                        *it, vbr_now);
                                 const auto evaluation =
                                     server_cache_plan_evaluate_checkpoint(
                                         !it->empty(), frontier_current,
-                                        recurrent, representation_matches,
+                                        recurrent, checkpoint_lineage_matches,
                                         it->pos_min, it->pos_max,
                                         seam_next, seam_min, it->size());
                                 if (evaluation.reason ==
@@ -12792,7 +12802,7 @@ private:
                         const bool live_removed = server_cache_transient_seq_rm_impl(
                             mem, slot.id, -1, -1);
                         if (!live_removed ||
-                            !llama_memory_try_seq_cp(mem, seq_backup, slot.id, -1, -1)) {
+                            !llama_memory_try_seq_cp_transient(mem, seq_backup, slot.id, -1, -1)) {
                             // could not restore the backup into the slot (recurrent pool exhausted):
                             // the slot is left at n_past_before with the accepted tokens unresolved.
                             // Reset it coherently rather than continue on inconsistent state [I13].

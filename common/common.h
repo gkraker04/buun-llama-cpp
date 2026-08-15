@@ -1387,13 +1387,12 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    // VBR representation epochs at capture time [I9]. A recurrent-only checkpoint restores exact
-    // recurrent state, but the attention KV it is paired with on restore degrades/relocates in place
-    // under dynamic VBR. If the representation changed since capture (epoch bumped by a transcode,
-    // cell-reuse, reset or import), the checkpoint is stale and must not be restored (fail closed).
-    // Both are 0 when VBR is inactive, making the restore-time check a no-op.
-    uint64_t representation_epoch     = 0;
-    uint64_t representation_epoch_swa = 0;
+    // Attention-content lineage epochs at capture time [I9]. A recurrent-only checkpoint restores
+    // exact recurrent state while retaining the live attention KV. Lossless in-place retiering
+    // preserves that lineage; occupied-cell reuse, clear/reset and import do not. Both are 0 when
+    // VBR is inactive, making the restore-time check a no-op.
+    uint64_t checkpoint_epoch     = 0;
+    uint64_t checkpoint_epoch_swa = 0;
 
     // Logical validity record, dual-written beside the legacy physical fields
     // during the Phase-1 migration. Legacy checkpoints have version == 0.
@@ -1460,3 +1459,10 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+inline bool common_prompt_checkpoint_lineage_matches(
+        const common_prompt_checkpoint & checkpoint,
+        const llama_memory_vbr_state_data & state) noexcept {
+    return checkpoint.checkpoint_epoch == state.checkpoint_epoch &&
+           checkpoint.checkpoint_epoch_swa == state.checkpoint_epoch_swa;
+}

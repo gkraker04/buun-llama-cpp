@@ -901,6 +901,10 @@ extern "C" {
                                            // single/primary (non-SWA) VBR controller
         uint64_t representation_epoch_swa; // monotone counter for the SWA controller when this
                                            // state aggregates iSWA; 0 for a single controller
+        uint64_t checkpoint_epoch;         // monotone attention-content lineage counter for the
+                                           // primary controller; retiering alone does not move it
+        uint64_t checkpoint_epoch_swa;     // corresponding SWA lineage counter; 0 for a single
+                                           // controller
         uint32_t retier_freeze_depth;       // active scoped retier-freeze nesting depth
         uint32_t retier_env_freeze;         // WS-0 deterministic env freeze is active
         uint64_t retier_freeze_enters;      // successful scoped-freeze entries this boot

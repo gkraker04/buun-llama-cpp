@@ -210,6 +210,15 @@ class vbr_adopt_test_seam {
         uint32_t child_id, bool inject_failure) noexcept = 0;
 };
 
+// No-fail publication capacity check shared by the production recheck and the model-free
+// adoption test. A publication advances representation/checkpoint once and tier identity once
+// per unit whose type changes.
+bool vbr_artifact_epoch_capacity(
+    uint64_t tier_epoch,
+    uint64_t representation_epoch,
+    uint64_t checkpoint_epoch,
+    uint64_t tier_changes) noexcept;
+
 struct vbr_adopt_test_control {
     vbr_adopt_fault fault;
     vbr_adopt_test_seam * target = nullptr;

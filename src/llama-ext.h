@@ -9,6 +9,16 @@
 #include <cstdint>
 #include <map>
 
+// Internal speculative memory operations: real mutations with ordinary accounting, but no global
+// checkpoint-lineage publication for a caller-proven disposable backup or rejected suffix.
+LLAMA_API bool llama_memory_seq_rm_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

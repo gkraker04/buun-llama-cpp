@@ -448,7 +448,7 @@ server_cache_plan_checkpoint_evaluation server_cache_plan_evaluate_checkpoint(
     bool payload_present,
     bool frontier_current,
     bool recurrent,
-    bool representation_matches,
+    bool checkpoint_lineage_matches,
     int64_t pos_min,
     int64_t pos_max,
     int64_t next_position,

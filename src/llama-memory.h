@@ -243,12 +243,25 @@ struct llama_memory_i {
     virtual bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) {
         return seq_rm(seq_id, p0, p1);
     }
+    // Internal speculative bookkeeping. These mutate real memory and retain normal
+    // generation/ownership accounting, but attention implementations may suppress global
+    // checkpoint-lineage publication for a proven disposable backup or rejected suffix.
+    virtual bool seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
+    virtual bool seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm_attn(seq_id, p0, p1);
+    }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     // Internal detectable copy path. Memory implementations whose seq_cp cannot fail use
     // this fallback; composite/recurrent memories override it to report transactional failure.
     virtual bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
         seq_cp(seq_id_src, seq_id_dst, p0, p1);
         return true;
+    }
+    virtual bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+        return try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;

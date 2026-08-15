@@ -2721,8 +2721,8 @@ bool checkpoint_payload_equal(
            a.id_task == b.id_task &&
            a.pos_min == b.pos_min &&
            a.pos_max == b.pos_max &&
-           a.representation_epoch == b.representation_epoch &&
-           a.representation_epoch_swa == b.representation_epoch_swa &&
+           a.checkpoint_epoch == b.checkpoint_epoch &&
+           a.checkpoint_epoch_swa == b.checkpoint_epoch_swa &&
            a.computation_frontier == b.computation_frontier &&
            a.data_tgt == b.data_tgt &&
            a.data_dft == b.data_dft &&

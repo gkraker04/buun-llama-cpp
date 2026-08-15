@@ -36,6 +36,16 @@ static int failures = 0;
         } \
     } while (0)
 
+static void test_epoch_capacity_preflight() {
+    CHECK(vbr_artifact_epoch_capacity(0, 0, 0, 0));
+    CHECK(!vbr_artifact_epoch_capacity(0, UINT64_MAX, 0, 0));
+    CHECK(!vbr_artifact_epoch_capacity(0, 0, UINT64_MAX, 0));
+    CHECK(vbr_artifact_epoch_capacity(UINT64_MAX, 0, 0, 0));
+    CHECK(!vbr_artifact_epoch_capacity(UINT64_MAX, 0, 0, 1));
+    CHECK(vbr_artifact_epoch_capacity(UINT64_MAX - 1, 0, 0, 1));
+    CHECK(!vbr_artifact_epoch_capacity(UINT64_MAX - 1, 0, 0, 2));
+}
+
 // Friend-only harness view for post-adopt checks and deliberate live-degrade
 // setup. Import inspection and reservation use the production public doors.
 struct llama_kv_cache_vbr_epoch_test {
@@ -3291,6 +3301,7 @@ static bool f42b_parse_type(const std::string & name, ggml_type & output) {
 }
 
 int main(int argc, char ** argv) {
+    test_epoch_capacity_preflight();
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();
     g2::test_g2_real_driver_smoke();

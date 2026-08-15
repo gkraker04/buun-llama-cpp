@@ -547,7 +547,7 @@ server_cache_plan_checkpoint_evaluation server_cache_plan_evaluate_checkpoint(
         bool payload_present,
         bool frontier_current,
         bool recurrent,
-        bool representation_matches,
+        bool checkpoint_lineage_matches,
         int64_t pos_min,
         int64_t pos_max,
         int64_t next_position,
@@ -558,7 +558,7 @@ server_cache_plan_checkpoint_evaluation server_cache_plan_evaluate_checkpoint(
     out.payload_bytes = payload_bytes;
     out.reason = !payload_present ? COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY :
                  !frontier_current ? COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID :
-                 !representation_matches ? COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED :
+                 !checkpoint_lineage_matches ? COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED :
                  recurrent
                     ? (pos_max < next_position
                         ? COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL

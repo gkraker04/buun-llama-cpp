@@ -240,6 +240,16 @@ const vbr_tracker_install_child * tracker_plan(
 
 } // namespace
 
+bool vbr_artifact_epoch_capacity(
+        uint64_t tier_epoch,
+        uint64_t representation_epoch,
+        uint64_t checkpoint_epoch,
+        uint64_t tier_changes) noexcept {
+    return representation_epoch != UINT64_MAX &&
+           checkpoint_epoch != UINT64_MAX &&
+           tier_changes <= UINT64_MAX-tier_epoch;
+}
+
 // This class is the sole friend of llama_kv_cache for F4 adoption. It owns
 // every prepublication mutation and its inverse; callers cannot acquire a
 // tensor/pool destination outside the open journal.
@@ -293,6 +303,27 @@ class vbr_kv_import_session {
                    cache_->vbr_import_operation_ != operation_)
                 : cache_->vbr_import_in_progress_) ||
             !cache_->vbr_operation_armed()) {
+            return false;
+        }
+        uint64_t tier_changes = 0;
+        for (const auto & metadata : final_units_) {
+            const size_t ikv = metadata.logical_unit/2;
+            const bool is_v = (metadata.logical_unit & 1u) != 0;
+            if (ikv >= cache_->layers.size()) {
+                return false;
+            }
+            const auto * canonical = is_v
+                ? cache_->layers[ikv].v : cache_->layers[ikv].k;
+            if (canonical == nullptr) {
+                return false;
+            }
+            tier_changes += canonical->type != metadata.target_type;
+        }
+        if (!vbr_artifact_epoch_capacity(
+                cache_->vbr_tier_epoch_,
+                cache_->vbr_representation_epoch_,
+                cache_->vbr_checkpoint_epoch_,
+                tier_changes)) {
             return false;
         }
         const auto * tracker = cache_->vbr_generation_tracker_get();
@@ -974,9 +1005,7 @@ class vbr_kv_import_session {
                 metadata.logical_unit, metadata.target_type);
         }
         cache_->vbr_degrade_cursor_ = size_t(final_cursor_);
-        if (cache_->vbr_representation_epoch_ != UINT64_MAX) {
-            ++cache_->vbr_representation_epoch_;
-        }
+        cache_->vbr_attention_content_changed();
         published_ = true;
         armed_ = false;
     }
