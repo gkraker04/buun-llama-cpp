@@ -85,11 +85,17 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_pair,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, ggml_tensor * dst_pair) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT((src0_pair == nullptr) == (dst_pair == nullptr));
+    GGML_ASSERT(!src0_pair || ids);
+    GGML_ASSERT(!src0_pair || (src0_pair->type == src0->type && dst_pair->type == dst->type));
+    GGML_ASSERT(!src0_pair || (ggml_are_same_shape(src0_pair, src0) && ggml_are_same_stride(src0_pair, src0)));
+    GGML_ASSERT(!dst_pair || (ggml_are_same_shape(dst_pair, dst) && ggml_are_same_stride(dst_pair, dst)));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -109,14 +115,16 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+    // If a weight tensor is a temporary compute buffer, clear any potential padding.
+    for (const ggml_tensor * weight : {src0, src0_pair}) {
+        if (weight && ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(weight);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+                GGML_ASSERT(!weight->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0, size_alloc - size_data, stream));
+            }
         }
     }
 
@@ -257,6 +265,25 @@ void ggml_cuda_mul_mat_q(
         ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+
+    if (src0_pair) {
+        mmq_args pair_args = args;
+        pair_args.x   = (const char *) src0_pair->data;
+        pair_args.dst = (float *) dst_pair->data;
+        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+    }
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr);
+}
+
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_pair,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, ggml_tensor * dst_pair) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src0_pair, src1, ids, dst, dst_pair);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

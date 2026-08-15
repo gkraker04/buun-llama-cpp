@@ -1155,7 +1155,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                const int col = col_low + jt*J + j;
+                ids_dst_shared[j] = col < col_high ? ids_dst[col] : 0;
             }
             __syncthreads();
         }
@@ -1530,15 +1531,20 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
 
     // Stream-K partitions the dense rectangular grid, including empty per-expert tiles. For
-    // sparse MUL_MAT_ID on SM86 this creates more imbalance than it removes; launch the same
-    // J128 kernel as independent output tiles instead. Keep ordinary MMQ and other GPU families
-    // on their architecture-tuned configuration.
+    // sparse MUL_MAT_ID this creates more imbalance than it removes on the measured SM86 and
+    // SM120 configurations, so launch independent output tiles instead. Keep each architecture's
+    // measured type, tile, and batch policy separate.
     constexpr bool has_sparse_tiled_kernel =
         !fallback &&
-        J == 128 &&
+        (J == 64 || J == 128) &&
+        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+         type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm86 = cc == 860 && J == 128 &&
         (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL &&
+        args.ncols_max >= (type == GGML_TYPE_IQ2_XS ? 2048 : 128);
     const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
-        args.nsamples_y == 1 && cc == 860 &&
+        args.nsamples_y == 1 && (use_sparse_sm86 || use_sparse_sm120) &&
         (type != GGML_TYPE_MXFP4 || args.ncols_max >= 1024);
     constexpr bool has_sparse_persistent_kernel = has_sparse_tiled_kernel &&
         type != GGML_TYPE_MXFP4;
@@ -1789,5 +1795,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src0_pair,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, ggml_tensor * dst_pair);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
