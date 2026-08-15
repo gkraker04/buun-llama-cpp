@@ -90,6 +90,9 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    mtp-vocab-qwen27b-balanced.inc
+    mtp-vocab-trim.cpp
+    mtp-vocab-trim.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
@@ -140,9 +143,9 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
 # CONTENT with the internal SHA-256 primitive and — deliberately — resolves schedule paths
 # through the SAME runtime resolver the VBR reader uses (llama-vbr-config.h), so identity
 # can never drift from behavior. That makes this TU depend on libllama at link time, which
-# libcommon already does. The retention codec uses only the internal SHA-256
-# primitive and carries no process-local accounting handles.
-set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp
+# libcommon already does. The retention codec and MTP derivative cache use only
+# the internal SHA-256 primitive and carry no process-local accounting handles.
+set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp mtp-vocab-trim.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
