@@ -477,6 +477,58 @@ void test_declared_family_round_trip_and_price() {
     std::puts("E1_FAMILY round_trip PASS main_price_equal no_stack");
 }
 
+void test_checkpoint_lineage_ignores_retier_but_rejects_content_change() {
+    common_prompt_checkpoint checkpoint;
+    checkpoint.checkpoint_epoch = 11;
+    checkpoint.checkpoint_epoch_swa = 13;
+
+    llama_memory_vbr_state_data state = {};
+    state.checkpoint_epoch = 11;
+    state.checkpoint_epoch_swa = 13;
+    CHECK(common_prompt_checkpoint_lineage_matches(checkpoint, state));
+
+    // Retiering advances representation identity but preserves the attention-content lineage.
+    state.representation_epoch = 7;
+    state.representation_epoch_swa = 9;
+    CHECK(common_prompt_checkpoint_lineage_matches(checkpoint, state));
+
+    state.checkpoint_epoch++;
+    CHECK(!common_prompt_checkpoint_lineage_matches(checkpoint, state));
+    state.checkpoint_epoch--;
+    state.checkpoint_epoch_swa++;
+    CHECK(!common_prompt_checkpoint_lineage_matches(checkpoint, state));
+}
+
+void test_checkpoint_suffix_trim_rebases_only_preserved_prefixes() {
+    llama_memory_vbr_state_data before = {};
+    before.checkpoint_epoch = 11;
+    before.checkpoint_epoch_swa = 13;
+    llama_memory_vbr_state_data after = before;
+    after.checkpoint_epoch++;
+    after.checkpoint_epoch_swa++;
+
+    std::list<common_prompt_checkpoint> checkpoints(3);
+    auto it = checkpoints.begin();
+    it->pos_max = 9;
+    it->checkpoint_epoch = before.checkpoint_epoch;
+    it->checkpoint_epoch_swa = before.checkpoint_epoch_swa;
+    auto & preserved = *it++;
+    it->pos_max = 10;
+    it->checkpoint_epoch = before.checkpoint_epoch;
+    it->checkpoint_epoch_swa = before.checkpoint_epoch_swa;
+    auto & removed_boundary = *it++;
+    it->pos_max = 8;
+    it->checkpoint_epoch = before.checkpoint_epoch - 1;
+    it->checkpoint_epoch_swa = before.checkpoint_epoch_swa;
+    auto & stale_lineage = *it;
+
+    CHECK(server_cache_checkpoint_rebase_preserved_suffix(
+        checkpoints, before, after, 10) == 1);
+    CHECK(common_prompt_checkpoint_lineage_matches(preserved, after));
+    CHECK(!common_prompt_checkpoint_lineage_matches(removed_boundary, after));
+    CHECK(!common_prompt_checkpoint_lineage_matches(stale_lineage, after));
+}
+
 bool host_source_present(
         const server_prompt_cache & cache,
         int32_t source_id) {
@@ -1374,8 +1426,8 @@ void test_checkpoint_bounded_publication_skip_predicate() {
     recovery.computation_frontier.execution_identity = "execution";
     recovery.computation_frontier.adapter_config_identity = "adapter";
     recovery.computation_frontier.media_content_identity = "media";
-    recovery.representation_epoch = 11;
-    recovery.representation_epoch_swa = 13;
+    recovery.checkpoint_epoch = 11;
+    recovery.checkpoint_epoch_swa = 13;
 
     common_prompt_checkpoint incoming = recovery;
     incoming.n_tokens = 2000;
@@ -1387,9 +1439,9 @@ void test_checkpoint_bounded_publication_skip_predicate() {
     incoming.computation_frontier.sequence_epoch++;
     CHECK(!server_cache_checkpoint_bounded_replay(recovery, incoming, 100));
     incoming.computation_frontier.sequence_epoch--;
-    incoming.representation_epoch_swa++;
+    incoming.checkpoint_epoch_swa++;
     CHECK(!server_cache_checkpoint_bounded_replay(recovery, incoming, 100));
-    incoming.representation_epoch_swa--;
+    incoming.checkpoint_epoch_swa--;
     CHECK(!server_cache_checkpoint_bounded_replay(incoming, recovery, 100));
 }
 
@@ -2486,6 +2538,8 @@ int main(int argc, char ** argv) {
     }
     test_lifecycle_full_cache_rotates();
     test_declared_family_round_trip_and_price();
+    test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
+    test_checkpoint_suffix_trim_rebases_only_preserved_prefixes();
     test_lifecycle_restore_retains_immutable_source();
     test_implicit_soft_append_chain_is_bounded();
     test_durable_recovery_binds_exact_published_peer();

@@ -926,6 +926,15 @@ int llama_sampler_chain_n(const struct llama_sampler * chain) {
     return p->samplers.size();
 }
 
+bool llama_sampler_chain_has_backend_prefix(const llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+
+    const auto * p = (const llama_sampler_chain *) chain->ctx;
+    return p->is_init && !p->samplers.empty() && p->samplers.front().is_backend;
+}
+
 //
 // samplers
 //
@@ -3784,6 +3793,35 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
     /* .backend_apply     = */ llama_sampler_logit_bias_backend_apply,
     /* .backend_set_input = */ llama_sampler_logit_bias_backend_set_input,
 };
+
+bool llama_sampler_chain_supports_candidates(const llama_sampler * chain) {
+    if (!llama_sampler_chain_has_backend_prefix(chain)) {
+        return false;
+    }
+
+    const auto * p = (const llama_sampler_chain *) chain->ctx;
+    for (const auto & sampler : p->samplers) {
+        if (!sampler.is_backend) {
+            break;
+        }
+
+        const llama_sampler_i * iface = sampler.ptr->iface;
+        const bool candidate_safe =
+                iface == &llama_sampler_empty_i     ||
+                iface == &llama_sampler_dist_i      ||
+                iface == &llama_sampler_top_k_i     ||
+                iface == &llama_sampler_top_p_i     ||
+                iface == &llama_sampler_min_p_i     ||
+                iface == &llama_sampler_temp_i      ||
+                iface == &llama_sampler_temp_ext_i  ||
+                iface == &llama_sampler_penalties_i;
+        if (!candidate_safe) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 struct llama_sampler * llama_sampler_init_logit_bias(
                          int32_t   n_vocab,

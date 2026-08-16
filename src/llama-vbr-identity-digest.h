@@ -33,8 +33,8 @@ inline bool vbr_digest_nonzero(const std::array<uint8_t, 32> & digest) {
 inline std::array<uint8_t, 32> vbr_type_vector_digest(
         const ggml_type * types, size_t count) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] = "buun.vbr.capture/type-vector";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    static constexpr char domain_label[] = "buun.vbr.capture/type-vector";
+    writer.string(domain_label, sizeof(domain_label) - 1);
     for (size_t i = 0; i < count; ++i) {
         writer.u32(static_cast<uint32_t>(types[i]));
     }

@@ -2288,8 +2288,8 @@ void common_prompt_checkpoint::clear() {
     pos_min = 0;
     pos_max = 0;
 
-    representation_epoch     = 0;
-    representation_epoch_swa = 0;
+    checkpoint_epoch     = 0;
+    checkpoint_epoch_swa = 0;
 
     computation_frontier.clear();
     cache_family = {};

@@ -4,6 +4,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -161,6 +163,142 @@ struct llama_kv_cache_vbr_epoch_test {
 
     static void full_reset(llama_kv_cache * kv) {
         kv->vbr_full_reset();
+    }
+
+    static bool dry_occupied_apply_preserves_epochs(llama_kv_cache * kv, llama_seq_id seq_id) {
+        const uint32_t stream = kv->seq_to_stream.at(size_t(seq_id));
+        auto & cells = kv->v_cells[stream];
+
+        uint32_t idx = cells.size();
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.seq_has(i, seq_id) &&
+                (idx == cells.size() || cells.pos_get(i) > cells.pos_get(idx))) {
+                idx = i;
+            }
+        }
+        if (idx == cells.size()) {
+            return false;
+        }
+
+        const auto before_representation = kv->vbr_representation_epoch();
+        const auto before_checkpoint     = kv->vbr_checkpoint_epoch();
+        const auto head_old              = kv->v_heads[stream];
+        const auto stash_dirty_old       = kv->vbr_stash_dirty_;
+        std::vector<uint32_t> idxs(cells.size());
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            idxs[i] = i;
+        }
+        const auto cells_old = cells.cp(idxs);
+
+        const auto * tracker = kv->vbr_generation_tracker_get();
+        if (tracker == nullptr) {
+            return false;
+        }
+        const auto tracker_generation = tracker->controller_generation();
+        const auto tracker_serial = tracker->mutation_serial();
+        std::vector<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t, llama_seq_id>> generations;
+        generations.reserve(cells.size());
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            generations.emplace_back(
+                tracker->dependency_generation(stream, i),
+                tracker->membership_generation(stream, i),
+                tracker->dependency_provenance(stream, i),
+                tracker->membership_provenance(stream, i),
+                tracker->last_membership_seq(stream, i));
+        }
+
+        std::vector<uint32_t> owned_before;
+        const bool ownership_before = kv->vbr_ownership_ != nullptr &&
+            kv->vbr_ownership_->enumerate_owned(stream, seq_id, owned_before);
+        const auto receipt_before = kv->vbr_import_receipt_;
+        const size_t physical_before = std::count_if(
+            idxs.begin(), idxs.end(),
+            [&](uint32_t i) { return cells.seq_has(i, seq_id); });
+        if (physical_before < 2) {
+            return false;
+        }
+
+        llama_batch_allocr balloc(kv->hparams.n_pos_per_embd());
+        llama_ubatch ubatch = balloc.ubatch_reserve(1, 1);
+        llama_seq_id ubatch_seq = seq_id;
+        ubatch.token[0]        = 1;
+        ubatch.pos[0]          = cells.pos_get(idx) + 1;
+        ubatch.n_seq_id[0]     = 1;
+        ubatch.seq_id[0]       = &ubatch_seq;
+        ubatch.seq_id_unq[0]   = seq_id;
+        ubatch.output[0]       = 0;
+
+        llama_kv_cache::slot_info sinfo;
+        sinfo.resize(1);
+        sinfo.s0 = stream;
+        sinfo.s1 = stream;
+        sinfo.strm[0] = stream;
+        sinfo.idxs[0].push_back(idx);
+        kv->apply_ubatch(sinfo, ubatch, false);
+
+        std::vector<uint32_t> owned_after;
+        const bool ownership_after = kv->vbr_ownership_ != nullptr &&
+            kv->vbr_ownership_->enumerate_owned(stream, seq_id, owned_after);
+        bool tracker_preserved =
+            tracker->controller_generation() == tracker_generation &&
+            tracker->mutation_serial() == tracker_serial;
+        for (uint32_t i = 0; tracker_preserved && i < cells.size(); ++i) {
+            tracker_preserved = generations[i] == std::make_tuple(
+                tracker->dependency_generation(stream, i),
+                tracker->membership_generation(stream, i),
+                tracker->dependency_provenance(stream, i),
+                tracker->membership_provenance(stream, i),
+                tracker->last_membership_seq(stream, i));
+        }
+        const size_t physical_after = std::count_if(
+            idxs.begin(), idxs.end(),
+            [&](uint32_t i) { return cells.seq_has(i, seq_id); });
+        const bool preserved =
+            kv->vbr_representation_epoch() == before_representation &&
+            kv->vbr_checkpoint_epoch() == before_checkpoint &&
+            tracker_preserved &&
+            ownership_before == ownership_after &&
+            owned_before == owned_after &&
+            kv->vbr_import_receipt_.get() == receipt_before.get() &&
+            physical_after < physical_before;
+        cells.set(idxs, cells_old);
+        kv->v_heads[stream] = head_old;
+        kv->vbr_stash_dirty_ = stash_dirty_old;
+
+        // Pin the receipt side of dry_run with a real non-null token. The production receipt
+        // class is deliberately private to the artifact adopter; an aliasing shared_ptr gives
+        // this friend fixture identity/lifetime without constructing or exposing that class.
+        // Removing the entire speculative sequence would release a real receipt if dry_run ever
+        // regressed into the committed empty-cache cleanup door.
+        const auto receipt_token_owner = std::make_shared<uint8_t>(0);
+        auto * receipt_token = reinterpret_cast<vbr_import_receipt_group *>(receipt_token_owner.get());
+        kv->vbr_import_receipt_ = std::shared_ptr<vbr_import_receipt_group>(
+            receipt_token_owner, receipt_token);
+        const bool dry_rm_ok = kv->seq_rm_impl(
+            seq_id, -1, -1, llama_kv_cache::seq_rm_mode::dry_run);
+        const bool receipt_preserved =
+            dry_rm_ok &&
+            cells.seq_pos_min(seq_id) < 0 &&
+            kv->vbr_import_receipt_.get() == receipt_token;
+
+        cells.set(idxs, cells_old);
+        kv->v_heads[stream] = head_old;
+        kv->vbr_stash_dirty_ = stash_dirty_old;
+        kv->vbr_import_receipt_ = receipt_before;
+        return preserved && receipt_preserved;
+    }
+
+    static bool transient_suffix_preserves_checkpoint_lineage(
+            llama_kv_cache * kv, llama_seq_id seq_id, llama_pos suffix_begin) {
+        const auto representation_before = kv->vbr_representation_epoch();
+        const auto checkpoint_before     = kv->vbr_checkpoint_epoch();
+        const llama_pos pos_before       = kv->seq_pos_max(seq_id);
+        const bool removed = kv->seq_rm_transient(seq_id, suffix_begin, -1);
+        return removed &&
+            pos_before >= suffix_begin &&
+            kv->seq_pos_max(seq_id) < pos_before &&
+            kv->vbr_representation_epoch() == representation_before &&
+            kv->vbr_checkpoint_epoch() == checkpoint_before;
     }
 
     static bool reconcile(llama_kv_cache * kv) {
@@ -370,9 +508,9 @@ struct llama_kv_cache_vbr_epoch_test {
     }
 };
 
-static bool decode_one(llama_context * ctx) {
+static bool decode_one(llama_context * ctx, llama_pos pos = 0) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, 1, 0, { 0 }, true);
+    common_batch_add(batch, 1, pos, { 0 }, true);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
@@ -383,6 +521,13 @@ static bool epochs_equal(
         const llama_memory_vbr_state_data & b) {
     return a.representation_epoch == b.representation_epoch &&
            a.representation_epoch_swa == b.representation_epoch_swa;
+}
+
+static bool checkpoint_epochs_equal(
+        const llama_memory_vbr_state_data & a,
+        const llama_memory_vbr_state_data & b) {
+    return a.checkpoint_epoch == b.checkpoint_epoch &&
+           a.checkpoint_epoch_swa == b.checkpoint_epoch_swa;
 }
 
 static bool get_iswa_children(
@@ -1650,6 +1795,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "PRECONDITION failed: initial SWA representation epoch was not zero\n");
         return 1;
     }
+    if (initial.checkpoint_epoch != 0 || initial.checkpoint_epoch_swa != 0) {
+        fprintf(stderr, "PRECONDITION failed: initial checkpoint lineage epoch was not zero\n");
+        return 1;
+    }
     if (!decode_one(ctx.get())) {
         fprintf(stderr, "PRECONDITION failed: seed decode failed\n");
         return 1;
@@ -1661,6 +1810,30 @@ int main(int argc, char ** argv) {
     }
     if (!epochs_equal(seeded, initial)) {
         fprintf(stderr, "PRECONDITION failed: seed decode changed a representation epoch\n");
+        return 1;
+    }
+    if (!checkpoint_epochs_equal(seeded, initial)) {
+        fprintf(stderr, "PRECONDITION failed: seed decode changed a checkpoint lineage epoch\n");
+        return 1;
+    }
+    if (!decode_one(ctx.get(), 1)) {
+        fprintf(stderr, "PRECONDITION failed: second seed decode failed\n");
+        return 1;
+    }
+    const auto seeded_pair = llama_memory_vbr_state(mem, 0, 0);
+    if (!epochs_equal(seeded_pair, seeded) ||
+        !checkpoint_epochs_equal(seeded_pair, seeded)) {
+        fprintf(stderr, "PRECONDITION failed: second seed decode changed a VBR epoch\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::dry_occupied_apply_preserves_epochs(base, 0) ||
+        !llama_kv_cache_vbr_epoch_test::dry_occupied_apply_preserves_epochs(swa, 0)) {
+        fprintf(stderr, "side-effect-free occupied-slot planning changed a VBR epoch\n");
+        return 1;
+    }
+    if (!llama_kv_cache_vbr_epoch_test::transient_suffix_preserves_checkpoint_lineage(base, 0, 1) ||
+        !llama_kv_cache_vbr_epoch_test::transient_suffix_preserves_checkpoint_lineage(swa, 0, 1)) {
+        fprintf(stderr, "speculative suffix rollback changed checkpoint lineage\n");
         return 1;
     }
     if (!llama_kv_cache_vbr_epoch_test::generation_seeded(base) ||
@@ -1832,6 +2005,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "base degrade unexpectedly changed the SWA epoch\n");
         return 1;
     }
+    if (!checkpoint_epochs_equal(base_degraded, initial)) {
+        fprintf(stderr, "base degrade invalidated checkpoint attention lineage\n");
+        return 1;
+    }
     if (!llama_kv_cache_vbr_epoch_test::generation_units_match(base)) {
         fprintf(stderr, "A1 base unit tuple did not publish the degraded live types\n");
         return 1;
@@ -1850,6 +2027,10 @@ int main(int argc, char ** argv) {
     if (both_degraded.representation_epoch_swa <=
         base_degraded.representation_epoch_swa) {
         fprintf(stderr, "SWA degrade did not advance the SWA epoch\n");
+        return 1;
+    }
+    if (!checkpoint_epochs_equal(both_degraded, initial)) {
+        fprintf(stderr, "SWA degrade invalidated checkpoint attention lineage\n");
         return 1;
     }
     if (!llama_kv_cache_vbr_epoch_test::generation_units_match(swa)) {
@@ -1872,6 +2053,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "clear did not advance the SWA representation epoch\n");
         return 1;
     }
+    if (cleared.checkpoint_epoch <= both_degraded.checkpoint_epoch ||
+        cleared.checkpoint_epoch_swa <= both_degraded.checkpoint_epoch_swa) {
+        fprintf(stderr, "clear did not advance both checkpoint lineage epochs\n");
+        return 1;
+    }
     llama_kv_cache_vbr_epoch_test::full_reset(base);
     llama_kv_cache_vbr_epoch_test::full_reset(swa);
     const auto reset = llama_memory_vbr_state(mem, 0, 0);
@@ -1886,6 +2072,11 @@ int main(int argc, char ** argv) {
     if (reset.representation_epoch_swa <=
         cleared.representation_epoch_swa) {
         fprintf(stderr, "full reset did not advance the SWA representation epoch\n");
+        return 1;
+    }
+    if (reset.checkpoint_epoch <= cleared.checkpoint_epoch ||
+        reset.checkpoint_epoch_swa <= cleared.checkpoint_epoch_swa) {
+        fprintf(stderr, "full reset did not advance both checkpoint lineage epochs\n");
         return 1;
     }
     if (!llama_kv_cache_vbr_epoch_test::generation_units_match(base) ||
@@ -1938,6 +2129,10 @@ int main(int argc, char ** argv) {
     if (degraded_again.representation_epoch_swa <=
         reset.representation_epoch_swa) {
         fprintf(stderr, "degrade-reset-degrade did not advance the SWA epoch\n");
+        return 1;
+    }
+    if (!checkpoint_epochs_equal(degraded_again, reset)) {
+        fprintf(stderr, "post-reset degrade invalidated checkpoint attention lineage\n");
         return 1;
     }
     const auto normal_final = llama_memory_vbr_state(mem, 0, 0);
@@ -2045,20 +2240,37 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "empty VBR_FREEZE composition scope changed a representation epoch\n");
         return 1;
     }
+    if (!checkpoint_epochs_equal(env_before, env_after)) {
+        fprintf(stderr, "empty VBR_FREEZE composition scope changed a checkpoint lineage epoch\n");
+        return 1;
+    }
+
+    if (!llama_memory_seq_rm_attn(env_mem, 0, 0, 1)) {
+        fprintf(stderr, "attention-only destructive sequence edit was refused\n");
+        return 1;
+    }
+    const auto env_trimmed = llama_memory_vbr_state(env_mem, 0, 0);
+    if (env_trimmed.representation_epoch <= env_after.representation_epoch ||
+        env_trimmed.representation_epoch_swa <= env_after.representation_epoch_swa ||
+        env_trimmed.checkpoint_epoch <= env_after.checkpoint_epoch ||
+        env_trimmed.checkpoint_epoch_swa <= env_after.checkpoint_epoch_swa) {
+        fprintf(stderr, "destructive sequence edit did not invalidate both checkpoint lineages\n");
+        return 1;
+    }
 
     // NOTE: the "native mixed-tier import bumps both epochs" case is intentionally NOT exercised
     // here. The fork deliberately REFUSES to serialize a dynamic-VBR cache after a tier degrade
     // (llama_state_seq_get_size throws "cannot serialize a dynamic-VBR KV cache after tier
     // degrades..."), so a degraded mixed-tier state cannot be captured and re-adopted in the
     // current codebase — native mixed-tier import/serialization is unbuilt Phase-2/3 work. The
-    // import path DOES bump the epoch (state_read adoption calls vbr_representation_changed), but it
-    // is unreachable at runtime until that serialization exists. The P0 I9 behavior that matters --
-    // per-child epoch advance on every degrade, clear, and full-reset (incl. the low-LCP ABA close),
-    // and cross-degrade monotonicity -- is fully covered above.
+    // import path DOES bump both epochs (state adoption changes checkpoint lineage), but it is
+    // unreachable at runtime until that serialization exists. The P0 I9 behavior that matters --
+    // per-child representation advance on every degrade, checkpoint-lineage stability across
+    // retiering, and checkpoint-lineage advance on clear/full-reset -- is fully covered above.
 
 
     fprintf(stderr, "PASS: VBR scoped freeze is nested/iSWA-coherent, defers mutations, "
             "re-evaluates fresh on exit, composes with VBR_FREEZE, and preserves monotone "
-            "per-child representation epochs\n");
+            "per-child representation and checkpoint-lineage epochs\n");
     return 0;
 }

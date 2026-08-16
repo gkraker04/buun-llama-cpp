@@ -205,9 +205,28 @@ bool server_cache_checkpoint_bounded_replay(
                later.computation_frontier.adapter_config_identity &&
            recovery.computation_frontier.media_content_identity ==
                later.computation_frontier.media_content_identity &&
-           recovery.representation_epoch == later.representation_epoch &&
-           recovery.representation_epoch_swa ==
-               later.representation_epoch_swa;
+           recovery.checkpoint_epoch == later.checkpoint_epoch &&
+           recovery.checkpoint_epoch_swa == later.checkpoint_epoch_swa;
+}
+
+size_t server_cache_checkpoint_rebase_preserved_suffix(
+        std::list<common_prompt_checkpoint> & checkpoints,
+        const llama_memory_vbr_state_data & before,
+        const llama_memory_vbr_state_data & after,
+        llama_pos suffix_begin) noexcept {
+    if (suffix_begin < 0) {
+        return 0;
+    }
+    size_t rebased = 0;
+    for (auto & checkpoint : checkpoints) {
+        if (checkpoint.pos_max >= 0 && checkpoint.pos_max < suffix_begin &&
+            common_prompt_checkpoint_lineage_matches(checkpoint, before)) {
+            checkpoint.checkpoint_epoch     = after.checkpoint_epoch;
+            checkpoint.checkpoint_epoch_swa = after.checkpoint_epoch_swa;
+            rebased++;
+        }
+    }
+    return rebased;
 }
 
 server_cache_checkpoint_floor_plan server_cache_plan_checkpoint_capacity_floor(

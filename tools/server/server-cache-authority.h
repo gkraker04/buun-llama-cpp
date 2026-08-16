@@ -129,6 +129,15 @@ bool server_cache_checkpoint_bounded_replay(
     const common_prompt_checkpoint & later,
     uint64_t max_replay_tokens) noexcept;
 
+// An exact recurrent-checkpoint restore may remove only the live attention suffix after the
+// installed frontier. Checkpoints wholly before that suffix still cite identical attention rows;
+// rebase those matching the pre-trim lineage so dedup/thinning do not copy a replacement image.
+size_t server_cache_checkpoint_rebase_preserved_suffix(
+    std::list<common_prompt_checkpoint> & checkpoints,
+    const llama_memory_vbr_state_data & before,
+    const llama_memory_vbr_state_data & after,
+    llama_pos suffix_begin) noexcept;
+
 struct server_cache_checkpoint_floor_input {
     uint32_t ordinal = 0;
     server_cache_checkpoint_protection protection =

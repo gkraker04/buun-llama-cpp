@@ -14,6 +14,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-sampler.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -3141,12 +3142,12 @@ bool llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
     if (tree_bufs.n_tokens > 0) {
         // Tree mode: branch tokens may have polluted KV at accepted positions.
         // Remove ALL entries from n_past_before onwards and restore from backup.
-        mem_attn->seq_rm(seq_id, n_past_before, -1);
-        mem_attn->seq_cp(seq_backup, seq_id, n_past_before, -1);
+        mem_attn->seq_rm_transient(seq_id, n_past_before, -1);
+        mem_attn->try_seq_cp_transient(seq_backup, seq_id, n_past_before, -1);
     } else {
         // Flat mode: no duplicate entries at same position, safe to keep accepted KV
         int kv_keep_pos = n_past_before + n_accepted;
-        mem_attn->seq_rm(seq_id, kv_keep_pos, -1);
+        mem_attn->seq_rm_transient(seq_id, kv_keep_pos, -1);
     }
 
     // Recurrent state: restore from backup, then tape replay. Keep the backup
@@ -3165,7 +3166,7 @@ bool llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
         return false;
     }
 
-    mem_attn->seq_rm(seq_backup, -1, -1);
+    mem_attn->seq_rm_transient(seq_backup, -1, -1);
     mem_recr->seq_rm(seq_backup, -1, -1);
     return true;
 }
@@ -3861,6 +3862,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft);
 
+        // A partially supported chain is useful when it has a backend prefix
+        // (for example GPU top-k followed by CPU sampling). If its first stage
+        // is unsupported, however, backend_apply() emits nothing; registering
+        // it would also incorrectly suppress the raw-logits fallback.
+        if (!llama_sampler_chain_has_backend_prefix(sampler)) {
+            LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d has no supported backend prefix\n",
+                    __func__, llama_sampler_name(sampler), seq_id);
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
+        }
+
         sampling.samplers[seq_id] = sampler;
 
         sched_need_reserve = true;
@@ -4380,20 +4395,7 @@ static void copy_tensor_async_candidates(
 }
 
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
-    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-        if (!ubatch.output[i]) {
-            continue;
-        }
-
-        // Check if the output token has at least one sequence without a backend sampler.
-        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
-                return true;
-            }
-        }
-    }
-    return false; // all sequences use backend sampling
+    return !llm_graph_all_outputs_have_samplers(ubatch, samplers);
 }
 
 namespace {
@@ -7829,6 +7831,22 @@ bool llama_memory_seq_rm_attn(
     return mem->seq_rm_attn(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem == nullptr || mem->seq_rm_transient(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem == nullptr || mem->seq_rm_attn_transient(seq_id, p0, p1);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
@@ -7853,6 +7871,15 @@ bool llama_memory_try_seq_cp(
     }
 
     return mem->try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem != nullptr && mem->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_seq_keep(

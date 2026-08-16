@@ -2178,10 +2178,10 @@ void llama_kv_cache::clear(bool data) {
         }
     }
 
-    // Clearing severs every checkpoint's attention representation, even when only metadata is
+    // Clearing severs every checkpoint's attention lineage, even when only metadata is
     // requested. Keep this separate from vbr_full_reset(): clear may leave the tier cursor in
     // place until the next empty-cache boundary, and both mutations must remain observable.
-    vbr_representation_changed();
+    vbr_attention_content_changed();
     vbr_generation_global(vbr_mutation_registrant::clear, vbr_operation_class::state_api);
     if (vbr_ownership_) {
         vbr_ownership_->clear_all();
@@ -2214,6 +2214,22 @@ void llama_kv_cache::vbr_import_receipts_release_if_empty() noexcept {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_impl(seq_id, p0, p1, seq_rm_mode::public_commit);
+}
+
+bool llama_kv_cache::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_impl(seq_id, p0, p1, seq_rm_mode::nested_commit);
+}
+
+bool llama_kv_cache::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_transient(seq_id, p0, p1);
+}
+
+bool llama_kv_cache::seq_rm_impl(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        seq_rm_mode mode) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -2232,17 +2248,21 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // A2 operation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
     // membership-only state_api (not provenance-bearing); the destructive §7.5 classes arrive
     // with the classed server paths in the A2 coordinator commit.
-    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+    const bool commit = mode != seq_rm_mode::dry_run;
+    vbr_mutation_op mutation_op(commit ? this : nullptr, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, seq_id, p0, p1);
     const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    bool changed = false;
 
     if (seq_id >= 0) {
         const uint32_t stream = seq_to_stream[seq_id];
         auto & cells = v_cells[stream];
         auto & head  = v_heads[stream];
-        auto generation_event = vbr_generation_begin(
-                vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, stream,
-                vbr_generation_stamp_kind::membership);
+        auto generation_event = commit
+                ? vbr_generation_begin(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, stream,
+                    vbr_generation_stamp_kind::membership)
+                : vbr_generation_event{};
 
         uint32_t new_head = cells.size();
 
@@ -2252,12 +2272,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id)) {
+                changed = true;
                 const llama_pos rm_pos = cells.pos_get(i);
                 const bool became_empty = cells.seq_rm(i, seq_id);
-                if (vbr_ownership_) {
+                if (commit && vbr_ownership_) {
                     vbr_ownership_->remove_cell(stream, seq_id, i, rm_pos);
                 }
-                vbr_stamp(mutation_op, generation_event, i, seq_id, rm_pos);
+                if (commit) {
+                    vbr_stamp(mutation_op, generation_event, i, seq_id, rm_pos);
+                }
                 if (!became_empty) {
                     continue;
                 }
@@ -2275,7 +2298,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             head = new_head;
         }
         // Gap fix: a fully removed sequence releases its index view (frees the Fenwick).
-        if (vbr_ownership_ && cells.seq_pos_min(seq_id) < 0) {
+        if (commit && vbr_ownership_ && cells.seq_pos_min(seq_id) < 0) {
             vbr_ownership_->clear_seq(stream, seq_id);
         }
     } else {
@@ -2283,9 +2306,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
-            auto generation_event = vbr_generation_begin(
-                    vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, s,
-                    vbr_generation_stamp_kind::membership);
+            auto generation_event = commit
+                    ? vbr_generation_begin(
+                        vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, s,
+                        vbr_generation_stamp_kind::membership)
+                    : vbr_generation_event{};
 
             uint32_t new_head = cells.size();
 
@@ -2297,10 +2322,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 const bool had_membership = !cells.is_empty(i);
                 const llama_pos any_rm_pos = had_membership ? cells.pos_get(i) : -1;
                 if (had_membership) {
-                    vbr_ownership_update_all_seqs(s, i, any_rm_pos, /*add=*/false);
+                    changed = true;
+                    if (commit) {
+                        vbr_ownership_update_all_seqs(s, i, any_rm_pos, /*add=*/false);
+                    }
                 }
                 cells.rm(i);
-                if (had_membership) {
+                if (commit && had_membership) {
                     vbr_stamp(mutation_op, generation_event, i, -1, any_rm_pos);
                 }
                 if (i < vbr_stash_rows_) {
@@ -2319,12 +2347,29 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
-    vbr_import_receipts_release_if_empty();
+    if (mode == seq_rm_mode::public_commit && changed) {
+        vbr_attention_content_changed();
+    }
+    if (commit) {
+        vbr_import_receipts_release_if_empty();
+    }
 
     return true;
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    seq_cp_impl(seq_id_src, seq_id_dst, p0, p1, true);
+}
+
+bool llama_kv_cache::try_seq_cp_transient(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    seq_cp_impl(seq_id_src, seq_id_dst, p0, p1, false);
+    return true;
+}
+
+void llama_kv_cache::seq_cp_impl(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1, bool publish_lineage) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2357,12 +2402,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
                 return;
         }
 
+        bool changed = false;
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
             if (cells.seq_has(i, seq_id_src) && !cells.seq_has(i, seq_id_dst)) {
+                changed = true;
                 cells.seq_add(i, seq_id_dst);
                 const llama_pos cp_pos = cells.pos_get(i);
                 if (vbr_ownership_) {
@@ -2370,6 +2417,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
                 }
                 vbr_stamp(mutation_op, generation_event, i, seq_id_dst, cp_pos);
             }
+        }
+
+        if (publish_lineage && changed) {
+            vbr_attention_content_changed();
         }
 
         return;
@@ -2400,11 +2451,13 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
+    bool changed = false;
     auto destination_reset_event = vbr_generation_begin(
             vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
             vbr_generation_stamp_kind::membership);
     for (uint32_t i = 0; i < v_cells[s1].size(); ++i) {
         if (!v_cells[s1].is_empty(i)) {
+            changed = true;
             vbr_stamp(mutation_op, destination_reset_event, i, -1);
         }
     }
@@ -2414,6 +2467,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             vbr_generation_stamp_kind::dependency, true);
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
+            changed = true;
             llama_pos pos   = v_cells[s0].pos_get(i);
             llama_pos shift = v_cells[s0].get_shift(i);
 
@@ -2437,6 +2491,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     }
 
     v_heads[s1] = v_heads[s0];
+
+    if (publish_lineage && changed) {
+        vbr_attention_content_changed();
+    }
 
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
@@ -2467,9 +2525,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
             vbr_generation_stamp_kind::membership);
 
     uint32_t new_head = cells.size();
+    bool changed_any = false;
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         const bool changed = !cells.is_empty(i) && (!cells.seq_has(i, seq_id) || cells.seq_count(i) > 1);
+        changed_any = changed_any || changed;
         if (changed) {
             vbr_ownership_update_all_seqs(stream, i, cells.pos_get(i), /*add=*/false,
                                           /*exclude_seq=*/seq_id);
@@ -2491,6 +2551,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
+    }
+    if (changed_any) {
+        vbr_attention_content_changed();
     }
 }
 
@@ -2520,6 +2583,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     uint32_t new_head = cells.size();
+    bool changed = false;
 
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
@@ -2532,6 +2596,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
+            changed = true;
             const llama_pos old_pos = cells.pos_get(i);
             const bool removed = cells.pos_add(i, shift);
             if (vbr_ownership_) {
@@ -2553,6 +2618,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
+    if (changed) {
+        vbr_attention_content_changed();
+    }
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -2584,6 +2652,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    bool changed = false;
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
@@ -2592,11 +2661,15 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         if (cells.seq_has(i, seq_id)) {
             const llama_pos old_pos = cells.pos_get(i);
             cells.pos_div(i, d);
+            changed = changed || cells.pos_get(i) != old_pos;
             if (vbr_ownership_) {
                 vbr_ownership_->move_cell(stream, seq_id, i, old_pos, cells.pos_get(i));
             }
             vbr_stamp(mutation_op, generation_event, i, seq_id, old_pos);
         }
+    }
+    if (changed) {
+        vbr_attention_content_changed();
     }
 }
 
@@ -3573,8 +3646,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // Appending into empty cells does not alter a checkpoint's attention prefix. Reusing an
     // occupied SWA/ring cell does: the following graph overwrites bytes a checkpoint may still
     // reference, so make that ownership/representation change visible before graph execution.
-    if (reused_occupied_cell) {
-        vbr_representation_changed();
+    if (commit && reused_occupied_cell) {
+        vbr_attention_content_changed();
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -3593,7 +3666,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm_impl(
+                    s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1,
+                    commit ? seq_rm_mode::nested_commit : seq_rm_mode::dry_run);
         }
     }
 
@@ -5542,6 +5617,15 @@ void llama_kv_cache::vbr_representation_changed() {
     }
 }
 
+void llama_kv_cache::vbr_attention_content_changed() {
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        GGML_ASSERT(vbr_checkpoint_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+        vbr_checkpoint_epoch_++;
+    }
+}
+
 vbr_generation_tracker * llama_kv_cache::vbr_generation_tracker_mut() {
     return other != nullptr ? other->vbr_generation_tracker_mut() : vbr_generation_.get();
 }
@@ -6828,7 +6912,7 @@ void llama_kv_cache::vbr_full_reset() {
     vbr_quiet_boundaries_  = 0;
     // Deliberately bumps even though the cursor is now 0: this is the low-LCP/empty-cache ABA
     // that a recurrent-only checkpoint must detect.
-    vbr_representation_changed();
+    vbr_attention_content_changed();
     vbr_generation_global(vbr_mutation_registrant::full_reset, vbr_operation_class::controller);
     if (vbr_ownership_) {
         vbr_ownership_->clear_all();
@@ -7594,6 +7678,7 @@ double llama_kv_cache::kv_bpv() const {
 llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
     llama_memory_vbr_state_data st = {};
     st.representation_epoch = vbr_representation_epoch();
+    st.checkpoint_epoch     = vbr_checkpoint_epoch();
     st.retier_freeze_depth       = other ? other->vbr_retier_freeze_depth_       : vbr_retier_freeze_depth_;
     st.retier_env_freeze         = other ? other->vbr_freeze_                    : vbr_freeze_;
     st.retier_freeze_enters      = other ? other->vbr_retier_freeze_enters_      : vbr_retier_freeze_enters_;
@@ -10605,7 +10690,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     // state_read_data adopts bytes in their native current tier (including mixed-tier caches).
     // Count the completed adoption once, independently of how many streams it populated.
     if (imported) {
-        vbr_representation_changed();
+        vbr_attention_content_changed();
         vbr_generation_global(
                 seq_id == -1
                         ? vbr_mutation_registrant::whole_import

@@ -305,12 +305,36 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = true;
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id, p0, p1));
+    res = res & kv_base->seq_rm_transient(seq_id, p0, p1);
+    res = res & kv_swa ->seq_rm_transient(seq_id, p0, p1);
+    return res;
+}
+
+bool llama_kv_cache_iswa::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_transient(seq_id, p0, p1);
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
             iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
                               vbr_operation_class::state_api, seq_id_dst, p0, p1));
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_kv_cache_iswa::try_seq_cp_transient(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id_dst, p0, p1));
+    const bool base = kv_base->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
+    const bool swa  = kv_swa ->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
+    return base && swa;
 }
 
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
@@ -498,6 +522,8 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     // Addition would make (base + 1, swa) collide with (base, swa + 1).
     r.representation_epoch     = b.representation_epoch;
     r.representation_epoch_swa = s.representation_epoch;
+    r.checkpoint_epoch         = b.checkpoint_epoch;
+    r.checkpoint_epoch_swa     = s.checkpoint_epoch;
     // Scoped entry/exit is parent-coordinated, so depth and scope counts agree whenever both
     // children are active. max also handles a model whose base or SWA side has no VBR layers.
     r.retier_freeze_depth  = std::max(b.retier_freeze_depth, s.retier_freeze_depth);

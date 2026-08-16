@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact.h"
+#include "llama-bit-ops.h"
 
 #include "llama-sha256.h"
 
@@ -538,7 +539,7 @@ bool validate_generation_record(
                 first = false;
                 prior_page = page.page_index;
                 for (uint64_t word : page.covered_mask) {
-                    cardinality += uint64_t(__builtin_popcountll(word));
+                    cardinality += llama_popcount_u64(word);
                 }
             }
             if (cardinality != stream.captured_dependency_count) {
@@ -1194,7 +1195,7 @@ bool stash_reference_valid(
         first = false;
         prior_page = page.page_index;
         for (uint64_t word : page.covered_mask) {
-            cardinality += uint64_t(__builtin_popcountll(word));
+            cardinality += llama_popcount_u64(word);
         }
     }
     return cardinality == reference.captured_sink_count;

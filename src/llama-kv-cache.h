@@ -166,7 +166,11 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -198,6 +202,13 @@ public:
     // clear/reset/import. It never resets, so cursor rewind cannot create an ABA.
     uint64_t vbr_representation_epoch() const {
         return other ? other->vbr_representation_epoch() : vbr_representation_epoch_;
+    }
+
+    // Checkpoint-facing attention-content lineage. In-place retiering preserves the live
+    // sequence and therefore does not move this counter. Clear/reset, occupied-cell reuse and
+    // state adoption do move it, so recurrent-only checkpoints cannot survive an ABA.
+    uint64_t vbr_checkpoint_epoch() const {
+        return other ? other->vbr_checkpoint_epoch() : vbr_checkpoint_epoch_;
     }
 
     // Revision-9 adapter over the cache's canonical dependency index used by
@@ -640,9 +651,14 @@ private:
     // a free-VRAM-clamp wave (or a promote map-retry) can flip tiers MID-band where the n_kv
     // shape check alone would still allow reuse.
     uint64_t vbr_tier_epoch_ = 0;
-    // Bumped once per representation-changing operation (degrade, promote, occupied-cell reuse,
-    // clear/full-reset, native state import). Never derive this from or reset it with the cursor.
+    // Bumped once per representation-changing operation (retier, attention sequence edit,
+    // occupied-cell reuse, clear/full-reset, native state import). Never derive this from or
+    // reset it with the cursor.
     uint64_t vbr_representation_epoch_ = 0;
+    // Bumped only when the attention-content lineage changes. A tier transcode changes storage
+    // representation but preserves every logical KV row, so it must not invalidate a
+    // recurrent-only checkpoint paired with that live attention prefix.
+    uint64_t vbr_checkpoint_epoch_ = 0;
     // Revision-9 A1 shadow generations. Allocated only for a construction-final armed VBR
     // controller; aliases delegate to their canonical owner and inert caches allocate nothing.
     // No current checkpoint read consults this store until the A2 four-way ratchet lands.
@@ -969,8 +985,18 @@ private:
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
     bool   vbr_stash_dirty_   = false;
+    enum class seq_rm_mode : uint8_t {
+        public_commit,
+        nested_commit,
+        dry_run,
+    };
     void     vbr_full_reset();                        // cache empty: undo every degrade (lossless)
-    void     vbr_representation_changed();             // monotone checkpoint change detector
+    void     vbr_representation_changed();             // monotone representation change detector
+    void     vbr_attention_content_changed();          // content mutation: representation + checkpoint lineage
+    bool     seq_rm_impl(llama_seq_id seq_id, llama_pos p0, llama_pos p1, seq_rm_mode mode);
+    void     seq_cp_impl(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+            llama_pos p0, llama_pos p1, bool publish_lineage);
     vbr_generation_tracker *       vbr_generation_tracker_mut();
     const vbr_generation_tracker * vbr_generation_tracker_get() const;
     static bool vbr_generation_cell_has_seq_cb(
