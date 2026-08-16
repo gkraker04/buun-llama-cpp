@@ -27,8 +27,8 @@ int tier_rank(ggml_type type) noexcept {
 std::array<uint8_t, 32> tree_digest(
         const std::vector<std::array<uint8_t, 32>> & children) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] = "buun.vbr.downward/tree-policy";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    static constexpr char domain_label[] = "buun.vbr.downward/tree-policy";
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.u32(VBR_DOWNWARD_RECIPE_VERSION);
     writer.u64(children.size());
     for (const auto & digest : children) {
@@ -106,9 +106,9 @@ std::array<uint8_t, 32> vbr_downward_build_identity(
             return {};
         }
         llama_sha256_writer writer;
-        static constexpr char DOMAIN[] =
+        static constexpr char domain_label[] =
             "buun.vbr.downward/build-identity/v1";
-        writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+        writer.string(domain_label, sizeof(domain_label) - 1);
         writer.u32(recipe.version);
         writer.u32(uint32_t(recipe.source_type));
         writer.u32(uint32_t(recipe.target_type));

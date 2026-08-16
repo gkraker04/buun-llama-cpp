@@ -55,8 +55,8 @@ std::string opaque_reference(
         llama_cache_acct_artifact_id artifact,
         const std::string & tenant) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] = "buun.vbr.server-reference/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    static constexpr char domain_label[] = "buun.vbr.server-reference/v1";
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.u64(nonce);
     writer.u64(ordinal);
     writer.u64(artifact.v);

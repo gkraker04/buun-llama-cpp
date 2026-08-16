@@ -261,8 +261,8 @@ uint64_t server_cache_control_idempotency_digest(
     }
     try {
         llama_sha256_writer writer;
-        static constexpr char DOMAIN[] = "buun.cache-control-idempotency/v1";
-        writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+        static constexpr char domain_label[] = "buun.cache-control-idempotency/v1";
+        writer.string(domain_label, sizeof(domain_label) - 1);
         writer.string(text.data(), text.size());
         const auto digest = writer.finish();
         uint64_t out = 0;

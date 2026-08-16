@@ -238,10 +238,10 @@ vbr_artifact_byte_source artifact_segment_chain::source() const noexcept {
 
 std::array<uint8_t, 32> vbr_capture_stream_digest(
         const artifact_segment_chain & chain) noexcept {
-    static constexpr char DOMAIN[] =
+    static constexpr char domain_label[] =
         "buun.vbr.capture.segment-stream";
     llama_sha256_writer hash;
-    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.string(domain_label, sizeof(domain_label) - 1);
     hash.u64(chain.size());
     std::array<uint8_t, 64*1024> scratch;
     for (uint64_t offset = 0; offset < chain.size();) {
@@ -349,9 +349,9 @@ vbr_capture_stream_status vbr_pinned_chunk_ring::stream(
 
     std::deque<vbr_pinned_chunk_lease> pending;
     llama_sha256_writer hash;
-    static constexpr char DOMAIN[] =
+    static constexpr char domain_label[] =
         "buun.vbr.capture.segment-stream";
-    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.string(domain_label, sizeof(domain_label) - 1);
     hash.u64(source.size);
 
     const auto synchronize_only = [&]() noexcept {

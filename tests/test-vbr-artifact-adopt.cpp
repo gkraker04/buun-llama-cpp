@@ -1,4 +1,5 @@
 #include "llama-vbr-artifact-adopt.h"
+#include "llama-bit-ops.h"
 
 #include "common.h"
 #include "llama-kv-cache.h"
@@ -2740,7 +2741,7 @@ static bool f42a_model_backed_adoption(
                     for (const auto & page :
                             reference->stash_reference.covered_sink_pages) {
                         for (uint64_t word : page.covered_mask) {
-                            covered += uint64_t(__builtin_popcountll(word));
+                            covered += llama_popcount_u64(word);
                         }
                     }
                     std::fprintf(stderr,

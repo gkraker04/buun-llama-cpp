@@ -84,9 +84,9 @@ static std::string server_cache_capture_tenant_key(
         credential = "authenticated-local";
     }
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] =
+    static constexpr char domain_label[] =
         "buun.vbr.server-tenant/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.string(credential.data(), credential.size());
     const auto digest = writer.finish();
     static constexpr char HEX[] = "0123456789abcdef";

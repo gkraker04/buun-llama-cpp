@@ -1,4 +1,5 @@
 #include "llama-vbr-extent.h"
+#include "llama-bit-ops.h"
 
 #include <algorithm>
 #include <limits>
@@ -359,7 +360,7 @@ bool vbr_ownership_index::enumerate_owned(uint32_t stream, llama_seq_id seq_id,
         for (uint32_t w = 0; w < MASK_WORDS_PER_PAGE; ++w) {
             uint64_t word = view->page_masks[size_t(page) * MASK_WORDS_PER_PAGE + w];
             while (word != 0) {
-                const uint32_t bit  = static_cast<uint32_t>(__builtin_ctzll(word));
+                const uint32_t bit  = llama_countr_zero_u64(word);
                 const uint32_t cell = page * VBR_GENERATION_PAGE_CELLS + w * 64 + bit;
                 cells.push_back(cell);
                 word &= word - 1;

@@ -100,9 +100,9 @@ std::array<uint8_t, 32> representation_rotation_identity(
         int32_t type,
         bool value_side) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] =
+    static constexpr char domain_label[] =
         "buun.vbr.codec-rotation/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.u32(uint32_t(type));
     writer.u32(value_side);
     const auto * matrix = value_side
@@ -117,9 +117,9 @@ std::array<uint8_t, 32> representation_meansub_identity(
         const vbr_explicit_representation_policy & policy,
         bool & ok) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] =
+    static constexpr char domain_label[] =
         "buun.vbr.codec-meansub/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.u32(uint32_t(type));
     writer.u32(value_side);
 
@@ -777,8 +777,8 @@ uint64_t import_tree_digest(
         llama_memory_i & memory,
         const std::vector<llama_memory_tree_child> & tree) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] = "buun.vbr.import-tree/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    static constexpr char domain_label[] = "buun.vbr.import-tree/v1";
+    writer.string(domain_label, sizeof(domain_label) - 1);
     writer.u64(uint64_t(reinterpret_cast<uintptr_t>(&memory)));
     for (const auto & child : tree) {
         writer.u32(child.child_id);
@@ -795,8 +795,8 @@ uint64_t import_tree_digest(
 uint64_t import_policy_epoch(
         const std::vector<llama_memory_tree_child> & tree) {
     llama_sha256_writer writer;
-    static constexpr char DOMAIN[] = "buun.vbr.import-policy/v1";
-    writer.string(DOMAIN, sizeof(DOMAIN) - 1);
+    static constexpr char domain_label[] = "buun.vbr.import-policy/v1";
+    writer.string(domain_label, sizeof(domain_label) - 1);
     size_t n_attention = 0;
     for (const auto & child : tree) {
         if (!child.attention) {
