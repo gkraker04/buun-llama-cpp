@@ -4638,22 +4638,9 @@ private:
                 }
             }
 
-            // This special solve is the final context advert: unlike the ordinary VBR growth
-            // ceiling, it must be fillable from the memory that is actually available at
-            // startup.  Charge memory already unavailable on each target GPU (CUDA/driver
-            // residency, plus any non-cooperating process) instead of letting the total-based
-            // dry fit spend it a second time.
-            std::vector<size_t> startup_unavailable(margins_base.size(), 0);
-            for (size_t i = 0; i < tgt_devices.size() && i < margins_base.size(); ++i) {
-                if (ggml_backend_dev_type(tgt_devices[i]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    continue;
-                }
-                size_t free = 0;
-                size_t total = 0;
-                ggml_backend_dev_memory(tgt_devices[i], &free, &total);
-                startup_unavailable[i] = total > free ? total - free : 0;
-                margins_base[i] += startup_unavailable[i];
-            }
+            // common_fit_params already projects allocations from each device's currently free
+            // memory. Do not also add (total - free) to the margin here: that would charge CUDA,
+            // driver, and co-tenant residency twice and under-advertise the swap configuration.
 
             std::vector<size_t> mmproj_by_device(margins_base.size(), 0);
             auto mparams_gpu = make_mmproj_params(true);
@@ -4816,8 +4803,6 @@ private:
             SRV_INF("mmproj GPU swap fit %s and validated: n_ctx=%u, device 0 margin=%.2f MiB\n",
                     converged ? "converged" : "bounded", params_base.n_ctx,
                     params_base.fit_params_target[0] / (1024.0 * 1024.0));
-            SRV_INF("mmproj GPU swap fit: device 0 startup-unavailable charge=%.2f MiB\n",
-                    startup_unavailable[0] / (1024.0 * 1024.0));
         }
 
         // Native MTP contributes a context-dependent KV cache plus compute buffers after the
