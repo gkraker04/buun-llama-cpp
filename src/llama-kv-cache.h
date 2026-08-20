@@ -4,12 +4,24 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-vbr-generation.h"
+#include "llama-vbr-hard-seal.h"
+#include "llama-vbr-downward.h"
+#include "llama-vbr-policy.h"
+#include "llama-vbr-transaction.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
+#include <array>
+#include <cstdio>
 #include <map>
+#include <memory>
+#include <exception>
+#include <limits>
+#include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -18,18 +30,20 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class vbr_unit_build;
+class vbr_pinned_chunk_ring;
+class vbr_kv_import_session;
+struct vbr_validated_child_plan;
+struct vbr_target_unit_snapshot;
+class vbr_import_receipt_group;
+struct vbr_capture_stream_stats;
+enum class vbr_explicit_generation_failure : uint8_t;
+enum class vbr_explicit_size_failure : uint8_t;
+struct vbr_artifact_stream_placement;
 
 //
 // llama_kv_cache
 //
-
-// Dynamic VBR (S3): one step of the measured decode-time degrade price order —
-// knock (layer il, K/V side) down to `tier` (a vbr_tier index, see llama-kv-cache.cpp).
-struct vbr_degrade_step {
-    uint8_t il;
-    uint8_t is_v;
-    uint8_t tier;
-};
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -145,13 +159,18 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool can_seq_rm_partial() const override { return true; }
 
     void breathe() override;
 
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -179,21 +198,87 @@ public:
     // e.g. the gemma4 MTP assistant, follow the target's VBR tier changes this way).
     uint64_t vbr_tier_epoch() const { return other ? other->vbr_tier_epoch() : vbr_tier_epoch_; }
 
+    // Checkpoint-facing semantic counter: unlike the graph tier fence, this also covers
+    // clear/reset/import. It never resets, so cursor rewind cannot create an ABA.
+    uint64_t vbr_representation_epoch() const {
+        return other ? other->vbr_representation_epoch() : vbr_representation_epoch_;
+    }
+
+    // Checkpoint-facing attention-content lineage. In-place retiering preserves the live
+    // sequence and therefore does not move this counter. Clear/reset, occupied-cell reuse and
+    // state adoption do move it, so recurrent-only checkpoints cannot survive an ABA.
+    uint64_t vbr_checkpoint_epoch() const {
+        return other ? other->vbr_checkpoint_epoch() : vbr_checkpoint_epoch_;
+    }
+
+    // Revision-9 adapter over the cache's canonical dependency index used by
+    // explicit VBR artifact capture.
+    bool vbr_generation_capture_live_guarded(
+            uint32_t child_id,
+            llama_seq_id seq_id,
+            llama_pos computation_frontier,
+            vbr_checkpoint_generation_controller & output,
+            vbr_artifact_stream_placement * placement = nullptr,
+            vbr_explicit_generation_failure * failure = nullptr) const;
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
 
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    bool vbr_operation_armed() const override;
+    // C4 boundary service: true while this cache's tracker is latched unavailable or its pool
+    // has unresolved recovery-ring work. The update context reports an update NEEDED in this
+    // state so the quarantine drain + monotone re-arm in update() actually run at quiet decode
+    // boundaries (a NO_UPDATE short-circuit would starve recovery until an unrelated shift).
+    bool vbr_recovery_service_pending() const;
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
+    bool vbr_retier_freeze_active() const {
+        return other ? other->vbr_retier_freeze_active() : vbr_retier_freeze_depth_ > 0;
+    }
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
-    // co-tenancy: bytes a demand-driven shed could free on `device` — max shed over the
-    // remaining f16->t8 band, net of the projected dequant-scratch growth it would cost.
-    // 0 when the band is spent/absent, the order is a custom override, or no VMM pool
-    // lives on the device. Memoized; safe to call between boundaries (marker writes).
-    size_t vbr_shed_available(int device) const;
-
     void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
                              uint64_t & offer, uint64_t & pending) const override;
+
+    bool vbr_ledger_tree_active() const override {
+        return vbr_ledger_owner_ && vbr_vmm_active();
+    }
+
+    // Composite-cache ledger topology. A standalone cache is its own implicit root.
+    // iSWA attaches both children after their pools exist so ownership follows the
+    // actually active controller and the last child in parent execution order is root.
+    bool vbr_controller_active() const { return vbr_vmm_active(); }
+    void vbr_attach_ledger_tree(llama_kv_cache * root, llama_kv_cache * peer, double device_share);
+    void vbr_finalize_ledger_tree();
+    void vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran);
+
+    // A share-linked drafter consumes f16 dequant scratch on its own compute backend while
+    // reading this cache's tensors. The owner-side donation planner needs the terminal
+    // requirement for every DISTINCT registered backend, not merely its own backend.
+    struct vbr_shared_scratch_plan {
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        size_t k_bytes = 0;
+        size_t v_bytes = 0;
+    };
+    using vbr_shared_scratch_visitor = std::function<void(const vbr_shared_scratch_plan &)>;
+    using vbr_device_watermarks = std::map<int, uint32_t>;
+
+    // Visit one plan per distinct live consumer compute backend. `terminal_types` is indexed
+    // like vbr_floor_sim_result::end_types; an empty vector (or GGML_TYPE_COUNT slot) uses the
+    // tensor's live type. `terminal_watermarks` must name every registered consumer device;
+    // device-local endpoints may differ after partial pool growth. The registry lock remains held
+    // through each callback, so a drafter's context-teardown detach cannot return and free the
+    // backend while it is being queried.
+    void vbr_shared_scratch_visit(
+            const std::vector<ggml_type> & terminal_types,
+            const vbr_device_watermarks & terminal_watermarks,
+            const vbr_shared_scratch_visitor & visitor) const;
+
+    void vbr_shared_scratch_detach() override;
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
@@ -218,6 +303,15 @@ public:
     vbr_floor_sim_result vbr_floor_sim(double floor_bpv, bool pooled_only,
             ggml_type entry_k = GGML_TYPE_COUNT, ggml_type entry_v = GGML_TYPE_COUNT) const;
 
+    // E1.0 read-only policy classification. Enforcement remains an E1.1c
+    // controller concern; this hook cannot change controller decisions.
+    bool vbr_hard_seal_classify(
+        vbr_hard_seal_classification & out) const noexcept;
+    void vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) override;
+    bool vbr_hard_seal_blocked_take(bool decode_failed) override;
+    void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & out) override;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -225,6 +319,9 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    llama_turbo_meansub_ref get_turbo_meansub_ref(int32_t il) const;
+
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     //
     // graph_build API
@@ -255,6 +352,15 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // Side-effect-free admission preflight.  iSWA uses this to prove that both
+    // child caches can place the whole batch before either child enters prepare().
+    slot_info_vec_t plan_slots(const std::vector<llama_ubatch> & ubatches);
+
+    // Complete preparation using a slot plan produced by plan_slots().
+    slot_info_vec_t prepare_with_slots(
+            const std::vector<llama_ubatch> & ubatches,
+            slot_info_vec_t                   sinfos);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -263,7 +369,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // commit=false is used only by plan_slots() to suppress non-metadata side effects
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
 
     //
     // input API
@@ -287,6 +394,114 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    friend class vbr_live_capture_adapter;
+    friend class vbr_kv_import_session;
+    struct vbr_capture_unit_request {
+        uint32_t child_id = 0;
+        const void * bindings = nullptr;
+    };
+    struct vbr_capture_unit_plan {
+        struct shard {
+            void * pool = nullptr;
+            void * extent = nullptr;
+            uint32_t shard_index = 0;
+            uint32_t topology_index = UINT32_MAX;
+            uint16_t device_ordinal = UINT16_MAX;
+            uint32_t lane = UINT32_MAX;
+            uint64_t payload_bytes = 0;
+            uint64_t row_bytes = 0;
+            uint64_t columns = 0;
+            uint64_t stash_bytes = 0;
+        };
+        uint32_t child_id = 0;
+        uint32_t logical_unit = 0;
+        uint32_t capture_index = UINT32_MAX;
+        bool is_v = false;
+        vbr_unit_generation generation;
+        uint32_t n_stream = 0;
+        bool unified = false;
+        uint32_t wm_cells = 0;
+        std::vector<shard> shards;
+    };
+    struct vbr_capture_stability_token {
+        struct geometry {
+            uint32_t logical_unit = 0;
+            vbr_unit_generation generation;
+            uint32_t wm_cells = 0;
+            std::vector<const ggml_tensor *> tensors;
+            std::vector<size_t> byte_offsets;
+            std::vector<uint32_t> stash_valid;
+            std::vector<size_t> stash_offsets;
+        };
+        vbr_lineage_uuid lineage_uuid;
+        vbr_controller_instance_id instance_id;
+        uint64_t controller_generation = 0;
+        uint64_t mutation_serial = 0;
+        std::array<uint8_t, 32> degrade_order_digest = {};
+        std::array<uint8_t, 32> policy_digest = {};
+        uint64_t degrade_cursor = 0;
+        int32_t floor_type = -1;
+        uint64_t pressure_independent_settings = 0;
+        bool completed_wave = false;
+        std::vector<geometry> units;
+    };
+
+    bool vbr_capture_settle() noexcept;
+    bool vbr_capture_size_pass(
+        const vbr_capture_unit_request & request,
+        std::vector<vbr_capture_unit_plan> & output,
+        vbr_capture_stability_token & stability,
+        vbr_explicit_size_failure * failure = nullptr) const noexcept;
+    bool vbr_capture_stream_unit(
+        const vbr_capture_unit_plan & plan,
+        vbr_unit_build & sink,
+        vbr_pinned_chunk_ring & ring,
+        vbr_capture_stream_stats & stats) const noexcept;
+    bool vbr_capture_stability_matches(
+        const vbr_capture_stability_token & token) const noexcept;
+    bool vbr_capture_generation_record(
+        uint32_t child_id,
+        checkpoint_child_dependency_mode dependency_mode,
+        llama_seq_id sequence,
+        llama_pos frontier,
+        vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement = nullptr,
+        vbr_explicit_generation_failure * failure = nullptr) const noexcept;
+    bool vbr_capture_policy_snapshot(
+        vbr_capture_stability_token & output) const noexcept;
+    bool vbr_downward_reserve_import(
+        const std::vector<const vbr_validated_child_plan *> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept;
+    bool vbr_downward_policy_input(
+        const std::vector<ggml_type> & source_types,
+        uint64_t source_cursor,
+        uint32_t projected_wm_cells,
+        int demanded_device,
+        vbr_downward_policy_child & output) const noexcept;
+    bool vbr_policy_priced_steps(
+        std::vector<ggml_type> & sim, size_t start_cursor,
+        int demanded_device, uint32_t watermark, bool fixed_watermark,
+        bool fail_closed, llama_vbr_policy::child & output,
+        vbr_hard_seal_consult_session * seal_session = nullptr) const;
+    bool vbr_downward_bind_target_unit(
+        ggml_type source_type,
+        const vbr_downward_policy_projection & projection,
+        uint32_t projection_child,
+        vbr_target_unit_snapshot & output) const noexcept;
+    vbr_downward_transform_status vbr_downward_transform_import(
+        const vbr_validated_child_plan & plan,
+        bool stashless,
+        uint32_t & stash_valid,
+        uint32_t & edge_reached) noexcept;
+    bool vbr_import_source_alias(
+        const ggml_tensor & destination,
+        ggml_type source_type,
+        ggml_tensor & output) const noexcept;
+    void vbr_import_set_unit_type_noalloc(
+        uint32_t logical_unit, ggml_type type) noexcept;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -300,6 +515,8 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        llama_turbo_meansub_ref turbo_meansub_ref;
     };
 
     // Dynamic VBR (M2): per-(layer,side) descriptor over the shared KV pool buffer. Tier is NOT
@@ -331,8 +548,8 @@ private:
         char *                base    = nullptr; // ggml_backend_buffer_get_base(buf)
         size_t                size    = 0;        // total pool bytes
         size_t                used    = 0;        // high-water of placed extents (log-only)
-        size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
-        size_t                budget_base = 0;      // init-armed/fallback share: the re-derivation floor
+        size_t                budget  = 0;         // current per-pool mapped-physical budget
+        size_t                budget_base = 0;      // explicit arm or floor-layout share: re-derivation floor
         // vbr_budget_eff memo: one live free-VRAM query per pool per boundary (the degrade loop
         // and promote hysteresis both consult it repeatedly within one boundary)
         mutable uint64_t      budget_eff_stamp = ~0ull;
@@ -342,6 +559,12 @@ private:
         // backend VBR vtable that owns this pool's device (resolved from the buffer type's
         // registry at init; a pool only exists if the backend exports it)
         const ggml_vbr_backend_iface * be = nullptr;
+        // non-owning main compute backend whose context owns the fattn Q/K/V scratch. This is
+        // intentionally distinct from `backend` below, which is a dedicated transcode stream.
+        // Valid only while llama_context::backends is alive. llama_context declares `memory`
+        // before `backends`, so backends are destroyed first: KV teardown must never dereference
+        // this handle (runtime reserve calls happen while the complete context is alive).
+        ggml_backend_t compute_backend = nullptr;
         // S2 (option C): VMM-backed pool — per-tensor fixed VA slots, physical pages mapped on
         // demand. When set, `size` is the VA reservation (not physical); each extent's byte_off is
         // page-aligned so tensor-tail unmaps never straddle a neighbor's pages.
@@ -355,6 +578,8 @@ private:
         uint64_t scratch_rows_epoch = ~0ull;
         size_t   scratch_k_row      = 0;
         size_t   scratch_v_row      = 0;
+        size_t   scratch_k_reserved = 0; // largest successful backend-global reserve requested here
+        size_t   scratch_v_reserved = 0;
         // co-tenancy (P2): PCI bus id (resolved once from the backend device; empty = none)
         // and the summed unamortized grant decrement vbr_budget_eff subtracts
         std::string busid;
@@ -367,10 +592,54 @@ private:
         ggml_backend_t backend      = nullptr;
         bool           wave_pending = false;      // async GPU work enqueued, fence not yet armed
         std::vector<std::pair<size_t, size_t>> unmap_deferred; // {pool byte_off, len}
-        // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): pristine first-degrade snapshot of the
-        // first N rows per tensor — permanently-hot sink rows re-encode from it at every hop
-        ggml_backend_buffer_t stash_buf = nullptr;
+        // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): one fixed-VA slab per KV pool. Extent
+        // offsets are assigned once at construction; physical pages are mapped grow-only when an
+        // extent first captures usable tapped-domain rows. This keeps allocation failure outside
+        // tier mutation and makes current/projected physical occupancy exactly queryable.
+        struct ggml_vbr_vmm_pool * stash_vmm = nullptr;
+        size_t                     stash_size = 0;       // page-padded VA reservation size
+        // F4.2b persistent workspace/stash receipts have exactly the owning
+        // pool/side-backend lifetime.  The ledger remains the charge-once
+        // authority; this holder owns only the committed C references.
+        std::unique_ptr<vbr_downward_resource_receipts> downward_receipts;
     };
+    // A share-linked cache aliases another context's K/V tensors but executes attention on
+    // this context's compute backends. Since fattn scratch is backend-context-owned, each
+    // device needs scratch-only metadata here even though the drafter intentionally owns no
+    // VMM pool or VBR controller. Tensor pointers are non-owning aliases whose live types are
+    // authoritative; row maxima are recomputed only when the delegated owner epoch changes.
+    struct vbr_shared_scratch_binding {
+        ggml_backend_buffer_t buf = nullptr;
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        std::vector<ggml_tensor *> k;
+        std::vector<ggml_tensor *> v;
+        uint64_t rows_epoch = ~0ull;
+        size_t k_row = 0;
+        size_t v_row = 0;
+    };
+
+    struct vbr_shared_scratch_registry;
+    struct vbr_shared_scratch_registration {
+        std::weak_ptr<vbr_shared_scratch_registry> registry;
+        uint64_t id = 0;
+
+        vbr_shared_scratch_registration() = default;
+        vbr_shared_scratch_registration(
+                const std::shared_ptr<vbr_shared_scratch_registry> & registry,
+                uint64_t id);
+        ~vbr_shared_scratch_registration();
+
+        vbr_shared_scratch_registration(const vbr_shared_scratch_registration &) = delete;
+        vbr_shared_scratch_registration & operator=(const vbr_shared_scratch_registration &) = delete;
+        vbr_shared_scratch_registration(vbr_shared_scratch_registration && other) noexcept;
+        vbr_shared_scratch_registration & operator=(vbr_shared_scratch_registration && other) noexcept;
+
+        void reset();
+    };
+    vbr_shared_scratch_registration vbr_shared_scratch_register(
+            const vbr_shared_scratch_binding & binding);
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
@@ -382,6 +651,33 @@ private:
     // a free-VRAM-clamp wave (or a promote map-retry) can flip tiers MID-band where the n_kv
     // shape check alone would still allow reuse.
     uint64_t vbr_tier_epoch_ = 0;
+    // Bumped once per representation-changing operation (retier, attention sequence edit,
+    // occupied-cell reuse, clear/full-reset, native state import). Never derive this from or
+    // reset it with the cursor.
+    uint64_t vbr_representation_epoch_ = 0;
+    // Bumped only when the attention-content lineage changes. A tier transcode changes storage
+    // representation but preserves every logical KV row, so it must not invalidate a
+    // recurrent-only checkpoint paired with that live attention prefix.
+    uint64_t vbr_checkpoint_epoch_ = 0;
+    // Revision-9 A1 shadow generations. Allocated only for a construction-final armed VBR
+    // controller; aliases delegate to their canonical owner and inert caches allocate nothing.
+    // No current checkpoint read consults this store until the A2 four-way ratchet lands.
+    std::unique_ptr<vbr_generation_tracker> vbr_generation_;
+    // A2 dual-view ownership index: updated in the SAME registrant transactions that stamp the
+    // tracker; capture consumes rank_below for scan-free exact dependency cardinality.
+    std::unique_ptr<vbr_ownership_index>    vbr_ownership_;
+    // F4 import receipts keep every committed adoption/staging reference
+    // accounted until reset/retirement. This is the fail-closed side of the
+    // TQ2 handoff: no release-first window can exist before a live producer
+    // gains an explicit serial-bound acknowledgement seam.
+    // One receipt group is shared by every attention child in a composite
+    // import. It releases only after the LAST child resets/retires, so a
+    // sequential tree clear cannot expose an unaccounted still-live sibling.
+    std::shared_ptr<vbr_import_receipt_group> vbr_import_receipt_;
+    bool vbr_import_in_progress_ = false;
+    vbr_operation_id vbr_import_operation_ = {};
+    void vbr_import_receipts_release() noexcept;
+    void vbr_import_receipts_release_if_empty() noexcept;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
@@ -392,7 +688,7 @@ private:
     // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
     // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
     size_t t8_band_end_ = 0;
-    // peer-yield consent bound (Preston 2026-07-20, explicit-floor-as-consent): a TYPED
+    // peer-yield consent bound (buun 2026-07-20, explicit-floor-as-consent): a TYPED
     // --vbr-floor (flag or VBR_MIN_BITS env) consents demand sheds down to the floor —
     // the ledger is per-uid, so the demander is the same human who typed it. A defaulted
     // floor keeps the conservative restorable band. 0 = demand shedding disabled.
@@ -404,12 +700,6 @@ private:
                                 : std::min(vbr_degrade_limit_, t8_band_end_);
     }
     bool vbr_floor_typed_ = false;
-    // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
-    // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
-    mutable uint64_t            shed_avail_epoch_ = ~0ull;
-    mutable uint32_t            shed_avail_wm_    = 0;
-    mutable std::vector<size_t> shed_avail_pool_;
-
     // ---- co-tenancy donor state (P2) ----
     // grant rows: private in-memory liabilities recording a demand-shed's decrement,
     // keyed (pid, starttime, ver) with the demanded device's busid; one row per pool the
@@ -423,7 +713,7 @@ private:
         uint64_t    ver;
         size_t      pool_idx;
         uint64_t    bytes;
-        uint64_t    bytes_now_at_grant;
+        uint64_t    bytes_now_at_grant; // staggered threshold: aggregate landed bytes consume rows once
         bool        collateral;
     };
     std::vector<vbr_grant_row> vbr_grants_;
@@ -436,10 +726,9 @@ private:
     bool     vbr_ledger_force_  = false; // pre-check hit: run the full controller path
     // last published marker fields per busid (republish = rename only on change)
     std::map<std::string, std::pair<uint64_t, uint64_t>> vbr_marker_pub_; // {shed_avail, grant_pending}
-    // our marker's created_ts (donor-rank input; 0 until first publish) and the per-device
-    // granted-but-not-yet-flushed bytes (set at shed commit, cleared at the first scan
-    // event after that wave's deferred unmaps flush)
-    uint64_t vbr_marker_created_ts_ = 0;
+    // Authoritative first-publish timestamps returned by successful marker publications,
+    // plus per-device granted-but-not-yet-flushed bytes.
+    std::map<std::string, uint64_t> vbr_marker_created_ts_;
     std::map<std::string, uint64_t> vbr_grant_pending_;
 
     // ---- P3 presence census ----
@@ -463,17 +752,20 @@ private:
     uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
     std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
     std::vector<size_t> vbr_pre_deficit_;    // per-pool pre-own-loop deficit (the honest ask)
+    bool     vbr_runtime_was_over_ = false;  // current boundary's child-local pressure sample
+    uint32_t vbr_runtime_wm_       = 0;
     void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
-    void   vbr_ledger_scan_service(uint32_t wm_next); // composes the four phases below
+    void   vbr_ledger_scan_service(uint32_t n_tokens); // composes the four phases below
     void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
     bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
     bool   vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
                                const std::vector<llama_vram_peer_marker> & peers,
-                               uint64_t now, uint32_t wm_next);
+                               const std::set<std::string> & announced,
+                               uint64_t now, uint32_t n_tokens);
     void   vbr_grant_pending_clear();
-    void   vbr_markers_publish(uint64_t now);
+    void   vbr_markers_publish(std::set<std::string> * changed = nullptr);
     void   vbr_maybe_promote(uint32_t wm_next); // gated promote step (boundary + tick)
     void   vbr_arm_wave_fences();               // arm fences for queued transcode waves
     vbr_pool * vbr_find_pool(const std::string & busid);
@@ -481,21 +773,161 @@ private:
     size_t vbr_total_grant_decrement() const;     // promote freeze gate
     const std::string & vbr_pool_busid(vbr_pool & p) const;
 
-public:
-    // co-tenancy: exactly one cache per memory tree runs the ledger protocol; composite
-    // parents (iSWA) demote all but one child and hand the owner a sibling pointer so the
-    // tree's offer is the SUM and demand targets split by offer weight. Non-owners keep
-    // every local mechanism (budget, band, waves, grants on their own pools) but never
-    // scan, serve, or publish themselves.
-    void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
-    void vbr_set_ledger_sibling(llama_kv_cache * sib) { vbr_ledger_sibling_ = sib; }
-    size_t vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
-private:
+    enum class vbr_tx_status {
+        no_capacity,
+        retryable_no_tier_mutation,
+        committed,
+    };
+    struct vbr_tx_result {
+        vbr_tx_status status = vbr_tx_status::no_capacity;
+        uint64_t credited = 0;
+    };
     bool vbr_ledger_owner_ = true;
-    llama_kv_cache * vbr_ledger_sibling_ = nullptr;
+    llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
+    llama_kv_cache * vbr_ledger_sibling_ = nullptr; // symmetric peer backlink in a composite
+    double vbr_tree_device_share_ = 1.0;            // parent share before child normalization
+    llama_kv_cache *       vbr_tree_root();
+    const llama_kv_cache * vbr_tree_root() const;
+    bool   vbr_tree_forced() const;
+    void   vbr_tree_force();
+    bool   vbr_tree_budget_explicit() const;
+    size_t vbr_tree_total_grant_decrement() const;
+    struct vbr_tree_pool_ref {
+        llama_kv_cache * child = nullptr;
+        vbr_pool * pool = nullptr;
+    };
+    vbr_tree_pool_ref vbr_tree_find_pool(const std::string & busid);
+    size_t vbr_child_offer(const llama_kv_cache * child, const std::string & busid) const;
+    size_t vbr_tree_offer(const std::string & busid) const;
+    bool   vbr_tree_has_grant(const llama_vram_peer_claim & c) const;
+    struct vbr_stash_request {
+        const vbr_extent * extent = nullptr;
+        uint32_t           rows   = 0;
+    };
+
+    struct vbr_tx_extent_key {
+        size_t child_idx = 0;
+        size_t pool_idx  = 0;
+        size_t ikv       = 0;
+        bool   is_v      = false;
+        bool operator<(const vbr_tx_extent_key & other) const {
+            return std::tie(child_idx, pool_idx, ikv, is_v) <
+                   std::tie(other.child_idx, other.pool_idx, other.ikv, other.is_v);
+        }
+    };
+    struct vbr_tx_pool_key {
+        size_t child_idx = 0;
+        size_t pool_idx  = 0;
+        bool operator<(const vbr_tx_pool_key & other) const {
+            return std::tie(child_idx, pool_idx) < std::tie(other.child_idx, other.pool_idx);
+        }
+    };
+    struct vbr_tx_child {
+        llama_kv_cache * cache = nullptr;
+        uint32_t incoming_wm = 0;
+        size_t start_cursor = 0;
+        size_t final_cursor = 0;
+        uint64_t start_epoch = 0;
+        std::vector<ggml_type> types_before;
+        std::vector<ggml_type> types_after;
+        std::vector<size_t> sealed_deferred;
+    };
+    struct vbr_tx_step {
+        size_t child_idx = 0;
+        size_t order_idx = 0;
+        size_t slot = 0;
+        size_t ikv = 0;
+        bool is_v = false;
+        ggml_type type_a = GGML_TYPE_COUNT;
+        ggml_type type_b = GGML_TYPE_COUNT;
+    };
+    struct vbr_tx_endpoint {
+        vbr_pool * pool = nullptr;
+        vbr_extent * extent = nullptr;
+        size_t final_span = 0;
+        size_t slot_span = 0;
+        uint64_t baseline_total = 0;
+        uint64_t baseline_inside = 0;
+        uint64_t gross_release = 0;
+        bool touched = false;
+        bool live = false;
+    };
+    struct vbr_tx_workspace_group {
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t backend = nullptr;
+        int device = -1;
+        std::vector<llama_vbr_transaction::workspace_request> requests;
+    };
+    struct vbr_tx_stash_group {
+        int device = -1;
+        std::vector<vbr_stash_request> requests;
+    };
+    struct vbr_tx_scratch_group {
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t backend = nullptr;
+        int device = -1;
+        size_t k_need = 0;
+        size_t v_need = 0;
+        uint64_t physical_projected = 0;
+        bool owner_backend = false;
+    };
+    struct vbr_tx_grant_plan {
+        size_t child_idx = 0;
+        vbr_grant_row row;
+    };
+    struct vbr_shed_tx {
+        int demanded_device = -1;
+        uint64_t target = 0;
+        std::vector<vbr_tx_child> children;
+        std::vector<llama_vbr_policy::selection> policy_prefix;
+        std::vector<vbr_tx_step> steps;
+        std::map<vbr_tx_extent_key, vbr_tx_endpoint> endpoints;
+        std::map<vbr_tx_pool_key, vbr_tx_workspace_group> workspaces;
+        std::map<vbr_tx_pool_key, vbr_tx_stash_group> stashes;
+        std::map<ggml_backend_t, vbr_tx_scratch_group> scratches;
+        std::map<int, llama_vbr_transaction::device_cost> devices;
+        std::map<vbr_tx_extent_key, uint64_t> endpoint_baseline_total;
+        std::map<vbr_tx_extent_key, std::map<size_t, uint64_t>> endpoint_baseline_inside;
+        std::map<vbr_tx_pool_key, uint64_t> workspace_baseline;
+        std::map<vbr_tx_pool_key, uint64_t> stash_baseline;
+        std::map<ggml_backend_t, uint64_t> scratch_baseline;
+        std::map<vbr_tx_pool_key, uint64_t> gross_by_pool;
+        std::map<vbr_tx_pool_key, uint64_t> deferred_by_pool;
+        std::vector<vbr_tx_grant_plan> planned_grants;
+        bool snapshot_open = true;
+    };
+    bool vbr_tx_settle_tree();
+    bool vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const;
+    bool vbr_tx_hard_seal_allowed(vbr_shed_tx & tx);
+    bool vbr_tx_preflight(vbr_shed_tx & tx);
+    bool vbr_tx_map_endpoints(vbr_shed_tx & tx);
+    bool vbr_tx_prepare_commit(vbr_shed_tx & tx, const llama_vram_peer_claim & c);
+    bool vbr_tx_publish_zero_intent(const vbr_shed_tx & tx);
+    void vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_id);
+    void vbr_tx_suppress(const std::string & busid);
+    vbr_tx_result vbr_execute_tree_shed(
+            const llama_vram_peer_claim & c, uint64_t target, uint32_t n_tokens);
+
+    // A retryable transaction failure temporarily withdraws this device's offer. The bound is
+    // short enough to retry after physical capacity or marker state changes, but prevents every
+    // scan from immediately selecting the same resident again.
+    mutable std::map<std::string, uint64_t> vbr_offer_suppressed_until_;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    vbr_hard_seal_guard vbr_hard_seal_guard_;
+    bool vbr_hard_seal_blocked_ = false;
+    std::vector<vbr_hard_seal_subject> vbr_hard_seal_evidence_;
+    std::vector<size_t> vbr_hard_seal_deferred_;
+    std::vector<uint8_t> vbr_hard_seal_attempted_;
+    bool vbr_hard_seal_step_blocked(
+            size_t order_ordinal,
+            vbr_hard_seal_consult_session & session) const;
+    void vbr_hard_seal_evidence_record(size_t order_ordinal);
+    // A recoverable ordinary boundary reserve failed during this boundary/tick. prepare() fails the
+    // batch instead of executing over budget; idle breathe() retains the exact cursor and retries
+    // on a later tick after physical capacity changes. Transaction retry suppression is separate.
+    bool   vbr_reserve_failed_ = false;
     // prepare() boundaries since the last applied degrade step — promote cooldown basis
     // (deterministic, unlike wall time); promotes wait for a quiet window after any degrade
     uint32_t vbr_quiet_boundaries_ = 0;
@@ -505,27 +937,320 @@ private:
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
     bool     vbr_budget_explicit_  = false;
+    bool     vbr_budget_from_scalar_ = false;
+    // WS-0 (P1) deterministic freeze mode — env VBR_FREEZE, TEST/GATING ONLY. Neutralizes the two
+    // live-VRAM / co-tenancy inputs that make the tier schedule irreproducible run-to-run: the
+    // vbr_budget_eff clamp (live cudaMemGetInfo) and the ledger scan/precheck + wall-clock gates,
+    // so the schedule becomes a pure function of the fixed budget + occupancy. Requires an explicit
+    // VBR_BUDGET_MIB (else vbr_pool_reach re-derivation, which is !explicit-gated, is not frozen).
+    // OFF => every gated branch runs verbatim: a freeze-off build is bit-identical to a pre-freeze
+    // build (the P0 base-numerics ratchet). Never a production degrade-policy lever.
+    bool     vbr_freeze_           = false;
+    // F5 acceptance-only companion to VBR_FREEZE. The routed downward gate
+    // needs an empty target that retains the naturally selected tier vector;
+    // absent this exact env, empty boundaries retain their shipped full reset.
+    bool     vbr_f5_preserve_empty_tiers_ = false;
+    // WS-6: production scoped freeze of representation mutation. Orthogonal to WS-0's
+    // deterministic-input freeze above: nesting never changes the ledger/presence machinery.
+    struct vbr_retier_freeze_frame {
+        vbr_operation_id operation_id = {};
+        uint64_t started_ns = 0;
+    };
+    static constexpr size_t VBR_RETIER_FREEZE_MAX_DEPTH = 64;
+    std::array<vbr_retier_freeze_frame, VBR_RETIER_FREEZE_MAX_DEPTH> vbr_retier_freeze_stack_ = {};
+    uint32_t vbr_retier_freeze_depth_       = 0;
+    uint64_t vbr_retier_freeze_enters_      = 0;
+    uint64_t vbr_retier_freeze_exits_       = 0;
+    uint64_t vbr_retier_deferred_decisions_ = 0;
+    uint64_t vbr_retier_reconciles_         = 0;
+    uint64_t vbr_retier_outer_deferred_base_ = 0;
+    bool     vbr_retier_reconcile_pending_  = false;
+    bool     vbr_retier_defer(const char * decision);
+    bool     vbr_retier_take_reconcile(const char * boundary);
+    // WS-0 (P1) schedule-trace recorder — env VBR_TRACE=<path>, TEST/GATING ONLY. One line per
+    // boundary: phase, boundary#, degrade cursor, tier-vector FNV digest, watermark, used cells,
+    // mapped bytes. The L2 null arm needs two runs proven schedule-IDENTICAL (not just same output);
+    // this makes the schedule diffable and localizes the first divergent boundary. null => no-op.
+    // RAII (Sol review F5): a throwing ctor after the open still closes the handle during unwinding.
+    std::unique_ptr<std::FILE, int (*)(std::FILE *)> vbr_trace_fp_{nullptr, &std::fclose};
+    void     vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used);
     // what this pool's device can give it right now: device_share x (mapped + free - headroom),
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.
     size_t   vbr_pool_reach(const vbr_pool & p) const;
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
+    uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
     void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
     bool   vbr_stash_dirty_   = false;
+    enum class seq_rm_mode : uint8_t {
+        public_commit,
+        nested_commit,
+        dry_run,
+    };
     void     vbr_full_reset();                        // cache empty: undo every degrade (lossless)
+    void     vbr_representation_changed();             // monotone representation change detector
+    void     vbr_attention_content_changed();          // content mutation: representation + checkpoint lineage
+    bool     seq_rm_impl(llama_seq_id seq_id, llama_pos p0, llama_pos p1, seq_rm_mode mode);
+    void     seq_cp_impl(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+            llama_pos p0, llama_pos p1, bool publish_lineage);
+    vbr_generation_tracker *       vbr_generation_tracker_mut();
+    const vbr_generation_tracker * vbr_generation_tracker_get() const;
+    static bool vbr_generation_cell_has_seq_cb(
+            const void * context, uint32_t stream, uint32_t cell, llama_seq_id seq_id);
+    static llama_pos vbr_generation_cell_pos_cb(
+            const void * context, uint32_t stream, uint32_t cell);
+
+    // A2 explicit operation binding (§7.2): every mutation entry point opens ONE scope carrying
+    // its authenticated multi-target manifest. The scope registers the operation and — for
+    // provenance-bearing mutations — reserves the recovery record BEFORE any mutation; damage
+    // extents reserve lazily per SELECTED target at the first destructive stamp (P1v2).
+    // Events minted while the scope is open cite its operation id. Close follows the
+    // per-family commit-boundary table (design Rev 5.1): synchronous families commit at scope
+    // end; deferred families transfer everything to the pending owner via detach_deferred().
+    // A2 (review F3): decode operations stay open past apply_ubatch — closed only when the
+    // decode outcome is known. One entry per in-flight committed ubatch.
+  public:
+    // P3v2 (v6): FIXED parent-declared participant slots with a sealed-registration phase.
+    // The parent declares every armed child before the first apply; each child claims its
+    // slot in its scope constructor (before mutation), and the slot reports terminal EXACTLY
+    // once — setup/decode/submit failure, or synchronize-time delivery. Detach transfers the
+    // still-OPEN token to pending ownership (never terminal). seal() folds the wrapper
+    // result, fails any never-claimed declared slot, and seals registration; only
+    // `sealed && every declared slot terminal` closes the root, failure dominating. No
+    // dynamic remaining++ anywhere — the v5 premature-close class is unrepresentable.
+    // (Public: the iSWA wrapper constructs it; methods live in llama-kv-cache.cpp so the
+    // registry close stays in that trust domain.)
+    struct vbr_composite_outcome {
+        vbr_operation_id operation_id = {};
+        int32_t          declared     = 0;
+        int32_t          claimed      = 0;
+        int32_t          terminal     = 0;
+        bool             sealed       = false;
+        bool             failed       = false;
+        bool             closed       = false;
+
+        void claim();
+        void report_terminal(bool ok);
+        void seal(bool wrapper_ok);
+
+      private:
+        void try_close();
+    };
+
+  private:
+    struct vbr_pending_decode_op {
+        vbr_operation_id  operation_id   = {};
+        // P1v2 (v6): per-target damage extents — submit, commit, fail, and recovery cover
+        // every handle; each cell cited its SELECTED target's extent at stamp time.
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> extents = {};
+        int32_t           recovery_index = -1;
+        // Single-cache ops close directly (owns_close). Composite children instead report
+        // their terminal result into the shared sealed aggregate, which closes the root.
+        bool              owns_close     = true;
+        std::shared_ptr<vbr_composite_outcome> composite;
+    };
+
+    class vbr_mutation_op {
+      public:
+        vbr_mutation_op(llama_kv_cache *    cache,
+                        vbr_operation_kind  kind,
+                        vbr_operation_class operation_class,
+                        llama_seq_id        seq_id,
+                        llama_pos           p0,
+                        llama_pos           p1,
+                        bool                provenance_bearing = false,
+                        uint16_t            extent_stream      = 0);
+        // Multi-target form (decode composites): the caller supplies the full manifest.
+        vbr_mutation_op(llama_kv_cache *              cache,
+                        const vbr_operation_binding & binding,
+                        bool                          provenance_bearing);
+        ~vbr_mutation_op();
+
+        vbr_mutation_op(const vbr_mutation_op &)             = delete;
+        vbr_mutation_op & operator=(const vbr_mutation_op &) = delete;
+        vbr_mutation_op(vbr_mutation_op &&)                  = delete;
+        vbr_mutation_op & operator=(vbr_mutation_op &&)      = delete;
+
+        bool active() const { return static_cast<bool>(operation_id_); }
+        std::optional<vbr_pending_decode_op> detach_deferred();
+        // P1v2 (v6): per-target lazy extent — reserved at the FIRST destructive stamp that
+        // SELECTS manifest target `target_index` (the tracker calls through the trampoline).
+        // Idempotent per target; empty on reservation failure (availability path taken).
+        vbr_extent_handle ensure_extent_for(uint8_t target_index);
+        static vbr_extent_handle extent_trampoline(void * ctx, uint8_t target_index);
+        // P1v2: a refused/unauthorized stamp poisons the whole LOGICAL operation — failure
+        // ownership follows the same root link as extent ownership (v6-fix F2), so a poison
+        // in a joined child fails the root: it reports FAILED (into its aggregate for
+        // composite children, at its close for owned scopes) and its recovery reservation
+        // survives to quarantine through the failed close's autorecord.
+        void poison() {
+            poisoned_ = true;
+            if (extent_owner_ != nullptr && extent_owner_ != this) {
+                extent_owner_->poison();
+            }
+        }
+        // v3.1 amendment 4: explicit success required — destruction without succeed() closes
+        // the operation FAILED (exception unwind and forgotten paths fail by construction).
+        // A poisoned scope can never succeed.
+        void succeed() {
+            if (!poisoned_) {
+                succeeded_ = true;
+            }
+        }
+
+        // For the always-succeed metadata-edit family: ONE opt-in per function. Succeeds at
+        // scope exit UNLESS an exception entered flight — the default-fail pin holds on
+        // unwind while every normal return path stops hand-spelling succeed().
+        class success_on_return {
+          public:
+            explicit success_on_return(vbr_mutation_op & op)
+                : op_(op), exceptions_at_entry_(std::uncaught_exceptions()) {}
+            ~success_on_return() {
+                if (std::uncaught_exceptions() == exceptions_at_entry_) {
+                    op_.succeed();
+                }
+            }
+          private:
+            vbr_mutation_op & op_;
+            int               exceptions_at_entry_;
+        };
+
+      private:
+        void abort_to_shadow_unavailable();
+        void fail_extents();
+        // Owned scopes read their manifest from the RAII (which retains the identical
+        // binding); only adopted scopes hold their own registry-fetched copy.
+        const vbr_operation_binding & scope_manifest() const {
+            return owned_op_ ? owned_op_->binding() : manifest_;
+        }
+
+        friend class llama_kv_cache;
+        llama_kv_cache *      cache_          = nullptr;
+        vbr_mutation_op *     outer_          = nullptr;
+        // The root scope owning the per-target extents this chain stamps against; joined
+        // scopes point at their root so the tracker's extent callback lands there.
+        vbr_mutation_op *     extent_owner_   = nullptr;
+        // Minting scopes own a registry operation; joining scopes (nested/adopted) borrow the
+        // outer/adopted id and own nothing (review F10).
+        std::optional<vbr_scoped_operation> owned_op_;
+        vbr_operation_id      operation_id_   = {};
+        vbr_operation_kind    kind_           = vbr_operation_kind::sequence_edit;
+        // P1v2 (v6): adopted scopes' authenticated manifest copy (owned scopes read the
+        // RAII's retained binding via scope_manifest()); one lazy extent per target.
+        vbr_operation_binding manifest_       = {};
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> extents_ = {};
+        // P3v2: the participant aggregate this adopted child claimed a slot in.
+        std::shared_ptr<vbr_composite_outcome> composite_;
+        int32_t               recovery_index_ = -1;
+        bool                  succeeded_      = false;
+        bool                  poisoned_       = false;
+        bool                  detached_       = false;   // token transferred to pending owner
+        bool                  joined_         = false;   // nested: borrows outer identity fully
+        bool                  adopted_        = false;   // C1: shared id, OWN reservations
+    };
+    friend class vbr_mutation_op;
+    // The innermost open mutation scope; vbr_generation_begin cites it.
+    vbr_mutation_op * vbr_current_mutation_ = nullptr;
+    // A2 (review F10b): an operation adopted from a composite wrapper — child mutation scopes
+    // join it instead of minting, so iSWA/hybrid children share ONE id per logical mutation.
+    vbr_operation_id vbr_adopted_operation_ = {};
+    // P2v2 (v6): the composite root's mint was REFUSED — child scopes open refused (fail
+    // closed to shadow-unavailable) instead of minting independently (A0 one-id in refusal).
+    bool vbr_adopted_refused_ = false;
+    // v4 review F1: the composite aggregate the adopted children report their terminal
+    // results into (set only for deferred/decode composites).
+    std::shared_ptr<vbr_composite_outcome> vbr_adopted_composite_;
+    // A2 (review F3): decode operations stay open past apply_ubatch — closed only when the
+    // decode outcome is known. One entry per in-flight committed ubatch.
+    std::vector<vbr_pending_decode_op> vbr_pending_decode_ops_;
+    // C1: records whose extents are `submitted`, awaiting terminal delivery at the sync fence.
+    // Their registry operations and recovery reservations remain OPEN until then.
+    std::vector<vbr_pending_decode_op> vbr_awaiting_commit_;
+    uint64_t vbr_pending_commit_failures_ = 0;  // sync-boundary commit failures, counted
+
+  public:
+    // Promote submitted extents to committed. Called from the context's existing synchronize
+    // point — never introduces a new fence (Rev 5.1). No-op when nothing is pending.
+    void vbr_commit_submitted();
+    // A2 (review F3): resolve in-flight decode operations at the decode boundary where the
+    // outcome is known. ok=true: extents -> submitted, ops close committed. ok=false: extents
+    // fail, ops close failed (autorecording their reserved recovery slots).
+    void vbr_decode_ops_finish(bool ok);
+    // A2 (review F10b): composite adoption — wrappers mint once and adopt into children.
+    void vbr_adopt_operation(vbr_operation_id operation_id);
+    void vbr_adopt_composite(std::shared_ptr<vbr_composite_outcome> composite);
+    void vbr_adopt_refused();
+    void vbr_release_adopted();
+    // v4 review F4 + P2v2/v6-fix F1: decode manifest bound to the ubatch's actual sequences —
+    // per touched seq an ordinary target over its exact position range, plus (when wrapping
+    // is possible) a whole-range swa_wrap target per seq and ONE declared seq-wildcard
+    // whole-range state_api target authorizing the nested §7.3 prefix purge: cross-sequence
+    // masked reuse makes the destroyed position and the purged old owner unbounded by the
+    // batch, and the owner is chosen by slot selection AFTER an adopted manifest has minted.
+    // TRANSACTIONAL: any target-ceiling overflow zeroes the manifest and returns false — the
+    // registry then refuses the mint (fail-closed shadow-unavailable), never partial.
+    static bool vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
+                                               vbr_controller_instance_id instance,
+                                               bool wrap_possible, uint16_t stream,
+                                               const llama_ubatch & ubatch);
+    // Durable trajectory identity for checkpoint/artifact capture.
+    vbr_lineage_uuid vbr_lineage_id() const {
+        const auto * tracker = vbr_generation_tracker_get();
+        return tracker != nullptr ? tracker->lineage_identity() : vbr_lineage_uuid{};
+    }
+    // Process-local routing identity for authenticated mutation/recovery manifests.
+    vbr_controller_instance_id vbr_instance_id() const {
+        const auto * tracker = vbr_generation_tracker_get();
+        return tracker != nullptr ? tracker->runtime_instance() : vbr_controller_instance_id{};
+    }
+
+  private:
+
+    vbr_generation_event vbr_generation_begin(
+            vbr_mutation_registrant registrant,
+            vbr_operation_class operation_class,
+            uint32_t stream,
+            vbr_generation_stamp_kind stamp_kind,
+            bool destructive = false,
+            bool imported = false);
+    // P1v2 (v6): the ONE spelling of "a refused stamp fails the owning operation" — inert on
+    // an empty (unarmed/latched) event, poisons the scope on refusal. Runtime fail-closed,
+    // never an assert.
+    void vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                   llama_seq_id membership_seq, llama_pos pre_mutation_pos = -1);
+    void vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                   const llama_seq_id * seqs, int32_t n_seqs, llama_pos pre_mutation_pos);
+    void vbr_generation_global(vbr_mutation_registrant registrant, vbr_operation_class operation_class);
+    void vbr_ownership_rebuild();  // A2: import/install-boundary index rebuild (sanctioned scan)
+    void vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
+                                       bool add, llama_seq_id exclude_seq = -1);
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
+    void     vbr_invalidate_dirty_stash();            // one dirty-stash settlement implementation
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
+    bool     vbr_retire_pending_before_unmap(const std::string & busid);
     size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
-    bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
-    char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
+    bool     vbr_scratch_reserve(size_t flat_cells);  // #88: boundary-time f16 dequant scratch grow
+    // Pure, allocator-blind child stream used by the tree transaction. It derives real steps only
+    // through vbr_sim_step(); physical pricing and preflight remain separate.
+    llama_vbr_policy::child vbr_policy_child_stream(int demanded_device, uint32_t wm_next) const;
+    // Pure physical projection for any set of captures in one pool. The first usable capture
+    // requires the complete tightly-packed slab, matching the old allocation's fidelity lifetime;
+    // current occupancy includes pages retained by earlier failed maps.
+    bool     vbr_stash_memory(const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+                              size_t & physical_now, size_t & physical_if_reserved) const;
+    // Idempotently reserve/map the same request set. false is recoverable and changes no tier or
+    // stash-valid metadata; a partial VMM map may remain resident and is visible to the query.
+    bool     vbr_stash_reserve(vbr_pool & p, const std::vector<vbr_stash_request> & requests);
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;
     size_t   vbr_budget_eff(const vbr_pool & p) const; // live-clamped per-pool budget (shared basis)
+    size_t   vbr_budget_eff_uncached(const vbr_pool & p) const; // restore preflight: fresh live capacity
     bool     vbr_vmm_active() const;                  // any pool is VMM-backed
     bool     vbr_over_budget(uint32_t wm_cells) const; // any VMM pool projected past its budget
     vbr_pool *       vbr_pool_of(const ggml_tensor * t);       // pool owning the tensor (by buffer)
@@ -544,7 +1269,8 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
-    bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
+    enum class vbr_degrade_result { applied, exhausted, reserve_failed, hard_lease_blocked };
+    vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)
 
@@ -602,12 +1328,21 @@ private:
     // Dynamic VBR shared KV pools (M2 bookkeeping; M3 transcode/relocate) — one per KV buffer
     // (per device under -sm layer; exactly one on a single GPU)
     std::vector<vbr_pool> vbr_pools_;
+    // Scratch bindings for shared-KV aliases. Deliberately separate from vbr_pools_: a
+    // controller-less drafter must not appear to own VMM, budget, ledger, or degrade state.
+    std::vector<vbr_shared_scratch_binding> vbr_shared_scratch_bindings_;
+    // Owner-side reverse registry plus drafter-side RAII registrations. Registration
+    // records never own either context; weak registry links make target-first teardown safe.
+    std::shared_ptr<vbr_shared_scratch_registry> vbr_shared_scratch_registry_;
+    std::vector<vbr_shared_scratch_registration> vbr_shared_scratch_registrations_;
     // [ikv*2 + is_v] -> (pool, extent) units; built once at ctor end, immutable after
     std::vector<std::vector<std::pair<vbr_pool *, vbr_extent *>>> vbr_units_tab_;
 
     // Permanent transcode oracle (env VBR_TRANSCODE_TEST): synthetic turbo8 A->A byte round-trip +
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
     void vbr_transcode_anchor_test();
+
+    friend struct llama_kv_cache_vbr_epoch_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
@@ -642,6 +1377,14 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
 
+    // Canonical sequence-serializer inclusion predicate. The disabled generation oracle
+    // reuses this cell-local rule while retaining its independent full scan (it must never
+    // consume the ownership index or production mask builder).
+    bool state_write_includes_cell(
+            const llama_kv_cells & cells,
+            uint32_t cell,
+            llama_seq_id seq_id) const;
+
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
@@ -661,6 +1404,12 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used by composite memories whose other child currently exposes fewer
+    // logical graph sequences than the attention cache was configured with
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t         max_graph_seqs_limit);
 
     // used to create an update context
     llama_kv_cache_context(
@@ -686,6 +1435,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_max_graph_seqs() const override;
 
     // VBR tier-flip epoch of the underlying cache (0 when VBR is off — the counter never moves)
     uint64_t get_vbr_epoch() const override;
@@ -702,6 +1452,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    llama_turbo_meansub_ref get_turbo_meansub_ref(int32_t il) const;
 
 
     // TurboQuant rotation accessors
@@ -742,6 +1493,8 @@ public:
 
 private:
     llama_memory_status status;
+
+    uint32_t max_graph_seqs = std::numeric_limits<uint32_t>::max();
 
     llama_kv_cache * kv;
     llama_context * lctx;

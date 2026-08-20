@@ -32,9 +32,10 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 
 | flag | meaning |
 |---|---|
-| `-ctk vbr` / `-ctv vbr` / `-ct vbr` | select VBR. In dynamic mode a one-sided selection implies vbr on the untouched side too; an explicitly non-default type (`-ctv q8_0`) PINS that side — it never degrades and counts in the aggregate at its fixed bits/value. |
+| no cache flags | common CLI tools default to dynamic VBR on both sides with a t4 quality floor; the tensors still enter at F16 and degrade only under pressure. |
+| `-ctk vbr` / `-ctv vbr` / `-ct vbr` | explicitly select VBR and, without `--vbr-floor`, open the complete ladder to t1. An explicitly non-VBR side (`-ctv q8_0`) is pinned — it never degrades and counts in the aggregate at its fixed bits/value. |
 | `--vbr-budget <tier\|number>` (`--vbr-bits`) | `dynamic` (default) = runtime controller. A tier (`t8/t4/t3/t2/t1`) or a number selects a **fixed** static tier instead — no runtime degrades. |
-| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 16]. Default: t1 (1.25). |
+| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 16]. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
 | `--vbr-policy <json>` | fixed mode only: a measured policy ladder; the best rung ≤ the fixed budget (and ≥ the floor) is selected and its per-layer schedule applied. |
 

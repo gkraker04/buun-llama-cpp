@@ -544,7 +544,11 @@ static vrlm_state & vrlm() {
     return s;
 }
 
-bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marker_fields & fields) {
+bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marker_fields & fields,
+                               uint64_t * created_ts_ns_out) {
+    if (created_ts_ns_out != nullptr) {
+        *created_ts_ns_out = 0;
+    }
     if (!llama_vram_ledger_armed()) {
         return false;
     }
@@ -581,6 +585,9 @@ bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marke
     e.fd            = fd;
     e.hb_seq        = hb_seq;
     e.created_ts_ns = created_ts_ns;
+    if (created_ts_ns_out != nullptr) {
+        *created_ts_ns_out = created_ts_ns;
+    }
     return true;
 }
 
@@ -670,7 +677,12 @@ int llama_vram_ledger_scan(std::vector<llama_vram_peer_claim> & out) { out.clear
 
 uint64_t llama_vram_ledger_dir_mtime_ns() { return 0; }
 
-bool llama_vram_marker_publish(const std::string &, const llama_vram_marker_fields &) { return false; }
+bool llama_vram_marker_publish(const std::string &, const llama_vram_marker_fields &, uint64_t * out) {
+    if (out != nullptr) {
+        *out = 0;
+    }
+    return false;
+}
 bool llama_vram_marker_present(const std::string &) { return false; }
 void llama_vram_marker_beat(const std::string &) {}
 

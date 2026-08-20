@@ -29,6 +29,16 @@
 // one upward revision). Keyed by the PCI bus id from ggml_backend_dev_props.device_id.
 void llama_vram_plan_hint_set(const char * device_id, uint64_t bytes);
 
+// Explicit composite-load ownership. Scopes are nestable: only the outermost
+// successful end publishes SATISFIED, and any outer failure abandons the claim.
+// A new outer scope resets the base and auxiliary plans for that load.
+void llama_vram_load_begin_internal(bool application_owned_completion);
+void llama_vram_load_end_internal(bool success);
+
+// Add an auxiliary component (draft/MTP/etc.) to the base target plan. Unlike
+// plan_hint_set(), repeated additions accumulate.
+void llama_vram_plan_aux_add_internal(const char * device_id, uint64_t bytes);
+
 // bytes landed on the device (successful buffer alloc during a held load) — feeds the
 // claim's self-measured bytes_now and the amortized grant release on the donor side
 void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes);
@@ -45,6 +55,12 @@ ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(struct ggml_context * ct
 // (claims already unlinked, terminal reason logged).
 bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes);
 
+// Hold against the remaining multi-device plan when one exists. This is for
+// aggregate allocations (such as a scheduler reserve) whose API reports only
+// success/failure, not the device or exact allocation that failed. With no
+// usable plan, falls back to the ordinary single-device hold above.
+bool llama_vram_demand_hold_plan_or(ggml_backend_dev_t fallback_dev, size_t fallback_bytes);
+
 // the load finished successfully with a live claim → flip it to phase=satisfied (the
 // writer thread keeps beating; donors keep their grants armed until claim-complete)
 void llama_vram_demand_satisfied();
@@ -59,3 +75,7 @@ void llama_vram_demand_complete();
 // true while a satisfied claim awaits its first real decode (cheap inline gate for the
 // decode-path complete hook)
 bool llama_vram_demand_pending_complete();
+
+// True only when the generic first-output hook owns completion. Applications
+// with linked execution paths use explicit completion after all paths ran.
+bool llama_vram_demand_auto_complete_pending();
