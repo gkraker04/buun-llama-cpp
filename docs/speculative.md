@@ -116,17 +116,19 @@ python convert_hf_to_gguf.py z-lab/Qwen3.8-27B-DFlash2 \
     --target-model-dir Qwen/Qwen3.8-27B --outtype q8_0 --outfile Qwen3.8-27B-DFlash2-Q8_0.gguf
 
 llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
-    --spec-type draft-dflash --spec-draft-n-max 7 -fa on --jinja
+    --spec-dflash-default -fa on --jinja
 ```
 
-The released Qwen3.8 sidecar advertises an eight-position block. A longer
-anchor-plus-12 block was faster in the RTX 3090 measurements, but is deliberately
-opt-in because it exceeds the checkpoint metadata:
+The released Qwen3.8 sidecar advertises an eight-position block. The runtime
+defaults that geometry to the faster measured `anchor + 12` block, and
+`--spec-dflash-default` therefore resolves to 12 draft tokens. Set
+`GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
+another value from 3 through 64 for experimentation:
 
 ```bash
-GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=13 llama-server \
+GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8 llama-server \
     -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
-    --spec-type draft-dflash --spec-draft-n-max 12 -fa on --jinja
+    --spec-dflash-default -fa on --jinja
 ```
 
 The shared driver keeps independent adaptive-depth and proposal state for every

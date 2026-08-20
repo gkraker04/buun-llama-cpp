@@ -314,9 +314,16 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
             if (override < 3 || override > 64) {
                 throw std::runtime_error("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE must be between 3 and 64");
             }
-            LLAMA_LOG_WARN("%s: overriding trained DFlash2 block size %u -> %d (experimental)\n",
+            LLAMA_LOG_WARN("%s: overriding DFlash2 block size %u -> %d\n",
                     __func__, hparams.dflash_block_size, override);
             hparams.dflash_block_size = override;
+        } else if (hparams.dflash_block_size == 8) {
+            // The released Qwen3.8 sidecar advertises eight positions, but
+            // anchor + 12 nearly doubled code throughput and also won on prose
+            // in the RTX 3090 sweep. Preserve metadata for other trained widths;
+            // GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8 restores this one.
+            LLAMA_LOG_INFO("%s: using tuned DFlash2 block size 13 (metadata: 8)\n", __func__);
+            hparams.dflash_block_size = 13;
         }
     }
 

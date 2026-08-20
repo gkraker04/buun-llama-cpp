@@ -20,6 +20,7 @@
 #include "common-cache-plan-estimate.h"
 #include "mtp-vocab-trim.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "../../src/llama-context.h"
@@ -295,6 +296,73 @@ static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_pa
         return {};
     }
     return { devices[params.main_gpu] };
+}
+
+// --spec-dflash-default predates the shared block-diffusion driver and therefore
+// enters argument parsing as the legacy DFlash type. DFlash2 needs to be resolved
+// before the target context is created: hybrid targets size their recurrent
+// rollback planes from draft.n_max, and changing the type after context creation
+// otherwise forces a first-request resize and CUDA graph recapture.
+//
+// Read only the GGUF metadata/tensor directory. The real draft model is still
+// loaded once, with its final placement, after the target context is available.
+static void server_preflight_dflash2(common_params & params) {
+    auto & spec = params.speculative;
+    if (!spec.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) || !spec.has_dft()) {
+        return;
+    }
+
+    const std::string & path = spec.draft.mparams.path;
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
+        gguf_init_from_file(path.c_str(), {
+            /*.no_alloc =*/ true,
+            /*.ctx      =*/ nullptr,
+        }),
+        gguf_free);
+    if (!metadata) {
+        SRV_WRN("%s", "could not inspect draft metadata before target sizing; using legacy DFlash sizing\n");
+        return;
+    }
+
+    const int64_t arch_id = gguf_find_key(metadata.get(), "general.architecture");
+    const int64_t rank_id = gguf_find_key(metadata.get(), "dflash.selector_rank");
+    if (arch_id < 0 || rank_id < 0 ||
+        gguf_get_kv_type(metadata.get(), arch_id) != GGUF_TYPE_STRING ||
+        gguf_get_kv_type(metadata.get(), rank_id) != GGUF_TYPE_UINT32 ||
+        std::strcmp(gguf_get_val_str(metadata.get(), arch_id), "dflash") != 0 ||
+        gguf_get_val_u32(metadata.get(), rank_id) == 0) {
+        return;
+    }
+
+    uint32_t block_size = 16;
+    int64_t block_id = gguf_find_key(metadata.get(), "dflash.block_size");
+    if (block_id < 0) {
+        block_id = gguf_find_key(metadata.get(), "dflash.dflash.block_size");
+    }
+    if (block_id >= 0 && gguf_get_kv_type(metadata.get(), block_id) == GGUF_TYPE_UINT32) {
+        block_size = gguf_get_val_u32(metadata.get(), block_id);
+    }
+
+    if (const char * value = std::getenv("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE")) {
+        const int override = std::atoi(value);
+        if (override < 3 || override > 64) {
+            throw std::runtime_error("GGML_DFLASH2_BLOCK_SIZE_OVERRIDE must be between 3 and 64");
+        }
+        block_size = (uint32_t) override;
+    } else if (block_size == 8) {
+        block_size = 13;
+    }
+
+    for (auto & type : spec.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        }
+    }
+    if (spec.n_max < 0) {
+        spec.draft.n_max = block_size > 1 ? (int32_t) block_size - 1 : 12;
+    }
+    SRV_INF("preselected adaptive shared DFlash2 driver (block_size=%u, draft-max=%d)\n",
+            block_size, spec.draft.n_max);
 }
 
 static server_shared_draft_device_config server_prepare_shared_draft_devices(const common_params & params) {
@@ -4348,6 +4416,10 @@ private:
                         trim.detail.c_str());
             }
         }
+
+        // Resolve DFlash2 before device selection, fit and target-context sizing.
+        // The post-load resolver remains as a safety net for non-server callers.
+        server_preflight_dflash2(params_base);
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool has_draft = params_base.speculative.has_dft();
