@@ -1,5 +1,4 @@
 #include "models.h"
-#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -40,15 +39,30 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+
+    // A standalone MTP-only draft GGUF may ship its LM head over a frequency-ranked
+    // subset of the vocab (FR-Spec style), signaled the same way EAGLE3 does it: a
+    // "d2t" tensor whose size is the draft vocab. Real trunks never have d2t, so this
+    // is a no-op everywhere except a deliberately trimmed MTP-only draft.
+    int64_t n_vocab_out = n_vocab;
+    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (mtp_only && d2t_meta) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), {n_vocab_out}, 0);
+        LLAMA_LOG_INFO("%s: QWEN35 MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n", __func__, (long long) n_vocab_out);
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
+        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires its own output.weight; "
+                "duplicating the full-width tok_embd would silently undo the trim");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -98,25 +112,25 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         auto & layer = layers[il];
 
         // MTP block looks like a full-attention Qwen3.5 decoder block.
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, 0);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, 0);
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
 
-        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
-        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, 0);
-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, 0);
-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, 0);
+        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
 
         // NextN-specific tensors that define the MTP block.
-        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, 0);
-        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              0);
-        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              0);
-        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
+        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
+        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
+        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
     for (int i = 0; i < n_layer; ++i) {
@@ -449,56 +463,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    if (cparams.tape_gpu_n_seqs > 0) {
-        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
-            auto * tgpu = cparams.tape_gpu_seqs[s];
-            if (!tgpu) continue;
-
-            int li = -1;
-            for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
-                if (tgpu->layer_ids[i] == il) { li = i; break; }
-            }
-            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
-
-            auto & tl = tgpu->layers[li];
-
-            ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
-                k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
-                k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
-            ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
-                v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
-                v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
-            ggml_tensor * g_slice = ggml_view_3d(ctx0, gate,
-                gate->ne[0], gate->ne[1], n_seq_tokens,
-                gate->nb[1], gate->nb[2], s * gate->nb[3]);
-            ggml_tensor * b_slice = ggml_view_3d(ctx0, beta_presigmoid,
-                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
-                beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
-
-            ggml_tensor * k_cont = ggml_cont(ctx0, k_slice);
-            ggml_tensor * v_cont = ggml_cont(ctx0, v_slice);
-            ggml_tensor * g_cont = ggml_cont(ctx0, g_slice);
-            ggml_tensor * b_cont = ggml_cont(ctx0, b_slice);
-
-            ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
-                tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
-                tl.k->nb[1], tl.k->nb[2], 0);
-            ggml_tensor * v_dst = ggml_view_3d(ctx0, tl.v,
-                tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
-                tl.v->nb[1], tl.v->nb[2], 0);
-            ggml_tensor * g_dst = ggml_view_3d(ctx0, tl.gate,
-                tl.gate->ne[0], tl.gate->ne[1], (int64_t)n_seq_tokens,
-                tl.gate->nb[1], tl.gate->nb[2], 0);
-            ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
-                tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
-                tl.beta->nb[1], tl.beta->nb[2], 0);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
-        }
-    }
+    build_dflash_tape_copies(il, n_seqs, n_seq_tokens,
+        k_conv, v_conv, gate, beta_presigmoid, qkv_mixed);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
@@ -691,6 +657,39 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
+
+    if (model.d2t) {
+        // FR-Spec-style draft-vocab trim: scatter the compressed logits back into a
+        // full-vocab-shaped tensor (rest filled -inf) so downstream verify/sampling
+        // code never has to know the draft scored a reduced vocab. Same pattern as
+        // eagle3.cpp's d2t handling.
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+        const bool compact_backend_sampling =
+                model.d2t->type == GGML_TYPE_I32 &&
+                !samplers.empty() &&
+                llm_graph_all_outputs_have_samplers(ubatch, samplers, true);
+        if (compact_backend_sampling) {
+            // Backend samplers already support an explicit candidate-id domain.
+            // Keep the 32K logits compact and let filtering map only its winners
+            // to target token ids, avoiding a full-vocab fill/scatter and scan.
+            res->t_logits_candidates = model.d2t;
+        } else {
+            // Raw-logits consumers, mixed backend/CPU batches, and legacy I64
+            // mappings retain the exact dense representation.
+            ggml_tensor * logits = ggml_fill(ctx0,
+                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+            cur = ggml_set_rows(ctx0, logits,
+                    ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
+            cb(cur, "result_output_d2t", -1);
+        }
+    }
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);

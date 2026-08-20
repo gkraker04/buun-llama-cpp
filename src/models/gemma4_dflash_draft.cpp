@@ -121,6 +121,31 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // set_input() rewrites every buffer (hidden window, positions, masks) from the live
+    // cross state on each call, so the graph is reusable whenever the baked shapes match.
+    // Without this override the base class refuses reuse and the drafter rebuilds its
+    // graph (and re-captures CUDA graphs) on every draft call.
+    bool can_reuse(const llm_graph_params & params) override {
+        if (cross != params.cross || n_block != (int64_t) params.ubatch.n_tokens) {
+            return false;
+        }
+        // ctx_len is baked into every tensor here but derived from live cross state at
+        // build time — recompute the builder's formula and refuse reuse across a window
+        // change instead of trusting the set-cross path to have invalidated the graph.
+        const int n_slots = std::clamp(params.cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
+        int64_t want_ctx;
+        if (n_slots == 1) {
+            want_ctx = (cross && cross->n_enc > 0) ? cross->n_enc : (int64_t) LLAMA_DFLASH_PER_SLOT_CTX;
+            const int64_t max_ctx = gemma4_dflash_max_cross_ctx();
+            if (max_ctx > 0 && want_ctx > max_ctx) {
+                want_ctx = max_ctx;
+            }
+        } else {
+            want_ctx = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
+        }
+        return want_ctx == ctx_len;
+    }
+
     ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len]
     ggml_tensor * pos_ctx           = nullptr; // [ctx_len]
     ggml_tensor * kq_mask           = nullptr; // [ctx_len + n_block, n_block, 1, 1]
@@ -533,16 +558,24 @@ llm_build_gemma4_dflash_draft::llm_build_gemma4_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    // GPU top-K or argmax for the DFlash draft.
-    const float sample_temp = cparams.dflash_sample_temp;
-    static std::atomic<uint64_t> gumbel_counter{1};
-    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
-    const int topk = cparams.dflash_topk;
-    if (topk > 1) {
-        res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
-    } else {
-        res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
-    }
+    ggml_build_forward_expand(gf, cur);
 
-    ggml_build_forward_expand(gf, res->t_logits_argmax);
+    // GPU top-K or argmax for the DFlash draft. Gated on dflash_argmax (default off,
+    // enabled at drafter-context init): the extended ids + log-probs layout is only
+    // implemented by the GPU argmax kernels, so the draft loop disables the tail and
+    // samples on the host when the sched puts it on the CPU backend (e.g. -ngld 0).
+    // With the tail off, raw logits are extracted instead.
+    if (cparams.dflash_argmax) {
+        const float sample_temp = cparams.dflash_sample_temp;
+        static std::atomic<uint64_t> gumbel_counter{1};
+        const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+        const int topk = cparams.dflash_topk;
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, sample_temp, seed);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
+        }
+
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
 }

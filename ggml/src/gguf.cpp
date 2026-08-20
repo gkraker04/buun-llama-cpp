@@ -557,6 +557,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
+            if (ok && key.empty()) {
+                GGML_LOG_ERROR("%s: key %" PRIi64 " is empty\n", __func__, i);
+                ok = false;
+            }
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
                 if (key == ctx->kv[j].key) {
                     GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
@@ -747,6 +751,58 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         return nullptr;
     }
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
+
+    // PrismML Bonsai group-128 detection. The released ternary Bonsai GGUFs store the canonical
+    // Q2_0 type-id (42, group-64) but actually pack weights in group-128 blocks. The two layouts
+    // are indistinguishable by type-id, so detect the group size from the on-disk byte span of a
+    // Q2_0 tensor (the gap between its offset and the next tensor's) and, when it matches the g128
+    // geometry, remap those tensors to the internal GGML_TYPE_Q2_0_G128 which carries the correct
+    // block layout. Genuine upstream group-64 Q2_0 files match sz_g64 and are left untouched.
+    {
+        bool     has_q2_0      = false;
+        bool     detected_g128 = false;
+        bool     decided       = false;
+        const size_t  tsz_g64   = ggml_type_size(GGML_TYPE_Q2_0);
+        const int64_t blk_g64   = ggml_blck_size(GGML_TYPE_Q2_0);
+        const size_t  tsz_g128  = ggml_type_size(GGML_TYPE_Q2_0_G128);
+        const int64_t blk_g128  = ggml_blck_size(GGML_TYPE_Q2_0_G128);
+        for (size_t i = 0; i < ctx->info.size(); ++i) {
+            if (ctx->info[i].t.type != GGML_TYPE_Q2_0) {
+                continue;
+            }
+            has_q2_0 = true;
+            if (decided || i + 1 >= ctx->info.size()) {
+                continue;
+            }
+            const ggml_tensor & t = ctx->info[i].t;
+            const int64_t ne0   = t.ne[0];
+            const int64_t nrows = t.ne[1]*t.ne[2]*t.ne[3];
+            const size_t sz_g64  = GGML_PAD((size_t)(tsz_g64  * (ne0 / blk_g64 )) * nrows, ctx->alignment);
+            const size_t sz_g128 = GGML_PAD((size_t)(tsz_g128 * (ne0 / blk_g128)) * nrows, ctx->alignment);
+            const uint64_t gap = ctx->info[i + 1].offset - ctx->info[i].offset;
+            if (sz_g128 != sz_g64 && gap == sz_g128) {
+                detected_g128 = true;
+                decided       = true;
+            } else if (gap == sz_g64) {
+                decided = true;
+            }
+        }
+        if (has_q2_0 && detected_g128) {
+            for (size_t i = 0; i < ctx->info.size(); ++i) {
+                if (ctx->info[i].t.type != GGML_TYPE_Q2_0) {
+                    continue;
+                }
+                ggml_tensor & t = ctx->info[i].t;
+                t.type  = GGML_TYPE_Q2_0_G128;
+                t.nb[0] = tsz_g128;
+                t.nb[1] = t.nb[0]*(t.ne[0]/blk_g128);
+                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                    t.nb[j] = t.nb[j - 1]*t.ne[j - 1];
+                }
+            }
+            GGML_LOG_INFO("%s: detected PrismML Bonsai group-128 Q2_0 layout; remapped Q2_0 tensors to q2_0_g128\n", __func__);
+        }
+    }
 
     // we require the data section to be aligned, so take into account any padding
     if (n_tensors > 0 && !gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
@@ -1182,6 +1238,11 @@ const char * gguf_get_tensor_name(const struct gguf_context * ctx, int64_t tenso
     return ctx->info[tensor_id].t.name;
 }
 
+const int64_t * gguf_get_tensor_ne(const struct gguf_context * ctx, int64_t tensor_id) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    return ctx->info[tensor_id].t.ne;
+}
+
 enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
     return ctx->info[tensor_id].t.type;
@@ -1415,7 +1476,7 @@ void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const vo
 struct gguf_writer_base {
     size_t written_bytes {0u};
 
-    ~gguf_writer_base(void) = default;
+    virtual ~gguf_writer_base(void) = default;
 
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;

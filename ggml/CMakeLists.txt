@@ -4,8 +4,8 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 15)
-set(GGML_VERSION_PATCH 3)
+set(GGML_VERSION_MINOR 19)
+set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
@@ -220,6 +220,8 @@ option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Lib
 # Upstream defaults this ON (VMM off) for broad HW safety; flip OFF here so AMD gets VMM without
 # the -DGGML_HIP_NO_VMM=OFF flag. Set it ON again for any card where HIP VMM misbehaves.
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 OFF)
+# fork: upstream removed rocWMMA FlashAttention (#26046); kept fork-side — the
+# RDNA4 f16 prefill widening (cb0d7779c) is a measured win on this path.
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
@@ -261,6 +263,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_ET                              "ggml: use ET backend"                            OFF)
+option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)

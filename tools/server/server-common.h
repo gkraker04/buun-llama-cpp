@@ -9,9 +9,15 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cinttypes>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <vector>
-#include <cinttypes>
 
 using json = nlohmann::ordered_json;
 
@@ -56,6 +62,7 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    ERROR_TYPE_HARD_LEASE_BLOCKED, // custom error
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions
@@ -119,6 +126,24 @@ bool are_lora_equal(
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 
+// Canonical, order-independent identity of the ACTIVE adapter configuration [I6]: the same set of
+// (adapter content digest, scale) applied in any request order maps to the same string, matching the
+// deterministic graph apply order (sorted by per-adapter content digest, then scale bits). Inactive
+// (scale 0) adapters are excluded. Used to key persisted prompt-cache state so a cache entry built
+// under one adapter set is never restored for a request with a different one.
+std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras);
+
+// Test-only fault injection [P0 gate]. LLAMA_SERVER_FAULT is a comma-separated list of tags;
+// server_fault(tag) is true when the tag is present. Lets tests drive the prompt-cache / checkpoint
+// transactional failure paths (I7 "save failure retains live state", I10 "short write rejected",
+// non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
+//   save_short  - force the state-save writer to report a short write (aborts the save)
+//   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
+//   load_clone_fail - force lifecycle restore clone staging to fail before target mutation
+//   frontier_disagree_after_flip - make the frontier selector disagree only after
+//                                  it owns reads (exercises fail-closed legacy fallback)
+bool server_fault(const char * tag);
+
 //
 // server_tokens
 //
@@ -178,6 +203,12 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    // Canonical comparison key for every media chunk wholly contained in the
+    // first n_tokens logical tokens. Returns false when the prefix cuts through
+    // a media chunk or a chunk has no content identity; callers must then fail
+    // closed rather than publish a reusable frontier.
+    bool media_content_identity(int64_t n_tokens, std::string & out) const;
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
@@ -206,6 +237,9 @@ public:
     size_t size() const { return tokens.size(); }
 
     bool empty() const { return tokens.empty(); }
+
+    // true if the sequence actually contains image/audio chunks.
+    bool has_media() const { return !map_idx_to_media.empty(); }
 
     void clear() {
         map_idx_to_media.clear();
@@ -373,3 +407,89 @@ server_tokens format_prompt_rerank(
         mtmd_context * mctx,
         const std::string & query,
         const std::string & doc);
+
+// ---- cache receipt (PROPOSAL §7.7, Phase 1) ----
+// Untrusted divergence-location hint attached to responses when enabled: a
+// keyed, chained block-hash vector over the slot's cached token prefix,
+// versioned against tokenizer/template identity. Never authorization.
+struct server_cache_receipt {
+    uint32_t                 version = 1;
+    uint32_t                 block_tokens = 1024;
+    std::string              hash_spec;      // "sha256-chain-trunc64/v1" or unkeyed-debug variant
+    std::string              model_identity; // model name/id the chain is scoped to
+    uint64_t                 sequence_epoch = 0;
+    int64_t                  token_count = 0;
+    std::string              adapter_identity;
+    std::vector<std::string> chain;          // one truncated hex digest per block
+};
+
+// Chained keyed hash over token ids: h_i = trunc64(SHA256(key || h_{i-1} || block_i)).
+// Empty key is permitted only when unkeyed_debug is set (caller enforces policy).
+std::vector<std::string> cache_receipt_chain(
+        const std::vector<llama_token> & tokens,
+        uint32_t                          block_tokens,
+        const std::string &               key);
+
+// simple implementation of a pipe
+// used for streaming data between threads
+template<typename T>
+struct server_pipe {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::queue<T> queue;
+    std::atomic<bool> writer_closed{false};
+    std::atomic<bool> reader_closed{false};
+
+    // 0 = unbounded (default)
+    // > 0, write() drops the oldest item once the queue is full
+    size_t max_size = 0;
+
+    void close_write() {
+        writer_closed.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+
+    void close_read() {
+        reader_closed.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+
+    // close_on_stop = true: should_stop means the reader is gone for good, so the writer is told the pipe is broken.
+    // close_on_stop = false: should_stop is a per-read deadline and further reads still come, so the pipe stays usable.
+    bool read(T & output, const std::function<bool()> & should_stop, bool close_on_stop = true) {
+        std::unique_lock<std::mutex> lk(mutex);
+        constexpr auto poll_interval = std::chrono::milliseconds(500);
+        while (true) {
+            if (!queue.empty()) {
+                output = std::move(queue.front());
+                queue.pop();
+                return true;
+            }
+            if (writer_closed.load()) {
+                return false; // clean EOF
+            }
+            if (should_stop && should_stop()) { // a null should_stop means "never stop"
+                if (close_on_stop) {
+                    close_read(); // signal broken pipe to writer
+                }
+                return false; // cancelled / deadline reached
+            }
+            cv.wait_for(lk, poll_interval);
+        }
+    }
+
+    bool write(T && data) {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (reader_closed.load()) {
+            return false; // broken pipe
+        }
+        if (max_size > 0) {
+            while (queue.size() >= max_size) {
+                queue.pop(); // drop oldest to stay bounded
+            }
+        }
+        queue.push(std::move(data));
+        cv.notify_one();
+        return true;
+    }
+};

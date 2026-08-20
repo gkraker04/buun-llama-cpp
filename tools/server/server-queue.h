@@ -29,6 +29,7 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<void(void)>           callback_idle;
 
 public:
     // Add a new task to the end of the queue
@@ -105,6 +106,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the function to be called on the loop's wait timeout while the queue is
+    // empty (~1s cadence, same thread as callback_update_slots; not called while sleeping)
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

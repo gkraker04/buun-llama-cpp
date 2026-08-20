@@ -202,7 +202,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // timeout with an empty queue: give the context a quiet moment for
+                // deferred maintenance (memory breathing), outside the queue lock
+                if (callback_idle) {
+                    lock.unlock();
+                    callback_idle();
+                }
+                // loop again to check sleeping condition
             }
         }
     }

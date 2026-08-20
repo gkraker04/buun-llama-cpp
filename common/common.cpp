@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -392,6 +393,46 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+}
+
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+        common_params & params, bool has_gpu) {
+    if (!params.vbr_enabled() ||
+        (has_gpu && params.n_gpu_layers != 0 && !params.no_kv_offload)) {
+        return common_vbr_cpu_fallback_result::not_needed;
+    }
+
+    // Only the untouched common default may fall back. Every explicit VBR
+    // selector remains armed so the core emits its existing hard refusal.
+    const bool explicit_vbr =
+        params.vbr_cache_type_k_explicit ||
+        params.vbr_cache_type_v_explicit ||
+        params.vbr_budget_explicit ||
+        params.vbr_min_bits_explicit ||
+        params.vbr_vram_budget_explicit ||
+        params.vbr_policy_explicit;
+    if (explicit_vbr) {
+        return common_vbr_cpu_fallback_result::explicit_vbr;
+    }
+
+    // Reset ONLY the sides the implicit vbr alias holds. A side the user set to
+    // an explicit non-VBR type (e.g. -ctk q8_0) carries no vbr flag and must
+    // keep its type — arg.cpp's intent-preservation rule.
+    if (params.vbr_cache_type_k) {
+        params.vbr_cache_type_k = false;
+        params.cache_type_k = GGML_TYPE_F16;
+    }
+    if (params.vbr_cache_type_v) {
+        params.vbr_cache_type_v = false;
+        params.cache_type_v = GGML_TYPE_F16;
+    }
+    // Drop the derived t4 floor that was attached to the implicit aliases.
+    // It is not marked explicit, but common_context_params_to_llama transports
+    // the scalar independently and would otherwise re-arm VBR.
+    params.vbr_min_bits = "auto";
+    params.vbr_min_bits_value = 0.0;
+    params.vbr_capacity_bits = 0.0;
+    return common_vbr_cpu_fallback_result::applied;
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
@@ -998,6 +1039,23 @@ bool fs_is_directory(const std::string & path) {
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
 }
 
+std::string common_get_env(const std::string & name) {
+    const char * value = std::getenv(name.c_str());
+    return value == nullptr ? "" : value;
+}
+
+void common_set_env(const std::string & name, const std::string & value) {
+#if defined(_WIN32)
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    if (value.empty()) {
+        unsetenv(name.c_str());
+    } else {
+        setenv(name.c_str(), value.c_str(), 1);
+    }
+#endif
+}
+
 std::string fs_get_cache_directory() {
     std::string cache_directory = "";
     auto ensure_trailing_slash = [](std::string p) {
@@ -1222,12 +1280,67 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        // Snapshot the pre-fit state so a failed fit can be rolled back to a
+        // documented fallback instead of continuing with an unproven placement.
+        const llama_model_params mparams_before = mparams;
+        const llama_context_params cparams_before = cparams;
+        const std::vector<float> tensor_split_before(
+                params.tensor_split, params.tensor_split + llama_max_devices());
+        const std::vector<llama_model_tensor_buft_override> tbo_before =
+            params.tensor_buft_overrides;
+        const common_moe_cache_params moe_cache_before = params.moe_cache;
+
+        const common_params_fit_status fit_status = common_fit_params(
+            params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
+            &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
+            throw std::runtime_error(
+                "failed to fit parameters to device memory (hard error); retry with -fit off");
+        }
+        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
+            mparams = mparams_before;
+            cparams = cparams_before;
+            std::copy(tensor_split_before.begin(), tensor_split_before.end(), params.tensor_split);
+            params.tensor_buft_overrides = tbo_before;
+            params.moe_cache = moe_cache_before;
+            // Re-point at the restored arrays (the override vector may have moved).
+            mparams.tensor_split = params.tensor_split;
+            mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
+                ? nullptr : params.tensor_buft_overrides.data();
+        } else {
+            // surface the RESOLVED placement: auto-fit decided the real offload count in
+            // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
+            // effective value, never the unresolved -1 sentinel
+            params.n_gpu_layers = mparams.n_gpu_layers;
+            if (common_params_apply_vbr_cpu_fallback(params, true) ==
+                    common_vbr_cpu_fallback_result::applied) {
+                COM_WRN("%s", "implicit VBR auto-fit resolved to CPU KV placement; using static f16 KV cache\n");
+                cparams = common_context_params_to_llama(params);
+            }
+            if (cparams.vbr_dynamic && params.fit_params_vbr_growth_headroom_bytes != 0) {
+                cparams.vbr_growth_headroom_bytes = params.fit_params_vbr_growth_headroom_bytes;
+            }
+        }
+    }
+
+    if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
+        const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+        const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
+        if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
+            COM_INF("%s", "MoE cache: mode=off\n");
+        } else if (params.moe_cache.budget_mib > 0) {
+            COM_INF("MoE cache: mode=%s budget=%zu MiB/device%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, params.moe_cache.budget_mib, placement);
+        } else {
+            COM_INF("MoE cache: mode=%s budget=free-minus-reserve%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, placement);
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1241,6 +1354,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
+    // types — llama_init_from_model hard-errors on a mismatch. When exactly one side was set
+    // explicitly, mirror it to the other instead of failing; two conflicting explicit types
+    // still error at init. When the mirror leaves both sides explicit-static and no --vbr-*
+    // knob was given, dynamic VBR is disarmed (a fully pinned cache has nothing to degrade).
+    if (llama_model_kv_cache_types_coupled(model) && cparams.type_k != cparams.type_v &&
+            params.cache_type_k_explicit != params.cache_type_v_explicit) {
+        const ggml_type t = params.cache_type_k_explicit ? cparams.type_k : cparams.type_v;
+        COM_WRN("model requires matching K/V cache types: mirroring %s to both sides\n", ggml_type_name(t));
+        cparams.type_k = t;
+        cparams.type_v = t;
+        if (!params.vbr_budget_explicit && !params.vbr_min_bits_explicit &&
+            !params.vbr_vram_budget_explicit && !params.vbr_policy_explicit &&
+            !params.vbr_cache_type_k_explicit && !params.vbr_cache_type_v_explicit) {
+            cparams.vbr_dynamic = false;
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1249,7 +1380,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
-            pimpl->model.reset(model);
+            pimpl->model.reset();
             return;
         }
 
@@ -1286,16 +1417,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
-    //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
-    //}
-
-    //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
-    //}
-
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
@@ -1313,6 +1434,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        // drop the model too: most callers only check model() and would deref the
+        // missing context — any failure past model load must yield an empty result
+        pimpl->samplers.clear();
+        pimpl->samplers_seq_config.clear();
+        pimpl->model.reset();
         return;
     }
 
@@ -1345,6 +1471,38 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    bool has_gpu = false;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    }
+    const auto vbr_fallback = model_only
+        ? common_vbr_cpu_fallback_result::not_needed
+        : common_params_apply_vbr_cpu_fallback(params, has_gpu);
+    if (vbr_fallback == common_vbr_cpu_fallback_result::applied) {
+        COM_WRN("%s", "implicit VBR requires GPU KV placement; using static f16 KV cache\n");
+    }
+    llama_vram_load_begin(false);
+    bool load_succeeded = false;
+    struct load_scope {
+        bool & succeeded;
+        bool complete_without_decode;
+        ~load_scope() {
+            llama_vram_load_end(succeeded);
+            if (succeeded && complete_without_decode) {
+                llama_vram_load_complete();
+            }
+        }
+    } load_guard { load_succeeded, model_only };
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1354,6 +1512,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (model_only) {
+        load_succeeded = true;
         return res;
     }
 
@@ -1422,6 +1581,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
+        // mark the context: warmup decodes are not real requests (the co-tenancy
+        // claim-complete hook and other warmup-sensitive logic key off this)
+        llama_set_warmup(lctx, true);
+
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
         llama_token eos = llama_vocab_eos(vocab);
@@ -1452,29 +1615,45 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+        llama_set_warmup(lctx, false);
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
 
+    load_succeeded = true;
     return res;
 }
 
 common_init_result::~common_init_result() = default;
 
 std::string common_get_model_endpoint() {
-    const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
-    // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
-    const char * hf_endpoint_env = getenv("HF_ENDPOINT");
-    const char * endpoint_env = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
-    std::string model_endpoint = "https://huggingface.co/";
-    if (endpoint_env) {
-        model_endpoint = endpoint_env;
-        if (model_endpoint.back() != '/') {
-            model_endpoint += '/';
-        }
+    std::string endpoint = common_get_env("MODEL_ENDPOINT");
+    if (endpoint.empty()) {
+        // the HF_ENDPOINT variable is respected for backward compatibility
+        endpoint = common_get_env("HF_ENDPOINT");
     }
-    return model_endpoint;
+    if (endpoint.empty()) {
+        return "https://huggingface.co/";
+    }
+    if (endpoint.back() != '/') {
+        endpoint += '/';
+    }
+    return endpoint;
+}
+
+char * common_get_model_or_exit(int argc, char * argv[]) {
+    if (argc > 1) {
+        return argv[1];
+    }
+
+    char * path = getenv("LLAMACPP_TEST_MODELFILE");
+    if (!path || strlen(path) == 0) {
+        fprintf(stderr, "\033[33mWARNING: No model file provided. Skipping this test. Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
+        exit(EXIT_SUCCESS);
+    }
+
+    return path;
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
@@ -1483,42 +1662,22 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
-
-    llama_memory_clear(mem, true);
-
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
-    }
-
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
-        goto done;
+        return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
     }
 
-    // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+    if (!llama_memory_can_seq_rm_partial(mem)) {
         COM_TRC("%s", "the context does not support partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-        goto done;
+        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
     }
 
-done:
-    llama_memory_clear(mem, true);
-    llama_synchronize(ctx);
-
-    return res;
+    return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 }
 
+// fork: external linkage — the server's censused destruction doors call these
+// directly (upstream made them static when its slot.mem wrapper became the
+// only caller; the fork kept its own door architecture in the 2026-08-09 sync)
 void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
@@ -1534,6 +1693,32 @@ void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_s
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    this->ctx_tgt = ctx_tgt;
+    this->ctx_dft = ctx_dft;
+}
+
+void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+    }
+}
+
+void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+    }
+}
+
+void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+    common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+    if (ctx_dft) {
+        common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
+    }
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
@@ -1558,10 +1743,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+    mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_direct_io   = params.use_direct_io;
-    mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -1583,6 +1766,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
@@ -1624,9 +1808,29 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.vbr_min_bits          = params.vbr_min_bits_value;
+    cparams.vbr_min_bits_explicit = params.vbr_min_bits_explicit;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_dynamic           = params.vbr_dynamic();
     cparams.vbr_budget_explicit   = params.vbr_vram_budget_explicit;
+    cparams.vbr_pin_k = params.vbr_pin_k();
+    cparams.vbr_pin_v = params.vbr_pin_v();
+
+    if (params.moe_cache.mode_explicit) {
+        switch (params.moe_cache.mode) {
+            case COMMON_MOE_CACHE_MODE_OFF:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+                break;
+            case COMMON_MOE_CACHE_MODE_AUTO:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+                break;
+            case COMMON_MOE_CACHE_MODE_ON:
+            case COMMON_MOE_CACHE_MODE_SOFT:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+                break;
+        }
+    }
+    cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
 
     return cparams;
 }
@@ -2072,23 +2276,30 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
-}
-
 bool common_prompt_checkpoint::empty() const {
     return data_tgt.empty();
 }
 
+size_t common_prompt_checkpoint::size() const {
+    return data_tgt.size() + data_dft.size() + accel.size();
+}
+
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
+    id_task  = -1;
 
     pos_min = 0;
     pos_max = 0;
 
+    checkpoint_epoch     = 0;
+    checkpoint_epoch_swa = 0;
+
+    computation_frontier.clear();
+    cache_family = {};
+
     data_tgt.clear();
     data_dft.clear();
-    data_spec.clear();
+    accel.clear();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2178,5 +2389,5 @@ void common_prompt_checkpoint::clear_tgt() {
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
-    data_spec.clear();
+    accel.spec.clear();
 }

@@ -23,6 +23,8 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
+common_params common_base_params_to_speculative(const common_params & params);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -125,6 +127,10 @@ void common_speculative_draft_batch(
         const std::vector<llama_token>    & id_last_per_spec,
         std::vector<llama_tokens>         & result_per_spec);
 
+// True only when the immediately preceding single/batched draft call completed
+// at least one decode on a linked draft-model context.
+bool common_speculative_last_draft_model_decode_succeeded(const common_speculative * spec);
+
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 void   common_speculative_flush_prefill(common_speculative * spec);
@@ -139,3 +145,19 @@ bool   common_speculative_ring_state_load(common_speculative * spec, const uint8
 // fork: draft length params
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+
+struct common_speculative_init_result {
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    ~common_speculative_init_result();
+
+    llama_model   * model();
+    llama_context * context();
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
+
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
