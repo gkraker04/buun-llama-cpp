@@ -137,6 +137,10 @@ server slot, and batches armed slots into one drafter decode. The legacy
 supported; the sidecar itself falls back to layer placement and can be pinned
 with `--spec-draft-device`. Adaptive depth is enabled by default; set
 `GGML_DFLASH_DRAFT_ADAPTIVE=0` to hold every cycle at the configured maximum.
+By default, DFlash2 matches the server's resolved main sampling temperature
+(the target GGUF default, or an explicit `--temp`). Use `--spec-draft-temp T`
+to override it; an explicit value of `0` keeps greedy draft proposals. Legacy
+DFlash sidecars retain their greedy default.
 
 CopySpec can be composed with DFlash2 explicitly using
 `--spec-type draft-dflash,copyspec`. It is not enabled automatically: on an RTX

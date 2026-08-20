@@ -4922,10 +4922,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_TOPK"));
     add_opt(common_arg(
         {"--spec-draft-temp", "--draft-temp"}, "T",
-        string_format("drafter sampling temperature (default: %.2f, 0 = greedy)",
-                (double) params.speculative.sample_temp),
+        "drafter sampling temperature (default: match DFlash2 target, 0 = greedy)",
         [](common_params & params, const std::string & value) {
             params.speculative.sample_temp = std::stof(value);
+            params.speculative.sample_temp_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
      .set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));

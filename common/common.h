@@ -408,6 +408,7 @@ struct common_params_speculative {
     float   p_split = 0.1f;   // speculative decoding split probability
     float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
     float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
+    bool    sample_temp_set = false; // true when --spec-draft-temp explicitly overrides DFlash2 auto-match
     int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
 
     // DFlash draft model (separate from upstream's draft.model)

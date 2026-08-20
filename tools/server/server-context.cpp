@@ -306,10 +306,11 @@ static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_pa
 //
 // Read only the GGUF metadata/tensor directory. The real draft model is still
 // loaded once, with its final placement, after the target context is available.
-static void server_preflight_dflash2(common_params & params) {
+static bool server_preflight_dflash2(common_params & params) {
     auto & spec = params.speculative;
-    if (!spec.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) || !spec.has_dft()) {
-        return;
+    if ((!spec.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
+         !spec.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) || !spec.has_dft()) {
+        return false;
     }
 
     const std::string & path = spec.draft.mparams.path;
@@ -321,7 +322,7 @@ static void server_preflight_dflash2(common_params & params) {
         gguf_free);
     if (!metadata) {
         SRV_WRN("%s", "could not inspect draft metadata before target sizing; using legacy DFlash sizing\n");
-        return;
+        return false;
     }
 
     const int64_t arch_id = gguf_find_key(metadata.get(), "general.architecture");
@@ -331,7 +332,7 @@ static void server_preflight_dflash2(common_params & params) {
         gguf_get_kv_type(metadata.get(), rank_id) != GGUF_TYPE_UINT32 ||
         std::strcmp(gguf_get_val_str(metadata.get(), arch_id), "dflash") != 0 ||
         gguf_get_val_u32(metadata.get(), rank_id) == 0) {
-        return;
+        return false;
     }
 
     uint32_t block_size = 16;
@@ -363,6 +364,7 @@ static void server_preflight_dflash2(common_params & params) {
     }
     SRV_INF("preselected adaptive shared DFlash2 driver (block_size=%u, draft-max=%d)\n",
             block_size, spec.draft.n_max);
+    return true;
 }
 
 static server_shared_draft_device_config server_prepare_shared_draft_devices(const common_params & params) {
@@ -4419,7 +4421,7 @@ private:
 
         // Resolve DFlash2 before device selection, fit and target-context sizing.
         // The post-load resolver remains as a safety net for non-server callers.
-        server_preflight_dflash2(params_base);
+        const bool preflight_dflash2 = server_preflight_dflash2(params_base);
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool has_draft = params_base.speculative.has_dft();
@@ -5155,6 +5157,20 @@ private:
 
         llama_init = common_init_from_params(params_base);
         params_base.n_parallel = n_parallel_user;
+
+        // common_init_from_params() has now applied the target GGUF's sampling
+        // defaults (while preserving explicit target CLI overrides). DFlash2
+        // proposals should follow that resolved temperature unless the user
+        // supplied a dedicated drafter override.
+        if (preflight_dflash2) {
+            if (!params_base.speculative.sample_temp_set) {
+                params_base.speculative.sample_temp = params_base.sampling.temp;
+            }
+            SRV_INF("DFlash2 draft temperature: %.2f (%s; target %.2f)\n",
+                    (double) params_base.speculative.sample_temp,
+                    params_base.speculative.sample_temp_set ? "explicit override" : "matched",
+                    (double) params_base.sampling.temp);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
