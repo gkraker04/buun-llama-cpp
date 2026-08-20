@@ -278,6 +278,11 @@ static void set_rows_cuda_quant(
 // Affine-tap mean vector for a turbo4/turbo8 set_rows dst (per-layer slice of the K or V mean
 // table, selected by cache_k_/cache_v_ name). Returns nullptr (no tap) unless the dst is a
 // cache_{k,v}_l<N> tensor within table bounds AND a mean table is loaded (TURBO_KMEAN/VMEAN_SUB).
+static inline int turbo_meansub_id_from_name(const char * name) {
+    const char * marker = strstr(name, "_ms");
+    return marker ? atoi(marker + 3) : 0;
+}
+
 static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t ne00) {
     // Tap tier gate: no mean-sub at 8-bit — measured zero median gain and +9.5% mean KLD cost
     // (native flat A/B, q27 16k×8ch, 2026-07-05). Tap stays on for t4 and coarser (t4 median
@@ -287,7 +292,9 @@ static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const 
     const int pf_layer = atoi(dst->name + 9);
     if (pf_layer < 0 || pf_layer >= PFHEAD_MAX_L || ne00 > PFHEAD_MAX_C) return nullptr;
     const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
-    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+    const int model_id = turbo_meansub_id_from_name(dst->name);
+    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, ctx.stream(), model_id)
+                                : turbo_vmean_table_enc(ctx.device, ctx.stream(), model_id);
     return tbl ? tbl + (size_t) pf_layer * PFHEAD_MAX_C : nullptr;
 }
 
@@ -885,7 +892,7 @@ static int ragged_tcq3_shared_bt(int device) {
         int max_shared_optin = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
         if (max_shared_optin >= bytes) {
-            CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo3_tcq<idx_t>, bytes);
+            CUDA_SET_SHARED_MEMORY_LIMIT((k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t>), bytes);
             use_shared[device] = 1;
         }
     }
@@ -1295,7 +1302,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 const int ragged_v_rotated = (!rg_is_k && ragged_v_rotated_enabled()) ? 1 : 0;
                 const float * kvmean_mu = nullptr;
                 if (rg_layer >= 0 && rg_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = rg_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = rg_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) rg_layer * PFHEAD_MAX_C;
                 }
                 k_set_rows_ragged_roundtrip<src_t, idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
@@ -1355,11 +1364,36 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                                 tmp_groups * (int64_t) sizeof(block_turbo3_tcq));
                         const int use_shared = ragged_tcq3_shared_bt<idx_t>(ctx.device);
                         if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 64);
-                        k_set_rows_turbo3_tcq<idx_t><<<(int)n_blk_total, TCQ3_ENC_NT, use_shared ? 128 * 64 : 0, stream>>>(
+#if defined(GGML_USE_HIP)
+                        // gfx1201 A/B: 512 threads wins small decode batches, 256 wins the
+                        // middle range, and 128 wins large batches/fill.
+                        const bool tcq3_rdna4 = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc);
+                        if (tcq3_rdna4 && ne01 <= 14) {
+                            k_set_rows_turbo3_tcq<512, idx_t><<<(int)n_blk_total, 512, use_shared ? 128 * 64 : 0, stream>>>(
+                                (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
+                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        } else if (tcq3_rdna4 && ne01 <= 28) {
+                            k_set_rows_turbo3_tcq<256, idx_t><<<(int)n_blk_total, 256, use_shared ? 128 * 64 : 0, stream>>>(
+                                (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
+                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        } else {
+                            k_set_rows_turbo3_tcq<128, idx_t><<<(int)n_blk_total, 128, use_shared ? 128 * 64 : 0, stream>>>(
+                                (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
+                                n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        }
+#else
+                        k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)n_blk_total, TCQ3_ENC_NT, use_shared ? 128 * 64 : 0, stream>>>(
                             (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
                             n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                             s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
                             ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+#endif
                         k_ragged_turbo3_tcq_overlay<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
                             src1_d, (const block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device], (half *) dst->data, n_blk_total,
                             s10_i, s11_i, s12_i, qs1, qs2, qs3, s1, s2, s3,
@@ -1496,7 +1530,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 const bool is_k = strncmp(dst->name, "cache_k_l", 9) == 0;
                 const bool is_v = strncmp(dst->name, "cache_v_l", 9) == 0;
                 if (is_k || is_v) {
-                    const float * tbl = is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                            : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     const int kl = atoi(dst->name + 9);
                     if (tbl && kl >= 0 && kl < PFHEAD_MAX_L) kmean_mu = tbl + (size_t) kl * PFHEAD_MAX_C;
                 }
@@ -1526,7 +1562,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             }
             const float * kmean_mu = nullptr;
             if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                const int model_id = turbo_meansub_id_from_name(dst->name);
+                const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                           : turbo_vmean_table_enc(ctx.device, stream, model_id);
                 if (tbl) kmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
             }
             k_set_rows_turbo3<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
@@ -1618,7 +1656,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     int max_shared_optin = 0;
                     CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
                     if (max_shared_optin >= tcq3_bt_shared_bytes) {
-                        CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo3_tcq<idx_t>, tcq3_bt_shared_bytes);
+                        CUDA_SET_SHARED_MEMORY_LIMIT((k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t>), tcq3_bt_shared_bytes);
                         tcq3_use_shared_bt[ctx.device] = 1;
                         fprintf(stderr, "TCQ encode: using shared-memory backtrace (%d bytes/block)\n", tcq3_bt_shared_bytes);
                     } else {
@@ -1640,15 +1678,42 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }
-            k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, TCQ3_ENC_NT, shared_bytes, stream>>>(
+#if defined(GGML_USE_HIP)
+            // gfx1201 A/B: 512 threads wins small decode batches, 256 wins the
+            // middle range, and 128 wins large batches/fill.
+            const bool tcq3_rdna4 = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc);
+            if (tcq3_rdna4 && ne01 <= 14) {
+                k_set_rows_turbo3_tcq<512, idx_t><<<(int)ne_total_groups, 512, shared_bytes, stream>>>(
+                    src0_d, src1_d, (block_turbo3_tcq *)dst->data,
+                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            } else if (tcq3_rdna4 && ne01 <= 28) {
+                k_set_rows_turbo3_tcq<256, idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
+                    src0_d, src1_d, (block_turbo3_tcq *)dst->data,
+                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            } else {
+                k_set_rows_turbo3_tcq<128, idx_t><<<(int)ne_total_groups, 128, shared_bytes, stream>>>(
+                    src0_d, src1_d, (block_turbo3_tcq *)dst->data,
+                    ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                    s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            }
+#else
+            k_set_rows_turbo3_tcq<TCQ3_ENC_NT, idx_t><<<(int)ne_total_groups, TCQ3_ENC_NT, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+#endif
         }
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
@@ -1703,7 +1768,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }
@@ -1758,7 +1825,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
                 const int pf_layer = atoi(dst->name + 9);
                 if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
-                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    const int model_id = turbo_meansub_id_from_name(dst->name);
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device, stream, model_id)
+                                               : turbo_vmean_table_enc(ctx.device, stream, model_id);
                     if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
                 }
             }

@@ -24,3 +24,7 @@ void vbr_dequant_turbo_to_f32(const char * src, enum ggml_type src_type, enum gg
 // Called at the top of every CUDA graph_compute so the next decode graph orders after the wave's
 // async transcodes without a host block. No-op when unarmed (one branch on a static bool).
 void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream);
+
+// Release the context-owned persistent VBR transcode workspace after all context streams have
+// been drained. Called from ggml_backend_cuda_context teardown.
+void ggml_cuda_vbr_transcode_workspace_free(ggml_backend_cuda_context & ctx);

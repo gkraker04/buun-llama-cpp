@@ -298,6 +298,25 @@ public:
     }
 
     // check if the cell contains seq_id
+    // Iterate the sequences ACTUALLY occupying cell i — O(occupants), not O(LLAMA_MAX_SEQ).
+    // (A2 ownership-index maintenance walks this per touched cell on whole-cache edits.)
+    template <typename F>
+    void seq_for_each(uint32_t i, F && f) const {
+        assert(i < seq.size());
+        const auto & set = seq[i];
+#if defined(__GNUC__)
+        for (size_t s = set._Find_first(); s < set.size(); s = set._Find_next(s)) {
+            f((llama_seq_id) s);
+        }
+#else
+        for (size_t s = 0; s < set.size(); ++s) {
+            if (set.test(s)) {
+                f((llama_seq_id) s);
+            }
+        }
+#endif
+    }
+
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
         assert(seq_id >= 0);
@@ -358,6 +377,23 @@ public:
 
         return seq_pos[seq_id].rbegin()->first;
     }
+
+    // Exact cardinality from the canonical ownership index. Revision-9 A1 uses this instead of
+    // trusting the covered mask's subset count. It allocates nothing and never scans empty
+    // physical cells; A2 supplies the child visibility/serializer-manifest filter.
+    uint32_t seq_pos_count_before(llama_seq_id seq_id, llama_pos frontier) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        uint32_t count = 0;
+        for (auto it = seq_pos[seq_id].begin(); it != seq_pos[seq_id].end() && it->first < frontier; ++it) {
+            assert(it->second > 0);
+            count += static_cast<uint32_t>(it->second);
+        }
+        return count;
+    }
+
+    const std::set<uint32_t> & used_indices() const { return used; }
 
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {

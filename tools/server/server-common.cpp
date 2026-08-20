@@ -13,6 +13,9 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <algorithm>
+#include <array>
+#include <cstring>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -49,6 +52,10 @@ json format_error_response(const std::string & message, const enum error_type ty
         case ERROR_TYPE_EXCEED_CONTEXT_SIZE:
             type_str = "exceed_context_size_error";
             code = 400;
+            break;
+        case ERROR_TYPE_HARD_LEASE_BLOCKED:
+            type_str = "hard_lease_blocked";
+            code = 503;
             break;
     }
     return json {
@@ -154,6 +161,68 @@ bool are_lora_equal(
         }
     }
     return true;
+}
+
+std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras) {
+    // Collect the ACTIVE adapters as (content digest, scale bits) and sort into the same canonical
+    // order libllama applies them in (by digest, then scale bits) so the identity is independent of
+    // request order. Inactive (scale 0, incl. -0) adapters do not affect execution and are excluded.
+    std::vector<std::pair<std::array<uint8_t, 32>, uint32_t>> entries;
+    entries.reserve(loras.size());
+
+    for (const auto & la : loras) {
+        if (la.ptr == nullptr || la.scale == 0.0f) {
+            continue;
+        }
+
+        std::array<uint8_t, 32> digest{};
+        llama_adapter_meta_digest(la.ptr, digest.data());
+
+        uint32_t scale_bits;
+        static_assert(sizeof(scale_bits) == sizeof(la.scale), "unexpected float size");
+        std::memcpy(&scale_bits, &la.scale, sizeof(scale_bits)); // -0 excluded above, no normalize needed
+
+        entries.emplace_back(digest, scale_bits);
+    }
+
+    std::sort(entries.begin(), entries.end());
+
+    // The identity is a pure comparison key (never logged or parsed), and the entries are
+    // fixed-width and sorted, so their raw concatenation is unambiguous. Prefix the active count so
+    // an empty set (base adapters only) is still a distinct, well-defined identity.
+    std::string key = std::to_string(entries.size());
+    key.reserve(key.size() + entries.size() * (32 + sizeof(uint32_t)));
+
+    for (const auto & e : entries) {
+        key.append(reinterpret_cast<const char *>(e.first.data()), e.first.size());
+        key.append(reinterpret_cast<const char *>(&e.second), sizeof(e.second));
+    }
+
+    return key;
+}
+
+bool server_fault(const char * tag) {
+    // parse LLAMA_SERVER_FAULT once; empty/unset disables all injection
+    static const std::string faults = []() {
+        const char * env = std::getenv("LLAMA_SERVER_FAULT");
+        return env ? std::string(env) : std::string();
+    }();
+
+    if (faults.empty() || tag == nullptr || tag[0] == '\0') {
+        return false;
+    }
+
+    // match `tag` as a whole comma-delimited token so "load_fail" does not match "load_fail_xyz"
+    const std::string t = tag;
+    for (size_t pos = faults.find(t); pos != std::string::npos; pos = faults.find(t, pos + t.size())) {
+        const bool left  = (pos == 0)                  || faults[pos - 1]        == ',';
+        const bool right = (pos + t.size() == faults.size()) || faults[pos + t.size()] == ',';
+        if (left && right) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras) {
@@ -315,6 +384,46 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
     }
 
     return idx;
+}
+
+bool server_tokens::media_content_identity(int64_t n_tokens, std::string & out) const {
+    if (n_tokens < 0 || n_tokens > (int64_t) tokens.size()) {
+        return false;
+    }
+
+    // Length-prefix every variable-width value so the comparison key is
+    // unambiguous even if a future mtmd content id contains punctuation. The
+    // key is process-local checkpoint metadata, not a portable file format.
+    out = "server-media-prefix-v1";
+
+    size_t n_chunks = 0;
+    for (const auto & entry : map_idx_to_media) {
+        const size_t start = entry.first;
+        if (start >= (size_t) n_tokens) {
+            break;
+        }
+
+        const auto & chunk = entry.second;
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+        const char * id = mtmd_input_chunk_get_id(chunk.get());
+
+        // A frontier in the middle of a media chunk has no coherent media
+        // prefix. Empty ids are likewise unverifiable (notably expanded video
+        // frames); get_common_prefix already treats them as divergence [I6].
+        if (start + n_tok > (size_t) n_tokens || id == nullptr || id[0] == '\0') {
+            out.clear();
+            return false;
+        }
+
+        const size_t id_len = std::strlen(id);
+        out += string_format("|%zu:%zu:%d:%zu:", start, n_tok, n_pos, id_len);
+        out.append(id, id_len);
+        n_chunks++;
+    }
+
+    out += string_format("|chunks:%zu", n_chunks);
+    return true;
 }
 
 std::string server_tokens::str() const {
@@ -493,13 +602,20 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 
             GGML_ASSERT(a_chunk && b_chunk);
 
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+            // compare via C strings to keep this prefix scan allocation-free: it runs inside the
+            // exception-sensitive prompt-cache save/load paths where an OOM mid-scan must not leave
+            // the cache partially mutated (mtmd_input_chunk_get_id returns the id's c_str()).
+            const char * id_ai = mtmd_input_chunk_get_id(a_chunk.get());
+            const char * id_bi = mtmd_input_chunk_get_id(b_chunk.get());
 
             const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
 
-            if (id_ai == id_bi && n_tok_a == n_tok_b) {
+            // An empty chunk id means unidentified media: video frame chunks lose the file-level
+            // content hash on expansion and carry id == "". Matching "" == "" would reuse one
+            // video's KV for a different video of the same shape, so fail closed — an empty-id chunk
+            // is always a divergence point. Images/audio carry the FNV content hash, unaffected. [I6]
+            if (id_ai && id_ai[0] != '\0' && id_bi && std::strcmp(id_ai, id_bi) == 0 && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;
@@ -1086,27 +1202,12 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // if the assistant message appears at the end of list, we do not add end-of-turn token
-    // for ex. this can be useful to modify the reasoning process in reasoning models
-    bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
-    common_chat_msg last_message;
-    if (prefill_assistant_message) {
-        last_message = inputs.messages.back();
-        inputs.messages.pop_back();
-
-        /* sanity check, max one assistant message at the end of the list */
-        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
-            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
-        }
-
-        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
-
-        // Upstream guarded against assistant prefill + enable_thinking with a
-        // blanket error, but harnesses that track thinking tokens themselves
-        // (hermes, etc.) drive prefill-to-continue for thinking-only responses
-        // and need both on at once. Experimental fork: allow it.
-
-        inputs.add_generation_prompt = true;
+    // Parse also the OAI "reasoning_effort": "none" specific value
+    if (body.contains("reasoning_effort")) {
+        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        if (reasoning_effort == "none") {
+            inputs.enable_thinking = false;
+        } // other reasoning_effort values are model-specific and not yet handled
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1146,10 +1247,10 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
-        if (!chat_params.thinking_end_tag.empty()) {
+        if (!chat_params.thinking_end_tags.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
+            llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
@@ -1607,4 +1708,129 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+// ---- cache receipt (§7.7) ----
+// Self-contained SHA-256 (FIPS 180-4). The receipt is an untrusted hint; the
+// key prevents cross-tenant prompt-content inference, not forgery. Kept local
+// so the API surface has no TLS-backend-conditional dependency.
+namespace {
+
+struct sha256_ctx {
+    uint32_t h[8];
+    uint64_t len = 0;
+    uint8_t  buf[64];
+    size_t   buf_len = 0;
+};
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+};
+
+static inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void sha256_init(sha256_ctx & c) {
+    static const uint32_t iv[8] = {
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+    };
+    memcpy(c.h, iv, sizeof(iv));
+    c.len = 0;
+    c.buf_len = 0;
+}
+
+static void sha256_block(sha256_ctx & c, const uint8_t * p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = (uint32_t) p[4*i] << 24 | (uint32_t) p[4*i+1] << 16 |
+               (uint32_t) p[4*i+2] << 8 | (uint32_t) p[4*i+3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        const uint32_t s0 = rotr32(w[i-15], 7) ^ rotr32(w[i-15], 18) ^ (w[i-15] >> 3);
+        const uint32_t s1 = rotr32(w[i-2], 17) ^ rotr32(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=c.h[0],b=c.h[1],d0=c.h[2],d=c.h[3],e=c.h[4],f=c.h[5],g=c.h[6],h=c.h[7];
+    for (int i = 0; i < 64; ++i) {
+        const uint32_t S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = h + S1 + ch + sha256_k[i] + w[i];
+        const uint32_t S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
+        const uint32_t mj = (a & b) ^ (a & d0) ^ (b & d0);
+        const uint32_t t2 = S0 + mj;
+        h=g; g=f; f=e; e=d+t1; d=d0; d0=b; b=a; a=t1+t2;
+    }
+    c.h[0]+=a; c.h[1]+=b; c.h[2]+=d0; c.h[3]+=d; c.h[4]+=e; c.h[5]+=f; c.h[6]+=g; c.h[7]+=h;
+}
+
+static void sha256_update(sha256_ctx & c, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    c.len += n;
+    while (n > 0) {
+        const size_t take = std::min(n, (size_t) 64 - c.buf_len);
+        memcpy(c.buf + c.buf_len, p, take);
+        c.buf_len += take; p += take; n -= take;
+        if (c.buf_len == 64) {
+            sha256_block(c, c.buf);
+            c.buf_len = 0;
+        }
+    }
+}
+
+static void sha256_final(sha256_ctx & c, uint8_t out[32]) {
+    const uint64_t bits = c.len * 8;
+    const uint8_t pad = 0x80;
+    sha256_update(c, &pad, 1);
+    const uint8_t zero = 0;
+    while (c.buf_len != 56) {
+        sha256_update(c, &zero, 1);
+    }
+    uint8_t lb[8];
+    for (int i = 0; i < 8; ++i) {
+        lb[i] = (uint8_t) (bits >> (56 - 8*i));
+    }
+    sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; ++i) {
+        out[4*i]   = (uint8_t) (c.h[i] >> 24);
+        out[4*i+1] = (uint8_t) (c.h[i] >> 16);
+        out[4*i+2] = (uint8_t) (c.h[i] >> 8);
+        out[4*i+3] = (uint8_t) (c.h[i]);
+    }
+}
+
+} // namespace
+
+std::vector<std::string> cache_receipt_chain(
+        const std::vector<llama_token> & tokens,
+        uint32_t                          block_tokens,
+        const std::string &               key) {
+    std::vector<std::string> chain;
+    if (block_tokens == 0) {
+        return chain;
+    }
+    uint8_t prev[32] = {0};
+    static const char hexd[] = "0123456789abcdef";
+    for (size_t off = 0; off < tokens.size(); off += block_tokens) {
+        const size_t n = std::min((size_t) block_tokens, tokens.size() - off);
+        sha256_ctx c;
+        sha256_init(c);
+        sha256_update(c, key.data(), key.size());
+        sha256_update(c, prev, sizeof(prev));
+        sha256_update(c, tokens.data() + off, n * sizeof(llama_token));
+        sha256_final(c, prev);
+        std::string hex;
+        hex.reserve(16);
+        for (int i = 0; i < 8; ++i) {   // trunc64: first 8 bytes as hex
+            hex.push_back(hexd[prev[i] >> 4]);
+            hex.push_back(hexd[prev[i] & 0xf]);
+        }
+        chain.push_back(std::move(hex));
+    }
+    return chain;
 }

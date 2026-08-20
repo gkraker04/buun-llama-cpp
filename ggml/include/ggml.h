@@ -584,6 +584,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_PARAMS,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2473,6 +2474,15 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Hint that the mask selects a sparse, non-contiguous subset of KV rows.
+    // Backends may use this to skip fully masked work; it does not change results.
+    GGML_API void ggml_flash_attn_ext_set_sparse_mask(
+            struct ggml_tensor * a,
+            bool                 sparse);
+
+    GGML_API bool ggml_flash_attn_ext_get_sparse_mask(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2673,6 +2683,17 @@ extern "C" {
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
     //
+    // hc_params: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //            -> [(2 + hc)*hc, n_tokens]
+    // The packed result contains pre [hc], post [hc], then comb [hc*hc] for each token.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_params(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
     // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
@@ -2853,6 +2874,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 

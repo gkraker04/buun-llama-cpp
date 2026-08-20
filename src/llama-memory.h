@@ -2,10 +2,13 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-vbr-operation.h"
+#include "llama-vbr-hard-seal.h"
 
 #include <map>
 #include <memory>
 #include <functional>
+#include <limits>
 
 struct llama_ubatch;
 
@@ -25,6 +28,10 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Resolve a simple KV buffer type to this llama_context's main compute backend instance.
+    // VBR uses the exact instance to reserve backend-context-owned flash-attention scratch.
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 // TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
@@ -38,10 +45,10 @@ struct llama_memory_vbr_params {
     // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
     bool     min_bits_explicit = false;
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
-    // (an auto budget floats within [armed value, live reach] at decode boundaries)
+    // (an auto budget floats within [floor-layout cost, live reach] at decode boundaries)
     bool     budget_explicit = false;
-    // free-VRAM headroom kept when re-deriving an auto budget (0 = 1 GiB default; the fit
-    // passes its --fit-target so startup and runtime encode the same worst case)
+    // free-VRAM headroom kept while growing a VBR pool (0 = 1 GiB default; the fit passes its
+    // --fit-target so startup and runtime encode the same worst case)
     uint64_t growth_headroom_bytes = 0;
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent splits by entry-tier footprint so the children never double-claim the same free)
@@ -49,6 +56,11 @@ struct llama_memory_vbr_params {
     // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
     bool     pin_v = false;
+    // WS-0 (P1) trace: VBR_TRACE path suffix so iSWA base/SWA children write to DISTINCT files
+    // instead of both truncating the same path (Sol review F2). nullptr for a standalone cache.
+    const char * trace_label = nullptr;
+
+    std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
 
 enum llama_memory_status {
@@ -88,6 +100,13 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Maximum number of sequences a graph built against this context can represent
+    // at the current physical allocation. Most memory types do not impose a tighter
+    // bound than the owning llama_context's configured sequence maximum.
+    virtual uint32_t get_max_graph_seqs() const {
+        return std::numeric_limits<uint32_t>::max();
+    }
 
     // TurboQuant: get rotation tensors for pre-rotate-queries optimization
     // Returns null for non-turbo memory types. Override in KV cache contexts.
@@ -135,6 +154,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether arbitrary token ranges can be removed without discarding the whole sequence
+    // default to the conservative answer for out-of-tree memory implementations
+    virtual bool can_seq_rm_partial() const { return false; }
+
     // effective bits/value of the attention KV storage, aggregated over all KV tensors at
     // their CURRENT types (dynamic VBR tier flips move this at runtime; f16 = 16, q8_0 = 8.5,
     // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
@@ -144,6 +167,28 @@ struct llama_memory_i {
     // all zeros: "no controller, no pressure, nothing resident" — safe for policy consumers.
     virtual llama_memory_vbr_state_data memory_vbr_state(llama_seq_id /*seq_id*/, uint32_t /*n_tokens_extra*/) const {
         return {};
+    }
+
+    // Scoped dynamic-VBR representation freeze. The public top-level wrapper mints the
+    // process-global operation ID once; composites only forward it. Non-VBR memories stay inert.
+    virtual bool vbr_operation_armed() const { return false; }
+    virtual bool vbr_retier_freeze_begin(
+            const char * /*owner*/, vbr_operation_id /*operation_id*/) { return false; }
+    virtual void vbr_retier_freeze_end(
+            const char * /*owner*/, vbr_operation_id /*operation_id*/) {}
+    // A2: promote deferred (submitted) extent entries at the context's existing synchronize
+    // boundary. Inert for non-VBR memories; composites forward to their attention child.
+    virtual void vbr_commit_submitted() {}
+    // A2 (review F3): resolve in-flight decode operations once the decode outcome is known.
+    virtual void vbr_decode_ops_finish(bool /*ok*/) {}
+    // A2 (review F10b): composite wrappers mint one operation per logical mutation and adopt
+    // it into every armed child so children never mint divergent ids.
+    virtual void vbr_adopt_operation(vbr_operation_id /*operation_id*/) {}
+    virtual void vbr_release_adopted() {}
+    virtual llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t /*n_tokens_extra*/) const {
+        llama_memory_vbr_preflight_data r = {};
+        r.fits = true;
+        return r;
     }
 
     // per-token KV bits of the layout the --vbr-floor clamp lands on when walking the degrade
@@ -170,6 +215,23 @@ struct llama_memory_i {
     virtual void vbr_cotenancy_accum(uint64_t & /*decrement*/, uint32_t & /*grants*/,
                                      uint64_t & /*offer*/, uint64_t & /*pending*/) const {}
 
+    // True for the single root that owns a live dynamic-VBR ledger controller.
+    // Composite memories forward this once for the whole tree.
+    virtual bool vbr_ledger_tree_active() const { return false; }
+
+    // E1 hard-seal enforcement. Non-VBR memories remain inert. The callback
+    // is scheduler-owned and read-only; implementations invoke it before any
+    // transcode, mapping, cursor publication, or backend mutation.
+    virtual void vbr_hard_seal_guard_set(vbr_hard_seal_guard /*guard*/) {}
+    virtual bool vbr_hard_seal_blocked_take(bool /*decode_failed*/) { return false; }
+    virtual void vbr_hard_seal_evidence_take(
+            std::vector<vbr_hard_seal_subject> & /*out*/) {}
+
+    // Drop any non-owning registrations that refer to compute backends owned by the
+    // enclosing llama_context. llama_context calls this before those backends are
+    // destroyed; memory implementations without shared-KV consumers have nothing to do.
+    virtual void vbr_shared_scratch_detach() {}
+
     //
     // ops
     //
@@ -178,7 +240,29 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+    virtual bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
+    // Internal speculative bookkeeping. These mutate real memory and retain normal
+    // generation/ownership accounting, but attention implementations may suppress global
+    // checkpoint-lineage publication for a proven disposable backup or rejected suffix.
+    virtual bool seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
+    virtual bool seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm_attn(seq_id, p0, p1);
+    }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    // Internal detectable copy path. Memory implementations whose seq_cp cannot fail use
+    // this fallback; composite/recurrent memories override it to report transactional failure.
+    virtual bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+        seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return true;
+    }
+    virtual bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+        return try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;

@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -148,10 +148,141 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build_and_test(test-server-recurrent-expansion.cpp)
+target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build(test-recurrent-state-rollback.cpp)
+    target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build(test-vbr-representation-epoch.cpp)
+    target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    add_test(
+        NAME test-vbr-controller-id-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --f4-cpu)
+    add_test(
+        NAME test-vbr-representation-a1-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a1-cpu)
+    add_test(
+        NAME test-vbr-representation-a2-cpu
+        COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --a2-cpu)
+
+    add_test(
+        NAME check-memory-tree-coverage
+        COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${PROJECT_SOURCE_DIR}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check-memory-tree-coverage.cmake)
+
+    llama_build_and_test(test-cache-accounting.cpp)
+    target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-cache-budget.cpp)
+    target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-cache-authority.cpp)
+    target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-vbr-artifact.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp)
+    target_include_directories(test-vbr-artifact PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-vbr-artifact-adopt.cpp)
+    target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-vbr-artifact-capture.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp)
+    target_include_directories(test-vbr-artifact-capture PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-lease PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-yield PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-destruction-quote PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(test-cache-plan-record.cpp)
+    target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(test-vbr-hard-seal.cpp)
+    target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-cache-control.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control-wire.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+    target_include_directories(test-cache-control PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-cache-control PRIVATE
+        CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
+
+    llama_build_and_test(test-cache-plan-estimate.cpp)
+    target_include_directories(test-cache-plan-estimate PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+    llama_build_and_test(
+        test-cache-plan-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-plan-authority PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build_and_test(
+        test-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-preflight.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-cache-plan-preflight PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-cache-plan-preflight PRIVATE
+        CACHE_PLAN_PREFLIGHT_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-plan-preflight-v1.json")
+
+    llama_build_and_test(
+        test-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+    target_include_directories(test-retention-sidecar PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+
+    llama_build(test-dflash-tape-vs-plane.cpp)
+    target_include_directories(test-dflash-tape-vs-plane PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -195,6 +326,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_build(test-lora-determinism.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -216,6 +348,34 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
         FIXTURES_REQUIRED generate-models
+    )
+
+    # test-vbr-representation-epoch requires an iSWA Gemma-4 fixture. test-llama-archs
+    # deliberately does not save Gemma-4 yet (its synthetic model/context support is
+    # incomplete), so registering this target against a generated non-iSWA model is
+    # a false gate. Hardware validation invokes the built binary with the canonical
+    # real Gemma-4 fixture explicitly.
+
+    set(LORA_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-lora-models/")
+    file(MAKE_DIRECTORY "${LORA_MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-lora-model
+        LABEL main
+        ARGS -a qwen35 -s 0 -o "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-lora-model PROPERTIES
+        FIXTURES_SETUP generate-lora-model
+    )
+
+    llama_test(
+        test-lora-determinism
+        LABEL main
+        ARGS "${LORA_MODEL_DIR}/qwen35-dense.gguf" "${LORA_MODEL_DIR}"
+    )
+    set_tests_properties(test-lora-determinism PROPERTIES
+        FIXTURES_REQUIRED generate-lora-model
     )
 endif()
 
@@ -258,12 +418,51 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-mtp-vocab-trim.cpp)
+if (MSVC)
+    target_compile_options(test-arg-parser PRIVATE /UNDEBUG)
+    target_compile_options(test-mtp-vocab-trim PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-arg-parser PRIVATE -UNDEBUG)
+    target_compile_options(test-mtp-vocab-trim PRIVATE -UNDEBUG)
+endif()
+llama_build_and_test(test-vbr-policy.cpp)
+llama_build_and_test(test-vbr-downward.cpp)
+llama_build_and_test(test-vbr-physical.cpp)
+llama_build_and_test(test-vbr-transaction.cpp)
+if (MSVC)
+    target_compile_options(test-vbr-policy PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-downward PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-physical PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-vbr-policy PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-downward PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-physical PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
+endif()
+llama_build_and_test(test-model-resolution.cpp)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build(test-moe-cache.cpp)
+    llama_test(test-moe-cache LABEL "main;backend")
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
+endif()
+
+llama_build_and_test(test-moe-cache-fit.cpp)
+
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-vbr-vmm.cpp)
+    target_link_libraries(test-vbr-vmm PRIVATE ggml-cuda)
+    llama_test(test-vbr-vmm LABEL "backend")
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -277,6 +476,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
