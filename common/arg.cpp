@@ -1951,8 +1951,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         params.lr.init();
 
-        // DFlash-safe defaults. The drafter's block_size=16 / internal max
-        // batch=64 means it only needs a tiny graph, and multi-slot target
+        // DFlash-safe target batch defaults. The drafter's block_size=16 / internal
+        // max batch=64 means it only needs a tiny graph, and multi-slot target
         // activation memory scales as n_ubatch * n_parallel — stock ub=512
         // with np=auto=4 OOMs a 24 GB GPU. So cap to keep first-run users
         // from hitting OOM. The tradeoff: target prefill is ~30% slower at
@@ -1973,12 +1973,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             };
             const bool b_passed   = arg_passed({"-b", "--batch-size"});
             const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
-            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
-
-            if (!cd_passed && params.speculative.draft.n_ctx == 0) {
-                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
-                params.speculative.draft.n_ctx = 256;
-            }
             bool capped = false;
             if (!b_passed && params.n_batch > 256) {
                 params.n_batch = 256;
@@ -3379,8 +3373,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
         {"--mmproj-gpu-swap"},
-        "temporarily swap MTP draft context out of VRAM to run mmproj on GPU for image encoding, then swap back\n"
-        "(useful when both MTP and mmproj don't fit in VRAM simultaneously)",
+        "temporarily swap a reloadable speculative context (MTP or external DFlash) out of VRAM to run mmproj on GPU, then restore it\n"
+        "(useful when the speculative context and mmproj don't fit in VRAM simultaneously)",
         [](common_params & params) {
             params.mmproj_gpu_swap = true;
         }
@@ -4914,7 +4908,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_TREE_BUDGET"));
     add_opt(common_arg(
         {"--dflash-max-slots"}, "N",
-        string_format("max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: %d)", params.speculative.dflash_max_slots),
+        string_format("max concurrent server slots with legacy DFlash state; shared draft-dflash/DSpark use every slot (default: %d)", params.speculative.dflash_max_slots),
         [](common_params & params, int value) {
             params.speculative.dflash_max_slots = value;
         }
@@ -4926,6 +4920,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft_topk = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DRAFT_TOPK"));
+    add_opt(common_arg(
+        {"--spec-draft-temp", "--draft-temp"}, "T",
+        string_format("drafter sampling temperature (default: %.2f, 0 = greedy)",
+                (double) params.speculative.sample_temp),
+        [](common_params & params, const std::string & value) {
+            params.speculative.sample_temp = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+     .set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));
     add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(

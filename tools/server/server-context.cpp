@@ -1422,6 +1422,11 @@ struct server_slot {
     void init_sampler() const {
         common_sampler_reset(smpl.get());
 
+        if (can_speculate()) {
+            common_speculative_set_rng_seed(
+                get_spec(), id, common_sampler_get_seed(smpl.get()));
+        }
+
         if (!task->need_sampling()) {
             return;
         }
@@ -1524,17 +1529,24 @@ struct server_slot {
 
         const int n_draft_min = common_speculative_n_min(get_spec(), task->params.speculative);
 
-
-        // determine the max draft that fits the current slot state
+        // determine the configured max draft and then cap it to what fits the
+        // current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        int n_draft_max = common_speculative_n_max(get_spec(), task->params.speculative);
+        n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+
+        if (n_draft_max < n_draft_min) {
+            SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n",
+                    n_draft_max, n_draft_min);
+            n_draft_max = 0;
+        }
 
         return n_draft_max;
     }
@@ -2006,7 +2018,11 @@ struct server_slot {
             if (mbatch) {
                 float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
                 if (embd) {
-                    void * cb_data = spec.get();
+                    // Shared block-diffusion DFlash/DSpark use one speculative object and leave
+                    // the slot-owned pointer empty. Route image-batch notifications through
+                    // the same accessor as text batches so the shared drafter observes the
+                    // multimodal boundary too.
+                    void * cb_data = get_spec();
                     static auto cb = [](llama_batch batch, void * user_data) {
                         common_speculative * spec = static_cast<common_speculative *>(user_data);
                         if (!common_speculative_process(spec, batch)) {
@@ -3838,10 +3854,13 @@ private:
 
     bool sleeping = false;
 
-    // MTP↔mmproj GPU swap state
+    // speculative-context ↔ mmproj GPU swap state
     bool mmproj_gpu_swap = false;
     bool mmproj_is_on_gpu = false;
     bool mtp_was_active_before_swap = false;
+    bool external_draft_was_active_before_swap = false;
+    bool external_draft_reload_configured = false;
+    common_params external_draft_reload_params;
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -3942,8 +3961,64 @@ private:
         return llama_init_from_model(model_tgt, cparams);
     }
 
-    void swap_mtp_to_mmproj_gpu() {
-        SRV_INF("%s", "swapping MTP out, loading mmproj to GPU...\n");
+    bool restore_external_draft() {
+        if (!external_draft_reload_configured) {
+            return false;
+        }
+
+        auto mparams = common_model_params_to_llama(external_draft_reload_params);
+        mparams.progress_callback = nullptr;
+        mparams.progress_callback_user_data = nullptr;
+        model_dft.reset(llama_model_load_from_file(
+                external_draft_reload_params.model.path.c_str(), mparams));
+        if (!model_dft) {
+            SRV_ERR("failed to reload DFlash draft model '%s' after mmproj swap\n",
+                    external_draft_reload_params.model.path.c_str());
+            return false;
+        }
+
+        llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
+        params_base.speculative.model_dft = model_dft.get();
+        params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
+        params_base.speculative.cparams_dft.n_rs_seq = 0;
+
+        ctx_dft.reset(llama_init_from_model(
+                model_dft.get(), params_base.speculative.cparams_dft));
+        if (!ctx_dft) {
+            SRV_ERR("%s", "failed to recreate DFlash context after mmproj swap\n");
+            model_dft.reset();
+            params_base.speculative.model_dft = nullptr;
+            return false;
+        }
+
+        ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+        params_base.speculative.draft.ctx_tgt = ctx_tgt;
+        params_base.speculative.draft.ctx_dft = ctx_dft.get();
+
+        try {
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to reinit DFlash speculative context: %s\n", e.what());
+        }
+        if (!spec) {
+            ctx_dft.reset();
+            model_dft.reset();
+            params_base.speculative.model_dft = nullptr;
+            params_base.speculative.draft.ctx_dft = nullptr;
+            return false;
+        }
+
+        for (server_slot & slot : slots) {
+            slot.ctx_dft = ctx_dft.get();
+            slot.spec_shared = spec.get();
+            common_speculative_set_seq_id(slot.get_spec(), slot.id);
+        }
+        return true;
+    }
+
+    void swap_spec_to_mmproj_gpu() {
+        SRV_INF("swapping %s out, loading mmproj to GPU...\n",
+                model_dft ? "DFlash" : "MTP");
         int64_t t0 = ggml_time_us();
 
         for (server_slot & slot : slots) {
@@ -3952,10 +4027,16 @@ private:
         }
         spec.reset();
 
-        mtp_was_active_before_swap = ctx_dft != nullptr;
+        mtp_was_active_before_swap = ctx_dft != nullptr && !model_dft;
+        external_draft_was_active_before_swap = ctx_dft != nullptr && model_dft &&
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
         if (ctx_dft) {
             ctx_dft.reset();
             params_base.speculative.draft.ctx_dft = nullptr;
+        }
+        if (external_draft_was_active_before_swap) {
+            model_dft.reset();
+            params_base.speculative.model_dft = nullptr;
         }
 
         reload_mmproj(true);
@@ -3969,14 +4050,21 @@ private:
         SRV_INF("swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
     }
 
-    void swap_mmproj_to_mtp() {
-        SRV_INF("%s", "unloading mmproj from GPU, restoring prior state...\n");
+    void swap_mmproj_to_spec() {
+        SRV_INF("%s", "unloading mmproj from GPU, restoring speculative state...\n");
         int64_t t0 = ggml_time_us();
 
         mmproj_is_on_gpu = false;
         reload_mmproj(false);
 
-        if (mtp_was_active_before_swap) {
+        if (external_draft_was_active_before_swap) {
+            if (!restore_external_draft()) {
+                SRV_ERR("%s", "DFlash restore failed; continuing without speculation\n");
+                for (server_slot & slot : slots) {
+                    slot.ctx_dft = nullptr;
+                }
+            }
+        } else if (mtp_was_active_before_swap) {
             // Already had MTP before the swap — recreate it
             ctx_dft.reset(create_mtp_context());
             if (!ctx_dft) {
@@ -4002,8 +4090,8 @@ private:
                 }
             }
         } else {
-            // No MTP was active — mmproj stays on CPU until next image arrives
-            SRV_INF("%s", "(no MTP to restore, mmproj will reload on next image)\n");
+            // No speculative context was active — mmproj stays on CPU until next image.
+            SRV_INF("%s", "(no speculative context to restore; mmproj will reload on next image)\n");
         }
 
         SRV_INF("swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
@@ -4429,7 +4517,8 @@ private:
                         auto data = common_get_device_memory_data_with_parent(
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                            measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
+                            measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR,
+                            !spec_mtp);
                         if (!spec_mtp) {
                             return data;
                         }
@@ -4545,6 +4634,40 @@ private:
                     // before the target exists (llama_init_from_model logs the reason at
                     // WARN, which the measurement's log filter demotes to DEBUG). The only
                     // effect is that the draft model VRAM is not charged to the fit reserve.
+                }
+            }
+        }
+
+        // An external DFlash model and the GPU projector are phase-exclusive under
+        // --mmproj-gpu-swap. The ordinary draft measurement above has already raised
+        // each target-device reserve to cover the drafter. Also measure the projector
+        // and retain the larger reservation, so a small/quantized drafter cannot make
+        // the auto-fit advertise a context that leaves no room for the image phase.
+        if (params_base.mmproj_gpu_swap && has_mmproj && has_draft &&
+            params_base.fit_params && params_base.n_ctx == 0 &&
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+            const auto target_devices = server_target_fit_devices(params_base);
+            auto mparams_gpu = make_mmproj_params(true);
+            const auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_gpu);
+            bool reserved = false;
+            for (const auto & [device, bytes] : mmproj_mem) {
+                for (size_t i = 0; i < target_devices.size() &&
+                                   i < params_base.fit_params_target.size(); ++i) {
+                    if (target_devices[i] == device) {
+                        params_base.fit_params_target[i] = std::max(
+                                params_base.fit_params_target[i], bytes);
+                        reserved = reserved || bytes > 0;
+                        break;
+                    }
+                }
+            }
+            if (!reserved && !params_base.fit_params_target.empty()) {
+                std::error_code ec;
+                const size_t file_bytes = std::filesystem::file_size(mmproj_path, ec);
+                if (!ec && file_bytes > 0) {
+                    params_base.fit_params_target[0] = std::max(
+                            params_base.fit_params_target[0],
+                            file_bytes + (size_t) 256 * 1024 * 1024);
                 }
             }
         }
@@ -5043,13 +5166,27 @@ private:
                 return false;
             }
 
+            // DFlash2 uses the shared block-diffusion driver, which owns the
+            // final per-sequence adaptive-depth controller. Normalize the older
+            // fork `dflash` spelling after inspecting the sidecar so there is no
+            // second DFlash2 execution route.
+            if (llama_model_dflash2_has_selector(model_dft.get())) {
+                common_speculative_resolve_draft_model_type(
+                        params_base.speculative, model_dft.get());
+                if (params_base.speculative.n_max < 0) {
+                    params_base.speculative.draft.n_max = -1;
+                }
+                SRV_INF("selected adaptive shared DFlash2 driver (block_size=%d)\n",
+                        llama_model_dflash_block_size(model_dft.get()));
+            }
+
             // Auto-detect DFlash from drafter model architecture. This tree carries TWO
             // DFlash implementations: the fork DeltaNet cross-attention drafter (arches
             // dflash-draft / gemma4-dflash-draft) and upstream's block-diffusion drafter
             // (arch dflash, which is also the DSpark backbone). Both report
             // dflash_block_size > 0, so discriminate on the architecture — it selects the
             // model graph, and each graph only works under its own driving protocol
-            // (routing an upstream-format drafter into the fork impl leaves it with 0
+            // (routing a block-diffusion-format drafter into the legacy DeltaNet impl leaves it with 0
             // capture layers and it silently never drafts). For arch dflash, a sidecar
             // carrying the DSpark Markov head must run the anchor-first DSpark protocol
             // (mirrors the download-plan rule: "dspark outranks dflash"); markov-less
@@ -5072,8 +5209,30 @@ private:
                             llama_model_dflash_block_size(model_dft.get()));
                 } else {
                     params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
-                    SRV_INF("auto-detected upstream block-diffusion DFlash drafter (block_size=%d)\n",
+                    SRV_INF("auto-detected block-diffusion DFlash drafter (block_size=%d)\n",
                             llama_model_dflash_block_size(model_dft.get()));
+                }
+            }
+
+            // Shared DFlash2 hosts CopySpec in the same multi-sequence owner.
+            // Suffix/recycle (and every model-free helper with DSpark) remain
+            // per-slot and cannot yet be composed with the shared owner.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+                const bool is_dspark =
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+                const auto is_unsupported_type = [is_dspark](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_SUFFIX ||
+                           type == COMMON_SPECULATIVE_TYPE_RECYCLE ||
+                           (is_dspark && type == COMMON_SPECULATIVE_TYPE_COPYSPEC);
+                };
+                const size_t old_size = params_base.speculative.types.size();
+                params_base.speculative.types.erase(
+                        std::remove_if(params_base.speculative.types.begin(),
+                                       params_base.speculative.types.end(), is_unsupported_type),
+                        params_base.speculative.types.end());
+                if (params_base.speculative.types.size() != old_size) {
+                    SRV_WRN("%s", "requested model-free speculator cannot share this draft lifecycle; disabling it\n");
                 }
             }
 
@@ -5180,7 +5339,7 @@ private:
             // 2026-08-10, crosskv A/B). Auto-detected fork drafters get the same small
             // default the --spec-dflash-default handler applies in arg.cpp; an explicit
             // -cd N still wins (it lands in params_spec.n_ctx).
-            // Do NOT apply this to the upstream draft-dflash/draft-dspark impls: they
+            // Do NOT apply this to the shared draft-dflash/draft-dspark impls: they
             // inject target features into the drafter KV at absolute prompt positions, so
             // the drafter context must span the target prompt — at -cd 256 any prompt
             // past ~256 tokens fails decode ("failed to find a memory slot") and the
@@ -5199,7 +5358,7 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            // The upstream draft-dflash/draft-dspark graphs also read the target's
+            // The shared draft-dflash/draft-dspark graphs also read the target's
             // tok_embd/output — through the ctx_other fallback, which references the
             // target tensors directly. A -sm layer target puts output.weight on the
             // last GPU, and a drafter pinned elsewhere (--spec-draft-device) then
@@ -5214,12 +5373,19 @@ private:
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 
-            // Upstream block-diffusion DFlash / DSpark: create the drafter context here
+            // Shared block-diffusion DFlash / DSpark: create the drafter context here
             // (it shares tok_embd/output with the target through cparams_dft.ctx_other)
             // and wire the draft params so the shared speculative init below picks the
             // draft-dflash / draft-dspark implementation.
             if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                 params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+                // Retain owning copies of placement/device vectors for DFlash reloads.
+                // llama_model_params contains pointers into these vectors and cannot be
+                // stored directly across an mmproj swap.
+                if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+                    external_draft_reload_params = params_dft;
+                    external_draft_reload_configured = true;
+                }
                 params_base.speculative.cparams_dft.n_rs_seq = 0;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), params_base.speculative.cparams_dft));
                 if (ctx_dft == nullptr) {
@@ -5275,10 +5441,15 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mmproj_gpu_swap = params_base.mmproj_gpu_swap && !model_dft;
-            // Note: ctx_dft is NOT required here. Without MTP, the swap simply
-            // keeps mmproj on CPU until an image arrives, loads it to GPU for
-            // encoding, then moves it back. No MTP state to swap out.
+            const bool external_dflash_swap = model_dft &&
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+            mmproj_gpu_swap = params_base.mmproj_gpu_swap && (!model_dft || external_dflash_swap);
+            // Note: ctx_dft is NOT required here. Without a speculative model, the
+            // swap simply keeps mmproj on CPU until an image arrives. External
+            // block-diffusion DFlash is reloadable and follows the same lifecycle.
+            if (params_base.mmproj_gpu_swap && model_dft && !external_dflash_swap) {
+                SRV_WRN("%s", "mmproj GPU swap is unavailable for this external draft type; keeping both resident\n");
+            }
 
             const bool use_gpu = mmproj_gpu_swap ? false : params_base.mmproj_use_gpu;
             auto mparams = make_mmproj_params(use_gpu, load_progress_callback, &load_progress_mmproj);
@@ -5426,7 +5597,7 @@ private:
             slots.emplace_back();
         }
 
-        // try speculative decoding (upstream shared spec — not used by fork types which init per-slot)
+        // try speculative decoding (shared multi-seq spec — not used by legacy fork types which init per-slot)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && !dflash_slots_cap) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
@@ -10209,6 +10380,7 @@ private:
         cycle_failed = false;
 
         std::vector<llama_tokens> batched_drafts(slots.size());
+        std::vector<bool> batched_draft_attempted(slots.size(), false);
         std::vector<bool> batched_draft_decode_succeeded(slots.size(), false);
         const auto recurrent_speculation_deferred = [&]() {
             return needs_reeval &&
@@ -10254,6 +10426,57 @@ private:
             }
         }
 
+        // The shared block-diffusion DFlash/DSpark implementation accepts one armed
+        // draft descriptor per sequence and deliberately builds all armed noise blocks
+        // into a single llama_decode(). Arm every generating slot before calling it;
+        // the old per-slot loop below threw that batching contract away and launched
+        // one drafter graph per slot per cycle.
+        if (!ctx_dft_shared && spec &&
+            (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK))) {
+            std::vector<int> batch_slot_ids;
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
+                    continue;
+                }
+                const int n_draft_max = recurrent_speculation_deferred() ? 0 : slot.get_n_draft_max();
+                if (n_draft_max <= 0) {
+                    continue;
+                }
+
+                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
+                dp.drafting = true;
+                dp.n_max    = n_draft_max;
+                dp.n_past   = slot.prompt.tokens.pos_next();
+                dp.id_last  = slot.sampled;
+                dp.prompt   = &cached_text_tokens;
+                dp.result   = &batched_drafts[slot.id];
+                batched_draft_attempted[slot.id] = true;
+                batch_slot_ids.push_back(slot.id);
+            }
+
+            if (!batch_slot_ids.empty()) {
+                const int64_t t_batch_start = ggml_time_us();
+                common_speculative_draft(spec.get());
+                t_draft_total += ggml_time_us() - t_batch_start;
+
+                const bool decode_succeeded =
+                    common_speculative_last_draft_model_decode_succeeded(spec.get());
+                for (const int slot_id : batch_slot_ids) {
+                    batched_draft_decode_succeeded[slot_id] = decode_succeeded;
+
+                    // Noise rows are proposals, not committed drafter state. The next
+                    // common_speculative_process() injection is the sole owner of cells
+                    // beyond the target frontier.
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot_id,
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot_id) + 1, -1);
+                    }
+                }
+            }
+        }
+
         // first, add sampled tokens from any ongoing sequences (and draft per slot)
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -10276,12 +10499,12 @@ private:
                 const int64_t t_draft_slot_start = ggml_time_us();
 
                 llama_tokens draft;
-                if (!batched_drafts[slot.id].empty()) {
+                if (batched_draft_attempted[slot.id] || !batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
                 } else if (!slot.spec && spec &&
                            (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK))) {
-                    // upstream shared multi-seq state (block-diffusion DFlash / DSpark):
+                    // shared multi-seq state (block-diffusion DFlash / DSpark):
                     // arm this slot's per-seq draft params — the fork single-seq wrapper
                     // below always drives drafter seq 0, which only matches slot 0
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
@@ -10297,7 +10520,7 @@ private:
                     // the draft decode wrote its noise block into the drafter KV at the
                     // frontier positions; trim back to the committed target frontier so
                     // the verify-batch injection in common_speculative_process stays the
-                    // only source of drafter cells (upstream's server does this same
+                    // only source of drafter cells (the reference server does this same
                     // post-draft seq_rm; it was dropped in the fork-owned merge)
                     if (ctx_dft) {
                         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id,
@@ -11621,13 +11844,13 @@ private:
 
                     bool has_mtmd = false;
 
-                    // swap MTP out of VRAM so mmproj can use GPU for image encoding
+                    // Swap the speculative context out so mmproj can use its GPU budget.
                     const bool needs_mmproj_swap = mmproj_gpu_swap && !mmproj_is_on_gpu
                         && slot.prompt.n_tokens() < slot.task->n_tokens()
                         && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
 
                     if (needs_mmproj_swap) {
-                        swap_mtp_to_mmproj_gpu();
+                        swap_spec_to_mmproj_gpu();
                     }
 
                     // check if we should process the image
@@ -11661,8 +11884,11 @@ private:
                         has_mtmd = true;
                     }
 
-                    if (needs_mmproj_swap && mmproj_is_on_gpu) {
-                        swap_mmproj_to_mtp();
+                    // Even when the GPU projector reload failed and fell back to CPU,
+                    // the speculative context was already destroyed above and must be
+                    // restored after the media chunk.
+                    if (needs_mmproj_swap) {
+                        swap_mmproj_to_spec();
                     }
 
                     const auto & spans = slot.task->params.message_spans;
@@ -12191,7 +12417,7 @@ private:
         // other requests retain host sampling and full-logits extraction.
         //
         // The whole DFlash family qualifies: the fork DeltaNet drafter (DFLASH)
-        // and the upstream block-diffusion drafters (DRAFT_DFLASH, and
+        // and the shared block-diffusion drafters (DRAFT_DFLASH, and
         // DRAFT_DSPARK — its anchor-first block layout only shapes the drafter
         // decode; the target verify batch is built by the shared code above as
         // [sampled, draft...], so the coverage proof is unchanged). All of them
@@ -12206,7 +12432,12 @@ private:
             spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
             spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
             spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        if (params_base.n_parallel == 1 && spec_type_target_argmax &&
+        // Tensor split shards result_output across the vocabulary axis. Its Meta
+        // backend cannot reduce GGML_OP_ARGMAX across that axis, so keep the ordinary
+        // host-logits verifier there; this tail is only an optional transfer shortcut.
+        if (params_base.n_parallel == 1 &&
+            params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR &&
+            spec_type_target_argmax &&
             !params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE)) {
             server_slot * verify_slot = nullptr;
             for (auto & slot : slots) {
@@ -12234,6 +12465,45 @@ private:
             }
         }
         ctx_tgt->set_dflash_target_argmax(dflash_target_argmax_active);
+
+        // DFlash2's target verification is the only workload for which MMQ has
+        // beaten Ampere's normal MMVQ choice. Arm the hint for
+        // this assembled pure-verification batch only; the next pre_decode()
+        // clears it before prompt processing or ordinary token generation.
+        bool dflash2_target_mmq_active = false;
+        if (model_dft &&
+            (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+             spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
+            llama_model_dflash2_has_selector(model_dft.get()) &&
+            n_tg_tokens == batch.size()) {
+            std::vector<bool> covered(batch.size(), false);
+            bool has_verification = false;
+            bool valid_coverage = true;
+            for (const auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING ||
+                    !slot.can_speculate() || slot.spec_draft.empty()) {
+                    continue;
+                }
+                has_verification = true;
+                for (const int32_t i_batch : slot.spec_i_batch) {
+                    if (i_batch < 0 || i_batch >= batch.size() || covered[i_batch]) {
+                        valid_coverage = false;
+                        break;
+                    }
+                    covered[i_batch] = true;
+                }
+            }
+            dflash2_target_mmq_active = has_verification && valid_coverage &&
+                std::all_of(covered.begin(), covered.end(), [](bool value) { return value; });
+        }
+        const char * dflash2_mmq_env = getenv("GGML_DFLASH2_TARGET_MMQ");
+        if (!dflash2_mmq_env || atoi(dflash2_mmq_env) == 0) {
+            dflash2_target_mmq_active = false;
+        }
+        ctx_tgt->set_dflash_target_mmq_batch(
+            dflash2_target_mmq_active
+                ? llama_model_dflash_block_size(model_dft.get())
+                : 0);
 
         // allow multi-seq batching when the batch is pure TG (no prompt tokens).
         // This lets concurrent slots' verify tokens be processed in a single
@@ -12555,7 +12825,7 @@ private:
                         // fork per-slot speculative state
                         common_speculative_begin(slot.get_spec(), slot.prompt.tokens.get_text_tokens());
                     } else if (spec) {
-                        // upstream shared multi-seq speculative state
+                        // shared multi-seq speculative state
                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     }
                 }
@@ -12593,7 +12863,9 @@ private:
                     llama_dflash_set_active_slot(ctx_tgt, slot.id);
                 }
                 llama_tokens batch_tokens = { id };
-                common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, 1);
+                common_speculative_update_logits(
+                        slot.get_spec(), slot.spec ? 0 : slot.id,
+                        ctx_tgt, batch_tokens, 1);
             }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -12703,7 +12975,29 @@ private:
                     accepted_from_target_argmax = true;
                 }
             }
+
+            bool accepted_from_dflash_q = false;
             if (!accepted_from_target_argmax) {
+                const common_speculative_proposal * proposal =
+                    common_speculative_get_proposal(slot.get_spec(), slot.id);
+                if (proposal && proposal->exact_q &&
+                        proposal->seq_id == slot.id &&
+                        proposal->q_covered_tokens > 0 &&
+                        proposal->q_covered_tokens <= slot.spec_draft.size() &&
+                        proposal->selected.size() == proposal->q_covered_tokens &&
+                        std::equal(proposal->selected.begin(), proposal->selected.end(),
+                            slot.spec_draft.begin())) {
+                    accepted_from_dflash_q = common_sampler_sample_and_accept_n_q(
+                        slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                        proposal->top_k, proposal->candidate_ids, proposal->q_rows,
+                        proposal->q_covered_tokens, ids);
+                    if (accepted_from_dflash_q) {
+                        SLT_TRC(slot, "verified %zu-token draft with %zu exact q rows\n",
+                            slot.spec_draft.size(), proposal->q_covered_tokens);
+                    }
+                }
+            }
+            if (!accepted_from_target_argmax && !accepted_from_dflash_q) {
                 ids = common_sampler_sample_and_accept_n(
                     slot.smpl.get(), ctx_tgt,
                     slot.spec_i_batch, slot.spec_draft);
@@ -12720,7 +13014,9 @@ private:
                 llama_tokens batch_tokens;
                 batch_tokens.push_back(slot.sampled);
                 batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
-                common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, (int) ids.size());
+                common_speculative_update_logits(
+                        slot.get_spec(), slot.spec ? 0 : slot.id,
+                        ctx_tgt, batch_tokens, (int) ids.size());
             }
 
             slot.spec_i_batch.clear();
@@ -12758,8 +13054,12 @@ private:
                 slot.n_accepted_per_pos[i]++;
             }
 
-            // notify the shared (upstream) speculative state, if this slot uses it
-            if (!slot.spec && spec) {
+            // Notify the implementation that produced this draft. The fork DFlash
+            // route is per-slot; the upstream route shares one multi-seq state.
+            // Zero accepted tokens are still a controller outcome.
+            if (slot.spec) {
+                common_speculative_accept(slot.spec.get(), ids.size() - 1);
+            } else if (spec) {
                 common_speculative_accept(spec.get(), slot.id, ids.size() - 1);
             }
 
