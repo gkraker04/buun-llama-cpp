@@ -1,13 +1,22 @@
 #include "llama-kv-cache.h"
 
+#include "llama-vbr-artifact-capture.h"
+#include "llama-vbr-explicit-capture.h"
+#include "llama-vbr-artifact-validate.h"
+#include "llama-vbr-config.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-sha256.h"
+#include "llama-vbr-identity-digest.h"
+#include "llama-vbr-physical.h"
 #include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -17,6 +26,7 @@
 #include <set>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +41,133 @@ enum vbr_tier : uint8_t {
     VBR_TIER_T1_TCQ,
     VBR_TIER_COUNT,
 };
+bool llama_kv_cache::vbr_hard_seal_classify(
+        vbr_hard_seal_classification & out) const noexcept {
+    return vbr_classify_hard_seal(
+        vbr_degrade_order_, VBR_TIER_T4, out);
+}
+
+void llama_kv_cache::vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) {
+    vbr_hard_seal_guard_ = std::move(guard);
+    vbr_hard_seal_blocked_ = false;
+    vbr_hard_seal_evidence_.clear();
+    if (vbr_hard_seal_guard_) {
+        vbr_hard_seal_deferred_.reserve(vbr_degrade_order_.size());
+        vbr_hard_seal_attempted_.assign(vbr_degrade_order_.size(), 0);
+    } else {
+        vbr_hard_seal_deferred_.clear();
+        vbr_hard_seal_attempted_.clear();
+    }
+}
+
+bool llama_kv_cache::vbr_hard_seal_blocked_take(bool decode_failed) {
+    return vbr_hard_seal_take_decode_terminal(
+        decode_failed, vbr_hard_seal_blocked_);
+}
+
+void llama_kv_cache::vbr_hard_seal_evidence_take(
+        std::vector<vbr_hard_seal_subject> & out) {
+    out.insert(out.end(), vbr_hard_seal_evidence_.begin(),
+            vbr_hard_seal_evidence_.end());
+    vbr_hard_seal_evidence_.clear();
+}
+
+void llama_kv_cache::vbr_hard_seal_evidence_record(size_t order_ordinal) {
+    if (order_ordinal >= vbr_degrade_order_.size()) {
+        return;
+    }
+    const auto & step = vbr_degrade_order_[order_ordinal];
+    const vbr_hard_seal_subject evidence {
+        step.il, step.is_v != 0, order_ordinal,
+    };
+    if (std::find(vbr_hard_seal_evidence_.begin(),
+            vbr_hard_seal_evidence_.end(), evidence) ==
+            vbr_hard_seal_evidence_.end()) {
+        vbr_hard_seal_evidence_.push_back(evidence);
+    }
+}
+
+bool llama_kv_cache::vbr_hard_seal_step_blocked(
+        size_t order_ordinal,
+        vbr_hard_seal_consult_session & session) const {
+    if (!vbr_hard_seal_guard_) {
+        return false;
+    }
+
+    // The common lifecycle-on/no-hard-lease case stops before classifying the
+    // ladder, walking cells, or hashing live identities.
+    if (!session.any_hard_sampled) {
+        session.any_hard_sampled = true;
+        session.any_hard = vbr_hard_seal_guard_.any_hard_lease();
+    }
+    if (!session.any_hard) {
+        return false;
+    }
+    if (!session.classified) {
+        session.classified = true;
+        if (!vbr_hard_seal_classify(session.classification)) {
+            session.classification_failed = true;
+            session.verdict_sampled = true;
+            session.verdict = vbr_hard_seal_guard_result::hard_lease_blocked;
+            return true;
+        }
+    }
+    if (session.classification_failed) {
+        return true;
+    }
+    const auto * protected_step = vbr_hard_seal_subject_for_step(
+        session.classification, order_ordinal);
+    if (protected_step == nullptr) {
+        return false;
+    }
+
+    if (!session.ranges_built) {
+        session.ranges_built = true;
+        std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> occupied;
+        for (const auto & cells : v_cells) {
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+                const llama_pos pos = cells.pos_get(cell);
+                cells.seq_for_each(cell, [&](llama_seq_id sequence) {
+                    auto [it, inserted] = occupied.emplace(
+                        sequence, std::make_pair(pos, pos));
+                    if (!inserted) {
+                        it->second.first = std::min(it->second.first, pos);
+                        it->second.second = std::max(it->second.second, pos);
+                    }
+                });
+            }
+        }
+        session.ranges.reserve(occupied.size());
+        for (const auto & [sequence, extent] : occupied) {
+            if (extent.first < 0 || extent.second < extent.first ||
+                static_cast<uint64_t>(extent.second - extent.first) >= UINT32_MAX) {
+                // Fail closed if live geometry cannot be represented by the
+                // range-qualified lease door.
+                session.verdict_sampled = true;
+                session.verdict =
+                    vbr_hard_seal_guard_result::hard_lease_blocked;
+                return true;
+            }
+            session.ranges.push_back({ sequence, static_cast<uint32_t>(extent.first),
+                static_cast<uint32_t>(extent.second - extent.first + 1) });
+        }
+    }
+    const auto verdict = vbr_hard_seal_guard_.inspect(
+        *protected_step, session.ranges);
+    // The installed guard evaluates occupied lease ranges, not layer/side.
+    // Subject-uniformity is the contract that makes policy filtering and the
+    // transaction-boundary recheck consistent across custom ladder orders.
+    if (session.verdict_sampled) {
+        GGML_ASSERT(session.verdict == verdict);
+    } else {
+        session.verdict_sampled = true;
+        session.verdict = verdict;
+    }
+    return verdict == vbr_hard_seal_guard_result::hard_lease_blocked;
+}
 
 // a type the degrade ladder can move: the five turbo tiers plus F16, which is the dynamic
 // entry tier (full-quality until budget pressure; the measured orders' first band is
@@ -52,6 +189,70 @@ static ggml_type vbr_tier_type(uint8_t tier) {
         case VBR_TIER_T1_TCQ: return GGML_TYPE_TURBO1_TCQ;
         default:              GGML_ABORT("invalid vbr tier %d", (int) tier);
     }
+}
+
+struct llama_kv_cache::vbr_shared_scratch_registry {
+    static constexpr size_t no_slot = (size_t) -1;
+
+    struct layer_slots {
+        size_t k = no_slot;
+        size_t v = no_slot;
+    };
+
+    struct consumer {
+        uint64_t id = 0;
+        const ggml_vbr_backend_iface * be = nullptr;
+        ggml_backend_t compute_backend = nullptr;
+        int device = -1;
+        std::vector<layer_slots> layers;
+    };
+
+    std::mutex mutex;
+    uint64_t next_id = 1;
+    std::vector<consumer> consumers;
+};
+
+llama_kv_cache::vbr_shared_scratch_registration::vbr_shared_scratch_registration(
+        const std::shared_ptr<vbr_shared_scratch_registry> & registry,
+        uint64_t id) : registry(registry), id(id) {
+}
+
+llama_kv_cache::vbr_shared_scratch_registration::~vbr_shared_scratch_registration() {
+    reset();
+}
+
+llama_kv_cache::vbr_shared_scratch_registration::vbr_shared_scratch_registration(
+        vbr_shared_scratch_registration && other) noexcept :
+    registry(std::move(other.registry)), id(other.id) {
+    other.id = 0;
+}
+
+llama_kv_cache::vbr_shared_scratch_registration &
+llama_kv_cache::vbr_shared_scratch_registration::operator=(
+        vbr_shared_scratch_registration && other) noexcept {
+    if (this != &other) {
+        reset();
+        registry = std::move(other.registry);
+        id = other.id;
+        other.id = 0;
+    }
+    return *this;
+}
+
+void llama_kv_cache::vbr_shared_scratch_registration::reset() {
+    if (id == 0) {
+        return;
+    }
+    if (const auto owner = registry.lock()) {
+        std::lock_guard<std::mutex> lock(owner->mutex);
+        const auto it = std::find_if(owner->consumers.begin(), owner->consumers.end(),
+                [&](const vbr_shared_scratch_registry::consumer & c) { return c.id == id; });
+        if (it != owner->consumers.end()) {
+            owner->consumers.erase(it);
+        }
+    }
+    registry.reset();
+    id = 0;
 }
 
 #include "llama-vbr-degrade-orders.inc"  // arch-keyed registry (matrix v3, 2026-07-05)
@@ -273,10 +474,14 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
     return ss.str();
 }
 
-static std::string turbo_vbr_read_schedule_env(const char * env, std::string & src) {
-    src = "inline";
+bool llama_vbr_resolve_layer_schedule(
+        const char * env,
+        std::string & schedule,
+        std::string & source) {
+    schedule.clear();
+    source = "inline";
     if (!env || !env[0]) {
-        return {};
+        return true;
     }
 
     std::string value = turbo_vbr_trim(env);
@@ -291,15 +496,18 @@ static std::string turbo_vbr_read_schedule_env(const char * env, std::string & s
         std::ifstream f(path);
         if (!f) {
             LLAMA_LOG_WARN("llama_kv_cache: could not open VBR_LAYER_SCHEDULE file %s\n", path.c_str());
-            return {};
+            source = path;
+            return false;
         }
         std::ostringstream ss;
         ss << f.rdbuf();
-        src = path;
-        return ss.str();
+        schedule = ss.str();
+        source = path;
+        return true;
     }
 
-    return value;
+    schedule = std::move(value);
+    return true;
 }
 
 static bool turbo_vbr_layer_strict_enabled(void) {
@@ -340,7 +548,8 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
 
     const char * env = turbo_vbr_getenv("VBR_LAYER_SCHEDULE");
     std::string src;
-    std::string schedule = turbo_vbr_read_schedule_env(env, src);
+    std::string schedule;
+    llama_vbr_resolve_layer_schedule(env, schedule, src);
     if (schedule.empty()) {
         if (env && env[0] && turbo_vbr_layer_strict_enabled()) {
             throw std::runtime_error("VBR_LAYER_SCHEDULE is empty or could not be read while VBR_LAYER_STRICT=1 is set");
@@ -580,10 +789,15 @@ static std::vector<ggml_backend_buffer_t> kv_phys_buffers(ggml_backend_buffer_t 
     return phys;
 }
 
-// fixed VA slot of a cache tensor: every extent reserves its F16-max footprint so tier flips
-// never move data pointers — this expression is the single encoding of that sizing rule
+// Logical bytes in a cache tensor's fixed VA slot. Physical mapping and tail release must use
+// the page-padded span: the VMM backend maps intersecting chunks but unmaps only fully-contained
+// chunks, so an interval ending at this raw length cannot release a terminal partial page.
 static size_t vbr_slot_bytes(const ggml_tensor * t) {
     return (size_t) ggml_row_size(GGML_TYPE_F16, t->ne[0]) * t->ne[1] * t->ne[2];
+}
+
+static size_t vbr_slot_span(const ggml_tensor * t, size_t gran) {
+    return GGML_PAD(vbr_slot_bytes(t), gran);
 }
 
 // byte spans of one (pool, extent) unit at tier type_B: how much must stay resident (keep),
@@ -594,12 +808,50 @@ struct vbr_span {
 };
 static vbr_span vbr_span_of(const ggml_tensor * t, ggml_type type_B, int64_t n_cells,
                             uint32_t wm_next, size_t gran) {
-    const size_t rB   = ggml_row_size(type_B, t->ne[0]);
-    const size_t slot = vbr_slot_bytes(t);
+    const size_t rB           = ggml_row_size(type_B, t->ne[0]);
+    const size_t logical_slot = vbr_slot_bytes(t);
+    const size_t slot         = vbr_slot_span(t, gran);
     const size_t keep      = rB * (size_t) std::max<int64_t>(n_cells, 1);
-    const size_t keep_live = std::min(slot, std::max(keep, rB * (size_t) wm_next));
+    const size_t keep_live = std::min(logical_slot, std::max(keep, rB * (size_t) wm_next));
     const size_t keep_pad  = std::min(slot, (size_t) GGML_PAD(keep_live, gran));
     return { slot, keep, keep_live, keep_pad };
+}
+
+struct vbr_scrub_span {
+    size_t keep;
+    size_t scrub_end;
+};
+
+// One page-tail scrub calculation shared by live degrade, atomic tree shed,
+// and downward import. The callers retain their local failure policy: live
+// controller paths assert an impossible geometry, while artifact import
+// rejects malformed/overflowing evidence recoverably.
+static bool vbr_scrub_span_of(
+        const ggml_tensor * t,
+                  ggml_type type_A,
+                    int64_t n_cells,
+           const vbr_span & span,
+                     size_t gran,
+           vbr_scrub_span & result) {
+    if (t == nullptr || n_cells < 0 || gran == 0) {
+        return false;
+    }
+    const size_t row_a = ggml_row_size(type_A, t->ne[0]);
+    const size_t cells = size_t(n_cells);
+    if ((row_a != 0 && cells > SIZE_MAX/row_a) ||
+        row_a*cells > SIZE_MAX-(gran - 1) ||
+        span.keep_live > SIZE_MAX-(gran - 1)) {
+        return false;
+    }
+    const size_t mapped_hi = std::min(
+        span.slot, (size_t) GGML_PAD(row_a*cells, gran));
+    const size_t scrub_end = std::min(
+        mapped_hi, (size_t) GGML_PAD(span.keep_live, gran));
+    if (scrub_end < span.keep) {
+        return false;
+    }
+    result = { span.keep, scrub_end };
+    return true;
 }
 
 
@@ -626,6 +878,10 @@ llama_kv_cache::llama_kv_cache(
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : kv_cells_make(unified ? 1 : n_seq_max, kv_size)),
     v_cells(*v_cells_impl) {
+
+    // Construct eagerly so multiple share-linked contexts can register without racing a lazy
+    // owner-side pointer initialization. The registry itself stays empty for ordinary caches.
+    vbr_shared_scratch_registry_ = std::make_shared<vbr_shared_scratch_registry>();
 
     // A share-linked cache follows the OWNER's dynamic VBR: tier flips mutate the owner's
     // tensors in place (which this cache's layer entries alias) and graph reuse fences on
@@ -725,6 +981,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    // Kept parallel to layers[] so scratch registration can select only tensors actually
+    // aliased from mem_other. Local f16 tensors must remain zero-cost.
+    std::vector<bool> layer_is_shared;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -761,6 +1020,7 @@ llama_kv_cache::llama_kv_cache(
 
                 layers.push_back(layer_share);
                 layers.back().il = il;
+                layer_is_shared.push_back(true);
 
                 continue;
             }
@@ -817,19 +1077,29 @@ llama_kv_cache::llama_kv_cache(
                 layer_type_k = vbr_layer_policy.k[il];
                 layer_type_v = vbr_layer_policy.v[il];
             }
-            // Turbo types have no CPU vec_dot kernel; partial offload keeps GPU
-            // VBR layers native and falls CPU-bound VBR layers back to q8_0.
-            if (cpu_bound_kv && (ggml_type_is_turbo(layer_type_k) || ggml_type_is_turbo(layer_type_v))) {
-                if (layer_type_k != GGML_TYPE_Q8_0) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                }
-                if (layer_type_v != GGML_TYPE_Q8_0) {
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-                static bool warned = false;
-                if (!warned) {
-                    LLAMA_LOG_WARN("llama_kv_cache: turbo KV cache falling back to q8_0 for CPU-bound layers (partial offload)\n");
-                    warned = true;
+            // Turbo types have no CPU vec_dot kernel. A movable dynamic-VBR side also cannot
+            // degrade on the host because host buffers have no VMM pool. Pin only those sides
+            // at q8_0; preserve an explicitly pinned f16/bf16/q8_0 side in a mixed -ct config.
+            // The no-alloc fit construction takes this same path, so its host-memory price and
+            // the real allocation stay identical.
+            if (cpu_bound_kv) {
+                const auto cpu_type = [&](ggml_type type, bool pinned) {
+                    const bool needs_q8 = ggml_type_is_turbo(type) ||
+                        (vbr_params_.dynamic && !pinned && type == GGML_TYPE_F16);
+                    return needs_q8 ? GGML_TYPE_Q8_0 : type;
+                };
+                const ggml_type cpu_type_k = cpu_type(layer_type_k, vbr_params_.pin_k);
+                const ggml_type cpu_type_v = cpu_type(layer_type_v, vbr_params_.pin_v);
+                const bool pinned_to_q8 = cpu_type_k != layer_type_k || cpu_type_v != layer_type_v;
+                layer_type_k = cpu_type_k;
+                layer_type_v = cpu_type_v;
+                if (pinned_to_q8) {
+                    static bool warned = false;
+                    if (!warned) {
+                        LLAMA_LOG_WARN("llama_kv_cache: CPU-bound movable KV sides pinned at q8_0 "
+                                "(partial offload; excluded from the VBR degrade ladder)\n");
+                        warned = true;
+                    }
                 }
             }
         }
@@ -889,8 +1159,8 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_alloc, kv_size, n_stream) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
-        has_v && ggml_format_name(v, "cache_v_l%d", il);
+        has_k && ggml_format_name(k, "cache_k_l%d_ms%d", il, hparams.turbo_meansub_id);
+        has_v && ggml_format_name(v, "cache_v_l%d_ms%d", il, hparams.turbo_meansub_id);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -902,7 +1172,9 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream });
+        layers.push_back({ il, k, v, k_stream, v_stream,
+                { hparams.turbo_meansub_id, (int) il } });
+        layer_is_shared.push_back(false);
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -969,9 +1241,21 @@ llama_kv_cache::llama_kv_cache(
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
         const std::vector<llama_vbr_dev> devs = llama_vbr_backend_devs_for_buft(bft);
         if (devs.empty()) {
-            // Falling back silently would be a trap: the fit pass priced this KV at the floor
-            // tier (1.25 bits/value) but a static fallback stays at the f16 entry tier — 12.8x
-            // the budgeted VRAM with no degrade possible, an OOM at depth on any fitted config.
+            // Host KV from partial offload is legal under dynamic VBR: movable sides were
+            // pinned at q8_0 by the CPU fallback above, while explicitly pinned sides kept
+            // their requested type. They live in system memory outside the fit's VRAM budget,
+            // and the degrade walk skips units with no pool — static allocation is correct.
+            if (ggml_backend_buft_is_host(bft)) {
+                LLAMA_LOG_WARN("%s: dynamic VBR with partial offload: CPU-bound KV layers stay "
+                        "static (movable sides use q8_0; explicit side pins keep their type); "
+                        "only GPU-resident layers degrade\n", __func__);
+                return nullptr;
+            }
+            // For device KV without VBR backend support (the meta tensor-parallel buft),
+            // falling back silently would be a trap: the fit pass priced this KV at the floor
+            // tier (1.25 bits/value) but a static fallback stays at the entry tier — up to
+            // 12.8x the budgeted VRAM with no degrade possible, an OOM at depth on any
+            // fitted config.
             throw std::runtime_error(format(
                     "dynamic VBR (-ctk vbr) requires per-device KV buffers with turbo/VBR backend "
                     "support, but the KV buffer type is %s (or a device underneath it) without "
@@ -987,11 +1271,31 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // Resolve every simple KV device to this context's already-existing compute backend
+        // before entering the meta allocator's C callback. A missing binding is a construction
+        // error, but throwing it through that callback would bypass the meta allocator's NULL
+        // failure path and its rollback of already-installed device buffers.
+        std::vector<ggml_backend_t> compute_backends(devs.size(), nullptr);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            compute_backends[i] = vbr_params_.compute_backend_for_buft
+                    ? vbr_params_.compute_backend_for_buft(devs[i].buft)
+                    : nullptr;
+            if (compute_backends[i] == nullptr) {
+                throw std::runtime_error(format(
+                        "VBR could not bind KV buffer type %s to this context's compute backend",
+                        ggml_backend_buft_name(devs[i].buft)));
+            }
+        }
+        // Keep all potentially-throwing vector growth outside the C callback and before any
+        // device pool/buffer has been acquired.
+        vbr_pools_.reserve(vbr_pools_.size() + devs.size());
+
         // lay out + place ONE device's tensors into a fresh VMM pool. `cc` holds either the KV
         // context itself (plain device buft) or one device's shard tensors (meta buft under
         // -sm tensor) — the walk is identical: every non-view tensor gets a page-aligned VA
         // slot; cache tensors are sized for the max tier so a later tier change never moves them.
-        auto vmm_alloc_ctx = [&](const llama_vbr_dev & d, ggml_context * cc) -> ggml_backend_buffer_t {
+        auto vmm_alloc_ctx = [&](size_t idev, ggml_context * cc) -> ggml_backend_buffer_t {
+            const llama_vbr_dev & d = devs[idev];
             const ggml_vbr_backend_iface * be = d.be;
             const int device = d.device;
             const size_t gran = be->vmm_granularity(device);
@@ -1008,9 +1312,19 @@ llama_kv_cache::llama_kv_cache(
                 GGML_ASSERT(!is_cache || ggml_row_size(t->type, t->ne[0]) <= ggml_row_size(GGML_TYPE_F16, t->ne[0]));
                 off = GGML_PAD(off, gran);
                 places.push_back({ t, off });
-                off += slot;
+                off += GGML_PAD(slot, gran);
             }
             const size_t va_size = GGML_PAD(off, gran);
+
+            // Resolve/copy metadata while no device resource needs exception cleanup.
+            std::string busid = "-";
+            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(d.buft)) {
+                ggml_backend_dev_props bprops;
+                ggml_backend_dev_get_props(bdev, &bprops);
+                if (bprops.device_id != nullptr) {
+                    busid = bprops.device_id;
+                }
+            }
 
             ggml_vbr_vmm_pool * pool = be->vmm_pool_init(device, va_size);
             if (pool == nullptr) {
@@ -1047,20 +1361,14 @@ llama_kv_cache::llama_kv_cache(
             p.base        = base;
             p.size        = va_size;
             p.be          = be;
+            p.compute_backend = compute_backends[idev];
             p.vmm         = pool;
             p.device      = device;
             p.gran        = gran;
             p.mapped_base = be->vmm_pool_mapped(pool);
             // co-tenancy: resolve the PCI bus id eagerly — p.backend stays null until the
             // first degrade wave arms the side stream, far too late for marker publication
-            p.busid = "-";
-            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b))) {
-                ggml_backend_dev_props bprops;
-                ggml_backend_dev_get_props(bdev, &bprops);
-                if (bprops.device_id != nullptr) {
-                    p.busid = bprops.device_id;
-                }
-            }
+            p.busid = std::move(busid);
             vbr_pools_.push_back(std::move(p));
             LLAMA_LOG_INFO("%s: VBR VMM pool #%zu: %.2f MiB VA reserved (device %d, %zu KiB pages), %.2f MiB mapped up front\n",
                     __func__, vbr_pools_.size() - 1, va_size/1024.0/1024.0, device, gran/1024,
@@ -1069,7 +1377,7 @@ llama_kv_cache::llama_kv_cache(
         };
 
         if (!ggml_backend_buft_is_meta(bft)) {
-            return vmm_alloc_ctx(devs[0], c);
+            return vmm_alloc_ctx(0, c);
         }
 
         // -sm tensor: the meta backend shards every KV tensor per device (axis-0, head-aligned —
@@ -1078,12 +1386,19 @@ llama_kv_cache::llama_kv_cache(
         // per-device pool buffers so graph building sees ordinary meta tensors.
         const size_t pools_before = vbr_pools_.size();
         // std::function bridges the capturing lambda across the C callback (alive only for this call)
-        const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> alloc_one =
-            [&](size_t i, ggml_context * sctx) { return vmm_alloc_ctx(devs[i], sctx); };
+        std::function<ggml_backend_buffer_t(size_t, ggml_context *)> alloc_one =
+            [&](size_t i, ggml_context * sctx) { return vmm_alloc_ctx(i, sctx); };
         ggml_backend_buffer_t buf = ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(c, bft,
             [](size_t i, ggml_backend_buffer_type_t /*simple_buft*/, ggml_context * sctx, void * u) -> ggml_backend_buffer_t {
-                return (*(const std::function<ggml_backend_buffer_t(size_t, ggml_context *)> *) u)(i, sctx);
-            }, (void *) &alloc_one);
+                // Never unwind C-style allocator frames with a C++ exception. Returning NULL
+                // makes the meta allocator free all simple buffers installed by earlier calls;
+                // the VMM-pool rollback immediately below then releases their VA reservations.
+                try {
+                    return (*(std::function<ggml_backend_buffer_t(size_t, ggml_context *)> *) u)(i, sctx);
+                } catch (...) {
+                    return nullptr;
+                }
+            }, &alloc_one);
         if (buf == nullptr) {
             // unwind pools created for devices that DID succeed: their buffers were already freed
             // by the meta teardown; the VA reservations are ours to release
@@ -1162,6 +1477,76 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    GGML_ASSERT(layer_is_shared.size() == layers.size());
+
+    // A shared-KV cache executes attention using this context's backend objects while its
+    // layer entries alias tensors owned (and tier-mutated) by another context. Register those
+    // aliases as scratch-only bindings. This restores the boundary-reserve invariant without
+    // creating a drafter-side VMM pool/controller/ledger participant.
+    if (other && !hparams.no_alloc) {
+        auto find_binding = [&](ggml_backend_buffer_t buf) -> vbr_shared_scratch_binding * {
+            for (auto & b : vbr_shared_scratch_bindings_) {
+                if (b.buf == buf) {
+                    return &b;
+                }
+            }
+            return nullptr;
+        };
+
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if (!layer_is_shared[ikv]) {
+                continue;
+            }
+            for (int side = 0; side < 2; ++side) {
+                ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+                if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+                    continue;
+                }
+                // Tensor-split shared KV is rejected above, so aliases are simple device
+                // buffers. Keep this assertion beside the registration contract so future
+                // relaxation cannot silently bind a meta tensor to the wrong backend.
+                GGML_ASSERT(!ggml_backend_buffer_is_meta(t->buffer));
+
+                vbr_shared_scratch_binding * b = find_binding(t->buffer);
+                if (b == nullptr) {
+                    const auto devs = llama_vbr_backend_devs_for_buft(
+                            ggml_backend_buffer_get_type(t->buffer));
+                    if (devs.empty()) {
+                        // CPU/non-Turbo aliases have no dequant scratch backend and cannot
+                        // activate the CUDA TurboQuant materialization path.
+                        continue;
+                    }
+                    GGML_ASSERT(devs.size() == 1);
+                    vbr_shared_scratch_binding fresh;
+                    fresh.buf    = t->buffer;
+                    fresh.be     = devs[0].be;
+                    fresh.device = devs[0].device;
+                    fresh.compute_backend = vbr_params_.compute_backend_for_buft
+                            ? vbr_params_.compute_backend_for_buft(
+                                    ggml_backend_buffer_get_type(t->buffer))
+                            : nullptr;
+                    if (fresh.compute_backend == nullptr) {
+                        throw std::runtime_error(format(
+                                "shared-KV scratch could not bind tensor buffer type %s to this context's compute backend",
+                                ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer))));
+                    }
+                    fresh.k.assign(layers.size(), nullptr);
+                    fresh.v.assign(layers.size(), nullptr);
+                    vbr_shared_scratch_bindings_.push_back(std::move(fresh));
+                    b = &vbr_shared_scratch_bindings_.back();
+                }
+                (side ? b->v : b->k)[ikv] = t;
+            }
+        }
+
+        for (size_t i = 0; i < vbr_shared_scratch_bindings_.size(); ++i) {
+            const auto & b = vbr_shared_scratch_bindings_[i];
+            LLAMA_LOG_INFO("%s: shared-KV scratch binding #%zu (device %d, backend %s)\n",
+                    __func__, i, b.device, ggml_backend_name(b.compute_backend));
+            vbr_shared_scratch_registrations_.push_back(other->vbr_shared_scratch_register(b));
+        }
+    }
+
     // Dynamic VBR (M2): record per-(layer,side) descriptors over the just-placed KV tensors.
     // Pure bookkeeping — allocation behavior above is unchanged (bit-identical decode). M3 uses
     // these to transcode a tensor down a tier in place and return the freed bytes to the pool.
@@ -1207,6 +1592,15 @@ llama_kv_cache::llama_kv_cache(
                         if (!pdevs.empty()) {
                             p.be     = pdevs[0].be;
                             p.device = pdevs[0].device;
+                            p.compute_backend = vbr_params_.compute_backend_for_buft
+                                    ? vbr_params_.compute_backend_for_buft(
+                                            ggml_backend_buffer_get_type(inst->buffer))
+                                    : nullptr;
+                            if (p.compute_backend == nullptr) {
+                                throw std::runtime_error(format(
+                                        "VBR could not bind KV buffer type %s to this context's compute backend",
+                                        ggml_backend_buft_name(ggml_backend_buffer_get_type(inst->buffer))));
+                            }
                         }
                         vbr_pools_.push_back(std::move(p));
                     }
@@ -1305,6 +1699,45 @@ llama_kv_cache::llama_kv_cache(
                 vbr_budget_bytes_    = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
                 vbr_budget_explicit_ = true; // forced-budget instrumentation must never grow
             }
+            // WS-0 (P1): deterministic freeze — TEST/GATING ONLY (see header). Read after the budget
+            // is final so the explicit-budget precondition is decided. Skips the vbr_budget_eff live
+            // clamp + the ledger; a fixed budget + no clamp makes degrade waves a pure function of
+            // occupancy (deterministic "scripted" waves). No effect on any production run.
+            vbr_freeze_ = turbo_vbr_env_enabled("VBR_FREEZE");
+            vbr_f5_preserve_empty_tiers_ = vbr_freeze_ &&
+                turbo_vbr_env_enabled("VBR_F5_PRESERVE_EMPTY_TIERS");
+            if (vbr_freeze_) {
+                LLAMA_LOG_INFO("%s: VBR_FREEZE active — live-VRAM clamp + ledger disabled "
+                        "(deterministic tier schedule; test/gating only)\n", __func__);
+                if (!vbr_budget_explicit_) {
+                    LLAMA_LOG_WARN("%s: VBR_FREEZE without an explicit VBR_BUDGET_MIB — the auto-budget "
+                            "re-derivation reads live free VRAM and is NOT frozen; set VBR_BUDGET_MIB\n",
+                            __func__);
+                }
+                if (vbr_f5_preserve_empty_tiers_) {
+                    LLAMA_LOG_WARN("%s: VBR_F5_PRESERVE_EMPTY_TIERS active — "
+                            "empty boundaries retain the current tier vector "
+                            "(F5 gate only)\n", __func__);
+                }
+            }
+            // WS-0 (P1) schedule-trace recorder (test/gating only): open the sink if requested.
+            if (const char * tp = turbo_vbr_getenv("VBR_TRACE")) {
+                // per-child suffix (Sol F2): iSWA base/SWA caches must not both truncate the same
+                // path. Standalone caches (trace_label == nullptr) keep the bare path unchanged.
+                std::string trace_path = tp;
+                if (vbr_params_.trace_label != nullptr) {
+                    trace_path += '.';
+                    trace_path += vbr_params_.trace_label;
+                }
+                vbr_trace_fp_.reset(fopen(trace_path.c_str(), "w"));
+                if (vbr_trace_fp_) {
+                    fprintf(vbr_trace_fp_.get(), "# phase\tboundary\tcursor\ttier_fnv\twm\tused\tmapped_bytes\n");
+                    fflush(vbr_trace_fp_.get());
+                    LLAMA_LOG_INFO("%s: VBR_TRACE -> %s (per-boundary tier-schedule trace)\n", __func__, trace_path.c_str());
+                } else {
+                    LLAMA_LOG_WARN("%s: VBR_TRACE=%s could not be opened for writing\n", __func__, trace_path.c_str());
+                }
+            }
             // growth headroom: env override > fit target (threaded) > 1 GiB default
             vbr_growth_headroom_ = (size_t) vbr_params_.growth_headroom_bytes;
             if (const char * env = getenv("VBR_GROWTH_HEADROOM_MIB")) {
@@ -1314,6 +1747,7 @@ llama_kv_cache::llama_kv_cache(
                 vbr_growth_headroom_ = 1024ull * 1024 * 1024;
             }
             const bool budget_fit_armed = vbr_budget_bytes_ > 0;
+            vbr_budget_from_scalar_ = budget_fit_armed;
             if (budget_fit_armed) {
                 LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (degrade trigger armed)\n",
                         __func__, vbr_budget_bytes_/1024.0/1024.0);
@@ -1346,11 +1780,16 @@ llama_kv_cache::llama_kv_cache(
                     const auto share_of = [&](size_t total) {
                         return n_vmm == 1 ? total : (size_t) ((double) total * ((double) p.size / (double) total_va));
                     };
+                    const size_t floor_share = share_of(vbr_floor_cost_bytes_);
                     if (budget_fit_armed) {
-                        p.budget      = share_of(vbr_budget_bytes_);
-                        p.budget_base = p.budget; // re-derivation floor: never below the armed value
+                        p.budget = share_of(vbr_budget_bytes_);
+                        // An explicit scalar is a hard per-pool cap after proportional splitting.
+                        // An auto scalar only proves aggregate capacity: fit sums device-local
+                        // allowances, while VA-proportional splitting can move that capacity onto
+                        // another device. Let live per-device re-derivation correct that split, but
+                        // never below the pool's share of the advertised floor-layout cost.
+                        p.budget_base = vbr_budget_explicit_ ? p.budget : floor_share;
                     } else {
-                        const size_t floor_share = share_of(vbr_floor_cost_bytes_);
                         p.budget      = std::max(vbr_pool_reach(p), floor_share);
                         p.budget_base = floor_share;
                         derived_total += p.budget;
@@ -1377,6 +1816,67 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_stash_rows_ > 0) {
                 LLAMA_LOG_INFO("%s: VBR f16 sink-stash: %u rows per (layer,side)\n",
                         __func__, vbr_stash_rows_);
+                // Assign stable offsets now, while the pool/extent topology is immutable. The
+                // reservation itself stays lazy: cuMemAddressReserve can fail at runtime, and that
+                // failure must surface at the pre-mutation reserve boundary rather than model load.
+                for (auto & p : vbr_pools_) {
+                    if (p.vmm == nullptr) {
+                        continue;
+                    }
+                    size_t total = 0;
+                    for (size_t j = 0; j < layers.size(); ++j) {
+                        for (int side = 0; side < 2; ++side) {
+                            vbr_extent & e = side ? p.v[j] : p.k[j];
+                            if (e.t == nullptr) {
+                                continue;
+                            }
+                            e.stash_off = total;
+                            const size_t ne0 = (size_t) e.t->ne[0];
+                            if (ne0 > SIZE_MAX / sizeof(uint16_t) ||
+                                (size_t) vbr_stash_rows_ > SIZE_MAX / (ne0 * sizeof(uint16_t))) {
+                                throw std::runtime_error("VBR sink-stash size overflow");
+                            }
+                            const size_t bytes = (size_t) vbr_stash_rows_ * ne0 * sizeof(uint16_t);
+                            if (total > SIZE_MAX - bytes) {
+                                throw std::runtime_error("VBR sink-stash size overflow");
+                            }
+                            total += bytes;
+                        }
+                    }
+                    if (total > SIZE_MAX - (p.gran - 1)) {
+                        throw std::runtime_error("VBR sink-stash page padding overflow");
+                    }
+                    p.stash_size = GGML_PAD(total, p.gran);
+                }
+            }
+
+            // Revision-9 A1 construction-final arming. This is shadow-only dual-write storage:
+            // current checkpoint selection still reads the legacy epoch exclusively. Allocate
+            // only after the effective budget is final, so an unarmed/static cache is byte-for-
+            // byte and allocation-for-allocation unchanged.
+            if (vbr_budget_bytes_ > 0) {
+                vbr_generation_ = std::make_unique<vbr_generation_tracker>(
+                        n_stream, kv_size, static_cast<uint32_t>(layers.size() * 2));
+                // F4.0 has no capture/import refusal surface yet. Keep construction fail-closed;
+                // F4.1 will route unavailable durable lineage into its typed refusal path.
+                GGML_ASSERT(vbr_generation_->active());
+                // A2 dual-view ownership index (D-A2-1v2): physical masks for enumeration +
+                // per-active-seq logical-position order statistic for scan-free exact rank.
+                vbr_ownership_ = std::make_unique<vbr_ownership_index>(
+                        n_stream, static_cast<uint32_t>(seq_to_stream.size()), kv_size);
+                for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                    for (uint32_t side = 0; side < 2; ++side) {
+                        const ggml_tensor * tensor = side != 0 ? layers[ikv].v : layers[ikv].k;
+                        const int32_t type = tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
+                        const vbr_repr_domain domain =
+                                tensor != nullptr && ggml_is_turbo_kv_type(tensor->type) &&
+                                                tensor->type != GGML_TYPE_TURBO8_0
+                                        ? vbr_repr_domain::tapped
+                                        : vbr_repr_domain::full;
+                        GGML_ASSERT(vbr_generation_->initialize_unit(
+                                static_cast<uint32_t>(ikv * 2 + side), type, domain));
+                    }
+                }
             }
         }
     }
@@ -1442,7 +1942,7 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM_DSA) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
@@ -1483,6 +1983,12 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    // vbr_trace_fp_ closes itself (RAII unique_ptr, Sol review F5)
+    // Normally the enclosing llama_context's detach guard clears these while this context's
+    // compute backends are still alive. Keep RAII cleanup for direct construction and for a
+    // cache constructor that throws after registering with its owner.
+    vbr_shared_scratch_detach();
+
     for (auto & p : vbr_pools_) {
         if (p.backend != nullptr) {
             // S5: a degrade wave may still be in flight on the side stream — it must finish before
@@ -1491,9 +1997,11 @@ llama_kv_cache::~llama_kv_cache() {
             ggml_backend_synchronize(p.backend);
             p.unmap_deferred.clear();
         }
-        if (p.stash_buf != nullptr) {
-            ggml_backend_buffer_free(p.stash_buf);
-            p.stash_buf = nullptr;
+        if (p.stash_vmm != nullptr) {
+            // The side-stream synchronize above retires capture/transcode readers before the
+            // stash VA disappears. vmm_pool_free adds a device-wide fence as a final backend guard.
+            p.be->vmm_pool_free(p.stash_vmm);
+            p.stash_vmm = nullptr;
         }
         if (p.backend != nullptr) {
             ggml_backend_free(p.backend);
@@ -1508,9 +2016,154 @@ llama_kv_cache::~llama_kv_cache() {
             p.vmm = nullptr;
         }
     }
+    // TQ2: retire the imported-live accounting receipt only after the mapped
+    // target ranges are no longer live. Never create a release-first window.
+    vbr_import_receipts_release();
+}
+
+llama_kv_cache::vbr_shared_scratch_registration llama_kv_cache::vbr_shared_scratch_register(
+        const vbr_shared_scratch_binding & binding) {
+    if (binding.be == nullptr || binding.compute_backend == nullptr || binding.device < 0) {
+        throw std::runtime_error("internal: incomplete shared-KV scratch consumer registration");
+    }
+
+    vbr_shared_scratch_registry::consumer consumer;
+    consumer.be = binding.be;
+    consumer.compute_backend = binding.compute_backend;
+    consumer.device = binding.device;
+
+    const auto tensor_slot = [&](const ggml_tensor * tensor, bool is_v) -> size_t {
+        if (tensor == nullptr) {
+            return vbr_shared_scratch_registry::no_slot;
+        }
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            if ((is_v ? layers[ikv].v : layers[ikv].k) == tensor) {
+                return ikv*2 + (is_v ? 1 : 0);
+            }
+        }
+        throw std::runtime_error("internal: shared-KV scratch alias is absent from its target owner");
+    };
+
+    GGML_ASSERT(binding.k.size() == binding.v.size());
+    for (size_t ikv = 0; ikv < binding.k.size(); ++ikv) {
+        vbr_shared_scratch_registry::layer_slots slots;
+        slots.k = tensor_slot(binding.k[ikv], false);
+        slots.v = tensor_slot(binding.v[ikv], true);
+        if (slots.k != vbr_shared_scratch_registry::no_slot ||
+            slots.v != vbr_shared_scratch_registry::no_slot) {
+            consumer.layers.push_back(slots);
+        }
+    }
+    if (consumer.layers.empty()) {
+        throw std::runtime_error("internal: empty shared-KV scratch consumer registration");
+    }
+
+    const auto registry = vbr_shared_scratch_registry_;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    consumer.id = registry->next_id++;
+    const uint64_t id = consumer.id;
+    registry->consumers.push_back(std::move(consumer));
+    return vbr_shared_scratch_registration(registry, id);
+}
+
+void llama_kv_cache::vbr_shared_scratch_visit(
+        const std::vector<ggml_type> & terminal_types,
+        const vbr_device_watermarks & terminal_watermarks,
+        const vbr_shared_scratch_visitor & visitor) const {
+    if (!visitor) {
+        return;
+    }
+    if (!terminal_types.empty() && terminal_types.size() != layers.size()*2) {
+        throw std::invalid_argument("shared-KV scratch terminal type vector has the wrong size");
+    }
+    const auto registry = vbr_shared_scratch_registry_;
+    if (!registry) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    std::vector<vbr_shared_scratch_plan> plans;
+    plans.reserve(registry->consumers.size());
+
+    const auto tensor_and_type = [&](size_t slot) {
+        const size_t ikv = slot/2;
+        const bool is_v = (slot & 1) != 0;
+        const ggml_tensor * tensor = is_v ? layers[ikv].v : layers[ikv].k;
+        GGML_ASSERT(tensor != nullptr);
+        ggml_type type = tensor->type;
+        if (!terminal_types.empty() && terminal_types[slot] != GGML_TYPE_COUNT) {
+            type = terminal_types[slot];
+        }
+        return std::make_pair(tensor, type);
+    };
+
+    for (const auto & consumer : registry->consumers) {
+        const auto wm = terminal_watermarks.find(consumer.device);
+        if (wm == terminal_watermarks.end()) {
+            throw std::invalid_argument(format(
+                    "shared-KV scratch terminal watermark is missing device %d",
+                    consumer.device));
+        }
+        auto it = std::find_if(plans.begin(), plans.end(), [&](const vbr_shared_scratch_plan & p) {
+            return p.compute_backend == consumer.compute_backend;
+        });
+        if (it == plans.end()) {
+            plans.push_back({ consumer.be, consumer.compute_backend, consumer.device, 0, 0 });
+            it = std::prev(plans.end());
+        } else if (it->be != consumer.be || it->device != consumer.device) {
+            throw std::runtime_error("internal: one shared-KV compute backend has inconsistent device metadata");
+        }
+
+        size_t k_row = 0;
+        size_t v_row = 0;
+        for (const auto & slots : consumer.layers) {
+            const ggml_tensor * tk = nullptr;
+            const ggml_tensor * tv = nullptr;
+            ggml_type type_k = GGML_TYPE_F16;
+            ggml_type type_v = GGML_TYPE_F16;
+            if (slots.k != vbr_shared_scratch_registry::no_slot) {
+                std::tie(tk, type_k) = tensor_and_type(slots.k);
+            }
+            if (slots.v != vbr_shared_scratch_registry::no_slot) {
+                std::tie(tv, type_v) = tensor_and_type(slots.v);
+            }
+            bool need_k = false;
+            bool need_v = false;
+            ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
+            if (need_k && tk != nullptr) {
+                k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+            }
+            if (need_v && tv != nullptr) {
+                v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+            }
+        }
+        const auto scale_row = [&](size_t row) {
+            if (wm->second != 0 && row > SIZE_MAX/(size_t) wm->second) {
+                throw std::overflow_error(format(
+                        "shared-KV scratch terminal size overflows on device %d",
+                        consumer.device));
+            }
+            return row*(size_t) wm->second;
+        };
+        it->k_bytes = std::max(it->k_bytes, scale_row(k_row));
+        it->v_bytes = std::max(it->v_bytes, scale_row(v_row));
+    }
+
+    // Keep the registry locked through the callback: llama_context's detach guard acquires the
+    // same lock before it allows the consumer backend-owning members to be destroyed.
+    for (const auto & plan : plans) {
+        visitor(plan);
+    }
+}
+
+void llama_kv_cache::vbr_shared_scratch_detach() {
+    vbr_shared_scratch_registrations_.clear();
 }
 
 void llama_kv_cache::clear(bool data) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1540,15 +2193,65 @@ void llama_kv_cache::clear(bool data) {
         }
 
         // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr) {
+        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !hparams.no_alloc) {
             #include "turbo-rotation-data.h"
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
         }
     }
+
+    // Clearing severs every checkpoint's attention lineage, even when only metadata is
+    // requested. Keep this separate from vbr_full_reset(): clear may leave the tier cursor in
+    // place until the next empty-cache boundary, and both mutations must remain observable.
+    vbr_attention_content_changed();
+    vbr_generation_global(vbr_mutation_registrant::clear, vbr_operation_class::state_api);
+    if (vbr_ownership_) {
+        vbr_ownership_->clear_all();
+    }
+    // The target is now logically empty (and, for data clears, byte-cleared),
+    // so its conservative import receipt can finally be released.
+    vbr_import_receipts_release();
+}
+
+void llama_kv_cache::vbr_import_receipts_release() noexcept {
+    vbr_import_receipt_.reset();
+}
+
+void llama_kv_cache::vbr_import_receipts_release_if_empty() noexcept {
+    if (!vbr_import_receipt_) {
+        return;
+    }
+    const bool empty = std::all_of(
+        v_cells.begin(), v_cells.end(),
+        [](const llama_kv_cells & cells) { return cells.get_used() == 0; });
+    if (empty) {
+        // seq_rm is the ordinary server erase path. Once the imported image has
+        // no live cell membership, retaining its conservative adoption claims
+        // would make a later import fail prepare_receipts despite the target
+        // being construction-empty. Every attention child owns one shared_ptr;
+        // the receipt group releases the ledger operations only after the last
+        // child reaches this boundary.
+        vbr_import_receipts_release();
+    }
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_impl(seq_id, p0, p1, seq_rm_mode::public_commit);
+}
+
+bool llama_kv_cache::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_impl(seq_id, p0, p1, seq_rm_mode::nested_commit);
+}
+
+bool llama_kv_cache::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_transient(seq_id, p0, p1);
+}
+
+bool llama_kv_cache::seq_rm_impl(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        seq_rm_mode mode) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -1564,9 +2267,24 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    // A2 operation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
+    // membership-only state_api (not provenance-bearing); the destructive §7.5 classes arrive
+    // with the classed server paths in the A2 coordinator commit.
+    const bool commit = mode != seq_rm_mode::dry_run;
+    vbr_mutation_op mutation_op(commit ? this : nullptr, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    bool changed = false;
+
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t stream = seq_to_stream[seq_id];
+        auto & cells = v_cells[stream];
+        auto & head  = v_heads[stream];
+        auto generation_event = commit
+                ? vbr_generation_begin(
+                    vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, stream,
+                    vbr_generation_stamp_kind::membership)
+                : vbr_generation_event{};
 
         uint32_t new_head = cells.size();
 
@@ -1575,7 +2293,19 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+            if (cells.seq_has(i, seq_id)) {
+                changed = true;
+                const llama_pos rm_pos = cells.pos_get(i);
+                const bool became_empty = cells.seq_rm(i, seq_id);
+                if (commit && vbr_ownership_) {
+                    vbr_ownership_->remove_cell(stream, seq_id, i, rm_pos);
+                }
+                if (commit) {
+                    vbr_stamp(mutation_op, generation_event, i, seq_id, rm_pos);
+                }
+                if (!became_empty) {
+                    continue;
+                }
                 if (i < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
                 }
@@ -1589,11 +2319,20 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+        // Gap fix: a fully removed sequence releases its index view (frees the Fenwick).
+        if (commit && vbr_ownership_ && cells.seq_pos_min(seq_id) < 0) {
+            vbr_ownership_->clear_seq(stream, seq_id);
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
+            auto generation_event = commit
+                    ? vbr_generation_begin(
+                        vbr_mutation_registrant::seq_rm, vbr_operation_class::state_api, s,
+                        vbr_generation_stamp_kind::membership)
+                    : vbr_generation_event{};
 
             uint32_t new_head = cells.size();
 
@@ -1602,7 +2341,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     continue;
                 }
 
+                const bool had_membership = !cells.is_empty(i);
+                const llama_pos any_rm_pos = had_membership ? cells.pos_get(i) : -1;
+                if (had_membership) {
+                    changed = true;
+                    if (commit) {
+                        vbr_ownership_update_all_seqs(s, i, any_rm_pos, /*add=*/false);
+                    }
+                }
                 cells.rm(i);
+                if (commit && had_membership) {
+                    vbr_stamp(mutation_op, generation_event, i, -1, any_rm_pos);
+                }
                 if (i < vbr_stash_rows_) {
                     vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
                 }
@@ -1619,10 +2369,29 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    if (mode == seq_rm_mode::public_commit && changed) {
+        vbr_attention_content_changed();
+    }
+    if (commit) {
+        vbr_import_receipts_release_if_empty();
+    }
+
     return true;
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    seq_cp_impl(seq_id_src, seq_id_dst, p0, p1, true);
+}
+
+bool llama_kv_cache::try_seq_cp_transient(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    seq_cp_impl(seq_id_src, seq_id_dst, p0, p1, false);
+    return true;
+}
+
+void llama_kv_cache::seq_cp_impl(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1, bool publish_lineage) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1634,32 +2403,46 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
 
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+
+    // A2 operation scope. Cross-stream copies additionally reserve recovery + carry the
+    // source-stability token; that wiring rides the sc_info pending owner below.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id_dst, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+
     if (s0 == s1) {
         // since both sequences are in the same stream, no data copy is necessary
         // we just have to update the cells meta data
 
         auto & cells = v_cells[s0];
+        auto generation_event = vbr_generation_begin(
+                vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s0,
+                vbr_generation_stamp_kind::membership);
 
         if (seq_id_src == seq_id_dst) {
-            return;
+                return;
         }
 
-        if (p0 < 0) {
-            p0 = 0;
-        }
-
-        if (p1 < 0) {
-            p1 = std::numeric_limits<llama_pos>::max();
-        }
-
+        bool changed = false;
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id_src)) {
+            if (cells.seq_has(i, seq_id_src) && !cells.seq_has(i, seq_id_dst)) {
+                changed = true;
                 cells.seq_add(i, seq_id_dst);
+                const llama_pos cp_pos = cells.pos_get(i);
+                if (vbr_ownership_) {
+                    vbr_ownership_->add_cell(s0, seq_id_dst, i, cp_pos);
+                }
+                vbr_stamp(mutation_op, generation_event, i, seq_id_dst, cp_pos);
             }
+        }
+
+        if (publish_lineage && changed) {
+            vbr_attention_content_changed();
         }
 
         return;
@@ -1667,13 +2450,20 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     // cross-stream sequence copies require to copy the actual buffer data
 
+    // A2: the deferred-copy fence (pending owner through stream_copy_info, commit at byte-copy
+    // completion) is NOT implemented — it is structurally unreachable because armed VBR
+    // requires n_stream == 1. Fail loudly if that invariant ever breaks rather than let a
+    // cross-stream copy close its operation before bytes land (design finding R3-4).
+    GGML_ASSERT(vbr_generation_tracker_mut() == nullptr &&
+                "cross-stream seq_cp under armed VBR requires the A2 pending-owner fence");
+
     bool is_full = true;
 
-    if (p0 > 0 && p0 + 1 < (int) get_size()) {
+    if (p0 > 0 && p0 < (int) get_size() - 1) {
         is_full = false;
     }
 
-    if (p1 > 0 && p1 + 1 < (int) get_size()) {
+    if (p1 > 0 && p1 < (int) get_size() - 1) {
         is_full = false;
     }
 
@@ -1683,9 +2473,23 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
+    bool changed = false;
+    auto destination_reset_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
+            vbr_generation_stamp_kind::membership);
+    for (uint32_t i = 0; i < v_cells[s1].size(); ++i) {
+        if (!v_cells[s1].is_empty(i)) {
+            changed = true;
+            vbr_stamp(mutation_op, destination_reset_event, i, -1);
+        }
+    }
     v_cells[s1].reset();
+    auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_cp, vbr_operation_class::state_api, s1,
+            vbr_generation_stamp_kind::dependency, true);
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
+            changed = true;
             llama_pos pos   = v_cells[s0].pos_get(i);
             llama_pos shift = v_cells[s0].get_shift(i);
 
@@ -1704,10 +2508,15 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
+            vbr_stamp(mutation_op, generation_event, i, seq_id_dst);
         }
     }
 
     v_heads[s1] = v_heads[s0];
+
+    if (publish_lineage && changed) {
+        vbr_attention_content_changed();
+    }
 
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
@@ -1720,24 +2529,53 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    // A2 operation scope: whole-range membership edit. The manifest declares the SEQ
+    // WILDCARD (P1v2): keep removes membership from every sequence EXCEPT the kept one, so
+    // per-cell stamps carry whichever sequence remains (or none) — a single-seq claim would
+    // be a false declaration.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head  = v_heads[stream];
+    auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_keep, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::membership);
 
     uint32_t new_head = cells.size();
+    bool changed_any = false;
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
+        const bool changed = !cells.is_empty(i) && (!cells.seq_has(i, seq_id) || cells.seq_count(i) > 1);
+        changed_any = changed_any || changed;
+        if (changed) {
+            vbr_ownership_update_all_seqs(stream, i, cells.pos_get(i), /*add=*/false,
+                                          /*exclude_seq=*/seq_id);
+        }
         if (cells.seq_keep(i, seq_id)) {
+            if (i < vbr_stash_rows_) {
+                vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
+            }
             if (new_head == cells.size()) {
                 new_head = i;
             }
+        }
+        if (changed) {
+            vbr_stamp(mutation_op, generation_event, i, cells.is_empty(i) ? -1 : seq_id,
+                      cells.is_empty(i) ? -1 : cells.pos_get(i));
         }
     }
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
+    }
+    if (changed_any) {
+        vbr_attention_content_changed();
     }
 }
 
@@ -1750,22 +2588,24 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head  = v_heads[stream];
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+    // A2 operation scope: position shift is a dependency-changing edit over [p0,p1).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_add, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::dependency, true);
 
     if (shift == 0) {
         return;
     }
 
     uint32_t new_head = cells.size();
-
-    if (p0 < 0) {
-        p0 = 0;
-    }
-
-    if (p1 < 0) {
-        p1 = std::numeric_limits<llama_pos>::max();
-    }
+    bool changed = false;
 
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
@@ -1778,17 +2618,31 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            changed = true;
+            const llama_pos old_pos = cells.pos_get(i);
+            const bool removed = cells.pos_add(i, shift);
+            if (vbr_ownership_) {
+                if (removed) {
+                    vbr_ownership_->remove_cell(stream, seq_id, i, old_pos);
+                } else {
+                    vbr_ownership_->move_cell(stream, seq_id, i, old_pos, old_pos + shift);
+                }
+            }
+            if (removed) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
             }
+            vbr_stamp(mutation_op, generation_event, i, seq_id, old_pos);
         }
     }
 
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
+    if (changed) {
+        vbr_attention_content_changed();
+    }
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -1800,18 +2654,19 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the scope (P5v2)
+    // A2 operation scope: position division is a dependency-changing edit over [p0,p1).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::state_api, seq_id, p0, p1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    auto generation_event = vbr_generation_begin(
+            vbr_mutation_registrant::seq_div, vbr_operation_class::state_api, stream,
+            vbr_generation_stamp_kind::dependency, true);
 
     if (d == 1) {
         return;
-    }
-
-    if (p0 < 0) {
-        p0 = 0;
-    }
-
-    if (p1 < 0) {
-        p1 = std::numeric_limits<llama_pos>::max();
     }
 
     // If there is no range then return early to avoid looping over the cache.
@@ -1819,14 +2674,24 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    bool changed = false;
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
         }
 
         if (cells.seq_has(i, seq_id)) {
+            const llama_pos old_pos = cells.pos_get(i);
             cells.pos_div(i, d);
+            changed = changed || cells.pos_get(i) != old_pos;
+            if (vbr_ownership_) {
+                vbr_ownership_->move_cell(stream, seq_id, i, old_pos, cells.pos_get(i));
+            }
+            vbr_stamp(mutation_op, generation_event, i, seq_id, old_pos);
         }
+    }
+    if (changed) {
+        vbr_attention_content_changed();
     }
 }
 
@@ -1940,15 +2805,50 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    auto sinfos = plan_slots(ubatches);
+    if (sinfos.empty()) {
+        // plan_slots() can refuse before prepare_with_slots() reaches its
+        // boundary reset. Do not let a prior donor-side seal refusal retype a
+        // later unrelated cell-exhaustion terminal.
+        llama_kv_cache * root = vbr_tree_root();
+        root->vbr_hard_seal_blocked_ = false;
+        root->vbr_hard_seal_evidence_.clear();
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            root->vbr_ledger_sibling_->vbr_hard_seal_blocked_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_evidence_.clear();
+        }
+        return {};
+    }
+
+    return prepare_with_slots(ubatches, std::move(sinfos));
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
+        const std::vector<llama_ubatch> & ubatches,
+        slot_info_vec_t                   sinfos) {
+    GGML_ASSERT(sinfos.size() == ubatches.size());
+
+    vbr_runtime_was_over_ = false;
     // VBR S4 degrade trigger — MUST run at the llama_decode boundary, before any of this batch's
-    // cells are positioned. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
+    // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
     // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
-    // rows as zeros and races graphs built against the old tier. Here the previous batch's writes
-    // are complete/visible and no built-but-unexecuted graphs exist. prepare() is the choke point
-    // BOTH paths use (kv_cache::init_batch and llama_memory_hybrid::init_batch call it directly).
-    // The check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers
-    // so it never overruns the budget mid-flight.
+    // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
+    // the previous batch's writes are visible, and no built-but-unexecuted graphs exist.
+    // prepare_with_slots() is the post-admission choke point both ordinary and iSWA paths use. The
+    // check is predictive: fit the WORST-CASE watermark this batch can reach at current tiers so it
+    // never overruns the budget mid-flight.
     if (vbr_vmm_active()) {
+        // Reserve failures are boundary-local. The exact step remains at the cursor and may be
+        // retried after another process releases capacity.
+        llama_kv_cache * root = vbr_tree_root();
+        root->vbr_reserve_failed_ = false;
+        root->vbr_hard_seal_blocked_ = false;
+        root->vbr_hard_seal_evidence_.clear();
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            root->vbr_ledger_sibling_->vbr_reserve_failed_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_blocked_ = false;
+            root->vbr_ledger_sibling_->vbr_hard_seal_evidence_.clear();
+        }
         // S5: release the tail pages queued by the PREVIOUS wave first — their transcodes are long
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
@@ -1956,23 +2856,17 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // P3 idleness input: a boundary IS decode activity; ticks never write this
         vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
-    // one ubatch token sum serves both the budget block and the scratch reserve below
+    // one ubatch token sum serves the budget block and the unified scratch projection below;
+    // non-unified scratch uses the planned physical views because their stream span also matters
     uint32_t n_tokens = 0;
     for (const auto & ub : ubatches) {
         n_tokens += ub.n_tokens;
     }
+    vbr_runtime_wm_ = vbr_watermark_cells(n_tokens);
     if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
         // sink-stash staleness: if any sink cell was freed since capture, every stash may hold
         // another request's rows — drop them all (they recapture at the next first degrade)
-        if (vbr_stash_dirty_) {
-            for (auto & p : vbr_pools_) {
-                for (size_t j = 0; j < layers.size(); ++j) {
-                    p.k[j].stash_valid = 0;
-                    p.v[j].stash_valid = 0;
-                }
-            }
-            vbr_stash_dirty_ = false;
-        }
+        vbr_invalidate_dirty_stash();
         // -- Stability fast-path: skip per-batch bookkeeping when settled (avoids ~1ms/token) --
         uint32_t used_now = 0;
         for (uint32_t st = 0; st < n_stream; ++st) {
@@ -1982,15 +2876,27 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
         // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
-        // a peer's rename (new claim, offer change) forces the full controller path
-        vbr_ledger_precheck();
-        bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
+        // a peer's rename (new claim, offer change) forces the full controller path.
+        // WS-0 (P1) freeze: ledger off (test/gating) — skip so the schedule ignores co-tenant
+        // state; the tree force stays clear and the scan below is skipped too.
+        if (!vbr_freeze_) {
+            vbr_ledger_precheck();
+        }
+        const bool vbr_reconcile_now = vbr_retier_take_reconcile("prepare");
+        // Compare predicted padded watermarks, not just total occupancy. A high-tail trim can make
+        // shrink or promotion work possible while changing fewer than VBR_USED_DELTA cells (or no
+        // cells at all after sequence redistribution). Consume each decrease exactly once: using a
+        // pool's grow-only wm_cells here would keep the full path hot until the 25% shrink threshold.
+        const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+        const bool wm_receded = wm_next < vbr_last_wm_;
+        const bool reset_due = vbr_degrade_cursor_ > 0 && used_now == 0;
+        bool vbr_stable = (vbr_retier_freeze_depth_ == 0 && !vbr_reconcile_now &&
+                           vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
-                           !vbr_ledger_force_);
+                           !wm_receded && !reset_due &&
+                           !vbr_tree_forced());
 
-        // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
-        uint32_t wm_next = 0;
         if (!vbr_stable) {
             // auto budgets track reality: throttle re-derive from live free VRAM — during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
@@ -2012,10 +2918,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             //  - container promotion: occupancy dropped (seq_rm) far enough that a higher tier fits
             //    with headroom — old rows keep their degraded quality (re-encoded recon, no
             //    information restored), but FUTURE rows encode at the higher tier.
-            if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+            if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
+                !vbr_f5_preserve_empty_tiers_) {
                 vbr_full_reset();
             }
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
 
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
@@ -2032,6 +2938,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // P3c: pre-loop pressure snapshot — the runtime demand's honest ask is what
             // this boundary was short BEFORE the own ladder's sacrifice resolved it
             const bool vbr_was_over = vbr_over_budget(wm_next);
+            vbr_runtime_was_over_ = vbr_was_over;
             if (vbr_was_over) {
                 vbr_pre_deficit_.assign(vbr_pools_.size(), 0);
                 for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
@@ -2043,21 +2950,45 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                     }
                 }
             }
-            while (vbr_over_budget(wm_next)) {
-                vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-                if (!vbr_degrade_next(wm_next)) {
-                    if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
-                        vbr_budget_warned_ = true;
-                        size_t projected_total = 0;
-                        for (const auto & p : vbr_pools_) {
-                            projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
-                        }
-                        LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
-                                __func__, vbr_budget_bytes_/1024.0/1024.0,
-                                vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
-                                projected_total/1024.0/1024.0, wm_next);
+            if (vbr_retier_freeze_depth_ > 0 && vbr_over_budget(wm_next)) {
+                // The preflight should make this unreachable for a correctly bounded consumer,
+                // but keep decode/bookkeeping live and remember the pressure if a caller grows
+                // past its declared bound. Never interpret "frozen" as ladder exhaustion.
+                vbr_retier_defer("degrade_pressure");
+            } else {
+                while (vbr_over_budget(wm_next)) {
+                    vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
+                    const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
+                    if (degrade == vbr_degrade_result::reserve_failed) {
+                        LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
+                                "failing this batch recoverably\n", __func__);
+                        // Earlier successful steps in this boundary remain committed. Fence their
+                        // side-stream waves before returning without a graph to carry the normal wait.
+                        vbr_tree_force();
+                        vbr_arm_wave_fences();
+                        return {};
                     }
-                    break;
+                    if (degrade == vbr_degrade_result::hard_lease_blocked) {
+                        LLAMA_LOG_WARN("%s: VBR pressure reached the hard-lease seal; "
+                                "failing this batch recoverably\n", __func__);
+                        vbr_tree_force();
+                        vbr_arm_wave_fences();
+                        return {};
+                    }
+                    if (degrade == vbr_degrade_result::exhausted) {
+                        if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
+                            vbr_budget_warned_ = true;
+                            size_t projected_total = 0;
+                            for (const auto & p : vbr_pools_) {
+                                projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+                            }
+                            LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
+                                    __func__, vbr_budget_bytes_/1024.0/1024.0,
+                                    vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
+                                    projected_total/1024.0/1024.0, wm_next);
+                        }
+                        break;
+                    }
                 }
             }
             // per-pool budget/occupancy trace for multi-GPU verification (visible with -v)
@@ -2075,14 +3006,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // projected <= budget_eff whenever the sub-band ladder still works, which must
             // not hide the demand (the band is what peers owe; the sub-band walk is the
             // demander's own sacrifice)
-            vbr_runtime_demand_update(wm_next, vbr_was_over);
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
             // boundary once ≥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
-            if (vbr_ledger_force_ ||
+            if (!vbr_freeze_ && (vbr_tree_forced() ||
                 (vbr_boundary_count_ % 8 == 0 &&
-                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
-                vbr_ledger_scan_service(wm_next);
+                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull))) {
+                vbr_ledger_scan_service(n_tokens);
+                if (vbr_tree_root()->vbr_reserve_failed_) {
+                    LLAMA_LOG_ERROR("%s: VBR demand-shed reserve failed before its tier mutation — "
+                            "failing this batch recoverably\n", __func__);
+                    vbr_tree_root()->vbr_arm_wave_fences();
+                    return {};
+                }
             }
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
@@ -2092,8 +3028,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
             // stable threshold.
-            wm_next = vbr_watermark_cells(n_tokens);
             vbr_quiet_boundaries_++;
+        }
+        // Every child records at the common post-policy point. Non-roots leave their sample
+        // for the last-running root, which aggregates even when its own path was stable.
+        if (!vbr_freeze_) {
+            vbr_runtime_demand_update(wm_next, vbr_runtime_was_over_);
         }
         // Eager physical backing to the predicted watermark, for BOTH paths: map failures surface HERE,
         // where no graphs exist and init_batch fails RECOVERABLY (llama_decode returns an error; the
@@ -2109,7 +3049,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // boundary to the full controller path — a stable-path resident squeezed by a
             // rename-free co-tenant would otherwise never publish its runtime demand and
             // livelock on failing batches
-            vbr_ledger_force_ = true;
+            vbr_tree_force();
+            // Sol F4: this boundary's degrade may already have flipped tiers, so trace it (distinct
+            // phase, counter not advanced) instead of silently dropping it under OOM/fault validation.
+            vbr_trace_emit("prepare_mapfail", wm_next, used_now);
             return {};
         }
         // free-running boundary counter: drives the auto-budget re-derive throttle above and the
@@ -2117,33 +3060,70 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // which path ran, so the %8 cadence is real wall-boundary time.
         vbr_boundary_count_++;
         vbr_last_used_ = used_now;
+        vbr_last_wm_ = wm_next;
+        vbr_trace_emit("prepare", wm_next, used_now);
     }
 
     // #88: grow the fattn f16 dequant scratch to this batch's watermark OUTSIDE the graphs, for
     // the sides that are dequant-active after the wave above — see vbr_scratch_reserve. Runs for
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
-    if (!vbr_pools_.empty()) {
-        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
+    if (!vbr_pools_.empty() || !vbr_shared_scratch_bindings_.empty()) {
+        size_t scratch_cells = vbr_watermark_cells(n_tokens);
+        if (n_stream > 1) {
+            // A non-unified graph views K/V as [head_dim, heads, n_kv, stream_span], and the
+            // CUDA materializer flattens all four dimensions into one shared f16 scratch. Predict
+            // the largest flattened view in this batch from the already-planned physical slots.
+            // Keep prior ubatch inserts in the prediction; ignoring a later purge can only make
+            // this an upper bound. Dynamic VBR is forced unified and retains the original path.
+            std::array<uint32_t, LLAMA_MAX_SEQ> used_max_p1 = {};
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                used_max_p1[s] = v_cells[s].used_max_p1();
+            }
+            scratch_cells = 0;
+            const uint32_t n_pad_cur = std::max(n_pad, 256u);
+            for (const auto & sinfo : sinfos) {
+                uint32_t n_kv = 0;
+                for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+                    const uint32_t stream = sinfo.strm[s];
+                    for (const uint32_t idx : sinfo.idxs[s]) {
+                        used_max_p1[stream] = std::max(used_max_p1[stream], idx + 1);
+                    }
+                    n_kv = std::max(n_kv,
+                            std::min(v_cells[stream].size(), GGML_PAD(used_max_p1[stream], n_pad_cur)));
+                }
+                const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
+                scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
+            }
+        }
+        if (!vbr_scratch_reserve(scratch_cells)) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
-            vbr_ledger_force_ = true; // same routing as the try_map failure above
+            vbr_tree_force(); // same routing as the try_map failure above
             return {};
         }
     }
 
+    return sinfos;
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    // Slot selection for later ubatches must observe the metadata changes made by
+    // earlier ones (notably SWA eviction and its contiguous-prefix purge).  Apply
+    // those changes speculatively, journal every cell they can touch, then restore
+    // the exact original metadata before returning the plan.  commit=false keeps
+    // VMM growth and the optional transcode self-test out of this transaction.
     struct state_t {
-        slot_info sinfo; // slot info for the ubatch
-
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
-
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<uint32_t> streams;
+        std::vector<std::vector<uint32_t>> idxs;
+        std::vector<llama_kv_cells> cells;
     };
 
-    // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+    const bool stash_dirty_old = vbr_stash_dirty_;
 
     bool success = true;
 
@@ -2158,37 +3138,73 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // remember the position that we found
         res.push_back(sinfo_new);
 
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
+        state_t state;
+        state.v_heads_old = v_heads;
 
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
+        // Start with the selected cells themselves.
+        std::map<uint32_t, std::vector<uint32_t>> touched;
+        llama_pos seq_pos_max_rm[LLAMA_MAX_SEQ];
+        std::fill(std::begin(seq_pos_max_rm), std::end(seq_pos_max_rm), -1);
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+        for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+            const uint32_t stream = sinfo_new.strm[s];
+            auto & idxs = touched[stream];
+            idxs.insert(idxs.end(), sinfo_new.idxs[s].begin(), sinfo_new.idxs[s].end());
+
+            const auto & cells = v_cells[stream];
+            for (const uint32_t idx : sinfo_new.idxs[s]) {
+                if (!cells.is_empty(idx)) {
+                    GGML_ASSERT(cells.seq_count(idx) == 1);
+                    const llama_seq_id seq_id = cells.seq_get(idx);
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], cells.pos_get(idx));
+                }
             }
-
-            states.push_back(std::move(state));
         }
 
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // Slot planning mutates then restores cell metadata. Generation stamps belong only to
+        // the later committed apply() call; a failed/dry prepare must leave no shadow mutation.
+        // apply_ubatch() also purges an evicted SWA sequence's older prefix.
+        // Include those cells in the journal even when they are outside sinfo.
+        for (uint32_t seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+            if (seq_pos_max_rm[seq_id] < 0) {
+                continue;
+            }
+
+            GGML_ASSERT(seq_id < seq_to_stream.size());
+            const uint32_t stream = seq_to_stream[seq_id];
+            const auto & cells = v_cells[stream];
+            auto & idxs = touched[stream];
+            for (uint32_t idx = 0; idx < cells.size(); ++idx) {
+                if (cells.pos_in(idx, 0, seq_pos_max_rm[seq_id] + 1) && cells.seq_has(idx, seq_id)) {
+                    idxs.push_back(idx);
+                }
+            }
+        }
+
+        for (auto & entry : touched) {
+            auto & idxs = entry.second;
+            std::sort(idxs.begin(), idxs.end());
+            idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+            state.streams.push_back(entry.first);
+            state.idxs.push_back(idxs);
+            state.cells.push_back(v_cells[entry.first].cp(idxs));
+        }
+
+        states.push_back(std::move(state));
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
 
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = it->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+        for (size_t i = 0; i < it->streams.size(); ++i) {
+            v_cells[it->streams[i]].set(it->idxs[i], it->cells[i]);
         }
+        v_heads = it->v_heads_old;
     }
+    vbr_stash_dirty_ = stash_dirty_old;
 
     if (!success) {
         return {};
@@ -2198,6 +3214,36 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    // C4 (v3.2): this tracker's cache services its pending quarantines at the decode boundary
+    // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
+    // ring slot. Failures without capabilities resolve here too, keeping the ring live.
+    if (auto * tracker = vbr_generation_tracker_mut()) {
+        const vbr_controller_instance_id instance = tracker->runtime_instance();
+        vbr_recovery_advance_recorded(instance);  // B3: recorded failures quarantine
+        for (;;) {
+            auto work = vbr_recovery_take_quarantine(instance);
+            if (!work.token) {
+                break;
+            }
+            if (!tracker->global_invalidate_and_reset_extents(
+                        vbr_mutation_registrant::authenticated_recovery,
+                        vbr_operation_class::controller)) {
+                // Invalidation impossible right now (mid-mutation): latch unavailable,
+                // RELEASE the take so the record stays serviceable, and retry next boundary
+                // — never ack unperformed work.
+                tracker->set_shadow_unavailable();
+                GGML_ASSERT(vbr_recovery_untake_quarantine(work.token, instance));
+                break;
+            }
+            GGML_ASSERT(vbr_recovery_ack_quarantine(work.token, instance));
+        }
+        // B7/v4-F3 upgraded by P4v2 (v6): monotone re-arm — the tracker owns the whole
+        // availability-creating transition (ring + capacity proof, sanctioned invalidation,
+        // monotone clear). Never re-arms in the same pass that latched: the latch path above
+        // breaks with an un-acked record that the ring proof still sees.
+        tracker->try_rearm();
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -2477,7 +3523,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2492,7 +3538,63 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
+    // C1 (v3.1): one decode-kind operation scope per apply_ubatch commit. Recovery is EAGER
+    // (reserved in the ctor — the wrap class is provenance-bearing); the extents and the
+    // reuse EVENT are LAZY — reserved per SELECTED target at the first destructive stamp, so
+    // a wrap-free decode pays neither extent traffic nor a destructive event.
+    // P2v2 (v6): the ubatch target scan is ARMED-ONLY — non-VBR decode never pays it — and
+    // skipped entirely when a composite wrapper already supplied the manifest (adoption).
+    const bool decode_armed = commit && vbr_generation_tracker_get() != nullptr;
+    const bool wrap_provenance = decode_armed && n_swa != 0;
+    const vbr_operation_class decode_class =
+            wrap_provenance ? vbr_operation_class::swa_wrap : vbr_operation_class::ordinary_decode;
+    const uint16_t extent_stream =
+            static_cast<uint16_t>(sinfo.n_stream() == 1 ? sinfo.strm[0] : VBR_STREAM_ANY);
+    const vbr_controller_instance_id decode_instance =
+            decode_armed ? vbr_instance_id() : vbr_controller_instance_id{};
+    // v4 review F4: seq/range-bound manifest from the actual ubatch; ceiling overflow yields a
+    // zero-target binding, which the registry REFUSES -> fail-closed shadow-unavailable.
+    vbr_operation_binding decode_manifest;
+    decode_manifest.kind        = vbr_operation_kind::decode;
+    decode_manifest.child_phase = vbr_operation_phase::mutate;
+    if (decode_armed && !vbr_adopted_operation_ && !vbr_adopted_refused_) {
+        (void) vbr_decode_targets_from_ubatch(decode_manifest, decode_instance,
+                                              wrap_provenance, extent_stream, ubatch);
+    }
+    // v3.1 amendment 1 (fully applied per v4 review F1): EVERY async decode op reserves
+    // recovery eagerly; only the tombstone EXTENTS stay wrap-gated and lazy.
+    vbr_mutation_op mutation_op(
+            decode_armed ? this : nullptr,
+            decode_manifest,
+            /*provenance_bearing=*/decode_armed);
+    if (decode_armed) {
+        // pre-reserve pending capacity BEFORE any mutation (C1: allocation never follows
+        // apply); geometric growth so the ramp is O(k) copies, not O(k^2). v6-fix F5: the
+        // awaiting list must absorb EVERY accumulated pending record without allocating —
+        // terminal transfer runs inside the decode transaction's noexcept destructor.
+        if (vbr_pending_decode_ops_.capacity() == vbr_pending_decode_ops_.size()) {
+            vbr_pending_decode_ops_.reserve(
+                    std::max<size_t>(8, 2 * vbr_pending_decode_ops_.size() + 1));
+        }
+        const size_t awaiting_needed =
+                vbr_awaiting_commit_.size() + vbr_pending_decode_ops_.size() + 1;
+        if (vbr_awaiting_commit_.capacity() < awaiting_needed) {
+            vbr_awaiting_commit_.reserve(
+                    std::max(awaiting_needed, 2 * vbr_awaiting_commit_.capacity() + 8));
+        }
+    }
+
+    bool reused_occupied_cell = false;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t stream = sinfo.strm[s];
+        auto append_event = decode_armed
+                ? vbr_generation_begin(
+                    vbr_mutation_registrant::apply_ubatch_append,
+                    vbr_operation_class::ordinary_decode,
+                    stream,
+                    vbr_generation_stamp_kind::dependency)
+                : vbr_generation_event{};
+        std::optional<vbr_generation_event> reuse_event;  // lazily minted at first reuse (C1)
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -2500,14 +3602,31 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             const auto idx = sinfo.idxs[s][ii];
 
-            if (!cells.is_empty(idx)) {
+            const bool occupied = !cells.is_empty(idx);
+            llama_pos  prior_pos = -1;
+            if (occupied) {
+                if (decode_armed && !reuse_event.has_value()) {
+                    // P1v2 (v6): no eager extent — the destructive stamps below reserve
+                    // per-SELECTED-target extents through the event's trampoline.
+                    reuse_event.emplace(vbr_generation_begin(
+                            vbr_mutation_registrant::apply_ubatch_occupied_reuse,
+                            decode_class, stream, vbr_generation_stamp_kind::dependency, true));
+                }
+                reused_occupied_cell = true;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
                 const llama_pos    pos    = cells.pos_get(idx);
+                prior_pos = pos;
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                if (decode_armed && vbr_ownership_) {
+                    vbr_ownership_->remove_cell(stream, seq_id, idx, pos);
+                }
+                if (idx < vbr_stash_rows_) {
+                    vbr_stash_dirty_ = true; // the SWA slot is about to hold a different token
+                }
                 cells.rm(idx);
             }
 
@@ -2524,7 +3643,33 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+            if (decode_armed && vbr_ownership_) {
+                for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
+                    vbr_ownership_->add_cell(stream, ubatch.seq_id[i][s], idx, ubatch.pos[i]);
+                }
+            }
+
+            vbr_generation_event * generation_event =
+                    occupied ? (reuse_event.has_value() && *reuse_event ? &*reuse_event : nullptr)
+                             : (append_event ? &append_event : nullptr);
+            if (generation_event != nullptr) {
+                // P1v2 (v6): the stamp proves a covering target for EVERY member of the
+                // token's sequence set at its pre-mutation position; a refusal poisons the
+                // event, latches the shadow, and fails the operation (via vbr_stamp) — the
+                // decode proceeds untracked.
+                vbr_stamp(mutation_op, *generation_event, idx,
+                          ubatch.seq_id[i], ubatch.n_seq_id[i],
+                          occupied ? prior_pos : ubatch.pos[i]);
+            }
         }
+    }
+
+    // Appending into empty cells does not alter a checkpoint's attention prefix. Reusing an
+    // occupied SWA/ring cell does: the following graph overwrites bytes a checkpoint may still
+    // reference, so make that ownership/representation change visible before graph execution.
+    if (commit && reused_occupied_cell) {
+        vbr_attention_content_changed();
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -2543,7 +3688,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm_impl(
+                    s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1,
+                    commit ? seq_rm_mode::nested_commit : seq_rm_mode::dry_run);
         }
     }
 
@@ -2556,14 +3703,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
     // grow the physical backing first (no-op unless the watermark advanced past a page)
-    if (vbr_vmm_active()) {
+    if (commit && vbr_vmm_active()) {
         vbr_vmm_ensure_mapped();
     }
 
     // Dynamic VBR M3 anchor self-test (env-gated, runs once). Fires from the 2nd apply_ubatch call so
     // a prior attention has identity-init'd the decode-side InnerQ scales the dequant relies on.
     static const bool vbr_test_env = getenv("VBR_TRANSCODE_TEST") != nullptr; // once, not per ubatch
-    if (vbr_test_env) {
+    if (commit && vbr_test_env) {
         static bool vbr_test_armed = false;
         static bool vbr_test_done  = false;
         // apply_ubatch only POSITIONS cells; the K/V write happens in the following graph compute.
@@ -2579,6 +3726,65 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
         }
     }
+
+    // A2 (review F3): the decode operation outlives apply_ubatch — outcome is unknown until
+    // the graph result. Transfer op + extent + recovery reservation to the pending list;
+    // vbr_decode_ops_finish(ok) resolves them at the decode boundary (extent -> submitted on
+    // success, promoted to committed at the synchronize fence; everything fails closed on a
+    // decode error).
+    if (auto pending = mutation_op.detach_deferred()) {
+        vbr_pending_decode_ops_.push_back(std::move(*pending));
+    }
+}
+
+// Defined with the mutation-op implementation below.
+static void vbr_fail_extent_set(
+        vbr_generation_tracker * tracker,
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> & extents);
+
+void llama_kv_cache::vbr_commit_submitted() {
+    if (other) {
+        other->vbr_commit_submitted();
+        return;
+    }
+    if (vbr_awaiting_commit_.empty()) {
+        return;
+    }
+    // C1/Rev 5.1: the sync fence delivers the TERMINAL result to each pending owner. Commit
+    // success closes the operation committed and releases recovery; a failed commit (slab
+    // reset / obsolete handle) is counted, latches availability, and closes failed — never a
+    // silent vanish (#10). P1v2 (v6): every per-target handle commits; one failure fails the
+    // owner and every remaining handle.
+    auto * tracker = vbr_generation_tracker_mut();
+    for (auto & pending : vbr_awaiting_commit_) {
+        bool committed = true;
+        if (tracker != nullptr) {
+            for (auto & extent : pending.extents) {
+                if (extent && committed && !tracker->extent_store().commit(extent)) {
+                    committed = false;
+                    ++vbr_pending_commit_failures_;
+                    tracker->set_shadow_unavailable();
+                }
+            }
+            if (!committed) {
+                // The op terminal-fails: EVERY handle fails, including any committed before
+                // the failing one — failed operations leave no admissible evidence.
+                vbr_fail_extent_set(tracker, pending.extents);
+            }
+        }
+        if (pending.recovery_index >= 0 && committed) {
+            vbr_recovery_release_unused(pending.recovery_index, pending.operation_id);
+        }
+        if (pending.composite) {
+            // P3v2 (v6): the sealed aggregate owns the root close — this slot's terminal
+            // result feeds it, failure dominating.
+            pending.composite->report_terminal(committed);
+        } else if (pending.owns_close) {
+            vbr_operation_registry_close(pending.operation_id,
+                    committed ? vbr_operation_outcome::committed : vbr_operation_outcome::failed);
+        }
+    }
+    vbr_awaiting_commit_.clear();
 }
 
 // padded cell watermark: the extent get_n_kv derives read views from (256 = the fattn padding
@@ -2603,6 +3809,107 @@ bool llama_kv_cache::vbr_vmm_active() const {
         }
     }
     return false;
+}
+
+llama_kv_cache * llama_kv_cache::vbr_tree_root() {
+    return vbr_ledger_root_ != nullptr ? vbr_ledger_root_ : this;
+}
+
+const llama_kv_cache * llama_kv_cache::vbr_tree_root() const {
+    return vbr_ledger_root_ != nullptr ? vbr_ledger_root_ : this;
+}
+
+void llama_kv_cache::vbr_attach_ledger_tree(
+        llama_kv_cache * root, llama_kv_cache * peer, double device_share) {
+    GGML_ASSERT(root != nullptr);
+    vbr_ledger_root_ = root;
+    vbr_ledger_sibling_ = peer;
+    vbr_ledger_owner_ = root == this;
+    vbr_tree_device_share_ = device_share;
+}
+
+void llama_kv_cache::vbr_finalize_ledger_tree() {
+    GGML_ASSERT(vbr_ledger_owner_ && vbr_tree_root() == this);
+
+    // Constructor-time live budgets were derived before the peer backlink existed. Repair
+    // only that fallback path; fit-provided and explicit scalar budgets retain their split.
+    auto finalize_child = [](llama_kv_cache * child) {
+        if (child == nullptr || child->vbr_budget_from_scalar_) {
+            return;
+        }
+        size_t derived_total = 0;
+        for (auto & p : child->vbr_pools_) {
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            p.budget = std::max(child->vbr_pool_reach(p), p.budget_base);
+            p.budget_eff_stamp = ~0ull;
+            derived_total += p.budget;
+        }
+        if (derived_total > 0) {
+            child->vbr_budget_bytes_ = std::max(derived_total, child->vbr_floor_cost_bytes_);
+        }
+    };
+    finalize_child(this);
+    finalize_child(vbr_ledger_sibling_);
+}
+
+void llama_kv_cache::vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran) {
+    llama_kv_cache * root = vbr_tree_root();
+    if (root != this) {
+        root->vbr_finalize_failed_child(n_tokens, root_ran);
+        return;
+    }
+
+    // The root may not have run when the earlier child failed. Do not aggregate its stale
+    // pressure sample. If the root itself failed, its current sample was already recorded.
+    if (!root_ran) {
+        root->vbr_runtime_was_over_ = false;
+        root->vbr_runtime_wm_ = root->vbr_watermark_cells(n_tokens);
+        root->vbr_runtime_demand_update(root->vbr_runtime_wm_, false);
+    }
+
+    // A child rejected a component reserve before its tier mutation.  Do not let finalization
+    // consume the forced scan edge or service another donation from either child while this batch
+    // is already returning failure.  Preserve the retry route and fence any earlier successful
+    // steps from this boundary; the next boundary will re-run the full tree after memory changes.
+    if (root->vbr_reserve_failed_ ||
+        (root->vbr_ledger_sibling_ != nullptr && root->vbr_ledger_sibling_->vbr_reserve_failed_)) {
+        root->vbr_tree_force();
+        root->vbr_arm_wave_fences();
+        return;
+    }
+
+    if (root->vbr_tree_forced() ||
+        (root->vbr_boundary_count_ % 8 == 0 &&
+         llama_vram_ledger_now_ns() - root->vbr_last_scan_ns_ >= 1000000000ull)) {
+        root->vbr_ledger_scan_service(n_tokens);
+    }
+    // Service can queue waves on either child even though the parent is returning failure.
+    root->vbr_arm_wave_fences();
+}
+
+bool llama_kv_cache::vbr_tree_forced() const {
+    return vbr_tree_root()->vbr_ledger_force_;
+}
+
+void llama_kv_cache::vbr_tree_force() {
+    vbr_tree_root()->vbr_ledger_force_ = true;
+}
+
+bool llama_kv_cache::vbr_tree_budget_explicit() const {
+    const llama_kv_cache * root = vbr_tree_root();
+    return root->vbr_budget_explicit_ ||
+           (root->vbr_ledger_sibling_ != nullptr && root->vbr_ledger_sibling_->vbr_budget_explicit_);
+}
+
+size_t llama_kv_cache::vbr_tree_total_grant_decrement() const {
+    const llama_kv_cache * root = vbr_tree_root();
+    size_t total = root->vbr_total_grant_decrement();
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        total += root->vbr_ledger_sibling_->vbr_total_grant_decrement();
+    }
+    return total;
 }
 
 llama_kv_cache::vbr_pool * llama_kv_cache::vbr_pool_of(const ggml_tensor * t) {
@@ -2637,11 +3944,14 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // VRAM at all. Clamp each pool's target by what its device can actually map right now
 // (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
 // ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+// Auto budgets already preserve vbr_growth_headroom_ when periodically re-derived. Explicit
+// budgets never re-derive—the typed value is a hard cap—so their live clamp must preserve that
+// same fit headroom instead of only the smaller co-tenancy reserve. This tightens the effective
+// per-device decision limit without changing or growing the user's configured cap.
 // Shared by the degrade trigger AND the promote hysteresis: gating the two on different
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
 // then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
-    const size_t headroom = llama_vram_headroom_bytes();
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
     // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
@@ -2649,45 +3959,71 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     if (p.budget_eff_stamp == vbr_boundary_count_) {
         return p.budget_eff_cache;
     }
+    const size_t budget_eff = vbr_budget_eff_uncached(p);
+    p.budget_eff_stamp = vbr_boundary_count_;
+    p.budget_eff_cache = budget_eff;
+    return budget_eff;
+}
+
+size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
     size_t budget_eff = p.budget;
-    size_t free_b = 0, total_b = 0;
-    p.be->get_device_memory(p.device, &free_b, &total_b);
-    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    // P3 fairness: headroom scales with the presence census (every live fork process has
-    // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
-    // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
-    // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
-    // single-tenant behavior; the quantization alone would cost up to 64 MiB).
-    const uint32_t n_live = vbr_pool_n_live(p);
-    const size_t headroom_eff = headroom * n_live;
-    if (n_live > 1) {
-        constexpr size_t quantum = 64ull * 1024 * 1024;
-        size_t va_total = 0;
-        for (const auto & q : vbr_pools_) {
-            va_total += q.vmm != nullptr ? q.size : 0;
+    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm); // deterministic (pool mapped bytes)
+    // WS-0 (P1) freeze: skip every live-VRAM / co-tenancy input — the live free-VRAM clamp
+    // (cudaMemGetInfo), the N_live>1 fair-share relax, and the grant-decrement subtraction — so
+    // budget_eff stays the fixed armed budget (still floored at mapped_now below). This clamp is the
+    // ONLY live-VRAM path that fires under an explicit budget, so neutralizing it makes both the pp
+    // one-shot fit and the tg degrade trajectory a pure function of the fixed budget + occupancy.
+    // OFF => this block runs verbatim, so a freeze-off build is bit-identical (the P0 ratchet).
+    if (!vbr_freeze_) {
+        const size_t ledger_headroom = llama_vram_headroom_bytes();
+        size_t free_b = 0, total_b = 0;
+        p.be->get_device_memory(p.device, &free_b, &total_b);
+        // P3 fairness: reserve the ordinary ledger headroom for every live peer. An explicit
+        // budget's own process instead reserves the (usually larger) fit growth target because it
+        // has no auto re-derivation path. At N_live > 1 the budget base also relaxes to a fair
+        // share of its own spare — mapped-anchored and 64 MiB-quantized.
+        const uint32_t n_live = vbr_pool_n_live(p);
+        // Explicit budgets reserve the fit growth target, but never more than the pool could
+        // still MAP (budget - mapped): the fit margin prices consumers that have already
+        // materialized by decode time (the spec drafter's model+context+compute raise
+        // fit_params_target before the fit, then allocate at load) — free VRAM already
+        // reflects them, so re-reserving their full size double-counts and strangles a
+        // comfortably-fitting pool to the --vbr-floor. Measured 2026-08-10 (27B + DFlash
+        // drafter at inherited -cd, --vbr-vram-budget 1024M): margin 3309 MiB vs 1937 MiB
+        // free -> budget_eff collapsed to mapped (4 MiB) against a 68 MiB need and the first
+        // boundary cascaded all 71 clamped steps to the floor.
+        const size_t grow_room = p.budget > mapped_now ? p.budget - mapped_now : 0;
+        const size_t own_headroom = vbr_budget_explicit_
+                ? std::max(std::min(vbr_growth_headroom_, grow_room), ledger_headroom)
+                : ledger_headroom;
+        const size_t headroom_eff = own_headroom + ledger_headroom * (n_live - 1);
+        if (n_live > 1) {
+            constexpr size_t quantum = 64ull * 1024 * 1024;
+            size_t va_total = 0;
+            for (const auto & q : vbr_pools_) {
+                va_total += q.vmm != nullptr ? q.size : 0;
+            }
+            const size_t floor_share = va_total > 0
+                ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
+            const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
+            budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
         }
-        const size_t floor_share = va_total > 0
-            ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
-        const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
-        budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
+        const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
+        if (cap < budget_eff) {
+            budget_eff = cap;
+        }
+        // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
+        // decrements, then floor at mapped — the floor binds precisely in the shed->flush
+        // window so no consumer (including our own degrade loop) ever sees a budget below
+        // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
+        budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
     }
-    const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
-    if (cap < budget_eff) {
-        budget_eff = cap;
-    }
-    // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
-    // decrements, then floor at mapped — the floor binds precisely in the shed->flush
-    // window so no consumer (including our own degrade loop) ever sees a budget below
-    // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
-    budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
     if (budget_eff < mapped_now) {
         budget_eff = mapped_now;
     }
 #ifndef NDEBUG
     GGML_ASSERT(budget_eff >= mapped_now);
 #endif
-    p.budget_eff_stamp = vbr_boundary_count_;
-    p.budget_eff_cache = budget_eff;
     return budget_eff;
 }
 
@@ -2697,17 +4033,43 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 // gigabytes free. Once per boundary, re-derive each pool's budget from what its device can
 // actually give it: share x (mapped + free − growth_headroom), quantized to 64 MiB so driver
 // jitter cannot move a tier decision between identical runs, RE-DERIVED not max-ratcheted (a
-// sawtooth co-tenant's trough must not be captured as permanent), floored at the init-armed
-// value (never stingier than startup), and never touched at all for explicit budgets. Throttled
+// sawtooth co-tenant's trough must not be captured as permanent), floored at the pool's
+// floor-layout cost for auto budgets (or the init-armed value for explicit budgets), and never
+// touched at all for explicit budgets. Throttled
 // by the caller (see prepare()); vbr_boundary_count_ is advanced there, not here.
 size_t llama_kv_cache::vbr_pool_reach(const vbr_pool & p) const {
     constexpr size_t quantum = 64ull * 1024 * 1024;
     size_t free_b = 0, total_b = 0;
     p.be->get_device_memory(p.device, &free_b, &total_b);
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    const size_t reach_raw  = mapped_now + (free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0);
-    size_t reach = (size_t) ((double) reach_raw * vbr_params_.device_share);
-    return reach / quantum * quantum; // 64 MiB quanta = the flap/jitter hysteresis
+    const size_t spare = free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0;
+
+    double share = vbr_params_.device_share;
+    if (vbr_ledger_root_ != nullptr) {
+        const llama_kv_cache * root = vbr_tree_root();
+        size_t denom = 0;
+        auto add_child = [&](const llama_kv_cache * child) {
+            if (child == nullptr) {
+                return;
+            }
+            for (const auto & q : child->vbr_pools_) {
+                // Child constructors eagerly assign device ordinals before tree attachment.
+                // Do not couple constructor-time normalization to marker-key resolution.
+                if (q.vmm != nullptr && q.device == p.device) {
+                    denom += q.size;
+                }
+            }
+        };
+        add_child(root);
+        add_child(root->vbr_ledger_sibling_);
+        share = denom > 0
+                ? root->vbr_tree_device_share_ * (double) p.size / (double) denom
+                : root->vbr_tree_device_share_;
+    }
+
+    // A child owns its mapped pages outright; only currently free device memory is divided.
+    const size_t reach_raw = mapped_now + (size_t) ((double) spare * share);
+    return std::max(mapped_now, reach_raw / quantum * quantum);
 }
 
 void llama_kv_cache::vbr_rederive_budget() {
@@ -2733,6 +4095,35 @@ void llama_kv_cache::vbr_rederive_budget() {
     }
 }
 
+// WS-0 (P1) schedule-trace recorder (test/gating only). One line per boundary. The tier vector is
+// the live type of every populated (layer,side) extent across all pools, in a stable pool->ikv->k,v
+// order, folded into an FNV-1a digest; two runs whose (boundary,cursor,digest,wm,used) columns match
+// at every boundary took the identical tier schedule. No effect on the schedule itself.
+void llama_kv_cache::vbr_trace_emit(const char * phase, uint32_t wm, uint32_t used) {
+    if (!vbr_trace_fp_) {
+        return;
+    }
+    uint64_t fnv    = 1469598103934665603ull;
+    size_t   mapped = 0;
+    for (const auto & p : vbr_pools_) {
+        for (size_t ikv = 0; ikv < p.k.size(); ++ikv) {
+            const uint8_t kt = p.k[ikv].t != nullptr ? (uint8_t) p.k[ikv].t->type : 0xFF;
+            const uint8_t vt = p.v[ikv].t != nullptr ? (uint8_t) p.v[ikv].t->type : 0xFF;
+            fnv = (fnv ^ kt) * 1099511628211ull;
+            fnv = (fnv ^ vt) * 1099511628211ull;
+        }
+        if (p.vmm != nullptr) {
+            mapped += p.be->vmm_pool_mapped(p.vmm);
+        }
+    }
+    fprintf(vbr_trace_fp_.get(), "%s\t%llu\t%zu\t%016llx\t%u\t%u\t%zu\n",
+            phase, (unsigned long long) vbr_boundary_count_, vbr_degrade_cursor_,
+            (unsigned long long) fnv, wm, used, mapped);
+    // Traces are test evidence for fail-closed and injected-abort arms. Do not leave the latest
+    // completed boundary stranded in stdio buffering when a later assertion terminates the run.
+    fflush(vbr_trace_fp_.get());
+}
+
 bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
     for (const auto & p : vbr_pools_) {
         if (p.vmm == nullptr) {
@@ -2746,19 +4137,21 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
 }
 
 // #88: boundary-time f16 dequant scratch reserve. The fattn prefill/materialize paths grow a
-// per-(device, side) f16 scratch to the attended width implicitly, mid-graph — a context-linear
-// consumer the budget doesn't own, and one that can JUMP from zero to watermark width in a
+// per-(device, side) f16 scratch to the flattened attended view implicitly, mid-graph: a
+// context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
+// does not own it, and it can JUMP from zero to watermark width in a
 // single graph when a degrade wave first takes a side off f16 (the #88 abort: a 217 MiB grow
 // with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
 // that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
 // symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
 // turbo pools too (bookkeeping-only pools resolve their vtable at init).
-bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
+bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
     for (auto & p : vbr_pools_) {
         if (p.be == nullptr || p.device < 0) {
             continue;
         }
+        GGML_ASSERT(p.compute_backend != nullptr);
         // active-side row maxima change only on a tier flip — memoize on the tier epoch so the
         // per-boundary cost is two multiplies (static caches compute this exactly once)
         if (p.scratch_rows_epoch != vbr_tier_epoch_) {
@@ -2780,12 +4173,12 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
             }
             p.scratch_rows_epoch = vbr_tier_epoch_;
         }
-        const size_t k_bytes = p.scratch_k_row * wm_cells;
-        const size_t v_bytes = p.scratch_v_row * wm_cells;
+        const size_t k_bytes = p.scratch_k_row * flat_cells;
+        const size_t v_bytes = p.scratch_v_row * flat_cells;
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
-        if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+        if (!p.be->kv_dequant_scratch_reserve(p.compute_backend, k_bytes, v_bytes)) {
             // First-activation transient: the wave that just took this side off f16 queued its
             // freed tier-A tail pages as deferred unmaps (released at the NEXT boundary), so the
             // bytes the wave freed are physically unavailable to the very reserve it triggered.
@@ -2794,7 +4187,52 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
                     "flushing deferred unmaps and retrying\n",
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
             vbr_flush_deferred_unmaps();
-            if (!p.be->kv_dequant_scratch_reserve(p.device, k_bytes, v_bytes)) {
+            if (!p.be->kv_dequant_scratch_reserve(p.compute_backend, k_bytes, v_bytes)) {
+                return false;
+            }
+        }
+        p.scratch_k_reserved = std::max(p.scratch_k_reserved, k_bytes);
+        p.scratch_v_reserved = std::max(p.scratch_v_reserved, v_bytes);
+    }
+    // Shared aliases are deliberately absent from vbr_pools_. Their live tensor types follow
+    // the owner, so use the delegated epoch and reserve against this context's compute backend.
+    // Multiple iSWA children call this serially on the same backend; the grow-only backend
+    // scratch therefore lands at the per-side maximum rather than the sum.
+    const uint64_t owner_epoch = vbr_tier_epoch();
+    for (auto & b : vbr_shared_scratch_bindings_) {
+        GGML_ASSERT(b.be != nullptr && b.compute_backend != nullptr && b.device >= 0);
+        if (b.rows_epoch != owner_epoch) {
+            b.k_row = 0;
+            b.v_row = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const ggml_tensor * tk = b.k[ikv];
+                const ggml_tensor * tv = b.v[ikv];
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
+                if (need_k && tk) {
+                    b.k_row = std::max(b.k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv) {
+                    b.v_row = std::max(b.v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
+            }
+            b.rows_epoch = owner_epoch;
+        }
+        const size_t k_bytes = b.k_row * flat_cells;
+        const size_t v_bytes = b.v_row * flat_cells;
+        if ((k_bytes != 0 || v_bytes != 0) &&
+            !b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
+            // The owner's tier flip may still have old-tier tails queued for release. They
+            // belong to the aliased tensors and are safe to reclaim with the same synchronized
+            // flush used by the owner's own reserve path. Retry once before failing this draft
+            // boundary recoverably.
+            LLAMA_LOG_WARN("%s: shared-KV f16 dequant scratch reserve of %.1f + %.1f MiB failed "
+                    "on device %d — flushing owner deferred unmaps and retrying\n",
+                    __func__, k_bytes/1048576.0, v_bytes/1048576.0, b.device);
+            other->vbr_flush_deferred_unmaps();
+            if (!b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
                 return false;
             }
         }
@@ -2870,7 +4308,7 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
                 continue;
             }
             const size_t need = (size_t) ggml_row_size(t->type, t->ne[0]) * wm_cells;
-            total += GGML_PAD(need, p.gran);
+            total += std::min(vbr_slot_span(t, p.gran), (size_t) GGML_PAD(need, p.gran));
         }
     }
     return total;
@@ -2885,6 +4323,7 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
 // service, promote step, fence-arm (MANDATORY — the next decode graph races the wave
 // otherwise), boundary count++ (budget memo + promote pacing depend on it).
 void llama_kv_cache::breathe() {
+    vbr_runtime_was_over_ = false;
     const size_t flushed = vbr_flush_deferred_unmaps();
     if (flushed > 0) {
         LLAMA_LOG_DEBUG("%s: flushed %zu deferred VBR unmaps at idle\n", __func__, flushed);
@@ -2892,15 +4331,13 @@ void llama_kv_cache::breathe() {
     if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
         return;
     }
-    if (vbr_stash_dirty_) {
-        for (auto & p : vbr_pools_) {
-            for (size_t j = 0; j < layers.size(); ++j) {
-                p.k[j].stash_valid = 0;
-                p.v[j].stash_valid = 0;
-            }
-        }
-        vbr_stash_dirty_ = false;
+    vbr_retier_take_reconcile("breathe");
+    llama_kv_cache * root = vbr_tree_root();
+    root->vbr_reserve_failed_ = false;
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        root->vbr_ledger_sibling_->vbr_reserve_failed_ = false;
     }
+    vbr_invalidate_dirty_stash();
     if (!vbr_budget_explicit_ && vbr_boundary_count_ % 8 == 0) {
         vbr_rederive_budget();
     }
@@ -2908,17 +4345,29 @@ void llama_kv_cache::breathe() {
     for (uint32_t st = 0; st < n_stream; ++st) {
         used_now += v_cells[st].get_used();
     }
-    if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+    if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
+        !vbr_f5_preserve_empty_tiers_) {
         vbr_full_reset();
     }
     const uint32_t wm_next = vbr_watermark_cells(0);
+    vbr_runtime_wm_ = wm_next;
     vbr_shrink_watermark();
-    vbr_ledger_precheck();
-    if (vbr_ledger_force_ ||
-        llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
-        vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+    // WS-0 (P1) freeze: ledger off (test/gating) — skip precheck + idle scan for a deterministic
+    // idle path. OFF => both run verbatim (bit-identical).
+    if (!vbr_freeze_) {
+        vbr_ledger_precheck();
+        if (vbr_tree_forced() ||
+            llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
+            vbr_ledger_scan_service(0); // demand waves run band-capped inside
+        }
+        if (root->vbr_reserve_failed_) {
+            // Idle ticks have no error return. Keep the rejected step at its exact cursor and retry
+            // later; arm any earlier committed wave before leaving this tick.
+            root->vbr_arm_wave_fences();
+            return;
+        }
+        vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     }
-    vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
     // grows here, so the general over-budget loop cannot fire — only demand decrements
     // (band-capped, in the scan) shed. Promotes get their idle chance under the same
@@ -2927,20 +4376,91 @@ void llama_kv_cache::breathe() {
     vbr_maybe_promote(wm_next);
     vbr_arm_wave_fences();
     vbr_boundary_count_++;
+    vbr_trace_emit("breathe", wm_next, used_now);
 }
 
 // S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
 // finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
+bool llama_kv_cache::vbr_retire_pending_before_unmap(const std::string & busid) {
+    auto pending_it = vbr_grant_pending_.find(busid);
+    if (pending_it == vbr_grant_pending_.end() || pending_it->second == 0) {
+        return true;
+    }
+
+    // A pending grant bridges the interval between committing a shed and making its deferred
+    // pages visible in cudaMemGetInfo(). Retire the bridge while those pages are still mapped;
+    // doing this after the unmap lets a peer count the same bytes once as free and once as pending.
+    // If publication fails, retain both the pages and the local liability for a forced retry.
+    if (!llama_vram_ledger_armed() || busid == "-") {
+        pending_it->second = 0;
+        return true;
+    }
+
+    llama_kv_cache * root = vbr_tree_root();
+    uint64_t remaining = 0;
+    const auto add_child = [&](const llama_kv_cache * child) {
+        if (child == nullptr || child == this) {
+            return;
+        }
+        const auto it = child->vbr_grant_pending_.find(busid);
+        if (it != child->vbr_grant_pending_.end()) {
+            GGML_ASSERT(it->second <= UINT64_MAX - remaining);
+            remaining += it->second;
+        }
+    };
+    add_child(root);
+    add_child(root->vbr_ledger_sibling_);
+
+    llama_vram_marker_fields f = {};
+    f.vbr            = 1;
+    f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
+    f.shed_available = 0;
+    f.grant_pending  = remaining;
+    uint64_t created_ts = 0;
+    if (!llama_vram_marker_publish(busid, f, &created_ts)) {
+        // A rename may have succeeded before reopening the replacement failed and unlinked it.
+        // Forget the cached publication so the forced retry recreates a truthful marker rather
+        // than heartbeat-writing the old, now unlinked descriptor.
+        root->vbr_marker_pub_.erase(busid);
+        root->vbr_tx_suppress(busid);
+        return false;
+    }
+
+    pending_it->second = 0;
+    root->vbr_marker_pub_[busid] = { 0, remaining };
+    root->vbr_marker_created_ts_[busid] = created_ts;
+    root->vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+    return true;
+}
+
 size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
     size_t flushed = 0;
+
+    // Synchronize every affected side stream before withdrawing any bridge. Once a marker says
+    // the bytes are no longer pending, keep the publication-to-unmap interval host-local and
+    // contain no further GPU waits.
     for (auto & p : vbr_pools_) {
         if (p.unmap_deferred.empty()) {
             continue;
         }
         GGML_ASSERT(p.backend != nullptr); // entries are only queued after async work on it
         ggml_backend_synchronize(p.backend);
+    }
+
+    std::set<std::string> blocked;
+    for (auto & p : vbr_pools_) {
+        if (!p.unmap_deferred.empty() && blocked.count(vbr_pool_busid(p)) == 0 &&
+            !vbr_retire_pending_before_unmap(vbr_pool_busid(p))) {
+            blocked.insert(vbr_pool_busid(p));
+        }
+    }
+
+    for (auto & p : vbr_pools_) {
+        if (p.unmap_deferred.empty() || blocked.count(vbr_pool_busid(p)) != 0) {
+            continue;
+        }
         for (const auto & [off, len] : p.unmap_deferred) {
             p.be->vmm_pool_unmap(p.vmm, off, len);
         }
@@ -2948,6 +4468,19 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
         p.unmap_deferred.clear();
     }
     return flushed;
+}
+
+void llama_kv_cache::vbr_invalidate_dirty_stash() {
+    if (!vbr_stash_dirty_) {
+        return;
+    }
+    for (auto & pool : vbr_pools_) {
+        for (size_t i = 0; i < layers.size(); ++i) {
+            pool.k[i].stash_valid = 0;
+            pool.v[i].stash_valid = 0;
+        }
+    }
+    vbr_stash_dirty_ = false;
 }
 
 // Generic degrade-rank curves for models WITHOUT a baked order (matrix v3, 2026-07-05).
@@ -3210,6 +4743,140 @@ bool llama_kv_cache::vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
     return true;
 }
 
+// Page-padded LOGICAL endpoint bytes for policy ordering.  This intentionally has no VMM pool or
+// residency query: partial mappings and allocator history are physical-pricing inputs, never
+// permission to change which measured layer loses quality next.
+static bool vbr_policy_endpoint_bytes_checked(
+        const ggml_tensor * t, ggml_type type, uint32_t wm,
+        size_t gran, uint64_t & result) {
+    if (t == nullptr || gran == 0) {
+        return false;
+    }
+    const uint64_t slot = vbr_slot_span(t, gran);
+    const uint64_t row  = ggml_row_size(type, t->ne[0]);
+    return llama_vbr_policy::logical_endpoint_bytes(
+        row, wm, slot, gran, result);
+}
+
+static uint64_t vbr_policy_endpoint_bytes(
+        const ggml_tensor * t, ggml_type type, uint32_t wm, size_t gran) {
+    uint64_t result = 0;
+    if (!vbr_policy_endpoint_bytes_checked(t, type, wm, gran, result)) {
+        GGML_ABORT("VBR policy endpoint overflow or invalid geometry");
+    }
+    return result;
+}
+
+bool llama_kv_cache::vbr_policy_priced_steps(
+        std::vector<ggml_type> & sim, size_t start_cursor,
+        int demanded_device, uint32_t watermark, bool fixed_watermark,
+        bool fail_closed, llama_vbr_policy::child & out,
+        vbr_hard_seal_consult_session * seal_session) const {
+    int64_t terminal = out.initial_progress;
+    for (size_t i = start_cursor; i < vbr_demand_limit(); ++i) {
+        size_t slot = 0;
+        const ggml_tensor * canonical = nullptr;
+        ggml_type type_b = GGML_TYPE_COUNT;
+        if (!vbr_sim_step(sim, i, slot, canonical, type_b)) {
+            continue;
+        }
+        const auto & order = vbr_degrade_order_[i];
+        const size_t ikv = slot/2;
+        int64_t gain = 0;
+        bool valid = true;
+        for (const auto & pool : vbr_pools_) {
+            if (!pool.vmm || pool.device != demanded_device) {
+                continue;
+            }
+            const auto & extent = order.is_v ? pool.v[ikv] : pool.k[ikv];
+            if (!extent.t) {
+                continue;
+            }
+            const uint32_t wm = fixed_watermark
+                ? watermark : std::max(pool.wm_cells, watermark);
+            uint64_t before = 0;
+            uint64_t after = 0;
+            int64_t next = 0;
+            valid = vbr_policy_endpoint_bytes_checked(
+                        extent.t, sim[slot], wm, pool.gran, before) &&
+                    vbr_policy_endpoint_bytes_checked(
+                        extent.t, type_b, wm, pool.gran, after) &&
+                    before >= after && before-after <= uint64_t(INT64_MAX) &&
+                    llama_vbr_policy::checked_add(
+                        gain, int64_t(before-after), next);
+            if (!valid) {
+                break;
+            }
+            gain = next;
+        }
+        int64_t next_terminal = 0;
+        valid = valid && llama_vbr_policy::checked_add(
+            terminal, gain, next_terminal);
+        if (!valid) {
+            if (fail_closed) {
+                return false;
+            }
+            GGML_ABORT("VBR policy progress overflow or invalid geometry");
+        }
+        if (seal_session != nullptr &&
+            vbr_hard_seal_step_blocked(i, *seal_session)) {
+            out.blocked_order_indices.push_back(i);
+            continue;
+        }
+        out.steps.push_back({
+            i, slot, int32_t(sim[slot]), int32_t(type_b), gain,
+        });
+        terminal = next_terminal;
+        sim[slot] = type_b;
+    }
+    out.terminal_progress = terminal;
+    return true;
+}
+
+llama_vbr_policy::child llama_kv_cache::vbr_policy_child_stream(
+        int demanded_device, uint32_t wm_next) const {
+    llama_vbr_policy::child out;
+    std::vector<ggml_type> sim;
+    vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                 nullptr, nullptr, nullptr);
+
+    // Incoming watermark growth is part of the logical baseline-to-prefix delta.  It can make
+    // initial progress negative; the interleaver clamps only for its ratio comparison.
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm == nullptr || p.device != demanded_device) {
+            continue;
+        }
+        const uint32_t terminal_wm = std::max(p.wm_cells, wm_next);
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const vbr_extent & e = side ? p.v[ikv] : p.k[ikv];
+                if (e.t == nullptr) {
+                    continue;
+                }
+                const size_t slot = ikv*2 + (side ? 1 : 0);
+                const ggml_type type = sim[slot] != GGML_TYPE_COUNT ? sim[slot] : e.t->type;
+                const uint64_t before = vbr_policy_endpoint_bytes(e.t, type, p.wm_cells, p.gran);
+                const uint64_t after  = vbr_policy_endpoint_bytes(e.t, type, terminal_wm, p.gran);
+                GGML_ASSERT(before <= (uint64_t) INT64_MAX && after <= (uint64_t) INT64_MAX);
+                int64_t next = 0;
+                if (!llama_vbr_policy::checked_add(
+                        out.initial_progress,
+                        (int64_t) before - (int64_t) after, next)) {
+                    GGML_ABORT("VBR policy progress overflow");
+                }
+                out.initial_progress = next;
+            }
+        }
+    }
+
+    vbr_hard_seal_consult_session seal_session;
+    GGML_ASSERT(vbr_policy_priced_steps(
+        sim, vbr_degrade_cursor_, demanded_device, wm_next,
+        false, false, out,
+        vbr_hard_seal_guard_ ? &seal_session : nullptr));
+    return out;
+}
+
 llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
         double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
     vbr_floor_sim_result res;
@@ -3389,29 +5056,1824 @@ static void vbr_set_tensor_type(ggml_tensor * t, std::vector<ggml_tensor *> & vi
     }
 }
 
-// lazily size + allocate one pool's f16 sink-stash buffer (one slab per pool on that pool's
-// device, per-extent offsets); returns its base. Requires the pool's side-stream backend.
-char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
-    if (p.stash_buf == nullptr) {
-        size_t total = 0;
-        for (size_t j = 0; j < layers.size(); ++j) {
-            for (int side = 0; side < 2; ++side) {
-                vbr_extent        & ex = side ? p.v[j] : p.k[j];
-                const ggml_tensor * tt = ex.t; // pool-local instance (shard under -sm tensor)
-                if (tt == nullptr) {
-                    continue;
-                }
-                ex.stash_off = total;
-                total += (size_t) vbr_stash_rows_ * tt->ne[0] * sizeof(uint16_t);
+// Transaction apply has crossed its recoverable-preflight boundary.  Update the same canonical,
+// stream-view and tensor-split metadata without constructing the temporary shard-view vector used
+// by the ordinary path.
+static void vbr_set_tensor_type_noalloc(
+        ggml_tensor * t, std::vector<ggml_tensor *> & views, ggml_type type) {
+    vbr_set_tensor_type_impl(t, views, type);
+    if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+        return;
+    }
+    const size_t n = ggml_backend_meta_buffer_n_bufs(t->buffer);
+    for (size_t i = 0; i < n; ++i) {
+        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, i);
+        if (shard == nullptr) {
+            continue;
+        }
+        shard->type  = type;
+        shard->nb[0] = ggml_type_size(type);
+        shard->nb[1] = ggml_row_size(type, shard->ne[0]);
+        shard->nb[2] = shard->nb[1]*shard->ne[1];
+        shard->nb[3] = shard->nb[2]*shard->ne[2];
+        for (ggml_tensor * view : views) {
+            ggml_tensor * shard_view = view != nullptr
+                    ? ggml_backend_meta_buffer_simple_tensor(view, i) : nullptr;
+            if (shard_view != nullptr) {
+                shard_view->type  = type;
+                shard_view->nb[0] = shard->nb[0];
+                shard_view->nb[1] = shard->nb[1];
+                shard_view->nb[2] = shard->nb[2];
+                shard_view->nb[3] = shard->nb[3];
             }
         }
-        GGML_ASSERT(p.backend != nullptr);
-        p.stash_buf = ggml_backend_buft_alloc_buffer(
-                ggml_backend_get_default_buffer_type(p.backend), total);
-        GGML_ASSERT(p.stash_buf != nullptr);
-        LLAMA_LOG_INFO("%s: VBR sink-stash buffer (device %d): %.2f MiB\n", __func__, p.device, total/1024.0/1024.0);
     }
-    return (char *) ggml_backend_buffer_get_base(p.stash_buf);
+}
+
+bool llama_kv_cache::vbr_stash_memory(
+        const vbr_pool & p, const std::vector<vbr_stash_request> & requests,
+        size_t & physical_now, size_t & physical_if_reserved) const {
+    physical_now = p.stash_vmm != nullptr ? p.be->vmm_pool_mapped(p.stash_vmm) : 0;
+    physical_if_reserved = physical_now;
+    if (requests.empty()) {
+        return true;
+    }
+    if (p.stash_size == 0 || p.gran == 0) {
+        return false;
+    }
+
+    bool needs_mapping = false;
+    for (const auto & request : requests) {
+        const vbr_extent * e = request.extent;
+        if (e == nullptr || e->t == nullptr || request.rows > vbr_stash_rows_) {
+            return false;
+        }
+        const bool owned = std::any_of(p.k.begin(), p.k.end(),
+                    [&](const vbr_extent & candidate) { return &candidate == e; }) ||
+                std::any_of(p.v.begin(), p.v.end(),
+                    [&](const vbr_extent & candidate) { return &candidate == e; });
+        if (!owned) {
+            return false;
+        }
+        const size_t ne0 = (size_t) e->t->ne[0];
+        if (ne0 > SIZE_MAX / sizeof(uint16_t) ||
+            (size_t) request.rows > SIZE_MAX / (ne0 * sizeof(uint16_t))) {
+            return false;
+        }
+        const size_t bytes = (size_t) request.rows * ne0 * sizeof(uint16_t);
+        if (bytes == 0) {
+            continue;
+        }
+        needs_mapping = true;
+        if (e->stash_off > p.stash_size || bytes > p.stash_size - e->stash_off) {
+            return false;
+        }
+    }
+    // One capture pins the slab for the cache lifetime, just as the prior cudaMalloc did. Keeping
+    // this a complete page-padded endpoint makes a transaction's stash price independent of which
+    // extent happens to be the first capture and avoids page-union arithmetic in the policy layer.
+    if (needs_mapping) {
+        physical_if_reserved = std::max(physical_now, p.stash_size);
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_stash_reserve(
+        vbr_pool & p, const std::vector<vbr_stash_request> & requests) {
+    size_t physical_now = 0;
+    size_t physical_if_reserved = 0;
+    if (!vbr_stash_memory(p, requests, physical_now, physical_if_reserved)) {
+        return false;
+    }
+    if (physical_if_reserved == physical_now) {
+        return true;
+    }
+    if (p.stash_vmm == nullptr) {
+        p.stash_vmm = p.be->vmm_pool_init(p.device, p.stash_size);
+        if (p.stash_vmm == nullptr) {
+            return false;
+        }
+    }
+
+    // The complete slab is one deterministic transaction endpoint. vmm_pool_map is idempotent and
+    // retains a settled prefix on failure, so retry grows only the missing pages.
+    if (!p.be->vmm_pool_map(p.stash_vmm, 0, p.stash_size)) {
+        const size_t physical_after = p.be->vmm_pool_mapped(p.stash_vmm);
+        LLAMA_LOG_WARN("%s: VBR sink-stash reserve failed on device %d after mapping %.2f "
+                "MiB / projected %.2f MiB (%.2f MiB VA); retry is idempotent\n",
+                __func__, p.device, physical_after/1048576.0,
+                physical_if_reserved/1048576.0, p.stash_size/1048576.0);
+        return false;
+    }
+    const size_t physical_after = p.be->vmm_pool_mapped(p.stash_vmm);
+    GGML_ASSERT(physical_after >= physical_if_reserved);
+    LLAMA_LOG_INFO("%s: VBR sink-stash reserve (device %d): %.2f MiB mapped / %.2f MiB VA\n",
+            __func__, p.device, physical_after/1048576.0, p.stash_size/1048576.0);
+    return true;
+}
+
+bool llama_kv_cache::vbr_downward_reserve_import(
+        const std::vector<const vbr_validated_child_plan *> & plans,
+        llama_cache_acct_ledger & ledger,
+        const llama_cache_budget_config & budget,
+        vbr_downward_stage_reservation & output) noexcept {
+    output = {};
+    struct stash_context {
+        llama_kv_cache * cache = nullptr;
+        vbr_pool * pool = nullptr;
+        std::vector<vbr_stash_request> requests;
+        std::vector<uint64_t> unit_ids;
+    };
+    try {
+        if (plans.empty()) {
+            output.status = vbr_downward_reserve_status::projection_unavailable;
+            return false;
+        }
+        output.status = vbr_downward_reserve_status::reserved;
+        for (auto & pool : vbr_pools_) {
+            std::vector<vbr_downward_workspace_endpoint> workspaces;
+            std::vector<vbr_downward_stash_endpoint> stashes;
+            stash_context stash_projection;
+            stash_projection.cache = this;
+            stash_projection.pool = &pool;
+            vbr_downward_workspace_endpoint workspace;
+            workspace.owner = &pool;
+            workspace.iface = pool.be;
+            workspace.backend = pool.backend;
+            workspace.device = pool.device;
+            llama_cache_acct_resource_domain pool_domain;
+            bool have_domain = false;
+
+            for (const auto * plan : plans) {
+                if (!plan || !plan->downward) {
+                    continue;
+                }
+                const size_t ikv = plan->logical_unit_id/2;
+                const bool is_v = (plan->logical_unit_id & 1u) != 0;
+                if (ikv >= layers.size()) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                const auto & units = vbr_units_of(ikv, is_v);
+                const auto shard = std::find_if(
+                    plan->shards.begin(), plan->shards.end(),
+                    [&](const vbr_validated_shard_plan & value) {
+                        return value.target_pool_cookie == &pool;
+                    });
+                if (shard == plan->shards.end()) {
+                    continue;
+                }
+                const auto unit = std::find_if(
+                    units.begin(), units.end(),
+                    [&](const auto & value) { return value.first == &pool; });
+                if (unit == units.end() || !unit->second ||
+                    !unit->second->t || pool.be == nullptr ||
+                    pool.be->kv_transcode_workspace_memory == nullptr ||
+                    pool.be->kv_transcode_workspace_reserve == nullptr) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                if (!have_domain) {
+                    pool_domain = shard->domain;
+                    workspace.domain = shard->domain;
+                    have_domain = true;
+                } else if (pool_domain != shard->domain) {
+                    output.status =
+                        vbr_downward_reserve_status::projection_unavailable;
+                    return false;
+                }
+                uint32_t stash_rows = 0;
+                const bool needs_stash =
+                    vbr_downward_recipe_needs_stash(plan->transcode_recipe);
+                if (needs_stash && vbr_stash_rows_ > 0) {
+                    stash_rows = std::min<uint64_t>(
+                        vbr_stash_rows_, plan->descriptor.wm_cells);
+                }
+                workspace.requests.push_back({
+                    int64_t(plan->descriptor.wm_cells),
+                    unit->second->t->ne[0], int64_t(stash_rows),
+                });
+                if (stash_rows > 0) {
+                    stash_projection.requests.push_back({
+                        unit->second, stash_rows,
+                    });
+                    stash_projection.unit_ids.push_back(
+                        vbr_downward_unit_key(
+                            plan->child_id, plan->logical_unit_id));
+                }
+            }
+            if (workspace.requests.empty()) {
+                continue;
+            }
+            if (pool.backend == nullptr) {
+                pool.backend = pool.be->backend_init(pool.device);
+                if (pool.backend == nullptr) {
+                    output.status =
+                        vbr_downward_reserve_status::workspace_reserve_failed;
+                    return true;
+                }
+                workspace.backend = pool.backend;
+            }
+            workspaces.push_back(std::move(workspace));
+            if (!stash_projection.requests.empty()) {
+                vbr_downward_stash_endpoint endpoint;
+                endpoint.owner = &pool;
+                endpoint.unit_ids = std::move(stash_projection.unit_ids);
+                endpoint.domain = pool_domain;
+                endpoint.context = &stash_projection;
+                endpoint.memory = [](void * opaque, uint64_t & now,
+                                     uint64_t & reserved) {
+                    auto & value = *static_cast<stash_context *>(opaque);
+                    size_t a = 0;
+                    size_t b = 0;
+                    if (!value.cache->vbr_stash_memory(
+                            *value.pool, value.requests, a, b)) {
+                        return false;
+                    }
+                    now = a;
+                    reserved = b;
+                    return true;
+                };
+                endpoint.reserve = [](void * opaque) {
+                    auto & value = *static_cast<stash_context *>(opaque);
+                    return value.cache->vbr_stash_reserve(
+                        *value.pool, value.requests);
+                };
+                stashes.push_back(std::move(endpoint));
+            }
+            if (!pool.downward_receipts) {
+                pool.downward_receipts =
+                    std::make_unique<vbr_downward_resource_receipts>(ledger);
+            }
+            const auto reserved = pool.downward_receipts->reserve_resources(
+                budget, workspaces, stashes);
+            if (reserved.status != vbr_downward_reserve_status::reserved &&
+                reserved.status !=
+                    vbr_downward_reserve_status::reserved_stashless) {
+                output.status = reserved.status;
+                return true;
+            }
+            output.stashless_units.insert(
+                output.stashless_units.end(),
+                reserved.stashless_units.begin(),
+                reserved.stashless_units.end());
+            if (!reserved.stashless_units.empty()) {
+                output.status =
+                    vbr_downward_reserve_status::reserved_stashless;
+            }
+        }
+        return true;
+    } catch (...) {
+        output.status = vbr_downward_reserve_status::internal_error;
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_downward_policy_input(
+        const std::vector<ggml_type> & source_types,
+        uint64_t source_cursor,
+        uint32_t projected_wm_cells,
+        int demanded_device,
+        vbr_downward_policy_child & output) const noexcept {
+    output = {};
+    try {
+        if (source_types.size() != layers.size()*2 ||
+            projected_wm_cells == 0 ||
+            source_cursor > vbr_demand_limit()) {
+            return false;
+        }
+        output.initial_types = source_types;
+        output.target_types.resize(source_types.size(), GGML_TYPE_COUNT);
+        output.initial_cursor = source_cursor;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            output.target_types[ikv*2] =
+                layers[ikv].k ? layers[ikv].k->type : GGML_TYPE_COUNT;
+            output.target_types[ikv*2 + 1] =
+                layers[ikv].v ? layers[ikv].v->type : GGML_TYPE_COUNT;
+        }
+        auto sim = source_types;
+        if (!vbr_policy_priced_steps(
+                sim, size_t(source_cursor), demanded_device,
+                projected_wm_cells, true, true, output.policy)) {
+            return false;
+        }
+        return output.policy.terminal_progress > 0 ||
+            output.initial_types == output.target_types;
+    } catch (...) {
+        output = {};
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_downward_bind_target_unit(
+        ggml_type source_type,
+        const vbr_downward_policy_projection & projection,
+        uint32_t projection_child,
+        vbr_target_unit_snapshot & output) const noexcept {
+    try {
+        const size_t ikv = output.logical_unit_id/2;
+        const bool is_v = (output.logical_unit_id & 1u) != 0;
+        if (ikv >= layers.size() || projection.status !=
+                vbr_downward_policy_status::coherent ||
+            projection_child >= projection.final_types.size() ||
+            projection_child >= projection.child_type_digests.size() ||
+            output.logical_unit_id >=
+                projection.final_types[projection_child].size()) {
+            return false;
+        }
+        const ggml_tensor * canonical = is_v ? layers[ikv].v : layers[ikv].k;
+        if (!canonical || projection.final_types[projection_child]
+                [output.logical_unit_id] != canonical->type) {
+            return false;
+        }
+        vbr_capture_stability_token policy;
+        if (!vbr_capture_policy_snapshot(policy)) {
+            return false;
+        }
+        vbr_downward_recipe recipe;
+        const bool movable = vbr_unit_movable(source_type, is_v);
+        if (vbr_downward_resolve_recipe(
+                source_type, canonical->type,
+                static_cast<ggml_type>(policy.floor_type),
+                movable, recipe) != vbr_downward_recipe_status::resolved) {
+            return false;
+        }
+        const auto & units = vbr_units_of(ikv, is_v);
+        if (units.empty() || units.size() != output.shards.size()) {
+            return false;
+        }
+        uint64_t mapped = 0;
+        uint64_t transfer = 0;
+        uint64_t workspace = 0;
+        const int64_t stash_rows = vbr_downward_recipe_needs_stash(recipe)
+            ? std::min<uint64_t>(vbr_stash_rows_, output.wm_cells)
+            : 0;
+        for (size_t i = 0; i < units.size(); ++i) {
+            const auto * pool = units[i].first;
+            const auto * extent = units[i].second;
+            if (!pool || !extent || !extent->t || !pool->be ||
+                !pool->be->kv_transcode_workspace_memory) {
+                return false;
+            }
+            const uint64_t target_row = ggml_row_size(
+                canonical->type, extent->t->ne[0]);
+            const uint64_t source_row = ggml_row_size(
+                source_type, extent->t->ne[0]);
+            if (target_row == 0 || source_row == 0 ||
+                output.wm_cells > uint64_t(INT64_MAX) ||
+                output.wm_cells > UINT64_MAX/target_row ||
+                output.wm_cells > UINT64_MAX/source_row) {
+                return false;
+            }
+            const uint64_t target_bytes = output.wm_cells*target_row;
+            const uint64_t source_bytes = output.wm_cells*source_row;
+            if (mapped > UINT64_MAX-target_bytes ||
+                transfer > UINT64_MAX-source_bytes) {
+                return false;
+            }
+            mapped += target_bytes;
+            transfer += source_bytes;
+            size_t now = 0;
+            size_t endpoint = 0;
+            if (!pool->be->kv_transcode_workspace_memory(
+                    pool->backend, pool->device,
+                    int64_t(output.wm_cells), extent->t->ne[0],
+                    stash_rows, &now, &endpoint) ||
+                endpoint > UINT64_MAX-workspace) {
+                return false;
+            }
+            workspace += endpoint;
+            output.shards[i].row_bytes = target_row;
+            output.shards[i].mapped_bytes = target_bytes;
+        }
+        output.downward_supported = true;
+        output.downward_movable = movable;
+        output.controller_floor_type = policy.floor_type;
+        output.downward_type = canonical->type;
+        output.downward_domain = vbr_downward_tier_domain(canonical->type);
+        output.downward_recipe_id = VBR_DOWNWARD_RECIPE_ID;
+        output.downward_recipe_version = VBR_DOWNWARD_RECIPE_VERSION;
+        output.downward_recipe = recipe;
+        output.downward_meansub_model_id = hparams.turbo_meansub_id;
+        output.downward_row_bytes = output.shards.front().row_bytes;
+        output.downward_mapped_bytes = mapped;
+        output.downward_transfer_bytes = transfer;
+        output.downward_codec_workspace_bytes = workspace;
+        output.downward_build_identity_digest = vbr_downward_build_identity(
+            recipe, output.downward_meansub_model_id,
+            output.meansub_digest,
+            projection.child_type_digests[projection_child],
+            projection.tree_digest);
+        return vbr_digest_nonzero(output.downward_build_identity_digest);
+    } catch (...) {
+        return false;
+    }
+}
+
+vbr_downward_transform_status llama_kv_cache::vbr_downward_transform_import(
+        const vbr_validated_child_plan & plan,
+        bool stashless,
+        uint32_t & stash_valid,
+        uint32_t & edge_reached) noexcept {
+    stash_valid = 0;
+    edge_reached = UINT32_MAX;
+    try {
+        if (!plan.downward || plan.logical_unit_id/2 >= layers.size() ||
+            plan.transcode_recipe.n_edges == 0) {
+            return vbr_downward_transform_status::invalid_recipe;
+        }
+        const size_t ikv = plan.logical_unit_id/2;
+        const bool is_v = (plan.logical_unit_id & 1u) != 0;
+        const auto & units = vbr_units_of(ikv, is_v);
+        if (units.size() != plan.shards.size()) {
+            return vbr_downward_transform_status::invalid_recipe;
+        }
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<vbr_pool *>(
+                const_cast<void *>(shard.target_pool_cookie));
+            const auto unit = std::find_if(
+                units.begin(), units.end(),
+                [&](const auto & value) { return value.first == pool; });
+            if (unit == units.end() || !pool || !unit->second ||
+                !unit->second->t || !pool->be || !pool->backend ||
+                pool->be->kv_transcode == nullptr ||
+                pool->be->kv_stash_capture == nullptr) {
+                return vbr_downward_transform_status::transform_failed;
+            }
+            auto & extent = *unit->second;
+            ggml_tensor source;
+            if (!vbr_import_source_alias(
+                    *extent.t, plan.transcode_recipe.source_type, source)) {
+                return vbr_downward_transform_status::transform_failed;
+            }
+
+            struct live_state {
+                vbr_pool * pool = nullptr;
+                vbr_extent * extent = nullptr;
+                ggml_tensor * source = nullptr;
+                bool is_v = false;
+                bool stashless = false;
+                uint32_t requested_stash = 0;
+                uint32_t captured_stash = 0;
+                uint32_t wm_cells = 0;
+            } state;
+            state.pool = pool;
+            state.extent = &extent;
+            state.source = &source;
+            state.is_v = is_v;
+            state.stashless = stashless;
+            state.wm_cells = plan.descriptor.wm_cells;
+            state.requested_stash = std::min<uint64_t>(
+                vbr_stash_rows_, plan.descriptor.wm_cells);
+
+            vbr_downward_edge_driver driver;
+            driver.context = &state;
+            driver.stash_available = [](void * opaque) noexcept {
+                const auto & value = *static_cast<live_state *>(opaque);
+                return value.stashless || value.captured_stash != 0;
+            };
+            driver.capture_stash = [](void * opaque,
+                                      const vbr_downward_edge &) noexcept {
+                auto & value = *static_cast<live_state *>(opaque);
+                if (value.requested_stash == 0 ||
+                    value.pool->stash_vmm == nullptr) {
+                    return false;
+                }
+                char * base = static_cast<char *>(
+                    value.pool->be->vmm_pool_base(value.pool->stash_vmm));
+                value.pool->be->kv_stash_capture(
+                    value.pool->backend, value.source,
+                    base + value.extent->stash_off,
+                    value.requested_stash, value.is_v);
+                value.captured_stash = value.requested_stash;
+                return true;
+            };
+            driver.transcode = [](void * opaque,
+                                  const vbr_downward_edge & edge) noexcept {
+                auto & value = *static_cast<live_state *>(opaque);
+                const void * stash = nullptr;
+                int64_t stash_rows = 0;
+                if (!value.stashless && value.captured_stash > 0 &&
+                    value.pool->stash_vmm != nullptr) {
+                    stash = static_cast<char *>(
+                        value.pool->be->vmm_pool_base(value.pool->stash_vmm)) +
+                        value.extent->stash_off;
+                    stash_rows = value.captured_stash;
+                }
+                // Match the live degrade path's page-tail discipline exactly.
+                // The target representation is smaller than its source, but
+                // VMM maps page-granular ranges.  Bytes after the target's
+                // logical prefix on the terminal mapped page must be scrubbed:
+                // a later padded attention read can otherwise reinterpret
+                // source-tier tail bytes as turbo block scales and propagate
+                // NaNs through an otherwise masked row.
+                const vbr_span span = vbr_span_of(
+                    value.extent->t, edge.target_type,
+                    int64_t(value.wm_cells), value.wm_cells,
+                    value.pool->gran);
+                vbr_scrub_span scrub;
+                if (!vbr_scrub_span_of(
+                        value.extent->t, edge.source_type,
+                        value.wm_cells, span, value.pool->gran, scrub)) {
+                    return false;
+                }
+                const ggml_vbr_transcode_params params = {
+                    value.source, edge.target_type, value.extent->t->data,
+                    value.pool->buf, int64_t(value.wm_cells), value.is_v,
+                    stash, stash_rows, scrub.scrub_end - scrub.keep,
+                };
+                value.pool->be->kv_transcode(value.pool->backend, &params);
+                const std::vector<ggml_tensor *> no_views;
+                vbr_set_tensor_type_impl(
+                    value.source, no_views, edge.target_type);
+                return true;
+            };
+            bool regenerated = false;
+            const auto status = vbr_downward_execute_edges(
+                plan.transcode_recipe, driver, regenerated, &edge_reached);
+            if (status != vbr_downward_transform_status::transformed) {
+                return status;
+            }
+            if (regenerated) {
+                stash_valid = state.captured_stash;
+            }
+        }
+        return vbr_downward_transform_status::transformed;
+    } catch (...) {
+        return vbr_downward_transform_status::internal_error;
+    }
+}
+
+bool llama_kv_cache::vbr_import_source_alias(
+        const ggml_tensor & destination,
+        ggml_type source_type,
+        ggml_tensor & output) const noexcept {
+    if (source_type == GGML_TYPE_COUNT) {
+        return false;
+    }
+    output = destination;
+    const std::vector<ggml_tensor *> no_views;
+    vbr_set_tensor_type_impl(&output, no_views, source_type);
+    output.data = destination.data;
+    return true;
+}
+
+void llama_kv_cache::vbr_import_set_unit_type_noalloc(
+        uint32_t logical_unit, ggml_type type) noexcept {
+    const size_t ikv = logical_unit/2;
+    const bool is_v = (logical_unit & 1u) != 0;
+    GGML_ASSERT(ikv < layers.size() && type != GGML_TYPE_COUNT);
+    ggml_tensor * canonical = is_v ? layers[ikv].v : layers[ikv].k;
+    GGML_ASSERT(canonical != nullptr);
+    vbr_set_tensor_type_noalloc(
+        canonical, is_v ? layers[ikv].v_stream : layers[ikv].k_stream,
+        type);
+}
+
+void llama_kv_cache::vbr_representation_changed() {
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+    }
+}
+
+void llama_kv_cache::vbr_attention_content_changed() {
+    if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
+        GGML_ASSERT(vbr_representation_epoch_ != UINT64_MAX);
+        GGML_ASSERT(vbr_checkpoint_epoch_ != UINT64_MAX);
+        vbr_representation_epoch_++;
+        vbr_checkpoint_epoch_++;
+    }
+}
+
+vbr_generation_tracker * llama_kv_cache::vbr_generation_tracker_mut() {
+    return other != nullptr ? other->vbr_generation_tracker_mut() : vbr_generation_.get();
+}
+
+const vbr_generation_tracker * llama_kv_cache::vbr_generation_tracker_get() const {
+    return other != nullptr ? other->vbr_generation_tracker_get() : vbr_generation_.get();
+}
+
+bool llama_kv_cache::vbr_generation_cell_has_seq_cb(
+        const void * context, uint32_t stream, uint32_t cell, llama_seq_id seq_id) {
+    const auto * cache = static_cast<const llama_kv_cache *>(context);
+    if (cache == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+            stream >= cache->v_cells.size() || cell >= cache->v_cells[stream].size()) {
+        return false;
+    }
+    return !cache->v_cells[stream].is_empty(cell) && cache->v_cells[stream].seq_has(cell, seq_id);
+}
+
+llama_pos llama_kv_cache::vbr_generation_cell_pos_cb(
+        const void * context, uint32_t stream, uint32_t cell) {
+    const auto * cache = static_cast<const llama_kv_cache *>(context);
+    if (cache == nullptr || stream >= cache->v_cells.size() ||
+            cell >= cache->v_cells[stream].size() || cache->v_cells[stream].is_empty(cell)) {
+        return -1;
+    }
+    return cache->v_cells[stream].pos_get(cell);
+}
+
+bool llama_kv_cache::vbr_generation_capture_live_guarded(
+        uint32_t child_id,
+        llama_seq_id seq_id,
+        llama_pos computation_frontier,
+        vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement,
+        vbr_explicit_generation_failure * failure) const {
+    if (failure != nullptr) {
+        *failure = vbr_explicit_generation_failure::none;
+    }
+    const auto fail = [&](vbr_explicit_generation_failure why) {
+        output = {};
+        if (failure != nullptr) {
+            *failure = why;
+        }
+        return false;
+    };
+    if (other != nullptr) {
+        return other->vbr_generation_capture_live_guarded(
+                child_id, seq_id, computation_frontier, output,
+                placement, failure);
+    }
+
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr) {
+        return fail(vbr_explicit_generation_failure::tracker_missing);
+    }
+    if (tracker->shadow_unavailable()) {
+        return fail(
+            vbr_explicit_generation_failure::tracker_shadow_unavailable);
+    }
+    if (!tracker->stable()) {
+        return fail(vbr_explicit_generation_failure::tracker_unstable);
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ ||
+            computation_frontier < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+        return fail(
+            vbr_explicit_generation_failure::invalid_sequence_or_frontier);
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size()) {
+        return fail(vbr_explicit_generation_failure::invalid_stream);
+    }
+
+    // Gap fix (review): capture enumerates owned cells from the ownership-index masks in page
+    // order — never a legacy cell scan. The scan remains only as the env-gated oracle check.
+    const auto & cells = v_cells[stream];
+    if (vbr_ownership_ == nullptr) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_index_missing);
+    }
+    if (!vbr_ownership_->initialized(stream, seq_id)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_view_missing);
+    }
+    if (!vbr_ownership_->available(stream, seq_id)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_view_unavailable);
+    }
+    uint32_t expected_rank = 0;
+    if (!vbr_ownership_->rank_below(stream, seq_id, computation_frontier, expected_rank)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_rank_failed);
+    }
+    std::vector<uint32_t> owned_cells;
+    owned_cells.reserve(expected_rank);
+    if (!vbr_ownership_->enumerate_owned(stream, seq_id, owned_cells)) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_enumeration_failed);
+    }
+    std::vector<uint32_t> dependency_cells;
+    dependency_cells.reserve(expected_rank);
+
+    vbr_artifact_stream_placement captured_placement;
+    captured_placement.child_id = child_id;
+    captured_placement.stream_index = stream;
+    captured_placement.source_sequence = seq_id;
+    captured_placement.computation_frontier = computation_frontier;
+    captured_placement.cells.reserve(expected_rank);
+    for (uint32_t cell : owned_cells) {
+        const auto position = cells.pos_get(cell);
+        if (position >= computation_frontier) {
+            continue;
+        }
+        // Shift is intentionally absent from artifact v2. A shifted source
+        // cannot be represented exactly and therefore fails capture closed.
+        if (cells.get_shift(cell) != 0) {
+            return fail(
+                vbr_explicit_generation_failure::stream_capture_failed);
+        }
+        const auto & ext = cells.ext_get(cell);
+        dependency_cells.push_back(cell);
+        captured_placement.cells.push_back({
+            cell, position, ext.x, ext.y,
+        });
+    }
+    if (dependency_cells.size() != expected_rank) {
+        return fail(
+            vbr_explicit_generation_failure::ownership_cardinality_mismatch);
+    }
+
+    vbr_checkpoint_generation_stream captured_stream;
+    if (!vbr_generation_capture_stream(
+                *tracker, stream, seq_id, computation_frontier, dependency_cells, captured_stream)) {
+        return fail(vbr_explicit_generation_failure::stream_capture_failed);
+    }
+
+    if (!vbr_generation_capture_controller(
+                *tracker,
+                child_id,
+                checkpoint_child_dependency_mode::live_guarded,
+                {std::move(captured_stream)},
+                output)) {
+        return fail(
+            vbr_explicit_generation_failure::controller_capture_failed);
+    }
+    if (placement != nullptr) {
+        *placement = std::move(captured_placement);
+    }
+    return true;
+}
+
+// VBR_EXPLICIT_CAPTURE_STABILITY_REGION_BEGIN
+// Reviewed F3 read authority: these private hooks snapshot and re-read live
+// generations to prove a byte capture stayed exact. They never perform
+// checkpoint admission; the isolation gate strips only this bounded region.
+bool llama_kv_cache::vbr_capture_policy_snapshot(
+        vbr_capture_stability_token & output) const noexcept {
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr || !tracker->stable()) {
+        return false;
+    }
+    output.lineage_uuid = tracker->lineage_identity();
+    output.instance_id = tracker->runtime_instance();
+    output.controller_generation = tracker->controller_generation();
+    output.mutation_serial = tracker->mutation_serial();
+
+    llama_sha256_writer order_hash;
+    static constexpr char ORDER_DOMAIN[] =
+        "buun.vbr.capture/degrade-order";
+    order_hash.string(ORDER_DOMAIN, sizeof(ORDER_DOMAIN) - 1);
+    order_hash.u64(vbr_degrade_order_.size());
+    for (const auto & step : vbr_degrade_order_) {
+        order_hash.u32(step.il);
+        order_hash.u32(step.is_v);
+        order_hash.u32(step.tier);
+    }
+    output.degrade_order_digest = order_hash.finish();
+    output.degrade_cursor = vbr_degrade_cursor_;
+    const size_t floor_index =
+        std::min(vbr_degrade_limit_, vbr_degrade_order_.size());
+    output.floor_type = floor_index < vbr_degrade_order_.size()
+        ? int32_t(vbr_tier_type(vbr_degrade_order_[floor_index].tier))
+        : int32_t(GGML_TYPE_TURBO1_TCQ);
+    output.pressure_independent_settings =
+        (uint64_t(vbr_params_.dynamic) << 0) |
+        (uint64_t(vbr_params_.min_bits_explicit) << 1) |
+        (uint64_t(vbr_params_.budget_explicit) << 2) |
+        (uint64_t(vbr_params_.pin_k) << 3) |
+        (uint64_t(vbr_params_.pin_v) << 4);
+    output.completed_wave = std::all_of(
+        vbr_pools_.begin(), vbr_pools_.end(),
+        [](const auto & pool) {
+            return !pool.wave_pending &&
+                   pool.unmap_deferred.empty();
+        });
+
+    llama_sha256_writer policy_hash;
+    static constexpr char POLICY_DOMAIN[] =
+        "buun.vbr.capture/controller-policy";
+    policy_hash.string(POLICY_DOMAIN, sizeof(POLICY_DOMAIN) - 1);
+    policy_hash.bytes(
+        output.degrade_order_digest.data(),
+        output.degrade_order_digest.size());
+    policy_hash.u64(output.degrade_cursor);
+    policy_hash.u32(uint32_t(output.floor_type));
+    policy_hash.u64(output.pressure_independent_settings);
+    policy_hash.u32(n_stream);
+    policy_hash.u32(n_stream == 1);
+    policy_hash.u64(vbr_pools_.empty()
+        ? 0 : vbr_pools_.front().wm_cells);
+    output.policy_digest = policy_hash.finish();
+    return tracker->stable() &&
+           tracker->mutation_serial() == output.mutation_serial;
+}
+
+bool llama_kv_cache::vbr_capture_settle() noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_settle();
+    }
+    if (!vbr_operation_armed() || vbr_generation_tracker_get() == nullptr) {
+        return false;
+    }
+    try {
+        vbr_flush_deferred_unmaps();
+        vbr_arm_wave_fences();
+        for (auto & pool : vbr_pools_) {
+            // The dedicated side stream is normally created by the first
+            // degrade/promote. A fresh F16 cache has mapped KV bytes but has
+            // never needed that stream. Explicit capture is its first D2H
+            // consumer, so initialize the stream here while the slot is idle.
+            // This creates capture infrastructure only; it changes no tier,
+            // watermark, ownership, generation, or KV byte.
+            if (pool.backend == nullptr) {
+                if (pool.be == nullptr || pool.device < 0) {
+                    return false;
+                }
+                pool.backend = pool.be->backend_init(pool.device);
+                if (pool.backend == nullptr) {
+                    return false;
+                }
+            }
+            if (pool.backend != nullptr) {
+                ggml_backend_synchronize(pool.backend);
+            }
+            if (pool.vmm != nullptr && pool.be != nullptr) {
+                pool.be->sync_device(pool.device);
+            }
+        }
+        // The sole intentional pre-quiescence source-side mutation: discard
+        // already-dirty stash metadata. This idempotent housekeeping changes
+        // no KV bytes, ownership, generation, or cursor and therefore needs
+        // no §9 rollback if the later capture fails.
+        vbr_invalidate_dirty_stash();
+        for (const auto & pool : vbr_pools_) {
+            if (pool.wave_pending || !pool.unmap_deferred.empty()) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_capture_size_pass(
+        const vbr_capture_unit_request & request,
+        std::vector<vbr_capture_unit_plan> & output,
+        vbr_capture_stability_token & stability,
+        vbr_explicit_size_failure * failure) const noexcept {
+    output.clear();
+    stability = {};
+    if (failure != nullptr) {
+        *failure = vbr_explicit_size_failure::none;
+    }
+    const auto fail = [&](vbr_explicit_size_failure why) {
+        if (failure != nullptr) {
+            *failure = why;
+        }
+        output.clear();
+        stability = {};
+        return false;
+    };
+    if (other != nullptr) {
+        return other->vbr_capture_size_pass(
+            request, output, stability, failure);
+    }
+    const auto * tracker = vbr_generation_tracker_get();
+    if (!vbr_operation_armed()) {
+        return fail(vbr_explicit_size_failure::not_armed);
+    }
+    if (tracker == nullptr) {
+        return fail(vbr_explicit_size_failure::tracker_missing);
+    }
+    if (!tracker->stable()) {
+        return fail(vbr_explicit_size_failure::tracker_unstable);
+    }
+    if (request.bindings == nullptr) {
+        return fail(vbr_explicit_size_failure::bindings_missing);
+    }
+    if (n_stream != 1 || v_trans) {
+        return fail(vbr_explicit_size_failure::stream_layout);
+    }
+    try {
+        const auto & bindings = *static_cast<
+            const std::vector<vbr_explicit_capture_pool_binding> *>(
+                request.bindings);
+        if (!vbr_capture_policy_snapshot(stability)) {
+            return fail(vbr_explicit_size_failure::policy_snapshot);
+        }
+        const uint32_t count = tracker->unit_count();
+        output.reserve(count);
+        stability.units.reserve(count);
+        for (uint32_t unit = 0; unit < count; ++unit) {
+            const size_t ikv = unit / 2;
+            const bool is_v = (unit & 1u) != 0;
+            if (ikv >= layers.size()) {
+                return fail(vbr_explicit_size_failure::unit_index);
+            }
+            const auto & extents = vbr_units_of(ikv, is_v);
+            if (extents.empty()) {
+                return fail(vbr_explicit_size_failure::extents_empty);
+            }
+            vbr_capture_unit_plan plan;
+            plan.child_id = request.child_id;
+            plan.logical_unit = unit;
+            plan.is_v = is_v;
+            plan.generation = tracker->unit_generation(unit);
+            plan.n_stream = n_stream;
+            plan.unified = n_stream == 1;
+
+            vbr_capture_stability_token::geometry geometry;
+            geometry.logical_unit = unit;
+            geometry.generation = plan.generation;
+            uint32_t watermark = 0;
+            bool first = true;
+            bool stash_present = false;
+            uint32_t stash_rows = 0;
+            uint32_t topology_index = UINT32_MAX;
+            uint16_t prior_ordinal = 0;
+            for (const auto & [pool, extent] : extents) {
+                if (pool == nullptr || extent == nullptr ||
+                    extent->t == nullptr) {
+                    return fail(
+                        vbr_explicit_size_failure::extent_missing);
+                }
+                if (pool->vmm == nullptr) {
+                    return fail(vbr_explicit_size_failure::vmm_missing);
+                }
+                if (pool->backend == nullptr) {
+                    return fail(
+                        vbr_explicit_size_failure::backend_unavailable);
+                }
+                const auto generation_failure =
+                    vbr_explicit_capture_validate_extent_generation(
+                        pool->wm_cells,
+                        static_cast<int32_t>(extent->t->type),
+                        extent->promote_hops, plan.generation);
+                if (generation_failure !=
+                        vbr_explicit_size_failure::none) {
+                    return fail(generation_failure);
+                }
+                if (first) {
+                    watermark = pool->wm_cells;
+                    stash_present = extent->stash_valid != 0;
+                    stash_rows = extent->stash_valid;
+                    first = false;
+                } else if (watermark != pool->wm_cells ||
+                           stash_present != (extent->stash_valid != 0) ||
+                           stash_rows != extent->stash_valid) {
+                    return fail(
+                        vbr_explicit_size_failure::shard_disagreement);
+                }
+                const auto binding = std::find_if(
+                    bindings.begin(), bindings.end(),
+                    [&](const vbr_explicit_capture_pool_binding & candidate) {
+                        return candidate.instance_id == stability.instance_id &&
+                               candidate.device == pool->device;
+                    });
+                if (binding == bindings.end() ||
+                    binding->topology_index == UINT32_MAX ||
+                    binding->device_ordinal == UINT16_MAX ||
+                    binding->lane == UINT32_MAX) {
+                    return fail(
+                        vbr_explicit_size_failure::binding_missing);
+                }
+                if (topology_index == UINT32_MAX) {
+                    topology_index = binding->topology_index;
+                    prior_ordinal = binding->device_ordinal;
+                } else if (binding->topology_index != topology_index ||
+                           binding->device_ordinal <= prior_ordinal) {
+                    return fail(
+                        vbr_explicit_size_failure::topology_order);
+                } else {
+                    prior_ordinal = binding->device_ordinal;
+                }
+                const uint64_t row_bytes =
+                    ggml_row_size(extent->t->type, extent->t->ne[0]);
+                if (row_bytes == 0 ||
+                    watermark > UINT64_MAX / row_bytes) {
+                    return fail(vbr_explicit_size_failure::bounds);
+                }
+                const uint64_t bytes = uint64_t(watermark) * row_bytes;
+                if (bytes == 0 || bytes > ggml_nbytes(extent->t) ||
+                    bytes > vbr_slot_bytes(extent->t) ||
+                    extent->byte_off > pool->size ||
+                    bytes > pool->size - extent->byte_off) {
+                    return fail(vbr_explicit_size_failure::bounds);
+                }
+                uint64_t stash_bytes = 0;
+                if (stash_present) {
+                    if (plan.generation.domain != vbr_repr_domain::tapped ||
+                        pool->stash_vmm == nullptr ||
+                        extent->t->ne[0] >
+                            int64_t(UINT64_MAX / sizeof(uint16_t))) {
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
+                    }
+                    const uint64_t stash_row_bytes =
+                        uint64_t(extent->t->ne[0]) * sizeof(uint16_t);
+                    if (stash_rows > UINT64_MAX / stash_row_bytes) {
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
+                    }
+                    stash_bytes = uint64_t(stash_rows) * stash_row_bytes;
+                    const size_t stash_size = pool->stash_size;
+                    if (extent->stash_off > stash_size ||
+                        stash_bytes > stash_size - extent->stash_off) {
+                        return fail(
+                            vbr_explicit_size_failure::stash_bounds);
+                    }
+                }
+                plan.shards.push_back({
+                    pool, extent, uint32_t(plan.shards.size()),
+                    binding->topology_index, binding->device_ordinal,
+                    binding->lane, bytes, row_bytes,
+                    uint64_t(extent->t->ne[0]), stash_bytes,
+                });
+                geometry.tensors.push_back(extent->t);
+                geometry.byte_offsets.push_back(extent->byte_off);
+                geometry.stash_valid.push_back(extent->stash_valid);
+                geometry.stash_offsets.push_back(extent->stash_off);
+            }
+            plan.wm_cells = watermark;
+            geometry.wm_cells = watermark;
+            output.push_back(std::move(plan));
+            stability.units.push_back(std::move(geometry));
+        }
+        if (output.empty() || !tracker->stable() ||
+            tracker->mutation_serial() != stability.mutation_serial) {
+            return fail(
+                vbr_explicit_size_failure::stability_reread);
+        }
+        return true;
+    } catch (...) {
+        return fail(vbr_explicit_size_failure::internal_error);
+    }
+}
+
+bool llama_kv_cache::vbr_capture_stream_unit(
+        const vbr_capture_unit_plan & plan,
+        vbr_unit_build & sink,
+        vbr_pinned_chunk_ring & ring,
+        vbr_capture_stream_stats & stats) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_stream_unit(plan, sink, ring, stats);
+    }
+    try {
+        for (const auto & shard : plan.shards) {
+            auto * pool = static_cast<vbr_pool *>(shard.pool);
+            auto * extent = static_cast<vbr_extent *>(shard.extent);
+            if (pool == nullptr || extent == nullptr) {
+                return false;
+            }
+            vbr_capture_stream_source source;
+            source.lane = shard.lane;
+            source.size = shard.payload_bytes;
+            source.backend = pool->backend;
+            source.device = ggml_backend_get_device(pool->backend);
+            source.tensor = extent->t;
+            auto chain = std::make_shared<artifact_segment_chain>();
+            vbr_capture_stream_stats one;
+            const auto status = ring.stream(source, *chain, one);
+            if (status != vbr_capture_stream_status::ok) {
+                return false;
+            }
+            vbr_verified_segment segment;
+            segment.unit_index = plan.capture_index;
+            segment.shard_index = shard.shard_index;
+            segment.bytes = chain;
+            segment.streaming_digest = one.streaming_digest;
+            if (sink.accept_verified_segment(segment) !=
+                    vbr_capture_stream_status::ok) {
+                return false;
+            }
+            stats.bytes += one.bytes;
+            stats.chunks += one.chunks;
+            stats.backpressure_waits += one.backpressure_waits;
+            stats.event_completions += one.event_completions;
+            stats.synchronous_fallbacks += one.synchronous_fallbacks;
+            stats.max_segment_size =
+                std::max(stats.max_segment_size, one.max_segment_size);
+
+            if (shard.stash_bytes != 0) {
+                ggml_init_params params = {
+                    2*ggml_tensor_overhead(), nullptr, true,
+                };
+                ggml_context_ptr context { ggml_init(params) };
+                if (!context) {
+                    return false;
+                }
+                ggml_tensor * alias = ggml_new_tensor_1d(
+                    context.get(), GGML_TYPE_I8,
+                    int64_t(shard.stash_bytes));
+                // The f16 sink stash is a raw VMM slab (no ggml buffer wrapper since the
+                // recoverable-stash rework). Borrow the extent's pool buffer for the CUDA
+                // same-device buft assert; the D2H copy reads alias->data directly.
+                alias->buffer = extent->t->buffer;
+                alias->data = static_cast<char *>(
+                    pool->be->vmm_pool_base(pool->stash_vmm)) +
+                    extent->stash_off;
+                vbr_capture_stream_source stash_source;
+                stash_source.lane = shard.lane;
+                stash_source.size = shard.stash_bytes;
+                stash_source.backend = pool->backend;
+                stash_source.device =
+                    ggml_backend_get_device(pool->backend);
+                stash_source.tensor = alias;
+                auto stash_chain =
+                    std::make_shared<artifact_segment_chain>();
+                vbr_capture_stream_stats stash_stats;
+                const auto stash_status =
+                    ring.stream(stash_source, *stash_chain, stash_stats);
+                if (stash_status != vbr_capture_stream_status::ok) {
+                    return false;
+                }
+                vbr_verified_segment stash_segment;
+                stash_segment.unit_index = plan.capture_index;
+                stash_segment.shard_index = shard.shard_index;
+                stash_segment.clean_stash = true;
+                stash_segment.bytes = stash_chain;
+                stash_segment.streaming_digest =
+                    stash_stats.streaming_digest;
+                if (sink.accept_verified_segment(stash_segment) !=
+                        vbr_capture_stream_status::ok) {
+                    return false;
+                }
+                stats.bytes += stash_stats.bytes;
+                stats.chunks += stash_stats.chunks;
+                stats.backpressure_waits +=
+                    stash_stats.backpressure_waits;
+                stats.event_completions +=
+                    stash_stats.event_completions;
+                stats.synchronous_fallbacks +=
+                    stash_stats.synchronous_fallbacks;
+                stats.max_segment_size = std::max(
+                    stats.max_segment_size,
+                    stash_stats.max_segment_size);
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_capture_stability_matches(
+        const vbr_capture_stability_token & token) const noexcept {
+    if (other != nullptr) {
+        return other->vbr_capture_stability_matches(token);
+    }
+    const auto * tracker = vbr_generation_tracker_get();
+    vbr_capture_stability_token policy;
+    if (tracker == nullptr || !vbr_capture_policy_snapshot(policy) ||
+        policy.lineage_uuid != token.lineage_uuid ||
+        policy.instance_id != token.instance_id ||
+        policy.controller_generation != token.controller_generation ||
+        policy.mutation_serial != token.mutation_serial ||
+        policy.degrade_order_digest != token.degrade_order_digest ||
+        policy.policy_digest != token.policy_digest ||
+        policy.degrade_cursor != token.degrade_cursor ||
+        policy.floor_type != token.floor_type ||
+        policy.pressure_independent_settings !=
+            token.pressure_independent_settings ||
+        policy.completed_wave != token.completed_wave ||
+        tracker->unit_count() != token.units.size()) {
+        return false;
+    }
+    try {
+        for (const auto & expected : token.units) {
+            if (tracker->unit_generation(expected.logical_unit).publish_seq !=
+                    expected.generation.publish_seq ||
+                !(tracker->unit_generation(expected.logical_unit).repr_gen ==
+                      expected.generation.repr_gen &&
+                  tracker->unit_generation(expected.logical_unit).current_type ==
+                      expected.generation.current_type &&
+                  tracker->unit_generation(expected.logical_unit).last_source_type ==
+                      expected.generation.last_source_type &&
+                  tracker->unit_generation(expected.logical_unit).domain ==
+                      expected.generation.domain &&
+                  tracker->unit_generation(expected.logical_unit).promote_hops ==
+                      expected.generation.promote_hops &&
+                  tracker->unit_generation(expected.logical_unit).last_transition ==
+                      expected.generation.last_transition)) {
+                return false;
+            }
+            const auto & extents = vbr_units_of(
+                expected.logical_unit / 2,
+                (expected.logical_unit & 1u) != 0);
+            if (extents.size() != expected.tensors.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < extents.size(); ++i) {
+                if (extents[i].first->wm_cells != expected.wm_cells ||
+                    extents[i].second->t != expected.tensors[i] ||
+                    extents[i].second->byte_off != expected.byte_offsets[i] ||
+                    extents[i].second->stash_valid != expected.stash_valid[i] ||
+                    extents[i].second->stash_off != expected.stash_offsets[i]) {
+                    return false;
+                }
+            }
+        }
+        return tracker->stable() &&
+               tracker->mutation_serial() == token.mutation_serial;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool llama_kv_cache::vbr_capture_generation_record(
+        uint32_t child_id,
+        checkpoint_child_dependency_mode dependency_mode,
+        llama_seq_id sequence,
+        llama_pos frontier,
+        vbr_checkpoint_generation_controller & output,
+        vbr_artifact_stream_placement * placement,
+        vbr_explicit_generation_failure * failure) const noexcept {
+    output = {};
+    if (placement != nullptr) {
+        *placement = {};
+    }
+    if (failure != nullptr) {
+        *failure = vbr_explicit_generation_failure::none;
+    }
+    try {
+        if (other != nullptr) {
+            return other->vbr_capture_generation_record(
+                child_id, dependency_mode, sequence, frontier, output,
+                placement, failure);
+        }
+        if (dependency_mode ==
+                checkpoint_child_dependency_mode::payload_complete) {
+            const auto * tracker = vbr_generation_tracker_get();
+            if (tracker == nullptr) {
+                if (failure != nullptr) {
+                    *failure =
+                        vbr_explicit_generation_failure::tracker_missing;
+                }
+                return false;
+            }
+            if (!tracker->stable()) {
+                if (failure != nullptr) {
+                    *failure =
+                        vbr_explicit_generation_failure::tracker_unstable;
+                }
+                return false;
+            }
+            // Payload-complete children serialize their bytes directly and
+            // therefore carry a vacuous ownership row. The unit payload
+            // descriptors retain their exact representation generations.
+            output.child_id = child_id;
+            output.dependency_mode = dependency_mode;
+            output.lineage_uuid = tracker->lineage_identity();
+            return tracker->stable() &&
+                   vbr_lineage_uuid_is_set(output.lineage_uuid);
+        }
+        if (dependency_mode !=
+                checkpoint_child_dependency_mode::live_guarded) {
+            if (failure != nullptr) {
+                *failure = vbr_explicit_generation_failure::
+                    invalid_sequence_or_frontier;
+            }
+            return false;
+        }
+        if (!vbr_generation_capture_live_guarded(
+                child_id, sequence, frontier, output, placement, failure)) {
+            return false;
+        }
+        output.dependency_mode = dependency_mode;
+        return true;
+    } catch (...) {
+        output = {};
+        if (failure != nullptr) {
+            *failure =
+                vbr_explicit_generation_failure::internal_error;
+        }
+        return false;
+    }
+}
+// VBR_EXPLICIT_CAPTURE_STABILITY_REGION_END
+
+// Keep the sequence-state writer's SWA visibility predicate in one place.
+bool llama_kv_cache::state_write_includes_cell(
+        const llama_kv_cells & cells,
+        uint32_t cell,
+        llama_seq_id seq_id) const {
+    if (cells.is_empty(cell) || (seq_id != -1 && !cells.seq_has(cell, seq_id))) {
+        return false;
+    }
+    if (seq_id == -1) {
+        return true;
+    }
+    return !llama_hparams::is_masked_swa(
+            n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
+}
+
+bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & binding,
+                                                    vbr_controller_instance_id instance,
+                                                    bool wrap_possible, uint16_t stream,
+                                                    const llama_ubatch & ubatch) {
+    // one (seq -> [min,max+1)) range per touched sequence
+    llama_seq_id seqs[vbr_operation_binding::MAX_TARGETS];
+    llama_pos    lo [vbr_operation_binding::MAX_TARGETS];
+    llama_pos    hi [vbr_operation_binding::MAX_TARGETS];
+    uint8_t      n_seqs = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq = ubatch.seq_id[i][s];
+            uint8_t j = 0;
+            while (j < n_seqs && seqs[j] != seq) {
+                ++j;
+            }
+            if (j == n_seqs) {
+                if (n_seqs == vbr_operation_binding::MAX_TARGETS) {
+                    binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+                    return false;
+                }
+                seqs[n_seqs] = seq;
+                lo[n_seqs]   = ubatch.pos[i];
+                hi[n_seqs]   = ubatch.pos[i] + 1;
+                ++n_seqs;
+            } else {
+                lo[j] = std::min(lo[j], ubatch.pos[i]);
+                hi[j] = std::max(hi[j], ubatch.pos[i] + 1);
+            }
+        }
+    }
+    const uint8_t per_seq = wrap_possible ? 2 : 1;
+    const uint8_t flat    = wrap_possible ? 1 : 0;
+    if (binding.n_targets + n_seqs * per_seq + flat > vbr_operation_binding::MAX_TARGETS) {
+        binding.n_targets = 0;  // P2v2: transactional — complete or nothing
+        return false;
+    }
+    for (uint8_t j = 0; j < n_seqs; ++j) {
+        binding.targets[binding.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::ordinary_decode,
+                instance, stream, seqs[j], lo[j], hi[j]);
+        if (wrap_possible) {
+            // v6-fix F1: unified-SWA slot selection may reuse a masked cell of a DIFFERENT
+            // sequence whose position is unbounded by this batch (find_slot checks only the
+            // old owner's own SWA mask), so the destructive claim is the incoming sequence's
+            // whole range — the SELECTED target still binds the exact seq's damage extent.
+            binding.targets[binding.n_targets++] = vbr_make_target(
+                    vbr_operation_kind::decode, vbr_operation_class::swa_wrap,
+                    instance, stream, seqs[j], 0,
+                    std::numeric_limits<llama_pos>::max());
+        }
+    }
+    if (wrap_possible) {
+        // Wrap overwrites force a prefix purge of the OVERWRITTEN cells' owners
+        // (apply_ubatch's nested seq_rm, the §7.3 composite purge). Those owners are chosen
+        // by slot selection INSIDE apply — unknowable at manifest build (the composite mints
+        // before its children run) — so the purge is DECLARED as one seq-wildcard whole-range
+        // target: still instance-exact, operation-bound, and confined to the generic seq_rm
+        // trim class (v6 P1: wildcards match only where the manifest declared them).
+        binding.targets[binding.n_targets++] = vbr_make_target(
+                vbr_operation_kind::decode, vbr_operation_class::state_api,
+                instance, stream, -1, 0, std::numeric_limits<llama_pos>::max());
+    }
+    return true;
+}
+
+// The innermost open scope's id for cited global/unit publications (empty when none).
+#define vbr_cited_op() \
+    (vbr_current_mutation_ != nullptr && vbr_current_mutation_->active() \
+             ? vbr_current_mutation_->operation_id_ : vbr_operation_id{})
+
+// P1v2 (v6): one spelling of "fail every per-target handle" — shared by the scope, the
+// pending records, and the commit fence. A failed operation leaves NO admissible evidence,
+// including any handle that already reached committed before a later one failed.
+static void vbr_fail_extent_set(
+        vbr_generation_tracker * tracker,
+        std::array<vbr_extent_handle, vbr_operation_binding::MAX_TARGETS> & extents) {
+    if (tracker == nullptr) {
+        return;
+    }
+    for (auto & extent : extents) {
+        if (extent) {
+            tracker->extent_store().fail(extent);
+            extent = {};
+        }
+    }
+}
+
+llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *    cache,
+                                                 vbr_operation_kind  kind,
+                                                 vbr_operation_class operation_class,
+                                                 llama_seq_id        seq_id,
+                                                 llama_pos           p0,
+                                                 llama_pos           p1,
+                                                 bool                provenance_bearing,
+                                                 uint16_t            extent_stream)
+    : vbr_mutation_op(cache,
+                      cache != nullptr && cache->vbr_generation_tracker_mut() != nullptr
+                          ? vbr_mutation_binding(
+                                kind, seq_id, p0, p1, operation_class,
+                                cache->vbr_generation_tracker_mut()->runtime_instance(),
+                                extent_stream)
+                          : vbr_operation_binding{},
+                      provenance_bearing) {}
+
+llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              cache,
+                                                 const vbr_operation_binding & manifest,
+                                                 bool                          provenance_bearing) {
+    if (cache == nullptr || cache->vbr_generation_tracker_mut() == nullptr) {
+        return;  // inert: unarmed caches open no operations (armed-VBR-only scope)
+    }
+    cache_         = cache;
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+
+    kind_         = manifest.kind;
+    extent_owner_ = this;
+    // Review F10/C1: composite participation. A nested scope (library-internal composite,
+    // e.g. apply_ubatch's purge trims) borrows the outer identity fully. An ADOPTED scope
+    // (wrapper-forwarded, e.g. iSWA children under one decode id) shares the id but owns its
+    // tracker-local reservations (v2 finding 3).
+    if (cache_->vbr_current_mutation_ != nullptr) {
+        // v6-fix F3: ANY outer scope determines nested identity. An active outer is joined;
+        // a refused/poisoned/inactive outer makes this nested scope inert under the same
+        // ABSENT identity — it never falls through to mint (A0 one-id, including refusal).
+        joined_       = true;
+        operation_id_ = cache_->vbr_current_mutation_->operation_id_;  // empty when inactive
+        extent_owner_ = cache_->vbr_current_mutation_->extent_owner_;
+    } else if (cache_->vbr_adopted_refused_) {
+        // P2v2 (v6): the composite root's mint was REFUSED — this child fails closed under
+        // the one (absent) identity instead of minting independently (A0 one-id in refusal).
+        adopted_ = true;
+        abort_to_shadow_unavailable();
+    } else if (cache_->vbr_adopted_operation_) {
+        adopted_      = true;
+        operation_id_ = cache_->vbr_adopted_operation_;
+        composite_    = cache_->vbr_adopted_composite_;
+        if (composite_ != nullptr) {
+            // P3v2 (v6): claim the parent-declared participant slot BEFORE any mutation.
+            composite_->claim();
+        }
+        if (!vbr_operation_registry_binding(operation_id_, manifest_)) {
+            abort_to_shadow_unavailable();
+        }
+    } else {
+        owned_op_.emplace(manifest);
+        operation_id_ = owned_op_->id();
+        if (!operation_id_) {
+            // Review F2: registry refusal is FAIL-CLOSED — the shadow must not survive an
+            // untracked mutation. Invalidate before the legacy mutation proceeds, then FALL
+            // THROUGH to scope registration: the inert scope must still be current so event
+            // sites no-op instead of asserting (F2/#8).
+            abort_to_shadow_unavailable();
+        }
+    }
+
+    if (provenance_bearing && !joined_ && operation_id_) {
+        // v3.1 amendment 1: recovery reservation is EAGER — before any mutation (Rev 4 rule
+        // uncompromised). The provenance EXTENTS are lazy: reserved per SELECTED target by
+        // ensure_extent_for() at the first destructive stamp, so a wrap-free SWA decode pays
+        // no extent traffic.
+        const vbr_controller_instance_id owner_instance = tracker->runtime_instance();
+        recovery_index_ = owned_op_
+                ? vbr_recovery_reserve(owned_op_->binding(), owner_instance)
+                : vbr_recovery_reserve(operation_id_, owner_instance);
+        if (recovery_index_ < 0) {
+            abort_to_shadow_unavailable();
+        }
+    }
+    outer_                        = cache_->vbr_current_mutation_;
+    cache_->vbr_current_mutation_ = this;
+}
+
+llama_kv_cache::vbr_mutation_op::~vbr_mutation_op() {
+    if (cache_ == nullptr) {
+        return;
+    }
+    cache_->vbr_current_mutation_ = outer_;
+    if (joined_) {
+        return;  // borrowed identity: the owner resolves extent/recovery/close
+    }
+    if (adopted_) {
+        // P3v2 (v6): an adopted participant that never transferred its token is terminal
+        // here — setup refusal, poison, and exceptions before detach all report FAILED
+        // exactly once. Its evidence fails; the shared root's failed close autorecords this
+        // child's recovery reservation for the quarantine drain.
+        if (composite_ != nullptr && !detached_) {
+            composite_->report_terminal(false);
+        }
+        if (!detached_ && operation_id_) {
+            fail_extents();
+        }
+        return;
+    }
+    if (detached_) {
+        return;  // everything transferred to the pending record
+    }
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+    if (!succeeded_) {
+        fail_extents();
+    } else if (tracker != nullptr) {
+        for (auto & extent : extents_) {
+            if (extent) {
+                tracker->extent_store().commit(extent);
+                extent = {};
+            }
+        }
+    }
+    if (recovery_index_ >= 0 && succeeded_) {
+        vbr_recovery_release_unused(recovery_index_, operation_id_);
+    }
+    if (owned_op_) {
+        owned_op_->close(succeeded_ ? vbr_operation_outcome::committed
+                                    : vbr_operation_outcome::failed);
+    }
+}
+
+vbr_extent_handle llama_kv_cache::vbr_mutation_op::ensure_extent_for(uint8_t target_index) {
+    if (cache_ == nullptr || !active() || joined_ || target_index >= scope_manifest().n_targets) {
+        return {};
+    }
+    if (extents_[target_index]) {
+        return extents_[target_index];
+    }
+    auto * tracker = cache_->vbr_generation_tracker_mut();
+    if (tracker == nullptr) {
+        return {};
+    }
+    // v3-B4 upgraded by P1v2 (v6): the extent copies the SELECTED covering target exactly —
+    // the tracker chose it per stamp by (seq, pre-mutation position), so the damage evidence
+    // is target-exact by construction.
+    const auto & target = scope_manifest().targets[target_index];
+    extents_[target_index] = tracker->extent_store().reserve(
+            vbr_operation_kind_family(kind_, target.operation_class), target.operation_class,
+            target.stream, target.seq_id, target.range.p0, target.range.p1);
+    if (!extents_[target_index]) {
+        abort_to_shadow_unavailable();
+    }
+    return extents_[target_index];
+}
+
+vbr_extent_handle llama_kv_cache::vbr_mutation_op::extent_trampoline(void * ctx, uint8_t target_index) {
+    return static_cast<vbr_mutation_op *>(ctx)->ensure_extent_for(target_index);
+}
+
+void llama_kv_cache::vbr_mutation_op::fail_extents() {
+    vbr_fail_extent_set(cache_ != nullptr ? cache_->vbr_generation_tracker_mut() : nullptr,
+                        extents_);
+}
+
+// The one spelling of the shadow-unavailable transition (altitude review): fail whatever
+// evidence this scope reserved, invalidate the shadow BEFORE the legacy mutation proceeds,
+// and leave the scope inert-but-open (its close stays clean). The recovery reservation is
+// deliberately KEPT (v6 P1): the operation closes FAILED, that close autorecords the slot,
+// and the boundary quarantine drain performs the sanctioned invalidation — the slot must
+// survive to that drain.
+void llama_kv_cache::vbr_mutation_op::abort_to_shadow_unavailable() {
+    auto * tracker = cache_ != nullptr ? cache_->vbr_generation_tracker_mut() : nullptr;
+    if (tracker == nullptr) {
+        return;
+    }
+    poisoned_ = true;
+    fail_extents();
+    (void) tracker->global_invalidate_and_reset_extents(
+            vbr_mutation_registrant::authenticated_recovery, vbr_operation_class::controller);
+    // P4v2 (v6): ALWAYS latch — even when the invalidation above succeeded. The legacy
+    // mutation that follows this scope is UNTRACKED; no capture may slip in between it and
+    // the next sanctioned transition, which try_clear now proves happened strictly later.
+    tracker->set_shadow_unavailable();
+    // The scope stays OPEN and inert (operation_id_ empty => events refuse politely); event
+    // sites see a current scope and no-op instead of asserting (F2/#8).
+    operation_id_ = {};
+    owned_op_.reset();
+}
+
+// Ownership transfer for deferred families (review F3 lifetime + altitude review): everything
+// the destructor would resolve moves to the pending record instead. Joined scopes own nothing.
+std::optional<llama_kv_cache::vbr_pending_decode_op> llama_kv_cache::vbr_mutation_op::detach_deferred() {
+    if (joined_) {
+        return std::nullopt;
+    }
+    if (!active() || poisoned_) {
+        // P1v2 (v6): a poisoned/refused decode op never transfers — the destructor reports
+        // its terminal FAILURE (aggregate report for composite children, failed close for
+        // owned scopes), and the failed close autorecords its recovery reservation.
+        return std::nullopt;
+    }
+    vbr_pending_decode_op pending;
+    pending.extents        = extents_;
+    extents_               = {};
+    pending.recovery_index = recovery_index_;
+    recovery_index_        = -1;
+    if (owned_op_) {
+        pending.operation_id = owned_op_->release();
+        pending.owns_close   = true;
+    } else {
+        // P3v2 (v6): detach transfers the still-OPEN participant token to the pending owner
+        // — never a terminal report; the sealed aggregate closes the root when every
+        // declared slot has terminated.
+        pending.operation_id = operation_id_;
+        pending.owns_close   = false;
+        pending.composite    = composite_;
+    }
+    detached_ = true;
+    if (!pending.operation_id) {
+        return std::nullopt;
+    }
+    return pending;
+}
+
+void llama_kv_cache::vbr_adopt_operation(vbr_operation_id operation_id) {
+    if (other) {
+        other->vbr_adopt_operation(operation_id);
+        return;
+    }
+    vbr_adopted_operation_ = operation_id;
+}
+
+void llama_kv_cache::vbr_adopt_composite(std::shared_ptr<vbr_composite_outcome> composite) {
+    if (other) {
+        other->vbr_adopt_composite(std::move(composite));
+        return;
+    }
+    vbr_adopted_composite_ = std::move(composite);
+}
+
+void llama_kv_cache::vbr_adopt_refused() {
+    if (other) {
+        other->vbr_adopt_refused();
+        return;
+    }
+    vbr_adopted_refused_ = true;
+}
+
+void llama_kv_cache::vbr_release_adopted() {
+    if (other) {
+        other->vbr_release_adopted();
+        return;
+    }
+    vbr_adopted_operation_ = {};
+    vbr_adopted_composite_.reset();
+    vbr_adopted_refused_   = false;
+}
+
+// P3v2 (v6): the fixed-participant aggregate. Defined here so the registry close stays in
+// the kv-cache trust domain; the iSWA wrapper only constructs/seals it.
+void llama_kv_cache::vbr_composite_outcome::claim() {
+    ++claimed;
+}
+
+void llama_kv_cache::vbr_composite_outcome::report_terminal(bool ok) {
+    failed = failed || !ok;
+    ++terminal;
+    try_close();
+}
+
+void llama_kv_cache::vbr_composite_outcome::seal(bool wrapper_ok) {
+    failed = failed || !wrapper_ok;
+    // Declared participants that never claimed their slot (an exception before a child's
+    // scope opened, or an armed child that never applied) are terminal failures by
+    // construction — every declared slot reports exactly once.
+    if (claimed < declared) {
+        failed    = true;
+        terminal += declared - claimed;
+        claimed   = declared;
+    }
+    sealed = true;
+    try_close();
+}
+
+void llama_kv_cache::vbr_composite_outcome::try_close() {
+    // Reports may accumulate before seal but can never close; the closed flag makes a late
+    // (over-declared) report inert instead of double-closing.
+    if (!sealed || closed || terminal < declared) {
+        return;
+    }
+    closed = true;
+    if (operation_id) {
+        vbr_operation_registry_close(operation_id,
+                failed ? vbr_operation_outcome::failed : vbr_operation_outcome::committed);
+    }
+}
+
+void llama_kv_cache::vbr_decode_ops_finish(bool ok) {
+    if (other) {
+        other->vbr_decode_ops_finish(ok);
+        return;
+    }
+    // C1 (scoped per v3 review B1): ok=false conservatively fails ONLY this decode's
+    // operations — awaiting records are PRIOR submitted decodes whose graphs already ran;
+    // only the scheduler fence may decide them. ok=true moves every per-target extent
+    // prepared -> submitted; operations + recovery reservations stay OPEN until the
+    // synchronize fence delivers the terminal result (Rev 5.1). A submit failure (obsolete
+    // post-reset handle) terminal-fails that owner now.
+    auto * tracker = vbr_generation_tracker_mut();
+    for (auto & pending : vbr_pending_decode_ops_) {
+        bool submitted = ok;
+        if (ok && tracker != nullptr) {
+            for (auto & extent : pending.extents) {
+                if (extent && !tracker->extent_store().submit(extent)) {
+                    ++vbr_pending_commit_failures_;
+                    submitted = false;
+                    break;
+                }
+            }
+        }
+        if (submitted) {
+            vbr_awaiting_commit_.push_back(std::move(pending));
+            continue;
+        }
+        vbr_fail_extent_set(tracker, pending.extents);
+        if (pending.composite) {
+            // P3v2 (v6): terminal failure feeds the sealed aggregate.
+            pending.composite->report_terminal(false);
+        } else if (pending.owns_close) {
+            vbr_operation_registry_close(pending.operation_id, vbr_operation_outcome::failed);
+        }
+    }
+    vbr_pending_decode_ops_.clear();
+}
+
+vbr_generation_event llama_kv_cache::vbr_generation_begin(
+        vbr_mutation_registrant registrant,
+        vbr_operation_class operation_class,
+        uint32_t stream,
+        vbr_generation_stamp_kind stamp_kind,
+        bool destructive,
+        bool imported) {
+    auto * tracker = vbr_generation_tracker_mut();
+    if (tracker == nullptr) {
+        return {};
+    }
+    // A2: events cite the innermost open mutation scope (§7.2 explicit binding). A mutation
+    // reaching here without a scope is a wiring bug — refuse the event loudly rather than mint
+    // an uncited one. A scope that opened shadow-unavailable (registry refusal) yields inert
+    // events, matching the legacy-proceeds contract — and once a poison latched the shadow
+    // mid-decode, later events in the same decode are inert the same way.
+    GGML_ASSERT(vbr_current_mutation_ != nullptr && "mutation without an operation scope");
+    if (!vbr_current_mutation_->active() || tracker->shadow_unavailable()) {
+        return {};  // inert scope / latched shadow: legacy proceeds untracked
+    }
+    // The per-target extent supplier attaches only to provenance-relevant
+    // (destructive/imported) events: apply_ubatch mints an append event and a destructive
+    // reuse event under ONE scope, and only the latter's stamps reserve/cite the selected
+    // target's extent (§5.5 row 2). Joined scopes route to their root's extents.
+    const bool provenance = destructive || imported;
+    auto event = tracker->begin_event(
+            registrant, operation_class, stream, stamp_kind,
+            vbr_current_mutation_->operation_id_,
+            provenance ? &vbr_mutation_op::extent_trampoline : nullptr,
+            provenance ? static_cast<void *>(vbr_current_mutation_->extent_owner_) : nullptr,
+            destructive, imported);
+    GGML_ASSERT(event);
+    return event;
+}
+
+void llama_kv_cache::vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                               llama_seq_id membership_seq, llama_pos pre_mutation_pos) {
+    vbr_stamp(op, event, cell, &membership_seq, 1, pre_mutation_pos);
+}
+
+void llama_kv_cache::vbr_stamp(vbr_mutation_op & op, vbr_generation_event & event, uint32_t cell,
+                               const llama_seq_id * seqs, int32_t n_seqs,
+                               llama_pos pre_mutation_pos) {
+    if (event &&
+        !vbr_generation_tracker_mut()->stamp_cell(event, cell, seqs, n_seqs, pre_mutation_pos)) {
+        op.poison();
+    }
+}
+
+void llama_kv_cache::vbr_generation_global(
+        vbr_mutation_registrant registrant, vbr_operation_class operation_class) {
+    auto * tracker = vbr_generation_tracker_mut();
+    if (tracker == nullptr) {
+        return;
+    }
+    // #11 (v2 verdict): a global invalidation is ONE operation — pending decode owners resolve
+    // (conservatively failed) first, then the transition also obsoletes every stored extent
+    // reference and resets the slab, so old cells can never pin slab capacity into the next
+    // lineage epoch.
+    vbr_decode_ops_finish(false);
+    const vbr_operation_id citing =
+            vbr_current_mutation_ != nullptr && vbr_current_mutation_->active()
+                    ? vbr_current_mutation_->operation_id_ : vbr_operation_id{};
+    GGML_ASSERT(tracker->global_invalidate_and_reset_extents(registrant, operation_class, citing));
+}
+
+bool llama_kv_cache::vbr_retier_defer(const char * decision) {
+    if (vbr_retier_freeze_depth_ == 0) {
+        return false;
+    }
+    vbr_retier_deferred_decisions_++;
+    vbr_retier_reconcile_pending_ = true;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=defer controller=%s decision=%s depth=%u deferred_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            decision, vbr_retier_freeze_depth_,
+            (unsigned long long) vbr_retier_deferred_decisions_);
+    return true;
+}
+
+bool llama_kv_cache::vbr_retier_take_reconcile(const char * boundary) {
+    if (vbr_retier_freeze_depth_ > 0 || !vbr_retier_reconcile_pending_) {
+        return false;
+    }
+    // Do not replay a queued promote/degrade choice: only force the ordinary controller off
+    // its stable fast path, where it recomputes watermark, occupancy and budgets from scratch.
+    vbr_retier_reconcile_pending_ = false;
+    vbr_retier_reconciles_++;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=reconcile controller=%s boundary=%s reconciles_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            boundary, (unsigned long long) vbr_retier_reconciles_);
+    return true;
 }
 
 // The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS — unlike
@@ -3421,6 +6883,13 @@ char * llama_kv_cache::vbr_stash_ensure(vbr_pool & p) {
 // start (prefill-direct). Fires lazily from prepare() at the first decode after the cache
 // empties, whatever emptied it (clear, seq_rm, server slot recycle).
 void llama_kv_cache::vbr_full_reset() {
+    // #9: the scope opens BEFORE the first observable mutation (type flips/unmaps below).
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
+            vbr_operation_class::controller, -1, 0, std::numeric_limits<llama_pos>::max());
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    if (vbr_retier_defer("full_reset")) {
+        return;
+    }
     // in-flight safety before ripping pages: settle the side streams and the devices once
     // (session-boundary event — the sync cost is irrelevant)
     vbr_flush_deferred_unmaps();
@@ -3451,7 +6920,7 @@ void llama_kv_cache::vbr_full_reset() {
                 }
                 e.stash_valid  = 0;
                 e.promote_hops = 0; // fresh hop budget — the reset epoch starts clean
-                const size_t slot = vbr_slot_bytes(e.t);
+                const size_t slot = vbr_slot_span(e.t, pool.gran);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
         }
@@ -3459,9 +6928,36 @@ void llama_kv_cache::vbr_full_reset() {
         mapped += pool.be->vmm_pool_mapped(pool.vmm);
     }
     vbr_degrade_cursor_    = 0;
+    vbr_hard_seal_deferred_.clear();
     vbr_budget_warned_     = false;
     vbr_stash_dirty_       = false;
     vbr_quiet_boundaries_  = 0;
+    // Deliberately bumps even though the cursor is now 0: this is the low-LCP/empty-cache ABA
+    // that a recurrent-only checkpoint must detect.
+    vbr_attention_content_changed();
+    vbr_generation_global(vbr_mutation_registrant::full_reset, vbr_operation_class::controller);
+    if (vbr_ownership_) {
+        vbr_ownership_->clear_all();
+    }
+    if (auto * tracker = vbr_generation_tracker_mut()) {
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (uint32_t side = 0; side < 2; ++side) {
+                const ggml_tensor * tensor = side != 0 ? layers[ikv].v : layers[ikv].k;
+                const uint32_t unit = static_cast<uint32_t>(ikv * 2 + side);
+                const auto before = tracker->unit_generation(unit);
+                const int32_t target = tensor != nullptr ? static_cast<int32_t>(tensor->type) : -1;
+                GGML_ASSERT(tracker->publish_unit(
+                        unit,
+                        before.current_type,
+                        target,
+                        vbr_repr_domain::full,
+                        0,
+                        vbr_repr_transition::full_reset,
+                        vbr_mutation_registrant::full_reset,
+                        vbr_cited_op()));
+            }
+        }
+    }
     LLAMA_LOG_INFO("%s: VBR full reset: cache empty — %zu tensors back at their entry tier, pools released "
             "(%.2f MiB mapped)\n", __func__, undone, mapped/1024.0/1024.0);
 }
@@ -3492,7 +6988,7 @@ void llama_kv_cache::vbr_shrink_watermark() {
                     continue;
                 }
                 const size_t keep = ggml_row_size(t->type, t->ne[0]) * (size_t) wm_now;
-                const size_t slot = vbr_slot_bytes(t);
+                const size_t slot = vbr_slot_span(t, pool.gran);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
             }
         }
@@ -3510,6 +7006,12 @@ void llama_kv_cache::vbr_shrink_watermark() {
 // per call; the in-place transcode runs descending tiles (see vbr-transcode.cu) after the grown
 // extent is mapped up front.
 bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
+            vbr_operation_class::controller, -1, -1, -1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    if (vbr_retier_defer("promote")) {
+        return false;
+    }
     while (vbr_degrade_cursor_ > 0) {
         const auto & st = vbr_degrade_order_[vbr_degrade_cursor_ - 1];
         const auto it = map_layer_ids.find(st.il);
@@ -3620,8 +7122,8 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 // would lock in the DEGRADED recon as the reference
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
-                if (vbr_stash_rows_ > 0 && e.stash_valid > 0 && pp->stash_buf != nullptr) {
-                    stash_ptr  = (char *) ggml_backend_buffer_get_base(pp->stash_buf) + e.stash_off;
+                if (vbr_stash_rows_ > 0 && e.stash_valid > 0 && pp->stash_vmm != nullptr) {
+                    stash_ptr  = (char *) pp->be->vmm_pool_base(pp->stash_vmm) + e.stash_off;
                     stash_rows = e.stash_valid;
                 }
                 const ggml_vbr_transcode_params tp = {
@@ -3640,8 +7142,24 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 e.promote_hops++; // only live-row re-encodes count — a 0-cell flip is free re-typing
             }
         }
+        const ggml_type type_A = t->type;
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
+        vbr_representation_changed();
+        if (auto * tracker = vbr_generation_tracker_mut()) {
+            const uint8_t promote_hops = units.empty() ? 0 : units.front().second->promote_hops;
+            GGML_ASSERT(tracker->publish_unit(
+                    static_cast<uint32_t>(ikv * 2 + (st.is_v != 0)),
+                    static_cast<int32_t>(type_A),
+                    static_cast<int32_t>(type_B),
+                    type_B == GGML_TYPE_F16 || type_B == GGML_TYPE_TURBO8_0
+                            ? vbr_repr_domain::full
+                            : vbr_repr_domain::tapped,
+                    promote_hops,
+                    vbr_repr_transition::promote,
+                    vbr_mutation_registrant::promote_next,
+                    vbr_cited_op()));
+        }
         vbr_degrade_cursor_--;
 
         for (const auto & [pp, ep] : units) {
@@ -3655,12 +7173,48 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
     return false;
 }
 
-bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
-    while (vbr_degrade_cursor_ < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_)) {
-        const auto & st = vbr_degrade_order_[vbr_degrade_cursor_++];
+llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
+            vbr_operation_class::controller, -1, -1, -1);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
+    if (vbr_retier_defer("degrade")) {
+        // The caller's freeze-pressure guard normally prevents entry. Treat a direct frozen
+        // call as a no-step terminal for this pass; the reconcile edge recomputes later.
+        return vbr_degrade_result::exhausted;
+    }
+    const size_t cursor_entry = vbr_degrade_cursor_;
+    bool saw_hard_lease_block = false;
+    vbr_hard_seal_consult_session seal_session;
+    GGML_ASSERT(!vbr_hard_seal_guard_ ||
+        vbr_hard_seal_attempted_.size() == vbr_degrade_order_.size());
+    bool attempted_ready = !vbr_hard_seal_deferred_.empty();
+    if (attempted_ready) {
+        std::fill(vbr_hard_seal_attempted_.begin(),
+                  vbr_hard_seal_attempted_.end(), 0);
+    }
+    while (true) {
+        size_t order_ordinal = 0;
+        bool from_deferred = false;
+        if (!vbr_hard_seal_next_order_step(
+                vbr_degrade_cursor_,
+                std::min(vbr_degrade_order_.size(), vbr_degrade_limit_),
+                vbr_hard_seal_deferred_, vbr_hard_seal_attempted_,
+                order_ordinal, from_deferred)) {
+            break;
+        }
+        const auto & st = vbr_degrade_order_[order_ordinal];
+
+        const auto retire_deferred = [&]() {
+            if (!from_deferred) {
+                return;
+            }
+            vbr_hard_seal_retire_step(
+                vbr_hard_seal_deferred_, order_ordinal);
+        };
 
         const auto it = map_layer_ids.find(st.il);
         if (it == map_layer_ids.end()) {
+            retire_deferred();
             continue;
         }
         const int32_t ikv = it->second;
@@ -3669,9 +7223,11 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // shard) under -sm tensor. The tier flip is a property of the UNIT — all pools move together.
         const auto & units = vbr_units_of(ikv, st.is_v != 0);
         if (t == nullptr || units.empty()) {
+            retire_deferred();
             continue;
         }
         if (!vbr_unit_movable(t->type, st.is_v != 0)) {
+            retire_deferred();
             continue; // PINNED unit (explicit non-vbr side): the ladder never touches it
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -3681,14 +7237,79 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             const size_t rA = ggml_row_size(t->type, t->ne[0]);
             const size_t rB = ggml_row_size(type_B,  t->ne[0]);
             if (t->type == type_B || rB >= rA) {
+                retire_deferred();
                 continue; // not a real degrade from the current tier (e.g. F16 band on a t8 static start)
+            }
+        }
+
+        if (vbr_hard_seal_guard_) {
+            if (vbr_hard_seal_step_blocked(order_ordinal, seal_session)) {
+                saw_hard_lease_block = true;
+                vbr_hard_seal_evidence_record(order_ordinal);
+                if (!from_deferred) {
+                    if (!attempted_ready) {
+                        std::fill(vbr_hard_seal_attempted_.begin(),
+                                  vbr_hard_seal_attempted_.end(), 0);
+                        attempted_ready = true;
+                    }
+                    vbr_hard_seal_defer_step(
+                        vbr_hard_seal_deferred_, order_ordinal,
+                        &vbr_hard_seal_attempted_);
+                }
+                LLAMA_LOG_INFO("%s: hard lease sealed VBR order step %zu (L%d %c); trying the next unit\n",
+                        __func__, order_ordinal, (int) st.il, st.is_v ? 'V' : 'K');
+                continue;
+            }
+        }
+
+        if (from_deferred) {
+            LLAMA_LOG_INFO("%s: hard-lease release reopened VBR order step %zu (L%d %c)\n",
+                    __func__, order_ordinal, (int) st.il, st.is_v ? 'V' : 'K');
+        }
+
+        // Determine and land every stash page this unit can touch before starting any side stream,
+        // capture, transcode, metadata flip, or deferred unmap. Tensor-split units reserve on all
+        // devices first; a failure may retain initialized VMM pages but cannot leave mixed tiers.
+        struct pending_stash {
+            vbr_pool *   pool;
+            vbr_extent * extent;
+            uint32_t     rows;
+            bool         capture;
+        };
+        std::vector<pending_stash> pending_stashes;
+        pending_stashes.reserve(units.size());
+        if (vbr_stash_rows_ > 0) {
+            for (auto & [pp, ep] : units) {
+                const int64_t n_cells = pp->wm_cells;
+                if (n_cells <= 0) {
+                    continue;
+                }
+                const bool capture = ep->stash_valid == 0 &&
+                        ggml_is_turbo_kv_type(ep->t->type) && ep->t->type != GGML_TYPE_TURBO8_0;
+                const uint32_t rows = capture
+                        ? (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells)
+                        : ep->stash_valid;
+                if (rows > 0) {
+                    pending_stashes.push_back({ pp, ep, rows, capture });
+                }
+            }
+            for (const auto & pending : pending_stashes) {
+                const std::vector<vbr_stash_request> request = {{ pending.extent, pending.rows }};
+                if (!vbr_stash_reserve(*pending.pool, request)) {
+                    // Restore the exact call-entry cursor so rejection is observationally atomic:
+                    // even skipped no-op order entries are reconsidered with the retried step.
+                    vbr_degrade_cursor_ = cursor_entry;
+                    vbr_reserve_failed_ = true;
+                    LLAMA_LOG_ERROR("%s: VBR sink-stash reserve failed on device %d before tier "
+                            "mutation; leaving %s at %s\n", __func__, pending.pool->device,
+                            pending.extent->t->name, ggml_type_name(pending.extent->t->type));
+                    return vbr_degrade_result::reserve_failed;
+                }
             }
         }
 
         for (auto & [pp, ep] : units) {
             vbr_extent  & e   = *ep;
-            const int64_t ne0 = e.t->ne[0];
-            const size_t rA = ggml_row_size(e.t->type, ne0);
 
             // every mapped row must become a VALID tier-B row — reads pad n_kv past the used cells, and
             // stale tier-A bytes reinterpreted as B can carry NaN f16 block scales that poison V sums
@@ -3702,12 +7323,15 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             //               scrub stops here — pages past it are zero-filled fresh on map
             const vbr_span sp = vbr_span_of(e.t, type_B, n_cells, wm_next, pp->gran);
             const size_t slot      = sp.slot;
-            const size_t keep      = sp.keep;
             const size_t keep_live = sp.keep_live;
-            const size_t mapped_hi = std::min(slot, (size_t) GGML_PAD(rA * (size_t) n_cells, pp->gran));
-            const size_t scrub_end = std::min(mapped_hi, (size_t) GGML_PAD(keep_live, pp->gran));
+            vbr_scrub_span scrub = {};
 
             if (n_cells > 0) {
+                // Scrub math is only meaningful (and its >=keep invariant only
+                // holds) for a populated extent; a 0-cell degrade is a free
+                // metadata-only re-typing and must never reach the helper.
+                GGML_ASSERT(vbr_scrub_span_of(
+                    e.t, e.t->type, n_cells, sp, pp->gran, scrub));
                 if (pp->backend == nullptr) {
                     pp->backend = pp->be->backend_init(pp->device); // the dedicated per-device side stream
                     GGML_ASSERT(pp->backend != nullptr);
@@ -3719,25 +7343,27 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                     pp->be->sync_device(pp->device);
                 }
 
-                // f16 sink-stash: capture rows [0, stash_rows) from the tier-A recon at the FIRST
-                // degrade (≈pristine when A is high), then every hop re-encodes those rows from the
-                // stash — the sink is the only region both permanently hot and permanently old
+                // f16 sink-stash: capture rows [0, stash_rows) from the first tapped-domain tier-A
+                // recon, then every later hop re-encodes those rows from the stash — the sink is
+                // the only region both permanently hot and permanently old
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
                 if (vbr_stash_rows_ > 0) {
-                    char * sbase = vbr_stash_ensure(*pp);
-                    // the stash is injected into TAPPED-tier encodes with the tap suppressed, so it
-                    // must hold tapped-domain rows (V - mu_V). t8 and f16 store FULL-domain — defer
-                    // capture until the source is a tapped tier (t4 or lower); the first tapped hop's
-                    // recon is the earliest domain-correct snapshot.
-                    if (e.stash_valid == 0 && ggml_is_turbo_kv_type(e.t->type) &&
-                        e.t->type != GGML_TYPE_TURBO8_0) {
-                        e.stash_valid = (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells);
-                        pp->be->kv_stash_capture(pp->backend, e.t, sbase + e.stash_off,
-                                                           e.stash_valid, st.is_v != 0);
+                    const auto pending = std::find_if(pending_stashes.begin(), pending_stashes.end(),
+                            [&](const pending_stash & s) { return s.pool == pp && s.extent == &e; });
+                    if (pending != pending_stashes.end()) {
+                        GGML_ASSERT(pp->stash_vmm != nullptr);
+                        char * sbase = (char *) pp->be->vmm_pool_base(pp->stash_vmm);
+                        // Only tapped tiers provide the domain the suppressed encode tap consumes.
+                        // f16/t8 hops neither allocate nor capture an unusable full-domain stash.
+                        if (pending->capture) {
+                            pp->be->kv_stash_capture(pp->backend, e.t, sbase + e.stash_off,
+                                                    pending->rows, st.is_v != 0);
+                            e.stash_valid = pending->rows;
+                        }
+                        stash_ptr  = sbase + e.stash_off;
+                        stash_rows = e.stash_valid;
                     }
-                    stash_ptr  = sbase + e.stash_off;
-                    stash_rows = e.stash_valid;
                 }
 
                 // S5: transcode + scrub run ASYNC on the side stream; the fence armed at end-of-wave
@@ -3755,7 +7381,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
                     /*.is_v        =*/ st.is_v != 0,
                     /*.stash_f16   =*/ stash_ptr,
                     /*.stash_rows  =*/ stash_rows,
-                    /*.scrub_bytes =*/ scrub_end - keep,
+                    /*.scrub_bytes =*/ scrub.scrub_end - scrub.keep,
                 };
                 pp->be->kv_transcode(pp->backend, &tp);
                 pp->wave_pending = true;
@@ -3774,11 +7400,37 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // flip metadata now (host state, consumed at graph BUILD time; shards flip in lockstep);
         // data ptr = fixed VA. The fence guarantees the built graph never RUNS before the bytes
         // are tier B.
+        const ggml_type type_A = t->type;
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
         vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
-        return true;
+        // Demand sheds route through this same mutation, so every shed transcode is covered here
+        // without a second generation publication in the caller.
+        vbr_representation_changed();
+        if (auto * tracker = vbr_generation_tracker_mut()) {
+            const uint8_t promote_hops = units.empty() ? 0 : units.front().second->promote_hops;
+            const auto transition = type_A == GGML_TYPE_F16 && type_B == GGML_TYPE_TURBO8_0
+                    ? vbr_repr_transition::degrade_f16_to_t8_admitted
+                    : vbr_repr_transition::degrade_other;
+            GGML_ASSERT(tracker->publish_unit(
+                    static_cast<uint32_t>(ikv * 2 + (st.is_v != 0)),
+                    static_cast<int32_t>(type_A),
+                    static_cast<int32_t>(type_B),
+                    type_B == GGML_TYPE_F16 || type_B == GGML_TYPE_TURBO8_0
+                            ? vbr_repr_domain::full
+                            : vbr_repr_domain::tapped,
+                    promote_hops,
+                    transition,
+                    vbr_mutation_registrant::degrade_next,
+                    vbr_cited_op()));
+        }
+        retire_deferred();
+        return vbr_degrade_result::applied;
     }
-    return false;
+    if (saw_hard_lease_block) {
+        vbr_hard_seal_blocked_ = true;
+        return vbr_degrade_result::hard_lease_blocked;
+    }
+    return vbr_degrade_result::exhausted;
 }
 
 // Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED —
@@ -4047,6 +7699,14 @@ double llama_kv_cache::kv_bpv() const {
 
 llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
     llama_memory_vbr_state_data st = {};
+    st.representation_epoch = vbr_representation_epoch();
+    st.checkpoint_epoch     = vbr_checkpoint_epoch();
+    st.retier_freeze_depth       = other ? other->vbr_retier_freeze_depth_       : vbr_retier_freeze_depth_;
+    st.retier_env_freeze         = other ? other->vbr_freeze_                    : vbr_freeze_;
+    st.retier_freeze_enters      = other ? other->vbr_retier_freeze_enters_      : vbr_retier_freeze_enters_;
+    st.retier_freeze_exits       = other ? other->vbr_retier_freeze_exits_       : vbr_retier_freeze_exits_;
+    st.retier_deferred_decisions = other ? other->vbr_retier_deferred_decisions_ : vbr_retier_deferred_decisions_;
+    st.retier_reconciles         = other ? other->vbr_retier_reconciles_         : vbr_retier_reconciles_;
 
     // full-reset feasibility: used cells the asking seq does not exclusively own. Cells above
     // used_max_p1 are empty by definition, so the scan is bounded by live occupancy.
@@ -4140,98 +7800,198 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     return st;
 }
 
-// co-tenancy: the marker-published donation offer. Walks the REMAINING consent window
-// [cursor, vbr_demand_limit()) — the f16->t8 band, or down to a TYPED floor — with the
-// same skip rules as vbr_degrade_next and sums,
-// per pool, the page-padded bytes the full band would free at the current watermark — then
-// subtracts the projected GROWTH of the #88 f16 dequant scratch those sheds would cost.
-// The scratch projection uses the max-row shape of vbr_scratch_reserve (the widest
-// dequant-active row per side), NOT a per-(layer,side) sum — summing would overstate the
-// cost by ~n_layers and zero every offer. The budget is deliberately not an input: an offer
-// says what shedding COULD free, the grant math decides what it does free.
-size_t llama_kv_cache::vbr_shed_available(int device) const {
-    if (!vbr_vmm_active() || vbr_demand_limit() == 0) {
-        return 0;
+bool llama_kv_cache::vbr_operation_armed() const {
+    if (other) {
+        return other->vbr_operation_armed();
     }
-    uint32_t wm_max = 0;
-    for (const auto & p : vbr_pools_) {
-        if (p.vmm != nullptr) {
-            wm_max = std::max(wm_max, p.wm_cells);
-        }
-    }
-    const uint32_t wm_key = GGML_PAD(wm_max, 256);
-    if (shed_avail_epoch_ != vbr_tier_epoch_ || shed_avail_wm_ != wm_key) {
-        shed_avail_pool_.assign(vbr_pools_.size(), 0);
+    return vbr_vmm_active() && vbr_budget_bytes_ > 0;
+}
 
-        std::vector<ggml_type> sim;
-        vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
-                     nullptr, nullptr, nullptr);
-        std::vector<int64_t> freed(vbr_pools_.size(), 0);
-        const size_t demand_limit = vbr_demand_limit();
-        for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
-            size_t slot; const ggml_tensor * t; ggml_type type_B;
-            if (!vbr_sim_step(sim, i, slot, t, type_B)) {
-                continue;
-            }
-            const auto & stp = vbr_degrade_order_[i];
-            const size_t ikv = slot / 2;
-            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-                const auto & p = vbr_pools_[pi];
-                if (p.vmm == nullptr) {
-                    continue;
-                }
-                const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
-                if (e.t == nullptr) {
-                    continue;
-                }
-                freed[pi] += (int64_t) GGML_PAD(ggml_row_size(sim[slot], e.t->ne[0]) * p.wm_cells, p.gran)
-                           - (int64_t) GGML_PAD(ggml_row_size(type_B,    e.t->ne[0]) * p.wm_cells, p.gran);
-            }
-            sim[slot] = type_B;
-        }
-        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-            const auto & p = vbr_pools_[pi];
-            if (p.vmm == nullptr) {
-                continue;
-            }
-            // scratch growth: widest dequant-active f16 row per side, before vs after the sim
-            size_t cur_k = 0, cur_v = 0, end_k = 0, end_v = 0;
-            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                const ggml_tensor * tk = p.k[ikv].t;
-                const ggml_tensor * tv = p.v[ikv].t;
-                bool need_k = false, need_v = false;
-                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
-                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
-                if (need_k && tk) { cur_k = std::max(cur_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
-                if (need_v && tv) { cur_v = std::max(cur_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
-                const ggml_type sk = sim[ikv*2 + 0] != GGML_TYPE_COUNT ? sim[ikv*2 + 0] : (tk ? tk->type : GGML_TYPE_F16);
-                const ggml_type sv = sim[ikv*2 + 1] != GGML_TYPE_COUNT ? sim[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
-                ggml_vbr_kv_dequant_sides(sk, sv, &need_k, &need_v);
-                if (need_k && tk) { end_k = std::max(end_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
-                if (need_v && tv) { end_v = std::max(end_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
-            }
-            const int64_t scratch_proj =
-                (int64_t) ((end_k > cur_k ? end_k - cur_k : 0) +
-                           (end_v > cur_v ? end_v - cur_v : 0)) * (int64_t) p.wm_cells;
-            shed_avail_pool_[pi] = (size_t) std::max<int64_t>(0, freed[pi] - scratch_proj);
-        }
-        shed_avail_epoch_ = vbr_tier_epoch_;
-        shed_avail_wm_    = wm_key;
-        size_t dbg_total = 0;
-        for (const size_t s : shed_avail_pool_) {
-            dbg_total += s;
-        }
-        LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
-                __func__, vbr_degrade_cursor_, demand_limit,
-                wm_key, dbg_total/1048576.0);
+bool llama_kv_cache::vbr_recovery_service_pending() const {
+    if (other) {
+        return other->vbr_recovery_service_pending();
     }
-    size_t total = 0;
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        if (vbr_pools_[pi].vmm != nullptr && vbr_pools_[pi].device == device) {
-            total += shed_avail_pool_[pi];
-        }
+    const auto * tracker = vbr_generation_tracker_get();
+    if (tracker == nullptr) {
+        return false;
     }
-    return total;
+    return tracker->shadow_unavailable() ||
+           vbr_recovery_pending_for(tracker->runtime_instance());
+}
+
+bool llama_kv_cache::vbr_retier_freeze_begin(
+        const char * owner, vbr_operation_id operation_id) {
+    if (other) {
+        return other->vbr_retier_freeze_begin(owner, operation_id);
+    }
+    if (!vbr_operation_armed()) {
+        return false;
+    }
+    if (!vbr_operation_registry_is_live(operation_id)) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=unregistered_id owner=%s operation_id=%llu\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value);
+        return false;
+    }
+    if (vbr_retier_freeze_depth_ >= VBR_RETIER_FREEZE_MAX_DEPTH) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=freeze_depth_limit owner=%s "
+                "operation_id=%llu depth=%u\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value,
+                vbr_retier_freeze_depth_);
+        return false;
+    }
+    const uint64_t now = llama_vram_ledger_now_ns();
+    if (vbr_retier_freeze_depth_ == 0) {
+        vbr_retier_outer_deferred_base_ = vbr_retier_deferred_decisions_;
+    }
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {
+        operation_id,
+        now != 0 ? now : 1,
+    };
+    vbr_retier_freeze_depth_++;
+    vbr_retier_freeze_enters_++;
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=enter controller=%s owner=%s operation_id=%llu "
+            "depth=%u env_freeze=%u enters_total=%llu\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            owner != nullptr ? owner : "-",
+            (unsigned long long) operation_id.value,
+            vbr_retier_freeze_depth_, vbr_freeze_ ? 1u : 0u,
+            (unsigned long long) vbr_retier_freeze_enters_);
+    return true;
+}
+
+void llama_kv_cache::vbr_retier_freeze_end(
+        const char * owner, vbr_operation_id operation_id) {
+    if (other) {
+        other->vbr_retier_freeze_end(owner, operation_id);
+        return;
+    }
+    GGML_ASSERT(vbr_retier_freeze_depth_ > 0);
+    const vbr_retier_freeze_frame frame =
+        vbr_retier_freeze_stack_[vbr_retier_freeze_depth_ - 1];
+    GGML_ASSERT(frame.operation_id == operation_id);
+    GGML_ASSERT(vbr_operation_registry_is_live(operation_id));
+    const uint64_t now = llama_vram_ledger_now_ns();
+    vbr_retier_freeze_depth_--;
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {};
+    vbr_retier_freeze_exits_++;
+    const uint64_t duration_us =
+        now > frame.started_ns ? (now - frame.started_ns) / 1000 : 0;
+    const uint64_t deferred_scope =
+        vbr_retier_deferred_decisions_ - vbr_retier_outer_deferred_base_;
+    if (vbr_retier_freeze_depth_ == 0 && !vbr_freeze_) {
+        // Even a no-op trim can change the controller's future occupancy inputs. Force a fresh
+        // decision pass at the next safe boundary; never execute a stale queued choice here.
+        vbr_retier_reconcile_pending_ = true;
+    }
+    LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s operation_id=%llu "
+            "depth=%u duration_us=%llu "
+            "deferred_scope=%llu deferred_total=%llu exits_total=%llu action=%s\n",
+            vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
+            owner != nullptr ? owner : "-",
+            (unsigned long long) operation_id.value,
+            vbr_retier_freeze_depth_,
+            (unsigned long long) duration_us,
+            (unsigned long long) deferred_scope,
+            (unsigned long long) vbr_retier_deferred_decisions_,
+            (unsigned long long) vbr_retier_freeze_exits_,
+            vbr_retier_freeze_depth_ > 0
+                ? "remain_frozen"
+                : vbr_retier_reconcile_pending_
+                    ? "reevaluate_next_boundary"
+                    : "env_freeze_noop");
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache::vbr_retier_preflight(
+        uint32_t n_tokens_extra) const {
+    if (other) {
+        return other->vbr_retier_preflight(n_tokens_extra);
+    }
+    llama_memory_vbr_preflight_data r = {};
+    r.fits = true;
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return r;
+    }
+    r.active = true;
+    r.watermark_cells = vbr_watermark_cells(n_tokens_extra);
+    struct device_growth {
+        const ggml_vbr_backend_iface * be = nullptr;
+        size_t kv = 0;
+        size_t scratch_k_need = 0;
+        size_t scratch_v_need = 0;
+        size_t scratch_k_have = 0;
+        size_t scratch_v_have = 0;
+    };
+    std::map<int, device_growth> growth;
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        const size_t needed   = vbr_vmm_projected_bytes(p, r.watermark_cells);
+        // A restore can begin after a long idle period but before another decode boundary.
+        // The controller memo is boundary-scoped, so preflight must sample live capacity now.
+        const size_t available = vbr_budget_eff_uncached(p);
+        const int64_t deficit =
+            needed > available ? (int64_t) (needed - available) : 0;
+        r.pools++;
+        r.bytes_needed    += needed;
+        r.bytes_available += available;
+        r.max_deficit = std::max(r.max_deficit, deficit);
+        r.fits = r.fits && deficit == 0;
+
+        // The KV budget deliberately excludes fattn's shared per-device f16 dequant scratch
+        // (#88). A frozen-tier replay can grow both, so price their physical deltas together.
+        auto & g = growth[p.device];
+        g.be = p.be;
+        const size_t mapped = p.be->vmm_pool_mapped(p.vmm);
+        g.kv += needed > mapped ? needed - mapped : 0;
+        size_t k_row = 0;
+        size_t v_row = 0;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            const ggml_tensor * tk = p.k[ikv].t;
+            const ggml_tensor * tv = p.v[ikv].t;
+            bool need_k = false;
+            bool need_v = false;
+            ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                      tv ? tv->type : GGML_TYPE_F16,
+                                      &need_k, &need_v);
+            if (need_k && tk) {
+                k_row = std::max(k_row,
+                        ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+            }
+            if (need_v && tv) {
+                v_row = std::max(v_row,
+                        ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+            }
+        }
+        // The backend scratch is shared per device and sized by a max, not a sum.
+        g.scratch_k_need = std::max(
+            g.scratch_k_need, k_row * (size_t) r.watermark_cells);
+        g.scratch_v_need = std::max(
+            g.scratch_v_need, v_row * (size_t) r.watermark_cells);
+        g.scratch_k_have = std::max(g.scratch_k_have, p.scratch_k_reserved);
+        g.scratch_v_have = std::max(g.scratch_v_have, p.scratch_v_reserved);
+    }
+    for (const auto & [device, g] : growth) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        g.be->get_device_memory(device, &free_b, &total_b);
+        const size_t scratch_k_delta =
+            g.scratch_k_need > g.scratch_k_have
+                ? g.scratch_k_need - g.scratch_k_have : 0;
+        const size_t scratch_v_delta =
+            g.scratch_v_need > g.scratch_v_have
+                ? g.scratch_v_need - g.scratch_v_have : 0;
+        const size_t physical_need = g.kv + scratch_k_delta + scratch_v_delta;
+        const int64_t physical_deficit =
+            physical_need > free_b ? (int64_t) (physical_need - free_b) : 0;
+        r.physical_growth_needed += physical_need;
+        r.physical_growth_available += free_b;
+        r.max_deficit = std::max(r.max_deficit, physical_deficit);
+        r.fits = r.fits && physical_deficit == 0;
+    }
+    return r;
 }
 
 // ---- co-tenancy donor side (P2) ----
@@ -4254,13 +8014,121 @@ llama_kv_cache::vbr_pool * llama_kv_cache::vbr_find_pool(const std::string & bus
     return nullptr;
 }
 
+llama_kv_cache::vbr_tree_pool_ref llama_kv_cache::vbr_tree_find_pool(const std::string & busid) {
+    llama_kv_cache * root = vbr_tree_root();
+    if (auto * p = root->vbr_find_pool(busid)) {
+        return { root, p };
+    }
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        if (auto * p = root->vbr_ledger_sibling_->vbr_find_pool(busid)) {
+            return { root->vbr_ledger_sibling_, p };
+        }
+    }
+    return {};
+}
+
+size_t llama_kv_cache::vbr_child_offer(
+        const llama_kv_cache * child, const std::string & busid) const {
+    const llama_kv_cache * root = vbr_tree_root();
+    if (child == nullptr || child != root) {
+        return 0;
+    }
+    return root->vbr_tree_offer(busid);
+}
+
+size_t llama_kv_cache::vbr_tree_offer(const std::string & busid) const {
+    const llama_kv_cache * root_const = vbr_tree_root();
+    const auto suppressed = root_const->vbr_offer_suppressed_until_.find(busid);
+    if (suppressed != root_const->vbr_offer_suppressed_until_.end() &&
+        llama_vram_ledger_now_ns() < suppressed->second) {
+        return 0;
+    }
+    llama_kv_cache * root = const_cast<llama_kv_cache *>(root_const);
+    const auto demanded = root->vbr_tree_find_pool(busid);
+    if (demanded.pool == nullptr) {
+        return 0;
+    }
+
+    vbr_shed_tx tx;
+    tx.demanded_device = demanded.pool->device;
+    auto append_child = [&](llama_kv_cache * child) {
+        if (child == nullptr || !child->vbr_vmm_active()) {
+            return;
+        }
+        vbr_tx_child state;
+        state.cache = child;
+        state.incoming_wm = child->vbr_watermark_cells(0);
+        state.start_cursor = child->vbr_degrade_cursor_;
+        state.final_cursor = state.start_cursor;
+        state.start_epoch = child->vbr_tier_epoch_;
+        child->vbr_sim_seed(state.types_before, /* pooled_only = */ true,
+                GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
+        state.types_after = state.types_before;
+        tx.children.push_back(std::move(state));
+    };
+    append_child(root);
+    append_child(root->vbr_ledger_sibling_);
+
+    std::vector<llama_vbr_policy::child> policy_children;
+    for (const auto & state : tx.children) {
+        policy_children.push_back(state.cache->vbr_policy_child_stream(
+                tx.demanded_device, state.incoming_wm));
+    }
+    llama_vbr_policy::shortest_prefix_stream stream(std::move(policy_children));
+    uint64_t best = 0;
+    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+        return 0;
+    }
+    const auto note_feasible = [&]() {
+        const auto demanded_cost = tx.devices.find(tx.demanded_device);
+        if (demanded_cost == tx.devices.end() || demanded_cost->second.capacity_signed <= 0) {
+            return;
+        }
+        for (const auto & [device, cost] : tx.devices) {
+            if (device != tx.demanded_device && cost.capacity_signed < 0) {
+                return;
+            }
+        }
+        best = std::max(best, (uint64_t) demanded_cost->second.capacity_signed);
+    };
+    note_feasible();
+    llama_vbr_policy::selection selected;
+    for (;;) {
+        const auto status = stream.next(selected);
+        if (status == llama_vbr_policy::result::exhausted) {
+            break;
+        }
+        if (status != llama_vbr_policy::result::selected) {
+            return 0;
+        }
+        tx.policy_prefix.push_back(selected);
+        if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+            return 0;
+        }
+        note_feasible();
+    }
+    return best > SIZE_MAX ? SIZE_MAX : (size_t) best;
+}
+
 uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
-    const auto it = vbr_presence_.find(p.busid);
-    return it != vbr_presence_.end() && it->second.cur > 0 ? it->second.cur : 1;
+    const auto * root = vbr_tree_root();
+    const auto it = root->vbr_presence_.find(p.busid);
+    return it != root->vbr_presence_.end() && it->second.cur > 0 ? it->second.cur : 1;
 }
 
 bool llama_kv_cache::vbr_presence_quiet() const {
-    return vbr_scan_events_ - vbr_nlive_change_scan_ >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
+    // WS-0 freeze (Sol review F3): the presence census is fed by the ledger scan, which freeze
+    // disables -- so vbr_scan_events_ stays 0 and this would be permanently false, DISABLING
+    // promotion under freeze (the frozen schedule would be degrade-only, structurally unlike
+    // production). Single-tenant frozen has no presence changes by definition -> always quiet,
+    // leaving promotion gated only by the deterministic vbr_quiet_boundaries_ cooldown.
+    if (vbr_freeze_) {
+        return true;
+    }
+    const auto * root = vbr_tree_root();
+    return !root->vbr_tree_forced() &&
+           root->vbr_scan_events_ - root->vbr_nlive_change_scan_ >=
+                   (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
 }
 
 // P3 runtime-growth demand, demander side. Publishes a phase=runtime claim when this
@@ -4272,52 +8140,81 @@ bool llama_kv_cache::vbr_presence_quiet() const {
 // where the recomputed shortage is gone — the donors' lift signal. Skipped entirely while
 // a load-phase claim is still live (satisfied pre-claim-complete: one claim per process).
 void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) {
-    if (!llama_vram_ledger_armed() || !vbr_ledger_owner_ || llama_vram_demand_pending_complete()) {
+    vbr_runtime_wm_ = wm_next;
+    vbr_runtime_was_over_ = was_over;
+
+    llama_kv_cache * root = vbr_tree_root();
+    if (this != root || !llama_vram_ledger_armed() || llama_vram_demand_pending_complete()) {
         return;
     }
-    // loop-invariant gate first: the common case (consent window unspent, nothing live)
-    // must not pay the per-pool projection walk every boundary
-    const bool window_spent = vbr_degrade_cursor_ >= vbr_demand_limit();
-    if (!window_spent && vbr_runtime_live_.empty()) {
-        return;
-    }
-    for (auto & p : vbr_pools_) {
-        if (p.vmm == nullptr || vbr_pool_busid(p) == "-") {
-            continue;
+
+    bool any_window_spent = false;
+    auto note_window = [&](const llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
         }
-        const size_t projected = vbr_vmm_projected_bytes(p, wm_next);
-        const size_t beff      = vbr_budget_eff(p);
-        // shorted: band spent AND this boundary saw pressure (pre-own-loop), or the ladder
-        // is exhausted with projection still over
-        const bool   shorted   = window_spent && (was_over || projected > beff);
-        const size_t pool_idx  = (size_t) (&p - vbr_pools_.data());
-        const bool live = vbr_runtime_live_.count(p.busid) != 0;
-        if (shorted) {
-            // saturated, pre-loop-honest ask (a post-loop subtraction can underflow — the
-            // own ladder's exit condition already restored projected <= budget_eff)
-            const uint64_t wanted = projected > beff ? projected - beff
-                : (pool_idx < vbr_pre_deficit_.size() ? vbr_pre_deficit_[pool_idx] : 0);
-            if (wanted == 0) {
+        const size_t limit = child->vbr_demand_limit();
+        any_window_spent = any_window_spent ||
+                (child->vbr_vmm_active() && limit > 0 && child->vbr_degrade_cursor_ >= limit);
+    };
+    note_window(root);
+    note_window(root->vbr_ledger_sibling_);
+    if (!any_window_spent && root->vbr_runtime_live_.empty()) {
+        return;
+    }
+
+    std::map<std::string, uint64_t> wanted_by_busid;
+    auto sample_child = [&](llama_kv_cache * child) {
+        if (child == nullptr || !child->vbr_vmm_active()) {
+            return;
+        }
+        const size_t limit = child->vbr_demand_limit();
+        const bool window_spent = limit > 0 && child->vbr_degrade_cursor_ >= limit;
+        for (size_t pi = 0; pi < child->vbr_pools_.size(); ++pi) {
+            auto & p = child->vbr_pools_[pi];
+            if (p.vmm == nullptr || child->vbr_pool_busid(p) == "-") {
                 continue;
             }
-            if (!live) {
-                llama_vram_claim_fields f = {};
-                f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
-                f.bytes_total_remaining_est = wanted;
-                f.est_partial               = 0;
-                f.ver                       = ++vbr_runtime_ver_;
-                f.created_ts_ns             = llama_vram_ledger_now_ns();
-                if (llama_vram_claim_publish(p.busid, f)) {
-                    vbr_runtime_live_.insert(p.busid);
-                    vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns(); // own rename
-                    LLAMA_LOG_INFO("%s: runtime demand on %s: %.1f MiB (consent window spent)\n",
-                            __func__, p.busid.c_str(), wanted/1048576.0);
-                }
+            const size_t projected = child->vbr_vmm_projected_bytes(p, child->vbr_runtime_wm_);
+            const size_t beff = child->vbr_budget_eff(p);
+            const bool shorted = window_spent &&
+                    (child->vbr_runtime_was_over_ || projected > beff);
+            if (!shorted) {
+                wanted_by_busid[p.busid] += 0;
+                continue;
             }
-        } else if (live) {
-            llama_vram_claim_withdraw(p.busid);
-            vbr_runtime_live_.erase(p.busid);
-            LLAMA_LOG_INFO("%s: runtime demand on %s cleared\n", __func__, p.busid.c_str());
+            const uint64_t add = projected > beff ? projected - beff
+                    : (pi < child->vbr_pre_deficit_.size() ? child->vbr_pre_deficit_[pi] : 0);
+            auto & wanted = wanted_by_busid[p.busid];
+            wanted = UINT64_MAX - wanted < add ? UINT64_MAX : wanted + add;
+        }
+    };
+    // Parent execution order is peer first and root last; root publishes one tree claim.
+    sample_child(root->vbr_ledger_sibling_);
+    sample_child(root);
+    for (const auto & busid : root->vbr_runtime_live_) {
+        wanted_by_busid[busid] += 0;
+    }
+
+    for (const auto & [busid, wanted] : wanted_by_busid) {
+        const bool live = root->vbr_runtime_live_.count(busid) != 0;
+        if (wanted > 0 && !live) {
+            llama_vram_claim_fields f = {};
+            f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
+            f.bytes_total_remaining_est = wanted;
+            f.est_partial               = 0;
+            f.ver                       = ++root->vbr_runtime_ver_;
+            f.created_ts_ns             = llama_vram_ledger_now_ns();
+            if (llama_vram_claim_publish(busid, f)) {
+                root->vbr_runtime_live_.insert(busid);
+                root->vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+                LLAMA_LOG_INFO("%s: runtime demand on %s: %.1f MiB (tree consent spent)\n",
+                        __func__, busid.c_str(), wanted/1048576.0);
+            }
+        } else if (wanted == 0 && live) {
+            llama_vram_claim_withdraw(busid);
+            root->vbr_runtime_live_.erase(busid);
+            LLAMA_LOG_INFO("%s: runtime demand on %s cleared\n", __func__, busid.c_str());
         }
     }
 }
@@ -4330,17 +8227,26 @@ void llama_kv_cache::vbr_maybe_promote(uint32_t wm_next) {
         return e == nullptr || atoi(e) != 0;
     }();
     if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
-        vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
+        vbr_tree_total_grant_decrement() == 0 && vbr_presence_quiet()) {
         vbr_promote_next(wm_next);
     }
 }
 
 void llama_kv_cache::vbr_arm_wave_fences() {
-    for (auto & p : vbr_pools_) {
-        if (p.wave_pending) {
-            p.be->fence_arm(p.backend);
-            p.wave_pending = false;
+    auto arm_child = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
         }
+        for (auto & p : child->vbr_pools_) {
+            if (p.wave_pending) {
+                p.be->fence_arm(p.backend);
+                p.wave_pending = false;
+            }
+        }
+    };
+    arm_child(this);
+    if (vbr_ledger_owner_) {
+        arm_child(vbr_ledger_sibling_);
     }
 }
 
@@ -4371,14 +8277,15 @@ void llama_kv_cache::vbr_apply_grant_decrements() {
 // dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1µs stat): a rename in the
 // ledger (new claim, phase flip, peer offer) forces the full controller path this boundary
 void llama_kv_cache::vbr_ledger_precheck() {
-    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
+    llama_kv_cache * root = vbr_tree_root();
+    if (!root->vbr_vmm_active() || !llama_vram_ledger_armed()) {
         return;
     }
     const uint64_t mtime = llama_vram_ledger_dir_mtime_ns();
-    if (mtime != vbr_ledger_mtime_) {
+    if (mtime != root->vbr_ledger_mtime_) {
         // adopt immediately: our own upcoming renames re-stat and re-adopt after writing
-        vbr_ledger_mtime_ = mtime;
-        vbr_ledger_force_ = true;
+        root->vbr_ledger_mtime_ = mtime;
+        root->vbr_tree_force();
     }
 }
 
@@ -4390,29 +8297,53 @@ void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marke
     // ---- P3 presence census: N_live per device = self + live peer markers ----
     vbr_scan_events_++;
     std::map<std::string, uint32_t> raw;
-    for (auto & p : vbr_pools_) {
-        if (p.vmm != nullptr && vbr_pool_busid(p) != "-") {
-            raw[p.busid] = 1; // self
+    auto seed_child = [&](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
         }
-    }
+        for (auto & p : child->vbr_pools_) {
+            if (p.vmm != nullptr && child->vbr_pool_busid(p) != "-") {
+                raw[p.busid] = 1; // one process/tree even when both children share a device
+            }
+        }
+    };
+    seed_child(this);
+    seed_child(vbr_ledger_sibling_);
     for (const auto & m : peers) {
         auto it = raw.find(m.busid);
         if (it != raw.end()) {
             it->second++;
         }
     }
-    // first sighting adopts silently; arrivals are immediate (growing headroom is the safe
-    // direction); departures only after the raw count holds DEBOUNCE consecutive scans
+    // A first self-only sighting adopts silently. Peer arrivals are immediate (growing
+    // headroom is the safe direction); departures wait for DEBOUNCE consecutive scans.
     for (auto & [busid, n] : raw) {
         auto & st = vbr_presence_[busid];
         st.stable = (st.cur != 0 && n < st.cur && st.raw == n) ? st.stable + 1 : 0;
         st.raw = n;
+        bool changed = false;
         if (st.cur == 0) {
             st.cur = n;
+            changed = n > 1; // first scan can discover an already-present peer arrival
         } else if (n > st.cur || st.stable >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE) {
             st.cur = n;
             st.stable = 0;
+            changed = true;
+        }
+        if (changed) {
             vbr_nlive_change_scan_ = vbr_scan_events_;
+            auto invalidate_child = [](llama_kv_cache * child) {
+                if (child == nullptr) {
+                    return;
+                }
+                for (auto & p : child->vbr_pools_) {
+                    p.budget_eff_stamp = ~0ull;
+                }
+            };
+            invalidate_child(this);
+            invalidate_child(vbr_ledger_sibling_);
+            // Both children must reject their next stable path and adopt the shared census.
+            vbr_tree_force();
         }
     }
 
@@ -4476,9 +8407,1077 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
     return grants_changed;
 }
 
+bool llama_kv_cache::vbr_tree_has_grant(const llama_vram_peer_claim & c) const {
+    const llama_kv_cache * root = vbr_tree_root();
+    auto child_has = [&](const llama_kv_cache * child) {
+        if (child == nullptr) {
+            return false;
+        }
+        for (const auto & g : child->vbr_grants_) {
+            if (g.pid == c.pid && g.starttime == c.starttime && g.ver == c.fields.ver &&
+                g.busid == c.busid && !g.collateral) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return child_has(root) || child_has(root->vbr_ledger_sibling_);
+}
+
+bool llama_kv_cache::vbr_tx_settle_tree() {
+    llama_kv_cache * root = vbr_tree_root();
+    auto settle_child = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return true;
+        }
+        child->vbr_flush_deferred_unmaps();
+        for (auto & p : child->vbr_pools_) {
+            if (p.wave_pending) {
+                GGML_ASSERT(p.backend != nullptr);
+                ggml_backend_synchronize(p.backend);
+                p.wave_pending = false;
+            }
+            if (!p.unmap_deferred.empty()) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool root_settled = settle_child(root);
+    const bool sibling_settled = settle_child(root->vbr_ledger_sibling_);
+    root->vbr_grant_pending_clear();
+    if (root->vbr_ledger_sibling_ != nullptr) {
+        root->vbr_ledger_sibling_->vbr_grant_pending_clear();
+    }
+    return root_settled && sibling_settled;
+}
+
+bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
+    tx.steps.clear();
+    tx.endpoints.clear();
+    tx.workspaces.clear();
+    tx.stashes.clear();
+    tx.scratches.clear();
+    tx.devices.clear();
+
+    for (auto & child : tx.children) {
+        child.types_after = child.types_before;
+        child.final_cursor = child.start_cursor;
+    }
+    // Selection-coherence rule mirrors the downward projection's apply in
+    // vbr_downward_project_policy_prefix — keep the two in sync.
+    for (const auto & selected : tx.policy_prefix) {
+        if (selected.child_index >= tx.children.size()) {
+            return false;
+        }
+        auto & child = tx.children[selected.child_index];
+        const auto & policy = selected.value;
+        if (policy.slot >= child.types_after.size() ||
+            child.types_after[policy.slot] != (ggml_type) policy.type_a) {
+            return false;
+        }
+        vbr_tx_step step;
+        step.child_idx = selected.child_index;
+        step.order_idx = policy.order_index;
+        step.slot      = policy.slot;
+        step.ikv       = policy.slot/2;
+        step.is_v      = (policy.slot & 1) != 0;
+        step.type_a    = (ggml_type) policy.type_a;
+        step.type_b    = (ggml_type) policy.type_b;
+        tx.steps.push_back(step);
+        child.types_after[step.slot] = step.type_b;
+        child.final_cursor = step.order_idx + 1;
+    }
+
+    std::map<vbr_tx_extent_key, uint32_t> virtual_stash_valid;
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        for (size_t pi = 0; pi < child->vbr_pools_.size(); ++pi) {
+            auto & p = child->vbr_pools_[pi];
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            const uint32_t terminal_wm = std::max(p.wm_cells, state.incoming_wm);
+            for (size_t ikv = 0; ikv < child->layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    auto & e = side ? p.v[ikv] : p.k[ikv];
+                    if (e.t == nullptr) {
+                        continue;
+                    }
+                    const vbr_tx_extent_key key { ci, pi, ikv, side != 0 };
+                    const size_t slot = ikv*2 + side;
+                    const ggml_type type = state.types_after[slot] != GGML_TYPE_COUNT
+                            ? state.types_after[slot] : e.t->type;
+                    const size_t slot_span = vbr_slot_span(e.t, p.gran);
+                    uint64_t final_span_u64 = 0;
+                    if (!llama_vbr_physical::endpoint_bytes(
+                                ggml_row_size(type, e.t->ne[0]), terminal_wm,
+                                slot_span, p.gran, final_span_u64) || final_span_u64 > SIZE_MAX) {
+                        return false;
+                    }
+                    const size_t final_span = (size_t) final_span_u64;
+
+                    auto baseline_total_it = tx.endpoint_baseline_total.find(key);
+                    if (baseline_total_it == tx.endpoint_baseline_total.end()) {
+                        if (!tx.snapshot_open) {
+                            return false;
+                        }
+                        const uint64_t total = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, slot_span);
+                        baseline_total_it = tx.endpoint_baseline_total.emplace(key, total).first;
+                    }
+                    auto & by_span = tx.endpoint_baseline_inside[key];
+                    auto baseline_inside_it = by_span.find(final_span);
+                    if (baseline_inside_it == by_span.end()) {
+                        if (!tx.snapshot_open) {
+                            return false;
+                        }
+                        const uint64_t inside = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, final_span);
+                        baseline_inside_it = by_span.emplace(final_span, inside).first;
+                    }
+                    const uint64_t baseline_total  = baseline_total_it->second;
+                    const uint64_t baseline_inside = baseline_inside_it->second;
+                    if (baseline_inside > baseline_total || baseline_inside > final_span_u64) {
+                        return false;
+                    }
+
+                    uint64_t gross_release = baseline_total - baseline_inside;
+                    if (actual) {
+                        const uint64_t current_total = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, slot_span);
+                        const uint64_t current_inside = p.be->vmm_pool_mapped_in_range(
+                                p.vmm, e.byte_off, final_span);
+                        if (current_inside != final_span_u64 || current_inside > current_total) {
+                            return false;
+                        }
+                        gross_release = current_total - current_inside;
+                    }
+
+                    vbr_tx_endpoint endpoint;
+                    endpoint.pool            = &p;
+                    endpoint.extent          = &e;
+                    endpoint.final_span      = final_span;
+                    endpoint.slot_span       = slot_span;
+                    endpoint.baseline_total  = baseline_total;
+                    endpoint.baseline_inside = baseline_inside;
+                    endpoint.gross_release   = gross_release;
+                    endpoint.live            = p.wm_cells > 0;
+                    tx.endpoints.emplace(key, std::move(endpoint));
+                    virtual_stash_valid[key] = e.stash_valid;
+
+                    auto & cost = tx.devices[p.device];
+                    if (!llama_vbr_transaction::add_u64(
+                                cost.release, baseline_total - baseline_inside) ||
+                        !llama_vbr_transaction::add_u64(
+                                cost.kv_growth, final_span_u64 - baseline_inside)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    for (const auto & step : tx.steps) {
+        llama_kv_cache * child = tx.children[step.child_idx].cache;
+        const auto & units = child->vbr_units_of(step.ikv, step.is_v);
+        for (auto & [pp, ep] : units) {
+            const size_t pi = (size_t) (pp - child->vbr_pools_.data());
+            const vbr_tx_extent_key ekey { step.child_idx, pi, step.ikv, step.is_v };
+            auto endpoint = tx.endpoints.find(ekey);
+            if (endpoint == tx.endpoints.end()) {
+                return false;
+            }
+            endpoint->second.touched = true;
+            if (pp->wm_cells == 0) {
+                continue;
+            }
+
+            const bool capture = child->vbr_stash_rows_ > 0 &&
+                    virtual_stash_valid[ekey] == 0 &&
+                    ggml_is_turbo_kv_type(step.type_a) &&
+                    step.type_a != GGML_TYPE_TURBO8_0;
+            const uint32_t capture_rows = capture
+                    ? std::min(child->vbr_stash_rows_, pp->wm_cells) : 0;
+            const vbr_tx_pool_key pkey { step.child_idx, pi };
+            auto & workspace = tx.workspaces[pkey];
+            workspace.be      = pp->be;
+            workspace.backend = pp->backend;
+            workspace.device  = pp->device;
+            workspace.requests.push_back({
+                    (int64_t) pp->wm_cells, ep->t->ne[0], (int64_t) capture_rows });
+            if (capture_rows > 0) {
+                auto & stash = tx.stashes[pkey];
+                stash.device = pp->device;
+                stash.requests.push_back({ ep, capture_rows });
+                virtual_stash_valid[ekey] = capture_rows;
+            }
+        }
+    }
+
+    // Once preflight has landed a persistent component, trimming away the step that requested it
+    // does not return those bytes. Keep every snapshotted group in the actual price and query its
+    // current occupancy even when the candidate prefix now has no request for it.
+    for (const auto & [key, baseline] : tx.workspace_baseline) {
+        GGML_UNUSED(baseline);
+        if (tx.workspaces.count(key) == 0) {
+            auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+            auto & group = tx.workspaces[key];
+            group.be = pool.be;
+            group.backend = pool.backend;
+            group.device = pool.device;
+        }
+    }
+    for (const auto & [key, baseline] : tx.stash_baseline) {
+        GGML_UNUSED(baseline);
+        if (tx.stashes.count(key) == 0) {
+            auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+            auto & group = tx.stashes[key];
+            group.device = pool.device;
+        }
+    }
+
+    for (auto & [key, group] : tx.workspaces) {
+        uint64_t physical_now = 0;
+        uint64_t physical_if_reserved = 0;
+        const auto project = [&](const llama_vbr_transaction::workspace_request & request,
+                                 uint64_t & now, uint64_t & projected) {
+                    size_t now_st = 0;
+                    size_t projected_st = 0;
+                    if (!group.be->kv_transcode_workspace_memory(
+                                group.backend, group.device,
+                                request.n_cells, request.ne0, request.stash_rows,
+                                &now_st, &projected_st)) {
+                        return false;
+                    }
+                    now = now_st;
+                    projected = projected_st;
+                    return true;
+                };
+        bool ok = true;
+        if (group.requests.empty()) {
+            // Zero work is the backend's read-only occupancy query.
+            ok = project({ 0, 1, 0 }, physical_now, physical_if_reserved);
+        } else {
+            ok = llama_vbr_transaction::workspace_endpoint(
+                    group.requests, project, physical_now, physical_if_reserved);
+        }
+        if (!ok) {
+            return false;
+        }
+        auto baseline = tx.workspace_baseline.find(key);
+        if (baseline == tx.workspace_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.workspace_baseline.emplace(key, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        if (!llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].workspace_growth, endpoint - baseline->second)) {
+            return false;
+        }
+    }
+
+    for (auto & [key, group] : tx.stashes) {
+        auto & child = tx.children[key.child_idx];
+        auto & pool = child.cache->vbr_pools_[key.pool_idx];
+        size_t physical_now = 0;
+        size_t physical_if_reserved = 0;
+        if (!child.cache->vbr_stash_memory(
+                    pool, group.requests, physical_now, physical_if_reserved)) {
+            return false;
+        }
+        auto baseline = tx.stash_baseline.find(key);
+        if (baseline == tx.stash_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.stash_baseline.emplace(key, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        if (!llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].stash_growth, endpoint - baseline->second)) {
+            return false;
+        }
+    }
+
+    auto query_scratch = [&](vbr_tx_scratch_group & group) {
+        size_t physical_now = 0;
+        size_t physical_if_reserved = 0;
+        group.be->kv_dequant_scratch_memory(
+                group.backend, group.k_need, group.v_need,
+                &physical_now, &physical_if_reserved);
+        auto baseline = tx.scratch_baseline.find(group.backend);
+        if (baseline == tx.scratch_baseline.end()) {
+            if (!tx.snapshot_open) {
+                return false;
+            }
+            baseline = tx.scratch_baseline.emplace(group.backend, physical_now).first;
+        }
+        const uint64_t endpoint = actual ? physical_now : physical_if_reserved;
+        if (endpoint < baseline->second) {
+            return false;
+        }
+        group.physical_projected = endpoint;
+        return true;
+    };
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        for (auto & p : child->vbr_pools_) {
+            if (p.be == nullptr || p.compute_backend == nullptr || p.device < 0) {
+                continue;
+            }
+            size_t k_row = 0;
+            size_t v_row = 0;
+            for (size_t ikv = 0; ikv < child->layers.size(); ++ikv) {
+                const ggml_tensor * tk = p.k[ikv].t;
+                const ggml_tensor * tv = p.v[ikv].t;
+                const ggml_type type_k = state.types_after[ikv*2] != GGML_TYPE_COUNT
+                        ? state.types_after[ikv*2] : (tk ? tk->type : GGML_TYPE_F16);
+                const ggml_type type_v = state.types_after[ikv*2 + 1] != GGML_TYPE_COUNT
+                        ? state.types_after[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
+                if (need_k && tk != nullptr) {
+                    k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv != nullptr) {
+                    v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
+            }
+            const uint32_t terminal_wm = std::max(p.wm_cells, state.incoming_wm);
+            if ((terminal_wm != 0 && k_row > SIZE_MAX/(size_t) terminal_wm) ||
+                (terminal_wm != 0 && v_row > SIZE_MAX/(size_t) terminal_wm)) {
+                return false;
+            }
+            auto & group = tx.scratches[p.compute_backend];
+            if (group.backend == nullptr) {
+                group.be = p.be;
+                group.backend = p.compute_backend;
+                group.device = p.device;
+            } else if (group.be != p.be || group.device != p.device) {
+                return false;
+            }
+            group.k_need = std::max(group.k_need, k_row*(size_t) terminal_wm);
+            group.v_need = std::max(group.v_need, v_row*(size_t) terminal_wm);
+            group.owner_backend = true;
+        }
+    }
+
+    for (auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        if (!query_scratch(group)) {
+            return false;
+        }
+    }
+
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & state = tx.children[ci];
+        llama_kv_cache * child = state.cache;
+        vbr_device_watermarks watermarks;
+        for (const auto & p : child->vbr_pools_) {
+            if (p.device >= 0) {
+                auto & wm = watermarks[p.device];
+                wm = std::max(wm, std::max(p.wm_cells, state.incoming_wm));
+            }
+        }
+        bool reverse_ok = true;
+        child->vbr_shared_scratch_visit(
+                state.types_after, watermarks,
+                [&](const vbr_shared_scratch_plan & plan) {
+                    auto & group = tx.scratches[plan.compute_backend];
+                    if (group.backend == nullptr) {
+                        group.be = plan.be;
+                        group.backend = plan.compute_backend;
+                        group.device = plan.device;
+                    } else if (group.be != plan.be || group.device != plan.device) {
+                        reverse_ok = false;
+                        return;
+                    }
+                    group.k_need = std::max(group.k_need, plan.k_bytes);
+                    group.v_need = std::max(group.v_need, plan.v_bytes);
+                    if (!query_scratch(group)) {
+                        reverse_ok = false;
+                    }
+                });
+        if (!reverse_ok) {
+            return false;
+        }
+    }
+
+    for (const auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        const auto baseline = tx.scratch_baseline.find(group.backend);
+        if (baseline == tx.scratch_baseline.end() || group.physical_projected < baseline->second ||
+            !llama_vbr_transaction::add_u64(
+                    tx.devices[group.device].scratch_growth,
+                    group.physical_projected - baseline->second)) {
+            return false;
+        }
+    }
+
+    for (auto & [device, cost] : tx.devices) {
+        GGML_UNUSED(device);
+        if (!llama_vbr_transaction::finalize(cost)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_map_endpoints(vbr_shed_tx & tx) {
+    for (auto & [key, endpoint] : tx.endpoints) {
+        GGML_UNUSED(key);
+        if (endpoint.final_span > 0 &&
+            !endpoint.pool->be->vmm_pool_map(
+                    endpoint.pool->vmm, endpoint.extent->byte_off, endpoint.final_span)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_preflight(vbr_shed_tx & tx) {
+    tx.snapshot_open = false;
+    for (auto & [key, group] : tx.workspaces) {
+        auto & pool = tx.children[key.child_idx].cache->vbr_pools_[key.pool_idx];
+        if (pool.backend == nullptr) {
+            pool.backend = pool.be->backend_init(pool.device);
+            if (pool.backend == nullptr) {
+                return false;
+            }
+        }
+        group.backend = pool.backend;
+    }
+    for (auto & [key, group] : tx.workspaces) {
+        GGML_UNUSED(key);
+        for (const auto & request : group.requests) {
+            if (!group.be->kv_transcode_workspace_reserve(
+                        group.backend, request.n_cells, request.ne0, request.stash_rows)) {
+                return false;
+            }
+        }
+    }
+    for (auto & [key, group] : tx.stashes) {
+        auto & child = tx.children[key.child_idx];
+        auto & pool = child.cache->vbr_pools_[key.pool_idx];
+        if (!child.cache->vbr_stash_reserve(pool, group.requests)) {
+            return false;
+        }
+    }
+
+    for (auto & [backend, group] : tx.scratches) {
+        GGML_UNUSED(backend);
+        if (group.owner_backend &&
+            !group.be->kv_dequant_scratch_reserve(
+                    group.backend, group.k_need, group.v_need)) {
+            return false;
+        }
+    }
+    for (auto & state : tx.children) {
+        vbr_device_watermarks watermarks;
+        for (const auto & p : state.cache->vbr_pools_) {
+            if (p.device >= 0) {
+                auto & wm = watermarks[p.device];
+                wm = std::max(wm, std::max(p.wm_cells, state.incoming_wm));
+            }
+        }
+        bool reserved = true;
+        state.cache->vbr_shared_scratch_visit(
+                state.types_after, watermarks,
+                [&](const vbr_shared_scratch_plan & plan) {
+                    if (reserved && !plan.be->kv_dequant_scratch_reserve(
+                                plan.compute_backend, plan.k_bytes, plan.v_bytes)) {
+                        reserved = false;
+                    }
+                });
+        if (!reserved) {
+            return false;
+        }
+    }
+    if (!vbr_tx_map_endpoints(tx)) {
+        return false;
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_hard_seal_allowed(vbr_shed_tx & tx) {
+    std::map<size_t, vbr_hard_seal_consult_session> sessions;
+    for (const auto & step : tx.steps) {
+        llama_kv_cache * child = tx.children[step.child_idx].cache;
+        if (!child->vbr_hard_seal_guard_) {
+            continue;
+        }
+        if (child->vbr_hard_seal_step_blocked(
+                step.order_idx, sessions[step.child_idx])) {
+            child->vbr_hard_seal_blocked_ = true;
+            child->vbr_hard_seal_evidence_record(step.order_idx);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::vbr_tx_prepare_commit(
+        vbr_shed_tx & tx, const llama_vram_peer_claim & c) {
+    tx.gross_by_pool.clear();
+    tx.deferred_by_pool.clear();
+    tx.planned_grants.clear();
+    tx.planned_grants.reserve(tx.endpoints.size());
+    std::map<vbr_tx_pool_key, size_t> tail_counts;
+
+    for (const auto & [key, endpoint] : tx.endpoints) {
+        const vbr_tx_pool_key pkey { key.child_idx, key.pool_idx };
+        const uint64_t baseline_release = endpoint.baseline_total - endpoint.baseline_inside;
+        if (!llama_vbr_transaction::add_u64(tx.gross_by_pool[pkey], baseline_release)) {
+            return false;
+        }
+        if (endpoint.gross_release > 0 && endpoint.final_span < endpoint.slot_span &&
+            endpoint.touched && endpoint.live) {
+            tail_counts[pkey]++;
+            if (!llama_vbr_transaction::add_u64(
+                        tx.deferred_by_pool[pkey], endpoint.gross_release)) {
+                return false;
+            }
+        }
+    }
+    for (const auto & [pkey, count] : tail_counts) {
+        auto & pool = tx.children[pkey.child_idx].cache->vbr_pools_[pkey.pool_idx];
+        if (count > SIZE_MAX - pool.unmap_deferred.size()) {
+            return false;
+        }
+        pool.unmap_deferred.reserve(pool.unmap_deferred.size() + count);
+    }
+
+    uint64_t prior_credit = 0;
+    for (const auto & child : tx.children) {
+        for (const auto & row : child.cache->vbr_grants_) {
+            if (!row.collateral && row.busid == c.busid && row.pid == c.pid &&
+                row.starttime == c.starttime && row.ver == c.fields.ver &&
+                !llama_vbr_transaction::add_u64(prior_credit, row.bytes)) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<size_t> grant_counts(tx.children.size(), 0);
+    for (const auto & [device, cost] : tx.devices) {
+        if (cost.capacity_signed < 0) {
+            return false;
+        }
+        uint64_t credit = (uint64_t) cost.capacity_signed;
+        if (device == tx.demanded_device) {
+            credit = std::min(credit, tx.target);
+        }
+        if (credit == 0) {
+            continue;
+        }
+
+        uint64_t gross_device = 0;
+        std::vector<std::pair<vbr_tx_pool_key, uint64_t>> releasing;
+        releasing.reserve(tx.gross_by_pool.size());
+        for (const auto & [pkey, gross] : tx.gross_by_pool) {
+            auto & pool = tx.children[pkey.child_idx].cache->vbr_pools_[pkey.pool_idx];
+            if (pool.device == device && gross > 0) {
+                releasing.push_back({ pkey, gross });
+                if (!llama_vbr_transaction::add_u64(gross_device, gross)) {
+                    return false;
+                }
+            }
+        }
+        if (gross_device == 0) {
+            return false;
+        }
+
+        uint64_t assigned = 0;
+        for (size_t i = 0; i < releasing.size(); ++i) {
+            const auto [pkey, gross] = releasing[i];
+            uint64_t share = 0;
+            if (i + 1 == releasing.size()) {
+                share = credit - assigned;
+            } else {
+#ifdef _MSC_VER
+                share = (uint64_t) ((double) credit * gross / gross_device);
+#else
+                share = (uint64_t) ((__uint128_t) credit * gross / gross_device);
+#endif
+            }
+            assigned += share;
+            if (share == 0) {
+                continue;
+            }
+            llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+            auto & pool = child->vbr_pools_[pkey.pool_idx];
+            vbr_tx_grant_plan plan;
+            plan.child_idx = pkey.child_idx;
+            plan.row.busid              = c.busid;
+            plan.row.pid                = c.pid;
+            plan.row.starttime          = c.starttime;
+            plan.row.ver                = c.fields.ver;
+            plan.row.pool_idx           = pkey.pool_idx;
+            plan.row.bytes              = share;
+            plan.row.collateral         = child->vbr_pool_busid(pool) != c.busid;
+            plan.row.bytes_now_at_grant = c.bytes_now;
+            if (!plan.row.collateral) {
+                if (!llama_vbr_transaction::grant_threshold(
+                            c.bytes_now, prior_credit, plan.row.bytes_now_at_grant) ||
+                    !llama_vbr_transaction::add_u64(prior_credit, share)) {
+                    return false;
+                }
+            }
+            tx.planned_grants.push_back(std::move(plan));
+            grant_counts[pkey.child_idx]++;
+        }
+        if (assigned != credit) {
+            return false;
+        }
+    }
+    for (size_t ci = 0; ci < tx.children.size(); ++ci) {
+        auto & grants = tx.children[ci].cache->vbr_grants_;
+        if (grant_counts[ci] > SIZE_MAX - grants.size()) {
+            return false;
+        }
+        grants.reserve(grants.size() + grant_counts[ci]);
+    }
+    for (const auto & [pkey, pending] : tx.deferred_by_pool) {
+        llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+        auto & pool = child->vbr_pools_[pkey.pool_idx];
+        uint64_t & current = child->vbr_grant_pending_[child->vbr_pool_busid(pool)];
+        if (pending > UINT64_MAX - current) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_tx_suppress(const std::string & busid) {
+    llama_kv_cache * root = vbr_tree_root();
+    constexpr uint64_t retry_ns = 1000000000ull;
+    root->vbr_offer_suppressed_until_[busid] = llama_vram_ledger_now_ns() + retry_ns;
+    auto invalidate = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
+        }
+        for (auto & p : child->vbr_pools_) {
+            p.budget_eff_stamp = ~0ull;
+        }
+    };
+    invalidate(root);
+    invalidate(root->vbr_ledger_sibling_);
+    root->vbr_tree_force();
+}
+
+bool llama_kv_cache::vbr_tx_publish_zero_intent(const vbr_shed_tx & tx) {
+    llama_kv_cache * root = vbr_tree_root();
+    std::set<std::string> busids;
+    for (const auto & [device, cost] : tx.devices) {
+        GGML_UNUSED(cost);
+        for (auto & child : tx.children) {
+            for (auto & p : child.cache->vbr_pools_) {
+                if (p.vmm != nullptr && p.device == device &&
+                    child.cache->vbr_pool_busid(p) != "-") {
+                    busids.insert(p.busid);
+                }
+            }
+        }
+    }
+    for (const auto & busid : busids) {
+        uint64_t pending = root->vbr_grant_pending_[busid];
+        if (root->vbr_ledger_sibling_ != nullptr) {
+            if (UINT64_MAX - pending < root->vbr_ledger_sibling_->vbr_grant_pending_[busid]) {
+                return false;
+            }
+            pending += root->vbr_ledger_sibling_->vbr_grant_pending_[busid];
+        }
+        llama_vram_marker_fields f = {};
+        f.vbr = 1;
+        f.serviced = llama_vram_marker_serviced_flag() ? 1u : 0u;
+        f.shed_available = 0;
+        // Withdraw only the new offer.  A prior committed wave may still own a bridge until its
+        // deferred tails flush; replacing that with zero would let another donor under-shed.
+        f.grant_pending = pending;
+        uint64_t created_ts = 0;
+        if (!llama_vram_marker_publish(busid, f, &created_ts)) {
+            // The substrate may have completed the rename and then failed to reopen the new path.
+            // Forget every affected cache entry so the next pass republishes instead of beating a
+            // stale/unlinked descriptor; earlier successful zero-intent writes remain safe.
+            for (const auto & affected : busids) {
+                root->vbr_marker_pub_.erase(affected);
+                root->vbr_tx_suppress(affected);
+            }
+            return false;
+        }
+        root->vbr_marker_pub_[busid] = { 0, pending };
+        root->vbr_marker_created_ts_[busid] = created_ts;
+        root->vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+    }
+    return true;
+}
+
+void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_id) {
+    for (const auto & state : tx.children) {
+        GGML_ASSERT(state.cache->vbr_degrade_cursor_ == state.start_cursor);
+        GGML_ASSERT(state.cache->vbr_tier_epoch_ == state.start_epoch);
+        for (size_t ikv = 0; ikv < state.cache->layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const ggml_type expected = state.types_before[ikv*2 + side];
+                const ggml_tensor * tensor = side
+                        ? state.cache->layers[ikv].v : state.cache->layers[ikv].k;
+                if (expected != GGML_TYPE_COUNT) {
+                    GGML_ASSERT(tensor != nullptr && tensor->type == expected);
+                }
+            }
+        }
+    }
+    for (const auto & step : tx.steps) {
+        auto & child_state = tx.children[step.child_idx];
+        llama_kv_cache * child = child_state.cache;
+        GGML_ASSERT(step.ikv < child->layers.size());
+        ggml_tensor * canonical = step.is_v
+                ? child->layers[step.ikv].v : child->layers[step.ikv].k;
+        GGML_ASSERT(canonical != nullptr && canonical->type == step.type_a);
+
+        const auto & units = child->vbr_units_of(step.ikv, step.is_v);
+        for (auto & [pp, ep] : units) {
+            const size_t pi = (size_t) (pp - child->vbr_pools_.data());
+            const vbr_tx_extent_key key { step.child_idx, pi, step.ikv, step.is_v };
+            const auto endpoint = tx.endpoints.find(key);
+            GGML_ASSERT(endpoint != tx.endpoints.end());
+            GGML_ASSERT(pp->be->vmm_pool_mapped_in_range(
+                    pp->vmm, ep->byte_off, endpoint->second.final_span) ==
+                    endpoint->second.final_span);
+
+            const int64_t n_cells = pp->wm_cells;
+            if (n_cells <= 0) {
+                continue;
+            }
+            GGML_ASSERT(pp->backend != nullptr);
+            if (!pp->wave_pending) {
+                pp->be->sync_device(pp->device);
+            }
+
+            const bool capture = child->vbr_stash_rows_ > 0 && ep->stash_valid == 0 &&
+                    ggml_is_turbo_kv_type(step.type_a) &&
+                    step.type_a != GGML_TYPE_TURBO8_0;
+            const uint32_t capture_rows = capture
+                    ? std::min(child->vbr_stash_rows_, pp->wm_cells) : 0;
+            const void * stash_ptr = nullptr;
+            int64_t stash_rows = 0;
+            if (capture_rows > 0) {
+                GGML_ASSERT(pp->stash_vmm != nullptr);
+                char * base = (char *) pp->be->vmm_pool_base(pp->stash_vmm);
+                pp->be->kv_stash_capture(
+                        pp->backend, ep->t, base + ep->stash_off,
+                        capture_rows, step.is_v);
+                ep->stash_valid = capture_rows;
+            }
+            if (ep->stash_valid > 0 && pp->stash_vmm != nullptr) {
+                stash_ptr = (char *) pp->be->vmm_pool_base(pp->stash_vmm) + ep->stash_off;
+                stash_rows = ep->stash_valid;
+            }
+
+            const vbr_span span = vbr_span_of(
+                    ep->t, step.type_b, n_cells,
+                    std::max(pp->wm_cells, child_state.incoming_wm), pp->gran);
+            vbr_scrub_span scrub;
+            GGML_ASSERT(vbr_scrub_span_of(
+                ep->t, step.type_a, n_cells, span, pp->gran, scrub));
+            const ggml_vbr_transcode_params params = {
+                /* .src         =*/ ep->t,
+                /* .type_B      =*/ step.type_b,
+                /* .dst         =*/ ep->t->data,
+                /* .pool_buf    =*/ pp->buf,
+                /* .n_cells     =*/ n_cells,
+                /* .is_v        =*/ step.is_v,
+                /* .stash_f16   =*/ stash_ptr,
+                /* .stash_rows  =*/ stash_rows,
+                /* .scrub_bytes =*/ scrub.scrub_end - scrub.keep,
+            };
+            pp->be->kv_transcode(pp->backend, &params);
+            pp->wave_pending = true;
+        }
+
+        vbr_set_tensor_type_noalloc(
+                canonical,
+                step.is_v ? child->layers[step.ikv].v_stream
+                          : child->layers[step.ikv].k_stream,
+                step.type_b);
+        child->vbr_degrade_cursor_ = step.order_idx + 1;
+        child->vbr_tier_epoch_++;
+        // Tree sheds bypass vbr_degrade_next(), so publish the same representation transition
+        // here at the atomic tree commit point. The root operation manifest covers every armed
+        // child instance and this exact id authenticates each child's unit publication.
+        child->vbr_representation_changed();
+        if (auto * tracker = child->vbr_generation_tracker_mut()) {
+            const uint8_t promote_hops = units.empty() ? 0 : units.front().second->promote_hops;
+            const auto transition = step.type_a == GGML_TYPE_F16 &&
+                                            step.type_b == GGML_TYPE_TURBO8_0
+                    ? vbr_repr_transition::degrade_f16_to_t8_admitted
+                    : vbr_repr_transition::degrade_other;
+            GGML_ASSERT(tracker->publish_unit(
+                    static_cast<uint32_t>(step.ikv * 2 + (step.is_v ? 1 : 0)),
+                    static_cast<int32_t>(step.type_a),
+                    static_cast<int32_t>(step.type_b),
+                    step.type_b == GGML_TYPE_F16 || step.type_b == GGML_TYPE_TURBO8_0
+                            ? vbr_repr_domain::full
+                            : vbr_repr_domain::tapped,
+                    promote_hops,
+                    transition,
+                    vbr_mutation_registrant::degrade_next,
+                    operation_id));
+        }
+        child->vbr_quiet_boundaries_ = 0;
+    }
+
+    for (auto & [key, endpoint] : tx.endpoints) {
+        GGML_UNUSED(key);
+        if (endpoint.gross_release == 0 || endpoint.final_span >= endpoint.slot_span) {
+            continue;
+        }
+        const size_t off = endpoint.extent->byte_off + endpoint.final_span;
+        const size_t len = endpoint.slot_span - endpoint.final_span;
+        if (endpoint.touched && endpoint.live) {
+            endpoint.pool->unmap_deferred.push_back({ off, len });
+        } else {
+            endpoint.pool->be->vmm_pool_unmap(endpoint.pool->vmm, off, len);
+        }
+    }
+
+    for (auto & state : tx.children) {
+        llama_kv_cache * child = state.cache;
+        vbr_hard_seal_defer_jumped_steps(
+            child->vbr_hard_seal_deferred_,
+            state.sealed_deferred,
+            state.final_cursor);
+        child->vbr_degrade_cursor_ = state.final_cursor;
+        for (auto & p : child->vbr_pools_) {
+            if (p.vmm != nullptr) {
+                p.wm_cells = std::max(p.wm_cells, state.incoming_wm);
+                p.budget_eff_stamp = ~0ull;
+                p.scratch_rows_epoch = ~0ull;
+            }
+        }
+    }
+
+    for (auto & plan : tx.planned_grants) {
+        tx.children[plan.child_idx].cache->vbr_grants_.push_back(std::move(plan.row));
+    }
+
+    for (const auto & [pkey, pending] : tx.deferred_by_pool) {
+        if (pending == 0) {
+            continue;
+        }
+        llama_kv_cache * child = tx.children[pkey.child_idx].cache;
+        auto & pool = child->vbr_pools_[pkey.pool_idx];
+        uint64_t & current = child->vbr_grant_pending_[child->vbr_pool_busid(pool)];
+        GGML_ASSERT(pending <= UINT64_MAX - current);
+        current += pending;
+    }
+    for (auto & state : tx.children) {
+        state.cache->vbr_apply_grant_decrements();
+    }
+}
+
+llama_kv_cache::vbr_tx_result llama_kv_cache::vbr_execute_tree_shed(
+        const llama_vram_peer_claim & c, uint64_t target, uint32_t n_tokens) {
+    vbr_tx_result result;
+    if (target == 0) {
+        return result;
+    }
+    llama_kv_cache * root = vbr_tree_root();
+    const bool root_frozen = root->vbr_retier_defer("peer_tree_shed");
+    const bool sibling_frozen = root->vbr_ledger_sibling_ != nullptr &&
+            root->vbr_ledger_sibling_->vbr_retier_defer("peer_tree_shed");
+    if (root_frozen || sibling_frozen) {
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    const auto demanded = root->vbr_tree_find_pool(c.busid);
+    if (demanded.pool == nullptr) {
+        return result;
+    }
+    if (!root->vbr_tx_settle_tree()) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+
+    vbr_shed_tx tx;
+    tx.demanded_device = demanded.pool->device;
+    tx.target = target;
+    auto append_child = [&](llama_kv_cache * child) {
+        if (child == nullptr || !child->vbr_vmm_active()) {
+            return;
+        }
+        vbr_tx_child state;
+        state.cache = child;
+        state.incoming_wm = child->vbr_watermark_cells(n_tokens);
+        state.start_cursor = child->vbr_degrade_cursor_;
+        state.final_cursor = state.start_cursor;
+        state.start_epoch = child->vbr_tier_epoch_;
+        child->vbr_sim_seed(state.types_before, /* pooled_only = */ true,
+                GGML_TYPE_COUNT, GGML_TYPE_COUNT, nullptr, nullptr, nullptr);
+        state.types_after = state.types_before;
+        tx.children.push_back(std::move(state));
+    };
+    append_child(root);
+    append_child(root->vbr_ledger_sibling_);
+    if (tx.children.empty()) {
+        return result;
+    }
+
+    std::vector<llama_vbr_policy::child> policy_children;
+    policy_children.reserve(tx.children.size());
+    for (size_t i = 0; i < tx.children.size(); ++i) {
+        auto policy = tx.children[i].cache->vbr_policy_child_stream(
+            tx.demanded_device, tx.children[i].incoming_wm);
+        tx.children[i].sealed_deferred = policy.blocked_order_indices;
+        policy_children.push_back(std::move(policy));
+    }
+
+    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    bool planned = llama_vbr_transaction::prefix_feasible(
+            tx.devices, tx.demanded_device, tx.target);
+    if (!planned) {
+        llama_vbr_policy::shortest_prefix_stream stream(std::move(policy_children));
+        std::vector<llama_vbr_policy::selection> prefix;
+        const auto selected = stream.shortest_prefix(
+                [&](const std::vector<llama_vbr_policy::selection> & candidate) {
+                    tx.policy_prefix = candidate;
+                    if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+                        return false;
+                    }
+                    return llama_vbr_transaction::prefix_feasible(
+                            tx.devices, tx.demanded_device, tx.target);
+                }, prefix);
+        if (selected != llama_vbr_policy::result::selected) {
+            return result;
+        }
+        tx.policy_prefix = std::move(prefix);
+        planned = true;
+    }
+    GGML_ASSERT(planned);
+
+    if (!root->vbr_tx_hard_seal_allowed(tx)) {
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    if (!root->vbr_tx_preflight(tx) ||
+        !root->vbr_tx_reprice(tx, /* actual = */ true) ||
+        !llama_vbr_transaction::prefix_feasible(
+                tx.devices, tx.demanded_device, tx.target)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+
+    while (!tx.policy_prefix.empty()) {
+        const auto removed = tx.policy_prefix.back();
+        tx.policy_prefix.pop_back();
+        if (!root->vbr_tx_reprice(tx, /* actual = */ false)) {
+            tx.policy_prefix.push_back(removed);
+            GGML_ASSERT(root->vbr_tx_reprice(tx, /* actual = */ true));
+            break;
+        }
+        if (!root->vbr_tx_map_endpoints(tx)) {
+            tx.policy_prefix.push_back(removed);
+            if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+                !llama_vbr_transaction::prefix_feasible(
+                        tx.devices, tx.demanded_device, tx.target)) {
+                root->vbr_tx_suppress(c.busid);
+                result.status = vbr_tx_status::retryable_no_tier_mutation;
+                return result;
+            }
+            break;
+        }
+        if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+            !llama_vbr_transaction::prefix_feasible(
+                    tx.devices, tx.demanded_device, tx.target)) {
+            tx.policy_prefix.push_back(removed);
+            if (!root->vbr_tx_reprice(tx, /* actual = */ true) ||
+                !llama_vbr_transaction::prefix_feasible(
+                        tx.devices, tx.demanded_device, tx.target)) {
+                root->vbr_tx_suppress(c.busid);
+                result.status = vbr_tx_status::retryable_no_tier_mutation;
+                return result;
+            }
+            break;
+        }
+    }
+
+    // One operation spans the atomic tree transaction. Its immutable manifest names every
+    // armed child instance, so the no-fail apply below can cite one id for all unit publications.
+    vbr_operation_binding shed_binding;
+    shed_binding.kind        = vbr_operation_kind::controller_retier;
+    shed_binding.child_phase = vbr_operation_phase::mutate;
+    for (const auto & state : tx.children) {
+        const vbr_controller_instance_id instance = state.cache->vbr_instance_id();
+        if (vbr_controller_instance_id_is_set(instance)) {
+            GGML_ASSERT(vbr_binding_add_instance_target(
+                    shed_binding,
+                    vbr_operation_kind::controller_retier,
+                    vbr_operation_class::controller,
+                    instance, VBR_STREAM_ANY, -1, -1, -1));
+        }
+    }
+    vbr_mutation_op shed_op(root, shed_binding, /* provenance_bearing = */ false);
+    const vbr_mutation_op::success_on_return shed_ok(shed_op);
+    if (shed_binding.n_targets > 0 && !shed_op.active()) {
+        // The root's refused scope already latched its own tracker unavailable. Propagate the
+        // same one-id refusal to every other armed child before the legacy tree mutation proceeds;
+        // otherwise a sibling could retain apparently valid evidence for an uncited tier flip.
+        for (const auto & state : tx.children) {
+            if (state.cache == root || state.cache->vbr_generation_tracker_get() == nullptr) {
+                continue;
+            }
+            state.cache->vbr_adopt_refused();
+            {
+                vbr_mutation_op refused_child(
+                        state.cache,
+                        vbr_operation_kind::controller_retier,
+                        vbr_operation_class::controller,
+                        -1, -1, -1);
+            }
+            state.cache->vbr_release_adopted();
+        }
+    }
+
+    if (!root->vbr_tx_prepare_commit(tx, c) ||
+        !root->vbr_tx_publish_zero_intent(tx)) {
+        root->vbr_tx_suppress(c.busid);
+        result.status = vbr_tx_status::retryable_no_tier_mutation;
+        return result;
+    }
+    const auto demanded_cost = tx.devices.find(tx.demanded_device);
+    GGML_ASSERT(demanded_cost != tx.devices.end() && demanded_cost->second.capacity_signed >= 0);
+    result.credited = std::min<uint64_t>(
+            tx.target, (uint64_t) demanded_cost->second.capacity_signed);
+    root->vbr_tx_apply(tx, vbr_cited_op());
+    root->vbr_offer_suppressed_until_.erase(c.busid);
+    result.status = vbr_tx_status::committed;
+    return result;
+}
+
 bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
                                          const std::vector<llama_vram_peer_marker> & peers,
-                                         uint64_t now, uint32_t wm_next) {
+                                         const std::set<std::string> & announced,
+                                         uint64_t now, uint32_t n_tokens) {
     bool grants_changed = false;
     // ---- demand service: rank-0 shed sizing ----
     // one band per donor per session-generation is enforced by the band cursor itself
@@ -4497,30 +9496,30 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             continue;
         }
         // already granted to this (pid, starttime, ver) on this device? one decision, one shed
-        bool granted = false;
-        for (const auto & g : vbr_grants_) {
-            if (g.pid == c.pid && g.starttime == c.starttime && g.ver == c.fields.ver &&
-                g.busid == c.busid && !g.collateral) {
-                granted = true;
-                break;
-            }
-        }
-        if (granted || vbr_budget_explicit_) {
+        if (vbr_tree_has_grant(c) || vbr_tree_budget_explicit()) {
             continue;
         }
         // does the demand name one of our devices, and do we have an offer there?
-        vbr_pool * demanded_pool = vbr_find_pool(c.busid);
-        if (demanded_pool == nullptr) {
+        const auto demanded = vbr_tree_find_pool(c.busid);
+        if (demanded.pool == nullptr) {
             continue;
         }
-        const size_t our_offer = vbr_shed_available(demanded_pool->device);
-        const size_t sib_offer = vbr_ledger_sibling_ != nullptr
-            ? vbr_ledger_sibling_->vbr_shed_available(demanded_pool->device) : 0;
+        vbr_pool * demanded_pool = demanded.pool;
+        llama_kv_cache * root = vbr_tree_root();
+        const size_t our_offer = vbr_child_offer(root, c.busid);
+        const size_t sib_offer = vbr_child_offer(root->vbr_ledger_sibling_, c.busid);
         if (our_offer + sib_offer == 0) {
             continue;
         }
+        const auto own_ts = vbr_marker_created_ts_.find(c.busid);
+        if (announced.count(c.busid) != 0 || own_ts == vbr_marker_created_ts_.end() || own_ts->second == 0) {
+            // A newly announced donor waits one scan so every contender ranks against a
+            // pre-existing offer set. Failed/unknown publication can never imply rank zero.
+            continue;
+        }
+        const uint64_t self_created_ts = own_ts->second;
         // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
-        // our created_ts is the marker's first-publish time; peers' come from the scan
+        // both sides use the marker registry's preserved first-publish timestamp
         bool rank0 = true;
         for (const auto & m : peers) {
             if (m.busid != c.busid || m.fields.shed_available == 0) {
@@ -4532,11 +9531,8 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
                     >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
                 continue; // stale offer — not a competitor
             }
-            // peers' created_ts vs ours: ours is unknowable from our own map (publish
-            // stamps it internally) — use pid as the deterministic total order fallback
-            // when created_ts ties are possible; the ledger's created_ts is authoritative
-            if (m.created_ts_ns < vbr_marker_created_ts_ ||
-                (m.created_ts_ns == vbr_marker_created_ts_ && m.pid < llama_vram_ledger_self_pid())) {
+            if (m.created_ts_ns < self_created_ts ||
+                (m.created_ts_ns == self_created_ts && m.pid < llama_vram_ledger_self_pid())) {
                 rank0 = false;
                 break;
             }
@@ -4549,7 +9545,8 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
         // headroom_eff = base x N_live (spec normative — flat base would undershed by
         // (N_live-1) x base exactly when the census matters)
-        const size_t headroom_eff = llama_vram_headroom_bytes() * vbr_pool_n_live(*demanded_pool);
+        const size_t headroom_eff = llama_vram_headroom_bytes() *
+                demanded.child->vbr_pool_n_live(*demanded_pool);
         uint64_t peers_pending = 0;
         for (const auto & m : peers) {
             if (m.busid == c.busid) {
@@ -4566,86 +9563,24 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         const uint64_t shortfall = c.fields.bytes_total_remaining_est - covered;
         const uint64_t target    = std::min<uint64_t>(our_offer + sib_offer, shortfall);
 
-        // parent-level iSWA servicing: the SUM of both children's offers backed the
-        // sufficiency above; split the target by offer weight (footprint-proportional —
-        // the offer IS the freeable footprint) and let each child shed its own portion
-        // with its own grants, decrements and pending. Non-iSWA: sibling is null and the
-        // whole target is ours.
-        // (our_offer + sib_offer > 0 guaranteed by the continue above)
-#ifdef _MSC_VER
-        const uint64_t own_target = (uint64_t) ((double) target * our_offer / (our_offer + sib_offer));
-#else
-        const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
-#endif
-        size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
-        grants_changed = grants_changed || freed_own > 0;
-        if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
-            vbr_ledger_sibling_->vbr_execute_shed(c, target - freed_own, wm_next);
+        // One root-owned transaction interleaves the children by the existing pure quality
+        // policy, then prices every physical device before changing either child's tier state.
+        const vbr_tx_result shed = root->vbr_execute_tree_shed(c, target, n_tokens);
+        if (shed.status == vbr_tx_status::committed) {
+            grants_changed = true;
+            LLAMA_LOG_INFO("%s: atomic VBR tree shed for pid %d on %s: %.1f MiB net credit\n",
+                    __func__, c.pid, c.busid.c_str(), shed.credited/1048576.0);
+            // One physical wave per scan.  Its pending bridge must be published and its tails
+            // flushed before another claim is sized from free memory and exact residency.
+            break;
+        } else if (shed.status == vbr_tx_status::retryable_no_tier_mutation) {
+            // Donation is optional. A retryable planning, reservation, mapping, preparation, or
+            // publication failure withdrew this donor's offer without changing tiers; it must not
+            // fail the resident's otherwise-valid batch.
+            break;
         }
     }
     return grants_changed;
-}
-
-// execute a demand shed of up to `target` bytes for claim c: band/consent-capped degrade
-// waves, one grant row per pool the wave freed bytes in (collateral on non-demanded
-// devices), grant_pending on each affected device's marker. Runs after the pool's own
-// degrade loop at a boundary; the caller's fence-arm covers the queued waves. Returns
-// the bytes freed on the DEMANDED device.
-size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
-    if (target == 0) {
-        return 0;
-    }
-    vbr_pool * demanded_pool = vbr_find_pool(c.busid);
-    if (demanded_pool == nullptr) {
-        return 0;
-    }
-    std::vector<size_t> proj_before(vbr_pools_.size(), 0);
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        if (vbr_pools_[pi].vmm != nullptr) {
-            proj_before[pi] = vbr_vmm_projected_bytes(vbr_pools_[pi], wm_next);
-        }
-    }
-    const size_t band_limit = vbr_demand_limit();
-    size_t freed_demanded = 0;
-    while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
-        if (!vbr_degrade_next(wm_next)) {
-            break;
-        }
-        vbr_quiet_boundaries_ = 0;
-        freed_demanded = proj_before[demanded_pool - vbr_pools_.data()]
-                       - vbr_vmm_projected_bytes(*demanded_pool, wm_next);
-    }
-    bool changed = false;
-    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-        auto & p = vbr_pools_[pi];
-        if (p.vmm == nullptr) {
-            continue;
-        }
-        const size_t proj_now = vbr_vmm_projected_bytes(p, wm_next);
-        if (proj_now >= proj_before[pi]) {
-            continue;
-        }
-        const uint64_t freed = proj_before[pi] - proj_now;
-        vbr_grant_row g;
-        g.busid              = c.busid;
-        g.pid                = c.pid;
-        g.starttime          = c.starttime;
-        g.ver                = c.fields.ver;
-        g.pool_idx           = pi;
-        g.bytes              = freed;
-        g.bytes_now_at_grant = c.bytes_now;
-        g.collateral         = vbr_pool_busid(p) != c.busid;
-        vbr_grants_.push_back(std::move(g));
-        changed = true;
-        vbr_grant_pending_[vbr_pool_busid(p)] += freed;
-        LLAMA_LOG_INFO("%s: co-tenancy shed for pid %d on %s: %.1f MiB freed from pool #%zu%s\n",
-                __func__, c.pid, c.busid.c_str(), freed/1048576.0, pi,
-                g.collateral ? " (collateral)" : "");
-    }
-    if (changed) {
-        vbr_apply_grant_decrements(); // sibling-hosted grants decrement sibling budgets
-    }
-    return freed_demanded;
 }
 
 void llama_kv_cache::vbr_grant_pending_clear() {
@@ -4668,22 +9603,43 @@ void llama_kv_cache::vbr_grant_pending_clear() {
 
 }
 
-void llama_kv_cache::vbr_markers_publish(uint64_t now) {
+void llama_kv_cache::vbr_markers_publish(std::set<std::string> * changed) {
     // ---- marker publish / beat (write discipline: rename only on field change) ----
-    for (auto & p : vbr_pools_) {
-        if (p.vmm == nullptr) {
-            continue;
+    std::set<std::string> busids;
+    auto collect_child = [&](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
         }
-        const std::string & busid = vbr_pool_busid(p);
-        if (busid == "-") {
-            continue;
+        for (auto & p : child->vbr_pools_) {
+            if (p.vmm != nullptr && child->vbr_pool_busid(p) != "-") {
+                busids.insert(p.busid);
+            }
         }
-        uint64_t offer   = vbr_budget_explicit_ ? 0 : (uint64_t) vbr_shed_available(p.device);
+    };
+    collect_child(this);
+    collect_child(vbr_ledger_sibling_);
+    for (const auto & busid : busids) {
         uint64_t pending = vbr_grant_pending_[busid];
-        if (vbr_ledger_sibling_ != nullptr && !vbr_budget_explicit_) {
-            // one marker per tree: the offer peers see is the SUM of both children
-            offer   += vbr_ledger_sibling_->vbr_shed_available(p.device);
+        if (vbr_ledger_sibling_ != nullptr) {
             pending += vbr_ledger_sibling_->vbr_grant_pending_[busid];
+        }
+        const auto child_busy = [&](const llama_kv_cache * child) {
+            if (child == nullptr) {
+                return false;
+            }
+            for (const auto & p : child->vbr_pools_) {
+                if (p.vmm != nullptr && p.busid == busid &&
+                    (p.wave_pending || !p.unmap_deferred.empty())) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool tree_busy = child_busy(this) || child_busy(vbr_ledger_sibling_);
+        uint64_t offer = 0;
+        if (!vbr_tree_budget_explicit() && pending == 0 && !tree_busy) {
+            offer = (uint64_t) vbr_child_offer(this, busid) +
+                    (uint64_t) vbr_child_offer(vbr_ledger_sibling_, busid);
         }
         auto pub = vbr_marker_pub_.find(busid);
         if (pub == vbr_marker_pub_.end() || pub->second.first != offer || pub->second.second != pending) {
@@ -4692,10 +9648,12 @@ void llama_kv_cache::vbr_markers_publish(uint64_t now) {
             f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
             f.shed_available = offer;
             f.grant_pending  = pending;
-            if (llama_vram_marker_publish(busid, f)) {
+            uint64_t created_ts = 0;
+            if (llama_vram_marker_publish(busid, f, &created_ts)) {
                 vbr_marker_pub_[busid] = { offer, pending };
-                if (vbr_marker_created_ts_ == 0) {
-                    vbr_marker_created_ts_ = now;
+                vbr_marker_created_ts_[busid] = created_ts;
+                if (changed != nullptr) {
+                    changed->insert(busid);
                 }
                 // our own rename: re-adopt the dir mtime so we don't trip our own pre-check
                 vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
@@ -4706,7 +9664,7 @@ void llama_kv_cache::vbr_markers_publish(uint64_t now) {
     }
 }
 
-void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
+void llama_kv_cache::vbr_ledger_scan_service(uint32_t n_tokens) {
     // explicit budgets still run the pass — they publish markers (shed_available = 0,
     // demand service skipped) so the demander's presence census stays complete
     if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
@@ -4715,11 +9673,22 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     vbr_ledger_force_ = false;
     vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
 
+    const uint64_t now = vbr_last_scan_ns_;
+
+    // The root-owned offer is page-exact only against a settled tree.  A current boundary may
+    // already have queued an ordinary budget wave on either child, so retire both children before
+    // querying ranges or publishing capacity.  This rare scan path deliberately pays the sync.
+    vbr_tx_settle_tree();
+    // Retire the pending bridge, then announce the current offer before taking the rank snapshot.
+    // A changed advert waits one scan; the post-service publish exposes the handoff immediately.
+    vbr_grant_pending_clear();
+    std::set<std::string> announced;
+    vbr_markers_publish(&announced);
+
     std::vector<llama_vram_peer_claim> claims;
     llama_vram_ledger_scan(claims);
     std::vector<llama_vram_peer_marker> peers;
     llama_vram_ledger_scan_markers(peers);
-    const uint64_t now = vbr_last_scan_ns_;
 
     vbr_presence_census(peers);
     bool grants_changed = vbr_grants_upkeep(claims, now);
@@ -4731,12 +9700,11 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
         }
         vbr_ledger_sibling_->vbr_grant_pending_clear();
     }
-    grants_changed = vbr_service_demands(claims, peers, now, wm_next) || grants_changed;
+    grants_changed = vbr_service_demands(claims, peers, announced, now, n_tokens) || grants_changed;
     if (grants_changed) {
         vbr_apply_grant_decrements();
     }
-    vbr_grant_pending_clear();
-    vbr_markers_publish(now);
+    vbr_markers_publish();
 }
 
 void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
@@ -4748,14 +9716,12 @@ void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants
     grants    += (uint32_t) vbr_grants_.size();
     // telemetry reports the PUBLISHED truth: an explicit budget never offers, so /slots
     // must not show peers an offer the marker does not carry
-    std::set<int> devs;
-    for (const auto & p : vbr_pools_) {
-        if (!vbr_budget_explicit_ && p.vmm != nullptr && devs.insert(p.device).second) {
-            offer += vbr_shed_available(p.device);
+    if (vbr_ledger_owner_) {
+        for (const auto & [busid, pub] : vbr_marker_pub_) {
+            GGML_UNUSED(busid);
+            offer += pub.first;
+            pending += pub.second;
         }
-    }
-    for (const auto & [busid, pend] : vbr_grant_pending_) {
-        pending += pend;
     }
 }
 
@@ -4818,6 +9784,20 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+llama_turbo_meansub_ref llama_kv_cache::get_turbo_meansub_ref(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return {};
+    }
+    return layers.at(it->second).turbo_meansub_ref;
+}
+
+const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return v_cells[seq_to_stream[seq_id]];
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -5633,19 +10613,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         uint32_t cell_range_begin = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            bool add_cell = true;
-
-            add_cell = add_cell && !cells.is_empty(i);
-            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
-
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
-
-            if (add_cell) {
+            if (state_write_includes_cell(cells, i, seq_id)) {
                 ++cell_count;
                 if (cell_range_begin == cells.size()) {
                     cell_range_begin = i;
@@ -5682,6 +10650,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // B6: imports are provenance-bearing — recovery reserved BEFORE the first read so a
+    // partial-import unwind autorecords and the boundary drain quarantines + invalidates.
+    vbr_mutation_op mutation_op(this, vbr_operation_kind::state_import,
+            vbr_operation_class::state_api, seq_id, 0, std::numeric_limits<llama_pos>::max(),
+            /*provenance_bearing=*/true);
+    const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -5697,6 +10671,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("n_stream mismatch");
     }
 
+    bool imported = false;
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
@@ -5716,7 +10691,12 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             // grown the VMM physical backing yet — state_read_data would write into unmapped VA
             vbr_vmm_ensure_mapped();
         }
-        res = res && state_read_data(io, strm, cell_count, sinfo);
+
+        try {
+            res = res && state_read_data(io, strm, cell_count, sinfo);
+        } catch (...) {
+            res = false;
+        }
 
         if (!res) {
             if (seq_id == -1) {
@@ -5725,6 +10705,56 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 seq_rm(seq_id, -1, -1);
             }
             throw std::runtime_error("failed to restore kv cache");
+        }
+        imported = true;
+    }
+
+    // state_read_data adopts bytes in their native current tier (including mixed-tier caches).
+    // Count the completed adoption once, independently of how many streams it populated.
+    if (imported) {
+        vbr_attention_content_changed();
+        vbr_generation_global(
+                seq_id == -1
+                        ? vbr_mutation_registrant::whole_import
+                        : vbr_mutation_registrant::state_read_install,
+                vbr_operation_class::state_api);
+        vbr_ownership_rebuild();
+    }
+}
+
+// A2 (altitude review): the one spelling of "update the index for every seq that owns a cell".
+// exclude_seq = -1 means none excluded; add=false removes.
+void llama_kv_cache::vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
+                                                   bool add, llama_seq_id exclude_seq) {
+    if (!vbr_ownership_) {
+        return;
+    }
+    // O(occupants) via the cell's own membership bitset (efficiency review: the all-seq probe
+    // was 12.8M bit tests per whole-cache edit at 200k cells x 64 seqs).
+    v_cells[stream].seq_for_each(cell, [&](llama_seq_id seq) {
+        if (seq == exclude_seq) {
+            return;
+        }
+        if (add) {
+            vbr_ownership_->add_cell(stream, seq, cell, pos);
+        } else {
+            vbr_ownership_->remove_cell(stream, seq, cell, pos);
+        }
+    });
+}
+
+// A2: one-time index rebuild at import/install boundaries (infrequent, sanctioned scan class).
+void llama_kv_cache::vbr_ownership_rebuild() {
+    if (!vbr_ownership_) {
+        return;
+    }
+    vbr_ownership_->clear_all();
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i)) {
+                vbr_ownership_update_all_seqs(s, i, cells.pos_get(i), /*add=*/true);
+            }
         }
     }
 }
@@ -5929,7 +10959,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
-        apply_ubatch(sinfo, ubatch);
+        // Native import publishes one controller-global generation only after state_read_data
+        // completes. Do not misclassify its preparatory cell placement as an ordinary append.
+        apply_ubatch(sinfo, ubatch, false);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -6195,13 +11227,32 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache_context
 //
 
-llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
+llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) :
+    status(status), max_graph_seqs(status == LLAMA_MEMORY_STATUS_SUCCESS ?
+            std::numeric_limits<uint32_t>::max() : 0) {
+}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, std::numeric_limits<uint32_t>::max()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t         max_graph_seqs_limit) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream_physical = kv->get_n_stream();
+    if (max_graph_seqs_limit == 0 || n_stream_physical == 0) {
+        status = LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+        max_graph_seqs = 0;
+        return;
+    }
+    // Unified KV has one physical stream but may represent every configured logical
+    // sequence. Keep physical graph layout separate from the composite's logical cap.
+    const uint32_t n_stream = n_stream_physical == 1
+        ? 1
+        : std::min(n_stream_physical, max_graph_seqs_limit);
+    max_graph_seqs = max_graph_seqs_limit;
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);
@@ -6219,7 +11270,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_context * lctx,
         bool do_shift,
         stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+    // C4: unresolved recovery work IS an update — update() owns the quarantine drain and the
+    // monotone re-arm, and a NO_UPDATE short-circuit here would starve a latched tracker on
+    // quiet decode streams until an unrelated shift happened to run.
+    if (!do_shift && this->sc_info.empty() && !kv->vbr_recovery_service_pending()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }
@@ -6262,6 +11316,10 @@ llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
 
+uint32_t llama_kv_cache_context::get_max_graph_seqs() const {
+    return max_graph_seqs;
+}
+
 const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
@@ -6290,6 +11348,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+llama_turbo_meansub_ref llama_kv_cache_context::get_turbo_meansub_ref(int32_t il) const {
+    return kv->get_turbo_meansub_ref(il);
 }
 
 

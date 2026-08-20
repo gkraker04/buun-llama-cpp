@@ -37,7 +37,9 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params);
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
@@ -64,6 +66,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// True when the sampler initialized for this request is exactly equivalent to
+// selecting the token with the largest unmodified model logit.
+bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
@@ -81,6 +87,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // returns at least 1 token, up to idxs.size()
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+
+// Advance sampler state from already-selected target tokens, stopping after
+// the first disagreement with the draft. Requires sampled.size() ==
+// draft.size() + 1 and returns at least one token.
+std::vector<llama_token> common_sampler_accept_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & sampled,
+        const llama_tokens & draft);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
