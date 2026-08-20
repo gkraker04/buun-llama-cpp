@@ -373,6 +373,15 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+    GGML_ASSERT(tensor != nullptr);
+    return (reinterpret_cast<uintptr_t>(tensor->data) % alignment) == 0 &&
+           tensor->nb[1] % alignment == 0 &&
+           tensor->nb[2] % alignment == 0 &&
+           tensor->nb[3] % alignment == 0;
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
@@ -629,7 +638,8 @@ template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
 };
 
 template <block_reduce_method reduce_method_t, const unsigned int block_size_template = 0, typename T>
-static __device__ T block_reduce(T val, T * shared_vals) {
+static __device__ T block_reduce(T val, [[maybe_unused]] T * shared_vals) {
+    // for multi-warp reductions, callers must not reuse shared_vals until all reads from this invocation have completed
     val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
     const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
     if (block_size > WARP_SIZE) {
@@ -1262,7 +1272,7 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
 
-    // fattn scratch-allocation epoch at last capture — see ggml_cuda_fattn_scratch_epoch (fattn.cuh)
+    // owning backend context's fattn scratch-allocation epoch at last capture
     unsigned long long fattn_scratch_epoch_at_capture = 0;
 
     bool is_enabled() const {
@@ -1427,6 +1437,36 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_fattn_scratch_side {
+    half * cuda_buf = nullptr;
+    size_t cuda_size = 0;
+
+    ggml_vbr_vmm_pool * vmm = nullptr;
+    size_t vmm_va = 0;
+    size_t vmm_hw = 0;
+};
+
+struct ggml_cuda_fattn_scratch {
+    float * q_rot_buf = nullptr;
+    size_t q_rot_buf_size = 0;
+
+    ggml_cuda_fattn_scratch_side k;
+    ggml_cuda_fattn_scratch_side v;
+
+    // Address changes are invisible to graph node src[] metadata. CUDA graphs snapshot this
+    // context-local epoch and recapture before replaying a stale internal scratch address.
+    unsigned long long epoch = 0;
+};
+
+struct ggml_cuda_vbr_transcode_workspace {
+    uint8_t * cuda_buf  = nullptr;
+    size_t    cuda_size = 0;
+
+    ggml_vbr_vmm_pool * vmm    = nullptr;
+    size_t              vmm_va = 0;
+    size_t              vmm_hw = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1436,6 +1476,15 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    // Persistent flash-attention scratch belongs to this backend context, not to the process or
+    // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.
+    ggml_cuda_fattn_scratch fattn_scratch;
+
+    // Dedicated VBR side backends enqueue multiple transcodes on one stream. Their temporary
+    // planes can therefore reuse one context-owned, grow-only physical workspace without using
+    // the generic pool (whose growth is fatal and cannot be projected by the KV controller).
+    ggml_cuda_vbr_transcode_workspace vbr_transcode_workspace;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1681,4 +1730,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

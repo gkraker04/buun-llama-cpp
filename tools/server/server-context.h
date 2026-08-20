@@ -11,6 +11,27 @@
 #include <set>
 
 struct server_context_impl; // private implementation
+class server_cache_control_authority;
+
+// TEST-ONLY E1.1b door. It constructs the private server_slot, resolves a
+// scheduler family token, exercises the real no-restore cache load, and then
+// verifies that host/checkpoint carriers are sourced from that same slot.
+struct server_cache_family_slot_round_trip_result {
+    bool resolved = false;
+    bool second_resolved = false;
+    bool roles_distinct = false;
+    bool host_roles_distinct = false;
+    bool no_restore_resume = false;
+    bool binding_intact = false;
+    bool host_save_carries = false;
+    bool checkpoint_carries = false;
+};
+
+server_cache_family_slot_round_trip_result
+server_cache_family_slot_round_trip_for_test(
+        server_cache_control_authority & authority,
+        server_cache_control_token binding_token,
+        server_cache_control_token second_binding_token = {});
 
 struct server_context_meta {
     std::string build_info;
@@ -143,6 +164,8 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t post_cache_plan;
+    server_http_context::handler_t post_cache_control;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
@@ -179,6 +202,8 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_capture(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_import(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
 

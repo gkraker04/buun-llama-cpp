@@ -30,8 +30,8 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
 
     // Q2_0: 2 bits per element, 4 elements per byte.
     // Stored code c in {0,1,2,3} maps to symbol s = c - 1 in {-1, 0, +1, +2}.
-    const int byte_index_0 = iqs       / 4;
-    const int bit_offset_0 = (iqs      % 4) * 2;
+    const int byte_index_0 = iqs / 4;
+    const int bit_offset_0 = (iqs % 4) * 2;
 
     const int byte_index_1 = (iqs + 1) / 4;
     const int bit_offset_1 = ((iqs + 1) % 4) * 2;

@@ -46,6 +46,9 @@ GGML_BACKEND_API struct ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int 
 GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_free(struct ggml_vbr_vmm_pool * pool);
 GGML_BACKEND_API void * ggml_backend_cuda_vmm_pool_base(struct ggml_vbr_vmm_pool * pool);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_mapped(struct ggml_vbr_vmm_pool * pool);
+GGML_BACKEND_API uint64_t ggml_backend_cuda_vmm_pool_residency_epoch(struct ggml_vbr_vmm_pool * pool);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_mapped_in_range(
+        struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_map(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_unmap(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_clear(struct ggml_vbr_vmm_pool * pool);
@@ -67,8 +70,19 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
-// #88: boundary-time reserve of the fattn f16 dequant scratch (ggml-vbr.h vtable slot)
-GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(int device, size_t k_bytes, size_t v_bytes);
+// #88: boundary-time reserve of one backend context's fattn f16 dequant scratch
+// (ggml-vbr.h vtable slot)
+GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(
+        ggml_backend_t backend, size_t k_bytes, size_t v_bytes);
+GGML_BACKEND_API void ggml_backend_cuda_kv_dequant_scratch_memory(
+        ggml_backend_t backend, size_t k_bytes, size_t v_bytes,
+        size_t * physical_now, size_t * physical_if_reserved);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_memory(
+        ggml_backend_t backend_or_null, int device,
+        int64_t n_cells, int64_t ne0, int64_t stash_rows,
+        size_t * physical_now, size_t * physical_if_reserved);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_transcode_workspace_reserve(
+        ggml_backend_t backend, int64_t n_cells, int64_t ne0, int64_t stash_rows);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

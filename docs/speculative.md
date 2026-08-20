@@ -52,6 +52,34 @@ Supported EAGLE-3 draft models include:
 
 For the full and up-to-date list of supported models, see #18039.
 
+### Native MTP (`draft-mtp`)
+
+Qwen3.5, Qwen3.6, and Qwen3.8 27B models can use their native next-token-prediction
+layer as an external MTP sidecar. For a standalone Qwen-27B MTP GGUF with a full
+output head, `llama-server` automatically creates a smaller derived sidecar in the
+llama.cpp cache directory. The original GGUF is never modified. Subsequent starts
+reuse the derivative.
+
+The derivative scores a frequency-ranked 32,768-token subset in the draft model and
+maps those logits back to the full target vocabulary with `d2t`. The map is the
+MIT-licensed [public balanced map](https://huggingface.co/Avifenesh/memra-bench/blob/main/mtp-Qwen3.6-27B-Q4_K_M-frspec-balanced32768.gguf)
+from Avifenesh/memra-bench, built from a reproducible 50/50 code-prose corpus for
+the Qwen3.6/3.8 tokenizer family. The target
+model still verifies every proposed token over its complete vocabulary, so speculative
+decoding remains lossless; an omitted draft token can reduce acceptance but cannot
+change accepted target output.
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \
+    --spec-type draft-mtp --spec-mtp-vocab-size 32768
+```
+
+`--spec-mtp-vocab-size` defaults to the measured 32768 map. `0` disables automatic
+repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
+Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads saved.
+Unsupported architectures, model sizes, split files, and already-trimmed sidecars
+fall back to their original behavior.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
@@ -77,6 +105,38 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 See:
 
 - #22105
+
+### DSpark (`draft-dspark`)
+
+DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
+block per forward pass, but each block position's logits are biased by a low-rank term keyed on
+the previous token, chained in-graph across the block. This keeps drafting at one decode per
+block while recovering some of the left-to-right signal that pure block diffusion loses.
+
+The draft is a small DeepSpec checkpoint trained for a specific target (for example
+[`deepseek-ai/dspark_qwen3_4b_block7`](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7)
+for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the target's tokenizer
+and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py deepseek-ai/dspark_qwen3_4b_block7 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DSpark.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
+
+Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+(e.g. Gemma4) is planned.
+
+See:
+
+- #25173
 
 ### n-gram Cache (`ngram-cache`)
 
@@ -173,7 +233,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -196,6 +256,10 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-mtp-vocab-size                   N
+                                        Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables
+                                        (default: 32768)
+                                        (env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -314,6 +378,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `draft-simple` | Use a simple draft model for speculation |
 | `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
 | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
+| `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
 | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |

@@ -4,7 +4,7 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 17)
+set(GGML_VERSION_MINOR 19)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -220,6 +220,8 @@ option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Lib
 # Upstream defaults this ON (VMM off) for broad HW safety; flip OFF here so AMD gets VMM without
 # the -DGGML_HIP_NO_VMM=OFF flag. Set it ON again for any card where HIP VMM misbehaves.
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 OFF)
+# fork: upstream removed rocWMMA FlashAttention (#26046); kept fork-side — the
+# RDNA4 f16 prefill widening (cb0d7779c) is a measured win on this path.
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)

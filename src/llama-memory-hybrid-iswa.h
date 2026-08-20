@@ -58,12 +58,40 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool can_seq_rm_partial() const override {
+        return mem_attn->can_seq_rm_partial() && mem_recr->can_seq_rm_partial();
+    }
 
     double kv_bpv() const override { return mem_attn->kv_bpv(); }
 
     // recurrent state has no VBR controller and clears with rm-all; the attn cache answers
     llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override {
         return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
+    }
+
+    bool vbr_operation_armed() const override {
+        return mem_attn->vbr_operation_armed();
+    }
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override {
+        return mem_attn->vbr_retier_freeze_begin(owner, operation_id);
+    }
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override {
+        mem_attn->vbr_retier_freeze_end(owner, operation_id);
+    }
+    void vbr_commit_submitted() override {
+        mem_attn->vbr_commit_submitted();
+    }
+    void vbr_decode_ops_finish(bool ok) override {
+        mem_attn->vbr_decode_ops_finish(ok);
+    }
+    void vbr_adopt_operation(vbr_operation_id operation_id) override {
+        mem_attn->vbr_adopt_operation(operation_id);
+    }
+    void vbr_release_adopted() override {
+        mem_attn->vbr_release_adopted();
+    }
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override {
+        return mem_attn->vbr_retier_preflight(n_tokens_extra);
     }
 
     // recurrent state has no deferred maintenance; the attn cache breathes
@@ -73,10 +101,20 @@ public:
         mem_attn->vbr_cotenancy_accum(d, g, o, p);
     }
 
+    bool vbr_ledger_tree_active() const override {
+        return mem_attn->vbr_ledger_tree_active();
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) override;
+    bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -141,6 +179,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    uint32_t get_max_graph_seqs() const override;
+
     // tier epoch of the attention child (the recurrent child has no VBR)
     uint64_t get_vbr_epoch() const override;
 
@@ -157,8 +197,8 @@ private:
 
     std::vector<llama_ubatch> ubatches;
 
-    const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+    const llama_memory_context_ptr ctx_attn;
 
     const llama_memory_status status;
 };
