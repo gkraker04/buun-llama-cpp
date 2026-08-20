@@ -1,5 +1,9 @@
 #include "llama-kv-cache-iswa.h"
 
+#include <exception>
+#include <limits>
+#include <optional>
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-model.h"
@@ -49,7 +53,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    const llama_memory_vbr_params & vbr) : unified(unified) {
+    const llama_memory_vbr_params & vbr) : swa_full(swa_full), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -87,6 +91,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // would target ~2x the configured mapped-physical total before degrading
     llama_memory_vbr_params vbr_base = vbr;
     llama_memory_vbr_params vbr_swa  = vbr;
+    // WS-0 (P1) trace: distinct VBR_TRACE files per child so BOTH schedules are recorded without
+    // the second open truncating the first (Sol review F2).
+    vbr_base.trace_label = "base";
+    vbr_swa.trace_label  = "swa";
     if (vbr.dynamic || vbr.budget_bytes > 0) {
         uint64_t n_base_l = 0;
         uint64_t n_swa_l  = 0;
@@ -168,7 +176,119 @@ void llama_kv_cache_iswa::vbr_finalize_prepare_failure(
     kv_vbr_root->vbr_finalize_failed_child(n_tokens, root_ran);
 }
 
+namespace {
+
+// A2 (review F10b): one operation per LOGICAL wrapper mutation. Minted here via the
+// operation-TU RAII (registry_begin never called from this file), adopted into both children
+// so their mutation scopes join the same id instead of minting divergent ones.
+// P2v2 (v6): a REFUSED mint propagates — children open refused (fail closed to
+// shadow-unavailable) instead of minting independently, preserving the A0 one-id invariant
+// even in refusal.
+struct iswa_forwarded_op {
+    // Synchronous families: armed iff the manifest carries at least one (armed-child) target.
+    iswa_forwarded_op(llama_kv_cache * base, llama_kv_cache * swa,
+                      const vbr_operation_binding & binding)
+        : iswa_forwarded_op(base, swa, binding, binding.n_targets > 0) {}
+
+    iswa_forwarded_op(llama_kv_cache * base, llama_kv_cache * swa,
+                      const vbr_operation_binding & binding, bool armed)
+        : base_(base), swa_(swa) {
+        if (!armed) {
+            return;
+        }
+        op_.emplace(binding);
+        if (*op_) {
+            base_->vbr_adopt_operation(op_->id());
+            swa_ ->vbr_adopt_operation(op_->id());
+            adopted_ = true;
+        } else {
+            base_->vbr_adopt_refused();
+            swa_ ->vbr_adopt_refused();
+            refused_ = true;
+        }
+    }
+    // P3v2 (v6): parent-declared FIXED participant slots, created before the first child
+    // apply. Children claim their slot in their scope constructors; detach transfers the
+    // still-open token; the root closes only at sealed && every declared slot terminal,
+    // failure dominating.
+    void adopt_composite(int32_t declared) {
+        if (adopted_) {
+            composite_ = std::make_shared<llama_kv_cache::vbr_composite_outcome>();
+            composite_->operation_id = op_->id();
+            composite_->declared     = declared;
+            base_->vbr_adopt_composite(composite_);
+            swa_ ->vbr_adopt_composite(composite_);
+        }
+    }
+    // Called with the children's apply result. With a composite the aggregate owns the root
+    // close from here: sealing folds the wrapper result and fails any never-claimed declared
+    // slot; the close fires once every declared slot is terminal (possibly right now, or at
+    // the sync fence for transferred tokens). Without one, close here, failure dominating.
+    void finalize(bool ok) {
+        if (!adopted_ && !refused_) {
+            return;
+        }
+        base_->vbr_release_adopted();
+        swa_ ->vbr_release_adopted();
+        adopted_ = refused_ = false;
+        // Refused roots fall through inert: composite_ was never built and *op_ is false.
+        if (composite_) {
+            op_->release();
+            composite_->seal(ok);
+        } else if (op_ && *op_) {
+            op_->close(ok ? vbr_operation_outcome::committed : vbr_operation_outcome::failed);
+        }
+    }
+    ~iswa_forwarded_op() {
+        if (adopted_ || refused_) {
+            // Exception/unwind before finalize: release the children and seal FAILED — the
+            // sealed+closed guards make any later pending report inert, never a double close.
+            base_->vbr_release_adopted();
+            swa_ ->vbr_release_adopted();
+            if (composite_) {
+                op_->release();
+                composite_->seal(false);
+            }
+        }
+        // Synchronous wrapper families commit at scope end; unwind fails (root RAII default).
+        if (op_ && *op_ && std::uncaught_exceptions() == exceptions_at_entry_) {
+            op_->close(vbr_operation_outcome::committed);
+        }
+    }
+    llama_kv_cache * base_;
+    llama_kv_cache * swa_;
+    std::optional<vbr_scoped_operation> op_;
+    std::shared_ptr<llama_kv_cache::vbr_composite_outcome> composite_;
+    bool adopted_ = false;
+    bool refused_ = false;
+    int  exceptions_at_entry_ = std::uncaught_exceptions();
+};
+
+// P5v2 (v6): synchronous wrapper families carry an exact-instance manifest — one target per
+// ARMED child, never an instance wildcard through default arguments. Raw public-API ranges
+// normalize here so the closed mint range rules see canonical values.
+vbr_operation_binding iswa_edit_binding(const llama_kv_cache * base, const llama_kv_cache * swa,
+                                        vbr_operation_kind kind, vbr_operation_class cls,
+                                        llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    vbr_normalize_edit_range(p0, p1);  // canonical range before the mint (P5v2)
+    vbr_operation_binding binding;
+    binding.kind        = kind;
+    binding.child_phase = vbr_operation_phase::mutate;
+    for (const vbr_controller_instance_id instance :
+            { base->vbr_instance_id(), swa->vbr_instance_id() }) {
+        vbr_binding_add_instance_target(
+            binding, kind, cls, instance, VBR_STREAM_ANY, seq_id, p0, p1);
+    }
+    return binding;
+}
+
+}  // namespace
+
 void llama_kv_cache_iswa::clear(bool data) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api,
+                              -1, 0, std::numeric_limits<llama_pos>::max()));
     kv_base->clear(data);
     kv_swa ->clear(data);
 }
@@ -176,28 +296,70 @@ void llama_kv_cache_iswa::clear(bool data) {
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = true;
 
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id, p0, p1));
     res = res & kv_base->seq_rm(seq_id, p0, p1);
     res = res & kv_swa ->seq_rm(seq_id, p0, p1);
 
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = true;
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id, p0, p1));
+    res = res & kv_base->seq_rm_transient(seq_id, p0, p1);
+    res = res & kv_swa ->seq_rm_transient(seq_id, p0, p1);
+    return res;
+}
+
+bool llama_kv_cache_iswa::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_transient(seq_id, p0, p1);
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id_dst, p0, p1));
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_kv_cache_iswa::try_seq_cp_transient(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id_dst, p0, p1));
+    const bool base = kv_base->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
+    const bool swa  = kv_swa ->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
+    return base && swa;
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
+    // The children's keep manifests declare the seq wildcard (membership leaves every OTHER
+    // sequence); the wrapper's shared manifest matches.
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api,
+                              -1, 0, std::numeric_limits<llama_pos>::max()));
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);
 }
 
 void llama_kv_cache_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id, p0, p1));
     kv_base->seq_add(seq_id, p0, p1, shift);
     kv_swa ->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    const iswa_forwarded_op forwarded(kv_base.get(), kv_swa.get(),
+            iswa_edit_binding(kv_base.get(), kv_swa.get(), vbr_operation_kind::sequence_edit,
+                              vbr_operation_class::state_api, seq_id, p0, p1));
     kv_base->seq_div(seq_id, p0, p1, d);
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
@@ -356,6 +518,22 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     r.deficit_clamped  = std::max(b.deficit_clamped, s.deficit_clamped);
     r.cursor           = b.cursor + s.cursor;
     r.used_cells_other = b.used_cells_other + s.used_cells_other;
+    // Representation epochs are identities, not quantities: preserve the ordered child tuple.
+    // Addition would make (base + 1, swa) collide with (base, swa + 1).
+    r.representation_epoch     = b.representation_epoch;
+    r.representation_epoch_swa = s.representation_epoch;
+    r.checkpoint_epoch         = b.checkpoint_epoch;
+    r.checkpoint_epoch_swa     = s.checkpoint_epoch;
+    // Scoped entry/exit is parent-coordinated, so depth and scope counts agree whenever both
+    // children are active. max also handles a model whose base or SWA side has no VBR layers.
+    r.retier_freeze_depth  = std::max(b.retier_freeze_depth, s.retier_freeze_depth);
+    r.retier_env_freeze    = std::max(b.retier_env_freeze,   s.retier_env_freeze);
+    r.retier_freeze_enters = std::max(b.retier_freeze_enters, s.retier_freeze_enters);
+    r.retier_freeze_exits  = std::max(b.retier_freeze_exits,  s.retier_freeze_exits);
+    r.retier_reconciles    = std::max(b.retier_reconciles,    s.retier_reconciles);
+    // Decisions are per-controller (base and SWA may see different pressure), so preserve both.
+    r.retier_deferred_decisions =
+        b.retier_deferred_decisions + s.retier_deferred_decisions;
 
     // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
     double bits_base = 0.0, vals_base = 0.0;
@@ -366,6 +544,90 @@ llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id s
     r.bpv_if_degraded = vals_sum > 0.0
         ? (b.bpv_if_degraded * vals_base + s.bpv_if_degraded * vals_swa) / vals_sum
         : 0.0;
+    return r;
+}
+
+bool llama_kv_cache_iswa::vbr_operation_armed() const {
+    return kv_base->vbr_operation_armed() || kv_swa->vbr_operation_armed();
+}
+
+bool llama_kv_cache_iswa::vbr_retier_freeze_begin(
+        const char * owner, vbr_operation_id operation_id) {
+    const bool base_armed = kv_base->vbr_operation_armed();
+    const bool swa_armed  = kv_swa ->vbr_operation_armed();
+    if (!base_armed && !swa_armed) {
+        return false;
+    }
+    if (vbr_retier_freeze_depth_ >= VBR_RETIER_FREEZE_MAX_DEPTH) {
+        return false;
+    }
+    const bool base_ok = !base_armed ||
+        kv_base->vbr_retier_freeze_begin(owner, operation_id);
+    if (!base_ok) {
+        return false;
+    }
+    const bool swa_ok = !swa_armed ||
+        kv_swa->vbr_retier_freeze_begin(owner, operation_id);
+    if (!swa_ok) {
+        if (base_armed) {
+            kv_base->vbr_retier_freeze_end(owner, operation_id);
+        }
+        return false;
+    }
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_++] = {
+        operation_id,
+        base_armed,
+        swa_armed,
+    };
+    return true;
+}
+
+void llama_kv_cache_iswa::vbr_retier_freeze_end(
+        const char * owner, vbr_operation_id operation_id) {
+    GGML_ASSERT(vbr_retier_freeze_depth_ > 0);
+    const vbr_retier_freeze_children children =
+        vbr_retier_freeze_stack_[vbr_retier_freeze_depth_ - 1];
+    GGML_ASSERT(children.operation_id == operation_id);
+
+    // Pair against the immutable begin record, never the current budget/armed state.
+    if (children.froze_base) {
+        kv_base->vbr_retier_freeze_end(owner, operation_id);
+    }
+    if (children.froze_swa) {
+        kv_swa->vbr_retier_freeze_end(owner, operation_id);
+    }
+    vbr_retier_freeze_depth_--;
+    vbr_retier_freeze_stack_[vbr_retier_freeze_depth_] = {};
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache_iswa::vbr_retier_preflight(
+        uint32_t n_tokens_extra) const {
+    const auto b = kv_base->vbr_retier_preflight(n_tokens_extra);
+    const auto s = kv_swa ->vbr_retier_preflight(n_tokens_extra);
+    llama_memory_vbr_preflight_data r = {};
+    r.active          = b.active || s.active;
+    r.fits            = b.fits && s.fits;
+    r.pools           = b.pools + s.pools;
+    r.watermark_cells = std::max(b.watermark_cells, s.watermark_cells);
+    r.bytes_needed    = b.bytes_needed + s.bytes_needed;
+    r.bytes_available = b.bytes_available + s.bytes_available;
+    // iSWA children normally share the same device set. Charge both growth requirements against
+    // one copy of the live-free pool (min of the child totals), not two: summing availability would
+    // false-accept two individually fitting children whose combined growth does not fit. On a
+    // future asymmetric multi-device layout this remains conservative (possible false reject).
+    r.physical_growth_needed =
+        b.physical_growth_needed + s.physical_growth_needed;
+    r.physical_growth_available = b.active && s.active
+        ? std::min(b.physical_growth_available, s.physical_growth_available)
+        : b.physical_growth_available + s.physical_growth_available;
+    const int64_t physical_deficit =
+        r.physical_growth_needed > r.physical_growth_available
+            ? (int64_t) (r.physical_growth_needed -
+                         r.physical_growth_available)
+            : 0;
+    r.max_deficit     = std::max(b.max_deficit, s.max_deficit);
+    r.max_deficit     = std::max(r.max_deficit, physical_deficit);
+    r.fits            = r.fits && physical_deficit == 0;
     return r;
 }
 
@@ -406,9 +668,15 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
-        llama_kv_cache_iswa * kv) :
-    ctx_base(kv->get_base()->init_full()),
-    ctx_swa (kv->get_swa ()->init_full()),
+        llama_kv_cache_iswa * kv) : llama_kv_cache_iswa_context(kv, std::numeric_limits<uint32_t>::max()) {
+}
+
+llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
+        llama_kv_cache_iswa * kv,
+        uint32_t              max_graph_seqs_limit) :
+    kv(kv),
+    ctx_base(new llama_kv_cache_context(kv->get_base(), max_graph_seqs_limit)),
+    ctx_swa (new llama_kv_cache_context(kv->get_swa (), max_graph_seqs_limit)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 
@@ -416,6 +684,7 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv,
         llama_context * lctx,
         bool optimize) :
+    kv(kv),
     ctx_base(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa (kv->get_swa ()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
@@ -426,6 +695,7 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         slot_info_vec_t sinfos_base,
         slot_info_vec_t sinfos_swa,
         std::vector<llama_ubatch> ubatches) :
+    kv(kv),
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_base(new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches)),
@@ -453,14 +723,61 @@ bool llama_kv_cache_iswa_context::apply() {
 
     bool res = true;
 
+    // KV-update / full contexts carry no decode ubatch — no composite decode operation
+    // (the children's own update paths handle their recovery drains).
+    if (ubatches.empty()) {
+        res = res & ctx_base->apply();
+        res = res & ctx_swa ->apply();
+        return res;
+    }
+
+    // C1 (v3 design) + P2v2/P3v2 (v6): the composite owns ONE logical decode operation with
+    // a FIXED parent-declared participant set. Both children apply under the adopted shared
+    // id (their scopes claim their slot and own tracker-local extent/recovery reservations).
+    // Manifest construction is ARMED-ONLY and TRANSACTIONAL: targets publish only when every
+    // armed child's ubatch scan succeeded; any overflow leaves a zero-target manifest, the
+    // registry refuses the mint, and the refusal PROPAGATES to both children — never
+    // independent minters (A0 one-id even in refusal).
+    const vbr_controller_instance_id base_instance = kv->get_base()->vbr_instance_id();
+    const vbr_controller_instance_id swa_instance  = kv->get_swa ()->vbr_instance_id();
+    const bool base_armed = vbr_controller_instance_id_is_set(base_instance);
+    const bool swa_armed  = vbr_controller_instance_id_is_set(swa_instance);
+    if (!base_armed && !swa_armed) {
+        res = res & ctx_base->apply();
+        res = res & ctx_swa ->apply();
+        return res;
+    }
+    const llama_ubatch & cur_ubatch = ubatches[i_next];
+    vbr_operation_binding composite_binding;
+    composite_binding.kind        = vbr_operation_kind::decode;
+    composite_binding.child_phase = vbr_operation_phase::mutate;
+    // A failed scan zeroes the whole manifest (transactional inside the builder).
+    (void) ((!base_armed || llama_kv_cache::vbr_decode_targets_from_ubatch(
+                    composite_binding, base_instance, false, VBR_STREAM_ANY, cur_ubatch)) &&
+            (!swa_armed  || llama_kv_cache::vbr_decode_targets_from_ubatch(
+                    composite_binding, swa_instance, true, VBR_STREAM_ANY, cur_ubatch)));
+    iswa_forwarded_op composite(kv->get_base(), kv->get_swa(), composite_binding, /*armed=*/true);
+    composite.adopt_composite((base_armed ? 1 : 0) + (swa_armed ? 1 : 0));
+
     res = res & ctx_base->apply();
     res = res & ctx_swa ->apply();
 
+    // P3v2 (v6): finalize folds the wrapper result and SEALS the aggregate; the root closes
+    // at sealed && every declared slot terminal — right now for all-synchronous applies, at
+    // the sync fence for transferred tokens — failure dominating.
+    composite.finalize(res);
     return res;
 }
 
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
     return status;
+}
+
+uint32_t llama_kv_cache_iswa_context::get_max_graph_seqs() const {
+    if (!ctx_base || !ctx_swa) {
+        return 0;
+    }
+    return std::min(ctx_base->get_max_graph_seqs(), ctx_swa->get_max_graph_seqs());
 }
 
 const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
@@ -483,4 +800,24 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
+}
+
+void llama_kv_cache_iswa::vbr_commit_submitted() {
+    kv_base->vbr_commit_submitted();
+    kv_swa ->vbr_commit_submitted();
+}
+
+void llama_kv_cache_iswa::vbr_decode_ops_finish(bool ok) {
+    kv_base->vbr_decode_ops_finish(ok);
+    kv_swa ->vbr_decode_ops_finish(ok);
+}
+
+void llama_kv_cache_iswa::vbr_adopt_operation(vbr_operation_id operation_id) {
+    kv_base->vbr_adopt_operation(operation_id);
+    kv_swa ->vbr_adopt_operation(operation_id);
+}
+
+void llama_kv_cache_iswa::vbr_release_adopted() {
+    kv_base->vbr_release_adopted();
+    kv_swa ->vbr_release_adopted();
 }

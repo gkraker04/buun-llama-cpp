@@ -28,6 +28,10 @@ struct child {
     // ineligible, matching the live selector's terminal_delta gate.
     int64_t terminal_progress = 0;
     std::vector<step> steps;
+    // Sealed steps omitted from this projection. A transaction that commits
+    // beyond one of these ordinals must defer it for a later boundary rather
+    // than losing it behind the monotone cursor.
+    std::vector<size_t> blocked_order_indices;
 };
 
 struct selection {

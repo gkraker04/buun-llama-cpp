@@ -3,9 +3,11 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "common-cache-family.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
+#include "llama.h"
 
 #include <set>
 #include <sstream>
@@ -44,6 +46,11 @@ struct common_time_meas {
 
     int64_t & t_acc;
 };
+
+// Defined by common-cache-plan.h. Fixed underlying type permits common_params
+// to carry the closed value without introducing the common.h <-> checkpoint-
+// shadow include cycle.
+enum class common_cache_plan_authority_level : uint8_t;
 
 struct common_adapter_lora_info {
     std::string path;
@@ -172,6 +179,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -237,14 +245,14 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
-    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
     float   penalty_present    = 0.00f;  // 0.0 = disabled
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
-    int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -287,18 +295,14 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
-    int32_t                  reasoning_budget_tokens   = -1;   // -1 = disabled, >= 0 = token budget
-    std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
-    std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
-    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
-    std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
-    bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
+    int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
+    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
+    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
+    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
+    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
-
-    bool has_logit_bias() const {
-        return !logit_bias.empty();
-    }
 
     // print the parameters into a string
     std::string print() const;
@@ -331,10 +335,15 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // Qwen-27B MTP-only sidecars: 32768 enables the experimental public
+    // balanced FR-Spec map; 0 keeps the full vocabulary (default).
+    uint32_t mtp_vocab_size = 0;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool dspark_gpu_assist = true; // keep lightweight DSpark layers/tail on a GPU when its backbone is CPU-resident
 
     common_params_model mparams;
 
@@ -428,7 +437,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -467,14 +476,6 @@ struct common_params_speculative {
     void set_type(common_speculative_type t) {
         types = { t };
     }
-};
-
-struct common_params_vocoder {
-    struct common_params_model model;
-
-    std::string speaker_file; // speaker file path
-
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
 };
 
 struct common_params_diffusion {
@@ -526,6 +527,21 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+enum common_moe_cache_mode {
+    COMMON_MOE_CACHE_MODE_OFF,
+    COMMON_MOE_CACHE_MODE_AUTO,
+    COMMON_MOE_CACHE_MODE_ON,
+    COMMON_MOE_CACHE_MODE_SOFT,
+};
+
+struct common_moe_cache_params {
+    common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
+    size_t budget_mib          = 0;
+    int expert_parallel        = 0;
+    bool mode_explicit         = false;
+    bool fit_selected          = false;
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -559,8 +575,13 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // Server-side auxiliary reservations may raise fit_params_target. Dynamic VBR should retain
+    // the caller's ordinary per-device safety headroom and account auxiliaries through live free
+    // memory instead of treating their bytes as permanently unavailable a second time.
+    uint64_t fit_params_vbr_growth_headroom_bytes = 0; // 0 = derive from fit_params_target
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -578,7 +599,6 @@ struct common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
@@ -653,9 +673,6 @@ struct common_params {
     bool logits_all        = true;  // see llama_context_params.logits_all
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
-    bool use_mmap          = true;  // enable mmap to use filesystem cache
-    bool use_direct_io     = false; // read from disk without buffering
-    bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
@@ -663,12 +680,15 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
+    bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
     std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
     std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
@@ -794,8 +814,36 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    // B0 shadow cache-plan observer: strictly zero observer work when disabled
+    bool cache_debug = false;
+
+    // Trusted-local, single-principal E0 cache-plan preview surface. This flag
+    // only exposes the route; ordinary requests allocate no observer/planner
+    // state merely because it is enabled.
+    bool cache_plan_preflight = false;
+
+    // Trusted-local, single-principal E1 cache-control HTTP surface. The
+    // scheduler authority remains unavailable unless cache lifecycle is also
+    // enabled; this flag only registers the reviewed routes.
+    bool cache_control_api = false;
+
+    // B-A graduated authority request. B-A0b dual-runs every non-off level but
+    // still executes legacy unconditionally; later ratchets consume the same
+    // closed spelling without another flag migration.
+    common_cache_plan_authority_level cache_plan_authority{}; // zero = off
+
+    // P2 F: cache-lifecycle authority substrate (accounting-gated admission). Constructs the
+    // authority (ledger/coordinator/leases/retention) independent of --cache-debug; enforcement
+    // is default-off and wired into no mutation path until F0b.
+    bool cache_lifecycle = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
+    std::string server_tools_runtime;
+
+    // MCP server configs (Cursor-compatible JSON)
+    std::string mcp_servers_config;   // path to JSON file with MCP server definitions
+    std::string mcp_servers_json;     // inline JSON with MCP server definitions
 
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server
@@ -808,6 +856,12 @@ struct common_params {
 
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
+
+    // cache receipt (PROPOSAL §7.7 Phase 1): untrusted divergence-location hint
+    // on responses. Keyed chain by default; unkeyed only behind the debug flag.
+    bool        cache_receipt = false;
+    std::string cache_receipt_key;          // per-session/tenant comparison key
+    bool        cache_receipt_unkeyed_debug = false;
 
     float slot_prompt_similarity = 0.1f;
 
@@ -867,7 +921,24 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TTS params
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
+
+    bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
+
+enum class common_vbr_cpu_fallback_result {
+    not_needed,
+    applied,
+    explicit_vbr,
+};
+
+// Common-layer policy seam for the implicit dynamic-VBR default. `has_gpu`
+// describes the resolved placement inventory; explicit VBR is never rewritten.
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+    common_params & params, bool has_gpu);
 
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
@@ -1001,6 +1072,15 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 bool glob_match(const std::string & pattern, const std::string & str);
 
 //
+// Environment utils
+//
+
+// portable environment access, an unset variable reads as an empty string
+// and setting an empty value unsets the variable
+std::string common_get_env(const std::string & name);
+void        common_set_env(const std::string & name, const std::string & value);
+
+//
 // Filesystem utils
 //
 
@@ -1067,6 +1147,9 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 // model endpoint from env
 std::string common_get_model_endpoint();
 
+// for testing purposes
+char * common_get_model_or_exit(int, char*[]);
+
 //
 // Context utils
 //
@@ -1082,10 +1165,22 @@ enum common_context_seq_rm_type {
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
-// aborts execution on failure
+// fork: kept external — the server's censused destruction doors call these directly
 void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
 void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+
+struct common_memory {
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+
+    // aborts execution on failure
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+    void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+};
 
 //
 // Batch utils
@@ -1230,6 +1325,63 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Server/common-layer logical computation frontier [WS-4]. This is the state after
+// processing the half-open logical prefix [0, token_count); next_position is the next
+// effective model position for that prefix. The three identity keys are opaque,
+// comparison-only server keys:
+//   - execution_identity: this loaded model/runtime instance
+//   - adapter_config_identity: active adapter weights + exact scales
+//   - media_content_identity: media content/shape in the logical prefix
+//
+// This deliberately lives beside common_prompt_checkpoint rather than in libllama:
+// sequence lineage, per-request adapters and mtmd media are server-layer concepts.
+// version == 0 means a legacy checkpoint with no dual-written frontier.
+struct common_computation_frontier {
+    static constexpr uint32_t VERSION = 1;
+
+    uint32_t version = 0;
+
+    uint64_t sequence_epoch = 0;
+    int64_t  token_count    = 0;
+    llama_pos next_position = 0;
+
+    std::string execution_identity;
+    std::string adapter_config_identity;
+    std::string media_content_identity;
+
+    bool valid() const {
+        return version == VERSION &&
+               sequence_epoch != 0 &&
+               token_count >= 0 &&
+               next_position >= 0 &&
+               !execution_identity.empty() &&
+               !adapter_config_identity.empty() &&
+               !media_content_identity.empty();
+    }
+
+    void clear() {
+        version = 0;
+        sequence_epoch = 0;
+        token_count = 0;
+        next_position = 0;
+        execution_identity.clear();
+        adapter_config_identity.clear();
+        media_content_identity.clear();
+    }
+};
+
+inline bool operator==(
+        const common_computation_frontier & a,
+        const common_computation_frontier & b) noexcept {
+    return a.version == b.version &&
+           a.sequence_epoch == b.sequence_epoch &&
+           a.token_count == b.token_count &&
+           a.next_position == b.next_position &&
+           a.execution_identity == b.execution_identity &&
+           a.adapter_config_identity == b.adapter_config_identity &&
+           a.media_content_identity == b.media_content_identity;
+}
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1239,13 +1391,44 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // Attention-content lineage epochs at capture time [I9]. A recurrent-only checkpoint restores
+    // exact recurrent state while retaining the live attention KV. Lossless in-place retiering
+    // preserves that lineage; occupied-cell reuse, clear/reset and import do not. Both are 0 when
+    // VBR is inactive, making the restore-time check a no-op.
+    uint64_t checkpoint_epoch     = 0;
+    uint64_t checkpoint_epoch_swa = 0;
+
+    // Logical validity record, dual-written beside the legacy physical fields
+    // during the Phase-1 migration. Legacy checkpoints have version == 0.
+    common_computation_frontier computation_frontier;
+
+    // E1 declared-family provenance. This is policy metadata only: it follows
+    // checkpoint copies/restores but never enters checkpoint payload bytes.
+    common_cache_family_binding cache_family;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
-    std::vector<uint8_t> ring_data; // fork: DFlash ring buffer state
 
-    // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
-    std::vector<uint8_t> data_spec;
+    // Typed accelerator state stashed with the checkpoint (Phase-1 typed
+    // accelerators). Exact restore readiness is conjunctive (PROPOSAL §6
+    // invariant 3): a component that is mandatory-on-presence and fails to
+    // apply fails the WHOLE checkpoint restore fail-closed; purely optional
+    // components may degrade drafting quality only, never correctness.
+    struct accel_state {
+        // DFlash drafter ring buffer bytes. Mandatory-on-presence: a non-empty
+        // ring that fails to load fails the restore (shipped behavior at the
+        // ring-restore site).
+        std::vector<uint8_t> ring;
+
+        // Speculative-impl state (e.g. eagle3's deferred-boundary g_embd row).
+        // Applied unconditionally; absence resets the impl state. Optional.
+        std::vector<uint8_t> spec;
+
+        size_t size()  const { return ring.size() + spec.size(); }
+        bool   empty() const { return ring.empty() && spec.empty(); }
+        void   clear()       { ring.clear(); spec.clear(); }
+    };
+    accel_state accel;
 
     size_t size() const;
 
@@ -1280,3 +1463,10 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+inline bool common_prompt_checkpoint_lineage_matches(
+        const common_prompt_checkpoint & checkpoint,
+        const llama_memory_vbr_state_data & state) noexcept {
+    return checkpoint.checkpoint_epoch == state.checkpoint_epoch &&
+           checkpoint.checkpoint_epoch_swa == state.checkpoint_epoch_swa;
+}

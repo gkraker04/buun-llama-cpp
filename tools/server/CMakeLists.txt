@@ -9,6 +9,30 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-cache-authority.cpp
+    server-cache-authority.h
+    server-cache-control.cpp
+    server-cache-control-wire.cpp
+    server-cache-control.h
+    server-cache-destruction-quote.cpp
+    server-cache-destruction-quote.h
+    server-cache-plan-authority.cpp
+    server-cache-plan-authority.h
+    server-cache-plan-preflight.cpp
+    server-cache-plan-preflight.h
+    server-cache-plan-preflight-internal.h
+    server-cache-lease.cpp
+    server-cache-lease.h
+    server-cache-retention-proof.cpp
+    server-cache-retention-proof.h
+    server-cache-vbr-proof.cpp
+    server-cache-vbr-proof.h
+    server-cache-yield.cpp
+    server-cache-yield.h
+    server-vbr-artifact-store.cpp
+    server-vbr-artifact-store.h
+    server-retention-sidecar.cpp
+    server-retention-sidecar.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
@@ -19,6 +43,8 @@ add_library(${TARGET} STATIC
     server-stream.h
     server-tools.cpp
     server-tools.h
+    server-mcp.cpp
+    server-mcp.h
     server-schema.cpp
     server-schema.h
 )
@@ -61,3 +87,29 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# C++ unit test for server_tokens::get_common_prefix (U3 empty-id media guard). Lives here rather
+# than tests/ because that subdir is configured before tools/, so server-context/mtmd targets are
+# not yet defined there. No model or mmproj needed — runs on CPU.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-server-media-prefix ${CMAKE_SOURCE_DIR}/tests/test-server-media-prefix.cpp)
+    target_link_libraries(test-server-media-prefix PRIVATE server-context mtmd llama llama-common)
+    target_include_directories(test-server-media-prefix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-media-prefix PRIVATE cxx_std_17)
+    add_test(NAME test-server-media-prefix COMMAND test-server-media-prefix)
+    set_property(TEST test-server-media-prefix PROPERTY LABELS main)
+
+    add_executable(test-server-prompt-cache ${CMAKE_SOURCE_DIR}/tests/test-server-prompt-cache.cpp)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context mtmd llama llama-common)
+    target_include_directories(test-server-prompt-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
+    add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
+    set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
+    add_test(NAME test-server-prompt-cache-clone-fault
+        COMMAND test-server-prompt-cache --clone-fault)
+    set_tests_properties(test-server-prompt-cache-clone-fault PROPERTIES
+        LABELS main
+        ENVIRONMENT "LLAMA_SERVER_FAULT=load_clone_fail")
+endif()

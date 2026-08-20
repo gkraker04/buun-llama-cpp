@@ -9,6 +9,16 @@
 #include <cstdint>
 #include <map>
 
+// Internal speculative memory operations: real mutations with ordinary accounting, but no global
+// checkpoint-lineage publication for a caller-proven disposable backup or rejected suffix.
+LLAMA_API bool llama_memory_seq_rm_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -90,9 +100,44 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+struct llama_moe_tensor_info {
+    enum ggml_type type;
+    size_t expert_size;
+    int64_t n_input;
+    int64_t n_output;
+    int64_t n_expert;
+    // Transformer block index parsed from the tensor name ("blk.<N>..."),
+    // or -1 when the layer cannot be determined.
+    int64_t layer;
+};
+
+LLAMA_API size_t llama_model_get_moe_tensor_info(
+        const struct llama_model * model,
+        struct llama_moe_tensor_info * info,
+        size_t capacity);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Resident cache-state allocation for one context, split into mutually-exclusive physical
+// leaves: attention KV, live recurrent state, recurrent rollback planes, and speculative
+// rolling-window tape. Keys are backend buffer types (one row per allocation). Recurrent
+// buffers physically contain (1 + n_rs_seq) equal state planes; their allocation bytes are
+// partitioned between the live plane and rollback planes without changing the measured total.
+// The rolling-window field excludes the fixed speculative tape.
+struct llama_live_memory_breakdown_data {
+    size_t attention             = 0;
+    size_t recurrent             = 0;
+    size_t recurrent_rollback    = 0;
+    size_t rolling_window_tape   = 0;
+};
+
+using llama_live_memory_breakdown =
+    std::map<ggml_backend_buffer_type_t, llama_live_memory_breakdown_data>;
+
+LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx);
 
 // Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
 // from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
@@ -169,3 +214,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

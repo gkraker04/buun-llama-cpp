@@ -139,6 +139,11 @@ struct ggml_vbr_backend_iface {
     // recoverable and returns false, allowing the caller to reclaim/retry before tier mutation.
     bool (*kv_transcode_workspace_reserve)(ggml_backend_t backend,
                                             int64_t n_cells, int64_t ne0, int64_t stash_rows);
+    // Clear a tensor subrange on the backend's side stream. Ordered with kv_transcode and async
+    // tensor uploads submitted through the same backend. APPENDED at the tail: the vtable is
+    // runtime-resolved with no size/version field, so new members must never shift older slots.
+    void (*tensor_memset_async)(ggml_backend_t backend, struct ggml_tensor * tensor,
+                                size_t offset, size_t size);
 };
 
 // proc name resolved via ggml_backend_reg_get_proc_address

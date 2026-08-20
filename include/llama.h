@@ -46,7 +46,7 @@
 #define LLAMA_SESSION_VERSION 9
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -202,9 +202,27 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    enum llama_load_mode {
+        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
+        LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
+        LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_DIRECT_IO  = 4, // use direct I/O if available
+    };
+
+    LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
+    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
+    };
+
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO = 1,
+        LLAMA_MOE_CACHE_MODE_ON = 2,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -301,6 +319,7 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
+        enum llama_load_mode  load_mode;  // how to load the model
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -321,13 +340,11 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
-        bool use_mmap;        // use mmap if possible
-        bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
-        bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // whether to load MTP layers
     };
 
     struct llama_sampler_seq_config {
@@ -373,6 +390,10 @@ extern "C" {
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
                                           // a VBR pool at decode boundaries (0 = 1 GiB default)
+
+        enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
+        int32_t moe_cache_expert_parallel;          // -1 = provider policy, 0 = disabled, N = device fanout
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -597,6 +618,11 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+
+    // true when the model requires matching K and V cache types: MLA-family latent KV,
+    // where V is a view of the K latent so the declared types must agree and any
+    // per-side cache tiering is inherently coupled
+    LLAMA_API bool llama_model_kv_cache_types_coupled(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
@@ -657,6 +683,8 @@ extern "C" {
     LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
     // fills layer_ids[0..n-1], returns n (capped by capacity)
     LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
+    // true if a dflash-arch drafter carries the DSpark Markov-head tensors (markov_w1/w2)
+    LLAMA_API bool    llama_model_dspark_has_markov_head  (const struct llama_model * model);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
@@ -711,6 +739,9 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_adapter_meta_val_str_by_index(const struct llama_adapter_lora * adapter, int32_t i, char * buf, size_t buf_size);
 
+    // Get the adapter's execution-content SHA-256 digest. Writes exactly 32 bytes to out.
+    LLAMA_API void llama_adapter_meta_digest(const struct llama_adapter_lora * adapter, uint8_t * out);
+
     // Manually free a LoRA adapter
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
@@ -756,6 +787,10 @@ extern "C" {
     // that calls llama_decode. No-op for memory types with nothing to do.
     LLAMA_API void llama_memory_breathe(llama_memory_t mem);
 
+    // Returns whether arbitrary token ranges can be removed without discarding the whole sequence.
+    // This is a non-mutating capability query.
+    LLAMA_API bool llama_memory_can_seq_rm_partial(llama_memory_t mem);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence
@@ -767,10 +802,31 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Remove only the attention component over [p0, p1). Hybrid memories leave recurrent
+    // state untouched; non-hybrid attention memories are identical to llama_memory_seq_rm;
+    // recurrent-only memories reject. [EXPERIMENTAL]
+    LLAMA_API bool llama_memory_seq_rm_attn(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
     LLAMA_API void llama_memory_seq_cp(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Same as llama_memory_seq_cp, but returns false if the copy could not be performed [I13]
+    // (e.g. a recurrent pool has no free cell). On failure the destination is left unchanged for a
+    // single memory, or cleared for a composite (hybrid) memory so it is never a half-copy. Callers
+    // that depend on the copy (speculative backup, sequence clone) must not treat the destination as
+    // valid when this returns false.
+    LLAMA_API bool llama_memory_try_seq_cp(
             llama_memory_t mem,
               llama_seq_id seq_id_src,
               llama_seq_id seq_id_dst,
@@ -841,12 +897,57 @@ extern "C" {
         uint32_t used_cells_other; // used cells NOT owned exclusively by seq_id (seq_id < 0
                                    // counts every used cell) -- 0 means removing seq_id's cells
                                    // would empty the cache (full-reset feasibility)
+        uint64_t representation_epoch;     // monotone representation-change counter for the
+                                           // single/primary (non-SWA) VBR controller
+        uint64_t representation_epoch_swa; // monotone counter for the SWA controller when this
+                                           // state aggregates iSWA; 0 for a single controller
+        uint64_t checkpoint_epoch;         // monotone attention-content lineage counter for the
+                                           // primary controller; retiering alone does not move it
+        uint64_t checkpoint_epoch_swa;     // corresponding SWA lineage counter; 0 for a single
+                                           // controller
+        uint32_t retier_freeze_depth;       // active scoped retier-freeze nesting depth
+        uint32_t retier_env_freeze;         // WS-0 deterministic env freeze is active
+        uint64_t retier_freeze_enters;      // successful scoped-freeze entries this boot
+        uint64_t retier_freeze_exits;       // matching scoped-freeze exits this boot
+        uint64_t retier_deferred_decisions; // representation-mutation decisions deferred by scopes
+        uint64_t retier_reconciles;         // mandatory fresh controller passes after outer exits
     };
 
     // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
     // decoded on top of the current occupancy (a launch passes the incoming prompt's suffix).
     LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
             llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
+    // Dynamic-VBR scoped retier freeze. This suspends representation mutations only; ordinary
+    // memory bookkeeping and decode remain live. The outermost exit arms a fresh controller
+    // evaluation at the next safe decode/idle boundary. begin returns an opaque process-local
+    // operation ID for end, or 0 when this memory has no active dynamic-VBR controller. The ID is
+    // nonzero/non-reusing and is never serialized. owner must remain valid until end.
+    // [EXPERIMENTAL]
+    LLAMA_API uint64_t llama_memory_vbr_retier_freeze_begin(
+            llama_memory_t mem, const char * owner);
+
+    LLAMA_API void llama_memory_vbr_retier_freeze_end(
+            llama_memory_t mem, const char * owner, uint64_t operation_id);
+
+    // Non-mutating footprint check at the CURRENT tiers. Every VMM pool must fit independently;
+    // bytes_needed/available are sums for observability, while max_deficit and fits preserve the
+    // tightest per-pool result (important for tensor split and iSWA). n_tokens_extra is the bounded
+    // replay/fill still to come while retiering is frozen. [EXPERIMENTAL]
+    struct llama_memory_vbr_preflight_data {
+        bool     active;
+        bool     fits;
+        uint32_t pools;
+        uint32_t watermark_cells;
+        uint64_t bytes_needed;
+        uint64_t bytes_available;
+        uint64_t physical_growth_needed;    // additional KV maps + dequant scratch growth
+        uint64_t physical_growth_available; // live free bytes on the corresponding devices
+        int64_t  max_deficit;
+    };
+
+    LLAMA_API struct llama_memory_vbr_preflight_data llama_memory_vbr_retier_preflight(
+            llama_memory_t mem, uint32_t n_tokens_extra);
 
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
@@ -1099,6 +1200,11 @@ extern "C" {
     LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
     // Log-probabilities of top-K tokens (available when dflash_sample_temp > 0).
     LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
+    // True when the last decode computed the argmax/top-K tail on a GPU backend.
+    // Only the GPU argmax kernels implement the extended [ids + log-probs] output
+    // layout; a tail scheduled on the CPU backend (e.g. a drafter with -ngld 0)
+    // runs the plain per-row argmax and leaves the extended layout uninitialized.
+    LLAMA_API bool      llama_get_logits_argmax_gpu(struct llama_context * ctx);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1140,6 +1246,48 @@ extern "C" {
 
     // DFlash: set top-K for drafter (1 = argmax, >1 = top-K candidates per position)
     LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
+
+    // Upstream block-diffusion drafter (arch "dflash"): build the in-graph top-K/argmax
+    // tail on the drafter's decode graph. When enabled, the full-vocab logits transfer
+    // is skipped and llama_get_logits_argmax* returns K ids + log-probs per draft
+    // position. Set on the drafter context by the speculative impl. Default off.
+    LLAMA_API void llama_set_dflash_argmax(struct llama_context * ctx, bool enable);
+
+    // Upstream block-diffusion drafter: fused encoder+injection. When enabled, decode
+    // embd batches carry raw concatenated target features (encoder input width) and the
+    // injection graph applies the fc + enc-norm encoder itself — one decode replaces the
+    // llama_encode + readback + inject-decode round-trip. Set on the drafter context by
+    // the speculative impl. Default off.
+    LLAMA_API void llama_set_dflash_fused_inject(struct llama_context * ctx, bool enable);
+
+    // Upstream drafter device-staged capture chain. stage_init (TARGET ctx) allocates a
+    // persistent [n_embd_enc, n_ubatch] device tensor; the target graph then writes each
+    // captured layer's input into it interleaved (D2D, no host round-trip) and skips the
+    // host extraction whenever the whole batch fits one ubatch (stage_valid_n returns the
+    // covered rows, 0 = use the host path). The DRAFTER binds the stage via
+    // set_inject_stage and passes per-decode row indices via set_inject_rows; its fused
+    // injection graph gathers the rows on-device. The stage is allocated on a GPU that
+    // both contexts can schedule (the drafter may be pinned to a subset of the target's
+    // devices via --spec-draft-device). Returns nullptr when unsupported (CPU-only or
+    // tensor-parallel target, or no GPU shared with the drafter).
+    LLAMA_API void *  llama_dflash_draft_stage_init(struct llama_context * ctx, struct llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
+    LLAMA_API int32_t llama_dflash_draft_stage_valid_n(struct llama_context * ctx);
+    LLAMA_API void    llama_set_dflash_inject_stage(struct llama_context * ctx, void * stage);
+    LLAMA_API void    llama_set_dflash_inject_rows(struct llama_context * ctx, const int32_t * rows, int32_t n);
+
+    // Upstream drafter single-graph fused cycle (phase C). The carry tensor (allocated by
+    // stage_init when n_carry_rows > 0, TARGET ctx) holds deferred inject rows copied out
+    // of the capture stage (D2D) so they survive the next target decode. The DRAFTER's
+    // fused decode gathers them via set_dflash_oneg_inject(carry, n_inject): a token batch
+    // whose first n_inject rows are staged KV injections and the rest the noise block —
+    // one constant-topology graph per generation cycle. n_inject = 0 disables (default).
+    LLAMA_API void *  llama_dflash_draft_stage_carry_tensor(struct llama_context * ctx);
+    LLAMA_API bool    llama_dflash_draft_stage_carry(struct llama_context * ctx, int32_t src_row0, int32_t n_rows, int32_t dst_row0);
+    LLAMA_API void    llama_set_dflash_oneg_inject(struct llama_context * ctx, void * carry, int32_t n_inject);
+
+    // true when the dflash drafter runs on the DeepSeek-V4 DSpark backbone (its fused
+    // single-graph cycle has its own kill switch, GGML_DFLASH_ONEGRAPH_DSV4)
+    LLAMA_API bool    llama_model_dflash_dsv4_backbone(const struct llama_model * model);
 
     // DFlash: set the number of concurrent slots the drafter graph is reserved for.
     // Called on the drafter context (ctx_dft). Default 1. Max LLAMA_DFLASH_MAX_SLOTS.
@@ -1183,34 +1331,39 @@ extern "C" {
     // the forward pass). Requires a GPU/IGPU-typed backend (tensor-split's meta backend
     // is neither) and all recurrent states resident on a single non-host device. When
     // false, callers should not record a tape: replay degrades to the CPU path, which
-    // cannot read the GPU tape and silently leaves rolled-back recurrent state stale —
-    // roll back by re-decoding the accepted tokens instead.
+    // does not provide the exact GPU namespace — roll back by re-decoding the
+    // accepted tokens instead.
     LLAMA_API bool llama_dflash_tape_replay_available(struct llama_context * ctx);
 
-    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
-    // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
-    // Must be called after restoring from backup (seq_cp) and before the next decode
-    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
+    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance.
+    // Must be called after restoring from backup (seq_cp) and before the next decode.
+    // Returns false when the exact GPU replay cannot be launched; callers must retain
+    // their backup and restore/re-decode rather than continue from the boundary state.
+    LLAMA_API bool llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
 
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
     //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
     //   - Recurrent state: restores from backup + tape replay for accepted tokens
     // This replaces the manual seq_rm/seq_cp + tape_replay sequence
-    LLAMA_API void llama_dflash_rollback(
+    // Returns false without consuming seq_backup when exact tape replay cannot
+    // be launched, allowing the caller to restore and re-decode exactly.
+    LLAMA_API bool llama_dflash_rollback(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
             int                    n_past_before,
             int                    n_accepted);
 
-    // DFlash: wait for async tape replay to complete (must be called before next verify)
-    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+    // DFlash: wait for async tape replay to complete (must be called before next verify).
+    // False means the deferred conv-state publication failed and the slot must
+    // be reset rather than used as an exact recurrent frontier.
+    LLAMA_API bool llama_tape_replay_sync(struct llama_context * ctx);
 
     // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
     // Restores recurrent state from backup and tape-replays to given depth.
     // Does NOT touch attention KV cache or destroy the backup.
-    LLAMA_API void llama_dflash_prepare_branch(
+    LLAMA_API bool llama_dflash_prepare_branch(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
@@ -1234,6 +1387,19 @@ extern "C" {
     // (checkpoint save). Both return false when the backend lacks the proc address.
     LLAMA_API bool   llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd);
     LLAMA_API bool   llama_dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd);
+
+    // DFlash projected cross-KV cache: per-(drafter layer, ring slot) K/V projections
+    // cached on GPU so each draft call projects only the newly ringed tokens instead of
+    // re-running dflash_fc + wk/wv over the whole ring. Single-slot GPU-ring path only.
+    // init returns NULL when unsupported (non dflash-draft arch, CPU drafter, missing
+    // backend procs); callers must then keep the legacy path. Kill: GGML_DFLASH_CROSSKV=0.
+    LLAMA_API void * llama_dflash_crosskv_init(struct llama_context * ctx, void * ring_handle, int ring_size);
+    LLAMA_API void   llama_dflash_crosskv_free(void * handle);
+    // project the n_new ring tokens ending at ring slot end_slot (exclusive) into the cache
+    LLAMA_API bool   llama_dflash_crosskv_project(struct llama_context * ctx, void * handle, void * ring_handle, int end_slot, int n_new);
+    // flip the drafter graph into cache-consumer mode for the next decode: window of
+    // n_real tokens ending at end_slot (exclusive)
+    LLAMA_API void   llama_dflash_crosskv_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int end_slot, int n_real);
 
     // DFlash GPU capture staging: graph-embedded l_out copies on the target context.
     // Enable only when a device-side consumer route exists (see write_d2d); the getter
@@ -1320,6 +1486,9 @@ extern "C" {
     LLAMA_API bool llama_vocab_get_add_bos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_eos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_sep(const struct llama_vocab * vocab);
+
+    // model-specific suppress tokens (gguf key: tokenizer.ggml.suppress_tokens)
+    LLAMA_API const llama_token * llama_vocab_get_suppress_tokens(const struct llama_vocab * vocab, int32_t * n_suppress_tokens);
 
     LLAMA_API llama_token llama_vocab_fim_pre(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_suf(const struct llama_vocab * vocab);
@@ -1639,19 +1808,19 @@ extern "C" {
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
-                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty, -1 = context size)
-                               float   penalty_repeat,   // 1.0 = disabled
-                               float   penalty_freq,     // 0.0 = disabled
-                               float   penalty_present); // 0.0 = disabled
+                             int32_t   n_vocab,
+                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty)
+                               float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
+                               float   penalty_freq,     // must be finite, 0.0 = disabled
+                               float   penalty_present); // must be finite, 0.0 = disabled
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
-                             int32_t    n_ctx_train,
                                float    dry_multiplier,
                                float    dry_base,
                              int32_t    dry_allowed_length,
-                             int32_t    dry_penalty_last_n,
+                             int32_t    dry_penalty_last_n, // last n tokens to penalize (0 = disable penalty)
                           const char ** seq_breakers,
                               size_t    num_breakers);
 

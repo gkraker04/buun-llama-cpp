@@ -79,8 +79,8 @@ struct dflash_tape_gpu {
     int max_tokens = 0;                         // allocated capacity
     int n_tokens = 0;                           // actual tokens recorded this pass
 
-    // qkv is graph-staged for this tape (single-seq staged decodes bypass the eval
-    // callback entirely) — the one predicate every staging consumer must agree on
+    // qkv is graph-staged per sequence for this tape. In a multi-sequence
+    // ubatch, every participating tape receives its own [channels, tokens] slice.
     bool qkv_staged() const {
         return !layers.empty() && layers[0].qkv != nullptr;
     }
@@ -117,10 +117,12 @@ struct dflash_capture_data {
 
     // tape recording (for DeltaNet state rollback)
     bool tape_enabled = false;
+    // Test-only one-shot fault used to prove exact GPU replay fails closed
+    // without consuming the old scratch buffer or running the CPU recurrence.
+    bool replay_force_alloc_failure_once = false;
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
-
     // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
     // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
     // (default), `tapes` has size 1 and `active_tape_idx` is always 0 — behavior is
@@ -155,10 +157,11 @@ struct dflash_capture_data {
     bool stage_active = false;
     int stage_n_tokens = 0;
 
-    // tokens covered by the graph-staged qkv tape copies in the last tape-enabled decode
-    // (0 = staging did not cover it; the eval-callback capture holds the data instead)
+    // Per-sequence tokens captured by the fixed GPU tape in the last covered
+    // ubatch. This includes single-device CUDA, where QKV arrives through the
+    // eval callback. Consumers that specifically require device-staged QKV must
+    // additionally test dflash_tape_gpu::qkv_staged().
     int tape_stage_n_tokens = 0;
-
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
@@ -209,6 +212,7 @@ struct dflash_capture_data {
     std::vector<ggml_backend_buffer_t> replay_meta_bufs;
     std::vector<size_t> replay_meta_buf_sizes;
     int replay_n_accepted = 0;
+    int replay_tape_n_tokens = 0; // immutable staged-QKV length for the pending replay
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
     llama_memory_recurrent * replay_mem_recurrent = nullptr;
@@ -257,6 +261,8 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    ggml_backend_t backend_for_device(
+        ggml_backend_dev_t device) const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -278,9 +284,11 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     int32_t * get_logits_argmax();
+    llama_token get_logits_argmax_ith(int32_t i);
     int32_t   get_logits_argmax_n();
     int32_t   get_logits_argmax_k();
     float   * get_logits_argmax_probs();
+    bool      get_logits_argmax_gpu();
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -320,7 +328,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -389,6 +397,7 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    llama_live_memory_breakdown live_memory_breakdown() const;
 
     //
     // training
@@ -455,6 +464,10 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // Choose a synthetic reserve shape that both the configured context and the
+    // current physical memory context can represent. Returns zero when unavailable.
+    uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -484,6 +497,7 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+    llama_adapter_loras_ordered_ptr loras_ordered;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
@@ -545,6 +559,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    // Largest DFlash cross-attention bucket covered by the current scheduler
+    // allocation. Smaller graph shapes can reuse that allocation without
+    // rebuilding the scheduler and replacing its host staging buffer.
+    int64_t dflash_cross_reserved_bucket = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -620,6 +638,30 @@ public:
     int32_t dflash_capture_stage_get(int32_t layer_idx, const void ** data);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
+    void set_dflash_argmax(bool enable);
+    void set_dflash_target_argmax(bool enable);
+    void set_dflash_fused_inject(bool enable);
+
+    // upstream drafter device-staged capture (this ctx = target): allocate the
+    // interleaved [n_embd_enc, T] staging tensor and register the capture layers.
+    // The stage lives on a GPU schedulable by both this context (writer) and the
+    // drafter (reader) — a drafter pinned via --spec-draft-device cannot schedule
+    // tensors on the target's other devices. Returns the stage tensor (opaque) or
+    // nullptr when unsupported (CPU-only, tensor-parallel split, no GPU shared
+    // with the drafter, or allocation failure). Idempotent.
+    ggml_tensor * dflash_draft_stage_init(llama_context * ctx_dft, const int32_t * layer_ids, int32_t n_layers, int64_t n_embd_enc, int32_t n_carry_rows);
+    // rows staged by the last decode (0 = host fallback was used)
+    int32_t dflash_draft_stage_valid_n() const { return dflash_stage_valid_n; }
+    // staged injection (this ctx = drafter): bind the target's stage + set rows
+    void set_dflash_inject_stage(ggml_tensor * stage);
+    void set_dflash_inject_rows(const int32_t * rows, int32_t n);
+    // single-graph fused cycle (this ctx = target): carry deferred inject rows out of
+    // the stage so they survive the next target decode (D2D; the caller must fence
+    // this ctx's capture decode first — process() syncs before its per-seq loop)
+    ggml_tensor * dflash_draft_stage_carry_tensor() const { return dflash_stage_carry; }
+    bool dflash_draft_stage_carry(int32_t src_row0, int32_t n_rows, int32_t dst_row0);
+    // (this ctx = drafter): arm/disarm the fused decode for the next graph build
+    void set_dflash_oneg_inject(ggml_tensor * carry, int32_t n_inject);
     void set_dflash_n_slots(int n);
 
     void dflash_reset_hidden_capture();
@@ -628,7 +670,7 @@ public:
     void set_tape_recording(bool enable);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
-    void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
+    bool tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
                           int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void set_active_dflash_slot(int slot_idx);
 
@@ -638,13 +680,13 @@ public:
 
     bool tape_replay_available();
 
-    void tape_replay(llama_seq_id seq_id, int n_accepted);
-    void tape_replay_sync();
+    bool tape_replay(llama_seq_id seq_id, int n_accepted);
+    bool tape_replay_sync();
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
 
-    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
-    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
+    bool dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    bool dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
 
     void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
     void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
@@ -653,6 +695,16 @@ public:
     using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
     void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
                             int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+
+    // --- projected cross-KV cache for the DFlash drafter (this ctx = drafter) ---
+    // init returns an opaque handle or nullptr when unsupported (non-dflash-draft
+    // arch, no CUDA procs, weights not device-resident). project runs the aux
+    // fc+wk/wv projection graph over the n_new ring tokens ending at end_slot
+    // (exclusive) and scatters the results into the cache. set_cross flips the
+    // drafter graph into cache-consumer mode for the next decode.
+    void * crosskv_init(void * ring_handle, int ring_size);
+    bool   crosskv_project(void * handle, void * ring_handle, int end_slot, int n_new);
+    void   crosskv_set_cross(void * handle, llama_seq_id seq_id, int end_slot, int n_real);
 
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();
@@ -667,9 +719,23 @@ public:
     std::vector<float>   logits_argmax_prob_buf;
     int32_t logits_argmax_count = 0;
     int32_t logits_argmax_k = 1;
+    // whether the last argmax/top-K tail ran on a GPU backend (only the GPU kernels
+    // implement the extended ids + log-probs layout; the CPU kernel does not)
+    bool logits_argmax_gpu = false;
+
+    // upstream drafter device-staged capture (target ctx)
+    ggml_context_ptr           dflash_stage_ctx;
+    ggml_backend_buffer_ptr    dflash_stage_buf;
+    int32_t                    dflash_stage_valid_n = 0;
+
+    // phase-C carry: deferred-inject row storage
+    ggml_tensor *              dflash_stage_carry   = nullptr;
 
     std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
     std::unique_ptr<dflash_capture_data> dflash_capture;
+
+    // aux projection graph state for the projected cross-KV cache (drafter ctx)
+    struct dflash_crosskv_proj * crosskv_proj = nullptr;
 
     llama_tree_mask tree_mask;
 

@@ -111,6 +111,11 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    // True when the configured chain is provably equivalent to selecting the
+    // largest raw model logit. Computed once from the chain configuration at
+    // construction so callers do not have to duplicate sampler semantics.
+    bool raw_argmax_exact;
+
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -184,9 +189,21 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params) {
+    if (!std::isfinite(params.penalty_repeat) ||
+        params.penalty_repeat <= 0.0f ||
+        !std::isfinite(1.0f/params.penalty_repeat)) {
+        throw std::invalid_argument("penalty_repeat must be finite and greater than 0");
+    }
+    if (!std::isfinite(params.penalty_freq)) {
+        throw std::invalid_argument("penalty_freq must be finite");
+    }
+    if (!std::isfinite(params.penalty_present)) {
+        throw std::invalid_argument("penalty_present must be finite");
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
-
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
     lparams.no_perf = params.no_perf;
@@ -309,7 +326,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (need_rbudget_for_grammar || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
         rbudget = common_reasoning_budget_init(
             vocab,
-            params.reasoning_budget_start,
+            {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
@@ -320,8 +337,19 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    if (params.has_logit_bias()) {
-        samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
+    // logit bias: user biases + model suppress tokens (-INFINITY)
+    {
+        std::vector<llama_logit_bias> merged = params.logit_bias;
+
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            merged.push_back({ suppress[i], -INFINITY });
+        }
+
+        if (!merged.empty()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        }
     }
 
     if (params.mirostat == 0) {
@@ -337,7 +365,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                         for (const auto & str : params.dry_sequence_breakers) {
                             c_breakers.push_back(str.c_str());
                         }
-                        samplers.push_back(llama_sampler_init_dry(vocab, llama_model_n_ctx_train(model), params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
+                        samplers.push_back(llama_sampler_init_dry(vocab, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
                     }
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_K:
@@ -365,7 +393,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_infill(vocab));
                     break;
                 case COMMON_SAMPLER_TYPE_PENALTIES:
-                    samplers.push_back(llama_sampler_init_penalties(params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
+                    samplers.push_back(llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
                     break;
                 case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
                     // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
@@ -413,6 +441,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .raw_argmax_exact = */ false,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -421,7 +450,47 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p   = */ {},
     };
 
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (grmr == nullptr && rbudget == nullptr && n_suppress == 0 &&
+        params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f &&
+        params.penalty_present == 0.0f && params.dry_multiplier == 0.0f &&
+        params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
+        params.top_n_sigma < 0.0f && params.adaptive_target < 0.0f &&
+        params.mirostat == 0 && params.n_probs == 0 &&
+        params.logit_bias.empty()) {
+        bool has_greedy_selector = false;
+        bool supported = true;
+        for (const auto sampler : params.samplers) {
+            switch (sampler) {
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    has_greedy_selector = true;
+                    break;
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                case COMMON_SAMPLER_TYPE_DRY:
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                case COMMON_SAMPLER_TYPE_XTC:
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    break;
+                case COMMON_SAMPLER_TYPE_NONE:
+                case COMMON_SAMPLER_TYPE_INFILL:
+                case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    supported = false;
+                    break;
+            }
+        }
+        result->raw_argmax_exact = supported && has_greedy_selector;
+    }
+
     return result;
+}
+
+bool common_sampler_raw_argmax_exact(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->raw_argmax_exact;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {
@@ -467,6 +536,17 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
+
+        // if done, replay end sequence which may contain a grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
+        if (gsmpl->grmr && !accept_grammar && is_done) {
+            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+            if (end_seq) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_sampler_accept(gsmpl->grmr, end_token);
+                }
+            }
+        }
     }
 
     if (gsmpl->grmr && accept_grammar) {
@@ -489,6 +569,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .raw_argmax_exact = */ gsmpl->raw_argmax_exact,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -635,15 +716,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
-
+template <typename Sample>
+static std::vector<llama_token> common_sampler_sample_and_accept_n_impl(
+        struct common_sampler * gsmpl,
+        const llama_tokens & draft,
+        Sample && sample) {
     std::vector<llama_token> result;
-    result.reserve(idxs.size());
+    result.reserve(draft.size() + 1);
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -655,7 +738,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(i);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -663,6 +746,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+    });
+}
+
+std::vector<llama_token> common_sampler_accept_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & sampled,
+        const llama_tokens & draft) {
+    GGML_ASSERT(sampled.size() == draft.size() + 1 && "sampled.size() must be draft.size() + 1");
+
+    return common_sampler_sample_and_accept_n_impl(gsmpl, draft, [&](size_t i) {
+        return sampled[i];
+    });
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
