@@ -32,8 +32,14 @@ struct dev_state {
 enum class phase { IDLE, PROBE, DEMAND, SATISFIED };
 
 struct demander {
-    // process-wide plan hints (device_id/busid -> bytes), set before load
-    std::map<std::string, uint64_t> plan;
+    // Per-transaction plan. The target fit replaces base entries; auxiliary
+    // components add to their device entry without being overwritten by fit.
+    std::map<std::string, uint64_t> plan_base;
+    std::map<std::string, uint64_t> plan_aux;
+    // Plan-hinted bytes can land before the first allocation failure opens an
+    // attempt. Keep them separately so the first claim advertises only the
+    // unallocated remainder of the plan.
+    std::map<std::string, uint64_t> landed_before_attempt;
 
     // a concluded attempt failed for good (insufficiency / expiry / lost tie-break):
     // every later alloc failure in the SAME load fails fast — patience windows must not
@@ -52,6 +58,10 @@ struct demander {
     std::map<std::string, uint64_t>  claim_progress; // peer claim key -> last bytes_now (tie-break)
     std::map<std::string, llama_vram_claim_fields> last_pub; // publish memo (rename on change only)
     uint64_t last_free_seen = 0;    // post-commit progress signal (primary demanded dev)
+
+    uint32_t load_depth = 0;
+    bool load_failed = false;
+    bool application_owned_completion = false;
 };
 
 demander & dm() {
@@ -65,6 +75,17 @@ std::string dev_busid(ggml_backend_dev_t dev) {
     return props.device_id != nullptr ? std::string(props.device_id) : std::string();
 }
 
+ggml_backend_dev_t dev_by_busid(const std::string & busid) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            dev_busid(dev) == busid) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
 uint64_t dev_free(ggml_backend_dev_t dev) {
     size_t free = 0, total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
@@ -76,6 +97,14 @@ uint64_t est_remaining(const dev_state & ds) {
         return ds.planned - ds.landed;
     }
     return 0;
+}
+
+std::map<std::string, uint64_t> combined_plan(const demander & d) {
+    std::map<std::string, uint64_t> result = d.plan_base;
+    for (const auto & [busid, bytes] : d.plan_aux) {
+        result[busid] += bytes;
+    }
+    return result;
 }
 
 
@@ -304,14 +333,67 @@ void llama_vram_plan_hint_set(const char * device_id, uint64_t bytes) {
     if (device_id == nullptr) {
         return;
     }
-    dm().plan[device_id] = bytes;
+    auto & d = dm();
+    d.plan_base[device_id] = bytes;
+    // A new hint supersedes any observations made against the previous plan.
+    d.landed_before_attempt.erase(device_id);
+}
+
+void llama_vram_plan_aux_add_internal(const char * device_id, uint64_t bytes) {
+    if (device_id == nullptr || bytes == 0) {
+        return;
+    }
+    dm().plan_aux[device_id] += bytes;
+}
+
+void llama_vram_load_begin_internal(bool application_owned_completion) {
+    auto & d = dm();
+    if (d.load_depth++ == 0) {
+        // A transaction is the owner of its plan and terminal state. Do not let
+        // a prior direct-API load leak estimates into this application load.
+        if (d.ph != phase::IDLE) {
+            unlink_all(d, "superseded by new load");
+        }
+        d.plan_base.clear();
+        d.plan_aux.clear();
+        d.landed_before_attempt.clear();
+        d.terminal_failed = false;
+        d.load_failed = false;
+        d.application_owned_completion = application_owned_completion;
+    } else {
+        d.application_owned_completion |= application_owned_completion;
+    }
+}
+
+void llama_vram_load_end_internal(bool success) {
+    auto & d = dm();
+    if (d.load_depth == 0) {
+        LLAMA_LOG_ERROR("vram-demand: unbalanced load transaction end\n");
+        if (!success) {
+            llama_vram_demand_abandon();
+        }
+        return;
+    }
+    d.load_failed |= !success;
+    if (--d.load_depth != 0) {
+        return;
+    }
+    if (d.load_failed) {
+        llama_vram_demand_abandon();
+    } else {
+        llama_vram_demand_satisfied();
+    }
 }
 
 ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(ggml_context * ctx,
                                                         ggml_backend_buffer_type_t buft) {
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+    // CUDA pinned-host buffer types report their associated GPU as `dev`, but
+    // consume host RAM and are excluded from the per-GPU fit plan. Never turn
+    // their allocation or failure into GPU landed bytes / a GPU demand.
+    if (dev == nullptr || ggml_backend_buft_is_host(buft) ||
+        ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return buf;
     }
     if (buf == nullptr) {
@@ -330,11 +412,22 @@ ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(ggml_context * ctx,
 }
 
 void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes) {
-    auto & d = dm();
-    if (d.ph == phase::IDLE) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return;
     }
+    auto & d = dm();
     const std::string busid = dev_busid(dev);
+    if (d.ph == phase::IDLE) {
+        // With a plan hint, successful model/context buffers preceding the
+        // first failure are part of bytes_now just as much as later retries.
+        // Without a hint the fallback estimate intentionally starts at the
+        // failed allocation, so there is nothing useful to retain here.
+        const auto plan = combined_plan(d);
+        if (plan.find(busid) != plan.end()) {
+            d.landed_before_attempt[busid] += bytes;
+        }
+        return;
+    }
     auto it = d.devs.find(busid);
     if (it == d.devs.end()) {
         return;
@@ -369,10 +462,18 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
         d.marker_obs.clear();
         d.claim_progress.clear();
         // every device with a plan-hint remainder is part of the joint claim
-        for (const auto & [hint_busid, hint_bytes] : d.plan) {
+        for (const auto & [hint_busid, hint_bytes] : combined_plan(d)) {
             dev_state ds;
+            ds.dev      = dev_by_busid(hint_busid);
             ds.planned  = hint_bytes;
+            const auto landed = d.landed_before_attempt.find(hint_busid);
+            if (landed != d.landed_before_attempt.end()) {
+                ds.landed = landed->second;
+            }
             ds.demanded = false;
+            LLAMA_LOG_DEBUG("vram-demand: plan on %s: %.1f MiB total, %.1f MiB already landed, %.1f MiB remaining\n",
+                    hint_busid.c_str(), ds.planned/1048576.0, ds.landed/1048576.0,
+                    est_remaining(ds)/1048576.0);
             d.devs.emplace(hint_busid, ds);
         }
     }
@@ -495,12 +596,49 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
     return backoff_step(d, now, cap);
 }
 
+bool llama_vram_demand_hold_plan_or(ggml_backend_dev_t fallback_dev, size_t fallback_bytes) {
+    auto & d = dm();
+
+    if (d.ph == phase::IDLE) {
+        for (const auto & [busid, planned] : combined_plan(d)) {
+            const auto landed = d.landed_before_attempt.find(busid);
+            const uint64_t landed_bytes = landed != d.landed_before_attempt.end() ? landed->second : 0;
+            if (planned > landed_bytes) {
+                if (ggml_backend_dev_t dev = dev_by_busid(busid)) {
+                    // Zero is deliberate: the plan already supplies the exact
+                    // remaining estimate and hold() marks every nonzero plan
+                    // remainder as part of the joint demand.
+                    return llama_vram_demand_hold(dev, 0);
+                }
+            }
+        }
+    } else if (d.ph != phase::SATISFIED) {
+        for (const auto & [busid, ds] : d.devs) {
+            if (est_remaining(ds) > 0) {
+                ggml_backend_dev_t dev = ds.dev != nullptr ? ds.dev : dev_by_busid(busid);
+                if (dev != nullptr) {
+                    return llama_vram_demand_hold(dev, 0);
+                }
+            }
+        }
+    }
+
+    return llama_vram_demand_hold(fallback_dev, fallback_bytes);
+}
+
 void llama_vram_demand_satisfied() {
     auto & d = dm();
+    if (d.load_depth != 0) {
+        return;
+    }
+    d.landed_before_attempt.clear();
+    d.plan_base.clear();
+    d.plan_aux.clear();
     d.terminal_failed = false; // load concluded — the next load negotiates fresh
     if (d.ph == phase::IDLE || d.ph == phase::PROBE) {
         // an attempt that never committed (or never opened) has nothing to hold onto
         unlink_all(d, "load done without demand");
+        d.application_owned_completion = false;
         return;
     }
     publish_claims(d, LLAMA_VRAM_CLAIM_SATISFIED);
@@ -510,8 +648,16 @@ void llama_vram_demand_satisfied() {
 }
 
 void llama_vram_demand_abandon() {
-    unlink_all(dm(), "abandoned");
-    dm().terminal_failed = false; // load concluded — the next load negotiates fresh
+    auto & d = dm();
+    if (d.load_depth != 0) {
+        return;
+    }
+    unlink_all(d, "abandoned");
+    d.landed_before_attempt.clear();
+    d.plan_base.clear();
+    d.plan_aux.clear();
+    d.terminal_failed = false; // load concluded — the next load negotiates fresh
+    d.application_owned_completion = false;
 }
 
 void llama_vram_demand_complete() {
@@ -520,8 +666,14 @@ void llama_vram_demand_complete() {
         return;
     }
     unlink_all(d, "claim-complete");
+    d.application_owned_completion = false;
 }
 
 bool llama_vram_demand_pending_complete() {
     return dm().ph == phase::SATISFIED;
+}
+
+bool llama_vram_demand_auto_complete_pending() {
+    const auto & d = dm();
+    return d.ph == phase::SATISFIED && !d.application_owned_completion;
 }

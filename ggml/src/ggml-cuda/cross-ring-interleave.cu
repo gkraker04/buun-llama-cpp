@@ -2,7 +2,9 @@
 #include "vendors/hip.h"
 #else
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #endif
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -250,6 +252,191 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
     cudaStreamSynchronize(cudaStreamPerThread);
 
     return ring->d_staging;
+}
+
+// ---------------------------------------------------------------------------
+// Projected cross-KV cache: per-(drafter layer, ring slot) K/V projections.
+// Slots map 1:1 to the cross ring above (slot = committed pos % ring_size), so
+// a ring overwrite is invalidated simply by re-projecting the overwritten
+// slots — which the update path does for every newly written token.
+// K rows are pre-RoPE (positions are window-relative and slide every draft
+// call, so RoPE must stay in the drafter graph); V rows are final.
+// ---------------------------------------------------------------------------
+
+struct dflash_crosskv_cache {
+    int device;
+    int n_layers;
+    int ring_size;
+    int quant;            // 0 = f32 rows, 1 = q8_0 rows (32-elem blocks, half scale)
+    int64_t k_row;        // floats per token (K)
+    int64_t v_row;        // floats per token (V)
+    int64_t k_row_bytes;  // stored bytes per token
+    int64_t v_row_bytes;
+    uint8_t ** k_rings;   // host array of per-layer device pointers
+    uint8_t ** v_rings;
+};
+
+// q8_0 block: half scale + 32 int8 (matches ggml block_q8_0 semantics: d = amax/127)
+#define CKV_Q8_BLOCK   32
+#define CKV_Q8_BYTES   (2 + CKV_Q8_BLOCK)
+
+__global__ static void k_crosskv_quant_q8_0(
+        const float * __restrict__ src, uint8_t * __restrict__ dst,
+        const int groups_per_row, const int64_t row, const int n_tokens) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_tokens * groups_per_row) return;
+    const int tok = g / groups_per_row;
+    const int grp = g % groups_per_row;
+
+    const float * s = src + (size_t)tok * row + (size_t)grp * CKV_Q8_BLOCK;
+    uint8_t * d = dst + (size_t)tok * groups_per_row * CKV_Q8_BYTES + (size_t)grp * CKV_Q8_BYTES;
+
+    float amax = 0.0f;
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) amax = fmaxf(amax, fabsf(s[i]));
+    const float scale = amax / 127.0f;
+    const float id    = scale != 0.0f ? 1.0f/scale : 0.0f;
+
+    *(half *)d = __float2half(scale);
+    int8_t * q = (int8_t *)(d + 2);
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) q[i] = (int8_t)roundf(s[i] * id);
+}
+
+__global__ static void k_crosskv_dequant_q8_0(
+        const uint8_t * __restrict__ src, float * __restrict__ dst,
+        const int groups_per_row, const int64_t row, const int n_tokens) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_tokens * groups_per_row) return;
+    const int tok = g / groups_per_row;
+    const int grp = g % groups_per_row;
+
+    const uint8_t * s = src + (size_t)tok * groups_per_row * CKV_Q8_BYTES + (size_t)grp * CKV_Q8_BYTES;
+    float * d = dst + (size_t)tok * row + (size_t)grp * CKV_Q8_BLOCK;
+
+    const float scale = __half2float(*(const half *)s);
+    const int8_t * q = (const int8_t *)(s + 2);
+    for (int i = 0; i < CKV_Q8_BLOCK; i++) d[i] = q[i] * scale;
+}
+
+extern "C" void * dflash_crosskv_alloc(int n_layers, int64_t k_row, int64_t v_row, int ring_size, int quant) {
+    if (quant != 0 && (k_row % CKV_Q8_BLOCK != 0 || v_row % CKV_Q8_BLOCK != 0)) {
+        fprintf(stderr, "dflash crosskv: rows not divisible by %d — falling back to f32 storage\n", CKV_Q8_BLOCK);
+        quant = 0;
+    }
+
+    auto * c = new dflash_crosskv_cache();
+    cudaGetDevice(&c->device);
+    c->n_layers  = n_layers;
+    c->ring_size = ring_size;
+    c->quant     = quant;
+    c->k_row     = k_row;
+    c->v_row     = v_row;
+    c->k_row_bytes = quant ? (k_row/CKV_Q8_BLOCK)*CKV_Q8_BYTES : k_row*(int64_t)sizeof(float);
+    c->v_row_bytes = quant ? (v_row/CKV_Q8_BLOCK)*CKV_Q8_BYTES : v_row*(int64_t)sizeof(float);
+    c->k_rings   = new uint8_t*[n_layers]();
+    c->v_rings   = new uint8_t*[n_layers]();
+
+    auto fail = [&]() {
+        for (int l = 0; l < n_layers; l++) {
+            if (c->k_rings[l]) cudaFree(c->k_rings[l]);
+            if (c->v_rings[l]) cudaFree(c->v_rings[l]);
+        }
+        delete[] c->k_rings;
+        delete[] c->v_rings;
+        delete c;
+        return (void *) nullptr;
+    };
+
+    for (int l = 0; l < n_layers; l++) {
+        if (cudaMalloc(&c->k_rings[l], (size_t)ring_size * c->k_row_bytes) != cudaSuccess) return fail();
+        if (cudaMalloc(&c->v_rings[l], (size_t)ring_size * c->v_row_bytes) != cudaSuccess) return fail();
+        // zero-init: cold slots must stay finite (they can be gathered as masked pad;
+        // an all-zero q8_0 block dequantizes to zeros)
+        cudaMemset(c->k_rings[l], 0, (size_t)ring_size * c->k_row_bytes);
+        cudaMemset(c->v_rings[l], 0, (size_t)ring_size * c->v_row_bytes);
+    }
+
+    size_t total_kb = (size_t)n_layers * ring_size * (c->k_row_bytes + c->v_row_bytes) / 1024;
+    fprintf(stderr, "dflash crosskv: allocated %d layers x %d slots (K %lld + V %lld floats/tok, %s, ~%zu KB)\n",
+            n_layers, ring_size, (long long)k_row, (long long)v_row, quant ? "q8_0" : "f32", total_kb);
+    return c;
+}
+
+extern "C" void dflash_crosskv_free(void * handle) {
+    if (!handle) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    for (int l = 0; l < c->n_layers; l++) {
+        cudaFree(c->k_rings[l]);
+        cudaFree(c->v_rings[l]);
+    }
+    delete[] c->k_rings;
+    delete[] c->v_rings;
+    delete c;
+}
+
+// Write n_tokens projected rows (device src, contiguous f32 [n_tokens, row]) into
+// the K (which==0) or V (which==1) ring at [ring_pos, ring_pos+n) with wrap-around.
+// f32 mode: plain D2D copies. q8_0 mode: quantize kernel per span.
+extern "C" void dflash_crosskv_write(
+        void * handle, int layer, int which, int ring_pos,
+        const void * dev_src, int n_tokens) {
+    if (!handle || !dev_src || n_tokens <= 0) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
+
+    (void)cudaSetDevice(c->device);
+
+    uint8_t * dst = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row       = which == 0 ? c->k_row       : c->v_row;
+    const int64_t row_bytes = which == 0 ? c->k_row_bytes : c->v_row_bytes;
+    const float * src = (const float *)dev_src;
+
+    ring_span_for_each(c->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
+        if (c->quant) {
+            const int gpr = (int)(row / CKV_Q8_BLOCK);
+            const int total = n * gpr;
+            k_crosskv_quant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                src + (size_t)src_tok * row, dst + (size_t)ring_tok * row_bytes, gpr, row, n);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)ring_tok * row_bytes, src + (size_t)src_tok * row,
+                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
+    });
+}
+
+// Gather the window [start, start+n_tokens) of the K/V ring into a device f32
+// destination (drafter graph input tensor) at byte offset dst_off.
+extern "C" void dflash_crosskv_read_window(
+        void * handle, int layer, int which, int start, int n_tokens,
+        void * dev_dst, size_t dst_off) {
+    if (!handle || !dev_dst || n_tokens <= 0) return;
+    auto * c = (dflash_crosskv_cache *)handle;
+    if (layer < 0 || layer >= c->n_layers || n_tokens > c->ring_size) return;
+
+    (void)cudaSetDevice(c->device);
+
+    const uint8_t * src = which == 0 ? c->k_rings[layer] : c->v_rings[layer];
+    const int64_t row       = which == 0 ? c->k_row       : c->v_row;
+    const int64_t row_bytes = which == 0 ? c->k_row_bytes : c->v_row_bytes;
+    char * dst = (char *)dev_dst + dst_off;
+
+    ring_span_for_each(c->ring_size, start, n_tokens, [&](int ring_tok, int dst_tok, int n) {
+        if (c->quant) {
+            const int gpr = (int)(row / CKV_Q8_BLOCK);
+            const int total = n * gpr;
+            k_crosskv_dequant_q8_0<<<(total + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                src + (size_t)ring_tok * row_bytes, (float *)(dst + (size_t)dst_tok * row * sizeof(float)),
+                gpr, row, n);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)dst_tok * row_bytes, src + (size_t)ring_tok * row_bytes,
+                            (size_t)n * row_bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
+    });
+}
+
+// Synchronize the stream all ring/cache copies run on. Needed before handing
+// data to a compute path that runs on a different (backend) stream.
+extern "C" void dflash_crosskv_sync(void) {
+    cudaStreamSynchronize(cudaStreamPerThread);
 }
 
 // D2D copy: from device source to device destination (raw pointers).
