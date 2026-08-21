@@ -17,16 +17,20 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 2)   // RDNA: 2nd resident block hides decode stalls (occupancy-bound); NVIDIA keeps 1 (TCQ codebook register pressure would spill at 2)
+#else
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+#endif
 static __global__ void flash_attn_ext_vec(
-        const char * __restrict__ Q,
-        const char * __restrict__ K,
-        const char * __restrict__ V,
-        const char * __restrict__ mask,
-        const char * __restrict__ sinks,
-        const int  * __restrict__ KV_max,
-        float      * __restrict__ dst,
-        float2     * __restrict__ dst_meta,
+        const char * Q_ptr,
+        const char * K_ptr,
+        const char * V_ptr,
+        const char * mask_ptr,
+        const char * sinks_ptr,
+        const int  * KV_max_ptr,
+        float      * dst_ptr,
+        float2     * dst_meta_ptr,
         const float scale,
         const float max_bias,
         const float m0,
@@ -40,7 +44,16 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+    ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
+    const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+    const char * GGML_CUDA_RESTRICT K        = K_ptr;
+    const char * GGML_CUDA_RESTRICT V        = V_ptr;
+    const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
+    const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
+    const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+    float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) {
@@ -119,10 +132,14 @@ static __global__ void flash_attn_ext_vec(
     constexpr bool is_tcq2 = type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ;
     constexpr int smem_cb_size = is_tcq3 ? 512 : (is_tcq2 ? 256 : 0);
     __shared__ float smem_codebook[smem_cb_size > 0 ? smem_cb_size : 1];
+    __shared__ float smem_codebook_v[smem_cb_size > 0 ? smem_cb_size : 1];  // V may use a different book than K (asymmetric K/V)
     if constexpr (smem_cb_size > 0) {
-        const float * cb_src = is_tcq3 ? d_turbo3_tcq_codebook_fattn : d_turbo2_tcq_codebook_fattn;
+        const float * cb_src   = is_tcq3 ? d_turbo3_tcq_codebook_fattn   : d_turbo2_tcq_codebook_fattn;
+        // K reads the K book, V reads the separate V book (asymmetric K/V split).
+        const float * cb_src_v = is_tcq3 ? d_turbo3_tcq_codebook_v_fattn : d_turbo2_tcq_codebook_v_fattn;
         for (int i = tid; i < smem_cb_size; i += nthreads) {
-            smem_codebook[i] = cb_src[i];
+            smem_codebook[i]   = cb_src[i];
+            smem_codebook_v[i] = cb_src_v[i];
         }
         __syncthreads();
     }
@@ -160,6 +177,8 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+
+    ggml_cuda_pdl_sync();
     if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
@@ -381,7 +400,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                 } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
                     dequantize_V_turbo3_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook_v);
                 } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
                     dequantize_V_turbo2_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
@@ -419,7 +438,7 @@ static __global__ void flash_attn_ext_vec(
                 float2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
                     dequantize_V_turbo3_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook_v);
                 } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
                     dequantize_V_turbo2_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
@@ -576,7 +595,7 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -609,6 +628,11 @@ template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
+
+    // Vanilla-book override: THIS vec instance TU's __constant__ copies feed vec_dot/dequantize_V.
+    // (The TCQ vec paths have NO per-TU load — they rely on dispatch preferring fused/materialize;
+    // do not copy that assumption for book overrides.)
+    turbo_vanilla_cb_load_fattn();
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));

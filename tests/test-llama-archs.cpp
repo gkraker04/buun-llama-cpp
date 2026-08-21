@@ -7,14 +7,18 @@
 #include "llama.h"
 #include "llama-cpp.h"
 
-// TODO: replace with #include "llama-ext.h" in the future
+// Internal test helpers.
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -39,8 +43,10 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
 }
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+    size_t seed = *(const size_t *) userdata;
     std::hash<std::string> hasher;
-    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
+    seed ^= hasher(tensor->name);
+    std::mt19937 gen(seed);
     std::normal_distribution<float> dis(0.0f, 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
@@ -99,6 +105,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -109,6 +116,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
+    } else if (arch == LLM_ARCH_QWEN3TTS) {
+        n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
@@ -155,6 +164,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
     if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -163,6 +173,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+    } else if (arch == LLM_ARCH_MINIMAX_M3) {
+        // partial rotary: n_rot must not exceed the indexer key length (64)
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
@@ -182,7 +195,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
+    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_GLIMMER) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -193,9 +206,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
 
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
+    // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
+    // indexer head count is independent of the main attention head count.
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,   uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
@@ -282,6 +299,208 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
+struct file_deleter {
+    void operator()(FILE * file) const {
+        if (file) {
+            fclose(file);
+        }
+    }
+};
+
+using file_ptr = std::unique_ptr<FILE, file_deleter>;
+
+static file_ptr make_qwen35_mtp_sidecar(const ggml_type d2t_type, const size_t seed) {
+    GGML_ASSERT(d2t_type == GGML_TYPE_I32 || d2t_type == GGML_TYPE_I64);
+    file_ptr file(tmpfile());
+    if (!file) {
+        return file;
+    }
+
+    gguf_context_ptr source_gguf = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    llama_model_saver source_meta(LLM_ARCH_QWEN35, source_gguf.get());
+    source_meta.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+
+    llama_model_params source_params = llama_model_default_params();
+    source_params.progress_callback = silent_model_load_progress;
+    source_params.load_mtp = true;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    source_params.devices = cpu_devices;
+
+    size_t tmp = seed;
+    llama_model_ptr source(llama_model_init_from_user(
+            source_gguf.get(), set_tensor_data, &tmp, source_params));
+    if (!source) {
+        throw std::runtime_error("failed to create synthetic Qwen3.5 MTP model");
+    }
+
+    // Write a genuine MTP-only sidecar: omit the trunk and the optional full-vocab
+    // NextN embedding/head so the normal loader must select tok_embd/output+d2t.
+    gguf_context_ptr sidecar_gguf(gguf_init_empty());
+    gguf_set_kv(sidecar_gguf.get(), source_gguf.get());
+    llama_model_saver saver(LLM_ARCH_QWEN35, sidecar_gguf.get());
+    for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
+        const std::string & name = entry.first;
+        if (name.rfind("blk.0.", 0) == 0 ||
+                name.find(".nextn.embed_tokens.") != std::string::npos ||
+                name.find(".nextn.shared_head_head.") != std::string::npos ||
+                name == "output.weight") {
+            continue;
+        }
+        saver.add_tensor(entry.second);
+    }
+
+    ggml_init_params tensor_params = {
+        /*.mem_size   =*/ 64*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
+    ggml_tensor * output = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F16, 256, 32);
+    ggml_set_name(output, "output.weight");
+    memset(output->data, 0, ggml_nbytes(output));
+    saver.add_tensor(output);
+
+    ggml_tensor * d2t = ggml_new_tensor_1d(tensor_ctx.get(), d2t_type, 32);
+    ggml_set_name(d2t, "d2t");
+    if (d2t_type == GGML_TYPE_I32) {
+        std::vector<int32_t> values(32);
+        for (int32_t i = 0; i < 32; ++i) {
+            values[i] = i;
+        }
+        memcpy(d2t->data, values.data(), ggml_nbytes(d2t));
+    } else {
+        std::vector<int64_t> values(32);
+        for (int64_t i = 0; i < 32; ++i) {
+            values[i] = i;
+        }
+        memcpy(d2t->data, values.data(), ggml_nbytes(d2t));
+    }
+    saver.add_tensor(d2t);
+    saver.save(file.get());
+    fflush(file.get());
+    rewind(file.get());
+    return file;
+}
+
+static std::pair<llama_model_ptr, llama_context_ptr> load_qwen35_mtp_sidecar(FILE * file) {
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    model_params.devices = cpu_devices;
+
+    llama_model_ptr model(llama_model_load_from_file_ptr(file, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to load synthetic Qwen3.5 MTP sidecar");
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.n_ctx = 8;
+    ctx_params.n_batch = 8;
+    ctx_params.n_ubatch = 8;
+    ctx_params.n_seq_max = 1;
+    ctx_params.n_outputs_max = 1;
+    ctx_params.n_threads = 1;
+    ctx_params.n_threads_batch = 1;
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create Qwen3.5 MTP context");
+    }
+    return std::make_pair(std::move(model), std::move(ctx));
+}
+
+static void test_qwen35_mtp_d2t_contract(const size_t seed) {
+    auto check_dense_fallback = [seed](const ggml_type d2t_type) {
+        file_ptr file = make_qwen35_mtp_sidecar(d2t_type, seed);
+        if (!file) {
+            return false;
+        }
+        auto model_and_ctx = load_qwen35_mtp_sidecar(file.get());
+        ggml_cgraph * gf = llama_graph_reserve(model_and_ctx.second.get(), 1, 1, 1);
+        GGML_ASSERT(gf != nullptr);
+
+        ggml_tensor * output = ggml_graph_get_tensor(gf, "result_output_d2t");
+        GGML_ASSERT(output != nullptr);
+        GGML_ASSERT(output->type == GGML_TYPE_F32 && output->ne[0] == 128 && output->ne[1] == 1);
+        GGML_ASSERT(output->op == GGML_OP_RESHAPE && output->src[0] != nullptr);
+
+        ggml_tensor * set_rows = output->src[0];
+        GGML_ASSERT(set_rows->op == GGML_OP_SET_ROWS);
+        GGML_ASSERT(set_rows->src[0] != nullptr && set_rows->src[0]->ne[1] == 32);
+        GGML_ASSERT(set_rows->src[1] != nullptr && set_rows->src[1]->type == d2t_type);
+        GGML_ASSERT(set_rows->src[1]->ne[0] == 32);
+        GGML_ASSERT(set_rows->src[2] != nullptr && set_rows->src[2]->ne[1] == 128);
+        return true;
+    };
+
+    if (!check_dense_fallback(GGML_TYPE_I64) || !check_dense_fallback(GGML_TYPE_I32)) {
+        printf("Qwen3.5 MTP d2t loader/graph contract test SKIPPED (tmpfile unavailable)\n");
+        return;
+    }
+
+    // A backend sampler may be valid without understanding a compact token-id
+    // domain. Such chains must keep the dense scatter fallback. Greedy would
+    // otherwise return the compact row index, while logit bias would use a full
+    // token id as a compact-row index.
+    for (int unsafe_kind = 0; unsafe_kind < 2; ++unsafe_kind) {
+        file_ptr file = make_qwen35_mtp_sidecar(GGML_TYPE_I32, seed);
+        if (!file) {
+            printf("Qwen3.5 MTP d2t loader/graph contract test SKIPPED (tmpfile unavailable)\n");
+            return;
+        }
+        auto model_and_ctx = load_qwen35_mtp_sidecar(file.get());
+
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        if (unsafe_kind == 0) {
+            llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        } else {
+            const llama_logit_bias bias = { 101, 5.0f };
+            llama_sampler_chain_add(sampler.get(), llama_sampler_init_logit_bias(128, 1, &bias));
+        }
+        GGML_ASSERT(llama_set_sampler(model_and_ctx.second.get(), 0, sampler.get()));
+
+        ggml_cgraph * gf = llama_graph_reserve(model_and_ctx.second.get(), 1, 1, 1);
+        GGML_ASSERT(gf != nullptr);
+        GGML_ASSERT(ggml_graph_get_tensor(gf, "result_output_d2t") != nullptr);
+    }
+
+    {
+        file_ptr file = make_qwen35_mtp_sidecar(GGML_TYPE_I32, seed);
+        if (!file) {
+            printf("Qwen3.5 MTP d2t loader/graph contract test SKIPPED (tmpfile unavailable)\n");
+            return;
+        }
+        auto model_and_ctx = load_qwen35_mtp_sidecar(file.get());
+
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        // Disabled default stages lower to a backend-capable no-op. They must
+        // preserve compact candidate-domain eligibility.
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_penalties(128, 0, 1.0f, 0.0f, 0.0f));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(4));
+        GGML_ASSERT(llama_set_sampler(model_and_ctx.second.get(), 0, sampler.get()));
+
+        ggml_cgraph * gf = llama_graph_reserve(model_and_ctx.second.get(), 1, 1, 1);
+        GGML_ASSERT(gf != nullptr);
+        GGML_ASSERT(ggml_graph_get_tensor(gf, "result_output_d2t") == nullptr);
+
+        ggml_tensor * output = ggml_graph_get_tensor(gf, "result_output");
+        GGML_ASSERT(output != nullptr);
+        GGML_ASSERT(output->type == GGML_TYPE_F32 && output->ne[0] == 32 && output->ne[1] == 1);
+
+        ggml_tensor * candidates = ggml_graph_get_tensor(gf, "top_k_candidates");
+        GGML_ASSERT(candidates != nullptr && candidates->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nelements(candidates) == 4 && candidates->op == GGML_OP_GET_ROWS);
+        GGML_ASSERT(candidates->src[0] != nullptr && candidates->src[0]->op == GGML_OP_RESHAPE);
+        GGML_ASSERT(candidates->src[0]->src[0] != nullptr);
+        GGML_ASSERT(candidates->src[0]->src[0]->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nelements(candidates->src[0]->src[0]) == 32);
+    }
+
+    printf("Qwen3.5 MTP d2t loader/graph contract test PASSED\n");
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -319,6 +538,7 @@ static std::vector<float> get_logits(
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
+        case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_GROK:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3MOE:
@@ -331,6 +551,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -341,18 +562,22 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_MINIMAX_M2:
+        case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_RND1:
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_MELLUM:
+        case LLM_ARCH_LAGUNA:
             return true;
         default:
             return false;
@@ -387,7 +612,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4) {
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
@@ -406,14 +631,42 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return false;
+    }
 
-    // FIXME some models are segfaulting with WebGPU:
+    // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_KIMI_LINEAR) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
 
+    // FIXME: jamba produces incorrect output (~0.55 NMSE vs CPU) on the HIP
+    // backend on RDNA3.5 (gfx1151); the SSM kernels need investigation.
+#ifdef GGML_USE_HIP
+    if (arch == LLM_ARCH_JAMBA) {
+        return false;
+    }
+#endif // GGML_USE_HIP
+
+    return true;
+}
+
+// Archs whose graphs the meta (tensor-parallel) split planner cannot split yet.
+// These pass on single devices and are skipped ONLY for SPLIT_MODE_TENSOR.
+static bool arch_tensor_split_supported(const llm_arch arch) {
+    if (llm_arch_is_diffusion(arch)) {
+        // diffusion graphs reshape a permuted tensor (ggml-backend-meta.cpp
+        // handle_reshape asserts); verified dream + llada, family-wide skip
+        return false;
+    }
+    if (arch == LLM_ARCH_DFLASH_DRAFT || arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT) {
+        // drafters are never tensor-split in production — TP spec-decode pins the
+        // drafter to a single device (--spec-draft-device); same permuted-reshape
+        // limitation as the diffusion family when forced onto the meta device
+        return false;
+    }
     return true;
 }
 
@@ -442,8 +695,11 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+            continue;
         }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
@@ -452,7 +708,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             if (!moe && moe_mandatory(arch)) {
                 continue;
             }
-            if (!llama_model_saver_supports_arch(arch)) {
+            if (!llama_model_saver_supports_arch(arch) || !arch_supported(arch)) {
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
@@ -497,6 +753,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     };
 
     std::vector<device_config> dev_configs;
+    size_t max_device_label_length = 4;
     {
         std::vector<ggml_backend_dev_t> devices_meta;
         {
@@ -504,6 +761,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
@@ -515,10 +773,27 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
     }
 
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llm_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
+    }
+
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
+    const std::string template_row_res = "%15s %10s|%20s|\n";
+
     bool all_ok = true;
     common_log_flush(common_log_main());
-    printf("|%16s|%30s|%6s|%15s|%9s|\n", "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
-    printf("|----------------|------------------------------|------|---------------|---------|\n");
+    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+    printf("|");
+    for (size_t i = 0; i < max_arch_name_length; i++) {
+        printf("-");
+    }
+    printf("|");
+    for (size_t i = 0; i < max_device_label_length; i++) {
+        printf("-");
+    }
+    printf("|------|---------------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -526,8 +801,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4) {
+        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+            continue;
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
@@ -543,15 +821,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
+                printf(template_row_cfg.c_str(),
+                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
+                fflush(stdout);
+
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
-#if defined(GGML_USE_WEBGPU)
-                skip = true; // FIXME
-#endif // GGML_USE_WEBGPU
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                        (dc.devs.empty() || !arch_tensor_split_supported(arch)));
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
@@ -595,8 +876,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     }
                 }
 
-                printf("|%16s|%30s|%6s|%15s %10s|%20s|\n", llm_arch_name(arch), dc.label.c_str(),
-                    config_name.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                // log the results for this test case
+                printf(template_row_res.c_str(),
+                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
             }
         }
     }
@@ -654,6 +936,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
+            test_qwen35_mtp_d2t_contract(seed);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

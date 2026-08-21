@@ -20,6 +20,11 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// return the max number of draft tokens based on the speculative parameters
+int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+common_params common_base_params_to_speculative(const common_params & params);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -51,19 +56,36 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
+//
+// CALLING CONTRACT (every consumer — server AND examples — must follow this;
+// the 2026-07 upstream sync silently broke speculative-simple by reordering it):
+//   1. common_speculative_init() BEFORE the prompt is decoded on the target —
+//      capture-based impls (DFlash) enable target hidden-state extraction here,
+//      so a prompt decoded earlier is invisible to the drafter.
+//   2. common_speculative_process(batch) after EVERY llama_decode on the target
+//      (prompt prefill and verify steps alike) — capture-based impls gather the
+//      extracted features here before the next decode overwrites them. No-op
+//      for impls that don't need it; always safe to call.
+//   3. DFlash-family drafter contexts must NOT be fed raw token batches
+//      (classic lockstep drafter decodes) — their state is managed entirely via
+//      begin()/process()/draft().
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
 
-// true if any implementation requires target pre-norm embeddings to be extracted
-bool common_speculative_need_embd_pre_norm(common_speculative * spec);
+// true if any implementation requires target nextn embeddings to be extracted
+bool common_speculative_need_embd_nextn(common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// (optional) get/set internal state
+bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
@@ -94,7 +116,8 @@ llama_tokens common_speculative_draft(
         const common_params_speculative & params,
         const llama_tokens              & prompt_tgt,
         llama_token                       id_last,
-        std::vector<float>              * draft_log_probs = nullptr);
+        std::vector<float>              * draft_log_probs = nullptr,
+        llama_pos                         n_past_override = -1);
 
 // fork: batched multi-slot DFlash drafting
 void common_speculative_draft_batch(
@@ -103,6 +126,10 @@ void common_speculative_draft_batch(
         const common_params_speculative   & params,
         const std::vector<llama_token>    & id_last_per_spec,
         std::vector<llama_tokens>         & result_per_spec);
+
+// True only when the immediately preceding single/batched draft call completed
+// at least one decode on a linked draft-model context.
+bool common_speculative_last_draft_model_decode_succeeded(const common_speculative * spec);
 
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
@@ -118,3 +145,19 @@ bool   common_speculative_ring_state_load(common_speculative * spec, const uint8
 // fork: draft length params
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+
+struct common_speculative_init_result {
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    ~common_speculative_init_result();
+
+    llama_model   * model();
+    llama_context * context();
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
+
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);

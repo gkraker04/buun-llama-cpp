@@ -50,6 +50,7 @@
 #define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
 #define cublasSetStream hipblasSetStream
 #define cublasSgemm hipblasSgemm
+#define cublasSgemmBatched hipblasSgemmBatched
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasStatus_t hipblasStatus_t
 #define cublasOperation_t hipblasOperation_t
@@ -59,10 +60,13 @@
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorUnknown hipErrorUnknown
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
@@ -78,6 +82,7 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaPeekAtLastError hipPeekAtLastError
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
@@ -94,6 +99,18 @@
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaPointerGetAttributes hipPointerGetAttributes
+// CUDA-style masked warp shuffles -> plain HIP shuffles (#70). AMD has no independent thread
+// scheduling, so the mask is meaningless there — and ROCm >= 7.2 ships strict __shfl*_sync
+// templates that static_assert on 32-bit mask literals (sizeof(MaskT) == 8 required), which
+// breaks every 0xFFFFFFFF call site at compile time. This mirrors mainline llama.cpp's hip.h
+// (the mapping was lost in this fork's divergence). Variadic: covers 3-arg (default width)
+// and 4-arg call forms alike.
+#define __shfl_sync(mask, var, ...)      __shfl((var), __VA_ARGS__)
+#define __shfl_up_sync(mask, var, ...)   __shfl_up((var), __VA_ARGS__)
+#define __shfl_down_sync(mask, var, ...) __shfl_down((var), __VA_ARGS__)
+#define __shfl_xor_sync(mask, var, ...)  __shfl_xor((var), __VA_ARGS__)
+#define cudaEventQuery hipEventQuery
+#define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -120,6 +137,7 @@
 #define CUmemAllocationProp hipMemAllocationProp
 #define cuDeviceGetAttribute hipDeviceGetAttribute
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamFireAndForget hipStreamFireAndForget
 #define cudaStreamNonBlocking hipStreamNonBlocking
@@ -224,9 +242,9 @@
 #define RDNA3
 #endif // defined(__GFX11__)
 
-#if defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 #define RDNA3_5
-#endif // defined(__gfx1150__) || defined(__gfx1151__)
+#endif // defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 
 #if defined(RDNA3) && !defined(RDNA3_5)
 #define RDNA3_0

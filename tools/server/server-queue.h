@@ -29,6 +29,7 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<void(void)>           callback_idle;
 
 public:
     // Add a new task to the end of the queue
@@ -46,6 +47,18 @@ public:
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
+
+    // true if any deferred task explicitly pins id_slot — a reclaim sweep must not clear the
+    // cache that task deferred itself to come back for
+    bool has_deferred_for_slot(int id_slot) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & task : queue_tasks_deferred) {
+            if (task.id_slot == id_slot) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
@@ -93,6 +106,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the function to be called on the loop's wait timeout while the queue is
+    // empty (~1s cadence, same thread as callback_update_slots; not called while sleeping)
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed
@@ -154,11 +173,15 @@ public:
     // Send a new result to a waiting id_task
     void send(server_task_result_ptr && result);
 
+    // broadcast a new result to all waiting tasks
+    // (used by router mode)
+    void broadcast(server_task_result_ptr && result);
+
     // terminate the waiting loop
     void terminate();
 };
 
-// utility class to make working with server_queue and server_response easier
+// RAII wrapper to make working with server_queue and server_response easier
 // it provides a generator-like API for server responses
 // support pooling connection state and aggregating multiple results
 struct server_response_reader {

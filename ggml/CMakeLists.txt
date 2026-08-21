@@ -4,7 +4,7 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 12)
+set(GGML_VERSION_MINOR 19)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -215,7 +215,13 @@ set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balan
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
-option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
+# HIP VMM default-ON for our fork: dynamic VBR needs it, and it is validated coherent on the AMD
+# cards we target (gfx1201/RDNA4 9070XT, gfx1151/RDNA3.5) incl. the VMM-backed decode scratch.
+# Upstream defaults this ON (VMM off) for broad HW safety; flip OFF here so AMD gets VMM without
+# the -DGGML_HIP_NO_VMM=OFF flag. Set it ON again for any card where HIP VMM misbehaves.
+option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 OFF)
+# fork: upstream removed rocWMMA FlashAttention (#26046); kept fork-side — the
+# RDNA4 f16 prefill widening (cb0d7779c) is a measured win on this path.
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
@@ -249,7 +255,7 @@ option(GGML_SYCL                            "ggml: use SYCL"                    
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
-option(GGML_SYCL_SUPPORT_LEVEL_ZERO         "ggml: use Level Zero API in SYCL backend"  ON)
+option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
@@ -257,6 +263,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_ET                              "ggml: use ET backend"                            OFF)
+option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
@@ -266,7 +274,6 @@ set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
-set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -329,6 +336,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
+    include/ggml-vbr.h
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h

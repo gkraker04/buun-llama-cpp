@@ -157,7 +157,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + (size_t)i*nv, tokens[i+1]);
+            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + size_t(i)*nv, tokens[i+1]);
             local_nll += v;
             local_nll2 += v*v;
         }
@@ -169,7 +169,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
     for (auto & w : workers) {
         w.join();
     }
-    out.write((const char *)log_probs.data(), (size_t)n_token*nv*sizeof(uint16_t));
+    out.write((const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
 }
 
 struct kl_divergence_result {
@@ -257,6 +257,17 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
+    // EXP-16 recency-wall probe: score only the last K tokens of each window (the
+    // decode-relevant positions) so the recency window can be measured without the
+    // half-window scoring blindness. TURBO_SCORE_LAST_ONLY => K=1 (exact decode pos);
+    // TURBO_SCORE_LAST_K=N => last N (more samples at long ctx, position blur N).
+    // Skipped positions are zero-filled (mean over kld.count stays exact; percentiles
+    // are meaningless in this mode and should be ignored).
+    static const int score_last_k = []() {
+        const char * k = getenv("TURBO_SCORE_LAST_K");
+        if (k) { int v = atoi(k); return v > 0 ? v : 0; }
+        return getenv("TURBO_SCORE_LAST_ONLY") != nullptr ? 1 : 0;
+    }();
     auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
         kl_divergence_result local_kld;
         while (true) {
@@ -279,7 +290,12 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + (size_t)i*nv, tokens[i+1], local_kld);
+            if (score_last_k > 0 && i < n_token - score_last_k) {
+                kld_values[i]    = 0.0f;
+                p_diff_values[i] = 0.0f;
+                continue;
+            }
+            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -524,7 +540,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), (size_t)n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize((size_t)n_ctx * nv);
+        log_probs.resize(size_t(n_ctx) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -923,7 +939,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, hs_data[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, hs_data[i0].required_tokens);
             return;
         }
 
@@ -1216,7 +1232,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, data[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, data[i0].required_tokens);
             return;
         }
 
@@ -1595,7 +1611,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
         }
 
         if (i0 == i1) {
-            LOG_ERR("%s : task %zu does not fit in the context window (requires %lu tokens)\n", __func__, i0, tasks[i0].required_tokens);
+            LOG_ERR("%s : task %zu does not fit in the context window (requires %zu tokens)\n", __func__, i0, tasks[i0].required_tokens);
             return;
         }
 
@@ -1692,6 +1708,15 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
+// EXP-15d: defined in ggml-cuda/set-rows.cu. Weak so CPU-only builds link cleanly
+// (symbol resolves to nullptr → call is skipped below).
+#if defined(_MSC_VER)
+static inline void ggml_cuda_ragged_set_window_dummy(int) {}
+#define ggml_cuda_ragged_set_window ggml_cuda_ragged_set_window_dummy
+#else
+extern "C" __attribute__((weak)) void ggml_cuda_ragged_set_window(int window);
+#endif
+
 static void kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1722,9 +1747,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     }
 
     int n_vocab;
-    int n_chunk;
+    int n_chunk_file;
     in.read((char *)&n_vocab, sizeof(n_vocab));
-    in.read((char *)&n_chunk, sizeof(n_chunk));
+    in.read((char *)&n_chunk_file, sizeof(n_chunk_file));
     if (in.fail()) {
         LOG_ERR("%s: failed reading n_vocab, n_chunk from %s\n", __func__, params.logits_file.c_str());
         return;
@@ -1733,7 +1758,17 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         LOG_ERR("%s: inconsistent vocabulary (%d vs %d)\n", __func__, n_vocab, llama_vocab_n_tokens(vocab));
     }
 
-    std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk);
+    const int n_chunk = params.n_chunks < 0 ? n_chunk_file : std::min(params.n_chunks, n_chunk_file);
+    if (n_chunk < 1) {
+        LOG_ERR("%s: invalid requested chunk count %d for %s with %d chunks\n",
+                __func__, params.n_chunks, params.logits_file.c_str(), n_chunk_file);
+        return;
+    }
+
+    // The base logits file stores all tokens before the per-chunk log-prob blocks.
+    // Read the full token block so the file cursor remains positioned at chunk 0
+    // log-probs, then evaluate only the requested prefix.
+    std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk_file);
     if (in.read((char *)tokens.data(), tokens.size()*sizeof(tokens[0])).fail()) {
         LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
         return;
@@ -1801,6 +1836,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        // EXP-15d: select the per-window content-mask plane (n_seq==1 at ctx8192 → window == chunk i)
+        if (ggml_cuda_ragged_set_window) ggml_cuda_ragged_set_window(i);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -1907,6 +1945,27 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     llama_batch_free(batch);
     LOG("\n");
 
+    // TURBO_KLD_DUMP: write the per-position KLD array (chunk-major, PRE-sort) so two
+    // runs against the same base+tokens can be differenced position-by-position offline
+    // (common random numbers): shared per-token difficulty cancels, so the paired-delta
+    // SE is far below sqrt(SE_cand^2 + SE_base^2). Layout: [int32 n_pos_per_chunk][int32
+    // n_chunk][float32 kld[n_chunk*n_pos] in chunk-major order]. Offline differ windows
+    // last-k from the tail of each chunk's n_pos block.
+    if (const char * dump_path = getenv("TURBO_KLD_DUMP")) {
+        std::ofstream dump(dump_path, std::ios::binary);
+        if (dump) {
+            const int32_t n_pos = n_ctx - 1 - first;
+            const int32_t nchk  = n_chunk;
+            dump.write((const char *) &n_pos, sizeof(n_pos));
+            dump.write((const char *) &nchk,  sizeof(nchk));
+            dump.write((const char *) kld_values.data(), kld_values.size()*sizeof(float));
+            LOG_INF("%s: TURBO_KLD_DUMP wrote %d x %d per-position KLDs to %s\n",
+                    __func__, n_pos, nchk, dump_path);
+        } else {
+            LOG_ERR("%s: TURBO_KLD_DUMP failed to open %s\n", __func__, dump_path);
+        }
+    }
+
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
     std::sort(kld_values.begin(), kld_values.end());
@@ -2005,7 +2064,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_perplexity(int argc, char ** argv);
+
+int llama_perplexity(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;

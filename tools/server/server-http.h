@@ -1,14 +1,27 @@
 #pragma once
 
+#include "server-cache-control.h"
+
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 
 struct common_params;
+
+// Vertex /predict is a compatibility dispatcher, not an alternate security
+// boundary. Cache-plan preflight is intentionally reachable only through its
+// reviewed route so its no-store and body-redaction contracts cannot be lost.
+inline bool server_http_gcp_predict_dispatch_allowed(
+        std::string_view path) noexcept {
+    return path != "/cache/plan" && !server_cache_control_is_route(path);
+}
 
 // generator-like API for HTTP response generation
 // this object response with one of the 2 modes:
@@ -22,11 +35,13 @@ struct server_http_res {
     std::string data;
     std::map<std::string, std::string> headers;
 
-    // TODO: move this to a virtual function once we have proper polymorphism support
     std::function<bool(std::string &)> next = nullptr;
     bool is_stream() const {
         return next != nullptr;
     }
+
+    // fired before req and res are destroyed
+    virtual void on_complete() {}
 
     virtual ~server_http_res() = default;
 };
@@ -58,6 +73,31 @@ struct server_http_req {
         }
         return def;
     }
+
+    // Header field names are case-insensitive (RFC 9110). Keep this behavior
+    // aligned with httplib::Request::get_header_value after the request is
+    // lowered into the server-owned map.
+    std::string get_header_value(const std::string & key) const {
+        const auto ascii_lower = [](unsigned char c) {
+            return c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c;
+        };
+        for (const auto & [name, value] : headers) {
+            if (name.size() != key.size()) {
+                continue;
+            }
+            bool equal = true;
+            for (size_t i = 0; i < name.size(); ++i) {
+                if (ascii_lower(name[i]) != ascii_lower(key[i])) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) {
+                return value;
+            }
+        }
+        return {};
+    }
 };
 
 struct server_http_context {
@@ -73,7 +113,8 @@ struct server_http_context {
 
     std::string path_prefix;
     std::string hostname;
-    int port;
+    int port    = 8080;
+    bool is_ssl = false;
 
     server_http_context();
     ~server_http_context();
@@ -84,10 +125,11 @@ struct server_http_context {
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
+    void del(const std::string & path, const handler_t & handler) const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
     // Must be called AFTER all other API routes are registered
-    void register_gcp_compat();
+    void register_gcp_compat() const;
 
     // for debugging
     std::string listening_address;

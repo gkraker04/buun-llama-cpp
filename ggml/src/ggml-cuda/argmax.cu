@@ -172,15 +172,18 @@ static __global__ void argmax_f32(
             int32_t prob_bits;
             memcpy(&prob_bits, &log_prob, sizeof(float));
             dst[nrows + row] = prob_bits;
-        } else {
-            dst[nrows + row] = 0;  // unused but zero-fill for consistency
         }
+        // NOTE: no else-branch store. Plain ggml_argmax allocates dst with exactly nrows
+        // elements, so writing dst[nrows + row] there is out of bounds.
     }
 }
 
 // Top-K kernel: each block handles one row, outputs K best tokens + log-probs.
 // Uses a register-based min-heap per thread, then merges via shared memory.
-// K is a runtime parameter but must be <= 32.
+// K is a runtime parameter; MAXK is the compiled heap capacity. K <= MAXK is
+// asserted at the launch site — ggml_topk_ext() admits K up to 64, so both a
+// 32 and a 64 instance are dispatched (keeps the common K<=32 stack frame small).
+template <int MAXK>
 static __global__ void topk_f32(
         const float * __restrict__ x,
         int32_t * __restrict__ dst,
@@ -196,9 +199,8 @@ static __global__ void topk_f32(
     const bool use_gumbel = (seed != 0);
 
     // Per-thread top-K heap (min-heap: smallest score at index 0)
-    // Max K=32, stored in registers
-    float  heap_val[32];
-    int32_t heap_idx[32];
+    float  heap_val[MAXK];
+    int32_t heap_idx[MAXK];
     for (int i = 0; i < K; i++) {
         heap_val[i] = -FLT_MAX;
         heap_idx[i] = -1;
@@ -245,6 +247,24 @@ static __global__ void topk_f32(
         }
     }
 
+    // Warp reduction for online softmax (merge logit_max and sum_exp), same as
+    // argmax_f32. Must happen for every warp BEFORE the cross-warp merge: the
+    // warp leaders below publish their accumulators to shared memory, so those
+    // must already cover the whole warp, not just lane 0's column stripe.
+    if (output_logprob) {
+#pragma unroll
+        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+            float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+            float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
+            if (other_max > logit_max) {
+                sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
+                logit_max = other_max;
+            } else {
+                sum_exp = sum_exp + other_sum * expf(other_max - logit_max);
+            }
+        }
+    }
+
     // Cross-thread merge via shared memory
     // Strategy: iterative pairwise merge within warp, then across warps
     const int n_warps = blockDim.x / WARP_SIZE;
@@ -258,12 +278,23 @@ static __global__ void topk_f32(
     float  * s_logit_max = (float *)(smem + 2 * K * n_warps * sizeof(float));
     float  * s_sum_exp   = s_logit_max + n_warps;
 
-    // Intra-warp merge: pair-reduce within warp using shuffle
-    // Each step: lane gets partner's min element, if it beats our min, replace and re-heapify
+    // Intra-warp merge: pair-reduce within warp using shuffle.
+    // The exchange must shuffle from a SNAPSHOT of the heap taken before the
+    // step: both lanes of a pair mutate their heaps while inserting, so
+    // shuffling the live heap sends a mid-merge mixture (elements bounce back,
+    // duplicate, and drop — wrong tail-of-top-K for K >= 8). With the snapshot
+    // both lanes merge each other's original sets and converge to the same
+    // top-K of the union, which keeps the butterfly reduction correct.
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float   snap_val[MAXK];
+        int32_t snap_idx[MAXK];
         for (int i = 0; i < K; i++) {
-            float partner_val = __shfl_xor_sync(0xFFFFFFFFULL, heap_val[i], offset);
-            int partner_idx = __shfl_xor_sync(0xFFFFFFFFULL, heap_idx[i], offset);
+            snap_val[i] = heap_val[i];
+            snap_idx[i] = heap_idx[i];
+        }
+        for (int i = 0; i < K; i++) {
+            float partner_val = __shfl_xor_sync(0xFFFFFFFFULL, snap_val[i], offset);
+            int partner_idx = __shfl_xor_sync(0xFFFFFFFFULL, snap_idx[i], offset);
             if (partner_val > heap_val[0]) {
                 heap_val[0] = partner_val;
                 heap_idx[0] = partner_idx;
@@ -339,21 +370,8 @@ static __global__ void topk_f32(
                 }
             }
         }
-    } else {
-        // Single warp: reduce softmax within warp
-        if (output_logprob) {
-            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-                float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
-                float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
-                if (other_max > logit_max) {
-                    sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
-                    logit_max = other_max;
-                } else {
-                    sum_exp = sum_exp + other_sum * expf(other_max - logit_max);
-                }
-            }
-        }
     }
+    // (single-warp softmax reduction is covered by the unified warp reduction above)
 
     // Output: sort heap descending and write
     if ((n_warps == 1 && lane_id == 0) || (n_warps > 1 && warp_id == 0 && lane_id == 0)) {
@@ -424,7 +442,10 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K <= 0) K = 1;
 
     const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
-    const bool output_logprob = true; // always output log-probs (needed for p_min early stopping + DDTree)
+    // ggml_argmax_ext() allocates 2*nrows (argmax row + packed log-prob row); plain
+    // ggml_argmax() allocates only nrows. Deriving the flag from the real dst extent keeps
+    // the log-prob store (needed for p_min early stopping + DDTree) in bounds for both.
+    const bool output_logprob = ggml_nelements(dst) >= 2*nrows;
 
     const int64_t num_blocks = nrows;
     const int64_t num_threads = std::min<int64_t>(1024, (ne00 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
@@ -434,9 +455,16 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K == 1) {
         argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00, nrows, inv_temp, seed, output_logprob);
     } else {
+        // ggml_topk_ext() admits K in [1, 64]; the heap capacity is a template
+        // parameter, so an out-of-range K here is a build-graph/kernel mismatch.
+        GGML_ASSERT(K <= 64);
         // Shared memory: K * n_warps floats + K * n_warps ints + 2 * n_warps floats (softmax)
         const int n_warps = (int)(num_threads / WARP_SIZE);
         const size_t smem_size = K * n_warps * (sizeof(float) + sizeof(int32_t)) + 2 * n_warps * sizeof(float);
-        topk_f32<<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        if (K <= 32) {
+            topk_f32<32><<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        } else {
+            topk_f32<64><<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        }
     }
 }

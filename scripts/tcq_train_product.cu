@@ -155,7 +155,14 @@ __global__ void k_viterbi_encode(
 
 // ============================================================================
 // Weighted centroid collection: accumulates w[t]*x and w[t] per state
+// Tail-weighted GLA (codebook-anatomy 2026-07-03: median-KLD winners minimize the error
+// TAIL, which plain GLA leaves free at convergence): samples whose |err| under the current
+// book exceeds d_tail_thresh get weight ×(1+d_tail_boost). Threshold set host-side each
+// iteration from the previous iteration's RMS (TCQ_TAIL_W / TCQ_TAIL_SIGMA envs).
 // ============================================================================
+__constant__ float d_tail_thresh = 1e30f;
+__constant__ float d_tail_boost  = 0.0f;
+
 __global__ void k_collect_centroids_weighted(
 	const float*   __restrict__ data,
 	const int16_t* __restrict__ states,
@@ -172,6 +179,9 @@ __global__ void k_collect_centroids_weighted(
 	int state = (int)(unsigned short)states[idx];
 	float val = data[idx];
 	float w = d_weights[t];
+	if (d_tail_boost > 0.0f && fabsf(val - d_codebook[state]) > d_tail_thresh) {
+		w *= 1.0f + d_tail_boost;
+	}
 
 	atomicAdd(&state_wsums[state], (double)(w * val));
 	atomicAdd(&state_waccum[state], (double)w);
@@ -253,6 +263,7 @@ __global__ void k_scale_queries(float* queries, int n_samples) {
 // Host code
 // ============================================================================
 
+static const float LM_1BIT[] = {-0.7979f, 0.7979f};
 static const float LM_2BIT[] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
 static const float LM_3BIT[] = {-1.748f, -1.050f, -0.5006f, -0.06971f, 0.06971f, 0.5006f, 1.050f, 1.748f};
 
@@ -293,7 +304,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 	constexpr int N_STATES = 1 << L;
 	constexpr int N_GROUPS = 1 << (L - K);
 	const float sigma = 1.0f / sqrtf(128.0f);
-	const float* centroids = (K == 2) ? LM_2BIT : LM_3BIT;
+	const float* centroids = (K == 1) ? LM_1BIT : (K == 2) ? LM_2BIT : LM_3BIT;
 
 	if (output_dir) { mkdir(output_dir, 0755); printf("Output dir: %s\n", output_dir); }
 	if (constrain_mono) printf("Monotonicity constraint: ENABLED\n");
@@ -415,6 +426,9 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 	float best_global_product = FLT_MAX;
 	float best_global_codebook[MAX_STATES];
 
+	const bool static_data = getenv("TCQ_STATIC_DATA") != nullptr;
+	float* h_batch = nullptr;
+
 	for (int restart = 0; restart < n_restarts; restart++) {
 		if (n_restarts > 1) printf("\n=== Restart %d/%d ===\n", restart+1, n_restarts);
 
@@ -458,14 +472,30 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 		memcpy(best_codebook, h_codebook, N_STATES * sizeof(float));
 		int stall = 0;
 
-		// upload real data once before iteration loop
+		// Real data: seeded per-iteration resampling (restored 2026-07-04 — the product
+		// rewrite lost tcq_train_cuda.cu's block, regressing --seed to eval-queries-only
+		// and training to a fixed first-n_train subset). TCQ_STATIC_DATA=1 keeps the
+		// regressed static path as an explicit control arm.
 		if (h_real_data) {
-			CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			if (static_data) {
+				CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			} else if (!h_batch) {
+				h_batch = (float*)malloc((size_t)n_train * T * sizeof(float));
+			}
 		}
 
 		for (int iter = 0; iter < n_iters; iter++) {
 			CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, h_codebook, N_STATES * sizeof(float)));
 
+			if (h_real_data && !static_data) {
+				// sample n_train blocks randomly from the full corpus (tcq_train_cuda.cu semantics)
+				srand(base_seed + restart * 10000 + iter);
+				for (int i = 0; i < n_train; i++) {
+					int idx = rand() % real_data_n;
+					memcpy(h_batch + (size_t)i * T, h_real_data + (size_t)idx * T, T * sizeof(float));
+				}
+				CHECK_CUDA(cudaMemcpy(d_data, h_batch, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			}
 			if (!h_real_data) {
 				// generate fresh synthetic K data
 				CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
@@ -543,6 +573,22 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 			}
 			pos_cv = sqrt(pos_cv / T) / pos_mean; // coefficient of variation
 
+			// tail-weighted GLA: threshold from this iteration's realized RMS (states were
+			// just computed under the current book, so d_codebook is coherent with d_states)
+			static float tail_boost = -1.0f, tail_sigma = 2.33f;
+			if (tail_boost < 0.0f) {
+				const char * te = getenv("TCQ_TAIL_W");
+				tail_boost = te ? (float)atof(te) : 0.0f;
+				const char * ts = getenv("TCQ_TAIL_SIGMA");
+				if (ts) tail_sigma = (float)atof(ts);
+				if (tail_boost > 0.0f) printf("tail-weighted GLA: boost=%.1f sigma=%.2f\n", tail_boost, tail_sigma);
+			}
+			if (tail_boost > 0.0f) {
+				float thr = tail_sigma * (float)sqrt(pos_mean);
+				CHECK_CUDA(cudaMemcpyToSymbol(d_tail_thresh, &thr, sizeof(float)));
+				CHECK_CUDA(cudaMemcpyToSymbol(d_tail_boost, &tail_boost, sizeof(float)));
+			}
+
 			// collect weighted centroids
 			CHECK_CUDA(cudaMemset(d_state_wsums, 0, N_STATES * sizeof(double)));
 			CHECK_CUDA(cudaMemset(d_state_waccum, 0, N_STATES * sizeof(double)));
@@ -608,7 +654,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 				save_codebook(h_codebook, N_STATES, fname);
 			}
 
-			if (stall >= 10 && iter > 20) {
+			if (stall >= 10 && iter > 20 && !output_dir) {  // checkpointing runs ALL iters (June fix: median improves past train-MSE stalls)
 				printf("  Converged (10 iters without improvement)\n");
 				break;
 			}
@@ -770,6 +816,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 
 	// cleanup
 	if (h_real_data) free(h_real_data);
+	if (h_batch) free(h_batch);
 	free(h_codebook); free(h_mse); free(h_wsums); free(h_waccum);
 	free(h_counts); free(h_pos_mse); free(h_product_err);
 	free(h_eval_mse); free(h_eval_prod);
@@ -830,6 +877,10 @@ int main(int argc, char** argv) {
 
 	if (bits == 2) {
 		train<2, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
+	} else if (bits == 1) {
+		// turbo1_tcq: k=1, L=8 -> 256 states, 2 outputs/state. Watch the used/balance
+		// diagnostics: 1-bit trellis training historically collapses if data scaling is off.
+		train<1, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else if (bits == 3) {
 		train<3, 9>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else {

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import { URL_PARAMS } from '$lib/constants';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { AlertTriangle, ArrowRight } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
@@ -21,7 +23,7 @@
 	function handleSelectModel(model: string) {
 		// Build URL with selected model, preserving other params
 		const url = new URL(page.url);
-		url.searchParams.set('model', model);
+		url.searchParams.set(URL_PARAMS.MODEL, model);
 
 		handleOpenChange(false);
 		goto(url.toString());
@@ -60,7 +62,7 @@
 							>
 								<span class="min-w-0 truncate font-mono text-xs">{model}</span>
 								<ArrowRight
-									class="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
+									class="{ICON_CLASS_DEFAULT} shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
 								/>
 							</button>
 						{/each}

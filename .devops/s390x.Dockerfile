@@ -5,7 +5,7 @@ ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
 
 ### Build Llama.cpp stage
-FROM gcc:${GCC_VERSION} AS build
+FROM docker.io/gcc:${GCC_VERSION} AS build
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -37,6 +37,7 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 COPY *.py             /opt/llama.cpp/bin
 COPY .devops/tools.sh /opt/llama.cpp/bin
+COPY conversion       /opt/llama.cpp/conversion
 
 COPY gguf-py          /opt/llama.cpp/gguf-py
 COPY requirements.txt /opt/llama.cpp/gguf-py
@@ -47,13 +48,14 @@ COPY requirements     /opt/llama.cpp/gguf-py/requirements
 FROM scratch AS collector
 
 # Copy llama.cpp binaries and libraries
-COPY --from=build /opt/llama.cpp/bin     /llama.cpp/bin
-COPY --from=build /opt/llama.cpp/lib     /llama.cpp/lib
-COPY --from=build /opt/llama.cpp/gguf-py /llama.cpp/gguf-py
+COPY --from=build /opt/llama.cpp/bin        /llama.cpp/bin
+COPY --from=build /opt/llama.cpp/lib        /llama.cpp/lib
+COPY --from=build /opt/llama.cpp/gguf-py    /llama.cpp/gguf-py
+COPY --from=build /opt/llama.cpp/conversion /llama.cpp/conversion
 
 
 ### Base image
-FROM ubuntu:${UBUNTU_VERSION} AS base
+FROM docker.io/ubuntu:${UBUNTU_VERSION} AS base
 
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
@@ -107,6 +109,7 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 
 COPY --from=collector /llama.cpp/bin /app
 COPY --from=collector /llama.cpp/gguf-py /app/gguf-py
+COPY --from=collector /llama.cpp/conversion /app/conversion
 
 RUN pip install --no-cache-dir --break-system-packages \
         -r /app/gguf-py/requirements.txt
@@ -121,7 +124,7 @@ WORKDIR /llama.cpp/bin
 
 # Copy llama.cpp binaries and libraries
 COPY --from=collector /llama.cpp/bin/*.so /llama.cpp/bin
-COPY --from=collector /llama.cpp/bin/llama-cli /llama.cpp/bin/llama-completion /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/llama /llama.cpp/bin/llama-cli /llama.cpp/bin/llama-completion /llama.cpp/bin
 
 ENTRYPOINT [ "/llama.cpp/bin/llama-cli" ]
 
@@ -135,7 +138,7 @@ WORKDIR /llama.cpp/bin
 
 # Copy llama.cpp binaries and libraries
 COPY --from=collector /llama.cpp/bin/*.so /llama.cpp/bin
-COPY --from=collector /llama.cpp/bin/llama-server /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/llama /llama.cpp/bin/llama-server /llama.cpp/bin
 
 EXPOSE 8080
 

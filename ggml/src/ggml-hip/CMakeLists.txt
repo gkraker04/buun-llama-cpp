@@ -61,6 +61,7 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX "../ggml-cuda/bsa_.*\\.cu$")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -80,7 +81,14 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec-instance-*turbo*.cu")
+    # Match the CUDA backend's fattn-vec selection exactly: only the turbo*_0 vec instances.
+    # The TCQ codecs (turbo1/2/3_tcq) dispatch through the MMA path, not fattn-vec — and
+    # turbo1_tcq has no get_vec_dot_KQ/get_dequantize_V case, so its vec instance can't compile.
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo2_0*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo3_0*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*turbo4_0*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})
 endif()
 
@@ -131,6 +139,9 @@ endif()
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
+
+# Fast math for HIP, like CUDA's -use_fast_math. Not -ffast-math: that implies -ffinite-math-only, which breaks ggml's INFINITY masking and produces NaNs.
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -funsafe-math-optimizations")
 
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)

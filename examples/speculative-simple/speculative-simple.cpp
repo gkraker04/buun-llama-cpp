@@ -5,6 +5,7 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -129,9 +130,37 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
+    // init the speculator BEFORE the prompt eval so capture-based impls (DFlash)
+    // can enable target hidden-state extraction first — same calling contract as
+    // the server (see common/speculative.h)
+    const auto & params_spec = params.speculative;
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
+
+    // DFlash-family drafters consume injected target features via
+    // common_speculative_process(); they must not be fed raw prompt/verify
+    // token batches like classic draft models
+    const bool spec_is_dflash = std::find(params.speculative.types.begin(),
+            params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+
+    // eval the prompt, handing the decoded batch to the speculator right after
+    // (DFlash gathers its captured target features there). The prompt fits one
+    // batch — checked above against llama_n_batch.
+    {
+        common_batch_clear(batch_tgt);
+        for (size_t i = 0; i + 1 < inp.size(); ++i) {
+            common_batch_add(batch_tgt, inp[i], (llama_pos) i, { seq_id }, i + 2 == inp.size());
+        }
+        llama_decode(ctx_tgt, batch_tgt);
+        common_speculative_process(spec, batch_tgt);
+
+        if (!spec_is_dflash) {
+            llama_decode(ctx_dft.get(), batch_tgt);
+        }
+    }
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -142,14 +171,7 @@ int main(int argc, char ** argv) {
 
     int n_past = inp.size() - 1;
 
-    // init the speculator
-    const auto & params_spec = params.speculative;
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
-
     common_speculative_begin(spec, seq_id, prompt_tgt);
-
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     size_t n_draft = 0;
 
@@ -175,7 +197,7 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
 
             if (use_ckpt_dft) {
-                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
 
             // generate a new draft
@@ -196,12 +218,12 @@ int main(int argc, char ** argv) {
             // this allows us to restore the state if partial draft acceptance occurs
             if (!draft.empty()) {
                 if (use_ckpt_tgt) {
-                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }
@@ -225,10 +247,12 @@ int main(int argc, char ** argv) {
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
             llama_decode(ctx_tgt, batch_tgt);
+            common_speculative_process(spec, batch_tgt);
         }
 
-        // evaluate the same batch with the draft model
-        {
+        // evaluate the same batch with the draft model (classic drafters only —
+        // DFlash receives target features via common_speculative_process above)
+        if (!spec_is_dflash) {
             // TODO: extend to support MTP, Eagle, etc. See server code for reference
             llama_decode(ctx_dft.get(), batch_tgt);
         }
@@ -261,13 +285,13 @@ int main(int argc, char ** argv) {
             draft = std::move(ids);
 
             {
-                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }

@@ -65,6 +65,12 @@ add_library(${TARGET}
     chat-peg-parser.h
     chat.cpp
     chat.h
+    common-cache-plan.cpp
+    common-cache-plan.h
+    common-cache-plan-estimate.cpp
+    common-cache-plan-estimate.h
+    common-retention-sidecar.cpp
+    common-retention-sidecar.h
     common.cpp
     common.h
     console.cpp
@@ -78,12 +84,15 @@ add_library(${TARGET}
     hf-cache.cpp
     hf-cache.h
     http.h
-    json-partial.cpp
-    json-partial.h
+    imatrix-loader.cpp
+    imatrix-loader.h
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
     log.h
+    mtp-vocab-qwen27b-balanced.inc
+    mtp-vocab-trim.cpp
+    mtp-vocab-trim.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
@@ -94,17 +103,19 @@ add_library(${TARGET}
     peg-parser.h
     preset.cpp
     preset.h
-    regex-partial.cpp
     reasoning-budget.cpp
     reasoning-budget.h
-    regex-partial.h
     sampling.cpp
     sampling.h
     speculative.cpp
     speculative.h
+    subproc.cpp
+    subproc.h
     suffix-tree.cpp
     suffix-tree.h
     int32-map.h
+    trie.cpp
+    trie.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
@@ -128,7 +139,19 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+# common-cache-plan-estimate.cpp hashes calibration identity file
+# CONTENT with the internal SHA-256 primitive and — deliberately — resolves schedule paths
+# through the SAME runtime resolver the VBR reader uses (llama-vbr-config.h), so identity
+# can never drift from behavior. That makes this TU depend on libllama at link time, which
+# libcommon already does. The retention codec and MTP derivative cache use only
+# the internal SHA-256 primitive and carry no process-local accounting handles.
+set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp mtp-vocab-trim.cpp
+    PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)

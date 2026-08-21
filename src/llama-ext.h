@@ -2,11 +2,22 @@
 
 // this is a staging header for new llama.cpp API
 // breaking changes and C++ are allowed. everything here should be considered WIP
+// try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
 
 #include <cstdint>
 #include <map>
+
+// Internal speculative memory operations: real mutations with ordinary accounting, but no global
+// checkpoint-lineage publication for a caller-proven disposable backup or rejected suffix.
+LLAMA_API bool llama_memory_seq_rm_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -67,6 +78,10 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    // portion of `context` that does NOT scale with n_ctx (recurrent-state cache, sized by
+    // n_seq_max). Included in `context`, never added separately. Budget formulas that exploit
+    // the context term cancelling out of context-linear projections must still charge this part.
+    size_t context_fixed = 0;
 
     size_t total() const {
         return model + context + compute;
@@ -85,22 +100,123 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+struct llama_moe_tensor_info {
+    enum ggml_type type;
+    size_t expert_size;
+    int64_t n_input;
+    int64_t n_output;
+    int64_t n_expert;
+    // Transformer block index parsed from the tensor name ("blk.<N>..."),
+    // or -1 when the layer cannot be determined.
+    int64_t layer;
+};
+
+LLAMA_API size_t llama_model_get_moe_tensor_info(
+        const struct llama_model * model,
+        struct llama_moe_tensor_info * info,
+        size_t capacity);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
-//
-// pre-norm embeddings (hidden state before the final output norm)
-//
+// Resident cache-state allocation for one context, split into mutually-exclusive physical
+// leaves: attention KV, live recurrent state, recurrent rollback planes, and speculative
+// rolling-window tape. Keys are backend buffer types (one row per allocation). Recurrent
+// buffers physically contain (1 + n_rs_seq) equal state planes; their allocation bytes are
+// partitioned between the live plane and rollback planes without changing the measured total.
+// The rolling-window field excludes the fixed speculative tape.
+struct llama_live_memory_breakdown_data {
+    size_t attention             = 0;
+    size_t recurrent             = 0;
+    size_t recurrent_rollback    = 0;
+    size_t rolling_window_tape   = 0;
+};
 
-// Set whether the context outputs pre-norm embeddings or not
+using llama_live_memory_breakdown =
+    std::map<ggml_backend_buffer_type_t, llama_live_memory_breakdown_data>;
+
+LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx);
+
+// Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
+// from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
+// bits/value would cross floor_bpv (<= 0 = bottom-tier default; pass 1e30 for the un-walked
+// layout cost of the given types). Returns 0 when the context has no VBR-capable cache.
+// Works on no_alloc (fit dry-load) contexts — the fit uses it for floor-true capacity math.
+LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
+// #88: per-token bytes of the fattn f16 dequant scratch at the settled (deep-fill) tier state
+// (see llama-memory.h memory_vbr_scratch_bytes_per_token). The fit charges this in its
+// total-VRAM wall constraint only — it must NOT enter the KV budget solves (the scratch draws
+// from the fit margin, not the budget). Works on no_alloc (fit dry-load) contexts.
+LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
+// co-tenancy plan hint: total bytes this process still intends to allocate on the device
+// (PCI bus id per ggml_backend_dev_props.device_id). Set by the fit pass before load so a
+// held demand can publish an honest joint cross-device estimate instead of drip-feeding
+// per-failure asks (est_partial).
+LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
+
+// Composite application-load transaction. Nested component loaders cannot
+// publish SATISFIED or abandon an outer load. The outermost end owns that result.
+LLAMA_API void llama_vram_load_begin(bool application_owned_completion);
+LLAMA_API void llama_vram_load_end(bool success);
+LLAMA_API void llama_vram_plan_aux(const char * device_id, uint64_t bytes);
+LLAMA_API void llama_vram_load_complete(void);
+
+// co-tenancy: declare this process serviced (runs an idle tick — llama-server). Presence
+// markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
+LLAMA_API void llama_vram_mark_serviced(void);
+
+// co-tenancy telemetry for /props//slots: all zeros = inert (single tenant, no ledger)
+struct llama_vram_cotenancy_state {
+    uint64_t grant_decrement; // unamortized bytes currently decremented from KV budgets
+    uint32_t grants_active;   // live grant rows
+    uint64_t shed_offer;      // published donation offer, summed over devices
+    uint64_t grant_pending;   // granted-but-not-yet-flushed bytes
+};
+LLAMA_API struct llama_vram_cotenancy_state llama_vram_cotenancy(const struct llama_context * ctx);
+
+// Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
-LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked);
+LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// Select which appended NextN block the DECODER_MTP graph runs (offset past
+// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+// chain multiple trained NextN heads. Default 0 (first head).
+LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
-LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
-LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Set whether the context outputs the input embeddings of a specific layer
+LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+//
+// model/context data extraction
+//
+
+// returns pointer to the target-model layer indices
+LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+// returns the number of extracted layers from target model
+LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

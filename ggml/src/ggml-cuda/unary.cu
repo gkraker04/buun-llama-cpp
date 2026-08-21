@@ -116,19 +116,22 @@ static __device__ __forceinline__ float op_trunc(float x) {
 
 template <float (*op)(float), typename T>
 static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
+    ggml_cuda_pdl_lc();
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
         return;
     }
 
+    ggml_cuda_pdl_sync();
     dst[i] = (T)op((float)x[i]);
 }
 
 template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
-    unary_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
 template <float (*op)(float)>
@@ -258,6 +261,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 template <float (*op)(float), typename T>
 static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
@@ -268,13 +272,15 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     const int64_t j0 = (i / n) * o0 + (i % n);
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
+    ggml_cuda_pdl_sync();
     dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
 }
 
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    unary_gated_op_kernel<op><<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
 }
 
 template <float (*op)(float)>
@@ -341,6 +347,86 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
+}
+
+template <typename T>
+static __global__ void up_clamp_swiglu_kernel(
+        const T * gate, const T * up, T * dst,
+        const int64_t k, const int64_t n,
+        const int64_t gate_stride, const int64_t up_stride,
+        const float up_min, const float up_max) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t gate_i = (i / n) * gate_stride + (i % n);
+    const int64_t up_i   = (i / n) * up_stride   + (i % n);
+    const float gate_v = (float) gate[gate_i];
+    const float up_v   = fminf(fmaxf((float) up[up_i],     up_min),   up_max);
+
+    ggml_cuda_pdl_sync();
+    dst[i] = (T) (ggml_cuda_op_silu_single(gate_v) * up_v);
+}
+
+template <typename T>
+static void up_clamp_swiglu_cuda(
+        const T * gate, const T * up, T * dst,
+        const int64_t k, const int64_t n,
+        const int64_t gate_stride, const int64_t up_stride,
+        const float up_min, const float up_max,
+        cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = {
+        (dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream
+    };
+    ggml_cuda_kernel_launch(
+        up_clamp_swiglu_kernel<T>, launch_params,
+        gate, up, dst, k, n, gate_stride, up_stride,
+        up_min, up_max);
+}
+
+void ggml_cuda_op_up_clamp_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up_clamp = dst->src[1];
+    const ggml_tensor * up   = up_clamp->src[0];
+
+    GGML_ASSERT(up_clamp->op   == GGML_OP_CLAMP);
+    GGML_ASSERT(dst->op        == GGML_OP_GLU);
+    GGML_ASSERT(dst->src[0] == gate);
+    GGML_ASSERT(dst->src[1] == up_clamp);
+    GGML_ASSERT(ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU);
+    GGML_ASSERT(!ggml_get_op_params_i32(dst, 1));
+    GGML_ASSERT(ggml_is_contiguous_1(gate));
+    GGML_ASSERT(ggml_is_contiguous_1(up));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(gate, up));
+    GGML_ASSERT(ggml_are_same_shape(gate, dst));
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
+    GGML_ASSERT(gate->type == up->type && gate->type == dst->type);
+
+    float up_min;
+    float up_max;
+    memcpy(&up_min, up_clamp->op_params, sizeof(float));
+    memcpy(&up_max, (const float *) up_clamp->op_params + 1, sizeof(float));
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t n = gate->ne[0];
+    cudaStream_t stream = ctx.stream();
+
+    if (gate->type == GGML_TYPE_F16) {
+        up_clamp_swiglu_cuda(
+            (const half *) gate->data, (const half *) up->data, (half *) dst->data,
+            k, n, gate->nb[1] / sizeof(half), up->nb[1] / sizeof(half),
+            up_min, up_max, stream);
+    } else {
+        up_clamp_swiglu_cuda(
+            (const float *) gate->data, (const float *) up->data, (float *) dst->data,
+            k, n, gate->nb[1] / sizeof(float), up->nb[1] / sizeof(float),
+            up_min, up_max, stream);
+    }
 }
 
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -1,5 +1,4 @@
 import { activeProcessingState } from '$lib/stores/chat.svelte';
-import { config } from '$lib/stores/settings.svelte';
 import { STATS_UNITS } from '$lib/constants';
 import type { ApiProcessingState, LiveProcessingStats, LiveGenerationStats } from '$lib/types';
 
@@ -46,7 +45,6 @@ export function useProcessingState(): UseProcessingStateReturn {
 		return activeProcessingState();
 	});
 
-	// Track last known state for keepStatsVisible functionality
 	$effect(() => {
 		if (processingState && isMonitoring) {
 			lastKnownState = processingState;
@@ -88,14 +86,8 @@ export function useProcessingState(): UseProcessingStateReturn {
 
 	function stopMonitoring(): void {
 		if (!isMonitoring) return;
-		isMonitoring = false;
 
-		// Only clear last known state if keepStatsVisible is disabled
-		const currentConfig = config();
-		if (!currentConfig.keepStatsVisible) {
-			lastKnownState = null;
-			lastKnownProcessingStats = null;
-		}
+		isMonitoring = false;
 	}
 
 	function getProcessingMessage(): string {
@@ -159,6 +151,11 @@ export function useProcessingState(): UseProcessingStateReturn {
 			);
 		}
 
+		// effective KV cache bits/value — live under dynamic VBR (drops as tiers degrade)
+		if (typeof stateToUse.kvBpv === 'number' && stateToUse.kvBpv > 0) {
+			details.push(`${stateToUse.kvBpv.toFixed(2)} KVB`);
+		}
+
 		if (stateToUse.outputTokensUsed > 0) {
 			// Handle infinite max_tokens (-1) case
 			if (stateToUse.outputTokensMax <= 0) {
@@ -207,6 +204,11 @@ export function useProcessingState(): UseProcessingStateReturn {
 			details.push(
 				`Context: ${stateToUse.contextUsed}/${stateToUse.contextTotal} (${contextPercent}%)`
 			);
+		}
+
+		// effective KV cache bits/value — live under dynamic VBR (drops as tiers degrade)
+		if (typeof stateToUse.kvBpv === 'number' && stateToUse.kvBpv > 0) {
+			details.push(`${stateToUse.kvBpv.toFixed(2)} KVB`);
 		}
 
 		if (stateToUse.outputTokensUsed > 0) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "turbo-tcq-alpha.cuh"
+
 // fattn-mma-f16.cuh must be included before this header (provides flash_attn_ext_f16,
 // launch_fattn, fattn_kernel_t, and the MMA helper functions).
 
@@ -16,7 +18,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     constexpr int ncols = ncols1 * ncols2;
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa_typed(DKQ, DV, ncols, cc, type_K, type_V);
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
@@ -54,62 +56,73 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
+#if defined(GGML_USE_HIP)
+            // RDNA/ROCm: a D=256 fused kernel needs >32KB dynamic LDS. It launches fine eagerly,
+            // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
+            // raised first. The static guard runs this once, on the first (eager, pre-capture)
+            // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
+            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaGetLastError();
+#else
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+#endif
             shared_memory_limit_raised[id] = true;
         }
-#endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false, type_K, type_V>;
 
-#if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
+#if defined(GGML_USE_HIP)
+            // RDNA/ROCm: a D=256 fused kernel needs >32KB dynamic LDS. It launches fine eagerly,
+            // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
+            // raised first. The static guard runs this once, on the first (eager, pre-capture)
+            // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
+            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaGetLastError();
+#else
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+#endif
             shared_memory_limit_raised[id] = true;
         }
-#endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#endif // !defined(GGML_USE_MUSA)
     }
 
     // Set TCQ constants in THIS compilation unit's __constant__ memory before kernel launch.
     // Each template instance .cu file has its own static __constant__ copies.
+    turbo_vanilla_cb_load_fattn();  // TURBO_CB_T2/3/4/8 override, self-guarded per device
     if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ) {
         static bool cb3_loaded = false;
         if (!cb3_loaded) {
             cb3_loaded = true;
-            const char * cb_path = getenv("TURBO_TCQ_CB");
-            if (cb_path) {
-                float cb[512];
-                FILE * f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 512, f) == 512) {
-                    fclose(f);
-                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512 * sizeof(float)));
-                } else { if (f) fclose(f); }
-            }
+            turbo_tcq_load_kv_decode();
         }
     }
     if constexpr (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {
         static bool cb2_loaded = false;
         if (!cb2_loaded) {
             cb2_loaded = true;
-            const char * cb_path = getenv("TURBO_TCQ_CB2");
-            if (cb_path) {
-                float cb[256];
-                FILE * f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 256, f) == 256) {
-                    fclose(f);
-                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256 * sizeof(float)));
-                } else { if (f) fclose(f); }
-            }
+            turbo2_tcq_load_kv_decode();
         }
     }
-    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ ||
-                  type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {
+    if constexpr (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) {
+        static bool cb1_loaded = false;
+        static int cb1_hot = -1; if (cb1_hot < 0) cb1_hot = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+        if (!cb1_loaded || cb1_hot) {
+            cb1_loaded = true;
+            turbo1_tcq_load_kv_encode();
+        }
+    }
+    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ ||
+                  type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) {
         const ggml_tensor * V = dst->src[2];
         const int64_t n_kv = V->ne[1] > 0 ? V->ne[1] : 1;
         const float ln_ctx = logf((float)n_kv);
@@ -129,11 +142,25 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         if (alpha_v_static > 0.0f) {
             alpha_v = alpha_v_static;
         } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
-            alpha_v = fmaxf(0.98f, fminf(1.06f, 1.1484f - 0.01443f * ln_ctx));
+            alpha_v = TURBO_TCQ_ALPHA_V_T3;
         } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
-            alpha_v = fmaxf(1.00f, fminf(1.12f, 0.8865f + 0.0195f * ln_ctx));
+            alpha_v = TURBO_TCQ_ALPHA_V_T2;
+        } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
+            alpha_v = TURBO_TCQ_ALPHA_V_T1;
         }
-        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
+        // Push alpha to this TU's __constant__ ONCE per device, skipping the memcpy on repeat
+        // launches. alpha_v is constant for this template instance, so re-pushing it every call is
+        // redundant — and a synchronous cudaMemcpyToSymbol during CUDA/HIP graph capture is illegal
+        // (ROCm: "operation would make the legacy stream depend on a capturing blocking stream").
+        // The first (eager, pre-capture) launch sets it; captured launches skip. Matches the
+        // static cbN_loaded codebook guards above.
+        static float alpha_v_pushed[GGML_CUDA_MAX_DEVICES];
+        static bool  alpha_v_have  [GGML_CUDA_MAX_DEVICES] = {};
+        if (!alpha_v_have[id] || alpha_v_pushed[id] != alpha_v) {
+            CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
+            alpha_v_pushed[id] = alpha_v;
+            alpha_v_have[id]   = true;
+        }
 
         // K alpha: static (default 1.0, env var override)
         static float alpha_k = -1.0f;
@@ -146,7 +173,13 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
                 if (end != s && a > 0.0f && a < 10.0f) alpha_k = a;
             }
         }
-        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_k_fattn, &alpha_k, sizeof(float)));
+        static float alpha_k_pushed[GGML_CUDA_MAX_DEVICES];
+        static bool  alpha_k_have  [GGML_CUDA_MAX_DEVICES] = {};
+        if (!alpha_k_have[id] || alpha_k_pushed[id] != alpha_k) {
+            CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_k_fattn, &alpha_k, sizeof(float)));
+            alpha_k_pushed[id] = alpha_k;
+            alpha_k_have[id]   = true;
+        }
     }
 
     // need_f16_K=false, need_f16_V=false: raw turbo data passes through to kernel.
@@ -174,10 +207,35 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
+// Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only.
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO4_0)
+// Asymmetric pairs for the dynamic VBR degrade ladder, D=256 only. The priced degrade orders
+// move K and V of a layer independently and are NOT banded — a live mixed layer can straddle up
+// to 4 rungs (q27 holds K=t8:V=t3 across a multi-step cursor range; g31 holds K=t8:V=t1 across
+// long ranges). Only the ADJACENT-tier subset gets fused instances (compile-time budget); wider
+// straddles fall to the materialize path (measured -13-15% tg32 @ d8192 when uniform).
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO8_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ)
+// f16<->t8 entry band: VBR enters at f16 and the FIRST band every layer crosses is f16->t8, which
+// the adjacent-tier set above skipped (it started at t8). A straddled layer there (K or V still f16)
+// otherwise falls to the materialize path — the penalty GROWS with context (-50% @ d64k measured),
+// exactly the regime the dynamic controller churns through as context grows. f16 side needs no
+// dequant and (as K) no WHT rotation, so the fused kernel is strictly cheaper than matched t8:t8.
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0, GGML_TYPE_F16)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_F16,      GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
