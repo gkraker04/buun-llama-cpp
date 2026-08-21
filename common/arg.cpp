@@ -4988,6 +4988,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -5228,6 +5229,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("(compat alias for --spec-draft-n-max) max draft tokens (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max_set = true;
             params.speculative.n_max       = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));

@@ -200,6 +200,7 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+    assert(params.speculative.draft.n_max_set);
 
     {
         common_params draft_temp_params;
@@ -215,6 +216,7 @@ static void test(void) {
 
     {
         common_params default_params;
+        assert(!default_params.speculative.draft.n_max_set);
         assert(default_params.speculative.draft.mtp_vocab_size == 0);
     }
 

@@ -4807,22 +4807,25 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
 }
 
-void common_speculative_resolve_draft_model_type(
-        common_params_speculative & params,
-        const llama_model *         model_dft) {
-    if (!model_dft || !llama_model_dflash2_has_selector(model_dft)) {
-        return;
-    }
-
-    bool replaced = false;
+void common_speculative_select_dflash2(common_params_speculative & params) {
+    params.types.erase(
+            std::remove(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_NONE),
+            params.types.end());
     for (auto & type : params.types) {
         if (type == COMMON_SPECULATIVE_TYPE_DFLASH) {
             type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
-            replaced = true;
         }
     }
-    if (replaced && !params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
-        params.set_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+    if (!params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) {
+        params.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+    }
+}
+
+void common_speculative_resolve_draft_model_type(
+        common_params_speculative & params,
+        const llama_model *         model_dft) {
+    if (model_dft && llama_model_dflash2_has_selector(model_dft)) {
+        common_speculative_select_dflash2(params);
     }
 }
 

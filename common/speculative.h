@@ -5,8 +5,10 @@
 
 struct common_speculative;
 
-// Normalize legacy DFlash spelling after the draft model is available. This is
-// shared by the server and non-server speculative frontends.
+// Select the shared DFlash driver while preserving composable extensions.
+void common_speculative_select_dflash2(common_params_speculative & params);
+
+// Select DFlash2 after the loaded draft model confirms selector support.
 void common_speculative_resolve_draft_model_type(
         common_params_speculative & params,
         const llama_model *         model_dft);

@@ -334,6 +334,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    bool n_max_set = false; // true when the user explicitly overrides the draft depth
 
     // Qwen-27B MTP-only sidecars: 32768 enables the experimental public
     // balanced FR-Spec map; 0 keeps the full vocabulary (default).

@@ -116,19 +116,22 @@ python convert_hf_to_gguf.py z-lab/Qwen3.8-27B-DFlash2 \
     --target-model-dir Qwen/Qwen3.8-27B --outtype q8_0 --outfile Qwen3.8-27B-DFlash2-Q8_0.gguf
 
 llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
-    --spec-dflash-default -fa on --jinja
+    -fa on --jinja
 ```
 
-The released Qwen3.8 sidecar advertises an eight-position block. The runtime
-defaults that geometry to the faster measured `anchor + 12` block, and
-`--spec-dflash-default` therefore resolves to 12 draft tokens. Set
+The server detects DFlash2 from the sidecar, so `-md` does not require an
+explicit `--spec-type`. Unless `--spec-draft-n-max` is supplied, it also selects
+the sidecar's fastest measured full draft depth. The released Qwen3.8 sidecar
+advertises an eight-position block; the runtime defaults that geometry to the
+faster measured `anchor + 12` block. `--spec-dflash-default` remains a compatible
+spelling. Set
 `GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8` to restore the checkpoint metadata, or use
 another value from 3 through 64 for experimentation:
 
 ```bash
 GGML_DFLASH2_BLOCK_SIZE_OVERRIDE=8 llama-server \
     -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2-Q8_0.gguf \
-    --spec-dflash-default -fa on --jinja
+    -fa on --jinja
 ```
 
 The shared driver keeps independent adaptive-depth and proposal state for every

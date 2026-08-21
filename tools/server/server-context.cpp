@@ -298,18 +298,16 @@ static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_pa
     return { devices[params.main_gpu] };
 }
 
-// --spec-dflash-default predates the shared block-diffusion driver and therefore
-// enters argument parsing as the legacy DFlash type. DFlash2 needs to be resolved
-// before the target context is created: hybrid targets size their recurrent
-// rollback planes from draft.n_max, and changing the type after context creation
-// otherwise forces a first-request resize and CUDA graph recapture.
+// Detect DFlash2 before the target context is created: hybrid targets size their
+// recurrent rollback planes from draft.n_max, and changing the type or depth
+// after context creation otherwise forces a first-request resize and CUDA graph
+// recapture. --spec-dflash-default may still enter as the legacy DFlash type.
 //
 // Read only the GGUF metadata/tensor directory. The real draft model is still
 // loaded once, with its final placement, after the target context is available.
 static bool server_preflight_dflash2(common_params & params) {
     auto & spec = params.speculative;
-    if ((!spec.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
-         !spec.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) || !spec.has_dft()) {
+    if (!spec.has_dft()) {
         return false;
     }
 
@@ -354,12 +352,8 @@ static bool server_preflight_dflash2(common_params & params) {
         block_size = 13;
     }
 
-    for (auto & type : spec.types) {
-        if (type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
-        }
-    }
-    if (spec.n_max < 0) {
+    common_speculative_select_dflash2(spec);
+    if (!spec.draft.n_max_set) {
         spec.draft.n_max = block_size > 1 ? (int32_t) block_size - 1 : 12;
     }
     SRV_INF("preselected adaptive shared DFlash2 driver (block_size=%u, draft-max=%d)\n",
