@@ -21,6 +21,8 @@ else()
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)
+    add_subdirectory(fake_quant_ear)
+    add_subdirectory(sensitivity_db)
     add_subdirectory(idle)
     add_subdirectory(lookahead)
     add_subdirectory(lookup)
