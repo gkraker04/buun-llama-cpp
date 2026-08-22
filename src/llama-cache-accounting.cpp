@@ -27,7 +27,7 @@ llama_cache_acct_topology_digest llama_cache_acct_compute_topology_digest(
         const llama_cache_acct_shard_topology & topology) noexcept {
     try {
         llama_sha256_writer writer;
-        static constexpr char domain_separator[] = "llama-cache-acct/shard-topology";
+        static const char domain_separator[] = "llama-cache-acct/shard-topology";
         writer.string(domain_separator, sizeof(domain_separator) - 1);
         writer.u32(topology.version);
         writer.u32(topology.device_count);

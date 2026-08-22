@@ -2343,6 +2343,17 @@ ggml_backend_t llama_context::find_gpu_backend() {
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
         if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
+            // Skip RPC backends: the device list deliberately puts RPC servers first
+            // (llama_prepare_model_devices) to minimize network transfers, but the fused
+            // GDN / tape / buffer-type paths here need a real native compute GPU. Returning
+            // an RPC backend made the auto_fgdn CUDA/ROCm name check fail and silently
+            // disabled the fused Gated Delta Net kernels on every RPC-enabled run even when
+            // the RPC device held zero layers (~2x decode penalty, 2026-08-14 measurement).
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            if (reg_name && strcmp(reg_name, "RPC") == 0) {
+                continue;
+            }
             return backend.get();
         }
     }

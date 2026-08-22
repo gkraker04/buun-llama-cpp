@@ -23,7 +23,7 @@ bool artifact_ptr_less(
 common_cache_plan_destruction_manifest_digest manifest_digest(
         const std::vector<const server_cache_destruction_artifact *> & manifest) {
     llama_sha256_writer hash;
-    static constexpr char tag[] = "cache-destruction-manifest-v1";
+    static const char tag[] = "cache-destruction-manifest-v1";
     hash.string(tag, sizeof(tag) - 1);
     hash.u64(manifest.size());
     for (const auto * artifact : manifest) {
@@ -260,7 +260,7 @@ server_cache_destruction_union_effect_digest(
         const std::vector<llama_cache_acct_op_id> & ops,
         const llama_cache_acct_release_set_preview & release) {
     llama_sha256_writer hash;
-    static constexpr char tag[] = "cache-destruction-union-effect-v1";
+    static const char tag[] = "cache-destruction-union-effect-v1";
     hash.string(tag, sizeof(tag) - 1);
     hash.u64(ops.size());
     for (const auto op : ops) {
@@ -294,7 +294,7 @@ server_cache_destruction_recovery_source_digest(
     canonical.erase(
         std::unique(canonical.begin(), canonical.end()), canonical.end());
     llama_sha256_writer hash;
-    static constexpr char tag[] = "cache-destruction-recovery-source-v1";
+    static const char tag[] = "cache-destruction-recovery-source-v1";
     hash.string(tag, sizeof(tag) - 1);
     hash.u64(artifact.v);
     hash.u64(canonical.size());

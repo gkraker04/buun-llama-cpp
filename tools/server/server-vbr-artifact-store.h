@@ -100,7 +100,7 @@ struct server_vbr_artifact_store_create_diagnostics {
 struct server_vbr_artifact_store_config {
     using sample_budget_fn = bool (*)(
         void * context,
-        llama_cache_budget_config & output) noexcept;
+        llama_cache_budget_config & output);
 
     llama_cache_acct_ledger * ledger = nullptr;
     llama_cache_acct_resource_domain pinned_domain;
@@ -203,7 +203,7 @@ struct server_vbr_artifact_import_request {
         void * context,
         const std::vector<llama_token> & tokens,
         uint64_t sequence_epoch) noexcept;
-    using publish_fn = void (*)(void * context) noexcept;
+    using publish_fn = void (*)(void * context);
 
     llama_memory_i * memory = nullptr;
     llama_seq_id destination = -1;

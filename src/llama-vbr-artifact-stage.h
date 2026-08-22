@@ -35,9 +35,9 @@ struct vbr_h2d_lane_binding {
 struct vbr_h2d_fake_destination {
     using issue_fn = bool (*)(
         void * context, uint64_t ticket, uint64_t offset,
-        const uint8_t * data, size_t size, bool asynchronous) noexcept;
+        const uint8_t * data, size_t size, bool asynchronous);
     using complete_fn = bool (*)(
-        void * context, uint64_t ticket) noexcept;
+        void * context, uint64_t ticket);
 
     void * context = nullptr;
     issue_fn issue = nullptr;

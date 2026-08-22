@@ -168,7 +168,7 @@ struct server_cache_destruction_request {
 
 using server_cache_lease_evaluator = server_cache_destruction_verdict (*)(
         void * context,
-        const server_cache_destruction_request & request) noexcept;
+        const server_cache_destruction_request & request);
 
 // A logical operation keeps this small token across split physical phases. D-S4 and D-S5
 // execute pass-through; D-A can later change execution authority without re-cutting joined

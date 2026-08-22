@@ -36,7 +36,26 @@ enum split_mode : uint8_t {
     MODE_NONE,
     MODE_TENSOR,
     MODE_SIZE,
+    MODE_LAYER,
 };
+
+// extract the layer number from a tensor name like "blk.12.attn_norm.weight"
+// returns -1 for non-layer tensors (e.g. "token_embd.weight", "output_norm.weight")
+static int tensor_layer_number(const char * name) {
+    if (strncmp(name, "blk.", 4) != 0) {
+        return -1;
+    }
+    const char * p = name + 4;
+    if (*p < '0' || *p > '9') {
+        return -1;
+    }
+    int layer = 0;
+    while (*p >= '0' && *p <= '9') {
+        layer = layer * 10 + (*p - '0');
+        p++;
+    }
+    return layer;
+}
 
 struct split_params {
     split_operation operation = OP_NONE;
@@ -64,6 +83,7 @@ static void split_print_usage(const char * executable) {
     printf("  --merge                 merge multiple GGUF to a single GGUF\n");
     printf("  --split-max-tensors     max tensors in each split (default: %d)\n", default_params.n_split_tensors);
     printf("  --split-max-size N(M|G) max size per split\n");
+    printf("  --split-layer           split per transformer layer (blk.N. prefix), one file per layer\n");
     printf("  --no-tensor-first-split do not add tensors to the first split (disabled by default)\n");
     printf("  --dry-run               only print out a split plan and exit, without writing any new files\n");
     printf("  --delete-splits         delete the split files during merge to free up disk space WARNING: this option is unsafe and will leave you in an unrecoverable state if something fails during the merge\n");
@@ -138,6 +158,12 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
             }
             params.mode = MODE_TENSOR;
             params.n_split_tensors = atoi(argv[arg_idx]);
+        } else if (arg == "--split-layer") {
+            arg_found = true;
+            if (params.mode != MODE_NONE && params.mode != MODE_LAYER) {
+                throw std::invalid_argument("error: either --split-max-tensors, --split-max-size or --split-layer can be specified, but not multiple");
+            }
+            params.mode = MODE_LAYER;
         } else if (arg == "--split-max-size") {
             if (++arg_idx >= argc) {
                 invalid_param = true;
@@ -291,6 +317,16 @@ struct split_strategy {
         } else if (params.mode == MODE_TENSOR) {
             // split by number of tensors per file
             return i_tensor > 0 && i_tensor < n_tensors && i_tensor % params.n_split_tensors == 0;
+        } else if (params.mode == MODE_LAYER) {
+            // split when the layer number changes (blk.N. prefix)
+            if (i_tensor == 0) {
+                return false;
+            }
+            const char * prev_name = gguf_get_tensor_name(ctx_gguf, i_tensor - 1);
+            const char * curr_name = gguf_get_tensor_name(ctx_gguf, i_tensor);
+            const int prev_layer = tensor_layer_number(prev_name);
+            const int curr_layer = tensor_layer_number(curr_name);
+            return prev_layer != curr_layer;
         }
         // should never happen
         GGML_ABORT("invalid mode");

@@ -178,7 +178,7 @@ struct vbr_artifact_payload_consumer {
         size_t size) noexcept;
     using finish_fn = void (*)(
         void * context,
-        bool verified) noexcept;
+        bool verified);
 
     void * context = nullptr;
     consume_fn consume = nullptr;

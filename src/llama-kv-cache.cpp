@@ -5815,7 +5815,7 @@ bool llama_kv_cache::vbr_capture_policy_snapshot(
     output.mutation_serial = tracker->mutation_serial();
 
     llama_sha256_writer order_hash;
-    static constexpr char ORDER_DOMAIN[] =
+    static const char ORDER_DOMAIN[] =
         "buun.vbr.capture/degrade-order";
     order_hash.string(ORDER_DOMAIN, sizeof(ORDER_DOMAIN) - 1);
     order_hash.u64(vbr_degrade_order_.size());
@@ -5845,7 +5845,7 @@ bool llama_kv_cache::vbr_capture_policy_snapshot(
         });
 
     llama_sha256_writer policy_hash;
-    static constexpr char POLICY_DOMAIN[] =
+    static const char POLICY_DOMAIN[] =
         "buun.vbr.capture/controller-policy";
     policy_hash.string(POLICY_DOMAIN, sizeof(POLICY_DOMAIN) - 1);
     policy_hash.bytes(

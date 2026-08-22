@@ -577,7 +577,7 @@ server_http_context::handler_t server_stream_make_delete_handler() {
 
 std::string server_stream_conv_id_from_headers(const std::map<std::string, std::string> & headers) {
     // case-insensitive scan for x-conversation-id
-    static constexpr char   target[]   = "x-conversation-id";
+    static const char   target[]   = "x-conversation-id";
     static constexpr size_t target_len = sizeof(target) - 1;
     for (const auto & [hk, hv] : headers) {
         if (hk.size() != target_len) continue;

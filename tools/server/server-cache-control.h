@@ -299,7 +299,7 @@ struct server_cache_control_config {
         server_cache_durable_fallback_proof & pin) noexcept;
     using acquire_host_proof_fn = server_cache_durable_fallback_proof (*)(
         void * context,
-        const server_cache_control_selector & selector) noexcept;
+        const server_cache_control_selector & selector);
     using selector_evidence_fn = bool (*)(
         void * context,
         const server_cache_control_selector & selector,

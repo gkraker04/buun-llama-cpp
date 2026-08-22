@@ -44,7 +44,7 @@ constexpr bool vbr_controller_instance_id_is_set(vbr_controller_instance_id id) 
     return id.hi != 0 && id.lo != 0;
 }
 
-using vbr_lineage_origin_provider = bool (*)(uint64_t & origin) noexcept;
+using vbr_lineage_origin_provider = bool (*)(uint64_t & origin);
 
 // The sole allocator doors. Both latch on exhaustion and never reuse an issued value.
 vbr_lineage_uuid            vbr_lineage_uuid_allocate() noexcept;

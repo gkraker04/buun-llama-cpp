@@ -210,12 +210,12 @@ struct vbr_adopt_policy {
         llama_memory_i & target,
         const std::vector<llama_memory_tree_child> & canonical_tree,
         vbr_target_validation_snapshot & output) noexcept;
-    using serial_fn = uint64_t (*)(const void * context) noexcept;
+    using serial_fn = uint64_t (*)(const void * context);
     using downward_digest_fn = bool (*)(
-        const void * context, std::array<uint8_t, 32> & output) noexcept;
+        const void * context, std::array<uint8_t, 32> & output);
     using target_recheck_fn = bool (*)(
         const void * context,
-        const vbr_target_empty_fingerprint & expected) noexcept;
+        const vbr_target_empty_fingerprint & expected);
     using parse_companion_fn = bool (*)(
         const void * context,
         const vbr_artifact_companion_payload & descriptor,

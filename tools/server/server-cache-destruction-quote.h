@@ -147,7 +147,7 @@ void server_cache_destruction_certify_receipt(
 // authority requires its protected source to be disjoint from the victim union.
 class server_cache_recovery_pin {
 public:
-    using release_fn = void (*)(void *) noexcept;
+    using release_fn = void (*)(void *);
 
     server_cache_recovery_pin() = default;
     ~server_cache_recovery_pin();

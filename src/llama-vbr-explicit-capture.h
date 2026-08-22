@@ -264,7 +264,7 @@ struct vbr_explicit_capture_request {
 struct vbr_explicit_capture_accounting {
     using prepare_fn = bool (*)(
         void * context,
-        const vbr_artifact_package & package) noexcept;
+        const vbr_artifact_package & package);
 
     const llama_cache_budget_config * budget = nullptr;
     llama_cache_transaction_fault fault;

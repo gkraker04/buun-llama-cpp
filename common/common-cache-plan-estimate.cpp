@@ -74,7 +74,7 @@ bool common_cache_plan_restore_us(
 }
 
 std::string common_cache_plan_sha256_hex_digest(const std::array<uint8_t, 32> & digest) {
-    static constexpr char hex[] = "0123456789abcdef";
+    static const char hex[] = "0123456789abcdef";
     std::string out;
     out.reserve(digest.size()*2);
     for (uint8_t byte : digest) {

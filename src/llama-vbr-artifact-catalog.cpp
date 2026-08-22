@@ -992,7 +992,7 @@ llama_vbr_artifact_catalog::begin_capture_impl(
             llama_cache_acct_content_digest staging_content;
             llama_cache_acct_lineage_id staging_lineage;
             llama_sha256_writer staging_hash;
-            static constexpr char STAGING_DOMAIN[] =
+            static const char STAGING_DOMAIN[] =
                 "buun.vbr.capture.transfer-staging";
             staging_hash.string(
                 STAGING_DOMAIN,
